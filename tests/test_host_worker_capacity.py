@@ -1172,3 +1172,65 @@ def test_launch_guard_and_pre_launch_cancel_never_start_the_target(tmp_path):
     assert not marker.exists()
     (row,) = _attempts(log)
     assert row["outcome"] == "cancelled"
+
+
+# --- review round 1 (#1108) --------------------------------------------------------
+
+
+def test_admission_notices_use_the_bounded_notice_callback(tmp_path):
+    root = tmp_path / "locks"
+    other = _lock(root, "other-loop")
+    assert other.reserve_host_workers(4, _cpus(4)) == 4
+    stream, bounded = [], []
+    try:
+        log, tel = _telemetry(tmp_path)
+        _run(
+            tmp_path, root, tel, env=_env("mine", wait=0), cmd=_PRINTER,
+            output_callback=stream.append, host_wait_notify=bounded.append,
+        )
+        assert any("runs with 1 worker(s)" in text for text in bounded)
+        assert not any("agent-loop worker budget" in text for text in stream)
+    finally:
+        other.close()
+
+
+def test_invalid_wait_notice_uses_the_bounded_notice_callback(tmp_path):
+    stream, bounded = [], []
+    _, tel = _telemetry(tmp_path)
+    _run(
+        tmp_path, tmp_path / "locks", tel, env=_env("mine", wait="not-a-number"), cmd=_PRINTER,
+        output_callback=stream.append, host_wait_notify=bounded.append,
+    )
+    assert any(ENV_HOST_WAIT in text for text in bounded)
+    assert not any(ENV_HOST_WAIT in text for text in stream)
+
+
+def test_successful_mutex_contention_is_recorded_as_wait(tmp_path, monkeypatch):
+    _fast(monkeypatch)
+    root = tmp_path / "locks"
+    holder = _hold_mutex_process(root, 1.5)
+    try:
+        log, tel = _telemetry(tmp_path)
+        result = _run(tmp_path, root, tel, env=_env("mine", wait=30), cmd=_PRINTER)
+        assert result.returncode == 0 and "workers=4" in result.output_tail
+        (row,) = _attempts(log)
+        assert row["outcome"] == "granted"
+        assert row["reservation_wait_seconds"] >= 1.0
+        assert row["wait_timed_out"] is False
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_exclusive_wait_expiry_is_a_timeout_even_when_the_fallback_fits(tmp_path, monkeypatch):
+    _fast(monkeypatch)
+    root = tmp_path / "locks"
+    a, b = _lock(root, "a"), _lock(root, "b")
+    big = HostCapacity(8, 1024 * GIB, GIB)
+    try:
+        assert a.reserve_host_workers(4, big) == 4
+        r = b.wait_for_host_workers(4, big, wait_seconds=0.2, notify=lambda _t: None)
+        assert r.granted == 4 and r.timed_out is True and r.oversubscribed is False
+    finally:
+        a.close()
+        b.close()

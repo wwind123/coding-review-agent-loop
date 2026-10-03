@@ -1064,6 +1064,8 @@ class WorkerBudgetLock:
         self.last_others: tuple[int, int] | None = None
         # Free workers the divide rule would have granted at the last attempt.
         self.last_free: int | None = None
+        # Whether the last accounting-mutex acquisition had to wait for another holder.
+        self.last_mutex_contended = False
 
     @classmethod
     def acquire(
@@ -1140,7 +1142,13 @@ class WorkerBudgetLock:
         """
         requested = max(1, int(requested))
         directory = self.path.parent
-        with _host_capacity_mutex(directory, deadline=mutex_deadline, tick=mutex_tick):
+        mutex = _host_capacity_mutex(directory, deadline=mutex_deadline, tick=mutex_tick)
+        self.last_mutex_contended = False
+        try:
+            mutex.__enter__()
+        finally:
+            self.last_mutex_contended = mutex.contended
+        try:
             previous, self.reservation = self.reservation, None
             if previous is not None:
                 _unlink_reservation(previous)
@@ -1192,6 +1200,8 @@ class WorkerBudgetLock:
             }
             _write_reservation(own, self._reservation_data)
             self.reservation = own
+        finally:
+            mutex.__exit__(None, None, None)
         return granted
 
     def wait_for_host_workers(
@@ -1238,18 +1248,24 @@ class WorkerBudgetLock:
 
         deadline = start + wait_seconds
         refused = False
+        contended = False
         try:
             if wait_seconds > 0:
                 interval = HOST_WAIT_POLL_INITIAL_SECONDS
                 last_notice = start
                 while True:
-                    granted = self.reserve_host_workers(
-                        requested, capacity, exclusive=True,
-                        mutex_deadline=deadline, mutex_tick=tick,
-                    )
+                    try:
+                        granted = self.reserve_host_workers(
+                            requested, capacity, exclusive=True,
+                            mutex_deadline=deadline, mutex_tick=tick,
+                        )
+                    finally:
+                        contended = contended or self.last_mutex_contended
                     if granted:
                         return HostWaitResult(
-                            granted, (monotonic() - start) if refused else 0.0, False, False, False,
+                            granted,
+                            (monotonic() - start) if (refused or contended) else 0.0,
+                            False, False, False,
                         )
                     others = self.last_others or (0, 0)
                     now = monotonic()
@@ -1283,14 +1299,18 @@ class WorkerBudgetLock:
                     if monotonic() >= deadline:
                         break
             tick()
-            granted = self.reserve_host_workers(
-                requested, capacity, floor=1,
-                mutex_deadline=monotonic() + HOST_MUTEX_FINAL_GRACE_SECONDS, mutex_tick=tick,
-            )
+            try:
+                granted = self.reserve_host_workers(
+                    requested, capacity, floor=1,
+                    mutex_deadline=monotonic() + HOST_MUTEX_FINAL_GRACE_SECONDS, mutex_tick=tick,
+                )
+            finally:
+                contended = contended or self.last_mutex_contended
             return HostWaitResult(
                 granted,
-                (monotonic() - start) if (refused or wait_seconds > 0) else 0.0,
-                wait_seconds > 0 and granted < requested,
+                (monotonic() - start) if (refused or contended or wait_seconds > 0) else 0.0,
+                # The bound expired, whatever the fallback then obtained.
+                wait_seconds > 0,
                 self.last_free == 0,
                 False,
             )
@@ -1456,6 +1476,7 @@ class _host_capacity_mutex:
         self._handle = None
         self._deadline = deadline
         self._tick = tick
+        self.contended = False
 
     def __enter__(self) -> "_host_capacity_mutex":
         handle = self._path.open("a+")
@@ -1473,7 +1494,7 @@ class _host_capacity_mutex:
                             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                             break
                         except BlockingIOError:
-                            pass
+                            self.contended = True
                         if self._deadline is not None and time.monotonic() >= self._deadline:
                             raise HostCapacityMutexTimeout(
                                 f"host capacity mutex {self._path} is held elsewhere"

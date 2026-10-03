@@ -519,16 +519,19 @@ def _run_foreground_test_body(
             # timeout it degrades to the free workers.  Host capacity never
             # reaches the coder as a refusal.
             capacity = host_capacity(worker_budget)
+            # Admission notices use the bounded notice callback so a client
+            # that stopped reading cannot delay admission or shutdown.
+            admission_notify = host_wait_notify or notify
             bound, bound_notice = host_wait_seconds(invocation_values)
             if bound_notice:
-                notify(bound_notice)
+                admission_notify(bound_notice)
             try:
                 wait = worker_lock.wait_for_host_workers(
                     worker_budget.workers,
                     capacity,
                     wait_seconds=bound,
                     notify=notify,
-                    wait_notify=host_wait_notify or notify,
+                    wait_notify=admission_notify,
                     heartbeat=host_wait_heartbeat,
                     cancel=host_wait_cancel,
                     on_wait_start=tel.wait_started,
@@ -566,7 +569,7 @@ def _run_foreground_test_body(
             else:
                 tel.set_outcome("granted")
             if wait.timed_out or granted < worker_budget.workers:
-                notify(
+                admission_notify(
                     f"agent-loop worker budget: waited {wait.waited_seconds:.0f} s (limit {bound:g} s) "
                     f"for the shared test-worker pool ({capacity.describe()}); this command runs "
                     f"with {granted} worker(s) instead of {worker_budget.workers}"

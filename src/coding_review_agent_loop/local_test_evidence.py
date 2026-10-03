@@ -1969,15 +1969,23 @@ class _ConnectionSender:
         frame = struct.pack(">I", len(raw)) + raw
         if self.wedged:
             return False
+        # One deadline covers lock acquisition and writing.
+        deadline = time.monotonic() + max(0.0, grace)
         if skip_if_busy:
             if not self._lock.acquire(blocking=False):
                 return False
-        elif not self._lock.acquire(timeout=max(0.0, grace)):
-            return False
+        else:
+            while not self._lock.acquire(
+                timeout=max(0.0, min(BROKER_SEND_CANCEL_POLL_SECONDS, deadline - time.monotonic()))
+            ):
+                if time.monotonic() >= deadline or (cancellable and self._cancel.is_set()):
+                    # Another send holds the lock mid-frame: fail this send
+                    # and wedge, so no later frame can interleave.
+                    self._wedge()
+                    return False
         try:
             if self.wedged:
                 return False
-            deadline = time.monotonic() + max(0.0, grace)
             view = memoryview(frame)
             sent = 0
             while sent < len(frame):
@@ -2283,8 +2291,10 @@ class TestBrokerServer:
         # Either the runner's guarded launch completes first and its process is
         # in the snapshot below, or it sees the event and launches nothing.
         with self._launch_lock:
-            self._stop_event.set()
             with self._journal_lock:
+                # Shared with evidence publication: a journal append either
+                # precedes this point or observes the stop and is unattributed.
+                self._stop_event.set()
                 active = list(self._active_processes.values())
         for proc in active:
             if proc.poll() is None:
@@ -2717,6 +2727,14 @@ class TestBrokerServer:
                 suite_start=suite_start,
             )
             with self._journal_lock:
+                if self._stop_event.is_set() and "unattributed: broker shutdown" not in observation.attribution.caveats:
+                    observation = replace(
+                        observation,
+                        attribution=TreeAttribution(
+                            state="unknown", stable=False,
+                            caveats=("unattributed: broker shutdown",),
+                        ),
+                    )
                 retained = self._append_journal_locked(observation)
                 execution_ref = retained.execution_ref if retained is not None else None
         return {
