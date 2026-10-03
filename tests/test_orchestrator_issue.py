@@ -15550,7 +15550,79 @@ def test_normalized_remaining_defect_is_quoted_and_persisted(tmp_path):
     assert "forbidden_side_effects" not in exhaustion.diagnostic
     assert "one automatic planner replay" in str(error.value)
     assert '"forbidden_side_effects": ["Must not refuse"]' in exhaustion.candidate_text
-    assert exhaustion.candidate_digest == hashlib.sha256(exhaustion.candidate_text.encode()).hexdigest()
+    independent = _matrix_plan_candidate_1229(
+        forbidden_side_effects=["Must not refuse"], related_scope_item_ids=""
+    )
+    assert exhaustion.candidate_text == independent
+    assert exhaustion.candidate_digest == hashlib.sha256(independent.encode()).hexdigest()
     assert len(runner.diagnostic_posts) == 1
     assert len(_claude_prompts_1229(runner)) == 2
+    replay_prompt = "\n".join(_claude_prompts_1229(runner)[1])
+    assert "Previous response not accepted: risk_test_matrix" in replay_prompt
+    assert "related_scope_item_ids" in replay_prompt
+    assert "forbidden_side_effects must be a JSON array" not in replay_prompt
     assert error.value.failure_category == "fresh-contract-integrity"
+
+
+def _issue_level_run_1229(tmp_path, outputs, **config_overrides):
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = list(outputs)
+    config = make_config(
+        tmp_path, execution_strategy_contract_required=True, quiet=False, **config_overrides
+    )
+    repair_calls = []
+    real_repair = orchestrator_module._run_structured_repair
+
+    def spy(*args, **kwargs):
+        repair_calls.append(args)
+        return real_repair(*args, **kwargs)
+
+    return runner, config, repair_calls, spy
+
+
+def _run_issue_level_1229(tmp_path, monkeypatch, outputs, retries=0):
+    runner, config, repair_calls, spy = _issue_level_run_1229(
+        tmp_path, outputs, agent_max_retries=retries
+    )
+    posted = []
+    real_post = orchestrator_module.post_issue_comment
+
+    def capture(_runner, *, config, issue_number, body):
+        posted.append(str(body))
+        return real_post(_runner, config=config, issue_number=issue_number, body=body)
+
+    monkeypatch.setattr(orchestrator_module, "_run_structured_repair", spy)
+    monkeypatch.setattr(orchestrator_module, "post_issue_comment", capture)
+    # Later stages have no scripted output; only the planning turn is under test.
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    return runner, repair_calls, posted
+
+
+def test_issue_level_bare_strings_are_accepted_on_first_planner_call(tmp_path, monkeypatch, capsys):
+    good = _matrix_plan_candidate_1229(
+        forbidden_side_effects="Slip one", related_scope_item_ids="scope-1"
+    )
+    runner, repair_calls, posted = _run_issue_level_1229(tmp_path, monkeypatch, [good])
+    assert len(_claude_prompts_1229(runner)) == 1
+    assert repair_calls == []
+    assert posted and "Slip one" in posted[0]
+    err = capsys.readouterr().err
+    assert "normalized risk test matrix string field(s)" in err
+    assert "forbidden_side_effects" in err and "related_scope_item_ids" in err
+
+
+def test_issue_level_unrecoverable_matrix_replays_once_and_is_accepted(tmp_path, monkeypatch, capsys):
+    bad = _matrix_plan_candidate_1229(forbidden_side_effects="")
+    good = _matrix_plan_candidate_1229(forbidden_side_effects=["Replay accepted"])
+    runner, repair_calls, posted = _run_issue_level_1229(tmp_path, monkeypatch, [bad, good])
+    prompts = ["\n".join(c) for c in _claude_prompts_1229(runner)]
+    assert len(prompts) == 2
+    assert "Previous response not accepted: risk_test_matrix" in prompts[1]
+    assert "forbidden_side_effects" in prompts[1].split("risk_test_matrix", 1)[1]
+    err = capsys.readouterr().err
+    assert err.count("repair backend=none model=fresh-matrix-contract-integrity") == 1
+    assert err.count("repair backend=") == 1
+    # Only the deterministic guard ran (backend=none); no repair model rewrote the matrix.
+    assert len(repair_calls) == 1
+    assert posted and "Replay accepted" in posted[0]

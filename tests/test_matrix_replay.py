@@ -235,3 +235,59 @@ def test_repair_guard_logs_its_own_normalization(tmp_path):
         )
     assert attempts and attempts[-1].outcome == "fresh_contract_integrity"
     assert any("normalized risk test matrix string field(s)" in m and "forbidden_side_effects" in m for m in logs)
+
+
+def test_replay_transitions_are_not_taken_for_the_dedicated_replay(tmp_path):
+    from coding_review_agent_loop.agents.antigravity import AntigravityAttemptState
+
+    transitions: list[object] = []
+    real = AntigravityAttemptState.next_after_failure
+
+    def spy(self, **kwargs):
+        transitions.append((self.retries_remaining, kwargs))
+        return real(self, **kwargs)
+
+    sleeps: list[object] = []
+    bad = _state(_row(forbidden_side_effects=""))
+    runner = _runner("antigravity", [bad, "Error: server is overloaded, try again later", _state()])
+    with patch.object(AntigravityAttemptState, "next_after_failure", spy), \
+            patch.object(orchestrator.time, "sleep", lambda s: sleeps.append(s)):
+        response, error, _logs, _spy, _ = _run_noskip(runner, _config(tmp_path, "antigravity", 1))
+    assert error is None and response is not None
+    # Only the later ordinary failure takes a transition, with its full allowance.
+    assert len(transitions) == 1 and transitions[0][0] == 1
+    assert len(sleeps) <= 1
+    assert _models(_cmds(runner, "antigravity")) == ["ModelA"] * 3
+
+
+def _run_noskip(runner, config):
+    logs: list[str] = []
+    with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
+        try:
+            response = orchestrator._run_validated_agent(
+                runner, agent=_AGENT[0], config=config, prompt="ORIGINAL PROMPT",
+                session_id=None,
+                marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
+                validate=_validate_state, use_repair=True, repair_expected_kind="plan_state",
+                role="planner", operation_description="planning",
+                require_execution_strategy_contract=True,
+                require_risk_test_matrix_contract=True,
+            )
+            error = None
+        except AgentInvocationError as exc:
+            response, error = None, exc
+    return response, error, logs, None, []
+
+
+def test_mixed_contract_failure_after_matrix_replay_reports_the_real_contract(tmp_path):
+    payload = json.loads(_state().rsplit("\n<!--", 1)[0])
+    payload.pop("execution_recommendation")
+    exec_bad = json.dumps(payload) + PLAN_FOOTER
+    runner = _runner("codex", [_state(_row(forbidden_side_effects="")), exec_bad])
+    response, error, _logs, _spy, exhaustions = _run(runner, _config(tmp_path, "codex", 0))
+    assert response is None and error.failure_category == "fresh-contract-integrity"
+    assert len(_cmds(runner, "codex")) == 2
+    text = str(error)
+    assert "also failed the fresh risk-test-matrix contract" not in text
+    assert "execution_recommendation" in text
+    assert len(exhaustions) == 1

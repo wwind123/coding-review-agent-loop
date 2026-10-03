@@ -1125,6 +1125,7 @@ def _run_validated_agent(
     pending_contract_reprompt: str | None = None
     omission_reask_used = False
     matrix_integrity_replay_used = False
+    terminal_integrity_contract: str | None = None
     pending_matrix_integrity_reprompt: str | None = None
     pending_omission_reask_ids: tuple[str, ...] | None = None
     executable_replacement_policies: dict[AgentName, tuple[str, str, str, bool]] = {
@@ -2321,6 +2322,7 @@ def _run_validated_agent(
                             ):
                                 matrix_integrity_replay_used = True
                                 pending_matrix_integrity_reprompt = original_validation_error
+                            terminal_integrity_contract = terminal_repair.integrity_contract
                             last_failure_category = "fresh-contract-integrity"
                             last_classification_text = (
                                 "fresh planning execution recommendation requires a new planner turn"
@@ -2590,10 +2592,17 @@ def _run_validated_agent(
             part for part in (last_classification_text, latest_replay_refusal_detail) if part
         ).strip()
     if matrix_integrity_replay_used and last_failure_category == "fresh-contract-integrity":
-        last_error = (
-            f"{last_error}; one automatic planner replay was already attempted "
-            "and also failed the fresh risk-test-matrix contract"
-        )
+        if terminal_integrity_contract == "risk_test_matrix":
+            replay_note = (
+                "one automatic planner replay was already attempted "
+                "and also failed the fresh risk-test-matrix contract"
+            )
+        else:
+            replay_note = (
+                "one automatic planner replay for the risk-test-matrix contract was "
+                f"already attempted; the final failure is the {terminal_integrity_contract} contract"
+            )
+        last_error = f"{last_error}; {replay_note}"
     diagnostics = _failed_run_diagnostics(
         runner=runner,
         config=config,
