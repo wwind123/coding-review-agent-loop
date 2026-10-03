@@ -34,7 +34,7 @@ PACKAGE = "coding_review_agent_loop"
 FACADE = f"{PACKAGE}.orchestrator"
 
 # Ordered: an extracted module may import only modules listed before it.
-EXTRACTED_MODULES: tuple[str, ...] = ("agent_failure",)
+EXTRACTED_MODULES: tuple[str, ...] = ("agent_failure", "architecture_contract")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
