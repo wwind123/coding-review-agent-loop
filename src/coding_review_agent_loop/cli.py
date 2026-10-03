@@ -190,6 +190,18 @@ def build_parser() -> argparse.ArgumentParser:
             help="Antigravity (agy) checkout. Defaults to a per-run detached git worktree off a shared repo-scoped clone (removed when the run ends; concurrent default runs proceed) when Antigravity is active. An explicit directory must be an existing, clean git checkout.",
         )
         subparser.add_argument(
+            "--worktree-link",
+            action="append",
+            default=None,
+            metavar="PATH",
+            help=(
+                "Opt-in, repeatable. A repository-relative path (for example .venv) that is untracked in "
+                "the shared default clone and is symlinked (never copied) into each per-run worktree. Its "
+                "parent directories must be tracked in the repository. Explicit --<agent>-dir checkouts "
+                "ignore it. The linked state is shared and mutable across concurrent runs."
+            ),
+        )
+        subparser.add_argument(
             "--coder",
             type=normalize_agent_name,
             choices=("claude", "codex", "gemini", "antigravity"),

@@ -49,6 +49,7 @@ args = build_parser().parse_args([
     "task", "x", "--repo", "OWNER/REPO", "--coder", coder, "--reviewer", reviewer,
     "--base", "main", "--gh-cmd", gh, "--claude-cmd", "/bin/true",
     "--codex-cmd", "/bin/true", "--antigravity-cmd", "/bin/true", "--quiet",
+    *sys.argv[9:],
 ])
 runner = Runner()
 config = config_from_args(args, runner)
@@ -132,12 +133,28 @@ class Env:
         ])
         return config_from_args(args, Runner())
 
-    def child(self, *, coder="claude", reviewer="codex"):
+    def seed_store(self, agent: str, *, venv: bool = True) -> Path:
+        """Clone the store the way prepare does, then add an untracked ``.venv``."""
+        store = default_agent_workdir("OWNER/REPO", agent)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([str(self.gh), "repo", "clone", "OWNER/REPO", str(store)], check=True)
+        if venv:
+            marker = store / ".venv" / "bin" / "python"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("#!/bin/sh\n")
+        return store
+
+    def seed_stores(self, *, venv: bool = True) -> None:
+        for agent in ("claude", "codex"):
+            self.seed_store(agent, venv=venv)
+
+    def child(self, *, coder="claude", reviewer="codex", extra=()):
         proc = subprocess.Popen(
             [
                 sys.executable, "-c", CHILD,
                 str(workdir_claims.claim_root()), str(run_worktrees.store_lock_root()),
                 str(self.tmp), str(self.xdg), str(self.bare), str(self.gh), coder, reviewer,
+                *extra,
             ],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=child_env(),
         )
@@ -414,3 +431,161 @@ def test_explicit_claude_dir_unchanged(tmp_path, monkeypatch):
         assert after == before
     finally:
         stop(holder)
+
+
+# --- --worktree-link (#1176) ------------------------------------------------
+
+
+def commit_gitignore(env, text):
+    env.commit(".gitignore", text)
+
+
+def prepare_inline(config):
+    runner = Runner()
+    claim_agent_workdirs(config)
+    ensure_agent_workdirs(config, runner)
+    return runner
+
+
+def redirected_root(path):
+    """Rename ``path`` aside and put a symlink to it at ``path``; return an undo callable."""
+    aside = path.with_name(path.name + "-aside")
+    path.rename(aside)
+    path.symlink_to(aside)
+
+    def undo():
+        path.unlink()
+        aside.rename(path)
+
+    return undo
+
+
+def test_worktree_link_created_and_ignored_link_is_integrity_checked(tmp_path, monkeypatch):
+    from coding_review_agent_loop.local_test_evidence import (
+        attribute_current_head,
+        stable_tracked_tree_snapshot,
+    )
+
+    env = Env(tmp_path, monkeypatch)
+    commit_gitignore(env, "/.venv\n")
+    env.seed_stores()
+    config = env.config(extra=("--worktree-link", ".venv"))
+    with workdir_claim_scope(command="task"):
+        prepare_inline(config)
+        root = config.claude_dir
+        link = root / ".venv"
+        store_venv = default_agent_workdir("OWNER/REPO", "claude") / ".venv"
+        assert link.is_symlink()
+        assert os.path.realpath(link) == os.path.realpath(store_venv)
+        snap = stable_tracked_tree_snapshot(root)
+        assert snap.complete and ".venv" not in snap.untracked_paths
+        target = os.readlink(link)
+
+        other = tmp_path / "other-venv"
+        other.mkdir()
+        link.unlink()
+        link.symlink_to(other)
+        retargeted = stable_tracked_tree_snapshot(root)
+        assert retargeted.complete is False
+        assert attribute_current_head(retargeted, retargeted, current_head=snap.head).state == "unknown"
+        link.unlink()
+        removed = stable_tracked_tree_snapshot(root)
+        assert removed.complete is False
+        assert attribute_current_head(removed, removed, current_head=snap.head).state == "unknown"
+        link.symlink_to(target)
+
+        undo = redirected_root(root)
+        try:
+            redirected = stable_tracked_tree_snapshot(root)
+            assert redirected.complete is False
+            assert attribute_current_head(redirected, redirected, current_head=snap.head).state == "unknown"
+        finally:
+            undo()
+        assert stable_tracked_tree_snapshot(root).complete is True
+
+
+def test_worktree_link_survives_sync_clean_and_verifies(tmp_path, monkeypatch):
+    from coding_review_agent_loop import checkout_verification as cv
+    from coding_review_agent_loop import local_test_evidence as lte
+
+    env = Env(tmp_path, monkeypatch)
+    commit_gitignore(env, "!/.venv\n")
+    env.seed_stores()
+    config = env.config(extra=("--worktree-link", ".venv"))
+    with workdir_claim_scope(command="task"):
+        runner = prepare_inline(config)
+        root = config.claude_dir
+        target = os.readlink(root / ".venv")
+        cv.verify_checkout(config, runner, path=root, agent="claude", purpose="agent turn")
+
+        (root / "dirt.txt").write_text("x")
+        (root / "a.txt").write_text("changed")
+        cv.record_checkout_baseline(config, runner, root, source="agent turn")
+
+        sync_coder_base_before_implementation(config, Runner())
+        assert not (root / "dirt.txt").exists()
+        assert (root / "a.txt").read_text() == "one"
+        assert os.readlink(root / ".venv") == target
+        cv.verify_checkout(config, runner, path=root, agent="claude", purpose="agent turn")
+
+        argv = (".venv/bin/python", "-m", "pytest")
+        snap = lte.stable_tracked_tree_snapshot(root, argv=argv)
+        assert snap.complete and snap.stable
+        assert ".venv" not in snap.untracked_paths
+        assert ".venv" not in snap.referenced_untracked_paths
+        assert lte.attribute_current_head(snap, snap, current_head=snap.head).state == "current-head"
+
+        undo = redirected_root(root)
+        try:
+            redirected = lte.stable_tracked_tree_snapshot(root)
+            assert redirected.complete is False
+            assert lte.attribute_current_head(redirected, redirected, current_head=snap.head).state == "unknown"
+        finally:
+            undo()
+
+
+def test_worktree_link_off_by_default(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.seed_stores()
+    config = env.config()
+    with workdir_claim_scope(command="task"):
+        prepare_inline(config)
+        assert config.claude_dir.is_dir()
+        assert not os.path.lexists(config.claude_dir / ".venv")
+
+
+def test_worktree_link_missing_source_fails_before_worktree(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.seed_stores(venv=False)
+    config = env.config(extra=("--worktree-link", "missing-env"))
+    with workdir_claim_scope(command="task"):
+        claim_agent_workdirs(config)
+        with pytest.raises(AgentLoopError, match="missing-env"):
+            ensure_agent_workdirs(config, Runner())
+        runs_root = default_run_worktree_root("OWNER/REPO", "claude")
+        assert not runs_root.exists() or not list(runs_root.iterdir())
+
+
+def test_worktree_links_are_per_run_and_removal_keeps_store_target(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    env.seed_stores()
+    store_marker = default_agent_workdir("OWNER/REPO", "claude") / ".venv" / "bin" / "python"
+    proc_a, paths_a = env.child(extra=("--worktree-link", ".venv"))
+    try:
+        a_link = Path(paths_a["claude"]) / ".venv"
+        config_b = env.config(extra=("--worktree-link", ".venv"))
+        with workdir_claim_scope(command="task"):
+            prepare_inline(config_b)
+            b_link = config_b.claude_dir / ".venv"
+            assert a_link.is_symlink() and b_link.is_symlink()
+            assert a_link != b_link
+            assert os.lstat(a_link).st_ino != os.lstat(b_link).st_ino
+            assert os.path.realpath(a_link) == os.path.realpath(b_link)
+            a_root = Path(paths_a["claude"])
+            stop(proc_a)
+            assert not a_root.exists()
+            assert store_marker.is_file()
+            assert (b_link / "bin" / "python").is_file()
+    finally:
+        if proc_a.poll() is None:
+            stop(proc_a)

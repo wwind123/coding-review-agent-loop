@@ -121,11 +121,97 @@ def _refuse_untrusted_root(path: Path, *, agent: str, purpose: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class _LinkRegistration:
+    """Worktree links of one prepared run worktree (``--worktree-link``)."""
+
+    lexical: str
+    alias: str
+    identity: tuple[int, int] | None
+    links: dict[bytes, bytes]
+
+
+# Held only in this process, never as git ignore state: lexical path -> registration.
+_LINKS: dict[Path, _LinkRegistration] = {}
+
+
+def register_worktree_links(path: Path, mapping: dict[str, str]) -> None:
+    """Record the links created in ``path`` plus the root identity they are bound to."""
+    registration = _LinkRegistration(
+        lexical=os.fspath(_key(path)),
+        alias=os.path.realpath(os.fspath(path)),
+        identity=_root_identity(path),
+        links={os.fsencode(link): os.fsencode(target) for link, target in mapping.items()},
+    )
+    with _LEDGER_LOCK:
+        _LINKS[_key(path)] = registration
+
+
+def registered_links(path: Path) -> dict[bytes, bytes]:
+    with _LEDGER_LOCK:
+        registration = _LINKS.get(_key(path))
+    return dict(registration.links) if registration else {}
+
+
+def lookup_worktree_links(requested: Path, canonical: Path) -> _LinkRegistration | None:
+    """Match only against the fixed recorded strings; refuse a redirected or replaced root."""
+    keys = {os.fspath(_key(requested)), os.fspath(canonical)}
+    with _LEDGER_LOCK:
+        registrations = list(_LINKS.values())
+    for registration in registrations:
+        if keys & {registration.lexical, registration.alias}:
+            if (
+                os.fspath(canonical) != registration.alias
+                or _root_identity(canonical) != registration.identity
+            ):
+                raise AgentLoopError("registered worktree root was redirected or replaced")
+            return registration
+    return None
+
+
+def link_intact(root: Path, link: bytes | str, target: bytes | str) -> bool:
+    """True iff ``root/link`` is, without following symlinked ancestors, exactly the recorded link."""
+    try:
+        root_fd = os.open(os.fspath(root), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return False
+    try:
+        descriptor = _classify(root_fd, os.fsencode(link), _Budget())
+    except (OSError, _Incomplete):
+        return False
+    finally:
+        os.close(root_fd)
+    return descriptor == ("symlink", os.fsencode(target))
+
+
+def _check_links(config, runner, path: Path, links: dict[bytes, bytes]) -> None:
+    for link, target in sorted(links.items()):
+        name = _disp(link)
+        if not link_intact(path, link, target):
+            raise _Incomplete(f"worktree link {name} was removed, retargeted or reached through a symlink")
+        if _probe(config, runner, path, ("ls-files", "-z", "--full-name", "--", f":(literal){name}")):
+            raise _Incomplete(f"worktree link {name} is staged in the index")
+        if _probe(config, runner, path, ("ls-tree", "-z", "--full-tree", "--name-only", "HEAD", "--", name)):
+            raise _Incomplete(f"worktree link {name} is owned by HEAD")
+
+
+def check_worktree_links(config, runner, path: Path) -> None:
+    """Raise CheckoutVerificationError unless every registered link is intact and untracked."""
+    links = registered_links(path)
+    if not links:
+        return
+    try:
+        _check_links(config, runner, path, links)
+    except _Incomplete as exc:
+        raise CheckoutVerificationError(f"Cannot verify worktree links of {path}: {exc}.") from exc
+
+
 def reset_checkout_baselines() -> None:
     """Forget every baseline (tests only)."""
     with _LEDGER_LOCK:
         _LEDGER.clear()
         _ROOT_IDENTITY.clear()
+        _LINKS.clear()
 
 
 def forget_checkout(path: Path) -> None:
@@ -133,6 +219,7 @@ def forget_checkout(path: Path) -> None:
     with _LEDGER_LOCK:
         _LEDGER.pop(_key(path), None)
         _ROOT_IDENTITY.pop(_key(path), None)
+        _LINKS.pop(_key(path), None)
 
 
 def has_entry(path: Path) -> bool:
@@ -303,6 +390,11 @@ def capture_fingerprint(config, runner, path: Path) -> CheckoutFingerprint:
         config, runner, path, ("diff", "--cached", "--raw", "--no-abbrev", "-z", "--no-renames")
     )
     records = _parse_status(status_raw)
+    links = registered_links(path)
+    if links:
+        _check_links(config, runner, path, links)
+        exact = {b"?? " + link for link in links}
+        records = [(xy, name) for xy, name in records if xy + b" " + name not in exact]
     if len(records) > MAX_DIRTY_PATHS:
         tops: dict[bytes, int] = {}
         for _xy, name in records:

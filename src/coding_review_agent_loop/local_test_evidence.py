@@ -1594,6 +1594,17 @@ def capture_tracked_tree_snapshot(
         canonical_root = requested_root.resolve(strict=True)
         if not canonical_root.is_dir():
             raise AgentLoopError("snapshot root is not a directory")
+        from . import checkout_verification as _cv
+
+        registration = _cv.lookup_worktree_links(
+            Path(os.path.abspath(requested_root)), canonical_root
+        )
+        link_names: set[str] = set()
+        if registration is not None:
+            for link_b, target_b in sorted(registration.links.items()):
+                if not _cv.link_intact(canonical_root, link_b, target_b):
+                    raise AgentLoopError("registered worktree link was removed or retargeted")
+                link_names.add(os.fsdecode(link_b))
         top = _run_git(canonical_root, ("rev-parse", "--show-toplevel"), timeout=timeout_seconds, cancel=cancel)
         git_root = Path(top.decode("utf-8", errors="strict").strip()).resolve(strict=True)
         if git_root != canonical_root:
@@ -1607,6 +1618,8 @@ def capture_tracked_tree_snapshot(
         untracked = _git_nul_paths(
             _run_git(canonical_root, ("ls-files", "--others", "--exclude-standard", "-z"), timeout=timeout_seconds, cancel=cancel)
         )
+        if link_names:
+            untracked = [name for name in untracked if name not in link_names]
         if len(tracked) + len(untracked) > max_files:
             raise AgentLoopError("git snapshot file limit exceeded")
         remaining = [max_bytes]
@@ -1614,6 +1627,13 @@ def capture_tracked_tree_snapshot(
             _bytes_snapshot_record("HEAD", head.encode(), remaining=remaining),
             _bytes_snapshot_record("INDEX", index_raw, remaining=remaining),
         ]
+        if registration is not None:
+            for link_b, target_b in sorted(registration.links.items()):
+                index_records.append(
+                    _bytes_snapshot_record(
+                        "\0worktree-link\0" + os.fsdecode(link_b), target_b, remaining=remaining
+                    )
+                )
         tracked_records: list[tuple[str, int, bytes]] = []
         for relative in tracked:
             _snapshot_checkpoint(started, timeout_seconds, cancel)
