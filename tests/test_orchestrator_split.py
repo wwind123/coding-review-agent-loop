@@ -31,7 +31,34 @@ def test_baseline_definitions_exist_exactly_once_and_unchanged():
 
 
 def test_registered_modules_bind_the_facades_objects():
-    assert guard.incoherent_bindings(orchestrator, guard.registered_modules()) == []
+    # Checked in a fresh interpreter: in this process the shim and the autouse
+    # repair stub would overwrite a divergent binding before it is observed.
+    registered = [f"{guard.PACKAGE}.{name}" for name in guard.registered_module_names()]
+    assert guard.fresh_incoherent_bindings(registered) == []
+
+
+def test_coherence_guard_rejects_divergent_binding_hidden_by_the_repair_stub(tmp_path, monkeypatch):
+    (tmp_path / "split_probe_consumer.py").write_text(
+        "def attempt_repair(*args, **kwargs):\n    return None\n", encoding="utf-8"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    import split_probe_consumer
+
+    monkeypatch.setattr(guard, "registered_modules", lambda: [split_probe_consumer])
+    monkeypatch.setattr(orchestrator, "attempt_repair", lambda *args, **kwargs: None)
+    # Under a propagated patch the divergent binding looks coherent in-process...
+    assert guard.incoherent_bindings(orchestrator, [split_probe_consumer]) == []
+    # ...but the pristine fresh-interpreter check still rejects it.
+    assert guard.fresh_incoherent_bindings(["split_probe_consumer"], extra_path=tmp_path) == [
+        "split_probe_consumer.attempt_repair is not the facade's object"
+    ]
+
+
+def test_fresh_coherence_check_accepts_identical_bindings(tmp_path):
+    (tmp_path / "split_probe_coherent.py").write_text(
+        "from coding_review_agent_loop.orchestrator import attempt_repair\n", encoding="utf-8"
+    )
+    assert guard.fresh_incoherent_bindings(["split_probe_coherent"], extra_path=tmp_path) == []
 
 
 def test_registered_modules_respect_layering():

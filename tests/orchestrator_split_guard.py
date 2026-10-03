@@ -194,6 +194,36 @@ def incoherent_bindings(facade: types.ModuleType, modules: Iterable[types.Module
     return problems
 
 
+def fresh_incoherent_bindings(
+    module_names: Sequence[str], *, facade: str = FACADE, extra_path: str | os.PathLike | None = None
+) -> list[str]:
+    """Run ``incoherent_bindings`` in a fresh interpreter with no shim installed.
+
+    Inside the test session the propagation shim and the suite-wide repair
+    stub rewrite owned names in registered modules, which would hide a
+    divergent production binding, so the pristine namespaces are checked here.
+    """
+    code = (
+        "import importlib, json, sys\n"
+        "import orchestrator_split_guard as guard\n"
+        "facade = importlib.import_module(sys.argv[1])\n"
+        "modules = [importlib.import_module(name) for name in sys.argv[2:]]\n"
+        "sys.stdout.write(json.dumps(guard.incoherent_bindings(facade, modules)))\n"
+    )
+    env = dict(os.environ)
+    paths = [str(SRC_ROOT), str(Path(__file__).resolve().parent)]
+    if extra_path is not None:
+        paths.append(str(extra_path))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [*paths, env.get("PYTHONPATH")]))
+    result = subprocess.run(
+        [sys.executable, "-c", code, facade, *module_names],
+        capture_output=True, text=True, env=env, cwd=str(REPO_ROOT), timeout=120,
+    )
+    if result.returncode != 0:
+        return [f"coherence check could not run: {result.stderr.strip().splitlines()[-1:]}"]
+    return json.loads(result.stdout)
+
+
 def _imported_module_names(source: str, module_name: str) -> set[str]:
     """Absolute module names a source imports at any nesting level.
 
@@ -307,7 +337,7 @@ def install_patch_propagation(
     if facade is None:
         facade = importlib.import_module(FACADE)
     if _STATE_KEY not in vars(facade):
-        vars(facade)[_STATE_KEY] = _PropagationState(registry or registered_modules)
+        vars(facade)[_STATE_KEY] = _PropagationState(registry or (lambda: registered_modules()))
     if not isinstance(facade, PatchPropagatingModule):
         facade.__class__ = PatchPropagatingModule
     return facade
