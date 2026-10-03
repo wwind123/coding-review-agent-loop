@@ -3612,3 +3612,100 @@ def test_broker_request_following_an_external_inflight_probe_is_cancelled_by_sto
         server.stop()
     assert spawned[0].poll() is not None
     assert external["r"].state == "unknown"
+
+
+# --- review round 8 (#1108): shutdown during the managed child handshake -----------
+
+
+def _managed_handle(tmp_path):
+    cgroup = tmp_path / "coder-cgroup"
+    cgroup.mkdir()
+    return SimpleNamespace(
+        managed=True, cgroup_path=cgroup, refresh_report=lambda: SimpleNamespace(target_started=True),
+    ), cgroup
+
+
+def _managed_server(tmp_path, turn_id, process_started=None):
+    server, locks = _wait_server(tmp_path, turn_id)
+    handle, cgroup = _managed_handle(tmp_path)
+    server.set_execution_context(
+        containment_handle=handle, process_started=process_started, process_finished=None,
+        worker_budget=_wait_budget(),
+    )
+    return server, locks, cgroup
+
+
+def test_stop_after_registration_before_the_containment_ready_byte_is_cancelled(tmp_path, monkeypatch):
+    marker = tmp_path / "ran"
+    holder = {}
+
+    def killing_started(proc):
+        # Simulates stop(): the registered held-exec child ends before its ready byte.
+        holder["server"]._stop_event.set()
+        os.killpg(proc.pid, 9)
+
+    server, locks, _cgroup = _managed_server(tmp_path, "turn-handshake-early", killing_started)
+    holder["server"] = server
+    try:
+        request = _wait_request(
+            server, tmp_path, "8e" * 16, 5,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        reader = _FrameReader(server, request)
+        reader.join(20)
+        assert reader.final["outcome"] == "cancelled" and reader.final["returncode"] is None
+        assert not marker.exists() and server.journal == ()
+        reservation = server._receipts[request["nonce"]]
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "cancelled"
+        lock, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert lock is not None, problem
+        lock.close()
+    finally:
+        server.stop()
+
+
+def test_stop_between_readiness_and_release_is_cancelled_without_evidence(tmp_path, monkeypatch):
+    marker = tmp_path / "ran"
+    server, locks, cgroup = _managed_server(tmp_path, "turn-handshake-late")
+    seen = {}
+
+    def stopping_cgroup_lookup(pid):
+        # Readiness was reported; now stop() ends the registered child before release.
+        seen["pid"] = pid
+        server._stop_event.set()
+        os.killpg(pid, 9)
+        time.sleep(0.3)
+        return cgroup
+
+    monkeypatch.setattr(runner_module, "cgroup_path_for_pid", stopping_cgroup_lookup)
+    try:
+        request = _wait_request(
+            server, tmp_path, "7e" * 16, 5,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        reader = _FrameReader(server, request)
+        reader.join(20)
+        assert "pid" in seen
+        assert reader.final["outcome"] == "cancelled" and reader.final["returncode"] is None
+        assert not marker.exists() and server.journal == ()
+        reservation = server._receipts[request["nonce"]]
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "cancelled"
+    finally:
+        server.stop()
+
+
+def test_handshake_failure_without_a_stop_is_still_an_error(tmp_path, monkeypatch):
+    server, locks, cgroup = _managed_server(tmp_path, "turn-handshake-error")
+
+    def failing_cgroup_lookup(pid):
+        os.killpg(pid, 9)
+        time.sleep(0.3)
+        return cgroup
+
+    monkeypatch.setattr(runner_module, "cgroup_path_for_pid", failing_cgroup_lookup)
+    try:
+        reader = _FrameReader(server, _wait_request(server, tmp_path, "6e" * 16, 5))
+        reader.join(20)
+        assert reader.final["type"] == "error"  # not a shutdown: a real launch failure
+    finally:
+        server.stop()

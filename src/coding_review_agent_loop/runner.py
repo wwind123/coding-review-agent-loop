@@ -789,8 +789,14 @@ def _run_foreground_test_body(
             ready_read, ready_write, release_read, release_write = held_fds
             os.close(ready_write)
             os.close(release_read)
+            handshake_cancelled = False
             try:
-                ready, _, _ = select.select([ready_read], [], [], 5.0)
+                ready = []
+                handshake_deadline = time.monotonic() + 5.0
+                while not ready and time.monotonic() < handshake_deadline:
+                    if host_wait_cancel is not None and host_wait_cancel.is_set():
+                        break
+                    ready, _, _ = select.select([ready_read], [], [], 0.05)
                 if not ready or os.read(ready_read, 1) != b"1":
                     raise AgentLoopError("broker test child did not reach the containment handshake")
                 (parent_cgroup_path / "cgroup.procs").write_text(str(proc.pid), encoding="ascii")
@@ -798,12 +804,31 @@ def _run_foreground_test_body(
                 if attached is None or attached.resolve() != parent_cgroup_path.resolve():
                     raise AgentLoopError("broker test child could not be verified in the coder cgroup")
                 os.write(release_write, b"1")
-            except BaseException:
+            except BaseException as handshake_error:
                 _terminate_process_group(proc)
-                raise
+                # A broker stop that ended the held child before its release
+                # means the target never executed: complete as cancelled.
+                if (
+                    isinstance(handshake_error, (OSError, AgentLoopError))
+                    and host_wait_cancel is not None
+                    and host_wait_cancel.is_set()
+                ):
+                    handshake_cancelled = True
+                else:
+                    raise
             finally:
                 os.close(ready_read)
                 os.close(release_write)
+            if handshake_cancelled:
+                if handle is not None:
+                    handle.close()
+                if process_finished is not None:
+                    process_finished(proc)
+                lane_lock.close()
+                tel.set_outcome("cancelled")
+                return _cancelled_result(
+                    cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance,
+                )
         if handle is not None and handle.managed:
             handle.refresh_report()
             before_cgroup = sample_cgroup(handle.cgroup_path, handle.capabilities)
