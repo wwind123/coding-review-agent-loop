@@ -1235,6 +1235,70 @@ def test_contained_target_exec_error_uses_preflight_retry_guidance(monkeypatch, 
     assert "disappeared after successful preflight" in detail
 
 
+@pytest.mark.parametrize(
+    ("command", "errno_value"),
+    [
+        # #1225: the updater re-created the binary before the decision ran.
+        ("provider-cli", errno.ENOENT),
+        ("/opt/bin/provider-cli", errno.ENOENT),
+        ("provider-cli", errno.ETXTBSY),
+        ("/opt/bin/provider-cli", errno.ETXTBSY),
+        ("provider-cli", errno.ENOEXEC),
+        ("/opt/bin/provider-cli", errno.ENOEXEC),
+    ],
+)
+def test_contained_target_exec_error_retries_preflighted_command_after_self_update(
+    monkeypatch, command, errno_value
+):
+    runner = Runner()
+    runner.remember_agent_command(command, "/opt/bin/provider-cli", "--provider-cmd")
+    monkeypatch.setattr(
+        "coding_review_agent_loop.runner.shutil.which", lambda _name: "/opt/bin/provider-cli"
+    )
+    monkeypatch.setattr("coding_review_agent_loop.runner.os.path.exists", lambda _path: True)
+    retryable, detail = runner.target_exec_retry_decision(command, errno_value)
+    assert retryable is True
+    assert "temporarily unavailable/being replaced after successful preflight" in detail
+    assert "possible self-update" in detail
+
+
+def test_contained_preflighted_absolute_enoent_still_missing_is_retryable(monkeypatch):
+    runner = Runner()
+    command = "/opt/bin/provider-cli"
+    runner.remember_agent_command(command, command, "--provider-cmd")
+    monkeypatch.setattr("coding_review_agent_loop.runner.os.path.exists", lambda _path: False)
+    retryable, detail = runner.target_exec_retry_decision(command, errno.ENOENT)
+    assert retryable is True
+    assert "disappeared after successful preflight" in detail
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("provider-cli", "CLI not found on PATH"),
+        ("/opt/bin/provider-cli", "not found or not executable"),
+    ],
+)
+def test_contained_unpreflighted_enoent_fails_fast(monkeypatch, command, expected):
+    runner = Runner()
+    monkeypatch.setattr(
+        "coding_review_agent_loop.runner.shutil.which", lambda _name: "/opt/bin/provider-cli"
+    )
+    retryable, detail = runner.target_exec_retry_decision(command, errno.ENOENT)
+    assert retryable is False
+    assert expected in detail
+
+
+@pytest.mark.parametrize("errno_value", [errno.EACCES, errno.EPIPE])
+@pytest.mark.parametrize("command", ["provider-cli", "/opt/bin/provider-cli"])
+def test_contained_preflighted_non_transient_errno_is_not_retryable(command, errno_value):
+    runner = Runner()
+    runner.remember_agent_command(command, "/opt/bin/provider-cli", "--provider-cmd")
+    retryable, detail = runner.target_exec_retry_decision(command, errno_value)
+    assert retryable is False
+    assert f"target execution failed (errno={errno_value})" in detail
+
+
 def test_aggregate_leases_reapply_strictest_live_ceiling(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(

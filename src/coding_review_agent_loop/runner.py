@@ -1130,6 +1130,9 @@ def _confirm_containment_empty(handle: InvocationHandle, *, timeout: float = 2.0
 _ANSI_RE = re.compile(r"\x1B\[[0-9;?]*[ -/]*[@-~]|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)|\x1B[()][AB0-2]")
 _SPAWN_ATTEMPTS = 3
 _SPAWN_RETRY_BACKOFF_SECONDS = 2
+# Exec errnos a mid-run agent CLI self-update can produce for a preflighted
+# command (#1226).
+_SELF_UPDATE_EXEC_ERRNOS = frozenset({errno.ENOENT, errno.ETXTBSY, errno.ENOEXEC})
 _SpawnResult = TypeVar("_SpawnResult")
 
 
@@ -1596,28 +1599,51 @@ class Runner:
             f"Retry shortly or pass {override_flag} <path>."
         )
 
-    def _command_non_executable_after_preflight_error(self, command: str) -> AgentLoopError:
+    def _command_non_executable_after_preflight_error(
+        self, command: str, errno_value: int | None = errno.ENOEXEC
+    ) -> AgentLoopError:
         override_flag = self._override_flag_for(command)
+        state = (
+            "temporarily busy (being replaced)"
+            if errno_value == errno.ETXTBSY
+            else "temporarily non-executable"
+        )
         return AgentLoopError(
-            f"{command} CLI remained temporarily non-executable after "
+            f"{command} CLI remained {state} after "
             f"{_SPAWN_ATTEMPTS} spawn attempts and may be updating; "
             f"retry shortly or pass {override_flag} <path>."
+        )
+
+    def _command_replaced_after_preflight_error(
+        self, command: str, errno_value: int | None
+    ) -> AgentLoopError:
+        override_flag = self._override_flag_for(command)
+        name = errno.errorcode.get(errno_value or 0, str(errno_value))
+        return AgentLoopError(
+            f"{command} CLI was temporarily unavailable/being replaced after "
+            f"successful preflight (possible self-update; exec errno {name}). "
+            f"Retry shortly or pass {override_flag} <path>."
         )
 
     def target_exec_retry_decision(
         self, command: str, errno_value: int | None
     ) -> tuple[bool, str]:
-        """Apply the same bounded PATH-race policy to a contained shim error."""
-        if os.path.isabs(command):
-            return False, str(self._missing_command_error(command))
+        """Apply the bounded preflight-evidence policy to a contained shim error.
+
+        Retryability depends only on durable preflight evidence from this run,
+        never on the racy PATH state at decision time: a self-update can
+        re-create the binary between the failed exec and this decision (#1226).
+        """
         with self._commands_lock:
             preflighted = command in self._preflighted_commands
-        if errno_value == errno.ENOEXEC and preflighted:
-            return True, str(self._command_non_executable_after_preflight_error(command))
-        current = shutil.which(command)
-        if errno_value == errno.ENOENT and preflighted and current is None:
-            return True, str(self._command_disappeared_after_preflight_error(command))
-        if errno_value == errno.ENOENT and not preflighted:
+        if errno_value in _SELF_UPDATE_EXEC_ERRNOS and preflighted:
+            if errno_value == errno.ENOENT and not os.path.isabs(command):
+                if shutil.which(command) is None:
+                    return True, str(self._command_disappeared_after_preflight_error(command))
+            elif errno_value == errno.ENOENT and not os.path.exists(command):
+                return True, str(self._command_disappeared_after_preflight_error(command))
+            return True, str(self._command_replaced_after_preflight_error(command, errno_value))
+        if errno_value == errno.ENOENT:
             return False, str(self._missing_command_error(command))
         return False, f"{command} target execution failed (errno={errno_value})"
 
@@ -1647,36 +1673,45 @@ class Runner:
             try:
                 return spawn_attempt(), spawn_wall_time, spawn_monotonic, before_identity
             except FileNotFoundError as exc:
+                # Retry only on durable preflight evidence from this run. A
+                # dangling cached candidate may choose the message but is never
+                # retry evidence on its own (#1226).
                 if os.path.isabs(command):
+                    current = command if os.path.exists(command) else None
+                    candidate = command
+                    with self._commands_lock:
+                        preflighted = command in self._preflighted_commands
+                else:
+                    current = shutil.which(command)
+                    with self._commands_lock:
+                        if current is not None:
+                            self._resolved_commands[command] = current
+                        candidate = current or self._resolved_commands.get(command)
+                        preflighted = command in self._preflighted_commands
+                if not preflighted:
                     raise self._missing_command_error(command) from exc
-                current = shutil.which(command)
-                with self._commands_lock:
-                    if current is not None:
-                        self._resolved_commands[command] = current
-                    candidate = current or self._resolved_commands.get(command)
-                    preflighted = command in self._preflighted_commands
                 dangling_symlink = self._is_dangling_symlink(candidate)
-                saw_preflight_disappearance |= preflighted and current is None
-                if not dangling_symlink and not preflighted:
-                    raise self._missing_command_error(command) from exc
+                saw_preflight_disappearance |= current is None
                 if attempt == _SPAWN_ATTEMPTS:
                     if saw_preflight_disappearance and not dangling_symlink:
                         raise self._command_disappeared_after_preflight_error(command) from exc
                     raise self._missing_command_error(command) from exc
                 time.sleep(_SPAWN_RETRY_BACKOFF_SECONDS)
             except OSError as exc:
-                # Claude Code can briefly leave its bare command pointing at
-                # an incomplete native install during an auto-update. Treat
-                # only ENOEXEC for a preflighted bare command as retryable;
-                # permission errors and explicit paths remain fail-closed.
-                if exc.errno != errno.ENOEXEC or os.path.isabs(command):
+                # An agent CLI self-update can briefly leave a preflighted
+                # command (bare or absolute) pointing at an incomplete install
+                # (ENOEXEC) or at a file still open for writing (ETXTBSY).
+                # Permission errors and unpreflighted commands stay fail-closed.
+                if exc.errno not in (errno.ENOEXEC, errno.ETXTBSY):
                     raise
                 with self._commands_lock:
                     preflighted = command in self._preflighted_commands
                 if not preflighted:
                     raise
                 if attempt == _SPAWN_ATTEMPTS:
-                    raise self._command_non_executable_after_preflight_error(command) from exc
+                    raise self._command_non_executable_after_preflight_error(
+                        command, exc.errno
+                    ) from exc
                 time.sleep(_SPAWN_RETRY_BACKOFF_SECONDS)
 
         raise AssertionError("spawn retry loop exited unexpectedly")
