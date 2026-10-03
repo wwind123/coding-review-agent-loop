@@ -3536,3 +3536,79 @@ def test_stalled_stream_read_after_a_real_target_with_a_waiting_follower(tmp_pat
         assert server._pinned_root is None and server._runtime_dir is None
     finally:
         release.set()
+
+
+# --- review round 4 (#1108) --------------------------------------------------------
+
+
+def test_broker_request_following_an_external_inflight_probe_is_cancelled_by_stop(tmp_path, monkeypatch):
+    from coding_review_agent_loop import test_runtime as runtime
+    from coding_review_agent_loop.test_runtime import acquire_command_lane
+
+    marker = tmp_path / "spawned"
+    argv = (sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+    monkeypatch.setattr(
+        runtime, "_recognized_inner_probe_with_environment",
+        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a)),
+    )
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def tracking(command, *args, **kwargs):
+        proc = real_popen(command, *args, **kwargs)
+        if command and command[0] == "sleep":
+            spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", tracking)
+    real_probe = runner_module.probe_inner_launcher
+    external_cancel = threading.Event()
+    external = {}
+    handler_entered = threading.Event()
+
+    def seeding(a, **kwargs):
+        # An owner outside the broker handler is already probing with the same identity.
+        owner_kwargs = {**kwargs, "cancel": external_cancel}
+        thread = threading.Thread(
+            target=lambda: external.setdefault("r", real_probe(a, **owner_kwargs))
+        )
+        thread.start()
+        external["thread"] = thread
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not spawned:
+            time.sleep(0.02)
+        handler_entered.set()
+        return real_probe(a, **kwargs)  # the broker handler is now a non-owner follower
+
+    monkeypatch.setattr(runner_module, "probe_inner_launcher", seeding)
+    server, locks = _wait_server(tmp_path, "turn-follower-probe")
+    try:
+        request = _wait_request(server, tmp_path, "3e" * 16, 5, argv=argv)
+        reader = _FrameReader(server, request)
+        assert handler_entered.wait(15)
+        time.sleep(0.5)
+        assert len(spawned) == 1  # the handler followed the external owner; it did not probe again
+        assert reader.final is None  # still waiting on the in-flight probe
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 6
+        reader.join(10)
+        assert reader.final["outcome"] == "cancelled" and not marker.exists()
+        assert not any(key[0] == server.turn_id for key in runtime._INNER_PREFLIGHT_CACHE)
+        assert spawned[0].poll() is None  # the external owner's probe was not the follower's to kill
+        lock, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert lock is not None, problem  # the follower released its invocation lock
+        lock.close()
+        lane = acquire_command_lane(list(argv), cwd=tmp_path, env={"AGENT_LOOP_INVOCATION_ID": server.turn_id})
+        assert lane is not None  # ...and its command lane
+        lane.close()
+    finally:
+        external_cancel.set()
+        if "thread" in external:
+            external["thread"].join(10)
+        for proc in spawned:
+            if proc.poll() is None:
+                proc.kill()
+        server.stop()
+    assert spawned[0].poll() is not None
+    assert external["r"].state == "unknown"
