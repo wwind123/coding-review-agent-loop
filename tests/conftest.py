@@ -2,6 +2,13 @@ from unittest.mock import patch
 
 import pytest
 
+from orchestrator_split_guard import install_patch_propagation
+
+# Patches set on the orchestrator facade must keep reaching code that the
+# split (#1181) moves into extracted modules; installed once per process, so
+# every xdist worker gets it too.
+install_patch_propagation()
+
 
 @pytest.fixture(autouse=True)
 def _no_real_repair():

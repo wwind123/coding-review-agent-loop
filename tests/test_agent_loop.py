@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
+import orchestrator_split_guard
 import coding_review_agent_loop.cli as cli_module
 import coding_review_agent_loop.orchestrator as orchestrator_module
 import coding_review_agent_loop.prompts as prompts_module
@@ -6884,7 +6885,18 @@ _OWNING_RUN_ENTRIES = {"run_issue_loop", "run_task_loop", "run_pr_loop", "run_di
 
 
 def _orchestrator_tree():
-    return ast.parse(Path(orchestrator_module.__file__).read_text(encoding="utf-8"))
+    # Spans orchestrator.py and every module extracted from it (#1181), so
+    # moved run entries and nested run_pr_loop calls stay in scope.
+    return orchestrator_split_guard.combined_split_tree()
+
+
+def test_orchestrator_tree_includes_registered_extracted_modules(monkeypatch):
+    monkeypatch.setattr(orchestrator_split_guard, "EXTRACTED_MODULES", ("usage",))
+    functions = {node.name for node in _orchestrator_tree().body if isinstance(node, ast.FunctionDef)}
+    assert "run_pr_loop" in functions
+    usage_source = orchestrator_split_guard.module_path("usage").read_text(encoding="utf-8")
+    usage_functions = {node.name for node in ast.parse(usage_source).body if isinstance(node, ast.FunctionDef)}
+    assert usage_functions and usage_functions <= functions
 
 
 def test_only_owning_run_entries_create_a_usage_context():
