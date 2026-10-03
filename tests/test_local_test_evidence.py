@@ -3694,6 +3694,57 @@ def test_stop_between_readiness_and_release_is_cancelled_without_evidence(tmp_pa
         server.stop()
 
 
+def test_stop_winning_before_the_release_write_never_releases_the_held_child(tmp_path, monkeypatch):
+    # Round 9 (#1108): a successful release write after stop() set the event
+    # (but before stop() signalled the child) must not start the target.
+    marker = tmp_path / "ran"
+    server, locks, cgroup = _managed_server(tmp_path, "turn-release-race")
+    stop_thread = {}
+    signal_gate = threading.Event()
+    real_killpg = os.killpg
+
+    def delayed_killpg(pgid, sig):
+        if threading.current_thread() is stop_thread.get("t"):
+            signal_gate.wait(15)  # stop()'s signal arrives only after the runner finished
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", delayed_killpg)
+
+    def stopping_cgroup_lookup(pid):
+        # Readiness and attachment happened; stop() now wins the launch lock
+        # while the child is still alive and its signal is delayed.
+        thread = threading.Thread(target=server.stop)
+        stop_thread["t"] = thread
+        thread.start()
+        deadline = time.monotonic() + 10
+        while not server._stop_event.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server._stop_event.is_set()
+        return cgroup
+
+    monkeypatch.setattr(runner_module, "cgroup_path_for_pid", stopping_cgroup_lookup)
+    try:
+        request = _wait_request(
+            server, tmp_path, "5e" * 16, 5,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        reader = _FrameReader(server, request)
+        reader.join(20)
+        signal_gate.set()
+        stop_thread["t"].join(15)
+        time.sleep(0.5)  # a wrongly released target would have created the marker by now
+        assert reader.final["outcome"] == "cancelled" and reader.final["returncode"] is None
+        assert not marker.exists() and server.journal == ()
+        reservation = server._receipts[request["nonce"]]
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "cancelled"
+        lock, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert lock is not None, problem
+        lock.close()
+    finally:
+        signal_gate.set()
+        server.stop()
+
+
 def test_handshake_failure_without_a_stop_is_still_an_error(tmp_path, monkeypatch):
     server, locks, cgroup = _managed_server(tmp_path, "turn-handshake-error")
 

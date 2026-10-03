@@ -803,7 +803,14 @@ def _run_foreground_test_body(
                 attached = cgroup_path_for_pid(proc.pid)
                 if attached is None or attached.resolve() != parent_cgroup_path.resolve():
                     raise AgentLoopError("broker test child could not be verified in the coder cgroup")
-                os.write(release_write, b"1")
+                # Issue #1108: release is the moment the target starts, so it
+                # is synchronised with stop() through the same launch guard.
+                # Either stop() already set the event (nothing is released) or
+                # the release lands first and stop() then terminates the child.
+                with (host_launch_guard() if host_launch_guard is not None else contextlib.nullcontext()):
+                    if host_wait_cancel is not None and host_wait_cancel.is_set():
+                        raise AgentLoopError("broker shutdown before the held child was released")
+                    os.write(release_write, b"1")
             except BaseException as handshake_error:
                 _terminate_process_group(proc)
                 # A broker stop that ended the held child before its release
