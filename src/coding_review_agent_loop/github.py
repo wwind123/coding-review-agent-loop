@@ -3672,6 +3672,58 @@ def search_issues(
     return tuple(found)
 
 
+def get_issue_found(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_number: int,
+) -> FoundIssue | None:
+    """Read one issue by number as a `FoundIssue`, or None when unavailable.
+
+    Used to resolve child references recorded in a decomposition summary
+    without depending on a title search. Dry-run returns None, matching
+    `search_issues`; unreadable or malformed responses also return None.
+    """
+    if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number <= 0:
+        raise AgentLoopError("get_issue_found issue_number must be a positive integer")
+    if config.dry_run:
+        return None
+    try:
+        result = runner.run(
+            [
+                config.gh_cmd,
+                "issue",
+                "view",
+                str(issue_number),
+                "--repo",
+                config.repo,
+                "--json",
+                "number,title,url,body",
+            ],
+            cwd=active_workdir(config),
+        )
+    except AgentLoopError:
+        return None
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    number = payload.get("number")
+    if isinstance(number, bool) or number != issue_number:
+        return None
+    return FoundIssue(
+        number=number,
+        title=_optional_str(payload.get("title")),
+        url=_optional_str(payload.get("url")),
+        body=_optional_str(payload.get("body")),
+    )
+
+
 def get_pr_head_sha(runner: Runner, config: AgentLoopConfig, pr_number: int) -> str:
     result = runner.run(
         [
