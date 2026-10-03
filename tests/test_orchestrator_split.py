@@ -163,6 +163,14 @@ def test_cli_entry_points_are_the_moved_definitions():
 
 # --- Each guard fails on a synthetic violation -------------------------------
 
+def test_surface_guard_names_a_dropped_attribute():
+    facade = types.ModuleType("synthetic_facade")
+    facade.kept = 1
+    assert guard.missing_surface_names(facade, ["kept", "dropped"]) == [
+        "orchestrator no longer exposes 'dropped'"
+    ]
+
+
 def test_thin_facade_guard_accepts_docstring_and_imports():
     source = '"""Facade."""\nfrom __future__ import annotations\n\nimport os\nfrom .moved import (\n    helper,\n)\n'
     assert guard.thin_facade_problems(source) == []
