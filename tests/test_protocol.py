@@ -2178,6 +2178,103 @@ def test_parse_structured_plan_review_rejects_malformed_finding_objects_957(item
         parse_structured_plan_review(_plan_review_with_blocking([item]), reviewer="OpenAI Codex")
 
 
+_ALIAS_LOGGER_1169 = "coding_review_agent_loop.protocol"
+_ALLOWED_KEYS_1169 = (
+    "description, evidence, finding, id, impact, issue, item_id, location, "
+    "rationale, recommendation, required_change, sub_items, suggested_fix, summary, text, title"
+)
+
+
+def test_plan_review_finding_alias_requested_change_normalized_1169():
+    from coding_review_agent_loop.protocol import _normalize_plan_review_finding_key_aliases
+
+    value = "Add X, without weakening Y."
+    original = {"title": "Gap", "requested_change": value}
+
+    parsed = parse_structured_plan_review(
+        _plan_review_with_blocking([original]), reviewer="OpenAI Codex"
+    )
+    native = parse_structured_plan_review(
+        _plan_review_with_blocking([{"title": "Gap", "required_change": value}]),
+        reviewer="OpenAI Codex",
+    )
+    assert parsed is not None and native is not None
+    assert [i.text for i in parsed.items.blocking] == [
+        "Gap Required change: Add X, without weakening Y."
+    ]
+    assert [i.text for i in parsed.items.blocking] == [i.text for i in native.items.blocking]
+
+    returned = _normalize_plan_review_finding_key_aliases(original, item_context="ctx")
+    assert "requested_change" in original and "required_change" not in original
+    assert returned is not original
+    assert "required_change" in returned and "requested_change" not in returned
+    assert returned["required_change"] is original["requested_change"]
+
+
+def test_plan_review_finding_alias_collision_rejected_unchanged_1169():
+    item = {"title": "x", "requested_change": "a", "required_change": "b"}
+    with pytest.raises(AgentLoopError) as excinfo:
+        parse_structured_plan_review(_plan_review_with_blocking([item]), reviewer="OpenAI Codex")
+    assert str(excinfo.value).endswith(
+        "at index 0 has unsupported finding key(s) requested_change; "
+        f"use a string or an object with only: {_ALLOWED_KEYS_1169}."
+    )
+
+
+def test_plan_review_finding_alias_logs_names_not_value_1169(caplog):
+    with caplog.at_level("WARNING", logger=_ALIAS_LOGGER_1169):
+        parse_structured_plan_review(
+            _plan_review_with_blocking([{"title": "Gap", "requested_change": "secret value"}]),
+            reviewer="OpenAI Codex",
+        )
+    messages = [r.getMessage() for r in caplog.records if r.name == _ALIAS_LOGGER_1169]
+    assert any("requested_change" in m and "required_change" in m for m in messages)
+    assert not any("secret value" in m for m in messages)
+
+
+@pytest.mark.parametrize("key", ["requested_fix", "severity"])
+def test_plan_review_finding_unknown_key_unchanged_1169(key, caplog):
+    with caplog.at_level("WARNING", logger=_ALIAS_LOGGER_1169):
+        with pytest.raises(AgentLoopError) as excinfo:
+            parse_structured_plan_review(
+                _plan_review_with_blocking([{"title": "x", key: "y"}]),
+                reviewer="OpenAI Codex",
+            )
+    assert str(excinfo.value).endswith(
+        f"has unsupported finding key(s) {key}; "
+        f"use a string or an object with only: {_ALLOWED_KEYS_1169}."
+    )
+    assert not [r for r in caplog.records if "alias" in r.getMessage()]
+
+
+def test_plan_review_finding_alias_table_integrity_1169():
+    from coding_review_agent_loop.protocol import (
+        PLAN_REVIEW_FINDING_ID_FIELDS,
+        PLAN_REVIEW_FINDING_KEY_ALIASES,
+        PLAN_REVIEW_FINDING_TEXT_FIELDS,
+    )
+
+    accepted = {n for n, _ in PLAN_REVIEW_FINDING_TEXT_FIELDS} | PLAN_REVIEW_FINDING_ID_FIELDS
+    accepted |= {"sub_items"}
+    for alias, canonical in PLAN_REVIEW_FINDING_KEY_ALIASES.items():
+        assert canonical in {n for n, _ in PLAN_REVIEW_FINDING_TEXT_FIELDS}
+        assert alias not in accepted
+
+
+def test_parse_plan_review_1108_shaped_requested_change_does_not_raise_1169():
+    review = _plan_review_with_blocking(
+        [
+            {
+                "title": "Plan omits a qualifier",
+                "evidence": "Step 3 does not state the limit.",
+                "requested_change": "State the limit, without dropping the fallback.",
+            }
+        ]
+    )
+    result = parse_plan_review(review, reviewer="OpenAI Codex")
+    assert len(result.items.blocking) == 1
+
+
 def test_parse_structured_plan_review_tolerates_omitted_empty_collections():
     payload = (
         json.dumps(

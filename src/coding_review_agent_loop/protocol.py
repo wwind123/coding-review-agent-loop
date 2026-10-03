@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import re
 import shlex
 from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 import dataclasses
 from dataclasses import dataclass, field
 
@@ -18,6 +20,8 @@ from .errors import (
 from .protocol_markers import sanitize_historical_text
 from .review_scheduling import normalize_fix_scope
 from .test_runtime import TestRuntimeConfigurationError, parse_managed_test_command
+
+_logger = logging.getLogger(__name__)
 
 PUBLIC_RESPONSE_MARKER = "=== AGENT_LOOP_PUBLIC_RESPONSE_BELOW ==="
 
@@ -4667,6 +4671,29 @@ PLAN_REVIEW_FINDING_TEXT_FIELDS: tuple[tuple[str, str], ...] = (
     ("suggested_fix", "Suggested fix"),
 )
 PLAN_REVIEW_FINDING_ID_FIELDS = frozenset({"item_id", "id"})
+# Explicit, unambiguous key aliases (#1169): each alias is renamed to its one
+# canonical key before validation, so a synonym spelling needs no model repair.
+# Extend this table when a new model adopts a new spelling; there is no fuzzy
+# matching.
+PLAN_REVIEW_FINDING_KEY_ALIASES: Mapping[str, str] = MappingProxyType(
+    {"requested_change": "required_change"}
+)
+
+
+def _normalize_plan_review_finding_key_aliases(raw: dict, *, item_context: str) -> dict:
+    """Return a copy of ``raw`` with alias keys renamed; values are untouched.
+
+    An alias is left in place when its canonical key is also present, so the
+    unknown-key check rejects the collision.  ``raw`` is never mutated.
+    """
+    normalized = dict(raw)
+    for alias, canonical in PLAN_REVIEW_FINDING_KEY_ALIASES.items():
+        if alias in normalized and canonical not in normalized:
+            normalized[canonical] = normalized.pop(alias)
+            _logger.warning(
+                "%s: normalized finding key alias %s -> %s", item_context, alias, canonical
+            )
+    return normalized
 
 
 def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
@@ -4674,6 +4701,7 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
         return _expect_non_empty_string(raw, context=item_context)  # shape-check: fatal:no-conservative-reading
     if not isinstance(raw, dict):
         raise AgentLoopError(f"{item_context} must be a string or a finding object.")  # shape-check: fatal:no-conservative-reading
+    raw = _normalize_plan_review_finding_key_aliases(raw, item_context=item_context)
     text_fields = {name for name, _label in PLAN_REVIEW_FINDING_TEXT_FIELDS}
     unknown = sorted(set(raw) - text_fields - PLAN_REVIEW_FINDING_ID_FIELDS - {"sub_items"})
     if unknown:
