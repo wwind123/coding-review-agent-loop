@@ -13,6 +13,7 @@ from coding_review_agent_loop.unresolved_items import _validate_review_response
 from agent_loop_helpers import (
     FakeRunner,
     make_config,
+    malformed_pr_review_source,
     structured_coder_followup,
     structured_pr_review,
 )
@@ -302,3 +303,118 @@ def test_reask_reuses_frozen_prompt_behind_publication_barrier(tmp_path, paralle
     )
     if parallel:
         assert "spool" in kinds[:gemini_post]
+
+
+# --- Workflow-path tests: real PR validator through the parallel worker -------
+
+_ITEM1_DISPOSED = [{"item_id": "item-1", "disposition": "resolved"}]
+
+
+def _panel_runner(target, target_round2):
+    """Target reviewer blocks in round 1; ``target_round2`` are its later turns."""
+    name = {"codex": "OpenAI Codex", "antigravity": "Google Antigravity"}[target]
+    first = structured_pr_review(
+        state="blocking", summary="Found a blocker.", blocking_items=["Blocker."], reviewer=name
+    )
+    turns = [first, *target_round2]
+    kwargs = {"gemini_outputs": [
+        structured_pr_review(summary="Gemini approves.", reviewer="Google Gemini"),
+        structured_pr_review(
+            summary="Gemini approves after the fix.", reviewer="Google Gemini",
+            prior_item_dispositions=_ITEM1_DISPOSED,
+        ),
+    ]}
+    if target == "codex":
+        kwargs["codex_outputs"] = turns
+    else:
+        kwargs["antigravity_outputs"] = [(turn, 0) for turn in turns]
+    return FakeRunner(
+        claude_outputs=[structured_coder_followup(summary="Fixed it.", addressed_items=["item-1"])],
+        **kwargs,
+    )
+
+
+def _panel_config(tmp_path, target):
+    extra = (
+        {"antigravity_models": ("ModelA", "ModelB", "ModelC")} if target == "antigravity" else {}
+    )
+    return make_config(
+        tmp_path, reviewer=(target, "gemini"), review_parallel=True, agent_max_retries=0, **extra
+    )
+
+
+def _target_commands(runner, target):
+    return _agent_commands(runner, "agy" if target == "antigravity" else "codex")
+
+
+@pytest.mark.parametrize("target", ["codex", "antigravity"])
+def test_parallel_worker_reasks_with_real_validator_without_repair_or_fallback(tmp_path, target):
+    name = "Google Antigravity" if target == "antigravity" else "OpenAI Codex"
+    runner = _panel_runner(target, [
+        structured_pr_review(summary="Omits item-1.", reviewer=name),
+        structured_pr_review(
+            summary="Complete after re-ask.", reviewer=name, prior_item_dispositions=_ITEM1_DISPOSED
+        ),
+    ])
+    repair_calls: list[str] = []
+    logs: list[str] = []
+    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repair_calls)), \
+            patch.object(orchestrator, "log", lambda _cfg, msg: logs.append(msg)):
+        assert run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, target)) == 0
+
+    commands = _target_commands(runner, target)
+    # Round 1 plus exactly two round-2 turns (first omission, then the re-ask).
+    assert len(commands) == 3
+    assert ADDENDUM_HEADING not in "\n".join(commands[1])
+    assert ADDENDUM_HEADING in "\n".join(commands[2]) and "item-1" in "\n".join(commands[2])
+    if target == "antigravity":
+        models = [cmd[cmd.index("--model") + 1] for cmd in commands]
+        assert models == ["ModelA"] * 3
+    assert repair_calls == []
+    assert not any(cmd[:1] == ["sleep"] for cmd, _cwd in runner.commands)
+    assert not any("falling back" in line.lower() or "retrying" in line.lower() for line in logs)
+
+
+def test_parallel_worker_second_omission_stops_and_repair_cannot_fabricate(tmp_path):
+    runner = _panel_runner("codex", [
+        structured_pr_review(summary="Omits item-1."),
+        structured_pr_review(summary="Still omits item-1."),
+        structured_pr_review(summary="Third turn must never be requested."),
+    ])
+    repair_inputs: list[str] = []
+
+    def fabricating_repair(raw, *args, **kwargs):
+        repair_inputs.append(raw)
+        # A repair model asserting a judgement the reviewer never made.
+        return structured_pr_review(
+            summary="Still omits item-1.", prior_item_dispositions=_ITEM1_DISPOSED
+        )
+
+    with patch.object(orchestrator, "attempt_repair", fabricating_repair):
+        with pytest.raises(AgentLoopError, match="did not evaluate all prior unresolved items: item-1"):
+            run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, "codex"))
+
+    # The real preservation check rejected the fabricated disposition.
+    assert len(repair_inputs) == 1
+    commands = _target_commands(runner, "codex")
+    assert len(commands) == 3  # round 1 + first omission + exactly one re-ask
+    assert ADDENDUM_HEADING in "\n".join(commands[2])
+    assert not any("Third turn must never" in cmd for cmd in map("\n".join, commands))
+
+
+def test_parallel_worker_malformed_review_goes_to_repair_without_reask(tmp_path):
+    runner = _panel_runner("codex", [malformed_pr_review_source(summary="Malformed envelope.")])
+    repair_calls: list[str] = []
+
+    def recording_repair(raw, *args, **kwargs):
+        repair_calls.append(raw)
+        return None
+
+    with patch.object(orchestrator, "attempt_repair", recording_repair):
+        with pytest.raises(AgentLoopError):
+            run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, "codex"))
+
+    assert len(repair_calls) >= 1
+    commands = _target_commands(runner, "codex")
+    assert len(commands) == 2  # round 1 plus the single malformed round-2 turn
+    assert not any(ADDENDUM_HEADING in "\n".join(cmd) for cmd in commands)
