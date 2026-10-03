@@ -583,6 +583,8 @@ metadata, so a later run can reconstruct the active review state. When the PR
 number is known, resume with `agent-loop pr <number>` instead of starting issue
 implementation again.
 
+Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming it) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep it ignored with `/.venv` (a dir-only `.venv/` rule does not match a symlink). `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it.
+
 ### Sub-items for conjunctive findings
 
 A reviewer can split a finding that bundles several separately checkable

@@ -1095,7 +1095,7 @@ Concurrent default-dir invocations on one repository are supported (#1162).
 Each run with an omitted `--<agent>-dir` gets its own detached `git worktree`
 under `<scratch>/OWNER-REPO/<agent>/runs/<run-token>`, backed by one shared
 clone per repo/agent (the *store*, `<scratch>/OWNER-REPO/<agent>/repo`) that
-owns the object store. Explicit `--<agent>-dir` paths are untouched. Parallel
+owns the object store. Explicit `--<agent>-dir` paths are untouched. Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming it) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep it ignored with `/.venv` (a dir-only `.venv/` rule does not match a symlink). `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it. Parallel
 reviewers within one invocation are supported; the orchestrator verifies
 distinct reviewer workdirs. Coder and reviewer turns are separate lifecycle
 stages even when they use the same CLI.

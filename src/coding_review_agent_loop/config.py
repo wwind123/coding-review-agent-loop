@@ -15,9 +15,12 @@ from pathlib import Path
 from .agents.base import AgentName
 from .agents.registry import default_agent_args
 from .checkout_verification import (
+    check_worktree_links,
     forget_checkout,
     recover_gemini_injection,
     refresh_after_sync,
+    register_worktree_links,
+    registered_links,
     verify_before_sync,
 )
 from .errors import AgentLoopError
@@ -213,6 +216,7 @@ class AgentLoopConfig:
     # directly constructed configs, which keep the standalone-clone behaviour.
     default_checkout_stores: tuple[tuple[AgentName, Path], ...] = ()
     run_token: str | None = None
+    worktree_links: tuple[str, ...] = ()
     # Optional plan-first override: use the main coder for planning/revision,
     # then switch only the approved implementation and PR follow-up coder/model.
     implementation_coder: AgentName | None = None
@@ -989,6 +993,27 @@ def default_run_worktree(repo: str, agent: AgentName, run_token: str) -> Path:
     return default_run_worktree_root(repo, agent) / run_token
 
 
+_WORKTREE_LINK_FORBIDDEN = set("*?[]!#\\:\0\n\r\t")
+
+
+def normalize_worktree_link(value: str) -> str:
+    """Validate one ``--worktree-link`` value; the accepted string is its only spelling."""
+    text = str(value)
+    bad = f"Invalid --worktree-link {text!r}: "
+    if not text or text != text.strip():
+        raise AgentLoopError(bad + "must be a non-empty path without surrounding whitespace.")
+    if any(ch in _WORKTREE_LINK_FORBIDDEN for ch in text):
+        raise AgentLoopError(bad + "contains a character that is not allowed in a link path.")
+    for part in text.split("/"):
+        if not part:
+            raise AgentLoopError(
+                bad + "empty path components (leading, trailing or repeated '/') are not allowed."
+            )
+        if part in (".", "..", ".git"):
+            raise AgentLoopError(bad + f"component {part!r} is not allowed.")
+    return text
+
+
 def new_run_token() -> str:
     return f"{datetime_stamp()}-{uuid.uuid4().hex[:12]}"
 
@@ -1149,6 +1174,10 @@ def _clean_or_reject_checkout(
 ) -> None:
     # A killed run's verifiable GEMINI.md injection is tool-owned, not dirt.
     recover_gemini_injection(config, runner, path)
+    links = registered_links(path)
+    if links:
+        _clean_or_reject_linked_checkout(path, links, label=label, config=config, runner=runner)
+        return
     status = _run_git(runner, path, ("status", "--porcelain")).stdout.strip()
     if not status:
         return
@@ -1157,6 +1186,25 @@ def _clean_or_reject_checkout(
     log(config, f"Cleaning dirty {label[0].lower()}{label[1:]}: {path}")
     _run_git(runner, path, ("reset", "--hard"))
     _run_git(runner, path, ("clean", "-fd"))
+
+
+def _clean_or_reject_linked_checkout(
+    path: Path, links: dict[bytes, bytes], *, label: str, config: AgentLoopConfig, runner: Runner
+) -> None:
+    """Clean a worktree that carries registered links; the links are never touched."""
+    check_worktree_links(config, runner, path)
+    raw = _run_git(runner, path, ("status", "--porcelain", "-z", "--untracked-files=all")).stdout
+    names = {os.fsdecode(link) for link in links}
+    remaining = [r for r in raw.split("\0") if r and r not in {f"?? {n}" for n in names}]
+    if not remaining:
+        return
+    log(config, f"Cleaning dirty {label[0].lower()}{label[1:]}: {path}")
+    _run_git(runner, path, ("reset", "--hard"))
+    excludes: list[str] = []
+    for name in sorted(names):
+        excludes += ["-e", f"/{name}"]
+    _run_git(runner, path, ("clean", "-fd", *excludes))
+    check_worktree_links(config, runner, path)
 
 
 def _sync_base_branch(
@@ -1246,11 +1294,15 @@ def _ensure_run_worktree(
             ("git", "worktree", "add", "--detach", str(path), f"origin/{config.base or 'HEAD'}"),
             cwd=store,
         )
+        for link in config.worktree_links:
+            log(config, f"[dry-run] Would link {store / link} -> {path / link}")
         return
     verify_before_sync(config, runner, path=path, label=label)
     sha = run_worktrees.prepare_store(store, config=config, runner=runner)
     run_worktrees.prune_dead_worktrees(store, runs_root, path, config=config, runner=runner)
     with run_worktrees.store_lock(store):
+        if config.worktree_links:
+            run_worktrees.check_link_sources(store, config.worktree_links)
         if not os.path.lexists(path):
             run_worktrees.add_run_worktree(store, path, sha, config=config, runner=runner)
         elif run_worktrees.identify_owned_worktree(store, runs_root, path) is None:
@@ -1262,6 +1314,9 @@ def _ensure_run_worktree(
         run_worktrees.remove_run_worktree(store, path, config=config, runner=runner)
 
     register_run_finalizer(os.path.abspath(path), finalize)
+    if config.worktree_links:
+        mapping = run_worktrees.create_worktree_links(path, store, config.worktree_links)
+        register_worktree_links(path, mapping)
     _sync_base_branch(path, label=label, default_owned=True, config=config, runner=runner)
 
 
@@ -1698,6 +1753,11 @@ def config_from_args(
     )
     run_token = new_run_token()
     store_by_agent: dict[AgentName, Path] = {}
+    worktree_links = tuple(
+        dict.fromkeys(
+            normalize_worktree_link(value) for value in (getattr(args, "worktree_link", None) or ())
+        )
+    )
 
     def resolve_agent_dir(agent: AgentName, value: Path | None) -> Path:
         if value is not None:
@@ -1710,6 +1770,10 @@ def config_from_args(
     gemini_dir = resolve_agent_dir("gemini", args.gemini_dir)
     antigravity_dir = resolve_agent_dir("antigravity", args.antigravity_dir)
     default_checkout_stores = tuple(store_by_agent.items())
+    if worktree_links and not default_checkout_stores:
+        log_message = "--worktree-link is ignored: every agent uses an explicit --<agent>-dir checkout."
+        print(log_message, file=sys.stderr)
+        worktree_links = ()
     store_roots = tuple(
         root
         for agent, store in default_checkout_stores
@@ -1936,6 +2000,7 @@ def config_from_args(
         auto_agent_dirs=auto_agent_dirs,
         default_checkout_stores=default_checkout_stores,
         run_token=run_token if default_checkout_stores else None,
+        worktree_links=worktree_links,
         containment_mode=getattr(args, "containment_mode", "auto"),
         containment_memory_high=getattr(args, "containment_memory_high", None),
         containment_memory_max=getattr(args, "containment_memory_max", None),

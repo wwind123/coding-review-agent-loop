@@ -214,6 +214,59 @@ def add_run_worktree(
     register_checkout(config, path)
 
 
+def check_link_sources(store: Path, links: Any) -> None:
+    """Fail, naming the path, before any worktree is added when a link source is missing."""
+    for link in links:
+        if not os.path.exists(store / link):
+            raise AgentLoopError(
+                f"--worktree-link '{link}': {store / link} does not exist in the shared checkout; "
+                "refusing to create a dangling link."
+            )
+
+
+def create_worktree_links(path: Path, store: Path, links: Any) -> dict[str, str]:
+    """Symlink each link from the store into the worktree, descriptor-relative (never copy)."""
+    mapping: dict[str, str] = {}
+    root_fd = os.open(os.fspath(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for link in links:
+            target = os.path.abspath(store / link)
+            parts = link.split("/")
+            opened: list[int] = []
+            dir_fd = root_fd
+            try:
+                for index, component in enumerate(parts[:-1]):
+                    try:
+                        dir_fd = os.open(
+                            component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd
+                        )
+                    except OSError as exc:
+                        missing = "/".join(parts[: index + 1])
+                        raise AgentLoopError(
+                            f"--worktree-link '{link}': parent directory '{missing}' does not exist "
+                            "in the run worktree; only paths whose parent directories are tracked "
+                            "can be linked (link the untracked top-level directory instead)"
+                        ) from exc
+                    opened.append(dir_fd)
+                name = parts[-1]
+                try:
+                    info = os.lstat(name, dir_fd=dir_fd)
+                except FileNotFoundError:
+                    os.symlink(target, name, dir_fd=dir_fd)
+                else:
+                    if not stat.S_ISLNK(info.st_mode) or os.readlink(name, dir_fd=dir_fd) != target:
+                        raise AgentLoopError(
+                            f"--worktree-link '{link}': {path / link} already exists in the run worktree."
+                        )
+            finally:
+                for fd in opened:
+                    os.close(fd)
+            mapping[link] = target
+    finally:
+        os.close(root_fd)
+    return mapping
+
+
 def _remove_owned_locked(store: Path, path: Path, *, config: Any, runner: Any) -> bool:
     """Remove one identified worktree; the store lock must be held and is never taken here."""
     _require_lock_held(store)
