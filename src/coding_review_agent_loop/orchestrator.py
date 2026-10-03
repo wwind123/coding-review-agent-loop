@@ -128,6 +128,7 @@ from .errors import (
     QuotaResetExceededError,
     ReviewSubstanceIntegrityError,
     SemanticPatchPayloadRejection,
+    MissingPriorItemDispositionError,
     SemanticPatchUnknownPriorItemDispositionError,
     UnknownPriorItemDispositionError,
 )
@@ -3459,6 +3460,7 @@ def _run_validated_agent(
     semantic_patch_payload_validator: Callable[[dict], object] | None = None,
     degrade_architecture_impact: bool = False,
     strict_revalidate: Callable[[str], object] | None = None,
+    reask_on_prior_disposition_omission: bool = False,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
@@ -3553,7 +3555,10 @@ def _run_validated_agent(
         if antigravity_attempts is not None
         else config.agent_max_retries + 2
     )
-    last_error = f"{agent_name} produced no output."
+    if reask_on_prior_disposition_omission:
+        # One dedicated slot that never consumes agent_max_retries.
+        max_attempts += 1
+    last_error =f"{agent_name} produced no output."
     last_result: AgentResult | None = None
     last_classification_text = ""
     last_failure_category = "empty-response"
@@ -3587,6 +3592,8 @@ def _run_validated_agent(
     # A field-naming diagnostic for the next attempt's prompt, set only by an
     # unsatisfied architecture-impact contract and consumed by one attempt.
     pending_contract_reprompt: str | None = None
+    omission_reask_used = False
+    pending_omission_reask_ids: tuple[str, ...] | None = None
     executable_replacement_policies: dict[AgentName, tuple[str, str, str, bool]] = {
         "claude": (
             config.claude_cmd,
@@ -3631,11 +3638,21 @@ def _run_validated_agent(
             )
         elif is_executable_replacement_replay:
             invocation_kwargs["attempt_suffix"] = executable_replacement_policies[agent][2]
-        attempt_prompt = (
-            _architecture_contract_retry_prompt(prompt, pending_contract_reprompt)
-            if pending_contract_reprompt is not None
-            else prompt
-        )
+        if pending_omission_reask_ids is not None:
+            # Reuse the frozen prompt and session: publishing or rebuilding the
+            # prompt between the two turns would reopen #1156.
+            attempt_prompt = _prior_disposition_omission_reask_prompt(
+                prompt, pending_omission_reask_ids
+            )
+            if agent == "claude":
+                invocation_kwargs["attempt_suffix"] = "omission-reask"
+            pending_omission_reask_ids = None
+        else:
+            attempt_prompt = (
+                _architecture_contract_retry_prompt(prompt, pending_contract_reprompt)
+                if pending_contract_reprompt is not None
+                else prompt
+            )
         pending_contract_reprompt = None
         if usage_context is not None:
             usage_context.note_agent_dispatch()
@@ -4081,6 +4098,29 @@ def _run_validated_agent(
                 if result.command_result is not None and result.command_result.capture_diagnostics:
                     last_failure_category = "transient"
                     public_text_is_transient = True
+                if (
+                    reask_on_prior_disposition_omission
+                    and not omission_reask_used
+                    and isinstance(exc, MissingPriorItemDispositionError)
+                    and not public_text_is_transient
+                    and not marker_safety_failure
+                    and last_failure_category != "unsupported_model"
+                ):
+                    # A missing carried-item disposition is a missing judgement
+                    # that only the reviewer can supply: re-ask the same reviewer
+                    # once, outside the retry budget and the Antigravity model
+                    # fallback, and never through repair (#1167).
+                    omission_reask_used = True
+                    pending_omission_reask_ids = tuple(exc.missing_ids)
+                    if usage_record is not None:
+                        usage_record.validation_status = "invalid"
+                    log(
+                        config,
+                        f"{agent_name}: review omitted disposition(s) for carried item(s) "
+                        f"{', '.join(pending_omission_reask_ids)}; re-asking the same reviewer "
+                        "once (no repair)",
+                    )
+                    continue
                 if (
                     last_failure_category == "deterministic"
                     and not marker_safety_failure
@@ -5312,6 +5352,26 @@ def _architecture_contract_retry_prompt(prompt: str, diagnostic: str) -> str:
         "assessment was absent or not determinable. Include `architecture_impact` with "
         "`status` set to exactly `changed` or `unchanged` and a non-empty rationale.\n"
         f"Diagnostic: {detail}\n"
+    )
+
+
+_OMISSION_REASK_MAX_IDS = 50
+
+
+def _prior_disposition_omission_reask_prompt(prompt: str, missing_ids: Sequence[str]) -> str:
+    """Append one bounded, marker-free section naming omitted carried item IDs."""
+    ids = [
+        " ".join(sanitize_historical_text(item_id).replace("<", "(").replace(">", ")").split())
+        for item_id in missing_ids
+    ]
+    listed = ", ".join(ids[:_OMISSION_REASK_MAX_IDS])
+    if len(ids) > _OMISSION_REASK_MAX_IDS:
+        listed += ", ..."
+    return (
+        f"{prompt}\n\n## Previous response not accepted: prior item dispositions\n\n"
+        "Your previous review omitted a `prior_item_dispositions` entry for these carried "
+        f"item IDs: {listed}. Evaluate each of them against the current PR, then re-emit "
+        "your complete review with every carried item dispositioned exactly once.\n"
     )
 
 
@@ -24711,6 +24771,7 @@ def run_pr_loop(
                                     repair_resolved_history_item_ids=round_resolved_history_item_ids,
                                     role="reviewer",
                                     operation_description="PR review",
+                                    reask_on_prior_disposition_omission=True,
                                 )
                             except AgentLoopError as exc:
                                 # Includes QuotaResetExceededError: captured here
@@ -25048,6 +25109,7 @@ def run_pr_loop(
                             repair_resolved_history_item_ids=round_resolved_history_item_ids,
                             role="reviewer",
                             operation_description="PR review",
+                            reask_on_prior_disposition_omission=True,
                             ),
                         )
                     )

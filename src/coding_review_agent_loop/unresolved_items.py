@@ -12,6 +12,7 @@ from .errors import (
     AgentLoopError,
     HumanDecisionRequiredError,
     IssueImplementationConflictError,
+    MissingPriorItemDispositionError,
     UnknownPriorItemDispositionError,
 )
 from .github import PullRequestMergeability
@@ -617,9 +618,7 @@ def _validate_review_response(
     if unresolved_items:
         missing = sorted(set(unresolved_by_id) - set(disposition_ids))
         if missing:
-            raise AgentLoopError(
-                "Review did not evaluate all prior unresolved items: " + ", ".join(missing)
-            )
+            raise MissingPriorItemDispositionError(tuple(missing))
     # Sub-item keys must name sub-items of that entry's carried item; anything
     # else (including any key on an item without sub-items or on a machine
     # obligation) is dropped with a degradation instead of rejecting the

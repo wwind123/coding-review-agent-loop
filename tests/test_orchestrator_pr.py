@@ -8330,6 +8330,8 @@ def test_pr_loop_rejects_cross_reviewer_approval_without_prior_item_disposition(
         codex_outputs=[
             "Codex approves first pass.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
             "Codex approves second pass.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            # The omission is re-asked once (#1167); it still omits item-1.
+            "Codex approves second pass again.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         ],
         gemini_outputs=["Implemented fix.\n<!-- AGENT_STATE: blocking -->\n-- Google Gemini"],
     )
