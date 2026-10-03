@@ -3182,3 +3182,177 @@ def test_coder_comment_separates_confirmed_counts_from_unverified_claims():
         prior_items=[],
     )
     assert "Sub-item progress" not in unchanged
+
+
+# --- #1230: rendered plan identifier vocabulary vs accepted finding schema ---
+
+# The matrix-evidence renderer is a PR-evidence surface, not plan text that
+# reviewers critique, so it is deliberately out of scope here.
+PLAN_RENDER_FUNCTIONS = (
+    "render_execution_recommendation_section",
+    "render_risk_test_matrix_section",
+)
+_ID_NAME_1230 = re.compile(r"^[a-z_]+_ids?$")
+
+
+def _classified_1230() -> set[str]:
+    from coding_review_agent_loop.protocol import (
+        PLAN_REVIEW_FINDING_EXCLUDED_RENDERED_KEYS,
+        PLAN_REVIEW_FINDING_REFERENCE_FIELDS,
+    )
+
+    accepted = {name for name, _label in PLAN_REVIEW_FINDING_REFERENCE_FIELDS}
+    assert accepted.isdisjoint(PLAN_REVIEW_FINDING_EXCLUDED_RENDERED_KEYS)
+    return accepted | set(PLAN_REVIEW_FINDING_EXCLUDED_RENDERED_KEYS)
+
+
+def _rendered_identifier_attributes(source: str, function_names) -> set[str]:
+    import ast
+
+    tree = ast.parse(source)
+    found: set[str] = set()
+    for name in function_names:
+        funcs = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        ]
+        assert funcs, f"{name} not found; update PLAN_RENDER_FUNCTIONS"
+        for func in funcs:
+            for node in ast.walk(func):
+                if isinstance(node, ast.Attribute) and _ID_NAME_1230.match(node.attr):
+                    found.add(node.attr)
+    return found
+
+
+def _comment_rendering_source_1230() -> str:
+    import coding_review_agent_loop.comment_rendering as module
+    from pathlib import Path
+
+    return Path(module.__file__).read_text(encoding="utf-8")
+
+
+def test_rendered_plan_identifier_keys_are_classified_1230():
+    from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
+    from coding_review_agent_loop.protocol import RiskTestMatrixChange, parse_risk_test_matrix
+
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    rendered = [
+        render_execution_recommendation_section(
+            validate_structured_plan_state(
+                json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder",
+                require_execution_strategy_contract=1,
+            ).execution_recommendation
+        )
+    ]
+    rendered.append(_staged_section_1230(payload))
+    row = {
+        "row_id": "row-a",
+        "label": "L",
+        "entry_path_or_mode": "m",
+        "initial_state": "s",
+        "event": "e",
+        "expected_outcome": "o",
+        "forbidden_side_effects": ["f"],
+        "proposed_test_level": "unit",
+        "proposed_test_location": "tests/test_x.py::t",
+        "applicability": "applicable",
+        "related_scope_item_ids": ["scope-1"],
+        "execution_owner": "one-shot",
+    }
+    matrix = parse_risk_test_matrix({"applicability": "applicable", "rows": [row], "important_exclusions": ["None."]})
+    rendered.append(
+        render_risk_test_matrix_section(
+            matrix, (RiskTestMatrixChange("change", ("row-a",), "Why."),)
+        )
+    )
+    tokens = {
+        token
+        for section in rendered
+        for token in re.findall(r"`([a-z_]+_ids?)`", section)
+    }
+    assert {"scope_item_ids", "covered_scope_item_ids", "depends_on_stage_ids"} <= tokens
+    assert tokens <= _classified_1230()
+
+
+def _staged_section_1230(payload: dict) -> str:
+    import copy
+
+    payload = copy.deepcopy(payload)
+    recommendation = payload["execution_recommendation"]
+    recommendation.pop("one_shot_delivery", None)
+    base = {
+        "summary": "S.",
+        "deliverables": ["D."],
+        "non_goals": [],
+        "acceptance_criteria": ["A."],
+        "dependency_notes": "N.",
+        "automation": "agent-pr",
+        "rollout_risk": "low",
+        "compatibility_constraints": [],
+    }
+    recommendation.update(
+        {
+            "strategy": "staged",
+            "staging_feasibility": "safe",
+            "scope_items": [
+                {"scope_item_id": "scope-a", "requirement": "R.", "acceptance_criteria": ["A."]},
+                {"scope_item_id": "scope-b", "requirement": "R2.", "acceptance_criteria": ["A."]},
+                {"scope_item_id": "scope-c", "requirement": "R3.", "acceptance_criteria": ["A."]},
+            ],
+            "coupling_constraints": [
+                {"constraint_id": "c-1", "scope_item_ids": ["scope-a", "scope-b"], "rationale": "Why."}
+            ],
+            "child_stages": [
+                {**base, "stage_id": "st-1", "position": 1, "title": "One",
+                 "depends_on_stage_ids": [], "covered_scope_item_ids": ["scope-a", "scope-b"]},
+                {**base, "stage_id": "st-2", "position": 2, "title": "Two",
+                 "depends_on_stage_ids": ["st-1"], "covered_scope_item_ids": ["scope-c"]},
+            ],
+            "retained_parent_work": {
+                "status": "none", "deliverables": [], "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "final_integration_work": {
+                "status": "none", "deliverables": [], "acceptance_criteria": [],
+                "covered_scope_item_ids": [],
+            },
+            "caveats": [],
+        }
+    )
+    parsed = validate_structured_plan_state(
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Coder",
+        require_execution_strategy_contract=1,
+    )
+    return render_execution_recommendation_section(parsed.execution_recommendation)
+
+
+def test_rendered_plan_identifier_attributes_are_classified_1230():
+    found = _rendered_identifier_attributes(
+        _comment_rendering_source_1230(), PLAN_RENDER_FUNCTIONS
+    )
+    assert {
+        "scope_item_id", "constraint_id", "stage_id", "row_id", "row_ids",
+        "scope_item_ids", "covered_scope_item_ids", "depends_on_stage_ids",
+    } <= found
+    assert found <= _classified_1230()
+
+
+def test_rendered_identifier_guard_flags_unclassified_value_identifier_1230():
+    source = (
+        "def render_execution_recommendation_section(widget):\n"
+        "    return f\"- `{widget.widget_id}`\"\n"
+    )
+    found = _rendered_identifier_attributes(source, ("render_execution_recommendation_section",))
+    assert found - _classified_1230() == {"widget_id"}
+
+
+def test_every_accepted_reference_key_flattens_1230():
+    from coding_review_agent_loop.protocol import (
+        PLAN_REVIEW_FINDING_REFERENCE_FIELDS,
+        _flatten_plan_review_finding,
+    )
+
+    for name, label in PLAN_REVIEW_FINDING_REFERENCE_FIELDS:
+        text = _flatten_plan_review_finding({"finding": "F.", name: ["x-1"]}, item_context="ctx")
+        assert text == f"F. {label}: x-1"

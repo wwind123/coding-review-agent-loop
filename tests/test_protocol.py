@@ -2180,8 +2180,10 @@ def test_parse_structured_plan_review_rejects_malformed_finding_objects_957(item
 
 _ALIAS_LOGGER_1169 = "coding_review_agent_loop.protocol"
 _ALLOWED_KEYS_1169 = (
-    "description, evidence, finding, id, impact, issue, item_id, location, "
-    "rationale, recommendation, required_change, sub_items, suggested_fix, summary, text, title"
+    "constraint_id, constraint_ids, covered_scope_item_ids, description, evidence, finding, "
+    "id, impact, issue, item_id, location, rationale, recommendation, required_change, "
+    "row_id, row_ids, scope_item_id, scope_item_ids, stage_id, stage_ids, sub_items, "
+    "suggested_fix, summary, text, title"
 )
 
 
@@ -2251,10 +2253,12 @@ def test_plan_review_finding_alias_table_integrity_1169():
     from coding_review_agent_loop.protocol import (
         PLAN_REVIEW_FINDING_ID_FIELDS,
         PLAN_REVIEW_FINDING_KEY_ALIASES,
+        PLAN_REVIEW_FINDING_REFERENCE_FIELDS,
         PLAN_REVIEW_FINDING_TEXT_FIELDS,
     )
 
     accepted = {n for n, _ in PLAN_REVIEW_FINDING_TEXT_FIELDS} | PLAN_REVIEW_FINDING_ID_FIELDS
+    accepted |= {n for n, _ in PLAN_REVIEW_FINDING_REFERENCE_FIELDS}
     accepted |= {"sub_items"}
     for alias, canonical in PLAN_REVIEW_FINDING_KEY_ALIASES.items():
         assert canonical in {n for n, _ in PLAN_REVIEW_FINDING_TEXT_FIELDS}
@@ -6665,3 +6669,71 @@ def test_rejection_keeps_truncated_projection_command_label():
 def _with_ref(obj):
     obj.execution_ref = "turn:observation-1"
     return obj
+
+
+def _blocking_texts_1230(item, key="blocking_plan_issues"):
+    payload = json.loads(_plan_review_with_blocking([]).split("\n", 1)[0])
+    payload[key] = [item]
+    text = json.dumps(payload) + "\n" + _plan_review_with_blocking([]).split("\n", 1)[1]
+    parsed = parse_structured_plan_review(text, reviewer="OpenAI Codex")
+    assert parsed is not None
+    items = {
+        "blocking_plan_issues": parsed.items.blocking,
+        "same_plan_followups": parsed.items.same_plan,
+        "future_followups": parsed.items.future,
+    }[key]
+    return [i.text for i in items]
+
+
+def test_plan_review_finding_scope_item_ids_folded_1230():
+    item = {"finding": "Gap.", "evidence": "Step 2.", "scope_item_ids": ["scope-1"]}
+    review = _plan_review_with_blocking([item])
+    assert len(parse_plan_review(review, reviewer="OpenAI Codex").items.blocking) == 1
+    assert _blocking_texts_1230(item) == ["Gap. Evidence: Step 2. Scope items: scope-1"]
+
+
+def test_plan_review_finding_single_string_reference_folded_1230():
+    item = {"finding": "Gap.", "covered_scope_item_ids": " scope-2 "}
+    assert _blocking_texts_1230(item) == ["Gap. Covered scope items: scope-2"]
+
+
+def test_plan_review_finding_reference_order_and_sub_items_1230():
+    item = {
+        "row_ids": ["r1"],
+        "stage_id": "stage-a",
+        "scope_item_ids": ["s2", "s1", "s2"],
+        "sub_items": ["one", "two"],
+        "finding": "Gap.",
+    }
+    assert _blocking_texts_1230(item) == [
+        "Gap. Scope items: s2, s1, s2 Stages: stage-a Matrix rows: r1 Sub-items: (1) one (2) two"
+    ]
+
+
+def test_plan_review_followup_finding_reference_folded_1230():
+    from coding_review_agent_loop.protocol import _expect_plan_review_finding_list
+
+    item = {"text": "Later.", "scope_item_ids": ["scope-3"]}
+    assert _blocking_texts_1230(item, "same_plan_followups") == ["Later. Scope items: scope-3"]
+    # A blocking review discards future follow-ups after parsing, so check the
+    # shared list helper directly for that key.
+    assert _expect_plan_review_finding_list(
+        {"future_followups": [item]}, "future_followups", context="future_followups"
+    ) == ("Later. Scope items: scope-3",)
+
+
+@pytest.mark.parametrize(
+    ("item", "message"),
+    [
+        ({"finding": "x", "scope_item_ids": []}, r"scope_item_ids must be a non-empty"),
+        ({"finding": "x", "scope_item_ids": [3]}, r"scope_item_ids\[0\]"),
+        ({"finding": "x", "scope_item_ids": ["a", " "]}, r"scope_item_ids\[1\]"),
+        ({"finding": "x", "stage_ids": {"a": "b"}}, r"stage_ids must be a non-empty"),
+        ({"finding": "x", "row_id": " "}, r"row_id"),
+        ({"scope_item_ids": ["scope-1"]}, "no text field"),
+        ({"finding": "x", "depends_on_stage_ids": ["a"]}, "unsupported finding key"),
+    ],
+)
+def test_plan_review_finding_reference_rejections_1230(item, message):
+    with pytest.raises(AgentLoopError, match=message):
+        parse_structured_plan_review(_plan_review_with_blocking([item]), reviewer="OpenAI Codex")
