@@ -130,6 +130,29 @@ def test_split_source_paths_follow_the_registry(monkeypatch):
     assert guard.module_path("usage") in guard.split_source_paths()
 
 
+def test_cli_entry_points_are_the_moved_definitions():
+    # cli.py still imports its loop entry points from the facade; each must be
+    # the identical function object defined in the module that now owns it.
+    import coding_review_agent_loop.checks as checks
+    import coding_review_agent_loop.cli as cli
+    import coding_review_agent_loop.discuss_loop as discuss_loop
+    import coding_review_agent_loop.issue_loop as issue_loop
+    import coding_review_agent_loop.pr_loop as pr_loop
+
+    owners = {
+        "run_issue_loop": issue_loop,
+        "run_task_loop": issue_loop,
+        "run_pr_loop": pr_loop,
+        "run_discuss_loop": discuss_loop,
+        "run_optional_tests": checks,
+    }
+    for name, owner in owners.items():
+        assert getattr(cli, name) is getattr(owner, name), name
+        assert getattr(orchestrator, name) is getattr(owner, name), name
+    for name in ("run_issue_loop", "run_task_loop"):
+        assert getattr(issue_loop, name).__module__ == issue_loop.__name__
+
+
 def test_baseline_records_every_top_level_definition_of_the_base():
     names = {name for name, _ in guard.top_level_definitions(
         guard.module_path("orchestrator").read_text(encoding="utf-8")
