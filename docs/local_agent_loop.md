@@ -1123,9 +1123,33 @@ Otherwise the grant must fit both pools: the CPU pool less the workers already
 reserved, and the memory pool less each holder's workers times its own
 per-worker cost, where the strictest capacity any live holder recorded
 applies, so loops with different headroom or `--test-worker-memory` settings
-cannot overcommit memory together. The command is lowered to what fits (the
-injected plugin then enforces the lower number), or gets `worker-budget-busy`
-(exit 125) when nothing fits. Every reservation has its own record, so a
+cannot overcommit memory together.
+
+Admission is **exclusive with a bounded wait** (issue #1108). A run requests
+its full configured budget; while any other live reservation exists it waits
+(even when both budgets would fit on the host) by polling the capacity record,
+never holding the accounting mutex across a sleep, so a waiter cannot delay a
+holder's release. The bound is `AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS`
+(default 1200 s, clamped to `[0, 7200]`; `0` degrades immediately; an invalid
+value falls back to the default with a notice). The wait does not count against
+the command's own timeout, and capacity is held only around the test command,
+never across an agent turn. On timeout the run degrades to the workers that are
+free, or to one oversubscribed worker when none are free, and exits with the
+target's own status; the same fallback applies when the accounting mutex is
+held elsewhere past the bound. Host capacity therefore never produces
+`worker-budget-busy` or exit 125; only a second concurrent command in the same
+invocation does. A fallback grant only lowers launched workers (including
+`-n auto` and `--tx` gateways) after the configured-budget judgement: a request
+within the configured budget is lowered to the grant instead of being refused in
+refuse mode, a request above it is still refused, targets observe
+`AGENT_LOOP_TEST_WORKERS` equal to the grant, and the plugin report still
+records the configured budget. Through the test broker, clients receive an
+empty heartbeat output frame every 2 s while a request waits, so a long wait
+never trips the client's receive timeout; stopping the broker cancels pending
+admission, no target launches after the owning turn ends, and a target that
+had already started is recorded as run but unattributed. Every broker send is
+bounded, so a client that stops reading cannot stall admission or shutdown.
+Every reservation has its own record, so a
 share left behind by an earlier command of the same invocation keeps counting.
 The reservation is anchored to the target atomically at launch: the spawned
 child inherits the per-invocation lock, writes its own pid (its process-group
@@ -1152,8 +1176,12 @@ file, or to `off` to disable it. An attempt records `requested_at`,
 `reserved_at` (the grant; null when nothing was reserved), `released_at`,
 `retained` (the reservation file still existed when the wrapper returned),
 `workers_requested`/`workers_granted`, `capacity` plus `others_count` and
-`others_workers` (other live reservations at decision time), `outcome`
-(`granted`, `degraded`, `refused`, `invocation-busy`, `unshared` or `error`),
+`others_workers` (other live reservations at decision time),
+`reservation_wait_seconds`, `wait_bound_seconds`, `wait_timed_out`,
+`oversubscribed` and `accounting_unavailable` (the wait, #1108; interrupted or
+cancelled waits keep their elapsed wait), `outcome`
+(`granted`, `degraded`, `oversubscribed`, `cancelled`, `invocation-busy`,
+`unshared` or `error`; `refused` appears only in records written before #1108),
 `target_started_at`, `command_seconds` (target spawn to exit), `test_outcome`,
 and `repo`/`run_id`/`issue_number`/`pr_number` with `attribution_source`
 (`runner` for the broker lane, where the orchestrator supplies attribution;
@@ -1161,7 +1189,9 @@ and `repo`/`run_id`/`issue_number`/`pr_number` with `attribution_source`
 self-reported). Duty cycle: `worker_telemetry.run_duty_cycles(load_records(path))`
 holds from `reserved_at`, so wait time is excluded, clips every interval to the
 run's `[run-start, run-end]` window and returns `duty_low`/`duty_high` (they
-differ only when a share was retained after the wrapper returned).
+differ only when a share was retained after the wrapper returned) plus the
+per-run counters `waits`, `wait_timeouts`, `oversubscribed` and
+`wait_seconds_total` (older records without the wait fields count as zero).
 `run_intervals` gives the clipped interval unions; `overlap_seconds` on two
 runs' unions is their overlap. Appends are best-effort, unlocked and never
 rotated, so the file is a disposable measurement artifact that grows by

@@ -2044,12 +2044,20 @@ def _terminate_probe_tree(
         pass
 
 
+PROBE_CANCEL_POLL_SECONDS = 0.05
+
+
+class ProbeCancelled(Exception):
+    """The inner-launcher probe was cancelled (the owning broker is stopping)."""
+
+
 def _run_bounded_probe(
     argv: Sequence[str],
     *,
     cwd: Path,
     env: Mapping[str, str] | None,
     timeout_seconds: float,
+    cancel: "threading.Event | None" = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a fixed probe with process-tree-aware timeout cleanup.
 
@@ -2102,7 +2110,25 @@ def _run_bounded_probe(
                 raise _ProbeContainmentUnavailable(
                     f"Windows suspended probe resume unavailable: {type(exc).__name__}"
                 ) from exc
-        stdout, stderr = process.communicate(timeout=timeout_seconds)
+        if cancel is None:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        else:
+            probe_deadline = time.monotonic() + timeout_seconds
+            while True:
+                if cancel.is_set():
+                    raise ProbeCancelled()
+                remaining = probe_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(
+                        [str(item) for item in argv], timeout_seconds
+                    )
+                try:
+                    stdout, stderr = process.communicate(
+                        timeout=min(PROBE_CANCEL_POLL_SECONDS, remaining)
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
     except subprocess.TimeoutExpired as exc:
         assert process is not None
         _terminate_probe_tree(process, windows_job=windows_job)
@@ -2654,8 +2680,14 @@ def _recognized_inner_probe_tokens(
 def probe_inner_launcher(
     argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None,
     environment_is_complete: bool = False,
+    cancel: "threading.Event | None" = None,
 ) -> LauncherProbeResult:
-    """Run only a recognized, identity-cached five-second bootstrap probe."""
+    """Run only a recognized, identity-cached five-second bootstrap probe.
+
+    ``cancel`` (issue #1108) aborts the probe: the owner kills its probe group
+    and nothing is published to the cache, so a cancelled probe is never
+    treated as authentication of the launcher.
+    """
     values = (
         dict(environment)
         if environment is not None and environment_is_complete
@@ -2720,11 +2752,20 @@ def probe_inner_launcher(
         # The owner has a five-second subprocess watchdog.  A small amount of
         # headroom lets waiters receive its published result without ever
         # starting a duplicate probe if the owner is slow to publish.
-        if flight.wait(LAUNCHER_PROBE_TIMEOUT_SECONDS + 1.0):
-            with _INNER_PREFLIGHT_LOCK:
-                cached = _INNER_PREFLIGHT_CACHE.get(cache_key)  # type: ignore[arg-type]
-            if cached is not None:
-                return bind(cached)
+        flight_deadline = time.monotonic() + LAUNCHER_PROBE_TIMEOUT_SECONDS + 1.0
+        while True:
+            remaining = flight_deadline - time.monotonic()
+            if cancel is not None and cancel.is_set():
+                return LauncherProbeResult(original, "unknown", "inner probe cancelled", identity_key)
+            if remaining <= 0:
+                break
+            slice_seconds = remaining if cancel is None else min(PROBE_CANCEL_POLL_SECONDS, remaining)
+            if flight.wait(slice_seconds):
+                with _INNER_PREFLIGHT_LOCK:
+                    cached = _INNER_PREFLIGHT_CACHE.get(cache_key)  # type: ignore[arg-type]
+                if cached is not None:
+                    return bind(cached)
+                break
         return LauncherProbeResult(
             original,
             "unknown",
@@ -2743,7 +2784,11 @@ def probe_inner_launcher(
                     else None
                 ),
                 timeout_seconds=LAUNCHER_PROBE_TIMEOUT_SECONDS,
+                cancel=cancel,
             )
+        except ProbeCancelled:
+            # Never published: the next request probes afresh.
+            return LauncherProbeResult(original, "unknown", "inner probe cancelled", identity_key)
         except subprocess.TimeoutExpired:
             result = LauncherProbeResult(original, "failed", "inner bootstrap probe timed out after 5s", identity_key)
         except _ProbeContainmentUnavailable as exc:

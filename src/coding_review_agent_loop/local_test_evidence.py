@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import select
 import json
 import math
 import os
@@ -1341,20 +1342,79 @@ class TrackedTreeSnapshot:
         }
 
 
-def _run_git(root: Path, args: Sequence[str], *, timeout: float = 10.0) -> bytes:
+class SnapshotCancelled(Exception):
+    """A tracked-tree snapshot was cancelled because the broker is stopping.
+
+    Deliberately not an ``AgentLoopError``/``OSError``: it must pass through the
+    incomplete-snapshot handlers and reach the broker's shutdown-completion path.
+    """
+
+
+SNAPSHOT_CANCEL_POLL_SECONDS = 0.05
+
+
+def _snapshot_checkpoint(started: float, timeout_seconds: float, cancel: Event | None) -> None:
+    if cancel is not None and cancel.is_set():
+        raise SnapshotCancelled()
+    if time.monotonic() - started > timeout_seconds:
+        raise AgentLoopError("git snapshot time limit exceeded")
+
+
+def _run_git(
+    root: Path, args: Sequence[str], *, timeout: float = 10.0, cancel: Event | None = None
+) -> bytes:
+    command = ("git", "-C", str(root), *args)
+    if cancel is None:
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise AgentLoopError(f"git snapshot failed: {type(exc).__name__}") from exc
+        if result.returncode != 0:
+            raise AgentLoopError("git snapshot command failed")
+        return result.stdout
+    # Cancellable: poll the child, kill it when cancelled or out of time.
+    if cancel.is_set():
+        raise SnapshotCancelled()
     try:
-        result = subprocess.run(
-            ("git", "-C", str(root), *args),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=timeout,
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except OSError as exc:
         raise AgentLoopError(f"git snapshot failed: {type(exc).__name__}") from exc
-    if result.returncode != 0:
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if cancel.is_set():
+                raise SnapshotCancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgentLoopError("git snapshot failed: TimeoutExpired")
+            try:
+                stdout, _stderr = process.communicate(
+                    timeout=min(SNAPSHOT_CANCEL_POLL_SECONDS, remaining)
+                )
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            process.communicate(timeout=2)
+        except Exception:
+            pass
+        raise
+    if process.returncode != 0:
         raise AgentLoopError("git snapshot command failed")
-    return result.stdout
+    return stdout
 
 
 def _git_nul_paths(raw: bytes) -> tuple[str, ...]:
@@ -1465,6 +1525,7 @@ def _stream_snapshot_record(
     remaining: list[int],
     started: float,
     timeout_seconds: float,
+    cancel: Event | None = None,
 ) -> tuple[str, int, bytes]:
     """Hash one file without reading beyond the aggregate byte/time budget."""
     name_size = len(name.encode("utf-8", errors="surrogateescape")) + 16
@@ -1473,15 +1534,13 @@ def _stream_snapshot_record(
     required = name_size + payload_size
     if required > remaining[0]:
         raise AgentLoopError("git snapshot byte limit exceeded")
-    if time.monotonic() - started > timeout_seconds:
-        raise AgentLoopError("git snapshot time limit exceeded")
+    _snapshot_checkpoint(started, timeout_seconds, cancel)
     remaining[0] -= required
     digest = hashlib.sha256(prefix)
     read_size = 0
     with path.open("rb") as stream:
         while True:
-            if time.monotonic() - started > timeout_seconds:
-                raise AgentLoopError("git snapshot time limit exceeded")
+            _snapshot_checkpoint(started, timeout_seconds, cancel)
             chunk = stream.read(min(1024 * 1024, before.st_size - read_size + 1))
             if not chunk:
                 break
@@ -1522,6 +1581,7 @@ def capture_tracked_tree_snapshot(
     max_files: int = MAX_SNAPSHOT_FILES,
     max_bytes: int = MAX_SNAPSHOT_BYTES,
     timeout_seconds: float = MAX_SNAPSHOT_SECONDS,
+    cancel: Event | None = None,
 ) -> TrackedTreeSnapshot:
     """Capture Git/index/tracked-content/unignored-untracked state.
 
@@ -1534,18 +1594,18 @@ def capture_tracked_tree_snapshot(
         canonical_root = requested_root.resolve(strict=True)
         if not canonical_root.is_dir():
             raise AgentLoopError("snapshot root is not a directory")
-        top = _run_git(canonical_root, ("rev-parse", "--show-toplevel"), timeout=timeout_seconds)
+        top = _run_git(canonical_root, ("rev-parse", "--show-toplevel"), timeout=timeout_seconds, cancel=cancel)
         git_root = Path(top.decode("utf-8", errors="strict").strip()).resolve(strict=True)
         if git_root != canonical_root:
             raise AgentLoopError("snapshot root does not equal Git top-level")
-        head = _run_git(canonical_root, ("rev-parse", "HEAD"), timeout=timeout_seconds).decode().strip()
-        index_raw = _run_git(canonical_root, ("ls-files", "-s", "-z"), timeout=timeout_seconds)
+        head = _run_git(canonical_root, ("rev-parse", "HEAD"), timeout=timeout_seconds, cancel=cancel).decode().strip()
+        index_raw = _run_git(canonical_root, ("ls-files", "-s", "-z"), timeout=timeout_seconds, cancel=cancel)
         index_entries = _git_index_entries(index_raw)
-        tracked = _git_nul_paths(_run_git(canonical_root, ("ls-files", "-z"), timeout=timeout_seconds))
+        tracked = _git_nul_paths(_run_git(canonical_root, ("ls-files", "-z"), timeout=timeout_seconds, cancel=cancel))
         if set(index_entries) != set(tracked):
             raise AgentLoopError("git snapshot index and tracked paths disagree")
         untracked = _git_nul_paths(
-            _run_git(canonical_root, ("ls-files", "--others", "--exclude-standard", "-z"), timeout=timeout_seconds)
+            _run_git(canonical_root, ("ls-files", "--others", "--exclude-standard", "-z"), timeout=timeout_seconds, cancel=cancel)
         )
         if len(tracked) + len(untracked) > max_files:
             raise AgentLoopError("git snapshot file limit exceeded")
@@ -1556,8 +1616,7 @@ def capture_tracked_tree_snapshot(
         ]
         tracked_records: list[tuple[str, int, bytes]] = []
         for relative in tracked:
-            if time.monotonic() - started > timeout_seconds:
-                raise AgentLoopError("git snapshot time limit exceeded")
+            _snapshot_checkpoint(started, timeout_seconds, cancel)
             path = canonical_root / relative
             try:
                 index_mode, object_id = index_entries[relative]
@@ -1591,14 +1650,14 @@ def capture_tracked_tree_snapshot(
                             remaining=remaining,
                             started=started,
                             timeout_seconds=timeout_seconds,
+                            cancel=cancel,
                         )
                     )
             except (OSError, UnicodeError) as exc:
                 raise AgentLoopError("tracked file could not be read") from exc
         untracked_records: list[tuple[str, int, bytes]] = []
         for relative in untracked:
-            if time.monotonic() - started > timeout_seconds:
-                raise AgentLoopError("git snapshot time limit exceeded")
+            _snapshot_checkpoint(started, timeout_seconds, cancel)
             path = canonical_root / relative
             try:
                 if path.is_symlink():
@@ -1615,6 +1674,7 @@ def capture_tracked_tree_snapshot(
                             remaining=remaining,
                             started=started,
                             timeout_seconds=timeout_seconds,
+                            cancel=cancel,
                         )
                     )
                 else:
@@ -1625,6 +1685,7 @@ def capture_tracked_tree_snapshot(
             canonical_root,
             ("status", "--porcelain=v1", "-z", "--untracked-files=no"),
             timeout=timeout_seconds,
+            cancel=cancel,
         )
         dirty_gitlinks = _dirty_gitlink_paths(tracked_status, index_entries)
         # A gitlink object ID does not describe the checked-out submodule
@@ -1666,14 +1727,19 @@ def stable_tracked_tree_snapshot(
     max_files: int = MAX_SNAPSHOT_FILES,
     max_bytes: int = MAX_SNAPSHOT_BYTES,
     timeout_seconds: float = MAX_SNAPSHOT_SECONDS,
+    cancel: Event | None = None,
 ) -> TrackedTreeSnapshot:
     before = capture_tracked_tree_snapshot(
-        root, argv=argv, max_files=max_files, max_bytes=max_bytes, timeout_seconds=timeout_seconds
+        root, argv=argv, max_files=max_files, max_bytes=max_bytes,
+        timeout_seconds=timeout_seconds, cancel=cancel,
     )
     if not before.complete:
         return before
+    if cancel is not None and cancel.is_set():
+        raise SnapshotCancelled()
     after = capture_tracked_tree_snapshot(
-        root, argv=argv, max_files=max_files, max_bytes=max_bytes, timeout_seconds=timeout_seconds
+        root, argv=argv, max_files=max_files, max_bytes=max_bytes,
+        timeout_seconds=timeout_seconds, cancel=cancel,
     )
     if not after.complete:
         return after
@@ -1841,6 +1907,115 @@ def _send_frame(connection: socket.socket, payload: Mapping[str, object]) -> Non
     connection.sendall(struct.pack(">I", len(raw)) + raw)
 
 
+BROKER_STREAM_SEND_GRACE_SECONDS = 10.0
+BROKER_TERMINAL_SEND_GRACE_SECONDS = 2.0
+BROKER_SEND_CANCEL_POLL_SECONDS = 0.05
+
+
+def _cancelled_frame() -> dict[str, object]:
+    return {
+        "type": "result", "receipt_id": "", "execution_ref": None, "outcome": "cancelled",
+        "returncode": None, "elapsed_seconds": 0.0, "output_tail": "",
+        "suite_start": "not-started",
+        "diagnostic": "test command cancelled before launch (the broker is stopping)",
+    }
+
+
+def _host_heartbeat_grace() -> float:
+    from .test_workers import HOST_WAIT_HEARTBEAT_SEND_GRACE_SECONDS
+
+    return HOST_WAIT_HEARTBEAT_SEND_GRACE_SECONDS
+
+
+class _ConnectionSender:
+    """Bounded, cancellation-aware writer for one broker connection (#1108).
+
+    Every send is non-blocking and gives up at its grace.  A frame that cannot
+    be written completely (zero or some bytes) wedges the connection: it is
+    shut down and every later send returns at once, so no byte ever follows a
+    truncated frame and a client that stopped reading can only stall its own
+    handler, never the admission bound or broker shutdown.
+    """
+
+    def __init__(self, connection: socket.socket, cancel: Event) -> None:
+        self._connection = connection
+        self._cancel = cancel
+        self._lock = Lock()
+        self.wedged = False
+
+    def _wedge(self) -> None:
+        self.wedged = True
+        try:
+            self._connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def send(
+        self,
+        payload: Mapping[str, object],
+        *,
+        grace: float,
+        cancellable: bool = True,
+        skip_if_busy: bool = False,
+    ) -> bool:
+        """Send one frame; return whether it was delivered or deliberately skipped-safe.
+
+        ``skip_if_busy`` (heartbeats) skips the beat, without wedging, when the
+        lock is busy or nothing at all could be written.
+        """
+        raw = json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(raw) > BROKER_FRAME_LIMIT:
+            raise BrokerProtocolError("broker response exceeds 128 KiB limit")
+        frame = struct.pack(">I", len(raw)) + raw
+        if self.wedged:
+            return False
+        # One deadline covers lock acquisition and writing.
+        deadline = time.monotonic() + max(0.0, grace)
+        if skip_if_busy:
+            if not self._lock.acquire(blocking=False):
+                return False
+        else:
+            while not self._lock.acquire(
+                timeout=max(0.0, min(BROKER_SEND_CANCEL_POLL_SECONDS, deadline - time.monotonic()))
+            ):
+                if time.monotonic() >= deadline or (cancellable and self._cancel.is_set()):
+                    # Another send holds the lock mid-frame: fail this send
+                    # and wedge, so no later frame can interleave.
+                    self._wedge()
+                    return False
+        try:
+            if self.wedged:
+                return False
+            view = memoryview(frame)
+            sent = 0
+            while sent < len(frame):
+                try:
+                    count = self._connection.send(view[sent:], socket.MSG_DONTWAIT)
+                except (BlockingIOError, InterruptedError):
+                    if sent == 0 and skip_if_busy:
+                        return False
+                    now = time.monotonic()
+                    if now >= deadline or (cancellable and self._cancel.is_set()):
+                        self._wedge()
+                        return False
+                    try:
+                        select.select(
+                            [], [self._connection],
+                            [], min(BROKER_SEND_CANCEL_POLL_SECONDS, deadline - now),
+                        )
+                    except (OSError, ValueError):
+                        self._wedge()
+                        return False
+                    continue
+                except OSError:
+                    self._wedge()
+                    return False
+                sent += count
+            return True
+        finally:
+            self._lock.release()
+
+
 def _validate_broker_request(
     request: Mapping[str, object], *, turn_id: str, capability: str, root: Path, ceiling: float
 ) -> dict[str, object]:
@@ -1984,6 +2159,12 @@ class TestBrokerServer:
         self._handler_threads: set[Thread] = set()
         self._stop = False
         self._send_lock = Lock()
+        # Issue #1108: pending admission is cancelled by ``_stop_event``; the
+        # launch lock synchronises stop() with target launch + registration.
+        self._stop_event = Event()
+        self._launch_lock = Lock()
+        self._deferred_close = False
+        self._resource_lock = Lock()
         self._journal: list[LocalTestObservation] = []
         # Reservations are retained for the broker lifetime. New work fails
         # closed at the bound instead of making an old authenticated nonce
@@ -2107,8 +2288,14 @@ class TestBrokerServer:
         server, self._socket = self._socket, None
         if server is not None:
             server.close()
-        with self._journal_lock:
-            active = list(self._active_processes.values())
+        # Either the runner's guarded launch completes first and its process is
+        # in the snapshot below, or it sees the event and launches nothing.
+        with self._launch_lock:
+            with self._journal_lock:
+                # Shared with evidence publication: a journal append either
+                # precedes this point or observes the stop and is unattributed.
+                self._stop_event.set()
+                active = list(self._active_processes.values())
         for proc in active:
             if proc.poll() is None:
                 try:
@@ -2130,17 +2317,31 @@ class TestBrokerServer:
         for handler in handlers:
             if handler is not current_thread():
                 handler.join(timeout=5)
-        if self._runtime_dir is not None:
+        with self._journal_lock:
+            still_running = any(
+                handler.is_alive() and handler is not current_thread()
+                for handler in self._handler_threads
+            )
+            if still_running:
+                # A handler (e.g. in one stalled file read) must never run
+                # against closed resources; the last one to exit closes them.
+                self._deferred_close = True
+        if not still_running:
+            self._close_resources()
+
+    def _close_resources(self) -> None:
+        with self._resource_lock:
+            runtime_dir, self._runtime_dir = self._runtime_dir, None
+            pinned_root, self._pinned_root = self._pinned_root, None
+        if runtime_dir is not None:
             try:
-                for item in self._runtime_dir.iterdir():
+                for item in runtime_dir.iterdir():
                     item.unlink(missing_ok=True)
-                self._runtime_dir.rmdir()
+                runtime_dir.rmdir()
             except OSError:
                 pass
-            self._runtime_dir = None
-        if self._pinned_root is not None:
-            self._pinned_root.close()
-            self._pinned_root = None
+        if pinned_root is not None:
+            pinned_root.close()
 
     def snapshot_journal(self) -> tuple[LocalTestObservation, ...]:
         return self.journal
@@ -2168,6 +2369,8 @@ class TestBrokerServer:
 
     def _handle(self, connection: socket.socket) -> None:
         validated: Mapping[str, object] | None = None
+        sender = _ConnectionSender(connection, self._stop_event)
+        terminal = BROKER_TERMINAL_SEND_GRACE_SECONDS
         try:
             with connection:
                 try:
@@ -2192,13 +2395,27 @@ class TestBrokerServer:
                         elif reservation.digest != digest:
                             raise BrokerProtocolError("conflicting replay for nonce")
                     if not owns_reservation:
-                        reservation.ready.wait()
+                        from .test_workers import HOST_WAIT_HEARTBEAT_SECONDS
+
+                        last_frame = time.monotonic()
+                        while not reservation.ready.wait(BROKER_SEND_CANCEL_POLL_SECONDS):
+                            if self._stop_event.is_set():
+                                # Cancel this follower alone: the owner's
+                                # reservation is left untouched.
+                                sender.send(_cancelled_frame(), grace=terminal, cancellable=False)
+                                return
+                            if time.monotonic() - last_frame >= HOST_WAIT_HEARTBEAT_SECONDS:
+                                last_frame = time.monotonic()
+                                sender.send(
+                                    {"type": "output", "data": ""},
+                                    grace=_host_heartbeat_grace(), skip_if_busy=True,
+                                )
                         if reservation.response is None:
                             raise BrokerProtocolError("broker replay did not complete")
-                        _send_frame(connection, reservation.response)
+                        sender.send(reservation.response, grace=terminal, cancellable=False)
                         return
                     try:
-                        response = self._execute_request(validated, connection)
+                        response = self._execute_request(validated, connection, sender)
                     except (BrokerProtocolError, AgentLoopError, OSError, ValueError) as exc:
                         if isinstance(exc, AgentLoopError):
                             self._record_capture_failure(validated, exc)
@@ -2213,7 +2430,7 @@ class TestBrokerServer:
                         with self._journal_lock:
                             reservation.response = response
                             reservation.ready.set()
-                    _send_frame(connection, response)
+                    sender.send(response, grace=terminal, cancellable=False)
                 except (BrokerProtocolError, AgentLoopError, OSError, ValueError) as exc:
                     if (
                         isinstance(exc, AgentLoopError)
@@ -2222,12 +2439,18 @@ class TestBrokerServer:
                     ):
                         self._record_capture_failure(validated, exc)
                     try:
-                        _send_frame(connection, {"type": "error", "error": _safe_text(exc)})
-                    except OSError:
+                        sender.send(
+                            {"type": "error", "error": _safe_text(exc)},
+                            grace=terminal, cancellable=False,
+                        )
+                    except (OSError, BrokerProtocolError):
                         pass
         finally:
             with self._journal_lock:
                 self._handler_threads.discard(current_thread())
+                close_now = self._deferred_close and not self._handler_threads
+            if close_now:
+                self._close_resources()
 
     def _record_capture_failure(
         self,
@@ -2321,8 +2544,16 @@ class TestBrokerServer:
             row.execution_ref == observation.execution_ref for row in self._journal
         ) else None
 
-    def _execute_request(self, request: Mapping[str, object], connection: socket.socket) -> dict[str, object]:
+    def _execute_request(
+        self,
+        request: Mapping[str, object],
+        connection: socket.socket,
+        sender: "_ConnectionSender | None" = None,
+    ) -> dict[str, object]:
         from .containment import open_confined_cwd
+
+        if sender is None:
+            sender = _ConnectionSender(connection, self._stop_event)
 
         argv = tuple(request["argv"])  # type: ignore[arg-type]
         requested_cwd = Path(request["cwd"])  # type: ignore[arg-type]
@@ -2347,12 +2578,24 @@ class TestBrokerServer:
             def stream(chunk: str) -> None:
                 safe = chunk.encode("utf-8", errors="replace")[:16 * 1024].decode("utf-8", errors="ignore")
                 try:
-                    with self._send_lock:
-                        _send_frame(connection, {"type": "output", "data": safe})
+                    # A disconnected or non-reading client never stops the
+                    # target; the evidence result is still returned.
+                    sender.send(
+                        {"type": "output", "data": safe}, grace=BROKER_STREAM_SEND_GRACE_SECONDS,
+                    )
                 except OSError:
-                    # The target remains bounded and the evidence result can
-                    # still be returned; a disconnected client is a capture caveat.
                     pass
+
+            def heartbeat() -> None:
+                sender.send(
+                    {"type": "output", "data": ""},
+                    grace=_host_heartbeat_grace(), skip_if_busy=True,
+                )
+
+            def wait_notice(text: str) -> None:
+                sender.send(
+                    {"type": "output", "data": text + "\n"}, grace=_host_heartbeat_grace(),
+                )
 
             if self._execute is not None:
                 result = self._execute(argv, cwd, float(request["timeout_seconds"]), environment, stream)
@@ -2391,6 +2634,10 @@ class TestBrokerServer:
                     reservation_telemetry=telemetry,
                     worker_budget=self.effective_worker_budget(environment),
                     worker_lock_root=self._worker_lock_root,
+                    host_wait_cancel=self._stop_event,
+                    host_wait_heartbeat=heartbeat,
+                    host_wait_notify=wait_notice,
+                    host_launch_guard=lambda: self._launch_lock,
                     cwd=cwd,
                     cwd_fd=confined.fd,
                     timeout_seconds=float(request["timeout_seconds"]),
@@ -2410,12 +2657,31 @@ class TestBrokerServer:
                     wrapper_bootstrap="verified",
                     health_provenance="broker-parent",
                 )
-            after = stable_tracked_tree_snapshot(
-                self.root,
-                argv=argv,
-                timeout_seconds=min(MAX_SNAPSHOT_SECONDS, self.timeout_ceiling),
+            if str(getattr(result, "outcome", "")) == "cancelled":
+                # Nothing launched: no post-run snapshot, attribution or evidence.
+                return _cancelled_frame()
+            shutdown = self._stop_event.is_set()
+            after = None
+            if not shutdown:
+                try:
+                    after = stable_tracked_tree_snapshot(
+                        self.root,
+                        argv=argv,
+                        timeout_seconds=min(MAX_SNAPSHOT_SECONDS, self.timeout_ceiling),
+                        cancel=self._stop_event,
+                    )
+                except SnapshotCancelled:
+                    shutdown = True
+        if shutdown or after is None:
+            # The target ran before the broker stopped: record it, but never as
+            # attributable (passing) evidence.
+            attribution = TreeAttribution(
+                state="unknown",
+                stable=False,
+                caveats=("unattributed: broker shutdown",),
             )
-        attribution = attribute_current_head(before, after, current_head=after.head, argv=argv)
+        else:
+            attribution = attribute_current_head(before, after, current_head=after.head, argv=argv)
         identity = self._environment_registry.capture(environment)
         from .test_runtime import normalize_test_command
         # Keep the shared registry private to the broker process; the bytes are
@@ -2438,7 +2704,7 @@ class TestBrokerServer:
                 + " ".join(str(item) for item in getattr(result, "args", argv))[:512],
             )
         if suite_start != "not-started" and str(getattr(result, "outcome", "")) not in {
-            "overlap-rejected", "worker-budget-busy", "worker-budget-refused",
+            "overlap-rejected", "worker-budget-busy", "worker-budget-refused", "cancelled",
         }:
             observation = LocalTestObservation(
                 command=argv,
@@ -2461,6 +2727,14 @@ class TestBrokerServer:
                 suite_start=suite_start,
             )
             with self._journal_lock:
+                if self._stop_event.is_set() and "unattributed: broker shutdown" not in observation.attribution.caveats:
+                    observation = replace(
+                        observation,
+                        attribution=TreeAttribution(
+                            state="unknown", stable=False,
+                            caveats=("unattributed: broker shutdown",),
+                        ),
+                    )
                 retained = self._append_journal_locked(observation)
                 execution_ref = retained.execution_ref if retained is not None else None
         return {

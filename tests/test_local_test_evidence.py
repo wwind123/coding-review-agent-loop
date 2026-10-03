@@ -2084,3 +2084,1679 @@ def test_sealing_that_shrinks_command_under_the_limit_is_stable():
     twice = redact_observation(once)
     assert twice.command == once.command
     assert twice.normalized_command == once.normalized_command
+
+
+# --- bounded host-capacity wait through the broker (#1108) -------------------------
+
+import time  # noqa: E402
+
+from coding_review_agent_loop.test_workers import (  # noqa: E402
+    ENV_HOST_WAIT,
+    HostCapacity,
+    WorkerBudget,
+    WorkerBudgetLock,
+)
+
+_GIB = 1024 ** 3
+_PRINTER_ARGV = (sys.executable, "-c", "import os; print('workers=' + os.environ['AGENT_LOOP_TEST_WORKERS'])")
+
+
+def _wait_budget(workers=4):
+    return WorkerBudget(
+        workers, "inherited", "clamp", "cpu",
+        {"cpu_available": 4, "host_usable_bytes": 64 * _GIB, "per_worker_bytes": _GIB, "reserve_bytes": _GIB},
+        False,
+    )
+
+
+def _wait_server(tmp_path, turn_id):
+    server = BrokerServer(root=tmp_path, turn_id=turn_id).start()
+    locks = tmp_path.parent / f"{tmp_path.name}-locks"
+    server._worker_lock_root = locks
+    server.set_execution_context(
+        containment_handle=None, process_started=None, process_finished=None,
+        worker_budget=_wait_budget(),
+    )
+    return server, locks
+
+
+def _foreign_holder(locks, workers=4):
+    lock, problem = WorkerBudgetLock.acquire(invocation_id="foreign", cwd=locks, root=locks)
+    assert lock is not None, problem
+    assert lock.reserve_host_workers(workers, HostCapacity(4, 1024 * _GIB, _GIB)) == workers
+    return lock
+
+
+def _wait_request(server, tmp_path, nonce, wait_seconds, argv=_PRINTER_ARGV):
+    request = _signed_broker_request(server, tmp_path, nonce, argv)
+    request["timeout_seconds"] = 1
+    request["environment"] = {**request["environment"], ENV_HOST_WAIT: str(wait_seconds)}
+    return request
+
+
+class _FrameReader:
+    """Reads broker frames on a thread, recording heartbeat timing."""
+
+    def __init__(self, server, request):
+        self.beats = []
+        self.final = None
+        self.error = None
+        self._connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._connection.settimeout(11)  # the minimum client receive timeout
+        self._connection.connect(server.endpoint)
+        evidence_module._send_frame(self._connection, request)
+        self.thread = threading.Thread(target=self._run)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            while True:
+                frame = evidence_module._recv_frame(self._connection)
+                if frame.get("type") == "output":
+                    if frame.get("data") == "":
+                        self.beats.append(time.monotonic())
+                    continue
+                self.final = frame
+                return
+        except Exception as exc:  # noqa: BLE001
+            self.error = exc
+        finally:
+            self._connection.close()
+
+    def join(self, timeout):
+        self.thread.join(timeout)
+        assert not self.thread.is_alive()
+
+
+def test_broker_clients_and_replay_followers_survive_a_long_wait(tmp_path):
+    server, locks = _wait_server(tmp_path, "turn-wait-keepalive")
+    holder = _foreign_holder(locks)
+    try:
+        marker = tmp_path / "runs.txt"
+        request = _wait_request(
+            server, tmp_path, "c" * 32, 60,
+            argv=(sys.executable, "-c", (
+                f"open({str(marker)!r}, 'a').write('x'); import os; "
+                "print('workers=' + os.environ['AGENT_LOOP_TEST_WORKERS'])"
+            )),
+        )
+        owner = _FrameReader(server, request)
+        time.sleep(1.0)
+        follower = _FrameReader(server, request)
+        time.sleep(12.5)  # longer than either client's ~11 s receive timeout
+        assert owner.final is None and follower.final is None
+        holder.close()
+        owner.join(15)
+        follower.join(15)
+        assert owner.error is None and follower.error is None
+        assert owner.final["outcome"] == "passed" and "workers=4" in owner.final["output_tail"]
+        assert follower.final == owner.final  # one execution, one receipt
+        assert marker.read_text() == "x"  # the target executed exactly once
+        assert len(owner.beats) >= 4 and len(follower.beats) >= 4
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_broker_stop_cancels_a_pending_admission_and_launches_nothing(tmp_path):
+    marker = tmp_path / "spawned"
+    server, locks = _wait_server(tmp_path, "turn-wait-stop")
+    holder = _foreign_holder(locks)
+    try:
+        request = _wait_request(
+            server, tmp_path, "d" * 32, 60,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        reader = _FrameReader(server, request)
+        time.sleep(0.8)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 5
+        reader.join(10)
+        assert reader.final["outcome"] == "cancelled" and reader.final["returncode"] is None
+        holder.close()
+        time.sleep(0.5)
+        assert not marker.exists()
+        assert server.journal == ()
+        again, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert again is not None, problem  # the per-invocation flock was released
+        again.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_broker_stop_during_accounting_mutex_contention(tmp_path):
+    server, locks = _wait_server(tmp_path, "turn-wait-mutex")
+    code = (
+        "import sys, time, fcntl, pathlib; "
+        "h = open(pathlib.Path(sys.argv[1]) / 'host-capacity.mutex', 'a+'); "
+        "fcntl.flock(h.fileno(), fcntl.LOCK_EX); print('held', flush=True); time.sleep(60)"
+    )
+    locks.mkdir(mode=0o700, parents=True, exist_ok=True)
+    holder = subprocess.Popen([sys.executable, "-c", code, str(locks)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        request = _wait_request(server, tmp_path, "e" * 32, 60)
+        reader = _FrameReader(server, request)
+        time.sleep(0.8)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 5
+        reader.join(10)
+        assert reader.final["outcome"] == "cancelled"
+    finally:
+        holder.kill()
+        holder.wait()
+        server.stop()
+
+
+def test_launch_guard_race_runner_sees_cancellation_and_never_launches(tmp_path):
+    marker = tmp_path / "spawned"
+    server, locks = _wait_server(tmp_path, "turn-launch-race")
+    try:
+        request = _wait_request(
+            server, tmp_path, "f" * 32, 5,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        server._launch_lock.acquire()  # a stop() that is already past its snapshot
+        reader = _FrameReader(server, request)
+        time.sleep(1.0)  # the handler is now waiting at the launch guard
+        server._stop_event.set()
+        server._launch_lock.release()
+        reader.join(10)
+        assert reader.final["outcome"] == "cancelled" and not marker.exists()
+    finally:
+        server.stop()
+
+
+def test_stopped_running_target_is_recorded_unattributed(tmp_path):
+    server, locks = _wait_server(tmp_path, "turn-running-stop")
+    try:
+        request = _wait_request(
+            server, tmp_path, "9" * 32, 5, argv=(sys.executable, "-c", "import time; time.sleep(60)"),
+        )
+        request["timeout_seconds"] = 120
+        reader = _FrameReader(server, request)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not server._active_processes:
+            time.sleep(0.05)
+        assert server._active_processes
+        server.stop()
+        reader.join(15)
+        assert reader.final["outcome"] != "passed"
+        (observation,) = server.journal
+        assert observation.attribution.state == "unknown"
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+        assert observation.returncode == reader.final["returncode"]
+    finally:
+        server.stop()
+
+
+def test_stalled_handler_defers_resource_closure_to_the_last_handler(tmp_path, monkeypatch):
+    release = threading.Event()
+    entered = threading.Event()
+    real = evidence_module.stable_tracked_tree_snapshot
+
+    def stalled(*args, **kwargs):
+        entered.set()
+        assert release.wait(30)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stalled)
+
+    def execute(argv, cwd, timeout, environment, stream):
+        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+
+    server = BrokerServer(root=tmp_path, turn_id="turn-deferred", execute=execute).start()
+    reader = _FrameReader(server, _signed_broker_request(server, tmp_path, "8" * 32))
+    try:
+        assert entered.wait(5)
+        server.stop()  # joins its 5 s bound, then must not close under the handler
+        assert server._deferred_close and server._pinned_root is not None
+        assert server._runtime_dir is not None
+        release.set()
+        reader.join(15)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and server._runtime_dir is not None:
+            time.sleep(0.05)
+        assert server._runtime_dir is None and server._pinned_root is None
+        (observation,) = server.journal
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+    finally:
+        release.set()
+
+
+def test_connection_sender_bounds_every_send_and_never_writes_after_a_truncated_frame():
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    cancel = threading.Event()
+    sender = evidence_module._ConnectionSender(left, cancel)
+    try:
+        # Fill the send buffer: the peer never reads.
+        left.setblocking(False)
+        try:
+            while True:
+                left.send(b"x" * 1024)
+        except BlockingIOError:
+            pass
+        left.setblocking(True)
+        started = time.monotonic()
+        assert sender.send({"type": "output", "data": ""}, grace=0.5, skip_if_busy=True) is False
+        assert time.monotonic() - started < 0.3 and not sender.wedged  # skipped, not wedged
+        started = time.monotonic()
+        assert sender.send({"type": "output", "data": "notice"}, grace=0.3) is False
+        assert 0.25 <= time.monotonic() - started < 1.5
+        assert sender.wedged
+        started = time.monotonic()
+        assert sender.send({"type": "result"}, grace=5) is False  # later sends return at once
+        assert time.monotonic() - started < 0.2
+    finally:
+        left.close()
+        right.close()
+
+
+def test_connection_sender_cancel_wakes_a_blocked_send():
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    cancel = threading.Event()
+    sender = evidence_module._ConnectionSender(left, cancel)
+    try:
+        left.setblocking(False)
+        try:
+            while True:
+                left.send(b"x" * 1024)
+        except BlockingIOError:
+            pass
+        left.setblocking(True)
+        threading.Timer(0.2, cancel.set).start()
+        started = time.monotonic()
+        assert sender.send({"type": "output", "data": "y"}, grace=30) is False
+        assert time.monotonic() - started < 3 and sender.wedged
+    finally:
+        left.close()
+        right.close()
+
+
+def test_connection_sender_delivers_complete_frames_to_a_slow_reader():
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    left.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    sender = evidence_module._ConnectionSender(left, threading.Event())
+    payload = {"type": "output", "data": "z" * 60000}
+    received = []
+    reader = threading.Thread(
+        target=lambda: (time.sleep(0.3), received.append(evidence_module._recv_frame(right)))
+    )
+    reader.start()
+    try:
+        assert sender.send(payload, grace=10) is True
+        reader.join(10)
+        assert received == [payload]
+    finally:
+        left.close()
+        right.close()
+
+
+# --- review round 1 (#1108) --------------------------------------------------------
+
+import struct  # noqa: E402
+
+from coding_review_agent_loop import runner as runner_module  # noqa: E402
+from coding_review_agent_loop import test_workers as workers_module  # noqa: E402
+
+
+def _hold_mutex(locks, seconds):
+    code = (
+        "import sys, time, fcntl, pathlib; "
+        "h = open(pathlib.Path(sys.argv[1]) / 'host-capacity.mutex', 'a+'); "
+        "fcntl.flock(h.fileno(), fcntl.LOCK_EX); print('held', flush=True); time.sleep(float(sys.argv[2]))"
+    )
+    locks.mkdir(mode=0o700, parents=True, exist_ok=True)
+    proc = subprocess.Popen([sys.executable, "-c", code, str(locks), str(seconds)], stdout=subprocess.PIPE, text=True)
+    assert proc.stdout.readline().strip() == "held"
+    return proc
+
+
+def _blocked_first_sender(monkeypatch):
+    """Make the first connection's sender start with a full send buffer."""
+    real = evidence_module._ConnectionSender
+    created = []
+
+    class Blocked(real):
+        def __init__(self, connection, cancel):
+            super().__init__(connection, cancel)
+            if not created:
+                connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+                raw = b'{"type":"output","data":""}'
+                frame = struct.pack(">I", len(raw)) + raw
+                connection.setblocking(False)
+                try:
+                    while True:
+                        connection.send(frame)
+                except BlockingIOError:
+                    pass
+                connection.setblocking(True)
+            created.append(self)
+
+    monkeypatch.setattr(evidence_module, "_ConnectionSender", Blocked)
+    return created
+
+
+def _open_silent_client(server, request):
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.connect(server.endpoint)
+    evidence_module._send_frame(connection, request)
+    return connection  # never reads until the test drains it
+
+
+def _drain_frames(connection):
+    connection.settimeout(2)
+    data = b""
+    try:
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (socket.timeout, OSError):
+        pass
+    frames, offset = [], 0
+    while offset + 4 <= len(data):
+        (length,) = struct.unpack(">I", data[offset:offset + 4])
+        if offset + 4 + length > len(data):
+            break  # truncated tail: nothing may follow it
+        frames.append(json.loads(data[offset + 4:offset + 4 + length]))
+        offset += 4 + length
+    return frames
+
+
+def test_connection_sender_lock_contention_shares_one_cancellable_deadline():
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    cancel = threading.Event()
+    sender = evidence_module._ConnectionSender(left, cancel)
+    sender._lock.acquire()  # another send is mid-frame
+    try:
+        started = time.monotonic()
+        assert sender.send({"type": "output", "data": "a"}, grace=0.4) is False
+        assert 0.3 <= time.monotonic() - started < 1.5 and sender.wedged
+    finally:
+        sender._lock.release()
+    other = evidence_module._ConnectionSender(left, cancel)
+    other._lock.acquire()
+    try:
+        threading.Timer(0.2, cancel.set).start()
+        started = time.monotonic()
+        assert other.send({"type": "output", "data": "b"}, grace=30) is False
+        assert time.monotonic() - started < 3 and other.wedged
+    finally:
+        other._lock.release()
+        left.close()
+        right.close()
+
+
+def test_stop_after_the_snapshot_but_before_publication_is_unattributed(tmp_path, monkeypatch):
+    calls = []
+    real = evidence_module.stable_tracked_tree_snapshot
+    holder = {}
+
+    def snapshot(*args, **kwargs):
+        result = real(*args, **kwargs)
+        calls.append(1)
+        if len(calls) == 2:  # the post-run snapshot has just finished cleanly
+            holder["server"]._stop_event.set()
+        return result
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", snapshot)
+
+    def execute(argv, cwd, timeout, environment, stream):
+        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+
+    server = BrokerServer(root=tmp_path, turn_id="turn-pub-race", execute=execute).start()
+    holder["server"] = server
+    try:
+        response = _raw_broker_request(server, _signed_broker_request(server, tmp_path, "7" * 32))
+        assert response["outcome"] == "passed" and response["returncode"] == 0
+        (observation,) = server.journal
+        assert observation.attribution.state == "unknown"
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+    finally:
+        server.stop()
+
+
+def test_accounting_mutex_contention_keeps_a_minimum_timeout_client_alive(tmp_path):
+    server, locks = _wait_server(tmp_path, "turn-mutex-keepalive")
+    holder = _hold_mutex(locks, 13)
+    try:
+        reader = _FrameReader(server, _wait_request(server, tmp_path, "6" * 32, 60))
+        reader.join(30)
+        assert reader.error is None
+        assert reader.final["outcome"] == "passed" and "workers=4" in reader.final["output_tail"]
+        assert len(reader.beats) >= 4
+    finally:
+        holder.kill()
+        holder.wait()
+        server.stop()
+
+
+def test_backpressure_cannot_stall_admission_or_other_connections(tmp_path, monkeypatch):
+    monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 0.2)
+    monkeypatch.setattr(workers_module, "HOST_WAIT_NOTICE_INTERVAL_SECONDS", 0.3)
+    created = _blocked_first_sender(monkeypatch)
+    server, locks = _wait_server(tmp_path, "turn-backpressure")
+    holder = _foreign_holder(locks)
+    try:
+        request = _wait_request(server, tmp_path, "5" * 32, 1.5)
+        blocked = _open_silent_client(server, request)
+        time.sleep(0.3)
+        # An identical replay follower is a second, unblocked connection.
+        other = _FrameReader(server, request)
+        time.sleep(1.0)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (created and created[0].wedged):
+            time.sleep(0.1)
+        assert created[0].wedged  # a notice or heartbeat gave up within its grace
+        assert len(other.beats) >= 2  # the other connection kept its heartbeats
+        handlers = list(server._handler_threads)
+        # The blocked request's admission bound still expired on time: its
+        # target ran oversubscribed and its handler finished.
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and any(h.is_alive() for h in handlers[:1]):
+            time.sleep(0.1)
+        assert not handlers[0].is_alive()
+        frames = _drain_frames(blocked)
+        assert all(isinstance(frame, dict) for frame in frames)
+        blocked.close()
+        other.join(20)
+        assert other.final["outcome"] == "passed" and other.error is None
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_terminal_backpressure_after_cancel_is_bounded_and_replay_completes(tmp_path, monkeypatch):
+    _blocked_first_sender(monkeypatch)
+    server, locks = _wait_server(tmp_path, "turn-terminal-bp")
+    holder = _foreign_holder(locks)
+    try:
+        nonce = "3" * 32
+        blocked = _open_silent_client(server, _wait_request(server, tmp_path, nonce, 60))
+        time.sleep(0.8)
+        handlers = list(server._handler_threads)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 6
+        assert not any(handler.is_alive() for handler in handlers)
+        reservation = server._receipts[nonce + "." + hmac.new(
+            server.capability.encode("ascii"), nonce.encode("ascii"), hashlib.sha256
+        ).hexdigest()]
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "cancelled"
+        blocked.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_stop_during_probe_after_grant_with_mutex_held_releases_everything(tmp_path, monkeypatch):
+    from coding_review_agent_loop.test_runtime import LauncherProbeResult
+
+    marker = tmp_path / "spawned"
+    entered = threading.Event()
+
+    def slow_probe(argv, **kwargs):
+        entered.set()
+        kwargs["cancel"].wait(30)
+        return LauncherProbeResult(tuple(argv), "unknown", "inner probe cancelled")
+
+    monkeypatch.setattr(runner_module, "probe_inner_launcher", slow_probe)
+    server, locks = _wait_server(tmp_path, "turn-probe-stop")
+    holder = None
+    try:
+        request = _wait_request(
+            server, tmp_path, "2" * 32, 5,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        reader = _FrameReader(server, request)
+        assert entered.wait(10)  # granted, now in the probe
+        holder = _hold_mutex(locks, 30)  # release bookkeeping must stay bounded
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 6
+        reader.join(10)
+        assert reader.final["outcome"] == "cancelled" and not marker.exists()
+        assert not server._active_processes
+        holder.kill()
+        holder.wait()
+        probe_lock, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert probe_lock is not None, problem  # invocation flock released
+        # A record left by the skipped release is reclaimed as stale.
+        assert probe_lock.reserve_host_workers(
+            4, HostCapacity(4, 1024 * _GIB, _GIB), exclusive=True,
+        ) == 4
+        probe_lock.close()
+    finally:
+        if holder is not None:
+            holder.kill()
+        server.stop()
+
+
+def test_cancelled_admission_takes_only_the_pre_run_snapshot(tmp_path, monkeypatch):
+    calls = []
+    real = evidence_module.stable_tracked_tree_snapshot
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", counting)
+    server, locks = _wait_server(tmp_path, "turn-cancel-snap")
+    holder = _foreign_holder(locks)
+    try:
+        reader = _FrameReader(server, _wait_request(server, tmp_path, "1" * 32, 60))
+        time.sleep(0.8)
+        server.stop()
+        reader.join(10)
+        assert reader.final["outcome"] == "cancelled"
+        assert len(calls) == 1 and server.journal == ()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_replay_follower_is_cancelled_alone_while_the_owner_is_stalled(tmp_path, monkeypatch):
+    release = threading.Event()
+    entered = threading.Event()
+    executions = []
+    real = evidence_module.stable_tracked_tree_snapshot
+    state = {"n": 0}
+
+    def stalled(*args, **kwargs):
+        state["n"] += 1
+        if state["n"] == 2:  # the post-run snapshot stalls in a single read
+            entered.set()
+            assert release.wait(30)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stalled)
+
+    def execute(argv, cwd, timeout, environment, stream):
+        executions.append(argv)
+        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+
+    server = BrokerServer(root=tmp_path, turn_id="turn-follower-stop", execute=execute).start()
+    request = _signed_broker_request(server, tmp_path, "0" * 32)
+    owner = _FrameReader(server, request)
+    try:
+        assert entered.wait(10)
+        follower = _FrameReader(server, request)
+        time.sleep(0.5)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 8
+        follower.join(5)
+        assert follower.final["outcome"] == "cancelled"
+        reservation = next(iter(server._receipts.values()))
+        assert reservation.response is None and not reservation.ready.is_set()
+        assert server._runtime_dir is not None and server._deferred_close
+        release.set()
+        owner.join(10)
+        assert owner.final["outcome"] == "passed" and len(executions) == 1
+        (observation,) = server.journal
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and server._runtime_dir is not None:
+            time.sleep(0.05)
+        assert server._runtime_dir is None
+    finally:
+        release.set()
+
+
+def _git_repo(path, size=0):
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    (path / "a.txt").write_text("hello")
+    if size:
+        (path / "big.bin").write_bytes(b"x" * size)
+    subprocess.run(["git", "-C", str(path), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.email=a@b", "-c", "user.name=n", "commit", "-qm", "m"],
+        check=True,
+    )
+
+
+def test_snapshot_cancel_propagates_mid_hash_and_is_not_an_incomplete_result(tmp_path, monkeypatch):
+    _git_repo(tmp_path, size=4 * 1024 * 1024)
+    cancel = threading.Event()
+    real = evidence_module._snapshot_checkpoint
+    state = {"n": 0}
+
+    def checkpoint(started, timeout_seconds, event):
+        state["n"] += 1
+        if state["n"] == 6:  # inside the big file's chunk loop
+            cancel.set()
+        return real(started, timeout_seconds, event)
+
+    monkeypatch.setattr(evidence_module, "_snapshot_checkpoint", checkpoint)
+    with pytest.raises(evidence_module.SnapshotCancelled):
+        evidence_module.stable_tracked_tree_snapshot(tmp_path, cancel=cancel)
+    assert cancel.is_set()
+
+
+def test_snapshot_cancel_kills_a_running_git_subprocess(tmp_path, monkeypatch):
+    _git_repo(tmp_path)
+    cancel = threading.Event()
+    real_popen = subprocess.Popen
+    spawned = []
+
+    def slow_git(command, **kwargs):
+        proc = real_popen(["sleep", "30"], **kwargs)
+        spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(evidence_module.subprocess, "Popen", slow_git)
+    threading.Timer(0.3, cancel.set).start()
+    started = time.monotonic()
+    with pytest.raises(evidence_module.SnapshotCancelled):
+        evidence_module.stable_tracked_tree_snapshot(tmp_path, cancel=cancel)
+    assert time.monotonic() - started < 5
+    assert spawned and spawned[0].poll() is not None
+
+
+def test_probe_cancel_kills_the_probe_group(tmp_path):
+    from coding_review_agent_loop import test_runtime as runtime
+
+    cancel = threading.Event()
+    threading.Timer(0.3, cancel.set).start()
+    started = time.monotonic()
+    with pytest.raises(runtime.ProbeCancelled):
+        runtime._run_bounded_probe(
+            ["sleep", "30"], cwd=tmp_path, env=None, timeout_seconds=30, cancel=cancel,
+        )
+    assert time.monotonic() - started < 5
+
+
+# --- review round 2 (#1108) --------------------------------------------------------
+
+
+class _PartialWriteConnection:
+    """Writes only the first `limit` bytes of its first send, then reports a full buffer forever."""
+
+    def __init__(self, connection, limit):
+        self._connection = connection
+        self._limit = limit
+        self._spent = False
+        self.written_after_partial = 0
+
+    def send(self, data, flags=0):
+        if self._spent:
+            self.written_after_partial += 1
+            raise BlockingIOError()
+        self._spent = True
+        return self._connection.send(bytes(data[: self._limit]), flags)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+def _gated_first_sender(monkeypatch):
+    """First connection's sender fills its send buffer when `gate` is set (before its next send)."""
+    real = evidence_module._ConnectionSender
+    created = []
+    gate = threading.Event()
+    state = {"wedged_at_fill": None, "filled": threading.Event()}
+
+    class Gated(real):
+        def __init__(self, connection, cancel):
+            super().__init__(connection, cancel)
+            self.first = not created
+            self.filled = False
+            created.append(self)
+
+        def send(self, payload, **kwargs):
+            if self.first and gate.is_set() and not self.filled:
+                self.filled = True
+                state["wedged_at_fill"] = self.wedged
+                if state.get("partial"):
+                    self._connection = _PartialWriteConnection(self._connection, state["partial"])
+                    state["filled"].set()
+                    return super().send(payload, **kwargs)
+                self._connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+                raw = b'{"type":"output","data":""}'
+                frame = struct.pack(">I", len(raw)) + raw
+                self._connection.setblocking(False)
+                try:
+                    while True:
+                        self._connection.send(frame)
+                except BlockingIOError:
+                    pass
+                self._connection.setblocking(True)
+                state["filled"].set()
+                if state.get("pause"):
+                    time.sleep(state["pause"])  # lets the client free a little room
+            return super().send(payload, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "_ConnectionSender", Gated)
+    return created, gate, state
+
+
+def _read_until_notice(connection):
+    connection.settimeout(10)
+    while True:
+        frame = evidence_module._recv_frame(connection)
+        if "waiting at most" in str(frame.get("data", "")):
+            return
+
+
+def _strict_frames(connection):
+    """Decode every complete frame strictly; only a truncated tail may remain."""
+    connection.settimeout(2)
+    data = b""
+    try:
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (socket.timeout, OSError):
+        pass
+    frames, offset = [], 0
+    while offset + 4 <= len(data):
+        (length,) = struct.unpack(">I", data[offset:offset + 4])
+        if offset + 4 + length > len(data):
+            return frames, True
+        frames.append(json.loads(data[offset + 4:offset + 4 + length]))  # raises on bytes after a truncation
+        offset += 4 + length
+    return frames, False
+
+
+def test_notice_and_heartbeat_backpressure_after_an_unwedged_start(tmp_path, monkeypatch):
+    monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 0.2)
+    monkeypatch.setattr(workers_module, "HOST_WAIT_NOTICE_INTERVAL_SECONDS", 0.4)
+    created, gate, state = _gated_first_sender(monkeypatch)
+    server, locks = _wait_server(tmp_path, "turn-notice-bp")
+    holder = _foreign_holder(locks)
+    try:
+        request = _wait_request(server, tmp_path, "a" * 32, 3)
+        blocked = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        blocked.connect(server.endpoint)
+        evidence_module._send_frame(blocked, request)
+        _read_until_notice(blocked)  # the initial notice was delivered: not wedged yet
+        assert created[0].wedged is False
+        handler = list(server._handler_threads)[0]
+        follower = _FrameReader(server, request)  # unaffected second connection
+        started = time.monotonic()
+        state["partial"] = 5  # the next frame (notice or heartbeat) is written only partly
+        gate.set()
+        assert state["filled"].wait(10)
+        handler.join(15)
+        assert not handler.is_alive()
+        assert time.monotonic() - started < 10  # the 3 s admission bound still held
+        assert state["wedged_at_fill"] is False
+        assert created[0].wedged  # a progress notice or heartbeat gave up inside its grace
+        follower.join(20)
+        assert follower.error is None and len(follower.beats) >= 2
+        assert follower.final["outcome"] in {"passed", "failed"} and follower.final["returncode"] == 0
+        _frames, truncated = _strict_frames(blocked)  # raises if bytes follow a truncated frame
+        assert truncated  # a genuinely partial broker frame reached the client
+        attempts = created[0]._connection.written_after_partial
+        assert created[0].send({"type": "output", "data": "late"}, grace=1) is False
+        assert created[0]._connection.written_after_partial == attempts  # nothing follows the truncation
+        blocked.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_stop_during_notice_backpressure_is_prompt(tmp_path, monkeypatch):
+    monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 0.2)
+    monkeypatch.setattr(workers_module, "HOST_WAIT_NOTICE_INTERVAL_SECONDS", 0.4)
+    created, gate, state = _gated_first_sender(monkeypatch)
+    server, locks = _wait_server(tmp_path, "turn-notice-stop")
+    holder = _foreign_holder(locks)
+    try:
+        blocked = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        blocked.connect(server.endpoint)
+        evidence_module._send_frame(blocked, _wait_request(server, tmp_path, "b" * 32, 60))
+        _read_until_notice(blocked)
+        gate.set()
+        time.sleep(1.0)
+        handlers = list(server._handler_threads)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 6
+        assert not any(handler.is_alive() for handler in handlers)
+        _strict_frames(blocked)
+        blocked.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_terminal_send_blocks_on_a_connection_that_was_not_wedged(tmp_path, monkeypatch):
+    monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 100)
+    monkeypatch.setattr(workers_module, "HOST_WAIT_NOTICE_INTERVAL_SECONDS", 100)
+    created, gate, state = _gated_first_sender(monkeypatch)
+    server, locks = _wait_server(tmp_path, "turn-terminal-unwedged")
+    holder = _foreign_holder(locks)
+    try:
+        nonce = "d" * 32
+        request = _wait_request(server, tmp_path, nonce, 60)
+        blocked = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        blocked.connect(server.endpoint)
+        evidence_module._send_frame(blocked, request)
+        _read_until_notice(blocked)
+        gate.set()  # only the terminal send will see the full buffer
+        time.sleep(0.5)
+        assert created[0].wedged is False
+        handlers = list(server._handler_threads)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 8
+        assert not any(handler.is_alive() for handler in handlers)
+        assert state["wedged_at_fill"] is False and created[0].wedged  # the terminal send gave up
+        key = request["nonce"]
+        reservation = server._receipts[key]
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "cancelled"
+        blocked.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_stop_after_registration_with_the_mutex_held_terminates_and_releases(tmp_path):
+    from coding_review_agent_loop.test_runtime import acquire_command_lane
+
+    server, locks = _wait_server(tmp_path, "turn-registered-stop")
+    argv = (sys.executable, "-c", "import time; time.sleep(60)")
+    holder = None
+    try:
+        request = _wait_request(server, tmp_path, "e" * 32, 5, argv=argv)
+        request["timeout_seconds"] = 120
+        reader = _FrameReader(server, request)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not server._active_processes:
+            time.sleep(0.05)
+        (proc,) = server._active_processes.values()
+        holder = _hold_mutex(locks, 30)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 8
+        reader.join(10)
+        assert proc.poll() is not None and reader.final["outcome"] != "passed"
+        holder.kill()
+        holder.wait()
+        again, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert again is not None, problem
+        # The reservation record left behind by the skipped release is stale now.
+        assert again.reserve_host_workers(4, HostCapacity(4, 1024 * _GIB, _GIB), exclusive=True) == 4
+        again.close()
+        lane = acquire_command_lane(
+            list(argv), cwd=tmp_path, env={"AGENT_LOOP_INVOCATION_ID": server.turn_id},
+        )
+        assert lane is not None  # the command lane was released
+        lane.close()
+    finally:
+        if holder is not None:
+            holder.kill()
+        server.stop()
+
+
+def test_real_stop_waits_for_a_guarded_popen_and_terminates_the_registered_target(tmp_path, monkeypatch):
+    popen_entered = threading.Event()
+    popen_release = threading.Event()
+    real_popen = subprocess.Popen
+
+    def guarded(command, *args, **kwargs):
+        if isinstance(command, (list, tuple)) and "slow-launch-marker" in command:
+            popen_entered.set()
+            assert popen_release.wait(20)
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", guarded)
+    server, locks = _wait_server(tmp_path, "turn-guard-race")
+    try:
+        argv = (sys.executable, "-c", "import time; time.sleep(60)", "slow-launch-marker")
+        request = _wait_request(server, tmp_path, "f" * 32, 5, argv=argv)
+        request["timeout_seconds"] = 120
+        reader = _FrameReader(server, request)
+        assert popen_entered.wait(15)  # the runner is inside the launch guard
+        stopped = threading.Event()
+        threading.Thread(target=lambda: (server.stop(), stopped.set())).start()
+        time.sleep(0.6)
+        assert not stopped.is_set()  # stop() waits for the guard
+        popen_release.set()
+        assert stopped.wait(15)
+        reader.join(10)
+        proc = None
+        (observation,) = server.journal
+        assert reader.final["outcome"] != "passed"
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+        assert not server._active_processes or all(p.poll() is not None for p in server._active_processes.values())
+    finally:
+        popen_release.set()
+        server.stop()
+
+
+def _post_run_server(tmp_path, turn_id, size=0, executions=None):
+    _git_repo(tmp_path, size=size)
+
+    def execute(argv, cwd, timeout, environment, stream):
+        if executions is not None:
+            executions.append(argv)
+        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+
+    return BrokerServer(root=tmp_path, turn_id=turn_id, execute=execute).start()
+
+
+def _assert_shutdown_completion(server, reader, nonce_request):
+    reader.join(15)
+    assert reader.final["outcome"] == "passed" and reader.final["returncode"] == 0
+    (observation,) = server.journal
+    assert observation.attribution.state == "unknown"
+    assert "unattributed: broker shutdown" in observation.attribution.caveats
+    assert not any("snapshot unknown" in item for item in observation.attribution.caveats)
+    reservation = server._receipts[nonce_request["nonce"]]
+    assert reservation.ready.is_set() and reservation.response["outcome"] == "passed"
+
+
+def test_stop_during_the_post_run_git_subprocess_completes_unattributed(tmp_path, monkeypatch):
+    server = _post_run_server(tmp_path, "turn-postgit")
+    real_popen = subprocess.Popen
+    spawned = []
+    entered = threading.Event()
+
+    def slow_git(command, *args, **kwargs):
+        # subprocess.run (pre-run capture) never sets start_new_session; the cancellable path does.
+        if command and command[0] == "git" and kwargs.get("start_new_session"):
+            proc = real_popen(["sleep", "30"], *args, **kwargs)
+            spawned.append(proc)
+            entered.set()
+            return proc
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(evidence_module.subprocess, "Popen", slow_git)
+    try:
+        request = _signed_broker_request(server, tmp_path, "1a" * 16)
+        reader = _FrameReader(server, request)
+        assert entered.wait(15)  # only the cancellable post-run capture uses Popen
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 8
+        _assert_shutdown_completion(server, reader, request)
+        assert spawned and spawned[0].poll() is not None
+    finally:
+        server.stop()
+
+
+def test_stop_during_post_run_hashing_completes_unattributed(tmp_path, monkeypatch):
+    server = _post_run_server(tmp_path, "turn-posthash", size=4 * 1024 * 1024)
+    phase = {"post": False, "n": 0}
+    real_stable = evidence_module.stable_tracked_tree_snapshot
+    real_checkpoint = evidence_module._snapshot_checkpoint
+    stopper = []
+
+    def stable(*args, **kwargs):
+        phase["post"] = kwargs.get("cancel") is not None  # only the post-run capture is cancellable
+        return real_stable(*args, **kwargs)
+
+    def checkpoint(started, timeout_seconds, cancel):
+        if phase["post"]:
+            phase["n"] += 1
+            if phase["n"] == 8 and not stopper:  # mid-way through the big file
+                thread = threading.Thread(target=server.stop)
+                thread.start()
+                stopper.append(thread)
+                deadline = time.monotonic() + 5
+                while not server._stop_event.is_set() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+        return real_checkpoint(started, timeout_seconds, cancel)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stable)
+    monkeypatch.setattr(evidence_module, "_snapshot_checkpoint", checkpoint)
+    try:
+        request = _signed_broker_request(server, tmp_path, "2b" * 16)
+        reader = _FrameReader(server, request)
+        reader.join(20)
+        assert stopper
+        stopper[0].join(10)
+        _assert_shutdown_completion(server, reader, request)
+    finally:
+        server.stop()
+
+
+def test_stalled_post_run_read_with_a_waiting_follower_after_a_real_target(tmp_path, monkeypatch):
+    _git_repo(tmp_path)
+    marker = tmp_path.parent / f"{tmp_path.name}-runs.txt"
+    server, locks = _wait_server(tmp_path, "turn-stalled-read")
+    release = threading.Event()
+    stalled = threading.Event()
+    phase = {"post": False, "done": False}
+    real_stable = evidence_module.stable_tracked_tree_snapshot
+    real_checkpoint = evidence_module._snapshot_checkpoint
+
+    def stable(*args, **kwargs):
+        phase["post"] = kwargs.get("cancel") is not None
+        return real_stable(*args, **kwargs)
+
+    def checkpoint(started, timeout_seconds, cancel):
+        if phase["post"] and not phase["done"]:
+            phase["done"] = True
+            stalled.set()
+            assert release.wait(30)  # one stalled read: ignores cancellation
+        return real_checkpoint(started, timeout_seconds, cancel)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stable)
+    monkeypatch.setattr(evidence_module, "_snapshot_checkpoint", checkpoint)
+    request = _wait_request(
+        server, tmp_path, "3c" * 16, 5,
+        argv=(sys.executable, "-c", f"open({str(marker)!r}, 'a').write('x'); print('ok')"),
+    )
+    owner = _FrameReader(server, request)
+    try:
+        assert stalled.wait(30)  # the real target has run; the post-run read is stalled
+        follower = _FrameReader(server, request)
+        time.sleep(0.5)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 9
+        follower.join(5)
+        assert follower.final["outcome"] == "cancelled"
+        reservation = server._receipts[request["nonce"]]
+        assert reservation.response is None and not reservation.ready.is_set()
+        assert server._deferred_close and server._pinned_root is not None
+        release.set()
+        owner.join(15)
+        assert owner.final["outcome"] == "passed" and marker.read_text() == "x"
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "passed"
+        (observation,) = server.journal
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and server._pinned_root is not None:
+            time.sleep(0.05)
+        assert server._pinned_root is None and server._runtime_dir is None
+    finally:
+        release.set()
+
+
+def test_probe_owner_and_inflight_follower_are_cancelled_without_publication(tmp_path, monkeypatch):
+    from coding_review_agent_loop import test_runtime as runtime
+
+    argv = (sys.executable, "-c", "pass")
+    monkeypatch.setattr(
+        runtime, "_recognized_inner_probe_with_environment",
+        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a)),
+    )
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def tracking(command, *args, **kwargs):
+        proc = real_popen(command, *args, **kwargs)
+        if command and command[0] == "sleep":
+            spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", tracking)
+    environment = {**os.environ, "AGENT_LOOP_INVOCATION_ID": "probe-cancel-turn"}
+    cancel = threading.Event()
+    results = {}
+    owner = threading.Thread(target=lambda: results.setdefault("owner", runtime.probe_inner_launcher(
+        argv, cwd=tmp_path, environment=environment, environment_is_complete=True, cancel=cancel)))
+    owner.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not spawned:
+        time.sleep(0.02)
+    assert spawned
+    follower = threading.Thread(target=lambda: results.setdefault("follower", runtime.probe_inner_launcher(
+        argv, cwd=tmp_path, environment=environment, environment_is_complete=True, cancel=cancel)))
+    follower.start()
+    time.sleep(0.3)
+    started = time.monotonic()
+    cancel.set()
+    owner.join(5)
+    follower.join(5)
+    assert not owner.is_alive() and not follower.is_alive()
+    assert time.monotonic() - started < 4
+    assert results["owner"].state == "unknown" and results["follower"].state == "unknown"
+    assert spawned[0].poll() is not None  # the probe group was killed
+    assert not any(key[0] == "probe-cancel-turn" for key in runtime._INNER_PREFLIGHT_CACHE)
+
+
+# --- review round 3 (#1108) --------------------------------------------------------
+
+
+def _classify(payload):
+    data = str(payload.get("data", ""))
+    if payload.get("type") != "output":
+        return "terminal"
+    if data == "":
+        return "heartbeat"
+    if "waiting at most" in data:
+        return "initial-notice"
+    if "still waiting" in data:
+        return "progress-notice"
+    return "output"
+
+
+def _phase_sender(monkeypatch, phase):
+    """Block exactly the selected broker send on the first connection, recording every send."""
+    real = evidence_module._ConnectionSender
+    created = []
+    log = []
+    entered = threading.Event()
+
+    class Phase(real):
+        def __init__(self, connection, cancel):
+            super().__init__(connection, cancel)
+            self.first = not created
+            self.armed = False
+            created.append(self)
+
+        def send(self, payload, **kwargs):
+            kind = _classify(payload)
+            record = None
+            if self.first:
+                if kind == phase and not self.armed:
+                    self.armed = True
+                    self._connection = _PartialWriteConnection(self._connection, 5)
+                    entered.set()
+                record = {"kind": kind, "enter": time.monotonic(), "selected": self.armed and kind == phase}
+                log.append(record)
+            result = super().send(payload, **kwargs)
+            if record is not None:
+                record["exit"] = time.monotonic()
+                record["result"] = result
+            return result
+
+    monkeypatch.setattr(evidence_module, "_ConnectionSender", Phase)
+    return created, log, entered
+
+
+@pytest.mark.parametrize("stop", [False, True], ids=["bound-expires", "stop-during-send"])
+@pytest.mark.parametrize("phase", ["initial-notice", "progress-notice", "heartbeat"])
+def test_each_backpressure_phase_is_bounded_isolated_and_truncation_safe(tmp_path, monkeypatch, phase, stop):
+    monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 0.2 if phase == "heartbeat" else 100)
+    monkeypatch.setattr(workers_module, "HOST_WAIT_NOTICE_INTERVAL_SECONDS", 0.4 if phase == "progress-notice" else 100)
+    created, log, entered = _phase_sender(monkeypatch, phase)
+    server, locks = _wait_server(tmp_path, f"turn-phase-{phase}-{stop}")
+    holder = _foreign_holder(locks)
+    bound = 60 if stop else 2
+    try:
+        request = _wait_request(server, tmp_path, "9" * 31 + ("1" if stop else "0"), bound)
+        blocked = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        blocked.connect(server.endpoint)
+        started = time.monotonic()
+        evidence_module._send_frame(blocked, request)
+        handler = None
+        deadline = time.monotonic() + 5
+        while handler is None and time.monotonic() < deadline:
+            handlers = list(server._handler_threads)
+            handler = handlers[0] if handlers and handlers[0].is_alive() else None
+            time.sleep(0.01)
+        time.sleep(0.3)
+        follower = _FrameReader(server, request) if not stop else None  # an unaffected second connection
+        assert entered.wait(10)  # the selected send is now blocked on a partly written frame
+        selected = next(item for item in log if item["selected"])
+        if stop:
+            stop_started = time.monotonic()
+            server.stop()
+            assert time.monotonic() - stop_started < 6
+            assert selected["exit"] >= stop_started  # stop interrupted an active send...
+            assert selected["exit"] - stop_started < 0.4  # ...immediately (cancel poll), not at its grace
+        else:
+            handler.join(bound + 8)
+            assert not handler.is_alive()
+            # Admission expired on time: the wait bound plus the run and terminal grace, nowhere near 20 s.
+            assert time.monotonic() - started < bound + 7
+            assert selected["exit"] - selected["enter"] < 0.5 + 0.4  # the notice/heartbeat grace
+            follower.join(20)
+            assert follower.error is None and follower.final["returncode"] == 0
+            if phase == "heartbeat":
+                assert len(follower.beats) >= 2  # isolation: the other connection kept its heartbeats
+        assert selected["result"] is False and created[0].wedged
+        assert selected["kind"] == phase
+        attempts = created[0]._connection.written_after_partial
+        assert created[0].send({"type": "output", "data": "late"}, grace=1) is False
+        assert created[0]._connection.written_after_partial == attempts  # nothing after the truncation
+        frames, truncated = _strict_frames(blocked)
+        assert truncated  # a genuinely partial broker frame reached the client
+        blocked.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_broker_stop_cancels_a_real_probe_owner_and_inflight_follower(tmp_path, monkeypatch):
+    from coding_review_agent_loop import test_runtime as runtime
+    from coding_review_agent_loop.test_runtime import acquire_command_lane
+
+    marker = tmp_path / "spawned"
+    argv = (sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+    monkeypatch.setattr(
+        runtime, "_recognized_inner_probe_with_environment",
+        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a)),
+    )
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def tracking(command, *args, **kwargs):
+        proc = real_popen(command, *args, **kwargs)
+        if command and command[0] == "sleep":
+            spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", tracking)
+    seen = {}
+    real_probe = runner_module.probe_inner_launcher
+
+    def recording(a, **kwargs):
+        seen.setdefault("args", (a, dict(kwargs)))
+        return real_probe(a, **kwargs)
+
+    monkeypatch.setattr(runner_module, "probe_inner_launcher", recording)
+    server, locks = _wait_server(tmp_path, "turn-real-probe")
+    try:
+        request = _wait_request(server, tmp_path, "7a" * 16, 5, argv=argv)
+        reader = _FrameReader(server, request)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not spawned:
+            time.sleep(0.02)
+        assert spawned and "args" in seen  # the broker's owning probe is running
+        follower_args, follower_kwargs = seen["args"]
+        follower_kwargs["cancel"] = server._stop_event
+        follower_result = {}
+        follower = threading.Thread(
+            target=lambda: follower_result.setdefault("r", real_probe(follower_args, **follower_kwargs))
+        )
+        follower.start()  # an in-flight follower of the same probe
+        time.sleep(0.4)
+        assert len(spawned) == 1  # it followed instead of probing again
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 6
+        follower.join(5)
+        reader.join(10)
+        assert not follower.is_alive() and follower_result["r"].state == "unknown"
+        assert reader.final["outcome"] == "cancelled" and not marker.exists()
+        assert spawned[0].poll() is not None  # the probe group was killed
+        assert not any(key[0] == server.turn_id for key in runtime._INNER_PREFLIGHT_CACHE)
+        lock, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert lock is not None, problem
+        lock.close()
+        lane = acquire_command_lane(list(argv), cwd=tmp_path, env={"AGENT_LOOP_INVOCATION_ID": server.turn_id})
+        assert lane is not None
+        lane.close()
+    finally:
+        server.stop()
+
+
+def _real_target_post_run_server(tmp_path, turn_id, size=0):
+    _git_repo(tmp_path, size=size)
+    return _wait_server(tmp_path, turn_id)
+
+
+def _assert_real_shutdown_completion(server, reader, request):
+    reader.join(20)
+    assert reader.final["outcome"] == "passed" and reader.final["returncode"] == 0
+    assert "workers=4" in reader.final["output_tail"]  # the real target's own output
+    (observation,) = server.journal
+    assert observation.attribution.state == "unknown"
+    assert "unattributed: broker shutdown" in observation.attribution.caveats
+    assert not any("snapshot unknown" in item for item in observation.attribution.caveats)
+    reservation = server._receipts[request["nonce"]]
+    assert reservation.ready.is_set() and reservation.response["outcome"] == "passed"
+
+
+def test_real_target_stopped_during_the_post_run_git_subprocess(tmp_path, monkeypatch):
+    server, locks = _real_target_post_run_server(tmp_path, "turn-real-postgit")
+    real_popen = subprocess.Popen
+    spawned = []
+    entered = threading.Event()
+
+    def slow_git(command, *args, **kwargs):
+        if command and command[0] == "git" and kwargs.get("start_new_session"):
+            proc = real_popen(["sleep", "30"], *args, **kwargs)
+            spawned.append(proc)
+            entered.set()
+            return proc
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(evidence_module.subprocess, "Popen", slow_git)
+    try:
+        request = _wait_request(server, tmp_path, "6b" * 16, 5)
+        reader = _FrameReader(server, request)
+        assert entered.wait(30)  # the target already ran; the post-run capture is blocked
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 8
+        _assert_real_shutdown_completion(server, reader, request)
+        assert spawned[0].poll() is not None
+    finally:
+        server.stop()
+
+
+def test_real_target_stopped_during_post_run_hashing(tmp_path, monkeypatch):
+    server, locks = _real_target_post_run_server(tmp_path, "turn-real-posthash", size=4 * 1024 * 1024)
+    phase = {"post": False, "n": 0}
+    real_stable = evidence_module.stable_tracked_tree_snapshot
+    real_checkpoint = evidence_module._snapshot_checkpoint
+    stopper = []
+
+    def stable(*args, **kwargs):
+        phase["post"] = kwargs.get("cancel") is not None
+        return real_stable(*args, **kwargs)
+
+    def checkpoint(started, timeout_seconds, cancel):
+        if phase["post"]:
+            phase["n"] += 1
+            if phase["n"] == 8 and not stopper:
+                thread = threading.Thread(target=server.stop)
+                thread.start()
+                stopper.append(thread)
+                deadline = time.monotonic() + 5
+                while not server._stop_event.is_set() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+        return real_checkpoint(started, timeout_seconds, cancel)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stable)
+    monkeypatch.setattr(evidence_module, "_snapshot_checkpoint", checkpoint)
+    try:
+        request = _wait_request(server, tmp_path, "5c" * 16, 5)
+        reader = _FrameReader(server, request)
+        reader.join(30)
+        assert stopper
+        stopper[0].join(10)
+        _assert_real_shutdown_completion(server, reader, request)
+    finally:
+        server.stop()
+
+
+def test_stalled_stream_read_after_a_real_target_with_a_waiting_follower(tmp_path, monkeypatch):
+    _git_repo(tmp_path, size=64 * 1024)
+    marker = tmp_path.parent / f"{tmp_path.name}-reads.txt"
+    server, locks = _wait_server(tmp_path, "turn-stalled-stream-read")
+    release = threading.Event()
+    stalled = threading.Event()
+    phase = {"post": False, "done": False}
+    real_stable = evidence_module.stable_tracked_tree_snapshot
+    real_open = Path.open
+
+    def stable(*args, **kwargs):
+        phase["post"] = kwargs.get("cancel") is not None
+        return real_stable(*args, **kwargs)
+
+    class StallingStream:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._stream.close()
+
+        def read(self, size=-1):
+            if not phase["done"]:
+                phase["done"] = True
+                stalled.set()
+                assert release.wait(30)  # one stalled read: cannot be cancelled
+            return self._stream.read(size)
+
+    def patched_open(self, mode="r", *args, **kwargs):
+        stream = real_open(self, mode, *args, **kwargs)
+        if phase["post"] and not phase["done"] and self.name == "big.bin" and "b" in mode:
+            return StallingStream(stream)
+        return stream
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stable)
+    monkeypatch.setattr(Path, "open", patched_open)
+    request = _wait_request(
+        server, tmp_path, "4d" * 16, 5,
+        argv=(sys.executable, "-c", f"open({str(marker)!r}, 'a').write('x'); import os; print('workers=' + os.environ['AGENT_LOOP_TEST_WORKERS'])"),
+    )
+    owner = _FrameReader(server, request)
+    try:
+        assert stalled.wait(30)  # the real target ran; one post-run chunk read is stalled
+        follower = _FrameReader(server, request)
+        time.sleep(0.5)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 9
+        follower.join(5)
+        assert follower.final["outcome"] == "cancelled"
+        reservation = server._receipts[request["nonce"]]
+        assert reservation.response is None and not reservation.ready.is_set()
+        assert server._deferred_close and server._pinned_root is not None and server._runtime_dir is not None
+        release.set()
+        owner.join(20)
+        assert owner.final["outcome"] == "passed" and marker.read_text() == "x"
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "passed"
+        (observation,) = server.journal
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and server._pinned_root is not None:
+            time.sleep(0.05)
+        assert server._pinned_root is None and server._runtime_dir is None
+    finally:
+        release.set()
+
+
+# --- review round 4 (#1108) --------------------------------------------------------
+
+
+def test_broker_request_following_an_external_inflight_probe_is_cancelled_by_stop(tmp_path, monkeypatch):
+    from coding_review_agent_loop import test_runtime as runtime
+    from coding_review_agent_loop.test_runtime import acquire_command_lane
+
+    marker = tmp_path / "spawned"
+    argv = (sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+    monkeypatch.setattr(
+        runtime, "_recognized_inner_probe_with_environment",
+        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a)),
+    )
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def tracking(command, *args, **kwargs):
+        proc = real_popen(command, *args, **kwargs)
+        if command and command[0] == "sleep":
+            spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", tracking)
+    real_probe = runner_module.probe_inner_launcher
+    external_cancel = threading.Event()
+    external = {}
+    handler_entered = threading.Event()
+
+    def seeding(a, **kwargs):
+        # An owner outside the broker handler is already probing with the same identity.
+        owner_kwargs = {**kwargs, "cancel": external_cancel}
+        thread = threading.Thread(
+            target=lambda: external.setdefault("r", real_probe(a, **owner_kwargs))
+        )
+        thread.start()
+        external["thread"] = thread
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not spawned:
+            time.sleep(0.02)
+        handler_entered.set()
+        return real_probe(a, **kwargs)  # the broker handler is now a non-owner follower
+
+    monkeypatch.setattr(runner_module, "probe_inner_launcher", seeding)
+    server, locks = _wait_server(tmp_path, "turn-follower-probe")
+    try:
+        request = _wait_request(server, tmp_path, "3e" * 16, 5, argv=argv)
+        reader = _FrameReader(server, request)
+        assert handler_entered.wait(15)
+        time.sleep(0.5)
+        assert len(spawned) == 1  # the handler followed the external owner; it did not probe again
+        assert reader.final is None  # still waiting on the in-flight probe
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 6
+        reader.join(10)
+        assert reader.final["outcome"] == "cancelled" and not marker.exists()
+        assert not any(key[0] == server.turn_id for key in runtime._INNER_PREFLIGHT_CACHE)
+        assert spawned[0].poll() is None  # the external owner's probe was not the follower's to kill
+        lock, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert lock is not None, problem  # the follower released its invocation lock
+        lock.close()
+        lane = acquire_command_lane(list(argv), cwd=tmp_path, env={"AGENT_LOOP_INVOCATION_ID": server.turn_id})
+        assert lane is not None  # ...and its command lane
+        lane.close()
+    finally:
+        external_cancel.set()
+        if "thread" in external:
+            external["thread"].join(10)
+        for proc in spawned:
+            if proc.poll() is None:
+                proc.kill()
+        server.stop()
+    assert spawned[0].poll() is not None
+    assert external["r"].state == "unknown"
+
+
+# --- review round 8 (#1108): shutdown during the managed child handshake -----------
+
+
+def _managed_handle(tmp_path):
+    cgroup = tmp_path / "coder-cgroup"
+    cgroup.mkdir()
+    return SimpleNamespace(
+        managed=True, cgroup_path=cgroup, refresh_report=lambda: SimpleNamespace(target_started=True),
+    ), cgroup
+
+
+def _managed_server(tmp_path, turn_id, process_started=None):
+    server, locks = _wait_server(tmp_path, turn_id)
+    handle, cgroup = _managed_handle(tmp_path)
+    server.set_execution_context(
+        containment_handle=handle, process_started=process_started, process_finished=None,
+        worker_budget=_wait_budget(),
+    )
+    return server, locks, cgroup
+
+
+def test_stop_after_registration_before_the_containment_ready_byte_is_cancelled(tmp_path, monkeypatch):
+    marker = tmp_path / "ran"
+    holder = {}
+
+    def killing_started(proc):
+        # Simulates stop(): the registered held-exec child ends before its ready byte.
+        holder["server"]._stop_event.set()
+        os.killpg(proc.pid, 9)
+
+    server, locks, _cgroup = _managed_server(tmp_path, "turn-handshake-early", killing_started)
+    holder["server"] = server
+    try:
+        request = _wait_request(
+            server, tmp_path, "8e" * 16, 5,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        reader = _FrameReader(server, request)
+        reader.join(20)
+        assert reader.final["outcome"] == "cancelled" and reader.final["returncode"] is None
+        assert not marker.exists() and server.journal == ()
+        reservation = server._receipts[request["nonce"]]
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "cancelled"
+        lock, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert lock is not None, problem
+        lock.close()
+    finally:
+        server.stop()
+
+
+def test_stop_between_readiness_and_release_is_cancelled_without_evidence(tmp_path, monkeypatch):
+    marker = tmp_path / "ran"
+    server, locks, cgroup = _managed_server(tmp_path, "turn-handshake-late")
+    seen = {}
+
+    def stopping_cgroup_lookup(pid):
+        # Readiness was reported; now stop() ends the registered child before release.
+        seen["pid"] = pid
+        server._stop_event.set()
+        os.killpg(pid, 9)
+        time.sleep(0.3)
+        return cgroup
+
+    monkeypatch.setattr(runner_module, "cgroup_path_for_pid", stopping_cgroup_lookup)
+    try:
+        request = _wait_request(
+            server, tmp_path, "7e" * 16, 5,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        reader = _FrameReader(server, request)
+        reader.join(20)
+        assert "pid" in seen
+        assert reader.final["outcome"] == "cancelled" and reader.final["returncode"] is None
+        assert not marker.exists() and server.journal == ()
+        reservation = server._receipts[request["nonce"]]
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "cancelled"
+    finally:
+        server.stop()
+
+
+def test_stop_winning_before_the_release_write_never_releases_the_held_child(tmp_path, monkeypatch):
+    # Round 9 (#1108): a successful release write after stop() set the event
+    # (but before stop() signalled the child) must not start the target.
+    marker = tmp_path / "ran"
+    server, locks, cgroup = _managed_server(tmp_path, "turn-release-race")
+    stop_thread = {}
+    signal_gate = threading.Event()
+    real_killpg = os.killpg
+
+    def delayed_killpg(pgid, sig):
+        if threading.current_thread() is stop_thread.get("t"):
+            signal_gate.wait(15)  # stop()'s signal arrives only after the runner finished
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", delayed_killpg)
+
+    def stopping_cgroup_lookup(pid):
+        # Readiness and attachment happened; stop() now wins the launch lock
+        # while the child is still alive and its signal is delayed.
+        thread = threading.Thread(target=server.stop)
+        stop_thread["t"] = thread
+        thread.start()
+        deadline = time.monotonic() + 10
+        while not server._stop_event.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert server._stop_event.is_set()
+        return cgroup
+
+    monkeypatch.setattr(runner_module, "cgroup_path_for_pid", stopping_cgroup_lookup)
+    try:
+        request = _wait_request(
+            server, tmp_path, "5e" * 16, 5,
+            argv=(sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"),
+        )
+        reader = _FrameReader(server, request)
+        reader.join(20)
+        signal_gate.set()
+        stop_thread["t"].join(15)
+        time.sleep(0.5)  # a wrongly released target would have created the marker by now
+        assert reader.final["outcome"] == "cancelled" and reader.final["returncode"] is None
+        assert not marker.exists() and server.journal == ()
+        reservation = server._receipts[request["nonce"]]
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "cancelled"
+        lock, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert lock is not None, problem
+        lock.close()
+    finally:
+        signal_gate.set()
+        server.stop()
+
+
+def test_handshake_failure_without_a_stop_is_still_an_error(tmp_path, monkeypatch):
+    server, locks, cgroup = _managed_server(tmp_path, "turn-handshake-error")
+
+    def failing_cgroup_lookup(pid):
+        os.killpg(pid, 9)
+        time.sleep(0.3)
+        return cgroup
+
+    monkeypatch.setattr(runner_module, "cgroup_path_for_pid", failing_cgroup_lookup)
+    try:
+        reader = _FrameReader(server, _wait_request(server, tmp_path, "6e" * 16, 5))
+        reader.join(20)
+        assert reader.final["type"] == "error"  # not a shutdown: a real launch failure
+    finally:
+        server.stop()

@@ -112,6 +112,7 @@ class ReservationTelemetry:
         self.data: dict[str, object] = {}
         self.reservation_path: Path | None = None
         self._target_started_monotonic: float | None = None
+        self._wait_started_monotonic: float | None = None
 
     @classmethod
     def disabled(cls) -> "ReservationTelemetry":
@@ -133,7 +134,33 @@ class ReservationTelemetry:
             "target_started_at": None,
             "command_seconds": None,
             "test_outcome": None,
+            "reservation_wait_seconds": 0.0,
+            "wait_bound_seconds": None,
+            "wait_timed_out": False,
+            "oversubscribed": False,
+            "accounting_unavailable": False,
         }
+        self._wait_started_monotonic = None
+
+    def wait_started(self, monotonic_start: float, bound: float) -> None:
+        """Record the start of a host-capacity wait before the first attempt."""
+        self._wait_started_monotonic = float(monotonic_start)
+        self.data["wait_bound_seconds"] = float(bound)
+
+    def waited(
+        self,
+        seconds: float,
+        bound: float,
+        timed_out: bool,
+        oversubscribed: bool,
+        accounting_unavailable: bool = False,
+    ) -> None:
+        self._wait_started_monotonic = None
+        self.data["reservation_wait_seconds"] = float(seconds)
+        self.data["wait_bound_seconds"] = float(bound)
+        self.data["wait_timed_out"] = bool(timed_out)
+        self.data["oversubscribed"] = bool(oversubscribed)
+        self.data["accounting_unavailable"] = bool(accounting_unavailable)
 
     def set_outcome(self, outcome: str) -> None:
         self.data["outcome"] = outcome
@@ -176,6 +203,12 @@ class ReservationTelemetry:
             return
         try:
             self.released()
+            if self._wait_started_monotonic is not None:
+                # Interrupted or cancelled mid-wait: keep the elapsed wait.
+                self.data["reservation_wait_seconds"] = max(
+                    0.0, time.monotonic() - self._wait_started_monotonic
+                )
+                self._wait_started_monotonic = None
             append_record(
                 self.path,
                 {
@@ -265,6 +298,7 @@ def run_intervals(records: Iterable[Mapping[str, object]]) -> dict[str, dict]:
                 "degraded": sum(1 for r in rows if r.get("outcome") == "degraded"),
                 "refused": sum(1 for r in rows if r.get("outcome") == "refused"),
                 "retained": sum(1 for r in rows if r.get("retained")),
+                **_wait_counters(rows),
                 "incomplete": ["no run-start"],
             }
             continue
@@ -308,9 +342,27 @@ def run_intervals(records: Iterable[Mapping[str, object]]) -> dict[str, dict]:
             "degraded": sum(1 for r in rows if r.get("outcome") == "degraded"),
             "refused": sum(1 for r in rows if r.get("outcome") == "refused"),
             "retained": sum(1 for r in rows if r.get("retained")),
+            **_wait_counters(rows),
             "incomplete": incomplete,
         }
     return result
+
+
+def _wait_counters(rows: list[Mapping[str, object]]) -> dict[str, object]:
+    """Wait counters; records written before #1108 lack the fields and count as zero."""
+    seconds = 0.0
+    waits = 0
+    for row in rows:
+        value = row.get("reservation_wait_seconds")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            waits += 1
+            seconds += float(value)
+    return {
+        "waits": waits,
+        "wait_timeouts": sum(1 for r in rows if r.get("wait_timed_out") is True),
+        "oversubscribed": sum(1 for r in rows if r.get("oversubscribed") is True),
+        "wait_seconds_total": seconds,
+    }
 
 
 def run_duty_cycles(records: Iterable[Mapping[str, object]]) -> dict[str, dict]:
@@ -332,6 +384,10 @@ def run_duty_cycles(records: Iterable[Mapping[str, object]]) -> dict[str, dict]:
             "degraded": info["degraded"],
             "refused": info["refused"],
             "retained": info["retained"],
+            "waits": info["waits"],
+            "wait_timeouts": info["wait_timeouts"],
+            "oversubscribed": info["oversubscribed"],
+            "wait_seconds_total": info["wait_seconds_total"],
             "incomplete": info["incomplete"],
         }
     return summary

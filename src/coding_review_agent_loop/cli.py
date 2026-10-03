@@ -1602,7 +1602,9 @@ def _record_run_tests_result(
     )
 
 
-_NO_RECORD_OUTCOMES = frozenset({"overlap-rejected", "worker-budget-busy", "worker-budget-refused"})
+_NO_RECORD_OUTCOMES = frozenset(
+    {"overlap-rejected", "worker-budget-busy", "worker-budget-refused", "cancelled"}
+)
 
 
 def _run_tests_command(args: argparse.Namespace) -> int:

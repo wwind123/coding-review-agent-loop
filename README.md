@@ -1419,9 +1419,14 @@ refuse, a plain direct pytest in a repository that declares pytest-xdist
 support also runs with the budget as its default `-n` when xdist is installed;
 a command naming `-n`, `--dist`, `--tx` or `-p no:xdist` keeps its own choice,
 and a target without xdist still runs serially. Concurrent
-loops on one host share a host-wide worker pool: a command is lowered to the
-workers other live loops have not reserved, or gets `worker-budget-busy` when
-none are left; set `AGENT_LOOP_TEST_WORKER_HOST_SHARING=off` to opt out. See
+loops on one host share a host-wide worker pool, admitted exclusively: a test
+command asks for its full budget and, while another loop holds the pool, waits
+(bounded by `AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS`, default 1200 s, `0`
+disables waiting) instead of dividing it. After the bound it runs with the
+free workers, or one worker when none are free; host capacity never fails a
+command or reaches the coder as `worker-budget-busy` (only a second concurrent
+command in the same invocation does). Set
+`AGENT_LOOP_TEST_WORKER_HOST_SHARING=off` to opt out. See
 [Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
 
 Remembered commands are suggestions only: agents must inspect the checkout and

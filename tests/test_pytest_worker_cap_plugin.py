@@ -81,6 +81,7 @@ def _run(
     command: list[str] | None = None,
     timeout: float = 120,
     default_workers: int | None = None,
+    host_cap: int | None = None,
 ):
     report = report or (project.parent / "report.jsonl")
     marker = project.parent / "ran.txt"
@@ -97,6 +98,8 @@ def _run(
     spec = {"version": 1, "budget": budget, "mode": mode, "report": str(report)}
     if default_workers is not None:
         spec["default_workers"] = default_workers
+    if host_cap is not None:
+        spec["host_cap"] = host_cap
     child_env[ENV_WORKER_CAP_SPEC] = json.dumps(spec)
     child_env.update(env or {})
     for key, value in list(child_env.items()):
@@ -817,3 +820,238 @@ def test_socket_gateways_refused_before_any_gateway(tmp_path, socket_servers):
     assert _gateway_log(project) == [] and ran == []
     analysis = analyze_worker_report(project.parent / "report.jsonl", command_class="direct-pytest", mode="refuse")
     assert analysis.direct_refusal
+
+
+# ---------------------------------------------------------------------------
+# Host-capacity fallback cap (#1108): applied after the configured judgement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+@pytest.mark.parametrize("args, cap, expected", [
+    (["-n", "4"], 1, 0),
+    (["-n", "4"], 2, 2),
+    (["-n", "2"], 3, 2),
+    (["--dist=load", "--tx", "4*popen"], 2, 2),
+])
+def test_host_cap_lowers_requests_within_the_configured_budget(tmp_path, mode, args, cap, expected):
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
+    proc, rows, ran = _run(
+        project, args, budget=4, mode=mode, host_cap=cap, env=_probe_env(project),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "refused" not in proc.stdout + proc.stderr
+    assert len(_gateway_log(project)) == expected
+    assert _confirmed(rows)["effective"] == expected
+    assert rows[0]["budget"] == 4  # the report keeps the configured budget
+    assert len(ran) == 4
+
+
+def test_host_cap_does_not_weaken_refuse_mode_judgement(tmp_path):
+    project = _project(tmp_path)
+    proc, rows, ran = _run(project, ["-n", "8"], budget=4, mode="refuse", host_cap=2)
+    assert proc.returncode != 0 and ran == []
+    assert _only(rows, "refused")
+    project2 = tmp_path / "second"
+    project2.mkdir()
+    project2 = _project(project2)
+    proc, rows, ran = _run(
+        project2, ["--dist=load", "--tx", "8*popen"], budget=4, mode="refuse", host_cap=2,
+    )
+    assert proc.returncode != 0 and ran == []
+
+
+def test_host_cap_lowers_over_budget_requests_in_clamp_mode(tmp_path):
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
+    proc, rows, ran = _run(
+        project, ["-n", "8"], budget=4, mode="clamp", host_cap=2, env=_probe_env(project),
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(_gateway_log(project)) == 2 and len(ran) == 4
+
+
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+def test_host_cap_caps_auto_resolution_within_budget(tmp_path, mode):
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
+    env = {**_probe_env(project), "PYTEST_XDIST_AUTO_NUM_WORKERS": "3"}
+    proc, rows, ran = _run(project, ["-n", "auto"], budget=4, mode=mode, host_cap=1, env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(_gateway_log(project)) == 1
+
+
+def test_host_cap_in_refuse_mode_still_refuses_auto_above_budget(tmp_path):
+    project = _project(tmp_path)
+    proc, rows, ran = _run(
+        project, ["-n", "auto"], budget=4, mode="refuse", host_cap=2,
+        env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "8"},
+    )
+    assert proc.returncode != 0 and ran == []
+
+
+def test_apply_worker_budget_exports_the_host_cap_but_keeps_the_configured_budget(tmp_path):
+    budget = WorkerBudget(4, "operator", "refuse", "cpu", {}, False)
+    decision = apply_worker_budget(
+        [sys.executable, "-c", "pass"], {}, tmp_path, budget, host_cap=2,
+    )
+    assert decision.env["AGENT_LOOP_TEST_WORKERS"] == "2"
+    spec = json.loads(decision.env[ENV_WORKER_CAP_SPEC])
+    assert spec["budget"] == 4 and spec["mode"] == "refuse" and spec["host_cap"] == 2
+    plain = apply_worker_budget([sys.executable, "-c", "pass"], {}, tmp_path, budget)
+    assert plain.env["AGENT_LOOP_TEST_WORKERS"] == "4"
+    assert "host_cap" not in json.loads(plain.env[ENV_WORKER_CAP_SPEC])
+    clamp = apply_worker_budget(
+        [sys.executable, "-c", "pass"], {"PYTEST_XDIST_AUTO_NUM_WORKERS": "3"}, tmp_path,
+        WorkerBudget(4, "operator", "clamp", "cpu", {}, False), host_cap=1,
+    )
+    assert clamp.env["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# Host fallback through run_foreground_test: real pytest + xdist targets (#1108)
+# ---------------------------------------------------------------------------
+
+import textwrap as _textwrap  # noqa: E402
+
+from coding_review_agent_loop.runner import run_foreground_test  # noqa: E402
+from coding_review_agent_loop.test_workers import (  # noqa: E402
+    ENV_HOST_WAIT,
+    HostCapacity,
+    WorkerBudgetLock,
+)
+
+_GIB = 1024 ** 3
+
+
+def _fallback_run(tmp_path, args, *, mode, held, env=None, command=None, reports=None):
+    """Run a real pytest target as a host-fallback run (holder keeps `held` of 4 workers)."""
+    project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
+    locks = tmp_path / "locks"
+    holder, problem = WorkerBudgetLock.acquire(invocation_id="holder", cwd=tmp_path, root=locks)
+    assert holder is not None, problem
+    assert holder.reserve_host_workers(held, HostCapacity(4, 1024 * _GIB, _GIB)) == held
+    budget = WorkerBudget(
+        4, "inherited", mode, "cpu",
+        {"cpu_available": 4, "host_usable_bytes": 64 * _GIB, "per_worker_bytes": _GIB, "reserve_bytes": _GIB},
+        False,
+    )
+    environment = {key: value for key, value in os.environ.items() if key not in _SCRUB}
+    environment.update(_probe_env(project))
+    environment.update({
+        "AGENT_LOOP_INVOCATION_ID": "fallback-run", ENV_HOST_WAIT: "0.2",
+        "AGENT_LOOP_TEST_WORKER_HOST_SHARING": "on",
+        "RAN_MARKER": str(tmp_path / "ran.txt"), "PYTEST_XDIST_AUTO_NUM_WORKERS": "8",
+    })
+    environment.update(env or {})
+    argv = command or [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", *args]
+    from coding_review_agent_loop import runner as runner_module
+
+    real_analyze = runner_module.analyze_worker_report
+
+    def capturing(report_path, **kwargs):
+        if reports is not None and report_path is not None and Path(report_path).exists():
+            reports.extend(
+                json.loads(line) for line in Path(report_path).read_text().splitlines() if line.strip()
+            )
+        return real_analyze(report_path, **kwargs)
+
+    runner_module.analyze_worker_report = capturing
+    try:
+        result = run_foreground_test(
+            argv, cwd=project, timeout_seconds=120, env=environment, environment_is_complete=True,
+            echo_output=False, worker_budget=budget, worker_lock_root=locks,
+        )
+    finally:
+        runner_module.analyze_worker_report = real_analyze
+        holder.close()
+    ran = (tmp_path / "ran.txt").read_text().split() if (tmp_path / "ran.txt").exists() else []
+    return result, len(_gateway_log(project)), ran
+
+
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+@pytest.mark.parametrize("held, grant", [(3, 1), (4, 1)])
+@pytest.mark.parametrize("how", ["argv", "addopts"])
+def test_fallback_grant_lowers_a_within_budget_dash_n_in_both_modes(tmp_path, mode, held, grant, how):
+    args = ["-n", "4"] if how == "argv" else []
+    env = {"PYTEST_ADDOPTS": "-n 4"} if how == "addopts" else None
+    result, gateways, ran = _fallback_run(tmp_path, args, mode=mode, held=held, env=env)
+    assert result.returncode == 0, result.output_tail
+    assert result.outcome == "passed" and len(ran) == 4
+    assert gateways <= grant
+
+
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+def test_fallback_grant_keeps_the_configured_judgement_for_over_budget_requests(tmp_path, mode):
+    result, gateways, ran = _fallback_run(tmp_path, ["-n", "8"], mode=mode, held=3)
+    if mode == "refuse":
+        assert result.returncode != 0 and ran == []
+    else:
+        assert result.returncode == 0 and gateways <= 1 and len(ran) == 4
+
+
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+def test_fallback_grant_auto_resolution(tmp_path, mode):
+    within = _fallback_run(tmp_path / "a", ["-n", "auto"], mode=mode, held=3, env={"PYTEST_XDIST_AUTO_NUM_WORKERS": "3"}) if (tmp_path / "a").mkdir() is None else None
+    result, gateways, ran = within
+    assert result.returncode == 0 and gateways <= 1 and len(ran) == 4
+    (tmp_path / "b").mkdir()
+    result, gateways, ran = _fallback_run(tmp_path / "b", ["-n", "auto"], mode=mode, held=3)
+    if mode == "refuse":
+        assert result.returncode != 0 and ran == []
+    else:
+        assert result.returncode == 0 and gateways <= 1
+    (tmp_path / "c").mkdir()
+    result, gateways, ran = _fallback_run(
+        tmp_path / "c", ["-n", "auto", "--maxprocesses", "3"], mode=mode, held=3,
+    )
+    assert result.returncode == 0 and gateways <= 1 and len(ran) == 4
+
+
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+def test_fallback_grant_tx_gateways(tmp_path, mode):
+    result, gateways, ran = _fallback_run(
+        tmp_path, ["--dist=load", "--tx", "4*popen"], mode=mode, held=3,
+    )
+    assert result.returncode == 0 and gateways == 1 and len(ran) == 4
+    (tmp_path / "over").mkdir()
+    result, gateways, ran = _fallback_run(
+        tmp_path / "over", ["--dist=load", "--tx", "8*popen"], mode=mode, held=3,
+    )
+    if mode == "refuse":
+        assert result.returncode != 0 and ran == [] and gateways == 0
+    else:
+        assert result.returncode == 0 and gateways == 1 and len(ran) == 4
+
+
+@pytest.mark.parametrize("mode", ["clamp", "refuse"])
+@pytest.mark.parametrize("held", [3, 4])
+def test_fallback_grant_reaches_printer_and_wrapper_targets(tmp_path, mode, held):
+    printer = [sys.executable, "-c", (
+        "import os; print('workers=' + os.environ['AGENT_LOOP_TEST_WORKERS']); "
+        "print('auto=' + os.environ.get('PYTEST_XDIST_AUTO_NUM_WORKERS', 'unset'))"
+    )]
+    result, _gateways, _ran = _fallback_run(tmp_path, [], mode=mode, held=held, command=printer)
+    assert result.returncode == 0 and "workers=1" in result.output_tail
+    if mode == "clamp":
+        assert "auto=1" in result.output_tail
+    (tmp_path / "w").mkdir()
+    wrapper = [sys.executable, "-c", _textwrap.dedent("""
+        import os, subprocess, sys
+        count = os.environ["AGENT_LOOP_TEST_WORKERS"]
+        print("wrapper-workers=" + count)
+        print("wrapper-auto=" + os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS", "unset"))
+        sys.stdout.flush()
+        sys.exit(subprocess.call([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", count]))
+    """)]
+    reports = []
+    result, gateways, ran = _fallback_run(
+        tmp_path / "w", [], mode=mode, held=held, command=wrapper, reports=reports,
+    )
+    assert result.returncode == 0 and gateways <= 1 and len(ran) == 4
+    assert "wrapper-workers=1" in result.output_tail
+    if mode == "clamp":
+        assert "wrapper-auto=1" in result.output_tail
+    # The plugin report keeps the configured budget although the grant is 1,
+    # and the nested pytest launched no more workers than the grant.
+    assert reports, "the nested pytest wrote no worker-cap report"
+    assert {row["budget"] for row in reports} == {4}
+    assert all(row.get("effective", 0) <= 1 for row in reports if row.get("kind") == "confirmed")

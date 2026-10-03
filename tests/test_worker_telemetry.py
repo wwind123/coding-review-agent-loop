@@ -122,3 +122,39 @@ def test_error_outcome_after_reap_still_counts_command_interval():
 def test_run_end_without_run_start_or_attempts_is_reported():
     out = wt.run_duty_cycles([{"record": "run-end", "run_id": "z", "at": 5}])
     assert out["z"]["incomplete"] == ["no run-start"] and out["z"]["window_seconds"] is None
+
+
+def test_wait_counters_and_legacy_records():
+    base = {"record": "attempt", "run_id": "r", "reserved_at": 110.0, "released_at": 120.0, "retained": False}
+    records = [
+        {"record": "run-start", "run_id": "r", "at": 100.0},
+        {"record": "run-end", "run_id": "r", "at": 200.0},
+        {**base, "outcome": "granted", "reservation_wait_seconds": 10.0, "wait_timed_out": False},
+        {**base, "outcome": "degraded", "reservation_wait_seconds": 5.0, "wait_timed_out": True},
+        {**base, "outcome": "oversubscribed", "reservation_wait_seconds": 2.5,
+         "wait_timed_out": True, "oversubscribed": True},
+        {**base, "outcome": "granted"},  # written before #1108: no wait fields
+    ]
+    info = wt.run_intervals(records)["r"]
+    assert (info["waits"], info["wait_timeouts"], info["oversubscribed"]) == (3, 2, 1)
+    assert info["wait_seconds_total"] == 17.5 and info["degraded"] == 1
+    summary = wt.run_duty_cycles(records)["r"]
+    assert summary["waits"] == 3 and summary["wait_timeouts"] == 2 and summary["wait_seconds_total"] == 17.5
+    # Hold intervals start at reserved_at, so the wait is not holding time.
+    assert info["low"] == [(110.0, 120.0)]
+    legacy = wt.run_duty_cycles([{**base, "run_id": "old", "outcome": "granted"}])["old"]
+    assert legacy["waits"] == 0 and legacy["wait_seconds_total"] == 0.0
+
+
+def test_interrupted_wait_records_elapsed_seconds(tmp_path):
+    import time
+
+    log = tmp_path / "t.jsonl"
+    tel = wt.ReservationTelemetry(log, {"repo": "o/r", "run_id": "r"})
+    tel.begin(4)
+    tel.wait_started(time.monotonic() - 1.5, 30.0)
+    tel.set_outcome("error")
+    tel.emit()
+    (row,) = [r for r in wt.load_records(log) if r["record"] == "attempt"]
+    assert row["reservation_wait_seconds"] >= 1.5 and row["wait_bound_seconds"] == 30.0
+    assert row["outcome"] == "error" and row["wait_timed_out"] is False

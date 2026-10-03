@@ -1166,7 +1166,14 @@ and injects a stdlib-only pytest plugin that clamps or refuses the final
 resolved pytest-xdist worker count and reports the gateways actually created.
 The local fallback is advisory by comparison, and the plugin is a prompt-slip
 safety net, not a sandbox. In clamp and refuse one test command per invocation
-holds a worker-budget lock. See
+holds a worker-budget lock. Host-wide admission is exclusive with a bounded
+wait (`AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS`): a run waits for the shared
+pool inside `run_foreground_test`, around the test command only, and on timeout
+falls back to the free workers (or one oversubscribed worker) instead of
+refusing; the fallback lowers launched workers after the configured-budget
+judgement, so refuse-mode enforcement is not weakened. A broker request's
+pending admission is cancelled when the broker stops, synchronised with target
+launch so no target starts after the owning turn ends. See
 [Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
 
 ## Other Entry Paths
