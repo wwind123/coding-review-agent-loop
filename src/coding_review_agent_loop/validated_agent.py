@@ -1274,6 +1274,7 @@ def _run_validated_agent(
 
         containment = result.containment
         target_exec_retryable = False
+        target_exec_command = ""
         if (
             containment is not None
             and result.returncode is not None
@@ -1305,8 +1306,9 @@ def _run_validated_agent(
                     if result.command_result is not None
                     else ()
                 )
+                target_exec_command = target_argv[0] if target_argv else ""
                 target_exec_retryable, detail = decision(
-                    target_argv[0] if target_argv else "",
+                    target_exec_command,
                     containment.target_exec_errno,
                 )
             else:
@@ -1498,6 +1500,10 @@ def _run_validated_agent(
                 or _is_transient_agent_output(classification_text)
             )
             last_failure_category = _failure_category(classification_text)
+            if target_exec_retryable:
+                # The typed runner decision outranks textual classification:
+                # a preflighted CLI mid self-update is transient (#1226).
+                last_failure_category = "transient"
             capacity = classify_antigravity_capacity(
                 classification_text,
                 returncode=result.returncode,
@@ -2438,6 +2444,12 @@ def _run_validated_agent(
                     f"{agent_name}: {category} failure ({last_error}); "
                     f"retrying in {delay}s (attempt {retry_attempt}/{retry_budget})",
                 )
+                stability_wait = getattr(runner, "wait_for_executable_stability", None)
+                if target_exec_retryable and target_exec_command and stability_wait is not None:
+                    # Give a self-updating CLI a bounded chance to settle.  The
+                    # result is deliberately ignored: an unstable binary still
+                    # gets the ordinary bounded relaunch (#1226).
+                    stability_wait(target_exec_command, deadline=None)
                 runner.run(("sleep", str(delay)), cwd=active_workdir(config))
                 continue
             if transition == "fallback":

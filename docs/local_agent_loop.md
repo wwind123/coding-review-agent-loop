@@ -817,6 +817,28 @@ failure may retry or fall back. A failed stability wait keeps ordinary retry and
 fallback eligibility, while changed or unavailable snapshots retain diagnostic
 refusal metadata without triggering stability waiting.
 
+### Agent CLI auto-updates during long runs
+
+Claude Code, Codex, and `agy` can update themselves while a run is in progress.
+The update replaces the installed binary non-atomically, so for a moment an exec
+of the command can fail with `ENOENT` (not found), `ETXTBSY` (text file busy),
+or `ENOEXEC` (exec format error). If the failing command was resolved by this
+run's startup preflight, that failure is treated as transient on both the
+contained and the uncontained launch paths, for bare and absolute commands. The
+answer does not depend on whether the command resolves again by the time the
+decision is made. The uncontained spawn retries within its fixed spawn-attempt
+budget. A contained launch is reported as a `transient` failure, waits up to six
+seconds for the executable to stabilize, and then relaunches within the ordinary
+`agent_max_retries` budget. Once those budgets are exhausted, the failure keeps
+the `transient` category. A command that preflight never resolved, such as a
+misconfigured `--<agent>-cmd`, still fails at once with the existing
+missing-command message. Other exec errors, such as `EACCES`, are not retried.
+
+Unattended runs, such as long overnight staged drives, should disable the CLIs'
+auto-updaters so they do not spend that retry budget. Set
+`DISABLE_AUTOUPDATER=1` for Claude Code and `AGY_CLI_DISABLE_AUTO_UPDATE=true`
+for `agy` in the environment that launches `agent-loop`.
+
 ## Prerequisites
 
 - `gh` is installed and authenticated for the target GitHub repository.
