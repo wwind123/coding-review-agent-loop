@@ -3217,3 +3217,322 @@ def test_probe_owner_and_inflight_follower_are_cancelled_without_publication(tmp
     assert results["owner"].state == "unknown" and results["follower"].state == "unknown"
     assert spawned[0].poll() is not None  # the probe group was killed
     assert not any(key[0] == "probe-cancel-turn" for key in runtime._INNER_PREFLIGHT_CACHE)
+
+
+# --- review round 3 (#1108) --------------------------------------------------------
+
+
+def _classify(payload):
+    data = str(payload.get("data", ""))
+    if payload.get("type") != "output":
+        return "terminal"
+    if data == "":
+        return "heartbeat"
+    if "waiting at most" in data:
+        return "initial-notice"
+    if "still waiting" in data:
+        return "progress-notice"
+    return "output"
+
+
+def _phase_sender(monkeypatch, phase):
+    """Block exactly the selected broker send on the first connection, recording every send."""
+    real = evidence_module._ConnectionSender
+    created = []
+    log = []
+    entered = threading.Event()
+
+    class Phase(real):
+        def __init__(self, connection, cancel):
+            super().__init__(connection, cancel)
+            self.first = not created
+            self.armed = False
+            created.append(self)
+
+        def send(self, payload, **kwargs):
+            kind = _classify(payload)
+            record = None
+            if self.first:
+                if kind == phase and not self.armed:
+                    self.armed = True
+                    self._connection = _PartialWriteConnection(self._connection, 5)
+                    entered.set()
+                record = {"kind": kind, "enter": time.monotonic(), "selected": self.armed and kind == phase}
+                log.append(record)
+            result = super().send(payload, **kwargs)
+            if record is not None:
+                record["exit"] = time.monotonic()
+                record["result"] = result
+            return result
+
+    monkeypatch.setattr(evidence_module, "_ConnectionSender", Phase)
+    return created, log, entered
+
+
+@pytest.mark.parametrize("stop", [False, True], ids=["bound-expires", "stop-during-send"])
+@pytest.mark.parametrize("phase", ["initial-notice", "progress-notice", "heartbeat"])
+def test_each_backpressure_phase_is_bounded_isolated_and_truncation_safe(tmp_path, monkeypatch, phase, stop):
+    monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 0.2 if phase == "heartbeat" else 100)
+    monkeypatch.setattr(workers_module, "HOST_WAIT_NOTICE_INTERVAL_SECONDS", 0.4 if phase == "progress-notice" else 100)
+    created, log, entered = _phase_sender(monkeypatch, phase)
+    server, locks = _wait_server(tmp_path, f"turn-phase-{phase}-{stop}")
+    holder = _foreign_holder(locks)
+    bound = 60 if stop else 2
+    try:
+        request = _wait_request(server, tmp_path, "9" * 31 + ("1" if stop else "0"), bound)
+        blocked = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        blocked.connect(server.endpoint)
+        started = time.monotonic()
+        evidence_module._send_frame(blocked, request)
+        handler = None
+        deadline = time.monotonic() + 5
+        while handler is None and time.monotonic() < deadline:
+            handlers = list(server._handler_threads)
+            handler = handlers[0] if handlers and handlers[0].is_alive() else None
+            time.sleep(0.01)
+        time.sleep(0.3)
+        follower = _FrameReader(server, request) if not stop else None  # an unaffected second connection
+        assert entered.wait(10)  # the selected send is now blocked on a partly written frame
+        selected = next(item for item in log if item["selected"])
+        if stop:
+            stop_started = time.monotonic()
+            server.stop()
+            assert time.monotonic() - stop_started < 6
+            assert selected["exit"] >= stop_started  # stop interrupted an active send...
+            assert selected["exit"] - stop_started < 0.4  # ...immediately (cancel poll), not at its grace
+        else:
+            handler.join(bound + 8)
+            assert not handler.is_alive()
+            # Admission expired on time: the wait bound plus the run and terminal grace, nowhere near 20 s.
+            assert time.monotonic() - started < bound + 7
+            assert selected["exit"] - selected["enter"] < 0.5 + 0.4  # the notice/heartbeat grace
+            follower.join(20)
+            assert follower.error is None and follower.final["returncode"] == 0
+            if phase == "heartbeat":
+                assert len(follower.beats) >= 2  # isolation: the other connection kept its heartbeats
+        assert selected["result"] is False and created[0].wedged
+        assert selected["kind"] == phase
+        attempts = created[0]._connection.written_after_partial
+        assert created[0].send({"type": "output", "data": "late"}, grace=1) is False
+        assert created[0]._connection.written_after_partial == attempts  # nothing after the truncation
+        frames, truncated = _strict_frames(blocked)
+        assert truncated  # a genuinely partial broker frame reached the client
+        blocked.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_broker_stop_cancels_a_real_probe_owner_and_inflight_follower(tmp_path, monkeypatch):
+    from coding_review_agent_loop import test_runtime as runtime
+    from coding_review_agent_loop.test_runtime import acquire_command_lane
+
+    marker = tmp_path / "spawned"
+    argv = (sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
+    monkeypatch.setattr(
+        runtime, "_recognized_inner_probe_with_environment",
+        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a)),
+    )
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def tracking(command, *args, **kwargs):
+        proc = real_popen(command, *args, **kwargs)
+        if command and command[0] == "sleep":
+            spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", tracking)
+    seen = {}
+    real_probe = runner_module.probe_inner_launcher
+
+    def recording(a, **kwargs):
+        seen.setdefault("args", (a, dict(kwargs)))
+        return real_probe(a, **kwargs)
+
+    monkeypatch.setattr(runner_module, "probe_inner_launcher", recording)
+    server, locks = _wait_server(tmp_path, "turn-real-probe")
+    try:
+        request = _wait_request(server, tmp_path, "7a" * 16, 5, argv=argv)
+        reader = _FrameReader(server, request)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not spawned:
+            time.sleep(0.02)
+        assert spawned and "args" in seen  # the broker's owning probe is running
+        follower_args, follower_kwargs = seen["args"]
+        follower_kwargs["cancel"] = server._stop_event
+        follower_result = {}
+        follower = threading.Thread(
+            target=lambda: follower_result.setdefault("r", real_probe(follower_args, **follower_kwargs))
+        )
+        follower.start()  # an in-flight follower of the same probe
+        time.sleep(0.4)
+        assert len(spawned) == 1  # it followed instead of probing again
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 6
+        follower.join(5)
+        reader.join(10)
+        assert not follower.is_alive() and follower_result["r"].state == "unknown"
+        assert reader.final["outcome"] == "cancelled" and not marker.exists()
+        assert spawned[0].poll() is not None  # the probe group was killed
+        assert not any(key[0] == server.turn_id for key in runtime._INNER_PREFLIGHT_CACHE)
+        lock, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert lock is not None, problem
+        lock.close()
+        lane = acquire_command_lane(list(argv), cwd=tmp_path, env={"AGENT_LOOP_INVOCATION_ID": server.turn_id})
+        assert lane is not None
+        lane.close()
+    finally:
+        server.stop()
+
+
+def _real_target_post_run_server(tmp_path, turn_id, size=0):
+    _git_repo(tmp_path, size=size)
+    return _wait_server(tmp_path, turn_id)
+
+
+def _assert_real_shutdown_completion(server, reader, request):
+    reader.join(20)
+    assert reader.final["outcome"] == "passed" and reader.final["returncode"] == 0
+    assert "workers=4" in reader.final["output_tail"]  # the real target's own output
+    (observation,) = server.journal
+    assert observation.attribution.state == "unknown"
+    assert "unattributed: broker shutdown" in observation.attribution.caveats
+    assert not any("snapshot unknown" in item for item in observation.attribution.caveats)
+    reservation = server._receipts[request["nonce"]]
+    assert reservation.ready.is_set() and reservation.response["outcome"] == "passed"
+
+
+def test_real_target_stopped_during_the_post_run_git_subprocess(tmp_path, monkeypatch):
+    server, locks = _real_target_post_run_server(tmp_path, "turn-real-postgit")
+    real_popen = subprocess.Popen
+    spawned = []
+    entered = threading.Event()
+
+    def slow_git(command, *args, **kwargs):
+        if command and command[0] == "git" and kwargs.get("start_new_session"):
+            proc = real_popen(["sleep", "30"], *args, **kwargs)
+            spawned.append(proc)
+            entered.set()
+            return proc
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(evidence_module.subprocess, "Popen", slow_git)
+    try:
+        request = _wait_request(server, tmp_path, "6b" * 16, 5)
+        reader = _FrameReader(server, request)
+        assert entered.wait(30)  # the target already ran; the post-run capture is blocked
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 8
+        _assert_real_shutdown_completion(server, reader, request)
+        assert spawned[0].poll() is not None
+    finally:
+        server.stop()
+
+
+def test_real_target_stopped_during_post_run_hashing(tmp_path, monkeypatch):
+    server, locks = _real_target_post_run_server(tmp_path, "turn-real-posthash", size=4 * 1024 * 1024)
+    phase = {"post": False, "n": 0}
+    real_stable = evidence_module.stable_tracked_tree_snapshot
+    real_checkpoint = evidence_module._snapshot_checkpoint
+    stopper = []
+
+    def stable(*args, **kwargs):
+        phase["post"] = kwargs.get("cancel") is not None
+        return real_stable(*args, **kwargs)
+
+    def checkpoint(started, timeout_seconds, cancel):
+        if phase["post"]:
+            phase["n"] += 1
+            if phase["n"] == 8 and not stopper:
+                thread = threading.Thread(target=server.stop)
+                thread.start()
+                stopper.append(thread)
+                deadline = time.monotonic() + 5
+                while not server._stop_event.is_set() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+        return real_checkpoint(started, timeout_seconds, cancel)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stable)
+    monkeypatch.setattr(evidence_module, "_snapshot_checkpoint", checkpoint)
+    try:
+        request = _wait_request(server, tmp_path, "5c" * 16, 5)
+        reader = _FrameReader(server, request)
+        reader.join(30)
+        assert stopper
+        stopper[0].join(10)
+        _assert_real_shutdown_completion(server, reader, request)
+    finally:
+        server.stop()
+
+
+def test_stalled_stream_read_after_a_real_target_with_a_waiting_follower(tmp_path, monkeypatch):
+    _git_repo(tmp_path, size=64 * 1024)
+    marker = tmp_path.parent / f"{tmp_path.name}-reads.txt"
+    server, locks = _wait_server(tmp_path, "turn-stalled-stream-read")
+    release = threading.Event()
+    stalled = threading.Event()
+    phase = {"post": False, "done": False}
+    real_stable = evidence_module.stable_tracked_tree_snapshot
+    real_open = Path.open
+
+    def stable(*args, **kwargs):
+        phase["post"] = kwargs.get("cancel") is not None
+        return real_stable(*args, **kwargs)
+
+    class StallingStream:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._stream.close()
+
+        def read(self, size=-1):
+            if not phase["done"]:
+                phase["done"] = True
+                stalled.set()
+                assert release.wait(30)  # one stalled read: cannot be cancelled
+            return self._stream.read(size)
+
+    def patched_open(self, mode="r", *args, **kwargs):
+        stream = real_open(self, mode, *args, **kwargs)
+        if phase["post"] and not phase["done"] and self.name == "big.bin" and "b" in mode:
+            return StallingStream(stream)
+        return stream
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stable)
+    monkeypatch.setattr(Path, "open", patched_open)
+    request = _wait_request(
+        server, tmp_path, "4d" * 16, 5,
+        argv=(sys.executable, "-c", f"open({str(marker)!r}, 'a').write('x'); import os; print('workers=' + os.environ['AGENT_LOOP_TEST_WORKERS'])"),
+    )
+    owner = _FrameReader(server, request)
+    try:
+        assert stalled.wait(30)  # the real target ran; one post-run chunk read is stalled
+        follower = _FrameReader(server, request)
+        time.sleep(0.5)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 9
+        follower.join(5)
+        assert follower.final["outcome"] == "cancelled"
+        reservation = server._receipts[request["nonce"]]
+        assert reservation.response is None and not reservation.ready.is_set()
+        assert server._deferred_close and server._pinned_root is not None and server._runtime_dir is not None
+        release.set()
+        owner.join(20)
+        assert owner.final["outcome"] == "passed" and marker.read_text() == "x"
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "passed"
+        (observation,) = server.journal
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and server._pinned_root is not None:
+            time.sleep(0.05)
+        assert server._pinned_root is None and server._runtime_dir is None
+    finally:
+        release.set()
