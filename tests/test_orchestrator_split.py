@@ -100,6 +100,27 @@ def test_facade_patch_reaches_a_registered_module_on_the_real_package(monkeypatc
     assert orchestrator.merge_pr is original
 
 
+def test_autouse_repair_stub_reaches_the_moved_validated_agent():
+    # tests/conftest.py stubs attempt_repair on the facade for every test; the
+    # moved repair path in validated_agent must see that stub, never the real
+    # repair CLI, and a nested facade patch must restore the stub on exit.
+    import coding_review_agent_loop.repair as repair
+    import coding_review_agent_loop.validated_agent as validated_agent
+
+    stub = orchestrator.attempt_repair
+    assert stub is not repair.attempt_repair
+    assert validated_agent.attempt_repair is stub
+    assert validated_agent._ORIGINAL_ATTEMPT_REPAIR is repair.attempt_repair
+
+    def fake(*args, **kwargs):
+        return None
+
+    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake):
+        assert validated_agent.attempt_repair is fake
+    assert validated_agent.attempt_repair is stub
+    assert orchestrator.attempt_repair is stub
+
+
 def test_split_source_paths_follow_the_registry(monkeypatch):
     assert guard.split_source_paths() == [
         guard.module_path("orchestrator"),
