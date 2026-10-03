@@ -5200,10 +5200,11 @@ def test_managed_qualification_resume_attaches_without_redispatch(
         },
     )
     contract = ManagedCiContract(
-        protocol_version=2, attached_run_id=123, run_attempt=1
+        protocol_version=2, attached_run_id=123, run_attempt=1, expected_head_sha="abc123"
     )
     dispatches = []
     merges = []
+    waited = []
     monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: contract)
     monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
     monkeypatch.setattr(
@@ -5211,15 +5212,18 @@ def test_managed_qualification_resume_attaches_without_redispatch(
         "dispatch_final_qualification",
         lambda *a, **k: dispatches.append(k),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "wait_for_final_qualification",
-        lambda *a, **k: ManagedCiOutcome(status="passed", head_sha="abc123"),
-    )
+
+    def wait(*a, **k):
+        c = k["contract"]
+        waited.append((c.attached_run_id, c.run_attempt, c.expected_head_sha))
+        return ManagedCiOutcome(status="passed", head_sha="abc123")
+
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait)
     monkeypatch.setattr(orchestrator, "merge_pr", lambda *a, **k: merges.append(k))
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert dispatches == []
+    assert waited == [(123, 1, "abc123")]
     assert merges == [{"expected_head_sha": "abc123"}]
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
@@ -16848,3 +16852,170 @@ def test_refresh_pass_with_unavailable_reviewer_publishes_no_release_and_reruns_
     assert runner.codex_outputs == [] and runner.gemini_outputs == []
     reasons = [record.metadata.evidence_release.reason for record in _release_records(runner)]
     assert reasons == ["evidence-cleared", "refresh-clean"]
+
+
+def _stale_attachment_stubs(monkeypatch, *, stale_contract, outcomes):
+    """Managed-CI stubs that record dispatches, waits and the attachment each wait saw."""
+    state = {"contract": stale_contract, "dispatches": [], "waited": [], "merges": [], "fresh": 0}
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: state["contract"])
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+
+    def dispatch(*args, **kwargs):
+        state["dispatches"].append(kwargs["expected_head_sha"])
+        state["fresh"] += 1
+        contract = kwargs["contract"]
+        contract.attached_run_id = 999 + state["fresh"] - 1
+        contract.run_attempt = 1
+        contract.expected_head_sha = kwargs["expected_head_sha"]
+        contract.nonce = f"fresh-nonce-{state['fresh']}"
+
+    def wait(*args, **kwargs):
+        contract = kwargs["contract"]
+        state["waited"].append((contract.attached_run_id, contract.expected_head_sha))
+        return outcomes(contract, kwargs["metadata"])
+
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", dispatch)
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait)
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *a, **k: state["merges"].append(k))
+    return state
+
+
+def test_stale_older_head_managed_attachment_is_released_and_fresh_attempt_dispatched(
+    tmp_path, monkeypatch, capsys
+):
+    """#1168: an attachment made for an older head is never attached or checkpointed."""
+    seeded = UnresolvedReviewItem(
+        item_id="item-1",
+        reviewer="GitHub managed exact-head CI",
+        source_round=1,
+        text="Managed CI failed on the previous head.",
+        status="blocking",
+        source_status="blocking",
+        authority="machine",
+        obligation_kind="managed-exact-head-ci",
+        lifecycle="awaiting_current_head_review",
+        failed_head_sha="old-head",
+        candidate_head_sha="abc123",
+        obligation_identity="managed-exact-head-ci:item-1",
+    )
+    coder_output = structured_coder_followup(
+        summary="The failed managed-CI head was repaired.", addressed_items=[seeded.item_id]
+    )
+    prior_round = _attach_round_metadata(
+        coder_output,
+        PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=1,
+            subject="abc123", prior_items=(seeded,), state="blocking",
+            raw_structured_coder_response=coder_output,
+        ),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved",
+                summary="Approved the repaired head.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+        pr_payload={
+            "comments": [{"author": {"login": "coding-review-agent-loop"}, "body": prior_round}]
+        },
+    )
+    stale = ManagedCiContract(
+        protocol_version=2, attached_run_id=37061662125, run_attempt=1,
+        expected_head_sha="old-head", nonce="old-nonce",
+    )
+    state = _stale_attachment_stubs(
+        monkeypatch,
+        stale_contract=stale,
+        outcomes=lambda c, m: ManagedCiOutcome(status="passed", head_sha=m.head_sha),
+    )
+    config = make_config(tmp_path, managed_ci=True, auto_merge=True, max_rounds=2, quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    bodies = [str(c) for c in runner.comments]
+    assert any(c[:2] == ["codex", "exec"] for c, _cwd in runner.commands)
+    assert any("authoritative exact-head validation is in progress" in b for b in bodies)
+    assert state["dispatches"] == ["abc123"]
+    assert not any("37061662125" in b for b in bodies)
+    assert [b for b in bodies if "attached attempt" in b and "999/1" in b]
+    assert len([b for b in bodies if "attached attempt" in b]) == 1
+    assert state["waited"] == [(999, "abc123")]
+    assert "resuming attached qualification attempt 37061662125" not in capsys.readouterr().err
+    assert state["merges"] == [{"expected_head_sha": "abc123"}]
+
+
+def test_pr1166_stale_attempt_failure_does_not_end_run_or_partial_the_approved_round(
+    tmp_path, monkeypatch, capsys
+):
+    """#1168: attempt A (head-1) fails late; round N+1 approves head-2 and uses a fresh attempt B."""
+    failed_check = PullRequestCheck(
+        name="final-ci/exact-head", kind="check_run", status="failure",
+        url="https://github.com/OWNER/REPO/actions/runs/37061662125",
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Approved head-1."),
+            structured_pr_review(
+                state="approved",
+                summary="Approved head-2.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                state="blocking", summary="Fixed managed CI.", addressed_items=["item-1"]
+            )
+        ],
+    )
+
+    def outcomes(contract, metadata):
+        if contract.attached_run_id == 999:
+            # Attempt A: bound to the first head and failing late.
+            return ManagedCiOutcome(
+                status="failed", head_sha="abc123",
+                checks=_watch_check_board("failing", failing=(failed_check,)),
+            )
+        return ManagedCiOutcome(status="passed", head_sha=metadata.head_sha)
+
+    state = _stale_attachment_stubs(
+        monkeypatch,
+        stale_contract=ManagedCiContract(protocol_version=2),
+        outcomes=outcomes,
+    )
+    config = make_config(tmp_path, managed_ci=True, auto_merge=True, max_rounds=1, quiet=False)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    bodies = [str(c) for c in runner.comments]
+    # A was dispatched for abc123; B for the coder's new head. A's failure is never
+    # reported as B's verdict, and the run does not stop on it.
+    assert state["dispatches"] == ["abc123", "abc123-coder-1"]
+    assert state["waited"] == [(999, "abc123"), (1000, "abc123-coder-1")]
+    assert state["merges"] == [{"expected_head_sha": "abc123-coder-1"}]
+    attached = [b for b in bodies if "qualification checkpoint: attached attempt" in b]
+    # Only the repair round carries a CI obligation, so only attempt B is checkpointed.
+    assert [("999/1" in b, "1000/1" in b) for b in attached] == [(False, True)]
+    assert not any("terminal state without publishing" in b for b in bodies)
+    assert "resuming attached qualification attempt 999" not in capsys.readouterr().err
+
+    # Resume over the posted history while the PR is still OPEN at the approved head.
+    codex_before = sum(c[:2] == ["codex", "exec"] for c, _cwd in runner.commands)
+    resumed = ManagedCiContract(
+        protocol_version=2, attached_run_id=1000, run_attempt=1,
+        expected_head_sha="abc123-coder-1", nonce="fresh-nonce-2",
+    )
+    state2 = _stale_attachment_stubs(
+        monkeypatch, stale_contract=resumed,
+        outcomes=lambda c, m: ManagedCiOutcome(status="passed", head_sha=m.head_sha),
+    )
+    runner.pr_payload["state"] = "OPEN"
+    assert runner.pr_payload["headRefOid"] == "abc123-coder-1"
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert sum(c[:2] == ["codex", "exec"] for c, _cwd in runner.commands) == codex_before
+    assert state2["dispatches"] == []
+    assert state2["waited"] == [(1000, "abc123-coder-1")]
+    assert state2["merges"] == [{"expected_head_sha": "abc123-coder-1"}]

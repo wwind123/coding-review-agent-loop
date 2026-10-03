@@ -5387,6 +5387,7 @@ def v2_contract(**overrides):
         "trusted_actor_id": 1,
         "workflow_revision": "base-sha",
         "nonce": "nonce-1",
+        "expected_head_sha": "abc123",
     }
     fields.update(overrides)
     return ManagedCiContract(**fields)
@@ -6402,6 +6403,7 @@ def test_v2_qualification_ignores_same_context_status_from_another_run(tmp_path)
         nonce="nonce-1",
         attached_run_id=100,
         run_attempt=1,
+        expected_head_sha="abc123",
     )
 
     outcome = wait_for_final_qualification(
@@ -6441,6 +6443,7 @@ def test_v2_qualification_accepts_only_attached_run_status(tmp_path):
         nonce="nonce-1",
         attached_run_id=100,
         run_attempt=1,
+        expected_head_sha="abc123",
     )
 
     outcome = wait_for_final_qualification(
