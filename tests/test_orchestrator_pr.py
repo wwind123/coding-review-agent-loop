@@ -16963,6 +16963,15 @@ def test_pr1166_stale_attempt_failure_does_not_end_run_or_partial_the_approved_r
                 prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
             ),
         ],
+        gemini_outputs=[
+            structured_pr_review(state="approved", summary="Approved head-1.", reviewer="Google Gemini"),
+            structured_pr_review(
+                state="approved",
+                summary="Approved head-2.",
+                reviewer="Google Gemini",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
         claude_outputs=[
             structured_coder_followup(
                 state="blocking", summary="Fixed managed CI.", addressed_items=["item-1"]
@@ -16984,7 +16993,10 @@ def test_pr1166_stale_attempt_failure_does_not_end_run_or_partial_the_approved_r
         stale_contract=ManagedCiContract(protocol_version=2),
         outcomes=outcomes,
     )
-    config = make_config(tmp_path, managed_ci=True, auto_merge=True, max_rounds=1, quiet=False)
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), managed_ci=True, auto_merge=True,
+        max_rounds=1, quiet=False,
+    )
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -17001,7 +17013,11 @@ def test_pr1166_stale_attempt_failure_does_not_end_run_or_partial_the_approved_r
     assert "resuming attached qualification attempt 999" not in capsys.readouterr().err
 
     # Resume over the posted history while the PR is still OPEN at the approved head.
-    codex_before = sum(c[:2] == ["codex", "exec"] for c, _cwd in runner.commands)
+    def reviewer_runs():
+        return sum(c[:2] == ["codex", "exec"] or c[:1] == ["gemini"] for c, _cwd in runner.commands)
+
+    reviewer_before = reviewer_runs()
+    assert reviewer_before == 4  # both reviewers approved both heads in run 1
     resumed = ManagedCiContract(
         protocol_version=2, attached_run_id=1000, run_attempt=1,
         expected_head_sha="abc123-coder-1", nonce="fresh-nonce-2",
@@ -17015,7 +17031,7 @@ def test_pr1166_stale_attempt_failure_does_not_end_run_or_partial_the_approved_r
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert sum(c[:2] == ["codex", "exec"] for c, _cwd in runner.commands) == codex_before
+    assert reviewer_runs() == reviewer_before
     assert state2["dispatches"] == []
     assert state2["waited"] == [(1000, "abc123-coder-1")]
     assert state2["merges"] == [{"expected_head_sha": "abc123-coder-1"}]
