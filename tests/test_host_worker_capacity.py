@@ -1264,7 +1264,16 @@ def test_same_invocation_survivor_never_makes_the_next_command_wait(tmp_path):
         assert second.returncode == 0 and "is busy" not in second.output_tail
         (row,) = _attempts(log)
         assert row["reservation_wait_seconds"] == 0.0 and row["wait_timed_out"] is False
-        assert row["workers_granted"] <= 1  # the survivor still reduces the grant
+        assert row["workers_granted"] == 1  # the survivor still reduces the grant
+        assert row["outcome"] == "oversubscribed" and row["oversubscribed"] is True
+        from coding_review_agent_loop.worker_telemetry import run_duty_cycles
+
+        duty = run_duty_cycles([
+            {"record": "run-start", "run_id": "r1", "at": row["requested_at"] - 1},
+            {"record": "run-end", "run_id": "r1", "at": row["released_at"] + 1},
+            {**row, "run_id": "r1"},
+        ])["r1"]
+        assert duty["oversubscribed"] == 1 and duty["waits"] == 0
         # A different invocation still waits (exclusive) for that same survivor.
         other = _lock(root, "other-inv")
         try:
@@ -1299,3 +1308,33 @@ def test_timed_out_full_grant_notice_does_not_say_instead_of(tmp_path, monkeypat
     assert "workers=4" in result.output_tail
     assert any("proceeding alongside the other run with the full 4 worker(s)" in text for text in notices)
     assert not any("instead of" in text for text in notices)
+
+
+def test_same_invocation_partial_free_survivor_is_degraded_not_oversubscribed(tmp_path):
+    from coding_review_agent_loop.runner import run_foreground_test
+
+    root = tmp_path / "locks"
+    pid_file = tmp_path / "escaped.pid"
+    script = (
+        "import subprocess, sys; "
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], start_new_session=True); "
+        f"open({str(pid_file)!r}, 'w').write(str(p.pid))"
+    )
+    first = run_foreground_test(
+        [sys.executable, "-c", script], cwd=tmp_path, timeout_seconds=30, env=_env("partial-inv"),
+        environment_is_complete=True, echo_output=False, worker_budget=_budget(2), worker_lock_root=root,
+    )
+    escaped = int(pid_file.read_text())
+    try:
+        assert first.returncode == 0 and _pid_alive(escaped)
+        log, tel = _telemetry(tmp_path)
+        second = _run(tmp_path, root, tel, env=_env("partial-inv", wait=60), cmd=_PRINTER)
+        assert "workers=2" in second.output_tail
+        (row,) = _attempts(log)
+        assert row["outcome"] == "degraded" and row["oversubscribed"] is False
+        assert row["reservation_wait_seconds"] == 0.0 and row["wait_timed_out"] is False
+    finally:
+        try:
+            os.kill(escaped, 9)
+        except ProcessLookupError:
+            pass

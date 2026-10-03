@@ -1268,10 +1268,15 @@ class WorkerBudgetLock:
                     finally:
                         contended = contended or self.last_mutex_contended
                     if granted:
+                        # Only same-invocation survivors can reach here with others
+                        # present; a floor grant on zero free workers oversubscribes.
+                        survivor_oversubscribed = (
+                            (self.last_others or (0, 0))[0] > 0 and self.last_free == 0
+                        )
                         return HostWaitResult(
                             granted,
                             (monotonic() - start) if (refused or contended) else 0.0,
-                            False, False, False,
+                            False, survivor_oversubscribed, False,
                         )
                     others = self.last_others or (0, 0)
                     now = monotonic()
