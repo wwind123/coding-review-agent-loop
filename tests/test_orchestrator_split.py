@@ -25,9 +25,17 @@ def test_baseline_surface_is_still_exposed_by_the_facade():
     assert guard.missing_surface_names(orchestrator, BASELINE["surface"]) == []
 
 
-def test_baseline_definitions_exist_exactly_once_and_unchanged():
+def test_orchestrator_facade_is_only_a_docstring_and_imports():
     facade_source = guard.module_path("orchestrator").read_text(encoding="utf-8")
-    assert guard.definition_problems(BASELINE["definitions"], facade_source, _registered_sources()) == []
+    assert guard.thin_facade_problems(facade_source) == []
+
+
+def test_baseline_no_longer_freezes_definition_digests():
+    # The per-definition digest freeze was effort-scoped (#1181) and retired
+    # in #1204 so the extracted modules can evolve; surface and module list stay.
+    assert set(BASELINE) == {"modules", "surface"}
+    assert "orchestrator" in BASELINE["modules"]
+    assert {"run_pr_loop", "run_issue_loop", "_run_validated_agent"} <= set(BASELINE["surface"])
 
 
 def test_registered_modules_bind_the_facades_objects():
@@ -153,95 +161,29 @@ def test_cli_entry_points_are_the_moved_definitions():
         assert getattr(issue_loop, name).__module__ == issue_loop.__name__
 
 
-def test_baseline_records_every_top_level_definition_of_the_base():
-    names = {name for name, _ in guard.top_level_definitions(
-        guard.module_path("orchestrator").read_text(encoding="utf-8")
-    )}
-    for name in guard.registered_module_names():
-        names |= {n for n, _ in guard.top_level_definitions(guard.module_path(name).read_text(encoding="utf-8"))}
-    assert set(BASELINE["definitions"]) <= names
-    assert {"run_pr_loop", "run_issue_loop", "_run_validated_agent"} <= set(BASELINE["definitions"])
-    assert "orchestrator" in BASELINE["modules"]
-
-
 # --- Each guard fails on a synthetic violation -------------------------------
 
-FACADE_SOURCE = '''"""Synthetic facade."""
-import os
-
-LIMIT = 3
-
-
-@staticmethod
-def decorated():
-    return LIMIT
+def test_thin_facade_guard_accepts_docstring_and_imports():
+    source = '"""Facade."""\nfrom __future__ import annotations\n\nimport os\nfrom .moved import (\n    helper,\n)\n'
+    assert guard.thin_facade_problems(source) == []
+    assert guard.thin_facade_problems("import os\n") == []
 
 
-def helper():
-    return os.sep
-
-
-class Carrier:
-    value = 1
-'''
-
-
-def _definitions(source):
-    return dict(guard.top_level_definitions(source))
-
-
-def test_surface_guard_names_a_dropped_attribute():
-    facade = types.ModuleType("synthetic_facade")
-    facade.kept = 1
-    assert guard.missing_surface_names(facade, ["kept", "dropped"]) == [
-        "orchestrator no longer exposes 'dropped'"
-    ]
-
-
-def test_definition_guard_accepts_a_pure_move():
-    baseline = _definitions(FACADE_SOURCE)
-    facade = 'import os\nfrom .moved import helper\n\nLIMIT = 3\n\n\n@staticmethod\ndef decorated():\n    return LIMIT\n\n\nclass Carrier:\n    value = 1\n'
-    moved = "import os\n\n\ndef helper():\n    return os.sep\n"
-    assert guard.definition_problems(baseline, facade, {"moved": moved}) == []
-
-
-def test_definition_guard_covers_decorators():
-    baseline = _definitions(FACADE_SOURCE)
-    undecorated = FACADE_SOURCE.replace("@staticmethod\n", "")
-    assert guard.definition_problems(baseline, undecorated, {}) == [
-        "'decorated' in orchestrator differs from its baseline source"
-    ]
-
-
-def test_definition_guard_names_an_altered_body():
-    baseline = _definitions(FACADE_SOURCE)
-    facade = FACADE_SOURCE.replace("def helper():\n    return os.sep\n", "")
-    moved = "import os\n\n\ndef helper():\n    return os.pathsep\n"
-    assert guard.definition_problems(baseline, facade, {"moved": moved}) == [
-        "'helper' in moved differs from its baseline source"
-    ]
-
-
-def test_definition_guard_names_a_copy_left_behind():
-    baseline = _definitions(FACADE_SOURCE)
-    moved = "import os\n\n\ndef helper():\n    return os.sep\n"
-    problems = guard.definition_problems(baseline, FACADE_SOURCE, {"moved": moved})
-    assert problems == ["'helper' is defined 2 times (in ['orchestrator', 'moved']); expected exactly once"]
-
-
-def test_definition_guard_names_a_missing_definition():
-    baseline = _definitions(FACADE_SOURCE)
-    facade = FACADE_SOURCE.replace("LIMIT = 3\n", "")
-    assert guard.definition_problems(baseline, facade, {}) == [
-        "'LIMIT' is defined 0 times (in []); expected exactly once"
-    ]
-
-
-def test_definition_guard_names_a_new_name_in_an_extracted_module():
-    baseline = _definitions(FACADE_SOURCE)
-    moved = "NEW_CONSTANT = 1\n"
-    assert guard.definition_problems(baseline, FACADE_SOURCE, {"moved": moved}) == [
-        "moved defines 'NEW_CONSTANT', which is not a baseline orchestrator definition"
+@pytest.mark.parametrize(
+    ("addition", "kind"),
+    [
+        ("LIMIT = 3\n", "Assign"),
+        ("LIMIT: int = 3\n", "AnnAssign"),
+        ("def helper():\n    return 1\n", "FunctionDef"),
+        ("class Carrier:\n    value = 1\n", "ClassDef"),
+        ("if True:\n    import sys\n", "If"),
+        ('"""A second string is not the docstring."""\n', "Expr"),
+    ],
+)
+def test_thin_facade_guard_rejects_a_top_level_definition_or_statement(addition, kind):
+    source = '"""Facade."""\nimport os\n' + addition
+    assert guard.thin_facade_problems(source) == [
+        f"orchestrator.py line 3 has a top-level {kind}; the facade may hold only a docstring and imports"
     ]
 
 
@@ -274,7 +216,7 @@ def test_completeness_guard_names_an_unregistered_module():
     ]
 
 
-def test_coherence_guard_names_divergent_and_unknown_bindings():
+def test_coherence_guard_names_divergent_bindings_and_allows_module_only_names():
     facade = types.ModuleType("synthetic_facade")
     shared, divergent = object(), object()
     facade.shared = shared
@@ -285,7 +227,6 @@ def test_coherence_guard_names_divergent_and_unknown_bindings():
     module.only_here = 1
     assert guard.incoherent_bindings(facade, [module]) == [
         "synthetic_consumer.divergent is not the facade's object",
-        "synthetic_consumer.only_here is not bound on the orchestrator facade",
     ]
 
 

@@ -4,10 +4,11 @@ This module is NOT a test file.  It holds:
 
 * ``EXTRACTED_MODULES`` -- the ordered registry of modules extracted from
   ``orchestrator.py``.  Each extraction stage appends exactly one name.
-* Baseline helpers that freeze the ``orchestrator`` import surface and a
-  SHA-256 of every top-level definition's exact source segment.  Regenerate
-  the fixture with ``python tests/orchestrator_split_guard.py`` (only when a
-  change to a definition is intended and visible in the diff).
+* Baseline helpers that freeze the ``orchestrator`` import surface and the
+  package module list at the start of the split.  The per-definition digest
+  freeze that kept every extraction a pure move was retired once the split
+  finished (#1204), so the extracted modules can now evolve; the facade itself
+  must stay a docstring plus import statements (``thin_facade_problems``).
 * Pure check functions used by ``tests/test_orchestrator_split.py``; each
   returns a list of human-readable problems so it can be exercised on
   synthetic violations as well as on the real package.
@@ -20,7 +21,6 @@ This module is NOT a test file.  It holds:
 from __future__ import annotations
 
 import ast
-import hashlib
 import importlib
 import json
 import os
@@ -96,47 +96,11 @@ def facade_surface(facade: types.ModuleType) -> list[str]:
     return sorted(name for name in dir(facade) if not _is_dunder(name))
 
 
-def top_level_definitions(source: str) -> list[tuple[str, str]]:
-    """``(name, sha256)`` for each top-level def, class and assignment.
-
-    The digest covers the exact source lines of the statement, decorators
-    included, so any edit to a moved body changes it.
-    """
-    lines = source.splitlines(keepends=True)
-    found: list[tuple[str, str]] = []
-    for node in ast.parse(source).body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names = [node.name]
-            start = min([node.lineno, *(decorator.lineno for decorator in node.decorator_list)])
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            names = [
-                leaf.id
-                for target in targets
-                for leaf in ast.walk(target)
-                if isinstance(leaf, ast.Name)
-            ]
-            start = node.lineno
-        else:
-            continue
-        segment = "".join(lines[start - 1 : node.end_lineno])
-        digest = hashlib.sha256(segment.encode("utf-8")).hexdigest()
-        found.extend((name, digest) for name in names)
-    return found
-
-
 def compute_baseline() -> dict:
     facade = importlib.import_module(FACADE)
-    source = module_path("orchestrator").read_text(encoding="utf-8")
-    definitions = top_level_definitions(source)
-    names = [name for name, _ in definitions]
-    duplicates = sorted({name for name in names if names.count(name) > 1})
-    if duplicates:
-        raise ValueError(f"orchestrator.py defines these names more than once: {duplicates}")
     return {
         "modules": package_module_names(),
         "surface": facade_surface(facade),
-        "definitions": dict(sorted(definitions)),
     }
 
 
@@ -151,45 +115,38 @@ def missing_surface_names(facade: object, surface: Iterable[str]) -> list[str]:
     return [f"orchestrator no longer exposes {name!r}" for name in surface if not hasattr(facade, name)]
 
 
-def definition_problems(
-    baseline_definitions: Mapping[str, str],
-    facade_source: str,
-    module_sources: Mapping[str, str],
-) -> list[str]:
-    """Every baseline definition exists exactly once, byte-identical.
-
-    ``module_sources`` maps each registered module name to its source; those
-    modules must not introduce a top-level name absent from the baseline.
-    """
-    occurrences: dict[str, list[tuple[str, str]]] = {}
+def thin_facade_problems(facade_source: str) -> list[str]:
+    """The facade's top level is an optional docstring plus import statements."""
     problems: list[str] = []
-    for owner, source in (("orchestrator", facade_source), *module_sources.items()):
-        for name, digest in top_level_definitions(source):
-            if owner != "orchestrator" and name not in baseline_definitions:
-                problems.append(f"{owner} defines {name!r}, which is not a baseline orchestrator definition")
-                continue
-            occurrences.setdefault(name, []).append((owner, digest))
-    for name, expected in baseline_definitions.items():
-        found = occurrences.get(name, [])
-        if len(found) != 1:
-            owners = [owner for owner, _ in found]
-            problems.append(f"{name!r} is defined {len(found)} times (in {owners}); expected exactly once")
+    for index, node in enumerate(ast.parse(facade_source).body):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
             continue
-        owner, digest = found[0]
-        if digest != expected:
-            problems.append(f"{name!r} in {owner} differs from its baseline source")
+        if (
+            index == 0
+            and isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            continue
+        problems.append(
+            f"orchestrator.py line {node.lineno} has a top-level {type(node).__name__}; "
+            "the facade may hold only a docstring and imports"
+        )
     return problems
 
 
 def incoherent_bindings(facade: types.ModuleType, modules: Iterable[types.ModuleType]) -> list[str]:
+    """Names bound in both the facade and a registered module are the same object.
+
+    A module-only global is allowed: extracted modules may grow new helpers
+    the facade does not re-export, and the shim never propagates to them.
+    """
     problems: list[str] = []
     for module in modules:
         for name, value in vars(module).items():
-            if _is_dunder(name):
+            if _is_dunder(name) or name not in vars(facade):
                 continue
-            if name not in vars(facade):
-                problems.append(f"{module.__name__}.{name} is not bound on the orchestrator facade")
-            elif vars(facade)[name] is not value:
+            if vars(facade)[name] is not value:
                 problems.append(f"{module.__name__}.{name} is not the facade's object")
     return problems
 
