@@ -19,7 +19,7 @@ from .child_topology import (
     preflight_flat_child_count,
 )
 from .errors import AgentLoopError
-from .github import FoundIssue, create_issue, post_issue_comment, search_issues
+from .github import FoundIssue, create_issue, get_issue_found, post_issue_comment, search_issues
 from .runner import Runner
 from .protocol_markers import TrustedBody, decompress_record_payload, sanitize_historical_text
 from .protocol import (
@@ -916,9 +916,31 @@ def _issue_number_from_url(issue_url: str | None) -> int | None:
     return int(match.group(1) or match.group(2))
 
 
+PHASE_ISSUE_TITLE_LIMIT = 120
+
+
 def _phase_issue_title(parent_issue: int, index: int, phase: PlanPhase) -> str:
+    """Build a bounded child title; only ``phase.title`` is truncated."""
     prefix = "[Human] " if phase.automation in {"human-action", "manual-close"} else ""
-    return f"{prefix}Phase {index}: {phase.title} (from #{parent_issue})"[:120]
+    head = f"{prefix}Phase {index}: "
+    tail = f" (from #{parent_issue})"
+    room = max(0, PHASE_ISSUE_TITLE_LIMIT - len(head) - len(tail))
+    return head + phase.title[:room] + tail
+
+
+def _legacy_phase_issue_title(parent_issue: int, index: int, phase: PlanPhase) -> str:
+    """Reproduce the historical whole-string cut that could drop the parent marker."""
+    prefix = "[Human] " if phase.automation in {"human-action", "manual-close"} else ""
+    return f"{prefix}Phase {index}: {phase.title} (from #{parent_issue})"[:PHASE_ISSUE_TITLE_LIMIT]
+
+
+def _phase_issue_title_matches(
+    title: str | None, parent_issue: int, index: int, phase: PlanPhase
+) -> bool:
+    return title in {
+        _phase_issue_title(parent_issue, index, phase),
+        _legacy_phase_issue_title(parent_issue, index, phase),
+    }
 
 
 def _phase_payload(phase: PlanPhase) -> dict[str, object]:
@@ -1748,7 +1770,9 @@ def _fresh_phase_content_matches(
     inherited_matrix_row_ids: Sequence[str] = (),
 ) -> bool:
     """Check the reviewed content around a fresh phase identity marker."""
-    if candidate.title != _phase_issue_title(parent_issue, phase.position or 0, phase):
+    if not _phase_issue_title_matches(
+        candidate.title, parent_issue, phase.position or 0, phase
+    ):
         return False
     body = candidate.body
     if not isinstance(body, str):
@@ -1853,7 +1877,7 @@ def create_decomposition_child_issues(
 
     # Search is read-only and intentionally includes every issue state.  It
     # closes the create-before-summary crash window without trusting authorship.
-    found = merge_found_issues(
+    searched = merge_found_issues(
         search_issues(
             runner,
             config=config,
@@ -1862,6 +1886,30 @@ def create_decomposition_child_issues(
         )
         for query in parent_child_search_queries(parent_issue)
     )
+    # Recorded child references are read directly by number: a truncated
+    # title can hide a child from every title search.  Direct reads win over
+    # incomplete search hits; unreadable references are simply skipped.
+    recorded_numbers: list[int] = []
+    for summary in find_decompositions_for_parent(issue_comments, parent_issue=parent_issue):
+        for _title, url, number in summary.children:
+            if number is None and url:
+                match = re.search(r"/issues/(\d+)\s*$", url)
+                number = int(match.group(1)) if match else None
+            if number is not None and number not in recorded_numbers:
+                recorded_numbers.append(number)
+    direct_reads = [
+        issue
+        for issue in (
+            get_issue_found(runner, config=config, issue_number=number)
+            for number in recorded_numbers
+        )
+        if issue is not None
+    ]
+    found = merge_found_issues([searched], prefer=direct_reads)
+    searched_numbers = {issue.number for issue in searched}
+    reference_only_numbers = {
+        issue.number for issue in direct_reads if issue.number not in searched_numbers
+    }
     expected_ids = {
         index: phase_identity(
             parent_issue=parent_issue,
@@ -1980,7 +2028,12 @@ def create_decomposition_child_issues(
                 # toward the parent budget, without adopting it as a desired
                 # decomposition phase.
                 recognized.add("linked:" + " ".join(candidate.title.casefold().split()))
-        if not fresh and not candidate.body and candidate.title:
+        if (
+            not fresh
+            and not candidate.body
+            and candidate.title
+            and candidate.number not in reference_only_numbers
+        ):
             # Some GitHub search responses omit bodies.  The generated parent
             # prefixed title is a canonical recovery key in that narrow case.
             for index, phase in enumerate(phases, start=1):

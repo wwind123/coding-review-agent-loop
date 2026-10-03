@@ -106,8 +106,11 @@ class ChildTopologyPreflight:
     missing_count: int
 
 
-def parent_child_search_queries(parent_issue: int) -> tuple[str, str]:
-    """Return the supported flat-child title searches separately.
+def parent_child_search_queries(parent_issue: int) -> tuple[str, ...]:
+    """Return the supported flat-child searches separately.
+
+    The third query matches the first visible line of every phase body, which
+    survives title truncation (the title suffix can be cut off at 120 chars).
 
     GitHub issue search does not implement the boolean ``OR`` operator used by
     code search. Keeping these as separate queries avoids silently missing one
@@ -116,11 +119,20 @@ def parent_child_search_queries(parent_issue: int) -> tuple[str, str]:
     return (
         f'"(from #{parent_issue})" in:title',
         f'"[#{parent_issue} stage]" in:title',
+        f'"Child phase issue for parent #{parent_issue}" in:body',
     )
 
 
-def merge_found_issues(result_sets: Iterable[Iterable[FoundIssue]]) -> tuple[FoundIssue, ...]:
-    """Merge parent-child search results, de-duplicating by issue number."""
+def merge_found_issues(
+    result_sets: Iterable[Iterable[FoundIssue]],
+    *,
+    prefer: Iterable[FoundIssue] = (),
+) -> tuple[FoundIssue, ...]:
+    """Merge parent-child search results, de-duplicating by issue number.
+
+    ``prefer`` holds complete direct reads; their non-empty fields win over
+    the same issue's (possibly incomplete) search hits.
+    """
     merged: dict[int, FoundIssue] = {}
     without_number: list[FoundIssue] = []
     for results in result_sets:
@@ -141,6 +153,19 @@ def merge_found_issues(result_sets: Iterable[Iterable[FoundIssue]]) -> tuple[Fou
                 body=previous.body or found.body,
                 url=previous.url or found.url,
             )
+    for direct in prefer:
+        if direct.number is None:
+            continue
+        previous = merged.get(direct.number)
+        if previous is None:
+            merged[direct.number] = direct
+            continue
+        merged[direct.number] = FoundIssue(
+            number=direct.number,
+            title=direct.title or previous.title,
+            body=direct.body or previous.body,
+            url=direct.url or previous.url,
+        )
     return tuple(merged.values()) + tuple(without_number)
 
 
