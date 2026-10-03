@@ -237,26 +237,52 @@ def test_repair_guard_logs_its_own_normalization(tmp_path):
     assert any("normalized risk test matrix string field(s)" in m and "forbidden_side_effects" in m for m in logs)
 
 
-def test_replay_transitions_are_not_taken_for_the_dedicated_replay(tmp_path):
+def _order(runner, binary):
+    """Ordered ('agent'|'sleep') events from the runner's recorded commands."""
+    events = []
+    for cmd, _cwd in runner.commands:
+        if cmd[:1] == [binary]:
+            events.append("agent")
+        elif cmd[:1] == ["sleep"]:
+            events.append("sleep")
+    return events
+
+
+def _spy_transitions():
     from coding_review_agent_loop.agents.antigravity import AntigravityAttemptState
 
-    transitions: list[object] = []
+    transitions: list[int] = []
     real = AntigravityAttemptState.next_after_failure
 
     def spy(self, **kwargs):
-        transitions.append((self.retries_remaining, kwargs))
+        transitions.append(self.retries_remaining)
         return real(self, **kwargs)
 
-    sleeps: list[object] = []
+    return AntigravityAttemptState, transitions, spy
+
+
+def test_replay_takes_no_transition_or_delay_with_zero_budget(tmp_path):
+    state_cls, transitions, spy = _spy_transitions()
+    runner = _runner("antigravity", [_state(_row(forbidden_side_effects="")), _state()])
+    with patch.object(state_cls, "next_after_failure", spy):
+        response, error, _l, _s, _e = _run_noskip(runner, _config(tmp_path, "antigravity", 0))
+    assert error is None and response is not None
+    assert transitions == []
+    assert _order(runner, "agy") == ["agent", "agent"]
+    assert _models(_cmds(runner, "antigravity")) == ["ModelA", "ModelA"]
+
+
+def test_replay_transitions_are_not_taken_for_the_dedicated_replay(tmp_path):
+    state_cls, transitions, spy = _spy_transitions()
     bad = _state(_row(forbidden_side_effects=""))
     runner = _runner("antigravity", [bad, "Error: server is overloaded, try again later", _state()])
-    with patch.object(AntigravityAttemptState, "next_after_failure", spy), \
-            patch.object(orchestrator.time, "sleep", lambda s: sleeps.append(s)):
+    with patch.object(state_cls, "next_after_failure", spy):
         response, error, _logs, _spy, _ = _run_noskip(runner, _config(tmp_path, "antigravity", 1))
     assert error is None and response is not None
     # Only the later ordinary failure takes a transition, with its full allowance.
-    assert len(transitions) == 1 and transitions[0][0] == 1
-    assert len(sleeps) <= 1
+    assert transitions == [1]
+    # No delay between the refusal and the replay; exactly one before the ordinary retry.
+    assert _order(runner, "agy") == ["agent", "agent", "sleep", "agent"]
     assert _models(_cmds(runner, "antigravity")) == ["ModelA"] * 3
 
 

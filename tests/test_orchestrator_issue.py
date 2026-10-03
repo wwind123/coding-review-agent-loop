@@ -15599,30 +15599,56 @@ def _run_issue_level_1229(tmp_path, monkeypatch, outputs, retries=0):
     return runner, repair_calls, posted
 
 
+def _posted_matrix_1229(body):
+    import re
+    from coding_review_agent_loop.comment_rendering import decode_risk_test_matrix_marker
+
+    match = re.search(r"<!-- AGENT_RISK_TEST_MATRIX: ([A-Za-z0-9+/=_-]+) -->", body)
+    assert match, "published plan carries no canonical matrix"
+    return decode_risk_test_matrix_marker(match.group(1), bodies=[body])["matrix"]
+
+
 def test_issue_level_bare_strings_are_accepted_on_first_planner_call(tmp_path, monkeypatch, capsys):
     good = _matrix_plan_candidate_1229(
         forbidden_side_effects="Slip one", related_scope_item_ids="scope-1"
     )
+    payload = json.loads(good.split("\n<!--", 1)[0])
+    payload["risk_test_matrix"]["important_exclusions"] = "Lone exclusion"
+    good = json.dumps(payload) + good[len(good.split("\n<!--", 1)[0]):]
     runner, repair_calls, posted = _run_issue_level_1229(tmp_path, monkeypatch, [good])
     assert len(_claude_prompts_1229(runner)) == 1
     assert repair_calls == []
-    assert posted and "Slip one" in posted[0]
+    assert posted
+    matrix = _posted_matrix_1229(posted[0])
+    assert matrix["rows"][0]["forbidden_side_effects"] == ["Slip one"]
+    assert matrix["rows"][0]["related_scope_item_ids"] == ["scope-1"]
+    assert matrix["important_exclusions"] == ["Lone exclusion"]
     err = capsys.readouterr().err
     assert "normalized risk test matrix string field(s)" in err
-    assert "forbidden_side_effects" in err and "related_scope_item_ids" in err
+    for path in ("forbidden_side_effects", "related_scope_item_ids", "important_exclusions"):
+        assert path in err
 
 
 def test_issue_level_unrecoverable_matrix_replays_once_and_is_accepted(tmp_path, monkeypatch, capsys):
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+
     bad = _matrix_plan_candidate_1229(forbidden_side_effects="")
+    with pytest.raises(AgentLoopError) as expected:
+        validate_structured_plan_state(
+            bad, require_execution_strategy_contract=1, require_risk_test_matrix_contract=1
+        )
     good = _matrix_plan_candidate_1229(forbidden_side_effects=["Replay accepted"])
     runner, repair_calls, posted = _run_issue_level_1229(tmp_path, monkeypatch, [bad, good])
     prompts = ["\n".join(c) for c in _claude_prompts_1229(runner)]
     assert len(prompts) == 2
-    assert "Previous response not accepted: risk_test_matrix" in prompts[1]
-    assert "forbidden_side_effects" in prompts[1].split("risk_test_matrix", 1)[1]
+    heading = "Previous response not accepted: risk_test_matrix"
+    assert heading not in prompts[0] and heading in prompts[1]
+    appended = prompts[1].split(heading, 1)[1]
+    assert str(expected.value) in appended
     err = capsys.readouterr().err
     assert err.count("repair backend=none model=fresh-matrix-contract-integrity") == 1
     assert err.count("repair backend=") == 1
     # Only the deterministic guard ran (backend=none); no repair model rewrote the matrix.
     assert len(repair_calls) == 1
-    assert posted and "Replay accepted" in posted[0]
+    assert posted
+    assert _posted_matrix_1229(posted[0])["rows"][0]["forbidden_side_effects"] == ["Replay accepted"]
