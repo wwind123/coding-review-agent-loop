@@ -248,6 +248,8 @@ from .managed_ci import (
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
     activate_managed_ci,
+    managed_ci_attachment_matches_head,
+    release_stale_managed_ci_attachment,
     authorize_fresh_issue_created_resume,
     authenticate_source_managed_resume,
     authenticate_issue_created_handoff,
@@ -12421,6 +12423,11 @@ def _render_recovery(recovery: PartialRoundRecovery) -> str:
             "Other comments (such as the incomplete-status notice) carry no round state for "
             "this round and need not be deleted."
         )
+        lines.append(
+            "Deleting qualification checkpoint records also removes the managed-CI "
+            "authorization binding; the next resume may then need fresh managed-CI "
+            "authorization (`--managed-ci-fresh`)."
+        )
     else:
         lines.append(
             "The comments below are a provisional list that could not be verified as a "
@@ -23773,8 +23780,7 @@ def run_pr_loop(
                 elif (
                     qualification_checkpoint.obligation_kind == "managed-exact-head-ci"
                     and managed_ci is not None
-                    and managed_ci.attached_run_id is not None
-                    and managed_ci.run_attempt is not None
+                    and managed_ci_attachment_matches_head(managed_ci, pr_metadata.head_sha)
                 ):
                     checkpoint_expected_attempt_id = (
                         f"{managed_ci.attached_run_id}/{managed_ci.run_attempt}"
@@ -26993,13 +26999,20 @@ def run_pr_loop(
                                         ),
                                     ),
                                 )
+                            release_stale_managed_ci_attachment(
+                                managed_ci,
+                                head_sha=pr_metadata.head_sha,
+                                config=config,
+                                pr_number=pr_number,
+                            )
                             attached_attempt = (
                                 qualification_checkpoint is not None
                                 and qualification_checkpoint.valid
                                 and qualification_checkpoint.lifecycle == "qualifying"
                                 and qualification_checkpoint.candidate_head_sha == pr_metadata.head_sha
-                                and managed_ci.attached_run_id is not None
-                                and managed_ci.run_attempt is not None
+                                and managed_ci_attachment_matches_head(
+                                    managed_ci, pr_metadata.head_sha
+                                )
                             )
                             if attached_attempt:
                                 log(

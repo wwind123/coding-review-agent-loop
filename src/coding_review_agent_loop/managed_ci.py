@@ -7115,6 +7115,44 @@ def _v2_attachment_is_excluded(contract: ManagedCiContract) -> bool:
     )
 
 
+def managed_ci_attachment_matches_head(contract: ManagedCiContract, head_sha: str | None) -> bool:
+    """True only for an attached attempt dispatched for ``head_sha`` (unknown binding fails closed)."""
+    return (
+        contract.attached_run_id is not None
+        and contract.run_attempt is not None
+        and bool(head_sha)
+        and contract.expected_head_sha == head_sha
+    )
+
+
+def release_stale_managed_ci_attachment(
+    contract: ManagedCiContract,
+    *,
+    head_sha: str | None,
+    config: AgentLoopConfig,
+    pr_number: int,
+) -> bool:
+    """Drop in-memory intent state bound to another head so a fresh attempt is dispatched.
+
+    The old head's intent comment is left untouched and its workflow run is
+    not cancelled.
+    """
+    if contract.protocol_version != 2:
+        return False
+    if contract.attached_run_id is None and contract.nonce is None:
+        return False
+    if contract.expected_head_sha is not None and contract.expected_head_sha == head_sha:
+        return False
+    log(
+        config,
+        f"PR #{pr_number}: managed-CI attempt {contract.attached_run_id}/{contract.run_attempt} "
+        f"was dispatched for {contract.expected_head_sha or 'an unknown head'}, not current head "
+        f"{head_sha}; treating it as stale and dispatching a fresh attempt",
+    )
+    _reset_v2_intent_generation(contract)
+    return True
+
+
 def _intent_producer_login(contract: ManagedCiContract) -> str:
     """Return the authenticated producer the intent ledger must be written by."""
     if not contract.trusted_actor_login:
@@ -7880,6 +7918,16 @@ def wait_for_final_qualification(
     expected_head = metadata.head_sha
     if not expected_head:
         raise AgentLoopError(f"PR #{pr_number} has no approved head SHA.")
+    if (
+        contract is not None
+        and contract.protocol_version == 2
+        and (contract.nonce is not None or contract.attached_run_id is not None)
+        and contract.expected_head_sha != expected_head
+    ):
+        raise AgentLoopError(
+            f"managed-CI intent/attempt is bound to head {contract.expected_head_sha or 'unknown'}, "
+            f"not {expected_head}; no qualification outcome is reported for this head"
+        )
     attempts = max(1, config.ci_timeout_seconds // config.ci_poll_interval_seconds)
     latest: PullRequestChecks | None = None
     terminal_confirmation: tuple[int, int | None] | None = None
