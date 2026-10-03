@@ -922,7 +922,7 @@ from coding_review_agent_loop.test_workers import (  # noqa: E402
 _GIB = 1024 ** 3
 
 
-def _fallback_run(tmp_path, args, *, mode, held, env=None, command=None):
+def _fallback_run(tmp_path, args, *, mode, held, env=None, command=None, reports=None):
     """Run a real pytest target as a host-fallback run (holder keeps `held` of 4 workers)."""
     project = _project(tmp_path, {"conftest.py": _GATEWAY_PROBE})
     locks = tmp_path / "locks"
@@ -943,12 +943,25 @@ def _fallback_run(tmp_path, args, *, mode, held, env=None, command=None):
     })
     environment.update(env or {})
     argv = command or [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", *args]
+    from coding_review_agent_loop import runner as runner_module
+
+    real_analyze = runner_module.analyze_worker_report
+
+    def capturing(report_path, **kwargs):
+        if reports is not None and report_path is not None and Path(report_path).exists():
+            reports.extend(
+                json.loads(line) for line in Path(report_path).read_text().splitlines() if line.strip()
+            )
+        return real_analyze(report_path, **kwargs)
+
+    runner_module.analyze_worker_report = capturing
     try:
         result = run_foreground_test(
             argv, cwd=project, timeout_seconds=120, env=environment, environment_is_complete=True,
             echo_output=False, worker_budget=budget, worker_lock_root=locks,
         )
     finally:
+        runner_module.analyze_worker_report = real_analyze
         holder.close()
     ran = (tmp_path / "ran.txt").read_text().split() if (tmp_path / "ran.txt").exists() else []
     return result, len(_gateway_log(project)), ran
@@ -1010,12 +1023,13 @@ def test_fallback_grant_tx_gateways(tmp_path, mode):
 
 
 @pytest.mark.parametrize("mode", ["clamp", "refuse"])
-def test_fallback_grant_reaches_printer_and_wrapper_targets(tmp_path, mode):
+@pytest.mark.parametrize("held", [3, 4])
+def test_fallback_grant_reaches_printer_and_wrapper_targets(tmp_path, mode, held):
     printer = [sys.executable, "-c", (
         "import os; print('workers=' + os.environ['AGENT_LOOP_TEST_WORKERS']); "
         "print('auto=' + os.environ.get('PYTEST_XDIST_AUTO_NUM_WORKERS', 'unset'))"
     )]
-    result, _gateways, _ran = _fallback_run(tmp_path, [], mode=mode, held=3, command=printer)
+    result, _gateways, _ran = _fallback_run(tmp_path, [], mode=mode, held=held, command=printer)
     assert result.returncode == 0 and "workers=1" in result.output_tail
     if mode == "clamp":
         assert "auto=1" in result.output_tail
@@ -1023,8 +1037,21 @@ def test_fallback_grant_reaches_printer_and_wrapper_targets(tmp_path, mode):
     wrapper = [sys.executable, "-c", _textwrap.dedent("""
         import os, subprocess, sys
         count = os.environ["AGENT_LOOP_TEST_WORKERS"]
+        print("wrapper-workers=" + count)
+        print("wrapper-auto=" + os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS", "unset"))
+        sys.stdout.flush()
         sys.exit(subprocess.call([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", count]))
     """)]
-    result, gateways, ran = _fallback_run(tmp_path / "w", [], mode=mode, held=3, command=wrapper)
-    assert "workers=" not in result.output_tail
+    reports = []
+    result, gateways, ran = _fallback_run(
+        tmp_path / "w", [], mode=mode, held=held, command=wrapper, reports=reports,
+    )
     assert result.returncode == 0 and gateways <= 1 and len(ran) == 4
+    assert "wrapper-workers=1" in result.output_tail
+    if mode == "clamp":
+        assert "wrapper-auto=1" in result.output_tail
+    # The plugin report keeps the configured budget although the grant is 1,
+    # and the nested pytest launched no more workers than the grant.
+    assert reports, "the nested pytest wrote no worker-cap report"
+    assert {row["budget"] for row in reports} == {4}
+    assert all(row.get("effective", 0) <= 1 for row in reports if row.get("kind") == "confirmed")

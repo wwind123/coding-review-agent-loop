@@ -2771,3 +2771,449 @@ def test_probe_cancel_kills_the_probe_group(tmp_path):
             ["sleep", "30"], cwd=tmp_path, env=None, timeout_seconds=30, cancel=cancel,
         )
     assert time.monotonic() - started < 5
+
+
+# --- review round 2 (#1108) --------------------------------------------------------
+
+
+class _PartialWriteConnection:
+    """Writes only the first `limit` bytes of its first send, then reports a full buffer forever."""
+
+    def __init__(self, connection, limit):
+        self._connection = connection
+        self._limit = limit
+        self._spent = False
+        self.written_after_partial = 0
+
+    def send(self, data, flags=0):
+        if self._spent:
+            self.written_after_partial += 1
+            raise BlockingIOError()
+        self._spent = True
+        return self._connection.send(bytes(data[: self._limit]), flags)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+def _gated_first_sender(monkeypatch):
+    """First connection's sender fills its send buffer when `gate` is set (before its next send)."""
+    real = evidence_module._ConnectionSender
+    created = []
+    gate = threading.Event()
+    state = {"wedged_at_fill": None, "filled": threading.Event()}
+
+    class Gated(real):
+        def __init__(self, connection, cancel):
+            super().__init__(connection, cancel)
+            self.first = not created
+            self.filled = False
+            created.append(self)
+
+        def send(self, payload, **kwargs):
+            if self.first and gate.is_set() and not self.filled:
+                self.filled = True
+                state["wedged_at_fill"] = self.wedged
+                if state.get("partial"):
+                    self._connection = _PartialWriteConnection(self._connection, state["partial"])
+                    state["filled"].set()
+                    return super().send(payload, **kwargs)
+                self._connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+                raw = b'{"type":"output","data":""}'
+                frame = struct.pack(">I", len(raw)) + raw
+                self._connection.setblocking(False)
+                try:
+                    while True:
+                        self._connection.send(frame)
+                except BlockingIOError:
+                    pass
+                self._connection.setblocking(True)
+                state["filled"].set()
+                if state.get("pause"):
+                    time.sleep(state["pause"])  # lets the client free a little room
+            return super().send(payload, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "_ConnectionSender", Gated)
+    return created, gate, state
+
+
+def _read_until_notice(connection):
+    connection.settimeout(10)
+    while True:
+        frame = evidence_module._recv_frame(connection)
+        if "waiting at most" in str(frame.get("data", "")):
+            return
+
+
+def _strict_frames(connection):
+    """Decode every complete frame strictly; only a truncated tail may remain."""
+    connection.settimeout(2)
+    data = b""
+    try:
+        while True:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (socket.timeout, OSError):
+        pass
+    frames, offset = [], 0
+    while offset + 4 <= len(data):
+        (length,) = struct.unpack(">I", data[offset:offset + 4])
+        if offset + 4 + length > len(data):
+            return frames, True
+        frames.append(json.loads(data[offset + 4:offset + 4 + length]))  # raises on bytes after a truncation
+        offset += 4 + length
+    return frames, False
+
+
+def test_notice_and_heartbeat_backpressure_after_an_unwedged_start(tmp_path, monkeypatch):
+    monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 0.2)
+    monkeypatch.setattr(workers_module, "HOST_WAIT_NOTICE_INTERVAL_SECONDS", 0.4)
+    created, gate, state = _gated_first_sender(monkeypatch)
+    server, locks = _wait_server(tmp_path, "turn-notice-bp")
+    holder = _foreign_holder(locks)
+    try:
+        request = _wait_request(server, tmp_path, "a" * 32, 3)
+        blocked = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        blocked.connect(server.endpoint)
+        evidence_module._send_frame(blocked, request)
+        _read_until_notice(blocked)  # the initial notice was delivered: not wedged yet
+        assert created[0].wedged is False
+        handler = list(server._handler_threads)[0]
+        follower = _FrameReader(server, request)  # unaffected second connection
+        started = time.monotonic()
+        state["partial"] = 5  # the next frame (notice or heartbeat) is written only partly
+        gate.set()
+        assert state["filled"].wait(10)
+        handler.join(15)
+        assert not handler.is_alive()
+        assert time.monotonic() - started < 10  # the 3 s admission bound still held
+        assert state["wedged_at_fill"] is False
+        assert created[0].wedged  # a progress notice or heartbeat gave up inside its grace
+        follower.join(20)
+        assert follower.error is None and len(follower.beats) >= 2
+        assert follower.final["outcome"] in {"passed", "failed"} and follower.final["returncode"] == 0
+        _frames, truncated = _strict_frames(blocked)  # raises if bytes follow a truncated frame
+        assert truncated  # a genuinely partial broker frame reached the client
+        attempts = created[0]._connection.written_after_partial
+        assert created[0].send({"type": "output", "data": "late"}, grace=1) is False
+        assert created[0]._connection.written_after_partial == attempts  # nothing follows the truncation
+        blocked.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_stop_during_notice_backpressure_is_prompt(tmp_path, monkeypatch):
+    monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 0.2)
+    monkeypatch.setattr(workers_module, "HOST_WAIT_NOTICE_INTERVAL_SECONDS", 0.4)
+    created, gate, state = _gated_first_sender(monkeypatch)
+    server, locks = _wait_server(tmp_path, "turn-notice-stop")
+    holder = _foreign_holder(locks)
+    try:
+        blocked = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        blocked.connect(server.endpoint)
+        evidence_module._send_frame(blocked, _wait_request(server, tmp_path, "b" * 32, 60))
+        _read_until_notice(blocked)
+        gate.set()
+        time.sleep(1.0)
+        handlers = list(server._handler_threads)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 6
+        assert not any(handler.is_alive() for handler in handlers)
+        _strict_frames(blocked)
+        blocked.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_terminal_send_blocks_on_a_connection_that_was_not_wedged(tmp_path, monkeypatch):
+    monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 100)
+    monkeypatch.setattr(workers_module, "HOST_WAIT_NOTICE_INTERVAL_SECONDS", 100)
+    created, gate, state = _gated_first_sender(monkeypatch)
+    server, locks = _wait_server(tmp_path, "turn-terminal-unwedged")
+    holder = _foreign_holder(locks)
+    try:
+        nonce = "d" * 32
+        request = _wait_request(server, tmp_path, nonce, 60)
+        blocked = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        blocked.connect(server.endpoint)
+        evidence_module._send_frame(blocked, request)
+        _read_until_notice(blocked)
+        gate.set()  # only the terminal send will see the full buffer
+        time.sleep(0.5)
+        assert created[0].wedged is False
+        handlers = list(server._handler_threads)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 8
+        assert not any(handler.is_alive() for handler in handlers)
+        assert state["wedged_at_fill"] is False and created[0].wedged  # the terminal send gave up
+        key = request["nonce"]
+        reservation = server._receipts[key]
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "cancelled"
+        blocked.close()
+    finally:
+        holder.close()
+        server.stop()
+
+
+def test_stop_after_registration_with_the_mutex_held_terminates_and_releases(tmp_path):
+    from coding_review_agent_loop.test_runtime import acquire_command_lane
+
+    server, locks = _wait_server(tmp_path, "turn-registered-stop")
+    argv = (sys.executable, "-c", "import time; time.sleep(60)")
+    holder = None
+    try:
+        request = _wait_request(server, tmp_path, "e" * 32, 5, argv=argv)
+        request["timeout_seconds"] = 120
+        reader = _FrameReader(server, request)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not server._active_processes:
+            time.sleep(0.05)
+        (proc,) = server._active_processes.values()
+        holder = _hold_mutex(locks, 30)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 8
+        reader.join(10)
+        assert proc.poll() is not None and reader.final["outcome"] != "passed"
+        holder.kill()
+        holder.wait()
+        again, problem = WorkerBudgetLock.acquire(invocation_id=server.turn_id, cwd=locks, root=locks)
+        assert again is not None, problem
+        # The reservation record left behind by the skipped release is stale now.
+        assert again.reserve_host_workers(4, HostCapacity(4, 1024 * _GIB, _GIB), exclusive=True) == 4
+        again.close()
+        lane = acquire_command_lane(
+            list(argv), cwd=tmp_path, env={"AGENT_LOOP_INVOCATION_ID": server.turn_id},
+        )
+        assert lane is not None  # the command lane was released
+        lane.close()
+    finally:
+        if holder is not None:
+            holder.kill()
+        server.stop()
+
+
+def test_real_stop_waits_for_a_guarded_popen_and_terminates_the_registered_target(tmp_path, monkeypatch):
+    popen_entered = threading.Event()
+    popen_release = threading.Event()
+    real_popen = subprocess.Popen
+
+    def guarded(command, *args, **kwargs):
+        if isinstance(command, (list, tuple)) and "slow-launch-marker" in command:
+            popen_entered.set()
+            assert popen_release.wait(20)
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(runner_module.subprocess, "Popen", guarded)
+    server, locks = _wait_server(tmp_path, "turn-guard-race")
+    try:
+        argv = (sys.executable, "-c", "import time; time.sleep(60)", "slow-launch-marker")
+        request = _wait_request(server, tmp_path, "f" * 32, 5, argv=argv)
+        request["timeout_seconds"] = 120
+        reader = _FrameReader(server, request)
+        assert popen_entered.wait(15)  # the runner is inside the launch guard
+        stopped = threading.Event()
+        threading.Thread(target=lambda: (server.stop(), stopped.set())).start()
+        time.sleep(0.6)
+        assert not stopped.is_set()  # stop() waits for the guard
+        popen_release.set()
+        assert stopped.wait(15)
+        reader.join(10)
+        proc = None
+        (observation,) = server.journal
+        assert reader.final["outcome"] != "passed"
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+        assert not server._active_processes or all(p.poll() is not None for p in server._active_processes.values())
+    finally:
+        popen_release.set()
+        server.stop()
+
+
+def _post_run_server(tmp_path, turn_id, size=0, executions=None):
+    _git_repo(tmp_path, size=size)
+
+    def execute(argv, cwd, timeout, environment, stream):
+        if executions is not None:
+            executions.append(argv)
+        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+
+    return BrokerServer(root=tmp_path, turn_id=turn_id, execute=execute).start()
+
+
+def _assert_shutdown_completion(server, reader, nonce_request):
+    reader.join(15)
+    assert reader.final["outcome"] == "passed" and reader.final["returncode"] == 0
+    (observation,) = server.journal
+    assert observation.attribution.state == "unknown"
+    assert "unattributed: broker shutdown" in observation.attribution.caveats
+    assert not any("snapshot unknown" in item for item in observation.attribution.caveats)
+    reservation = server._receipts[nonce_request["nonce"]]
+    assert reservation.ready.is_set() and reservation.response["outcome"] == "passed"
+
+
+def test_stop_during_the_post_run_git_subprocess_completes_unattributed(tmp_path, monkeypatch):
+    server = _post_run_server(tmp_path, "turn-postgit")
+    real_popen = subprocess.Popen
+    spawned = []
+    entered = threading.Event()
+
+    def slow_git(command, *args, **kwargs):
+        # subprocess.run (pre-run capture) never sets start_new_session; the cancellable path does.
+        if command and command[0] == "git" and kwargs.get("start_new_session"):
+            proc = real_popen(["sleep", "30"], *args, **kwargs)
+            spawned.append(proc)
+            entered.set()
+            return proc
+        return real_popen(command, *args, **kwargs)
+
+    monkeypatch.setattr(evidence_module.subprocess, "Popen", slow_git)
+    try:
+        request = _signed_broker_request(server, tmp_path, "1a" * 16)
+        reader = _FrameReader(server, request)
+        assert entered.wait(15)  # only the cancellable post-run capture uses Popen
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 8
+        _assert_shutdown_completion(server, reader, request)
+        assert spawned and spawned[0].poll() is not None
+    finally:
+        server.stop()
+
+
+def test_stop_during_post_run_hashing_completes_unattributed(tmp_path, monkeypatch):
+    server = _post_run_server(tmp_path, "turn-posthash", size=4 * 1024 * 1024)
+    phase = {"post": False, "n": 0}
+    real_stable = evidence_module.stable_tracked_tree_snapshot
+    real_checkpoint = evidence_module._snapshot_checkpoint
+    stopper = []
+
+    def stable(*args, **kwargs):
+        phase["post"] = kwargs.get("cancel") is not None  # only the post-run capture is cancellable
+        return real_stable(*args, **kwargs)
+
+    def checkpoint(started, timeout_seconds, cancel):
+        if phase["post"]:
+            phase["n"] += 1
+            if phase["n"] == 8 and not stopper:  # mid-way through the big file
+                thread = threading.Thread(target=server.stop)
+                thread.start()
+                stopper.append(thread)
+                deadline = time.monotonic() + 5
+                while not server._stop_event.is_set() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+        return real_checkpoint(started, timeout_seconds, cancel)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stable)
+    monkeypatch.setattr(evidence_module, "_snapshot_checkpoint", checkpoint)
+    try:
+        request = _signed_broker_request(server, tmp_path, "2b" * 16)
+        reader = _FrameReader(server, request)
+        reader.join(20)
+        assert stopper
+        stopper[0].join(10)
+        _assert_shutdown_completion(server, reader, request)
+    finally:
+        server.stop()
+
+
+def test_stalled_post_run_read_with_a_waiting_follower_after_a_real_target(tmp_path, monkeypatch):
+    _git_repo(tmp_path)
+    marker = tmp_path.parent / f"{tmp_path.name}-runs.txt"
+    server, locks = _wait_server(tmp_path, "turn-stalled-read")
+    release = threading.Event()
+    stalled = threading.Event()
+    phase = {"post": False, "done": False}
+    real_stable = evidence_module.stable_tracked_tree_snapshot
+    real_checkpoint = evidence_module._snapshot_checkpoint
+
+    def stable(*args, **kwargs):
+        phase["post"] = kwargs.get("cancel") is not None
+        return real_stable(*args, **kwargs)
+
+    def checkpoint(started, timeout_seconds, cancel):
+        if phase["post"] and not phase["done"]:
+            phase["done"] = True
+            stalled.set()
+            assert release.wait(30)  # one stalled read: ignores cancellation
+        return real_checkpoint(started, timeout_seconds, cancel)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stable)
+    monkeypatch.setattr(evidence_module, "_snapshot_checkpoint", checkpoint)
+    request = _wait_request(
+        server, tmp_path, "3c" * 16, 5,
+        argv=(sys.executable, "-c", f"open({str(marker)!r}, 'a').write('x'); print('ok')"),
+    )
+    owner = _FrameReader(server, request)
+    try:
+        assert stalled.wait(30)  # the real target has run; the post-run read is stalled
+        follower = _FrameReader(server, request)
+        time.sleep(0.5)
+        started = time.monotonic()
+        server.stop()
+        assert time.monotonic() - started < 9
+        follower.join(5)
+        assert follower.final["outcome"] == "cancelled"
+        reservation = server._receipts[request["nonce"]]
+        assert reservation.response is None and not reservation.ready.is_set()
+        assert server._deferred_close and server._pinned_root is not None
+        release.set()
+        owner.join(15)
+        assert owner.final["outcome"] == "passed" and marker.read_text() == "x"
+        assert reservation.ready.is_set() and reservation.response["outcome"] == "passed"
+        (observation,) = server.journal
+        assert "unattributed: broker shutdown" in observation.attribution.caveats
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and server._pinned_root is not None:
+            time.sleep(0.05)
+        assert server._pinned_root is None and server._runtime_dir is None
+    finally:
+        release.set()
+
+
+def test_probe_owner_and_inflight_follower_are_cancelled_without_publication(tmp_path, monkeypatch):
+    from coding_review_agent_loop import test_runtime as runtime
+
+    argv = (sys.executable, "-c", "pass")
+    monkeypatch.setattr(
+        runtime, "_recognized_inner_probe_with_environment",
+        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a)),
+    )
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def tracking(command, *args, **kwargs):
+        proc = real_popen(command, *args, **kwargs)
+        if command and command[0] == "sleep":
+            spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(runtime.subprocess, "Popen", tracking)
+    environment = {**os.environ, "AGENT_LOOP_INVOCATION_ID": "probe-cancel-turn"}
+    cancel = threading.Event()
+    results = {}
+    owner = threading.Thread(target=lambda: results.setdefault("owner", runtime.probe_inner_launcher(
+        argv, cwd=tmp_path, environment=environment, environment_is_complete=True, cancel=cancel)))
+    owner.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not spawned:
+        time.sleep(0.02)
+    assert spawned
+    follower = threading.Thread(target=lambda: results.setdefault("follower", runtime.probe_inner_launcher(
+        argv, cwd=tmp_path, environment=environment, environment_is_complete=True, cancel=cancel)))
+    follower.start()
+    time.sleep(0.3)
+    started = time.monotonic()
+    cancel.set()
+    owner.join(5)
+    follower.join(5)
+    assert not owner.is_alive() and not follower.is_alive()
+    assert time.monotonic() - started < 4
+    assert results["owner"].state == "unknown" and results["follower"].state == "unknown"
+    assert spawned[0].poll() is not None  # the probe group was killed
+    assert not any(key[0] == "probe-cancel-turn" for key in runtime._INNER_PREFLIGHT_CACHE)
