@@ -4255,11 +4255,19 @@ def test_recorded_references_without_valid_identity_are_not_adopted(tmp_path, va
     by_number = {child["number"]: child for child in children[1:]}
     if variant != "unreadable":
         by_number[bad["number"]] = bad
-    runner = FakeRunner(search_issues_payload=[], issue_payloads_by_number=by_number)
+    runner = FakeRunner(
+        search_issues_payload=[],
+        issue_payloads_by_number=by_number,
+        malformed_issue_view_numbers={601} if variant == "unreadable" else None,
+    )
     comments = (_summary_comment_1207(topology, plan, children),)
 
     recovered = _run_1207(runner, tmp_path, topology, plan, comments)
 
+    if variant == "unreadable":
+        assert any(
+            cmd[:4] == ["gh", "issue", "view", "601"] for cmd, _cwd in runner.commands
+        )
     assert recovered[0].origin != "adopted"
     assert recovered[0].issue_number != 601
 
@@ -4503,13 +4511,21 @@ def test_non_fresh_recorded_references_without_valid_identity_are_not_adopted(tm
     elif variant == "foreign-parent":
         by_number[970] = _foreign_child_1207(phase, plan, 970)
     comments = (_model_summary_1207(topology, plan, {1: 970, 2: 971}),)
-    runner = FakeRunner(search_issues_payload=[], issue_payloads_by_number=by_number)
+    runner = FakeRunner(
+        search_issues_payload=[],
+        issue_payloads_by_number=by_number,
+        malformed_issue_view_numbers={970} if variant == "unreadable" else None,
+    )
 
     recovered = _call_1207(
         runner, tmp_path, topology, plan, comments=comments, source="model",
         preflight_only=True, flat_child_limit=5,
     )
 
+    if variant == "unreadable":
+        assert any(
+            cmd[:4] == ["gh", "issue", "view", "970"] for cmd, _cwd in runner.commands
+        )
     assert all(item.issue_number not in {970} for item in recovered)
     assert recovered[0].origin != "adopted"
     assert not runner.issues
