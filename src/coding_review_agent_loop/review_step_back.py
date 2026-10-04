@@ -1030,8 +1030,10 @@ def _location_is_member(
     # The path-wide fallback belongs to an UNMAPPABLE anchor only.  A mappable anchor
     # requires the mapped window, so a location that cannot be placed (moved or
     # deleted code, a failed diff) is not declared a member by path alone.
-    return (
-        not mapping.mappable and location.path in {mapping.original_path, mapping.path}
+    # Under that policy the location's known rename destination takes part too, so a
+    # chain of renames still meets the anchor's original or destination path.
+    return not mapping.mappable and bool(
+        {location.path, moved.path} & {mapping.original_path, mapping.path}
     )
 
 

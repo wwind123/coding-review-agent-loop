@@ -1417,3 +1417,51 @@ def test_a_moved_distant_carried_item_does_not_keep_a_mappable_anchors_episode_o
         records[:3], PR_REVIEWER, window=40, mapper=lost, current_round=4, current_head=HEAD_B
     )
     assert kept.entry is not None
+
+
+# --- review round 7 fix (#1265) ---------------------------------------------
+
+
+def test_a_carried_locations_known_rename_destination_keeps_an_unmappable_anchors_episode_open():
+    near = _pr_item("item-3", "gap src/a.py:130", round_number=3)
+    far = _pr_item("item-6", "elsewhere src/b.py:900", round_number=4)
+
+    def mapper(from_head, to_head, path, start, end):
+        if (from_head, to_head) == (HEAD_A, HEAD_B) and path == "src/a.py":
+            return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, "src/b.py", start, end)
+        if (from_head, to_head) == (HEAD_A, HEAD_C) and path == "src/a.py":
+            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, "src/c.py", start, end, "rewritten")
+        if (from_head, to_head) == (HEAD_B, HEAD_C) and path == "src/b.py":
+            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, "src/c.py", start, end, "moved")
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    records = [
+        _pr_review(40, 3, HEAD_A, new=[near]),
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A, path="src/a.py")]),
+        _pr_review(
+            60, 4, HEAD_B, new=[far], prior=[near],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        ),
+        # The near item is resolved; the distant one is carried onto a head where both
+        # files were renamed to src/c.py and the anchored code was rewritten.
+        _pr_review(
+            70, 5, HEAD_C, prior=[near, far],
+            dispositions=[
+                ReviewItemDisposition("item-3", PR_REVIEWER, "resolved"),
+                ReviewItemDisposition("item-6", PR_REVIEWER, "blocking"),
+            ],
+        ),
+        _pr_review(
+            80, 6, HEAD_C, new=[_pr_item("item-9", "sibling src/c.py:50", round_number=6)],
+            prior=[far], dispositions=[ReviewItemDisposition("item-6", PR_REVIEWER, "blocking")],
+        ),
+    ]
+    for _ in range(2):  # live, then a replay as a resume would see it
+        result = sb.derive_pr_episode(
+            records, PR_REVIEWER, window=40, mapper=mapper, current_round=6, current_head=HEAD_C
+        )
+        assert result.entry is not None and result.sibling_round == 6
+    # Before the sibling arrives the episode is still open (the rename destination counts).
+    assert sb.derive_pr_episode(
+        records[:4], PR_REVIEWER, window=40, mapper=mapper, current_round=5, current_head=HEAD_C
+    ).entry is not None
