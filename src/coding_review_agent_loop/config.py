@@ -68,7 +68,13 @@ DEFAULT_ANTIGRAVITY_MODELS: tuple[str, ...] = (
     "Gemini 3.7 Flash (High)",
     "Gemini 3.6 Flash (High)",
     "Gemini 3.1 Pro (High)",
+    # Served on a quota separate from Gemini's, so it only runs when the Gemini
+    # group cannot serve (#1236). Two reviewers may then share one model.
+    "Claude Opus 5.5 (Medium)",
 )
+# How long an Antigravity quota group with no parsed reset is skipped (#1236).
+DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS = 600
+MAX_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS = 3600
 DEFAULT_MAX_ROUNDS = 10
 # Primary-phase plan stall stop threshold (#1103); 0 disables it.
 DEFAULT_PLAN_PRIMARY_STALL_ROUNDS = 8
@@ -232,6 +238,9 @@ class AgentLoopConfig:
     antigravity_models: tuple[str, ...] = ()
     antigravity_print_timeout_seconds: int = DEFAULT_ANTIGRAVITY_PRINT_TIMEOUT_SECONDS
     antigravity_quota_signatures: tuple[str, ...] = DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES
+    antigravity_quota_cooldown_seconds: int = DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS
+    # Explicit (model, group) overrides of the derived quota group (#1236).
+    antigravity_quota_groups: tuple[tuple[str, str], ...] = ()
     # Declared model / reasoning effort for the dynamic signature (#332). Empty
     # means "not declared" (the agent runs its own default and the signature
     # falls back to the generic provider name). antigravity always has a model.
@@ -459,6 +468,27 @@ class AgentLoopConfig:
             raise AgentLoopError("antigravity_models chain cannot be empty or contain blank entries.")
         if self.antigravity_print_timeout_seconds <= 0:
             raise AgentLoopError("--antigravity-print-timeout-seconds must be greater than zero.")
+        cooldown = self.antigravity_quota_cooldown_seconds
+        if (
+            isinstance(cooldown, bool)
+            or not isinstance(cooldown, int)
+            or not 0 < cooldown <= MAX_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS
+        ):
+            raise AgentLoopError(
+                "--antigravity-quota-cooldown-seconds must be a positive integer "
+                f"no larger than {MAX_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS}."
+            )
+        seen_group_models: set[str] = set()
+        for override in self.antigravity_quota_groups:
+            if (
+                not isinstance(override, tuple)
+                or len(override) != 2
+                or not all(isinstance(part, str) and part.strip() for part in override)
+            ):
+                raise AgentLoopError("--antigravity-quota-group must be MODEL=GROUP with non-blank parts.")
+            if override[0] in seen_group_models:
+                raise AgentLoopError(f"--antigravity-quota-group names {override[0]!r} more than once.")
+            seen_group_models.add(override[0])
         if self.semantic_followup_backend not in {"claude", "codex", "gemini", "antigravity"}:
             raise AgentLoopError("--semantic-followup-backend must name a supported agent.")
         for option_name, value in (
@@ -1706,6 +1736,19 @@ def resolve_agent_permissions_mode(args: argparse.Namespace) -> str:
     return mode
 
 
+def parse_antigravity_quota_group_overrides(values) -> tuple[tuple[str, str], ...]:
+    """Parse repeated ``MODEL=GROUP`` flag values (shape only; #1236)."""
+    parsed: list[tuple[str, str]] = []
+    for value in values:
+        model, sep, group = str(value).rpartition("=")
+        if not sep or not model.strip() or not group.strip():
+            raise AgentLoopError(
+                f"--antigravity-quota-group must be MODEL=GROUP with non-blank parts, got {value!r}."
+            )
+        parsed.append((model.strip(), group.strip()))
+    return tuple(parsed)
+
+
 def config_from_args(
     args: argparse.Namespace,
     runner: Runner,
@@ -1821,6 +1864,23 @@ def config_from_args(
             return tuple(supplied)
         return default_agent_args(agent, dangerous=dangerous, mode=permission_mode)
 
+    quota_group_overrides = parse_antigravity_quota_group_overrides(
+        getattr(args, "antigravity_quota_group", None) or ()
+    )
+    if quota_group_overrides:
+        if args.antigravity_model is not None:
+            resolved_chain: tuple[str, ...] = (args.antigravity_model,)
+        elif getattr(args, "antigravity_models", None):
+            resolved_chain = tuple(args.antigravity_models)
+        else:
+            resolved_chain = DEFAULT_ANTIGRAVITY_MODELS
+        for override_model, _group in quota_group_overrides:
+            if override_model not in resolved_chain:
+                raise AgentLoopError(
+                    f"--antigravity-quota-group names {override_model!r}, which is not in the "
+                    "configured Antigravity chain."
+                )
+
     return AgentLoopConfig(
         repo=repo,
         claude_dir=claude_dir,
@@ -1856,6 +1916,12 @@ def config_from_args(
             getattr(args, "antigravity_quota_signatures", None)
             or DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES
         ),
+        antigravity_quota_cooldown_seconds=getattr(
+            args,
+            "antigravity_quota_cooldown_seconds",
+            DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS,
+        ),
+        antigravity_quota_groups=quota_group_overrides,
         codex_model=getattr(args, "codex_model", ""),
         codex_reasoning_effort=getattr(args, "codex_reasoning_effort", ""),
         reviewer_codex_model=getattr(args, "reviewer_codex_model", ""),

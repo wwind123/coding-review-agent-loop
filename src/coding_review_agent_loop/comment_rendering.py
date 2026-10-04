@@ -8,7 +8,7 @@ import html
 import json
 import re
 import shlex
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -3194,3 +3194,45 @@ def render_plan_phase_advance(
             "-- Orchestrator",
         ]
     )
+
+
+_MODEL_TRAILING_PARENTHETICAL_RE = re.compile(r"\s*\([^)]*\)\s*$")
+_MODEL_EFFORT_SUFFIX_RE = re.compile(r"-(?:low|medium|high|xhigh|max)$")
+_MODEL_WORD_SEPARATOR_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _strip_model_effort(label: str) -> str:
+    return _MODEL_TRAILING_PARENTHETICAL_RE.sub("", label.strip()).strip()
+
+
+def canonical_model_identity(label: str | None) -> str:
+    """Comparable identity of a model label; empty when the label is unknown.
+
+    ``claude-opus-5-5`` and ``Claude Opus 5.5 (Medium)`` share one identity.
+    """
+    if not label or not label.strip():
+        return ""
+    base = _strip_model_effort(label).lower()
+    if base == "unknown model":
+        return ""  # placeholder for an undeclared model: never a shared identity
+    base = _MODEL_WORD_SEPARATOR_RE.sub("-", base).strip("-")
+    return _MODEL_EFFORT_SUFFIX_RE.sub("", base)
+
+
+def same_model_panel_note(models_by_reviewer: Mapping[str, str | None]) -> str | None:
+    """Note naming reviewers that resolved to one underlying model (#1236)."""
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for reviewer, model in models_by_reviewer.items():
+        identity = canonical_model_identity(model)
+        if identity:
+            groups.setdefault(identity, []).append((reviewer, _strip_model_effort(model or "")))
+    notes: list[str] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        names = [name for name, _label in members]
+        label = next((lab for _name, lab in members if " " in lab), members[0][1])
+        joined = " and ".join(names) if len(names) == 2 else f"{', '.join(names[:-1])} and {names[-1]}"
+        quantifier = "both" if len(names) == 2 else "all"
+        notes.append(f"{joined} {quantifier} reviewed with {label}")
+    return f"note: {'; '.join(notes)}" if notes else None

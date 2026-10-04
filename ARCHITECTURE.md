@@ -96,7 +96,7 @@ Source paths below are relative to
 | --- | --- | --- |
 | Entry points and effective configuration | `cli.py`, `config.py` | Parse modes; resolve role-specific models, effort, base, and policy before invocation. |
 | Lifecycle facade | `orchestrator.py` | Import/re-export facade only: a docstring plus import statements that keep the historical `coding_review_agent_loop.orchestrator` surface (used by `cli.py` and tests) bound to the owning modules below; it defines nothing itself. Together with the rows below it composes planning, implementation, review, recovery, and finalization; control decisions are never delegated to free-form agent prose. |
-| Agent failure classification | `agent_failure.py` | Validated agent response types, rate-limit reset parsing, transient/unsupported-model classification, structured-candidate recovery, and failed-run diagnostics. |
+| Agent failure classification | `agent_failure.py`, `reset_parsing.py` | Validated agent response types, rate-limit reset parsing (the pure parsers live in the stdlib-only leaf module `reset_parsing.py`, which `agent_failure` re-exports and `transient` imports, so `transient` never imports `agent_failure`), transient/unsupported-model classification, structured-candidate recovery, and failed-run diagnostics. |
 | Architecture-impact contract | `architecture_contract.py` | Prompt-architecture freezing, PR architecture identity revalidation, and accepted-candidate carriers for the architecture-impact contract. |
 | Validated agent turn | `validated_agent.py` | Run telemetry and usage contexts, structured repair, completion recovery, and the validated agent turn shared by every role. |
 | Response validation | `response_validation.py` | Coder and plan response validators, human-requirement checks, and post-PR test/observation validation. |
@@ -1202,6 +1202,27 @@ judgement, so refuse-mode enforcement is not weakened. A broker request's
 pending admission is cancelled when the broker stops, synchronised with target
 launch so no target starts after the owning turn ends. See
 [Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
+
+**Antigravity quota-group fallback (#1236).** `agents/antigravity.py` derives a
+quota group per chain entry (an explicit override or the model-name family) and
+keeps `AntigravityQuotaGroupMemory`, a locked map of exhausted groups with
+finite monotonic expiries: the parsed reset, or a bounded
+`--antigravity-quota-cooldown-seconds` cooldown. The memory is owned by the
+logical run: it is keyed by the `workdir_claims` owner's `run_id`, created on
+first use, dropped by a run finalizer when the outermost scope ends, shared by
+nested loops, and reached from reviewer threads because `review_rounds.py` and
+`discuss_loop.py` submit with `contextvars.copy_context()`. With no owner
+(library use, the skill helper process) the memory is local to one attempt
+state. Exhaustion is classified in `transient.py` only from the matched
+provider error frame, extracted from raw unstripped lines (never the whole
+transcript), with capacity wording taking precedence. `AntigravityAttemptState`
+is the single policy shared by `validated_agent.py` and `helpers/run_external.py`:
+transient failures retry then fall back to a later eligible entry; a verified
+exhaustion skips the whole group with no retry or sleep and makes at most one
+cross-group jump per turn; a second verified exhaustion is a shared-limit stop;
+and an all-groups-cooling state stops before invoking. Only when every group
+carries a parsed long reset is `QuotaResetExceededError` raised. Memory is not
+persisted across processes.
 
 ## Other Entry Paths
 

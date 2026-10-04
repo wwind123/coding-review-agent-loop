@@ -186,6 +186,7 @@ from .ci_health import (
 from .comment_rendering import (
     add_coder_followup_head_unchanged_notice,
     normalize_freeform_signature,
+    same_model_panel_note,
     render_public_agent_comment,
     resolve_matrix_evidence_render,
 )
@@ -3952,6 +3953,9 @@ def run_pr_loop(
                             "PR sync; nothing to launch in parallel this round",
                         )
 
+            # Actual models of reviewers that reviewed in THIS round (fresh or
+            # same-round resumed); carried prior-round approvals are excluded (#1236).
+            round_review_models: dict[str, str | None] = {}
             for reviewer in (() if skip_reviewers_this_round else configured_reviewers):
                 reviewer_name = agent_display_name(reviewer)
                 reviewer_pr_checks = shared_reviewer_pr_checks
@@ -4214,6 +4218,9 @@ def run_pr_loop(
                     review_state = parsed_review.state
                     reviewer_new_unresolved_items = []
 
+                if carried_approval_record is None:
+                    round_review_models[reviewer_name] = review_model_used
+
                 if (
                     resumed_record is None
                     and review_state == "blocking"
@@ -4446,8 +4453,16 @@ def run_pr_loop(
                 # Every same-round outcome is now published; a sequential
                 # resume that replayed withheld reviews no longer needs them.
                 pr_round_spool.discard()
+            same_model_note = same_model_panel_note(round_review_models)
+            if same_model_note is not None:
+                log(config, f"Round {round_number}: {same_model_note}")
             if (
-                (pr_round_parallel or selective_policy or unavailable_reviewer_failures)
+                (
+                    pr_round_parallel
+                    or selective_policy
+                    or unavailable_reviewer_failures
+                    or same_model_note is not None
+                )
                 and not skip_reviewers_this_round
                 and not (current_resume is not None and current_resume.reconciled)
                 and evidence_pass is None
@@ -4467,7 +4482,8 @@ def run_pr_loop(
                         f"cumulatively: {scheduler_calls_avoided}. Phase: "
                         f"{scheduler_decision.phase if scheduler_decision is not None else 'full-board'}; "
                         f"force-full: {scheduler_recorded_force_full} "
-                        f"(source: {scheduler_recorded_force_full_source or 'none'}).",
+                        f"(source: {scheduler_recorded_force_full_source or 'none'})."
+                        + (f" {same_model_note}." if same_model_note else ""),
                         PostedRoundMetadata(
                             flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
                             subject=current_pr_subject, prior_items=prior_unresolved_items,

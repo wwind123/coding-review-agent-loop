@@ -23,7 +23,8 @@ emits no token usage (usage falls back to the estimated path).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 import errno
 import hashlib
 import os
@@ -31,6 +32,8 @@ from pathlib import Path
 import re
 import stat as stat_module
 import tempfile
+import threading
+import time
 from typing import TYPE_CHECKING, Callable
 
 from .base import (
@@ -47,11 +50,159 @@ from ..errors import AgentLoopError, CheckoutVerificationError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
 from ..runner import CommandResult, Runner, strip_ansi
+from .. import workdir_claims
 from ..scratch import make_private_dirs, scratch_root
 from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
+
+
+def antigravity_quota_group(model: str, overrides: tuple[tuple[str, str], ...] = ()) -> str:
+    """Quota group of a chain entry: override, else derived from the model name.
+
+    Groups are a skipping heuristic, not a claim of independent quota.
+    """
+    for override_model, group in overrides:
+        if override_model == model:
+            return group
+    name = model.strip().lower()
+    if name.startswith("gemini"):
+        return "gemini"
+    if name.startswith("claude"):
+        return "claude"
+    return f"model:{model.strip()}"
+
+
+@dataclass
+class _QuotaGroupEntry:
+    expires_at: float
+    source: str
+    frame: str
+    failed_attempt_seconds: float
+    seq: int = 0
+
+
+def _now() -> float:
+    # Looked up per call so tests can substitute a fake monotonic clock.
+    return time.monotonic()
+
+
+class AntigravityQuotaGroupMemory:
+    """Thread-safe record of exhausted quota groups with finite expiries."""
+
+    def __init__(self, clock: Callable[[], float] | None = None) -> None:
+        self._clock = clock if clock is not None else _now
+        self._lock = threading.Lock()
+        self._entries: dict[str, _QuotaGroupEntry] = {}
+        self._seq = 0
+
+    def _utc(self, expires_at: float) -> str:
+        moment = datetime.now(timezone.utc) + timedelta(seconds=expires_at - self._clock())
+        return moment.strftime("%Y-%m-%d %H:%M:%SZ")
+
+    def mark_exhausted(
+        self,
+        group: str,
+        reset_seconds: int | None,
+        source: str,
+        frame: str,
+        failed_attempt_seconds: float,
+        *,
+        cooldown_seconds: int,
+        config: "AgentLoopConfig | None" = None,
+    ) -> None:
+        wait = reset_seconds if source == "parsed" and reset_seconds is not None else cooldown_seconds
+        expires_at = self._clock() + wait
+        with self._lock:
+            current = self._entries.get(group)
+            if current is not None and current.expires_at >= expires_at:
+                return
+            self._seq += 1
+            self._entries[group] = _QuotaGroupEntry(
+                expires_at, source, frame, failed_attempt_seconds, self._seq
+            )
+            detail = "parsed reset" if source == "parsed" else f"cooldown {cooldown_seconds}s"
+            message = (
+                f"Antigravity quota group {group} exhausted until {self._utc(expires_at)} ({detail})"
+            )
+        if config is not None:
+            log(config, message)
+
+    def is_exhausted(self, group: str, config: "AgentLoopConfig | None" = None) -> bool:
+        with self._lock:
+            entry = self._entries.get(group)
+            if entry is None:
+                return False
+            if entry.expires_at > self._clock():
+                return True
+            del self._entries[group]
+        if config is not None:
+            log(config, f"Antigravity quota group {group} eligible again")
+        return False
+
+    def entry(self, group: str) -> _QuotaGroupEntry | None:
+        with self._lock:
+            return self._entries.get(group)
+
+    def remaining_seconds(self, group: str) -> int | None:
+        with self._lock:
+            entry = self._entries.get(group)
+            if entry is None:
+                return None
+            return max(1, int(entry.expires_at - self._clock()))
+
+    def earliest_expiry(self, groups) -> int | None:
+        remaining = [self.remaining_seconds(g) for g in dict.fromkeys(groups)]
+        known = [value for value in remaining if value is not None]
+        return min(known) if known else None
+
+    def all_parsed(self, groups) -> bool:
+        distinct = tuple(dict.fromkeys(groups))
+        if not distinct:
+            return False
+        for group in distinct:
+            entry = self.entry(group)
+            if entry is None or entry.source != "parsed" or entry.expires_at <= self._clock():
+                return False
+        return True
+
+    def reeligible_at(self, groups) -> str:
+        times = [e.expires_at for g in dict.fromkeys(groups) if (e := self.entry(g)) is not None]
+        return self._utc(min(times)) if times else "unknown"
+
+    def last_frame(self, groups) -> str:
+        """Frame of the most recently recorded exhaustion among ``groups``."""
+        entries = [e for g in dict.fromkeys(groups) if (e := self.entry(g)) is not None and e.frame]
+        return max(entries, key=lambda e: e.seq).frame if entries else ""
+
+
+_run_memories: dict[str, AntigravityQuotaGroupMemory] = {}
+_run_memories_lock = threading.Lock()
+
+
+def quota_memory_for_current_run() -> AntigravityQuotaGroupMemory:
+    """Memory owned by the active logical run, or a fresh local one with no owner.
+
+    Runs share it across nested loops and (context-propagated) reviewer threads;
+    a finalizer drops it when the outermost workdir claim scope ends.
+    """
+    owner = workdir_claims.current_claim_owner()
+    if owner is None:
+        return AntigravityQuotaGroupMemory()
+    with _run_memories_lock:
+        memory = _run_memories.get(owner.run_id)
+        if memory is None:
+            memory = AntigravityQuotaGroupMemory()
+            _run_memories[owner.run_id] = memory
+            run_id = owner.run_id
+
+            def _drop() -> None:
+                with _run_memories_lock:
+                    _run_memories.pop(run_id, None)
+
+            workdir_claims.register_run_finalizer("antigravity-quota-memory", _drop)
+    return memory
 
 
 @dataclass
@@ -62,13 +213,61 @@ class AntigravityAttemptState:
     retries_remaining: int
     model_index: int = 0
     attempts: int = 0
+    groups: tuple[str, ...] = ()
+    memory: AntigravityQuotaGroupMemory | None = None
+    cooldown_seconds: int = 600
+    exhaustion_jumps: int = 0
+    config: "AgentLoopConfig | None" = None
+    models_tried: list[str] = field(default_factory=list)
+    last_frame: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.groups:
+            self.groups = tuple(antigravity_quota_group(m) for m in self.models)
+        if self.memory is None:
+            self.memory = AntigravityQuotaGroupMemory()
 
     @classmethod
     def from_config(cls, config: "AgentLoopConfig", retries: int) -> "AntigravityAttemptState":
-        return cls(config.antigravity_models, retries)
+        overrides = config.antigravity_quota_groups
+        state = cls(
+            config.antigravity_models,
+            retries,
+            groups=tuple(antigravity_quota_group(m, overrides) for m in config.antigravity_models),
+            memory=quota_memory_for_current_run(),
+            cooldown_seconds=config.antigravity_quota_cooldown_seconds,
+            config=config,
+        )
+        first = state._first_eligible(0)
+        if first is not None:
+            state.model_index = first
+        return state
+
+    def _eligible(self, index: int) -> bool:
+        return not self.memory.is_exhausted(self.groups[index], self.config)
+
+    def _first_eligible(self, start: int, *, other_than: str | None = None) -> int | None:
+        for index in range(start, len(self.models)):
+            if other_than is not None and self.groups[index] == other_than:
+                continue
+            if self._eligible(index):
+                return index
+        return None
 
     def singleton_config(self, config: "AgentLoopConfig") -> "AgentLoopConfig":
-        return replace(config, antigravity_model=None, antigravity_models=(self.models[self.model_index],))
+        model = self.models[self.model_index]
+        self.models_tried.append(model)
+        return replace(config, antigravity_model=None, antigravity_models=(model,))
+
+    def ensure_eligible_before_attempt(self) -> str:
+        """``ok`` or ``all-exhausted``; moves off a group exhausted since the last check."""
+        if self._eligible(self.model_index):
+            return "ok"
+        first = self._first_eligible(0)
+        if first is None:
+            return "all-exhausted"
+        self.model_index = first
+        return "ok"
 
     def next_after_failure(self, *, retryable: bool, provider_capacity: bool) -> str:
         """Return retry, fallback, or stop; retries are chain-wide."""
@@ -76,10 +275,59 @@ class AntigravityAttemptState:
         if retryable and self.retries_remaining:
             self.retries_remaining -= 1
             return "retry"
-        if provider_capacity and self.model_index + 1 < len(self.models):
-            self.model_index += 1
-            return "fallback"
+        if provider_capacity:
+            later = self._first_eligible(self.model_index + 1)
+            if later is not None:
+                self.model_index = later
+                return "fallback"
         return "stop"
+
+    def next_after_quota_exhaustion(self, quota, failed_attempt_seconds: float = 0.0) -> str:
+        """Mark the current group exhausted; ``fallback``, ``all-exhausted`` or ``shared-limit``.
+
+        Cross-group fallback is best-effort and happens at most once per turn.
+        """
+        self.attempts += 1
+        group = self.groups[self.model_index]
+        self.last_frame = quota.frame
+        self.memory.mark_exhausted(
+            group,
+            quota.reset_seconds,
+            quota.reset_source,
+            quota.frame,
+            failed_attempt_seconds,
+            cooldown_seconds=self.cooldown_seconds,
+            config=self.config,
+        )
+        if self.exhaustion_jumps >= 1:
+            return "shared-limit"
+        target = self._first_eligible(0, other_than=group)
+        if target is None:
+            return "all-exhausted"
+        self.model_index = target
+        self.exhaustion_jumps += 1
+        return "fallback"
+
+    def stop_is_verified_long_reset(self) -> bool:
+        return self.memory.all_parsed(self.groups)
+
+    def earliest_reset_seconds(self) -> int | None:
+        return self.memory.earliest_expiry(self.groups)
+
+    def unavailable_message(self, shared_limit: bool = False) -> str:
+        frame = (self.last_frame or self.memory.last_frame(self.groups)).strip().splitlines()
+        first_line = frame[0] if frame else "provider quota exhausted"
+        message = (
+            f"Antigravity unavailable on all models: {first_line}; "
+            f"tried {', '.join(dict.fromkeys(self.models_tried)) or 'no models'}; "
+            f"quota groups re-eligible from {self.memory.reeligible_at(self.groups)}"
+        )
+        if shared_limit:
+            message += (
+                "; the cross-group fallback failed the same way, so further groups "
+                "were not tried"
+            )
+        return message
 
 
 def _git_lock_path(workdir: Path) -> Path:

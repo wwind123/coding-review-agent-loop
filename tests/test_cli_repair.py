@@ -185,6 +185,7 @@ def test_default_repair_and_antigravity_chains_use_current_flash_generation(tmp_
         "Gemini 3.7 Flash (High)",
         "Gemini 3.6 Flash (High)",
         "Gemini 3.1 Pro (High)",
+        "Claude Opus 5.5 (Medium)",
     )
     args = build_parser().parse_args([
         "issue", "1", "--repo", "OWNER/REPO",

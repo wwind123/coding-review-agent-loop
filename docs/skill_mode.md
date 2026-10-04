@@ -228,7 +228,7 @@ Merge stays a human decision.
 The external agent can be `codex`, `gemini`, or `antigravity` (the `agy` CLI —
 the migration path for Gemini CLI consumer access, which Google retires on
 2026-06-18). With no override, Antigravity uses the ordered fallback chain
-`Gemini 3.8 Flash (High)` → `Gemini 3.7 Flash (High)` → `Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)`. Use
+`Gemini 3.8 Flash (High)` → `Gemini 3.7 Flash (High)` → `Gemini 3.6 Flash (High)` → `Gemini 3.1 Pro (High)` → `Claude Opus 5.5 (Medium)`. A quota-exhausted group (Gemini) is skipped straight to `Claude Opus 5.5 (Medium)` within one invocation (see [Quota groups and fallback](local_agent_loop.md#quota-groups-and-fallback)). Use
 `--model MODEL` for the legacy single-model override or `--antigravity-models MODEL [MODEL ...]` for a
 custom ordered chain; these options are mutually exclusive. Use
 `--antigravity-quota-signatures SIGNATURE [SIGNATURE ...]` to customize the

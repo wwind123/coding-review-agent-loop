@@ -122,6 +122,7 @@ from .usage import RunUsageContext
 from .comment_rendering import (
     render_plan_phase_advance,
     render_plan_scheduling_audit,
+    same_model_panel_note,
     RISK_TEST_MATRIX_MARKER_RE,
     decode_risk_test_matrix_marker,
     normalize_freeform_signature,
@@ -1894,6 +1895,9 @@ def _run_plan_first_loop(
         # an acknowledgement repair can pin its assessment and records (#925).
         accepted_review_carriers: dict[str, ParsedPlanReview | ParsedReview] = {}
         all_approved = True
+        # Actual models of reviewers that reviewed in THIS round (fresh or resumed
+        # same-round records), for the same-model panel note (#1236).
+        round_review_models: dict[str, str | None] = {}
         resumed_by_name = {
             record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
         }
@@ -2477,6 +2481,7 @@ def _run_plan_first_loop(
                 "Planning round "
                 f"{round_number}: {reviewer_name} outcome is {_describe_plan_review_outcome(parsed_review)}",
             )
+            round_review_models[reviewer_name] = review_model_used
             for disposition in parsed_review.dispositions:
                 _record_prior_item_disposition(
                     prior_dispositions,
@@ -2545,13 +2550,19 @@ def _run_plan_first_loop(
             # Every same-round outcome is now published; a sequential resume
             # that replayed withheld reviews no longer needs them.
             plan_round_spool.discard()
-        if plan_round_parallel and not (current_resume is not None and current_resume.reconciled):
+        same_model_note = same_model_panel_note(round_review_models)
+        if same_model_note is not None:
+            log(config, f"Planning round {round_number}: {same_model_note}")
+        if (
+            plan_round_parallel or same_model_note is not None
+        ) and not (current_resume is not None and current_resume.reconciled):
             settled = ", ".join(agent_display_name(reviewer) for reviewer in round_reviewers)
             post_issue_comment(
                 runner, config=config, issue_number=issue_number,
                 body=_attach_round_metadata(
                     f"Plan review round {round_number} reconciliation: settled reviewers: {settled or 'none'}. "
-                    f"Finalization {'stops' if plan_fatal_errors else 'continues'} after reconciliation.",
+                    f"Finalization {'stops' if plan_fatal_errors else 'continues'} after reconciliation."
+                    + (f" {same_model_note}." if same_model_note else ""),
                     PostedRoundMetadata(
                         flow="plan", role="summary", agent="Orchestrator", round_number=round_number,
                         subject=_plan_subject(current_plan), prior_items=prior_unresolved_items,

@@ -63,7 +63,11 @@ from .repair_preservation import (
 )
 from .runner import Runner
 from .salvage import SalvageContext
-from .transient import classify_antigravity_capacity, looks_like_backgrounded_completion
+from .transient import (
+    classify_antigravity_capacity,
+    classify_antigravity_quota_exhaustion,
+    looks_like_backgrounded_completion,
+)
 from .usage import RunUsageContext, UsageMetadata, estimate_usage
 from .worker_telemetry import append_record, run_record, telemetry_log_path
 from .workdirs import active_workdir
@@ -1078,7 +1082,7 @@ def _run_validated_agent(
     # Each fallback retains an initial attempt; retry allowance is shared. The
     # provider-specific replacement replay gets one explicit extra slot.
     max_attempts = (
-        len(config.antigravity_models) + config.agent_max_retries + 1
+        len(config.antigravity_models) + config.agent_max_retries + 2
         if antigravity_attempts is not None
         else config.agent_max_retries + 2
     )
@@ -1155,8 +1159,66 @@ def _run_validated_agent(
         ),
     }
 
+    def _quota_reset_error(reset_secs: int, classification_text: str) -> QuotaResetExceededError:
+        duration_str = _format_reset_duration(reset_secs)
+        at_str = _format_reset_at_utc(reset_secs)
+        message = (
+            f"{agent_name} quota exhausted. Reset in {duration_str} (at {at_str}). "
+            "Rerun when quota resets, or switch to a different API key / model."
+        )
+        replacement_detail = _executable_replacement_failure_detail(
+            provider=executable_replacement_provider,
+            reason=executable_replacement_reason,
+            stability_error=self_update_stability_error,
+        )
+        diagnostic_classification_text = classification_text
+        if replacement_detail:
+            message += f" {replacement_detail}"
+            diagnostic_classification_text = (
+                f"{classification_text}\n{replacement_detail}"
+            ).strip()
+        if latest_replay_refusal_detail:
+            message += f" {latest_replay_refusal_detail}"
+            diagnostic_classification_text = (
+                f"{diagnostic_classification_text}\n{latest_replay_refusal_detail}"
+            ).strip()
+        diagnostics = _failed_run_diagnostics(
+            runner=runner,
+            config=config,
+            agent_name=agent_name,
+            salvage_context=salvage_context,
+            operation_description=operation_description,
+            failure_category=last_failure_category,
+            failure_reason=message,
+            classification_text=diagnostic_classification_text,
+            marker_description=marker_description,
+            result=last_result,
+        )
+        message += diagnostics.format_for_error()
+        return QuotaResetExceededError(message)
+
+    def _antigravity_stop_error(
+        classification_text: str, *, shared_limit: bool
+    ) -> AgentInvocationError:
+        """Early stop: every reachable quota group is exhausted (#1236)."""
+        state = antigravity_attempts
+        if state.stop_is_verified_long_reset():
+            return _quota_reset_error(state.earliest_reset_seconds() or 1, classification_text)
+        # Transient, like the ordinary chain-exhausted failure it replaces: multi-reviewer
+        # rounds then mark Antigravity unavailable instead of aborting the round.
+        return AgentInvocationError(
+            state.unavailable_message(shared_limit), failure_category="transient"
+        )
+
     for attempt in range(1, max_attempts + 1):
         replacement_stability_failed = False
+        if (
+            antigravity_attempts is not None
+            and antigravity_attempts.ensure_eligible_before_attempt() == "all-exhausted"
+        ):
+            log(config, f"{agent_name}: every Antigravity quota group is cooling down; not invoking")
+            raise _antigravity_stop_error(last_classification_text, shared_limit=False)
+        attempt_started_at = time.monotonic()
         attempt_config = (
             antigravity_attempts.singleton_config(config)
             if antigravity_attempts is not None
@@ -1480,6 +1542,7 @@ def _run_validated_agent(
                 continue
         should_retry = False
         provider_capacity = False
+        capacity = None
         if artifact_contract_refusal is not None:
             # The artifact stays authoritative for this invocation: skip the
             # timeout and nonzero-exit transport branches, make no repair
@@ -2479,45 +2542,42 @@ def _run_validated_agent(
             )
             continue
         if should_retry:
-            if _QUOTA_RATE_LIMIT_RE.search(classification_text):
+            quota = None
+            if antigravity_attempts is not None:
+                if capacity is not None:
+                    attempt_seconds = time.monotonic() - attempt_started_at
+                    if capacity.is_capacity:
+                        frame_lines = capacity.frame.strip().splitlines()
+                        log(
+                            config,
+                            f"Antigravity {result.model_used} capacity failure after "
+                            f"{attempt_seconds:.1f}s: {frame_lines[0] if frame_lines else 'no frame'}",
+                        )
+                    quota = classify_antigravity_quota_exhaustion(
+                        capacity, threshold=LONG_RESET_THRESHOLD_SECONDS
+                    )
+                    if quota is not None:
+                        previous_model = antigravity_attempts.models[antigravity_attempts.model_index]
+                        previous_group = antigravity_attempts.groups[antigravity_attempts.model_index]
+                        quota_transition = antigravity_attempts.next_after_quota_exhaustion(
+                            quota, attempt_seconds
+                        )
+                        if quota_transition == "fallback":
+                            log(
+                                config,
+                                f"{agent_name}: quota exhausted for {previous_model}; skipping quota "
+                                f"group {previous_group} to "
+                                f"{antigravity_attempts.models[antigravity_attempts.model_index]} "
+                                "without delay",
+                            )
+                            continue
+                        raise _antigravity_stop_error(
+                            classification_text, shared_limit=quota_transition == "shared-limit"
+                        )
+            elif _QUOTA_RATE_LIMIT_RE.search(classification_text):
                 reset_secs = _parse_rate_limit_reset_seconds(classification_text)
                 if reset_secs is not None and reset_secs > LONG_RESET_THRESHOLD_SECONDS:
-                    duration_str = _format_reset_duration(reset_secs)
-                    at_str = _format_reset_at_utc(reset_secs)
-                    message = (
-                        f"{agent_name} quota exhausted. Reset in {duration_str} (at {at_str}). "
-                        "Rerun when quota resets, or switch to a different API key / model."
-                    )
-                    replacement_detail = _executable_replacement_failure_detail(
-                        provider=executable_replacement_provider,
-                        reason=executable_replacement_reason,
-                        stability_error=self_update_stability_error,
-                    )
-                    diagnostic_classification_text = classification_text
-                    if replacement_detail:
-                        message += f" {replacement_detail}"
-                        diagnostic_classification_text = (
-                            f"{classification_text}\n{replacement_detail}"
-                        ).strip()
-                    if latest_replay_refusal_detail:
-                        message += f" {latest_replay_refusal_detail}"
-                        diagnostic_classification_text = (
-                            f"{diagnostic_classification_text}\n{latest_replay_refusal_detail}"
-                        ).strip()
-                    diagnostics = _failed_run_diagnostics(
-                        runner=runner,
-                        config=config,
-                        agent_name=agent_name,
-                        salvage_context=salvage_context,
-                        operation_description=operation_description,
-                        failure_category=last_failure_category,
-                        failure_reason=message,
-                        classification_text=diagnostic_classification_text,
-                        marker_description=marker_description,
-                        result=last_result,
-                    )
-                    message += diagnostics.format_for_error()
-                    raise QuotaResetExceededError(message)
+                    raise _quota_reset_error(reset_secs, classification_text)
             transition = (
                 antigravity_attempts.next_after_failure(
                     retryable=should_retry, provider_capacity=provider_capacity

@@ -51,6 +51,7 @@
   "pytest_plugin._agent_loop_worker_cap",
   "repair",
   "repair_preservation",
+  "reset_parsing",
   "review_evaluation",
   "review_scheduling",
   "review_spool",

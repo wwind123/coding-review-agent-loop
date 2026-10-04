@@ -434,6 +434,7 @@ def test_config_from_args_antigravity_defaults(tmp_path):
         "Gemini 3.7 Flash (High)",
         "Gemini 3.6 Flash (High)",
         "Gemini 3.1 Pro (High)",
+        "Claude Opus 5.5 (Medium)",
     )
     assert config.antigravity_print_timeout_seconds == 600
     assert config.antigravity_quota_signatures == (

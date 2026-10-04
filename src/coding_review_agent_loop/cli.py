@@ -32,6 +32,7 @@ from .config import (
     DEFAULT_REPAIR_MODELS,
     DEFAULT_FLAT_CHILD_LIMIT,
     DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
+    DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS,
     DEFAULT_SEMANTIC_FOLLOWUP_BACKEND,
     DEFAULT_SEMANTIC_FOLLOWUP_MAX_CALLS,
     DEFAULT_SEMANTIC_FOLLOWUP_MAX_CANDIDATES,
@@ -371,6 +372,25 @@ def build_parser() -> argparse.ArgumentParser:
             nargs="+",
             default=list(DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES),
             help="Provider error substrings that permit Antigravity fallback (default: quota, high traffic, etc).",
+        )
+        subparser.add_argument(
+            "--antigravity-quota-cooldown-seconds",
+            type=int,
+            default=DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS,
+            help=(
+                "Seconds an Antigravity quota group with no parsed reset is skipped after "
+                f"exhaustion (default: {DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS}, max 3600)."
+            ),
+        )
+        subparser.add_argument(
+            "--antigravity-quota-group",
+            action="append",
+            default=None,
+            metavar="MODEL=GROUP",
+            help=(
+                "Override the derived Antigravity quota group of a chain model "
+                "(repeatable). Models in one group are skipped together after quota exhaustion."
+            ),
         )
         subparser.add_argument(
             "--codex-model",
