@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 import shlex
+import threading
 import time
 from collections.abc import Collection, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -2766,7 +2767,10 @@ def authorize_fresh_issue_created_resume(
     )
     if not label_events:
         raise AgentLoopError(
-            "Managed-CI fresh authorization requires an actor-owned managed-label event."
+            _with_reason(
+                "Managed-CI fresh authorization requires an actor-owned managed-label event.",
+                _last_list_failure() if label_events is None else "",
+            )
         )
     label_event = label_events[-1]
     valid_label_event_ids = {event_id for event_id, _login, _actor_id in label_events}
@@ -2920,7 +2924,7 @@ def authorize_fresh_issue_created_resume(
             approved_plan_hash=record.approved_plan_hash,
             retired_plan_hashes=retired,
         )
-    issue_timeline = _api_list(
+    issue_timeline, timeline_reason = _api_list_detailed(
         runner,
         config,
         f"repos/{config.repo}/issues/{issue_number}/timeline?per_page=100",
@@ -2946,8 +2950,11 @@ def authorize_fresh_issue_created_resume(
                 break
     if not associated:
         raise AgentLoopError(
-            "Managed-CI fresh authorization requires a server-observed issue-to-PR "
-            "association for the explicit issue scope."
+            _with_reason(
+                "Managed-CI fresh authorization requires a server-observed issue-to-PR "
+                "association for the explicit issue scope.",
+                timeline_reason,
+            )
         )
     if incompatible_records and not supersede:
         raise AgentLoopError(
@@ -3136,7 +3143,10 @@ def revalidate_issue_created_handoff(
             event_id for event_id, _login, _actor_id in history
         }:
             raise AgentLoopError(
-                "Managed-CI direct-resume label provenance changed before activation."
+                _with_reason(
+                    "Managed-CI direct-resume label provenance changed before activation.",
+                    _last_list_failure() if history is None else "",
+                )
             )
         validated = replace(validated, active_label_event_id=handoff.active_label_event_id)
     elif handoff.active_label_event_id is not None:
@@ -3326,7 +3336,12 @@ def _recover_issue_created_protection(
         actor_login=handoff.trusted_actor_login, actor_id=handoff.trusted_actor_id,
     )
     if valid_label_event_ids is None:
-        raise refuse("the managed-label event history could not be inspected", remedy=retry)
+        raise refuse(
+            _with_reason(
+                "the managed-label event history could not be inspected", _last_list_failure()
+            ),
+            remedy=retry,
+        )
     comments, reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
@@ -5667,7 +5682,10 @@ def _activate_v2_managed_ci(
                 actor_id=actor_id,
             )
             if historical_label_events is None:
-                reason = "the actor-owned managed-label history is temporarily unreadable"
+                reason = _with_reason(
+                    "the actor-owned managed-label history is temporarily unreadable",
+                    _last_list_failure(),
+                )
             elif not historical_label_events:
                 reason = "no actor-owned historical managed-label event authenticates strict re-entry"
             else:
@@ -6032,7 +6050,23 @@ def _activate_v2_managed_ci(
         )
 
 
+_LIST_FAILURE = threading.local()
+
+
+def _last_list_failure() -> str:
+    """Reason of the most recent ``_api_list`` failure on this thread ('' if it succeeded)."""
+    return getattr(_LIST_FAILURE, "reason", "")
+
+
 def _api_list_detailed(
+    runner: Runner, config: AgentLoopConfig, endpoint: str
+) -> tuple[list[dict[str, object]] | None, str]:
+    payload, reason = _api_list_detailed_inner(runner, config, endpoint)
+    _LIST_FAILURE.reason = reason if payload is None else ""
+    return payload, reason
+
+
+def _api_list_detailed_inner(
     runner: Runner, config: AgentLoopConfig, endpoint: str
 ) -> tuple[list[dict[str, object]] | None, str]:
     """Fetch a paginated GitHub list; on failure return ``(None, reason)``.

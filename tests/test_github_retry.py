@@ -310,3 +310,61 @@ def test_managed_ci_list_failure_reason_reaches_callers(tmp_path, sleeps):
     assert "could not be inspected" in message
     assert "list-final" in message and "attempt 3:" in message
     assert managed_ci._api_list(runner, config, "repos/o/r/issues/4/comments") is None
+
+
+# --- round 2: branch protection and managed-CI list consumers ---------------------
+
+
+def test_get_pr_checks_branch_protection_exhaustion_keeps_diagnostics(tmp_path, sleeps):
+    config = make_config(tmp_path)
+    metadata = github.PullRequestMetadata(7, "OWNER/REPO", "title", "head", "main", "sha", "url")
+
+    class ProtectionRunner(ScriptedRunner):
+        def run(self, args, *, cwd, input_text=None, check=True, env=None):
+            self.calls.append(list(args))
+            if "required_status_checks" in " ".join(args):
+                return CommandResult(list(args), cwd, "", "HTTP 503 protection-final", 1)
+            return CommandResult(list(args), cwd, '{"check_runs": [], "statuses": []}', "", 0)
+
+    runner = ProtectionRunner([(0, "", "")])
+    checks = github.get_pr_checks(runner, config=config, metadata=metadata)
+    protection_calls = [c for c in runner.calls if "required_status_checks" in " ".join(c)]
+    assert len(protection_calls) == 3
+    assert checks.branch_protection_status == "unavailable"
+    note = checks.branch_protection_note or ""
+    assert "protection-final" in note
+    assert all(f"attempt {n}:" in note for n in (1, 2, 3))
+
+
+def test_managed_ci_event_and_timeline_failure_reasons(tmp_path, sleeps):
+    from coding_review_agent_loop import managed_ci
+
+    config = make_config(tmp_path)
+    runner = ScriptedRunner([(1, "", "HTTP 503 events-final")])
+    history = managed_ci._managed_label_event_history(
+        runner, config=config, pr_number=4, actor_login="bot", actor_id=7
+    )
+    assert history is None
+    assert "events-final" in managed_ci._last_list_failure()
+    assert "attempt 3:" in managed_ci._last_list_failure()
+
+    ids = managed_ci._actor_owned_label_event_ids(
+        runner, config=config, pr_number=4, actor_login="bot", actor_id=7
+    )
+    assert ids is None
+    assert "events-final" in managed_ci._last_list_failure()
+
+    ok = ScriptedRunner([(0, "[]", "")])
+    assert managed_ci._api_list(ok, config, "repos/o/r/issues/4/events") == []
+    assert managed_ci._last_list_failure() == ""
+
+
+def test_fresh_authorization_event_history_failure_reaches_error(tmp_path, sleeps):
+    from coding_review_agent_loop import managed_ci
+
+    config = make_config(tmp_path)
+    runner = ScriptedRunner([(1, "", "HTTP 503 fresh-final")])
+    events, reason = managed_ci._api_list_detailed(runner, config, "repos/o/r/issues/4/timeline")
+    assert events is None and "fresh-final" in reason and "attempt 3:" in reason
+    message = managed_ci._with_reason("requires an association", reason)
+    assert "requires an association" in message and "fresh-final" in message

@@ -1701,7 +1701,8 @@ def _fetch_branch_protection_required_checks(
     return (
         "unavailable",
         (),
-        "GitHub branch protection could not be inspected due to an unexpected API failure.",
+        "GitHub branch protection could not be inspected due to an unexpected API failure."
+        + _failure_detail(result),
     )
 
 
