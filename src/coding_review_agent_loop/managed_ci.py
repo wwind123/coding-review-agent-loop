@@ -323,6 +323,9 @@ class ManagedCiContract:
     # followed a mutation by this run (#1067).  Callers print it instead of a
     # hard-coded post-state sentence.
     state_report: str | None = None
+    # Final write diagnostic and attempt history of the last failed
+    # release_adopted_managed_ci removal (empty when it succeeded).
+    release_diagnostic: str = ""
 
 
 @dataclass(frozen=True)
@@ -6267,7 +6270,12 @@ def label_event_history(
         return UnknownLabelHistory(reason or "event list unreadable")
     latest: LabelEvent | None = None
     for event in events:
-        if event.get("event") not in {"labeled", "unlabeled"}:
+        kind = event.get("event")
+        if not isinstance(kind, str) or not kind:
+            # An envelope without a usable discriminator could be a label
+            # transition; the history is unreadable, never merely filtered.
+            return UnknownLabelHistory("a timeline event lacked an event kind")
+        if kind not in {"labeled", "unlabeled"}:
             continue
         # A label transition whose label cannot be identified might belong to
         # this label; the history is then unreadable, never merely absent.
@@ -6734,6 +6742,9 @@ def release_adopted_managed_ci(
         runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL,
         owned_event_id=contract.active_label_event_id,
     ).result
+    # The bool API is unchanged; the final write diagnostic and attempt history
+    # ride on the contract so the public cleanup refusal can report them.
+    contract.release_diagnostic = "" if result.returncode == 0 else failure_suffix(result)
     return result.returncode == 0
 
 

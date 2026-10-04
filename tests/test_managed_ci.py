@@ -13561,3 +13561,79 @@ def test_explicit_adoption_refusal_carries_the_label_write_diagnostic(tmp_path, 
     assert "attempt 1" in text
     if not unreadable:
         assert "attempt 3" in text
+
+
+# --- #510 review round 3: event-kind validation and release diagnostics ----------
+
+
+@pytest.mark.parametrize("label", [MANAGED_LABEL, QUALIFIED_LABEL])
+@pytest.mark.parametrize("bad_kind", [None, 5, ""], ids=["missing", "non-string", "empty"])
+def test_remove_never_replays_over_a_remove_reapply_pair_with_unusable_event_kinds(
+    tmp_path, label_env, label, bad_kind
+):
+    hub = _LabelHub(["fail"], label=label)
+    owned = hub.event("labeled")["id"]
+    original = hub.run
+
+    def run(args, **kw):
+        result = original(args, **kw)
+        if hub.deletes == 1 and result.returncode != 0 and len(hub.events) == 1:
+            for event_id in (2001, 2002):  # remove then re-apply, kind unreadable
+                envelope = {
+                    "id": event_id, "label": {"name": label},
+                    "actor": {"login": _BOT[0], "id": _BOT[1]},
+                }
+                if bad_kind is not None:
+                    envelope["event"] = bad_kind
+                hub.events.append(envelope)
+        return result
+
+    hub.run = run
+    outcome = _label_remove(
+        hub, config=_lcfg(tmp_path), pr_number=7, label_name=label, owned_event_id=owned
+    )
+    assert outcome.result.returncode != 0 and outcome.outcome == "unknown"
+    assert hub.deletes == 1
+
+
+def test_label_history_rejects_an_event_without_a_kind(tmp_path, label_env):
+    hub = _LabelHub()
+    hub.events.append({"id": 9, "label": {"name": MANAGED_LABEL}, "actor": {"login": "a", "id": 1}})
+    assert isinstance(
+        _label_history(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL), _Unknown
+    )
+
+
+@pytest.mark.parametrize("unreadable", [False, True], ids=["exhausted", "unreadable-reconciliation"])
+def test_release_failure_carries_the_removal_diagnostic_and_attempt_history(
+    tmp_path, label_env, unreadable
+):
+    hub = _LabelHub(["fail", "fail", "fail"])
+    owned = hub.event("labeled")["id"]
+    if unreadable:
+        original = hub.run
+
+        def run(args, **kw):
+            result = original(args, **kw)
+            if hub.deletes == 1 and result.returncode != 0:
+                hub.events_unreadable = True
+            return result
+
+        hub.run = run
+    contract = _owned_contract(owned)
+
+    assert _release510(hub, config=_lcfg(tmp_path), pr_number=7, contract=contract) is False
+
+    assert "503 Service Unavailable" in contract.release_diagnostic
+    assert "attempt 1" in contract.release_diagnostic
+    if not unreadable:
+        assert "attempt 3" in contract.release_diagnostic
+
+
+def test_successful_release_clears_the_diagnostic(tmp_path, label_env):
+    hub = _LabelHub()
+    owned = hub.event("labeled")["id"]
+    contract = _owned_contract(owned)
+    contract.release_diagnostic = "stale"
+    assert _release510(hub, config=_lcfg(tmp_path), pr_number=7, contract=contract) is True
+    assert contract.release_diagnostic == ""

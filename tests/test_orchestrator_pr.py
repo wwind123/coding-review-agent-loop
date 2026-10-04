@@ -17227,3 +17227,49 @@ def test_merge_502_that_actually_merged_is_recovered_with_no_second_merge(tmp_pa
             runner, config=config, pr_number=77, capability=capability,
         )
     assert len(_merge_commands(runner)) == 1
+
+
+class _FailingReleaseRunner(FakeRunner):
+    """Label DELETEs fail with a 503 so the PR-loop cleanup cannot release."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.deletes = 0
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        cmd = [str(a) for a in args]
+        where = Path(cwd) if cwd else Path(".")
+        if "DELETE" in cmd and any(a.endswith("/labels/agent-loop-managed") for a in cmd):
+            super().run(args, cwd=cwd, input_text=input_text, check=False, env=env)
+            self.deletes += 1
+            return CommandResult(cmd, where, "", "HTTP 503 Service Unavailable", 1)
+        return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+
+def test_pr_loop_cleanup_refusal_carries_the_release_diagnostic(tmp_path, monkeypatch):
+    approval = structured_pr_review(state="approved", summary="Approved.")
+    runner = _FailingReleaseRunner(codex_outputs=[approval])
+    config = make_config(
+        tmp_path, watch_pending_ci=True, auto_merge=True, managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+    )
+    contract = ManagedCiContract(
+        protocol_version=2, adopted_existing_pr=True, invocation_applied_label=True,
+        active_label_event_id=None,
+    )
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *a, **k: None)
+
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification",
+        lambda *a, **k: (_ for _ in ()).throw(AgentLoopError("qualification aborted")),
+    )
+
+    with pytest.raises(AgentLoopError) as raised:
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    notes = " ".join(getattr(raised.value, "__notes__", []))
+    assert "requires manual label removal" in notes or "requires manual label removal" in str(raised.value)
+    assert "503 Service Unavailable" in notes + str(raised.value)
+    assert runner.deletes >= 1
