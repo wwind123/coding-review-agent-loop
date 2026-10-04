@@ -3177,7 +3177,7 @@ def _pr_step_back_records_may_matter(
 ) -> bool:
     """Cheap pre-check on the round-start snapshot: could this dispatch step back?
 
-    The snapshot lacks only the current round's review, so a trigger needs the
+    The snapshot lacks at most the current round's review, so a trigger needs the
     previous K-1 reviews to already be consecutive new findings, and an episode
     needs a recorded entry.  Anything else skips the fresh read entirely.
     """
@@ -3187,7 +3187,13 @@ def _pr_step_back_records_may_matter(
             return True
         if k <= 1:
             return True
-        recent = _step_back.pr_reviews_for(records, reviewer)[-(k - 1):]
+        # The snapshot may or may not already hold the current round's review (a
+        # resume restores it), so the preceding K-1 reviews are taken before it.
+        recent = [
+            review
+            for review in _step_back.pr_reviews_for(records, reviewer)
+            if review.round_number < round_number
+        ][-(k - 1):]
         if (
             len(recent) == k - 1
             and recent[-1].round_number == round_number - 1

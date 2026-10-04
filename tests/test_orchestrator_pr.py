@@ -17802,3 +17802,21 @@ def test_resume_after_a_carried_in_window_sweep_review_keeps_the_episode_and_sto
     assert "human decision required" in message
     assert "Generalization: any spool record that fails a validation step is malformed." in message
     assert len(_sb_coder_prompts(runner)) == 4  # no coder turn after the sibling
+
+
+def test_resume_after_the_kth_review_is_published_still_issues_the_step_back_turn(tmp_path):
+    """Interrupted between the K-th clustered review and its coder dispatch."""
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders()[:2],  # the third (step-back) coder turn cannot run
+        codex_outputs=_three_clustered_blocks(),
+    )
+    config = _sb_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    runner.claude_outputs.append(_step_back_coders()[2])
+    runner.codex_outputs.append(_sb_review(resolved=["item-3"]))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    prompts = _sb_coder_prompts(runner)
+    assert "STEP-BACK TURN" in prompts[-1]  # the resumed dispatch, not an ordinary follow-up
+    assert len([p for p in prompts[:2] if "STEP-BACK TURN" in p]) == 0
+    assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[-1]
