@@ -9,6 +9,7 @@ import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator_module
 import coding_review_agent_loop.phase_progress as phase_progress_module
+from coding_review_agent_loop.agents.base import AgentResult
 from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.comment_rendering import (
@@ -15723,3 +15724,104 @@ def test_issue_loop_plan_first_resume_reparses_alias_keyed_requirement_dispositi
 
     agent_commands = [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
     assert agent_commands == []
+
+
+def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
+    tmp_path, monkeypatch
+):
+    """#1240: the real approved-plan hand-off re-asks once and hands off PR #77."""
+    approved_plan, plan_context = _implementation_matrix_context()
+    unverified = _workflow_observation(
+        execution_ref="turn-1:observation-1", receipt_id="receipt-1", head="abc123"
+    )
+    unverified.turn_id = "turn-1"
+    unverified.suite_start = "unknown"
+    fresh = _workflow_observation(
+        execution_ref="turn-2:observation-1", receipt_id="receipt-2", head="abc123"
+    )
+    fresh.turn_id = "turn-2"
+    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "abc123"})
+    config = make_config(tmp_path, coder="claude")
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Issue body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(),
+        human_requirements=(),
+    )
+    results = [
+        AgentResult(
+            text=_semantic_issue_implementation_text(unverified.execution_ref),
+            returncode=0,
+            session_id="coder-session",
+            test_turn_id="turn-1",
+            test_turn_observations=(unverified,),
+        ),
+        AgentResult(
+            text=_semantic_issue_implementation_text(fresh.execution_ref),
+            returncode=0,
+            session_id="coder-session",
+            test_turn_id="turn-2",
+            test_turn_observations=(fresh,),
+        ),
+    ]
+    dispatches = []
+
+    def fake_run_agent_result(*_a, **kwargs):
+        dispatches.append(kwargs)
+        return results[len(dispatches) - 1]
+
+    def forbid_repair(*_a, **_k):
+        pytest.fail("a citation re-ask must not invoke structured repair")
+
+    run_pr_calls = []
+    monkeypatch.setattr(orchestrator_module, "run_agent_result", fake_run_agent_result)
+    monkeypatch.setattr(orchestrator_module, "_run_structured_repair", forbid_repair)
+    monkeypatch.setattr(
+        orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "validate_assigned_head_advanced", lambda **_k: None
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "run_pr_loop",
+        lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "reconcile_test_observations",
+        lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
+    )
+    monkeypatch.setattr(
+        orchestrator_module, "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head="abc123", tracked_digest="tree-current", complete=True,
+            stable=True, status_clean=True,
+        ),
+    )
+    result = orchestrator_module._implement_approved_issue(
+        runner,
+        issue_number=56,
+        approved_plan=approved_plan,
+        config=config,
+        memory=None,
+        issue_context=issue_context,
+        coder_session_id=None,
+        usage_context=orchestrator_module._new_usage_context(config),
+        approved_plan_context=plan_context,
+    )
+
+    assert result == 0
+    assert len(dispatches) == 2
+    assert "Previous response not accepted: test evidence" in dispatches[1]["prompt"]
+    assert dispatches[1]["session_id"] == "coder-session"
+    assert run_pr_calls and run_pr_calls[0]["pr_number"] == 77
+    assert any("AGENT_ISSUE_PR_HANDOFF" in comment for comment in runner.comments)
+    assert not any("turn-1:observation-1" in comment for comment in runner.comments)
