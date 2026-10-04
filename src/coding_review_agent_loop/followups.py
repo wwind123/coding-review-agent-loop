@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections import Counter
 from collections.abc import Sequence
@@ -13,6 +15,8 @@ from .errors import AgentLoopError, QuotaResetExceededError
 from .github import (
     FoundIssue,
     create_issue,
+    issue_reconciliation_window_start,
+    recover_created_issue,
     post_issue_comment,
     post_pr_comment,
     search_issues,
@@ -20,6 +24,7 @@ from .github import (
 )
 from .issue_body_limits import BoundedSection, fit_github_body
 from .logging import log
+from .github_retry import GitHubAmbiguousWriteError, GitHubTransientExhaustedError
 from .protocol import ApprovedFollowup, UnresolvedReviewItem
 from .comment_rendering import render_canonical_plan_steps
 from .round_state import find_approved_plan_comment
@@ -886,6 +891,29 @@ def _dedupe_approved_followups(followups: Sequence[ApprovedFollowup]) -> list[Gr
     return list(reconcile_approved_followups(followups, issue_limit=len(followups) or 0).groups)
 
 
+FOLLOWUP_IDENTITY_TOKEN = "AGENT_FOLLOWUP_CREATION_IDENTITY"
+
+
+def followup_creation_identity(
+    *, repo: str, source_kind: str, source_number: int, plan_hash: str | None, text: str
+) -> str:
+    """Stable per-follow-up creation identity (#510).
+
+    ``sha256`` over the repo, the source kind and number (PR number for
+    review-derived follow-ups, issue number plus plan hash for plan-derived
+    ones) and the group's canonical normalized text.
+    """
+    material = json.dumps(
+        [repo.casefold(), source_kind, source_number, plan_hash or "", _normalize_followup_key(text)],
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _followup_identity_record(identity: str) -> str:
+    return f"<!-- {FOLLOWUP_IDENTITY_TOKEN}: {identity} -->"
+
+
 def _followup_issue_body(
     pr_number: int,
     followup: GroupedApprovedFollowup,
@@ -893,7 +921,17 @@ def _followup_issue_body(
     source_context: FollowupSourceContext | None = None,
     possible_duplicate: str | None = None,
 ) -> str:
+    identity = followup_creation_identity(
+        repo=source_context.repo if source_context is not None else "",
+        source_kind="pr",
+        source_number=pr_number,
+        plan_hash=None,
+        text=followup.text,
+    )
+    # The identity record leads the body, outside every bounded section, so
+    # body bounding can never remove it.
     lines = [
+        _followup_identity_record(identity),
         f"Future follow-up from approved review on PR #{pr_number}.",
         "",
     ]
@@ -992,7 +1030,15 @@ def _plan_followup_issue_body(
     bounded.append(
         BoundedSection(name="approved plan subject", text=safe_plan_subject, pointer=pointer)
     )
+    identity = followup_creation_identity(
+        repo=source_context.repo if source_context is not None else "",
+        source_kind="plan",
+        source_number=issue_number,
+        plan_hash=plan_hash,
+        text=followup.text,
+    )
     lines = [
+        _followup_identity_record(identity),
         f"Future follow-up from approved planning for issue #{issue_number}.",
         "",
         "Source context:",
@@ -1219,14 +1265,15 @@ def _publish_issue_followup_groups(
             skipped_by_cap += 1
             continue
         body_reason = reason if status == "uncertain" else None
+        title_for_group: str | None = None
+        body_for_group: TrustedBody | None = None
+        captured_window_start = issue_reconciliation_window_start()
         try:
             if isinstance(group, PlanGroupedApprovedFollowup):
                 assert issue_number is not None and plan_hash is not None and plan_subject is not None
-                raw_url = create_issue(
-                    runner,
-                    config=config,
-                    title=_plan_followup_issue_title(group),
-                    body=_plan_followup_issue_body(
+                title_for_group = _plan_followup_issue_title(group)
+                body_for_group = TrustedBody.canonical(
+                    _plan_followup_issue_body(
                         issue_number=issue_number,
                         plan_hash=plan_hash,
                         plan_subject=plan_subject,
@@ -1234,56 +1281,64 @@ def _publish_issue_followup_groups(
                         source_context=source_context,
                         possible_duplicate=body_reason,
                     ),
+                    expected_tokens=(FOLLOWUP_IDENTITY_TOKEN,),
                 )
             else:
-                raw_url = create_issue(
-                    runner,
-                    config=config,
-                    title=_followup_issue_title(proposed),
-                    body=_followup_issue_body(
+                title_for_group = _followup_issue_title(proposed)
+                body_for_group = TrustedBody.canonical(
+                    _followup_issue_body(
                         source_context.source_number,
                         group,
                         source_context=source_context,
                         possible_duplicate=body_reason,
                     ),
+                    expected_tokens=(FOLLOWUP_IDENTITY_TOKEN,),
                 )
+            raw_url = create_issue(
+                runner, config=config, title=title_for_group, body=body_for_group
+            )
         except QuotaResetExceededError:
             raise
-        except Exception:
-            # A create-then-interruption window is recoverable when GitHub has
-            # indexed the tracker.  Rediscover that exact group before allowing
-            # the orchestration failure to escape.
-            recovered = _search_followup_trackers(
-                runner,
-                config=config,
-                source_context=source_context,
-                followups=(proposed,),
+        except (GitHubAmbiguousWriteError, GitHubTransientExhaustedError):
+            # create_issue already ran the strict recovery and could not
+            # prove the issue absent (or exhausted its budget); nothing may
+            # override that fail-closed outcome.
+            raise
+        except Exception as create_error:
+            # A create-then-interruption window is recoverable only through
+            # the strict creator-id lookup: authenticated creator, exact
+            # title, exact stored body and creation identity, unique match.
+            # Search results are never consulted after a failed create.
+            window_start = getattr(create_error, "window_start", None) or captured_window_start
+            recovered_url = None
+            if (
+                title_for_group is not None
+                and body_for_group is not None
+                and not config.dry_run
+            ):
+                recovered_url = recover_created_issue(
+                    runner,
+                    config=config,
+                    title=title_for_group,
+                    body=body_for_group,
+                    window_start=window_start,
+                )
+            recovered_number, recovered_issue_url = _validated_created_issue_url(
+                recovered_url, repo=source_context.repo
             )
-            recovered_match = next(
-                (
-                    candidate
-                    for candidate in recovered
-                    if _exact_existing_match(proposed, candidate)
-                    and _validated_issue_number(candidate, repo=source_context.repo) is not None
-                ),
-                None,
-            )
-            if recovered_match is not None:
-                recovered_number = _validated_issue_number(recovered_match, repo=source_context.repo)
-                assert recovered_number is not None
-                if _try_revalidate_open_issue(
-                    runner, config=config, issue_number=recovered_number, cache=revalidated
-                ):
-                    publications.append(
-                        FollowupPublication(
-                            group=group,
-                            status="reused",
-                            issue_number=recovered_number,
-                            issue_url=_issue_url(source_context.repo, recovered_number),
-                            reason="Recovered an issue created before the publication interruption.",
-                        )
+            if recovered_number is not None and _try_revalidate_open_issue(
+                runner, config=config, issue_number=recovered_number, cache=revalidated
+            ):
+                publications.append(
+                    FollowupPublication(
+                        group=group,
+                        status="reused",
+                        issue_number=recovered_number,
+                        issue_url=recovered_issue_url,
+                        reason="Recovered an issue created before the publication interruption.",
                     )
-                    continue
+                )
+                continue
             raise
         created_count += 1
         created_number, created_url = _validated_created_issue_url(raw_url, repo=source_context.repo)

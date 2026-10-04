@@ -829,3 +829,397 @@ def test_isolated_config_does_not_inherit_plan_reset_stall_streak(tmp_path):
         import shutil
 
         shutil.rmtree(isolated_dir, ignore_errors=True)
+
+
+# --- #510 stage 3: creation identity and ambiguous issue-create recovery ----------
+
+import datetime as _dt
+import re as _re
+from pathlib import Path as _Path
+
+import coding_review_agent_loop.followups as followups_module
+import coding_review_agent_loop.github as github_module
+from coding_review_agent_loop import github_retry as _github_retry
+from coding_review_agent_loop.followups import (
+    FOLLOWUP_IDENTITY_TOKEN,
+    GroupedApprovedFollowup,
+    PlanApprovedFollowupSource,
+    PlanGroupedApprovedFollowup,
+    _plan_followup_issue_body,
+)
+from coding_review_agent_loop.github import create_issue, recover_created_issue
+from coding_review_agent_loop.github_retry import (
+    GitHubAmbiguousWriteError,
+    GitHubTransientExhaustedError,
+)
+from coding_review_agent_loop.protocol_markers import TrustedBody
+from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+_ACTOR = ("agent-bot", 11)
+_OTHER = ("someone", 22)
+_IDENTITY_RE = _re.compile(r"<!-- AGENT_FOLLOWUP_CREATION_IDENTITY: [0-9a-f]{64} -->")
+
+
+def _now_iso(delta: float = 0.0) -> str:
+    moment = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=delta)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class FakeIssueHub:
+    """Stateful issue surface with scripted ``gh issue create`` outcomes.
+
+    ``script`` entries: ``ok``; ``fail`` (502, nothing stored); ``accepted``
+    (issue stored, client sees a 502); ``fail422`` (permanent validation error).
+    """
+
+    def __init__(self, script=()):
+        self.script = list(script)
+        self.issues: list[dict] = []
+        self.next_number = 100
+        self.creates: list[list[str]] = []
+        self.listing_pages: list[int] = []
+        self.search_calls = 0
+        self.fail_page: int | None = None
+        self.malformed_page: int | None = None
+        self.body_paths: list[str] = []
+        self.dry_run = False
+
+    def add(self, title, body, *, author=_ACTOR, pull_request=False, created=None):
+        self.next_number += 1
+        issue = {
+            "number": self.next_number,
+            "title": title,
+            "body": body,
+            "user": {"login": author[0], "id": author[1]},
+            "created_at": created or _now_iso(),
+            "html_url": f"https://github.com/OWNER/REPO/issues/{self.next_number}",
+        }
+        if pull_request:
+            issue["pull_request"] = {"url": "x"}
+        self.issues.append(issue)
+        return issue
+
+    @staticmethod
+    def _res(rc, out="", err=""):
+        return SimpleNamespace(returncode=rc, stdout=out, stderr=err, args=[], cwd=None)
+
+    def terminate_active_processes(self):  # pragma: no cover - interface parity
+        pass
+
+    def run(self, args, *, cwd, check=True, input_text=None, env=None):
+        cmd = [str(part) for part in args]
+        joined = " ".join(cmd)
+        if cmd[1:3] == ["api", "user"]:
+            return self._res(0, out=json.dumps({"login": _ACTOR[0], "id": _ACTOR[1]}))
+        if cmd[1:3] == ["issue", "create"]:
+            self.creates.append(cmd)
+            if "--body" in cmd:  # dry-run form
+                return self._res(0, out="")
+            path = cmd[cmd.index("--body-file") + 1]
+            self.body_paths.append(path)
+            title = cmd[cmd.index("--title") + 1]
+            action = self.script.pop(0) if self.script else "ok"
+            if action == "fail":
+                return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+            if action == "fail422":
+                return self._res(1, err="HTTP 422: Validation Failed")
+            issue = self.add(title, _Path(path).read_text(encoding="utf-8"))
+            if action == "accepted":
+                return self._res(1, err="GraphQL: We couldn't respond to your request in time. HTTP 504")
+            return self._res(0, out=issue["html_url"] + "\n")
+        match = _re.search(r"issues\?creator=([^&]+)&.*&page=(\d+)", joined)
+        if match:
+            page = int(match.group(2))
+            self.listing_pages.append(page)
+            if self.fail_page == page:
+                return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+            if self.malformed_page == page:
+                return self._res(0, out="{not json")
+            ordered = sorted(self.issues, key=lambda item: item["number"])
+            return self._res(0, out=json.dumps(ordered[(page - 1) * 100 : page * 100]))
+        if cmd[1:3] == ["issue", "list"]:
+            self.search_calls += 1
+            return self._res(0, out="[]")
+        match = _re.search(r"repos/OWNER/REPO/issues/(\d+)$", cmd[-1]) or _re.search(
+            r"repos/OWNER/REPO/issues/(\d+)", joined
+        )
+        if match and cmd[1] == "api":
+            return self._res(0, out=json.dumps({"number": int(match.group(1)), "state": "open", "is_pr": False, "url": "u"}))
+        return self._res(0, out="")
+
+
+@pytest.fixture
+def issue_env(monkeypatch):
+    monkeypatch.setattr(github_module, "log", lambda _config, _message: None)
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    sleeps: list[float] = []
+    monkeypatch.setattr(_github_retry, "_sleep", sleeps.append)
+    return sleeps
+
+
+def _followup_group(text="Bound the remaining tool-created bodies."):
+    return GroupedApprovedFollowup(
+        text=text, items=(ApprovedFollowup(reviewer="codex", text=text),)
+    )
+
+
+def _canonical_followup_body(text="Bound the remaining tool-created bodies."):
+    return TrustedBody.canonical(
+        _followup_issue_body(488, _followup_group(text), source_context=_source(parent=1)),
+        expected_tokens=(FOLLOWUP_IDENTITY_TOKEN,),
+    )
+
+
+def _plan_group(note="note"):
+    return PlanGroupedApprovedFollowup(
+        text="Split the transport rewrite into its own stage.",
+        items=(ApprovedFollowup(reviewer="codex", text=note),),
+        sources=(PlanApprovedFollowupSource(item_id="item-1", reviewer="codex", source_round=1, text=note),),
+    )
+
+
+def test_followup_identity_record_leads_pr_and_plan_bodies_and_survives_bounding():
+    huge = "\n".join(f"Reviewer note line {i}: " + "detail " * 30 for i in range(3_000))
+    pr_body = _followup_issue_body(
+        488,
+        GroupedApprovedFollowup(text="Bound bodies.", items=(ApprovedFollowup(reviewer="codex", text=huge),)),
+        source_context=_source(parent=1),
+    )
+    plan_body = _plan_followup_issue_body(
+        issue_number=841, plan_hash="abc123", plan_subject="subject", followup=_plan_group(huge),
+        source_context=_source(parent=1),
+    )
+    for body in (pr_body, plan_body):
+        assert len(body) <= MAX_GITHUB_BODY_CHARS
+        assert _IDENTITY_RE.match(body.splitlines()[0])
+        TrustedBody.canonical(body, expected_tokens=(FOLLOWUP_IDENTITY_TOKEN,))
+    # The identity is stable for the same source and text, and distinct otherwise.
+    again = _followup_issue_body(
+        488,
+        GroupedApprovedFollowup(text="Bound bodies.", items=(ApprovedFollowup(reviewer="x", text="other"),)),
+        source_context=_source(parent=1),
+    )
+    assert again.splitlines()[0] == pr_body.splitlines()[0]
+    other = _followup_issue_body(489, _followup_group("Bound bodies."), source_context=_source(parent=1))
+    assert other.splitlines()[0] != pr_body.splitlines()[0]
+    assert plan_body.splitlines()[0] != pr_body.splitlines()[0]
+
+
+def test_accepted_but_failed_create_returns_existing_issue_and_creates_none(tmp_path, issue_env):
+    hub = FakeIssueHub(["accepted"])
+    body = _canonical_followup_body()
+    url = create_issue(hub, config=make_config(tmp_path), title="T", body=body)
+    assert url == "https://github.com/OWNER/REPO/issues/101"
+    assert len(hub.creates) == 1 and len(hub.issues) == 1
+    assert issue_env == []
+    assert not any(_Path(p).exists() for p in hub.body_paths)
+
+
+def test_transient_create_not_accepted_is_replayed_with_one_body_file(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    url = create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
+    assert url and len(hub.creates) == 2 and len(hub.issues) == 1
+    assert len(set(hub.body_paths)) == 1
+    assert len(issue_env) == 1
+    assert not _Path(hub.body_paths[0]).exists()
+
+
+def test_exhausted_create_keeps_history_and_cleans_up(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail", "fail", "fail"])
+    with pytest.raises(GitHubTransientExhaustedError) as excinfo:
+        create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
+    assert len(hub.creates) == 3 and hub.issues == []
+    assert "attempt 3" in str(excinfo.value)
+    assert excinfo.value.window_start is not None
+    assert not _Path(hub.body_paths[0]).exists()
+
+
+def test_permanent_create_failure_is_not_retried(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail422"])
+    with pytest.raises(AgentLoopError, match="Command failed with exit"):
+        create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
+    assert len(hub.creates) == 1 and issue_env == []
+
+
+def test_same_identity_different_body_is_never_adopted(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    body = _canonical_followup_body()
+    hub.add("T", str(body) + "\nedited")  # same actor, title and identity; different stored body
+    with pytest.raises(GitHubAmbiguousWriteError, match="differs"):
+        create_issue(hub, config=make_config(tmp_path), title="T", body=body)
+    assert len(hub.creates) == 1
+
+
+def test_same_identity_different_title_is_never_adopted(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    body = _canonical_followup_body()
+    hub.add("Other title", str(body))
+    with pytest.raises(GitHubAmbiguousWriteError):
+        create_issue(hub, config=make_config(tmp_path), title="T", body=body)
+    assert len(hub.creates) == 1
+
+
+def test_same_title_different_identity_is_not_adopted_and_create_replays(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    hub.add("T", str(_canonical_followup_body("A completely different follow-up.")))
+    url = create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
+    assert url == "https://github.com/OWNER/REPO/issues/102"
+    assert len(hub.creates) == 2
+
+
+def test_pull_request_object_and_foreign_creator_are_not_adopted(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    body = _canonical_followup_body()
+    hub.add("T", str(body), pull_request=True)
+    hub.add("T", str(body), author=_OTHER)
+    url = create_issue(hub, config=make_config(tmp_path), title="T", body=body)
+    assert url == "https://github.com/OWNER/REPO/issues/103"
+    assert len(hub.creates) == 2
+
+
+def test_prewindow_identity_match_is_not_adopted(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    body = _canonical_followup_body()
+    hub.add("T", str(body), created=_now_iso(-3600))
+    create_issue(hub, config=make_config(tmp_path), title="T", body=body)
+    assert len(hub.creates) == 2
+
+
+def test_duplicate_identities_fail_closed(tmp_path, issue_env):
+    hub = FakeIssueHub(["accepted"])
+    body = _canonical_followup_body()
+    hub.add("T", str(body))
+    with pytest.raises(GitHubAmbiguousWriteError, match="same creation identity"):
+        create_issue(hub, config=make_config(tmp_path), title="T", body=body)
+    assert len(hub.creates) == 1
+
+
+def test_later_page_match_is_adopted(tmp_path, issue_env):
+    hub = FakeIssueHub(["accepted"])
+    body = _canonical_followup_body()
+    for index in range(100):
+        hub.add(f"filler {index}", "filler")
+    # The accepted create is issue #201 and lands on page 2.
+    url = create_issue(hub, config=make_config(tmp_path), title="T", body=body)
+    assert url.endswith("/201")
+    assert hub.listing_pages == [1, 2]
+    assert len(hub.creates) == 1
+
+
+@pytest.mark.parametrize("defect", ["fail_page", "malformed_page"])
+def test_failed_or_malformed_later_page_fails_closed(tmp_path, issue_env, defect):
+    hub = FakeIssueHub(["accepted"])
+    for index in range(100):
+        hub.add(f"filler {index}", "filler")
+    setattr(hub, defect, 2)
+    with pytest.raises(GitHubAmbiguousWriteError, match="incomplete"):
+        create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
+    assert len(hub.creates) == 1
+
+
+def test_phase_and_split_identity_records_are_recovered_the_same_way(tmp_path, issue_env):
+    from coding_review_agent_loop.github import creation_identity_records
+
+    split = TrustedBody.canonical(
+        "child\n<!-- AGENT_SPLIT_CHILD: parent=5 key=" + "a" * 64 + " -->",
+        expected_tokens=("AGENT_SPLIT_CHILD",),
+    )
+    assert len(creation_identity_records(str(split))) == 1
+    hub = FakeIssueHub(["accepted"])
+    url = create_issue(hub, config=make_config(tmp_path), title="child", body=split)
+    assert url and len(hub.creates) == 1 and len(hub.issues) == 1
+
+
+def test_transient_create_without_identity_is_not_replayed(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    with pytest.raises(GitHubAmbiguousWriteError, match="no creation identity"):
+        create_issue(hub, config=make_config(tmp_path), title="T", body="plain body")
+    assert len(hub.creates) == 1
+
+
+def test_dry_run_create_bypasses_reconciliation(tmp_path, issue_env):
+    hub = FakeIssueHub()
+    create_issue(hub, config=make_config(tmp_path, dry_run=True), title="T", body=_canonical_followup_body())
+    assert len(hub.creates) == 1 and "--body" in hub.creates[0]
+    assert hub.listing_pages == []
+
+
+def _publish_one(hub, tmp_path, monkeypatch, create_stub):
+    monkeypatch.setattr(followups_module, "create_issue", create_stub)
+    group = _followup_group()
+    return followups_module._publish_issue_followup_groups(
+        hub,
+        config=make_config(tmp_path, approved_followups="issue", semantic_followup_dedupe=False),
+        groups=[group],
+        source_context=_source(parent=1),
+        heading="Created:",
+        deduplicated_count=0,
+        skipped_by_cap=0,
+    )
+
+
+def _failing_create(hub, *, author=_ACTOR, store=True, error=RuntimeError("interrupted")):
+    def stub(runner, *, config, title, body):
+        if store:
+            hub.add(title, str(body), author=author)
+        hub.search_before_failure = hub.search_calls
+        raise error
+
+    return stub
+
+
+def test_followup_fallback_adopts_unique_actor_created_exact_match(tmp_path, issue_env, monkeypatch):
+    hub = FakeIssueHub()
+    body, urls, publications = _publish_one(hub, tmp_path, monkeypatch, _failing_create(hub))
+    assert urls == ("https://github.com/OWNER/REPO/issues/101",)
+    assert publications[0].status == "reused"
+    # Search results are never consulted after the failed create.
+    assert hub.search_calls == hub.search_before_failure
+
+
+def test_followup_fallback_rejects_foreign_created_identity_copy(tmp_path, issue_env, monkeypatch):
+    hub = FakeIssueHub()
+    with pytest.raises(RuntimeError, match="interrupted"):
+        _publish_one(hub, tmp_path, monkeypatch, _failing_create(hub, author=_OTHER))
+    assert hub.search_calls == hub.search_before_failure
+
+
+def test_followup_fallback_zero_matches_reraises_original(tmp_path, issue_env, monkeypatch):
+    hub = FakeIssueHub()
+    with pytest.raises(RuntimeError, match="interrupted"):
+        _publish_one(hub, tmp_path, monkeypatch, _failing_create(hub, store=False))
+
+
+def test_followup_fallback_duplicates_fail_closed(tmp_path, issue_env, monkeypatch):
+    hub = FakeIssueHub()
+    group_body = str(_canonical_followup_body())
+    hub.add("preexisting", group_body)
+
+    def stub(runner, *, config, title, body):
+        hub.add(title, str(body))
+        raise RuntimeError("interrupted")
+
+    with pytest.raises(GitHubAmbiguousWriteError):
+        _publish_one(hub, tmp_path, monkeypatch, stub)
+
+
+def test_followup_fallback_failed_listing_after_plain_error_fails_closed(tmp_path, issue_env, monkeypatch):
+    hub = FakeIssueHub()
+    hub.fail_page = 1
+    with pytest.raises(GitHubAmbiguousWriteError):
+        _publish_one(hub, tmp_path, monkeypatch, _failing_create(hub, store=False))
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        GitHubAmbiguousWriteError("ambiguous"),
+        GitHubTransientExhaustedError("exhausted", ()),
+    ],
+)
+def test_followup_fallback_never_overrides_ambiguity_or_exhaustion(tmp_path, issue_env, monkeypatch, error):
+    hub = FakeIssueHub()
+    stub = _failing_create(hub, error=error)  # an identical actor-created issue exists
+    with pytest.raises(type(error)):
+        _publish_one(hub, tmp_path, monkeypatch, stub)
+    assert hub.listing_pages == []

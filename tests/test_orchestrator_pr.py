@@ -7424,6 +7424,18 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert len(runner.comments) == 3
+    # Every follow-up leads with its stable creation-identity record (#510).
+    import re as _re_identity
+
+    identity_line = _re_identity.compile(
+        r"<!-- AGENT_FOLLOWUP_CREATION_IDENTITY: [0-9a-f]{64} -->\n"
+    )
+    for issue in runner.issues:
+        assert identity_line.match(issue["body"])
+    runner.issues = [
+        {**issue, "body": identity_line.sub("", issue["body"], count=1)}
+        for issue in runner.issues
+    ]
     assert runner.issues == [
         {
             "title": "Follow up future review note: Add cleanup docs.",

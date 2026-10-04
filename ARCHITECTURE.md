@@ -1027,6 +1027,19 @@ the exact posted carrier and checking the producing login and ID, fetching the
 comment when the write response carries no envelope; a rejected read-back takes
 that seam's existing failure path rather than being accepted on an exit status.
 
+Tool-owned GitHub writes never replay blindly after a transient (5xx or
+transport) failure. Bounded retry (three attempts, backoff with jitter) applies
+to read-only `gh` calls directly; every write — comments, issue creation, label
+add and remove, ready transitions — first reconciles complete live state
+(baseline-aware exact-body or identity matching by the authenticated actor,
+event-history ownership, draft state and exact head) and fails closed with the
+attempt history when that state is unreadable or ambiguous. A merge is never
+replayed in-process: only an already-merged exact head counts as recovered, and
+any other state ends the run so a rerun re-executes every merge gate.
+Ambiguous-write recovery is distinct from cross-invocation spool replay, which
+republishes a preserved reviewer acquisition from a frozen carrier. See
+`docs/local_agent_loop.md` ("Transient GitHub failures").
+
 Some hosts append a fixed footer to every posted comment (Claude Code cloud
 sessions; #1043). The one byte-exact suffix `KNOWN_HOST_COMMENT_FOOTER` in
 `protocol_markers.py` is tolerated once and nowhere else:

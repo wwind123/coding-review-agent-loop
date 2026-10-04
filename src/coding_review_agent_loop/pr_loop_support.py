@@ -45,6 +45,7 @@ from .github import (
     PullRequestChecks,
     PullRequestMergeability,
     PullRequestReviewContext,
+    reconciled_pr_ready,
     board_protection_is_reliable,
     protection_awaits_readiness,
     get_pr_head_sha,
@@ -560,9 +561,9 @@ def _finalize_ordinary_recovery_merge(
         raise AgentLoopError(
             f"PR #{pr_number} ordinary recovery provenance changed before readiness; no merge attempted."
         )
-    ready = runner.run(
-        [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
-        cwd=active_workdir(config), check=False,
+    ready = reconciled_pr_ready(
+        runner, config=config, pr_number=pr_number,
+        expected_head_sha=capability.expected_head_sha,
     )
     if ready.returncode != 0:
         raise AgentLoopError(f"Unable to mark recovered PR #{pr_number} ready for review.")

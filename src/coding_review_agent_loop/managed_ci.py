@@ -10,7 +10,7 @@ import secrets
 import shlex
 import threading
 import time
-from collections.abc import Collection, Iterable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from dataclasses import dataclass, replace
@@ -28,6 +28,8 @@ from .config import AgentLoopConfig
 from .errors import AgentLoopError
 from .github import (
     PullRequestMergeability,
+    reconciled_pr_ready,
+    resolve_authenticated_github_actor,
     PullRequestMetadata,
     board_protection_is_reliable,
     get_pr_checks,
@@ -42,8 +44,14 @@ from .github import (
     WrittenProtocolComment,
 )
 from .logging import log
-from .github_retry import describe_gh_failure, run_gh_read
-from .runner import Runner
+from . import github_retry
+from .github_retry import (
+    DEFAULT_POLICY,
+    classify_gh_failure,
+    describe_gh_failure,
+    run_gh_read,
+)
+from .runner import CommandResult, Runner
 from .workdirs import active_workdir, github_api_cwd
 from .protocol_markers import (
     MARKER_BY_TOKEN,
@@ -922,19 +930,9 @@ def activate_managed_ci(
             config=config,
             head_sha=metadata.head_sha,
         )
-        apply_result = runner.run(
-            [
-                config.gh_cmd,
-                "api",
-                "--method",
-                "POST",
-                f"repos/{config.repo}/issues/{pr_number}/labels",
-                "-f",
-                f"labels[]={MANAGED_LABEL}",
-            ],
-            cwd=active_workdir(config),
-            check=False,
-        )
+        apply_result = _label_add(
+            runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL
+        ).result
         if apply_result.returncode != 0:
             raise AgentLoopError(f"Unable to apply `{MANAGED_LABEL}` to PR #{pr_number}.")
         try:
@@ -946,17 +944,9 @@ def activate_managed_ci(
                 prior_run_ids=prior_workflow_run_ids,
             )
         except AgentLoopError as exc:
-            remove_result = runner.run(
-                [
-                    config.gh_cmd,
-                    "api",
-                    "--method",
-                    "DELETE",
-                    f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
-                ],
-                cwd=active_workdir(config),
-                check=False,
-            )
+            remove_result = _label_remove(
+                runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL
+            ).result
             if remove_result.returncode != 0:
                 raise AgentLoopError(
                     f"{exc} Cleanup also failed: `{MANAGED_LABEL}` remains applied and "
@@ -4404,9 +4394,8 @@ def _evaluate_ready_restoration(
             None,
             False,
         )
-    ready = runner.run(
-        [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
-        cwd=active_workdir(config), check=False,
+    ready = reconciled_pr_ready(
+        runner, config=config, pr_number=pr_number, expected_head_sha=entry.head_sha,
     )
     after = _read_failed_activation_state(runner, config, pr_number)
     if ready.returncode != 0:
@@ -4590,13 +4579,9 @@ def _restore_ordinary_ci_after_v2_fallback(
         return
     if report_context is not None:
         report_context.label_release_attempted = True
-    result = runner.run(
-        [
-            config.gh_cmd, "api", "--method", "DELETE",
-            f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
-        ],
-        cwd=active_workdir(config), check=False,
-    )
+    result = _label_remove(
+        runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL,
+    ).result
     if result.returncode != 0:
         message = (
             f"Managed-CI v2 could not activate ({reason}); the `{MANAGED_LABEL}` label DELETE "
@@ -4687,13 +4672,10 @@ def _release_for_ordinary_recovery(
             )
     if report_context is not None:
         report_context.label_release_attempted = True
-    result = runner.run(
-        [
-            config.gh_cmd, "api", "--method", "DELETE",
-            f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
-        ],
-        cwd=active_workdir(config), check=False,
-    )
+    result = _label_remove(
+        runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL,
+        owned_event_id=active_event[0] if active_event is not None else None,
+    ).result
     if result.returncode != 0:
         message = f"Managed-CI v2 could not activate ({reason}); the label DELETE was not confirmed."
         if report_context is None:
@@ -5789,9 +5771,9 @@ def _activate_v2_managed_ci(
                     "re-entry state. It was left unchanged; rerun with explicit `--managed-ci`: "
                     f"{command}"
                 )
-            undo = runner.run(
-                [config.gh_cmd, "pr", "ready", "--undo", str(pr_number), "--repo", config.repo],
-                cwd=active_workdir(config), check=False,
+            undo = reconciled_pr_ready(
+                runner, config=config, pr_number=pr_number,
+                expected_head_sha=metadata.head_sha, undo=True,
             )
             # A zero exit is GitHub's acknowledgement of this invocation's
             # conversion; a nonzero exit is ambiguous (the PR may be draft by
@@ -5883,13 +5865,9 @@ def _activate_v2_managed_ci(
             if not ensure_managed_label(runner, config=config):
                 raise AgentLoopError(f"Unable to create the `{MANAGED_LABEL}` label.")
             context.label_post_attempted = True
-            applied_label = runner.run(
-                [
-                    config.gh_cmd, "api", "--method", "POST",
-                    f"repos/{config.repo}/issues/{pr_number}/labels",
-                    "-f", f"labels[]={MANAGED_LABEL}",
-                ], cwd=active_workdir(config), check=False,
-            )
+            applied_label = _label_add(
+                runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL
+            ).result
             if applied_label.returncode != 0:
                 # GitHub may still have applied the label; this is an
                 # ambiguous request, never evidence of label ownership.
@@ -6191,6 +6169,57 @@ def _normalized_comment_body(
     return body
 
 
+@dataclass(frozen=True)
+class LabelEvent:
+    event_id: int
+    kind: str
+    actor_login: str
+    actor_id: int
+
+
+@dataclass(frozen=True)
+class CompleteLabelHistory:
+    """Complete event history of one label: its latest event, or ``None``."""
+
+    latest: LabelEvent | None
+
+
+@dataclass(frozen=True)
+class UnknownLabelHistory:
+    reason: str
+
+
+def label_event_history(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, label_name: str
+) -> CompleteLabelHistory | UnknownLabelHistory:
+    """Read one label's latest labeled/unlabeled event completely, or ``Unknown``.
+
+    Missing actor IDs, malformed pagination and a malformed latest event are
+    unreadable, never an empty history.
+    """
+    events, reason = _api_list_detailed(
+        runner, config, f"repos/{config.repo}/issues/{pr_number}/events?per_page=100"
+    )
+    if events is None:
+        return UnknownLabelHistory(reason or "event list unreadable")
+    latest: dict[str, object] | None = None
+    for event in events:
+        label = event.get("label") if isinstance(event.get("label"), dict) else {}
+        if label.get("name") == label_name and event.get("event") in {"labeled", "unlabeled"}:
+            latest = event
+    if latest is None:
+        return CompleteLabelHistory(None)
+    actor = latest.get("actor") if isinstance(latest.get("actor"), dict) else {}
+    event_id = latest.get("id")
+    login, actor_id = actor.get("login"), actor.get("id")
+    if (
+        isinstance(event_id, bool) or not isinstance(event_id, int)
+        or not isinstance(login, str) or isinstance(actor_id, bool) or not isinstance(actor_id, int)
+    ):
+        return UnknownLabelHistory("latest label event lacked an id or actor")
+    return CompleteLabelHistory(LabelEvent(event_id, str(latest["event"]), login, actor_id))
+
+
 def _active_managed_label_event(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int
 ) -> tuple[int, str, int] | None:
@@ -6199,24 +6228,142 @@ def _active_managed_label_event(
     Timeline provenance is an enforcement input for adoption.  Treat missing
     actor IDs, malformed pagination, and an intervening unlabel as untrusted.
     """
-    events = _api_list(
-        runner, config, f"repos/{config.repo}/issues/{pr_number}/events?per_page=100"
+    history = label_event_history(
+        runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL
     )
-    if events is None:
+    if not isinstance(history, CompleteLabelHistory):
         return None
-    latest: dict[str, object] | None = None
-    for event in events:
-        label = event.get("label") if isinstance(event.get("label"), dict) else {}
-        if label.get("name") == MANAGED_LABEL and event.get("event") in {"labeled", "unlabeled"}:
-            latest = event
-    if latest is None or latest.get("event") != "labeled":
+    latest = history.latest
+    if latest is None or latest.kind != "labeled":
         return None
-    actor = latest.get("actor") if isinstance(latest.get("actor"), dict) else {}
-    event_id = latest.get("id")
-    login, actor_id = actor.get("login"), actor.get("id")
-    if not isinstance(event_id, int) or not isinstance(login, str) or not isinstance(actor_id, int):
-        return None
-    return event_id, login, actor_id
+    return latest.event_id, latest.actor_login, latest.actor_id
+
+
+@dataclass(frozen=True)
+class ReconciledLabelWrite:
+    """Outcome of a reconciled label write.
+
+    ``result`` keeps the callers' ``returncode`` contract: success (possibly
+    synthesized after the history proved the write landed) or the failed result
+    that sends the caller down its existing refusal path.  ``event_id`` is the
+    adopted ``labeled`` event id when a transient failure was proven accepted.
+    """
+
+    result: CommandResult
+    event_id: int | None = None
+    outcome: str = "direct"
+
+
+def reconciled_label_write(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    label_name: str,
+    op: str,
+    write: Callable[[], CommandResult],
+    owned_event_id: int | None = None,
+) -> ReconciledLabelWrite:
+    """Add (``op='add'``) or remove (``op='remove'``) one label with reconciliation (#510).
+
+    After a transient failure that exact label's event history is re-read before
+    any replay.  Add: a newer ``labeled`` event by the authenticated actor id is
+    success; a newer foreign or ``unlabeled`` event, or unreadable history,
+    fails closed; no newer event with the label absent replays.  Remove: a newer
+    ``unlabeled`` by the actor is success; the label still present with the owned
+    ``labeled`` event id replays; a replacement ``labeled`` event (same actor or
+    foreign), a foreign unlabel, or unreadable history is never replayed against.
+    A failed baseline read allows a single attempt only.  Permanent failures and
+    dry-run are returned untouched.
+    """
+    if config.dry_run:
+        return ReconciledLabelWrite(write())
+    baseline: CompleteLabelHistory | UnknownLabelHistory | None = None
+    if op == "add":
+        baseline = label_event_history(
+            runner, config=config, pr_number=pr_number, label_name=label_name
+        )
+    active = DEFAULT_POLICY
+    result: CommandResult | None = None
+    for number in range(1, active.attempts + 1):
+        result = write()
+        if result.returncode == 0 or classify_gh_failure(result) == "permanent":
+            return ReconciledLabelWrite(result)
+        if op == "add" and not isinstance(baseline, CompleteLabelHistory):
+            log(config, f"PR #{pr_number}: `{label_name}` add is ambiguous and had no baseline; not replayed")
+            return ReconciledLabelWrite(result, outcome="unknown")
+        history = label_event_history(
+            runner, config=config, pr_number=pr_number, label_name=label_name
+        )
+        if not isinstance(history, CompleteLabelHistory):
+            log(config, f"PR #{pr_number}: `{label_name}` {op} is ambiguous and its history is unreadable; not replayed")
+            return ReconciledLabelWrite(result, outcome="unknown")
+        try:
+            actor_id = resolve_authenticated_github_actor(runner, config=config)[1]
+        except Exception:
+            return ReconciledLabelWrite(result, outcome="unknown")
+        latest = history.latest
+        if op == "add":
+            assert isinstance(baseline, CompleteLabelHistory)
+            before = baseline.latest.event_id if baseline.latest is not None else 0
+            if latest is not None and latest.event_id > before:
+                if latest.kind == "labeled" and latest.actor_id == actor_id:
+                    log(config, f"PR #{pr_number}: `{label_name}` was applied despite a transient error (event {latest.event_id})")
+                    return ReconciledLabelWrite(
+                        github_retry.as_success(result), latest.event_id, "adopted"
+                    )
+                return ReconciledLabelWrite(result, outcome="foreign")
+            if latest is not None and latest.kind == "labeled":
+                # Present with no newer event: not the state this add expects.
+                return ReconciledLabelWrite(result, outcome="unknown")
+        else:
+            if latest is None:
+                return ReconciledLabelWrite(result, outcome="unknown")
+            if latest.kind == "unlabeled":
+                if latest.actor_id == actor_id:
+                    log(config, f"PR #{pr_number}: `{label_name}` was removed despite a transient error")
+                    return ReconciledLabelWrite(github_retry.as_success(result), outcome="adopted")
+                return ReconciledLabelWrite(result, outcome="foreign")
+            if owned_event_id is not None and latest.event_id != owned_event_id:
+                log(config, f"PR #{pr_number}: `{label_name}` was re-applied by a different event; not removed")
+                return ReconciledLabelWrite(result, outcome="replacement")
+        if number < active.attempts:
+            github_retry.sleep_before_retry(active, number)
+    assert result is not None
+    return ReconciledLabelWrite(result, outcome="exhausted")
+
+
+def _label_add(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, label_name: str
+) -> ReconciledLabelWrite:
+    command = [
+        config.gh_cmd, "api", "--method", "POST",
+        f"repos/{config.repo}/issues/{pr_number}/labels", "-f", f"labels[]={label_name}",
+    ]
+    return reconciled_label_write(
+        runner, config=config, pr_number=pr_number, label_name=label_name, op="add",
+        write=lambda: runner.run(command, cwd=active_workdir(config), check=False),
+    )
+
+
+def _label_remove(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    label_name: str,
+    owned_event_id: int | None = None,
+    cwd: Path | None = None,
+) -> ReconciledLabelWrite:
+    command = [
+        config.gh_cmd, "api", "--method", "DELETE",
+        f"repos/{config.repo}/issues/{pr_number}/labels/{label_name}",
+    ]
+    return reconciled_label_write(
+        runner, config=config, pr_number=pr_number, label_name=label_name, op="remove",
+        owned_event_id=owned_event_id,
+        write=lambda: runner.run(command, cwd=cwd or active_workdir(config), check=False),
+    )
 
 
 def _has_exact_head_protection(runner: Runner, *, config: AgentLoopConfig, base_ref: str) -> bool:
@@ -6256,7 +6403,16 @@ def ensure_managed_label(runner: Runner, *, config: AgentLoopConfig) -> bool:
             "-f", "description=Suppress intermediate CI; agent-loop dispatches exact-head final CI",
         ], cwd=active_workdir(config), check=False,
     )
-    return created.returncode == 0
+    if created.returncode == 0:
+        return True
+    if classify_gh_failure(created) != "transient":
+        return False
+    # A transient failure may have created the label: re-read its definition.
+    reread = runner.run(
+        [config.gh_cmd, "api", f"repos/{config.repo}/labels/{MANAGED_LABEL}"],
+        cwd=active_workdir(config), check=False,
+    )
+    return reread.returncode == 0
 
 
 def _adoption_identity(
@@ -6338,10 +6494,9 @@ def _activate_v2_existing_pr_adoption(
     if MANAGED_LABEL not in labels:
         if not ensure_managed_label(runner, config=config):
             return None
-        created = runner.run(
-            [config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/issues/{pr_number}/labels",
-             "-f", f"labels[]={MANAGED_LABEL}"], cwd=active_workdir(config), check=False,
-        )
+        created = _label_add(
+            runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL
+        ).result
         if created.returncode != 0:
             return None
         applied = True
@@ -6430,10 +6585,10 @@ def release_adopted_managed_ci(
         event = _active_managed_label_event(runner, config=config, pr_number=pr_number)
         if event is None or event[0] != contract.active_label_event_id:
             return True
-    result = runner.run(
-        [config.gh_cmd, "api", "--method", "DELETE", f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}"],
-        cwd=active_workdir(config), check=False,
-    )
+    result = _label_remove(
+        runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL,
+        owned_event_id=contract.active_label_event_id,
+    ).result
     return result.returncode == 0
 
 
@@ -6481,12 +6636,9 @@ def _delete_managed_label(
     Only gh's own unambiguous status diagnostic proves a 404, so incidental
     or conflicting ``HTTP 404`` text never counts as absence.
     """
-    result = runner.run(
-        [
-            config.gh_cmd, "api", "--method", "DELETE",
-            f"repos/{config.repo}/issues/{pr_number}/labels/{MANAGED_LABEL}",
-        ], cwd=cwd, check=False,
-    )
+    result = _label_remove(
+        runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL, cwd=cwd,
+    ).result
     if result.returncode == 0:
         return True
     return _http_status(result) == 404
@@ -6654,12 +6806,9 @@ def _publish_manual_v2_qualification(
         if isinstance(item, dict) and isinstance(item.get("name"), str)
     }
     if QUALIFIED_LABEL in labels:
-        removed = runner.run(
-            [
-                config.gh_cmd, "api", "--method", "DELETE",
-                f"repos/{config.repo}/issues/{pr_number}/labels/{QUALIFIED_LABEL}",
-            ], cwd=active_workdir(config), check=False,
-        )
+        removed = _label_remove(
+            runner, config=config, pr_number=pr_number, label_name=QUALIFIED_LABEL
+        ).result
         if removed.returncode != 0:
             raise AgentLoopError(f"Unable to clear stale `{QUALIFIED_LABEL}` from PR #{pr_number}.")
 
@@ -6682,9 +6831,8 @@ def _publish_manual_v2_qualification(
 
     changed = not_published
     if not contract.adopted_existing_pr:
-        ready = runner.run(
-            [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
-            cwd=active_workdir(config), check=False,
+        ready = reconciled_pr_ready(
+            runner, config=config, pr_number=pr_number, expected_head_sha=expected_head_sha,
         )
         if ready.returncode != 0:
             raise AgentLoopError(f"Unable to mark qualified PR #{pr_number} ready for manual review.")
@@ -8383,17 +8531,15 @@ def prepare_v2_merge(
     """Publish continuity before readying the PR, then re-check its exact head."""
     if contract.protocol_version != 2:
         return
-    labelled = runner.run(
-        [config.gh_cmd, "api", "--method", "POST", f"repos/{config.repo}/issues/{pr_number}/labels", "-f", f"labels[]={QUALIFIED_LABEL}"],
-        cwd=active_workdir(config), check=False,
-    )
+    labelled = _label_add(
+        runner, config=config, pr_number=pr_number, label_name=QUALIFIED_LABEL
+    ).result
     if labelled.returncode != 0:
         raise AgentLoopError(f"Unable to apply `{QUALIFIED_LABEL}` before readying PR #{pr_number}.")
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     if pr.get("draft") is True:
-        ready = runner.run(
-            [config.gh_cmd, "pr", "ready", str(pr_number), "--repo", config.repo],
-            cwd=active_workdir(config), check=False,
+        ready = reconciled_pr_ready(
+            runner, config=config, pr_number=pr_number, expected_head_sha=expected_head_sha,
         )
         if ready.returncode != 0:
             raise AgentLoopError(f"Unable to mark qualified PR #{pr_number} ready for review.")

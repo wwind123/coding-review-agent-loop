@@ -11611,7 +11611,8 @@ def test_m1067_foreign_label_event_preflight_refuses_restoration(tmp_path):
 
 def test_m1067_foreign_event_after_reentry_draft_vetoes_restoration(tmp_path):
     foreign = [label_event(login="someone", actor_id=9)]
-    runner = _m1067_ready_runner(events_script=[foreign, foreign])
+    # The first read is the label add's pre-write baseline (#510).
+    runner = _m1067_ready_runner(events_script=[[], foreign, foreign])
 
     _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
 
@@ -11698,7 +11699,8 @@ def test_m1067_label_post_failure_after_draft_restores_readiness(tmp_path):
     assert "the label request was not confirmed" in text
     assert f"its `{MANAGED_LABEL}` label request was not confirmed" in text
     assert "Restored to ready/unlabeled as found" in text
-    assert len(_m1067_label_posts(runner)) == 1
+    # A transient 502 that history proves absent is replayed within the budget (#510).
+    assert len(_m1067_label_posts(runner)) == 3
     assert len(_m1067_ready_calls(runner)) == 1
 
 
@@ -12920,3 +12922,326 @@ def test_api_json_runs_from_a_directory_that_is_not_an_agent_checkout(tmp_path):
     assert cwd not in (
         config.claude_dir, config.codex_dir, config.gemini_dir, config.antigravity_dir
     )
+
+
+# --- #510 stage 3: label add/remove and ready reconciliation ----------------------
+
+import json as _json510
+from types import SimpleNamespace as _NS510
+
+import coding_review_agent_loop.github as _github510
+from coding_review_agent_loop.github import reconciled_pr_ready as _reconciled_ready
+from coding_review_agent_loop.managed_ci import (
+    CompleteLabelHistory as _Complete,
+    ManagedCiContract as _Contract510,
+    UnknownLabelHistory as _Unknown,
+    _label_add,
+    _label_remove,
+    label_event_history as _label_history,
+    release_adopted_managed_ci as _release510,
+)
+
+QUALIFIED_LABEL = managed_ci.QUALIFIED_LABEL
+_BOT = ("agent-bot", 11)
+_STRANGER = ("someone", 22)
+
+
+class _LabelHub:
+    """Label timeline + draft state with scripted write outcomes.
+
+    Script entries: ``ok``; ``fail`` (502, nothing applied); ``accepted``
+    (applied, client sees 502); ``fail422``.
+    """
+
+    def __init__(self, script=(), *, label=MANAGED_LABEL):
+        self.label = label
+        self.script = list(script)
+        self.events: list[dict] = []
+        self.next_event = 1000
+        self.posts = 0
+        self.deletes = 0
+        self.readies: list[list[str]] = []
+        self.draft = True
+        self.head = "a" * 40
+        self.events_unreadable = False
+        self.events_reads = 0
+        self.ready_script: list[str] = []
+        self.dry_run = False
+
+    def event(self, kind, actor=_BOT):
+        self.next_event += 1
+        record = {
+            "id": self.next_event,
+            "event": kind,
+            "label": {"name": self.label},
+            "actor": {"login": actor[0], "id": actor[1]},
+        }
+        self.events.append(record)
+        return record
+
+    @staticmethod
+    def _res(rc, out="", err=""):
+        return _NS510(returncode=rc, stdout=out, stderr=err, args=[], cwd=None)
+
+    def terminate_active_processes(self):  # pragma: no cover
+        pass
+
+    def run(self, args, *, cwd, check=True, input_text=None, env=None):
+        cmd = [str(a) for a in args]
+        joined = " ".join(cmd)
+        if cmd[1:3] == ["api", "user"]:
+            return self._res(0, out=_json510.dumps({"login": _BOT[0], "id": _BOT[1]}))
+        if "/events" in joined:
+            self.events_reads += 1
+            if self.events_unreadable:
+                return self._res(1, err="HTTP 404: Not Found")
+            return self._res(0, out=_json510.dumps(self.events))
+        if "--method" in cmd and "POST" in cmd and joined.endswith(f"labels[]={self.label}"):
+            self.posts += 1
+            action = self.script.pop(0) if self.script else "ok"
+            if action == "fail":
+                return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+            if action == "fail422":
+                return self._res(1, err="HTTP 422: Validation Failed")
+            self.event("labeled")
+            if action == "accepted":
+                return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+            return self._res(0)
+        if "--method" in cmd and "DELETE" in cmd:
+            self.deletes += 1
+            action = self.script.pop(0) if self.script else "ok"
+            if action == "fail":
+                return self._res(1, err="HTTP 503 Service Unavailable")
+            self.event("unlabeled")
+            if action == "accepted":
+                return self._res(1, err="HTTP 503 Service Unavailable")
+            return self._res(0)
+        if cmd[1:3] == ["pr", "ready"]:
+            self.readies.append(cmd)
+            action = self.ready_script.pop(0) if self.ready_script else "ok"
+            undo = "--undo" in cmd
+            if action == "fail":
+                return self._res(1, err="HTTP 503 Service Unavailable")
+            self.draft = undo
+            if action == "accepted":
+                return self._res(1, err="HTTP 503 Service Unavailable")
+            return self._res(0)
+        if cmd[1:3] == ["pr", "view"] and "isDraft,headRefOid" in cmd:
+            return self._res(0, out=_json510.dumps({"isDraft": self.draft, "headRefOid": self.head}))
+        return self._res(0, out="")
+
+
+@pytest.fixture
+def label_env(monkeypatch):
+    monkeypatch.setattr(_github510, "log", lambda _c, _m: None)
+    monkeypatch.setattr(managed_ci, "log", lambda _c, _m: None)
+    monkeypatch.setattr(_github510, "active_workdir", lambda config: None)
+    monkeypatch.setattr(managed_ci, "active_workdir", lambda config: None)
+
+
+def _lcfg(tmp_path):
+    return make_config(tmp_path)
+
+
+@pytest.mark.parametrize("label", [MANAGED_LABEL, QUALIFIED_LABEL])
+def test_label_add_accepted_but_failed_is_success_with_the_true_event_id(tmp_path, label_env, label):
+    hub = _LabelHub(["accepted"], label=label)
+    outcome = managed_ci.reconciled_label_write(
+        hub, config=_lcfg(tmp_path), pr_number=7, label_name=label, op="add",
+        write=lambda: hub.run(
+            ["gh", "api", "--method", "POST", "repos/OWNER/REPO/issues/7/labels", "-f", f"labels[]={label}"],
+            cwd=None, check=False,
+        ),
+    )
+    assert outcome.result.returncode == 0
+    assert outcome.event_id == hub.events[-1]["id"] and outcome.outcome == "adopted"
+    assert hub.posts == 1
+
+
+def test_label_add_transient_not_applied_replays_once_then_succeeds(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+    result = _label_add(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL).result
+    assert result.returncode == 0 and hub.posts == 2
+
+
+def test_label_add_foreign_newer_event_fails_closed_without_replay(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+
+    original_run = hub.run
+
+    def run(args, **kw):
+        result = original_run(args, **kw)
+        if hub.posts == 1 and result.returncode != 0:
+            hub.event("labeled", actor=_STRANGER)  # another actor labels meanwhile
+        return result
+
+    hub.run = run
+    outcome = _label_add(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL)
+    assert outcome.result.returncode != 0 and outcome.outcome == "foreign"
+    assert hub.posts == 1
+
+
+def test_label_add_newer_unlabeled_event_fails_closed(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+    original_run = hub.run
+
+    def run(args, **kw):
+        result = original_run(args, **kw)
+        if hub.posts == 1 and result.returncode != 0:
+            hub.event("unlabeled", actor=_BOT)
+        return result
+
+    hub.run = run
+    outcome = _label_add(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL)
+    assert outcome.result.returncode != 0 and hub.posts == 1
+
+
+def test_label_add_unreadable_history_after_failure_is_not_replayed(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+    original_run = hub.run
+
+    def run(args, **kw):
+        result = original_run(args, **kw)
+        if hub.posts == 1 and result.returncode != 0:
+            hub.events_unreadable = True
+        return result
+
+    hub.run = run
+    outcome = _label_add(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL)
+    assert outcome.result.returncode != 0 and outcome.outcome == "unknown"
+    assert hub.posts == 1
+
+
+def test_label_add_without_a_readable_baseline_is_a_single_attempt(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+    hub.events_unreadable = True
+    outcome = _label_add(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL)
+    assert outcome.result.returncode != 0 and hub.posts == 1
+
+
+def test_label_add_permanent_failure_is_not_retried(tmp_path, label_env):
+    hub = _LabelHub(["fail422"])
+    outcome = _label_add(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL)
+    assert outcome.result.returncode != 0 and hub.posts == 1
+
+
+def test_label_history_distinguishes_unknown_from_empty(tmp_path, label_env):
+    hub = _LabelHub()
+    assert _label_history(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL) == _Complete(None)
+    hub.events_unreadable = True
+    assert isinstance(_label_history(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL), _Unknown)
+
+
+def _owned_contract(event_id):
+    return _Contract510(
+        protocol_version=2, adopted_existing_pr=True, invocation_applied_label=True,
+        active_label_event_id=event_id,
+    )
+
+
+def test_label_remove_503_still_present_with_owned_event_replays(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+    owned = hub.event("labeled")["id"]
+    assert _release510(hub, config=_lcfg(tmp_path), pr_number=7, contract=_owned_contract(owned)) is True
+    assert hub.deletes == 2
+
+
+def test_label_remove_accepted_by_actor_is_success_without_replay(tmp_path, label_env):
+    hub = _LabelHub(["accepted"])
+    owned = hub.event("labeled")["id"]
+    assert _release510(hub, config=_lcfg(tmp_path), pr_number=7, contract=_owned_contract(owned)) is True
+    assert hub.deletes == 1
+
+
+@pytest.mark.parametrize("replacement_actor", [_BOT, _STRANGER])
+def test_label_remove_replacement_event_is_never_deleted(tmp_path, label_env, replacement_actor):
+    hub = _LabelHub(["fail"])
+    owned = hub.event("labeled")["id"]
+    original_run = hub.run
+
+    def run(args, **kw):
+        result = original_run(args, **kw)
+        if hub.deletes == 1 and result.returncode != 0:
+            hub.event("labeled", actor=replacement_actor)
+        return result
+
+    hub.run = run
+    # The ownership pre-check passes on the owned event, then the DELETE 503s and
+    # a replacement application appears: the remove is refused, never replayed.
+    assert _release510(hub, config=_lcfg(tmp_path), pr_number=7, contract=_owned_contract(owned)) is False
+    assert hub.deletes == 1
+
+
+def test_label_remove_unreadable_history_is_not_replayed(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+    owned = hub.event("labeled")["id"]
+    original_run = hub.run
+
+    def run(args, **kw):
+        result = original_run(args, **kw)
+        if hub.deletes == 1 and result.returncode != 0:
+            hub.events_unreadable = True
+        return result
+
+    hub.run = run
+    assert _release510(hub, config=_lcfg(tmp_path), pr_number=7, contract=_owned_contract(owned)) is False
+    assert hub.deletes == 1
+
+
+@pytest.mark.parametrize("undo", [False, True])
+def test_ready_503_same_head_in_desired_state_is_success_without_replay(tmp_path, label_env, undo):
+    hub = _LabelHub()
+    hub.draft = not undo
+    hub.ready_script = ["accepted"]
+    result = _reconciled_ready(
+        hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha=hub.head, undo=undo
+    )
+    assert result.returncode == 0 and len(hub.readies) == 1
+
+
+def test_ready_503_with_head_changed_fails_closed_without_replay(tmp_path, label_env):
+    hub = _LabelHub()
+    hub.ready_script = ["accepted"]
+    hub.head = "b" * 40  # pushed while the transition was ambiguous
+    result = _reconciled_ready(
+        hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha="a" * 40
+    )
+    assert result.returncode != 0 and len(hub.readies) == 1
+
+
+def test_ready_503_not_applied_same_head_replays(tmp_path, label_env):
+    hub = _LabelHub()
+    hub.ready_script = ["fail"]
+    result = _reconciled_ready(hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha=hub.head)
+    assert result.returncode == 0 and len(hub.readies) == 2
+
+
+def test_ready_without_expected_head_is_a_single_attempt(tmp_path, label_env):
+    hub = _LabelHub()
+    hub.ready_script = ["fail"]
+    result = _reconciled_ready(hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha=None)
+    assert result.returncode != 0 and len(hub.readies) == 1
+
+
+def test_label_definition_create_503_that_landed_is_success(tmp_path, label_env):
+    class Definitions(_LabelHub):
+        def __init__(self):
+            super().__init__()
+            self.defined = False
+            self.creates = 0
+
+        def run(self, args, *, cwd, check=True, **kw):
+            cmd = [str(a) for a in args]
+            if cmd[1:2] == ["api"] and cmd[-1] == f"repos/OWNER/REPO/labels/{MANAGED_LABEL}":
+                if self.defined:
+                    return self._res(0, out="{}")
+                return self._res(1, err="HTTP 404: Not Found")
+            if "--method" in cmd and cmd[-1:] and any(a == "repos/OWNER/REPO/labels" for a in cmd):
+                self.creates += 1
+                self.defined = True
+                return self._res(1, err="HTTP 503 Service Unavailable")
+            return super().run(args, cwd=cwd, check=check, **kw)
+
+    hub = Definitions()
+    assert managed_ci.ensure_managed_label(hub, config=_lcfg(tmp_path)) is True
+    assert hub.creates == 1

@@ -457,3 +457,145 @@ def test_merge_conflict_item_label():
     label = _format_unresolved_item_label(item)
 
     assert "Merge conflict item, round 3" in label
+
+
+# --- #510 stage 3: merge ambiguity (never replayed in-process) -------------------
+
+
+import json as _json
+from types import SimpleNamespace as _NS
+
+import pytest as _pytest
+
+import coding_review_agent_loop.github as _github_module
+from coding_review_agent_loop.errors import AgentLoopError as _AgentLoopError
+from coding_review_agent_loop.github import merge_pr as _merge_pr
+from coding_review_agent_loop.github_retry import GitHubAmbiguousWriteError as _Ambiguous
+from coding_review_agent_loop.pr_loop_support import (
+    ExactHeadCiProof as _ExactHeadCiProof,
+    _merge_with_exact_head_proof as _merge_with_proof,
+)
+from agent_loop_helpers import make_config as _make_config
+
+_HEAD = "a" * 40
+
+
+class _MergeRunner:
+    def __init__(self, merge_error="non-200 OK status code: 502 Bad Gateway", view=None, view_error=None):
+        self.merge_error = merge_error
+        self.view = view
+        self.view_error = view_error
+        self.merges: list[list[str]] = []
+        self.views: list[list[str]] = []
+        self.dry_run = False
+
+    @staticmethod
+    def _res(rc, out="", err=""):
+        return _NS(returncode=rc, stdout=out, stderr=err, args=[], cwd=None)
+
+    def terminate_active_processes(self):  # pragma: no cover
+        pass
+
+    def run(self, args, *, cwd, check=True, input_text=None, env=None):
+        cmd = [str(a) for a in args]
+        if cmd[1:3] == ["pr", "merge"]:
+            self.merges.append(cmd)
+            if self.merge_error is None:
+                return self._res(0)
+            return self._res(1, err=self.merge_error)
+        if cmd[1:3] == ["pr", "view"]:
+            self.views.append(cmd)
+            if "state,mergedAt,headRefOid,mergeCommit" in cmd:
+                if self.view_error:
+                    return self._res(1, err=self.view_error)
+                return self._res(0, out=_json.dumps(self.view))
+            return self._res(0, out=_HEAD + "\n")  # live head for the proof
+        return self._res(0, out="")
+
+
+@_pytest.fixture
+def merge_env(monkeypatch):
+    monkeypatch.setattr(_github_module, "log", lambda _c, _m: None)
+    monkeypatch.setattr(_github_module, "active_workdir", lambda config: None)
+
+
+def _merge_cfg(tmp_path):
+    return _make_config(tmp_path, auto_merge=True)
+
+
+def test_merge_502_merged_at_expected_head_is_success_with_one_merge_call(tmp_path, merge_env):
+    runner = _MergeRunner(view={"state": "MERGED", "mergedAt": "t", "headRefOid": _HEAD, "mergeCommit": {"oid": "m"}})
+    _merge_pr(runner, _merge_cfg(tmp_path), 7, expected_head_sha=_HEAD)
+    assert len(runner.merges) == 1
+    assert runner.merges[0][-2:] == ["--match-head-commit", _HEAD]
+
+
+@_pytest.mark.parametrize(
+    ("view", "needle"),
+    [
+        ({"state": "OPEN", "mergedAt": None, "headRefOid": _HEAD, "mergeCommit": None}, "rerun to re-execute every merge gate"),
+        ({"state": "OPEN", "mergedAt": None, "headRefOid": "b" * 40, "mergeCommit": None}, "now OPEN at head " + "b" * 40),
+        ({"state": "CLOSED", "mergedAt": None, "headRefOid": _HEAD, "mergeCommit": None}, "now CLOSED"),
+        ({"state": "MERGED", "mergedAt": "t", "headRefOid": "b" * 40, "mergeCommit": {"oid": "m"}}, "now MERGED at head " + "b" * 40),
+    ],
+)
+def test_merge_502_any_other_state_is_terminal_with_exactly_one_merge_call(tmp_path, merge_env, view, needle):
+    runner = _MergeRunner(view=view)
+    with _pytest.raises(_AgentLoopError) as excinfo:
+        _merge_pr(runner, _merge_cfg(tmp_path), 7, expected_head_sha=_HEAD)
+    assert needle in str(excinfo.value)
+    assert "attempt 1" in str(excinfo.value)
+    assert len(runner.merges) == 1
+
+
+def test_merge_502_with_unreadable_state_is_ambiguous_and_not_replayed(tmp_path, merge_env):
+    runner = _MergeRunner(view_error="HTTP 404: Not Found")
+    with _pytest.raises(_Ambiguous, match="could not be re-read"):
+        _merge_pr(runner, _merge_cfg(tmp_path), 7, expected_head_sha=_HEAD)
+    assert len(runner.merges) == 1
+
+
+def test_permanent_merge_failure_behaves_as_before_without_a_state_read(tmp_path, merge_env):
+    runner = _MergeRunner(merge_error="HTTP 405: Pull Request is not mergeable")
+    with _pytest.raises(_AgentLoopError, match="Command failed with exit"):
+        _merge_pr(runner, _merge_cfg(tmp_path), 7, expected_head_sha=_HEAD)
+    assert len(runner.merges) == 1 and runner.views == []
+
+
+def test_merge_without_expected_head_is_a_single_unreconciled_attempt(tmp_path, merge_env):
+    class Raising(_MergeRunner):
+        def run(self, args, *, cwd, check=True, **kw):
+            result = super().run(args, cwd=cwd, check=check)
+            if check and result.returncode != 0:
+                raise _AgentLoopError("boom")
+            return result
+
+    runner = Raising()
+    with _pytest.raises(_AgentLoopError, match="boom"):
+        _merge_pr(runner, _merge_cfg(tmp_path), 7)
+    assert len(runner.merges) == 1 and runner.views == []
+    assert "--match-head-commit" not in runner.merges[0]
+
+
+@_pytest.mark.parametrize("source", ["full-board", "managed exact-head", "ordinary recovery"])
+def test_every_merge_mode_performs_exactly_one_merge_call_on_a_same_head_502(tmp_path, merge_env, source):
+    runner = _MergeRunner(view={"state": "OPEN", "mergedAt": None, "headRefOid": _HEAD, "mergeCommit": None})
+    with _pytest.raises(_AgentLoopError, match="rerun to re-execute every merge gate"):
+        _merge_with_proof(
+            runner,
+            config=_merge_cfg(tmp_path),
+            pr_number=7,
+            proof=_ExactHeadCiProof(head_sha=_HEAD, source=source),
+        )
+    assert len(runner.merges) == 1
+
+
+def test_merged_at_head_recovery_succeeds_through_the_proof_path(tmp_path, merge_env):
+    runner = _MergeRunner(view={"state": "MERGED", "mergedAt": "t", "headRefOid": _HEAD, "mergeCommit": {"oid": "m"}})
+    _merge_with_proof(
+        runner,
+        config=_merge_cfg(tmp_path),
+        pr_number=7,
+        proof=_ExactHeadCiProof(head_sha=_HEAD, source="full-board"),
+    )
+    assert len(runner.merges) == 1

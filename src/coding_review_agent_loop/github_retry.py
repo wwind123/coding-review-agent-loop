@@ -12,7 +12,8 @@ import random
 import re
 import time
 from pathlib import Path
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, is_dataclass, replace
 from typing import Literal, Sequence
 
 from .errors import AgentLoopError
@@ -235,3 +236,13 @@ def sleep_before_retry(policy: GitHubRetryPolicy, failed_attempts: int) -> None:
 
 def format_attempt_history(attempts: Sequence[GitHubAttempt]) -> str:
     return "\n".join(f"  {attempt.describe()}" for attempt in attempts)
+
+
+def as_success(result: CommandResult) -> CommandResult:
+    """Return ``result`` rewritten as a success (the live state proved the write landed)."""
+    if is_dataclass(result) and not isinstance(result, type):
+        return replace(result, returncode=0, stderr="")
+    clone = copy.copy(result)
+    clone.returncode = 0
+    clone.stderr = ""
+    return clone

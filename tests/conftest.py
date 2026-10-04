@@ -24,6 +24,18 @@ def _no_real_repair():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_github_backoff(monkeypatch):
+    """The GitHub transient-retry backoff never really sleeps under test (#510).
+
+    Tests asserting the backoff sequence patch ``_sleep`` themselves, which
+    takes precedence over this fixture.
+    """
+    from coding_review_agent_loop import github_retry
+
+    monkeypatch.setattr(github_retry, "_sleep", lambda _seconds: None)
+
+
+@pytest.fixture(autouse=True)
 def _reset_checkout_baselines():
     """The checkout-verification ledger is process-global; isolate every test (#1130)."""
     from coding_review_agent_loop.checkout_verification import reset_checkout_baselines
