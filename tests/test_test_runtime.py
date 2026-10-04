@@ -1247,6 +1247,35 @@ def test_cli_records_playwright_run_as_evidence_and_list_as_non_evidence(tmp_pat
     assert not runtime.runtime_row_is_evidence(row)
 
 
+def test_cli_records_npx_playwright_run_as_evidence_with_npx_command(tmp_path, monkeypatch, no_ambient_invocation):
+    memory = tmp_path / "memory"
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "AGENT_LOOP_TEST_BROKER_ENDPOINT",
+        "AGENT_LOOP_TEST_BROKER_CAPABILITY",
+        "AGENT_LOOP_TEST_BROKER_PROTOCOL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    _fake_playwright(tmp_path)
+    sentinel = tmp_path / "npx-ran"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake_npx = bindir / "npx"
+    fake_npx.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 0\n", encoding="utf-8")
+    fake_npx.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    base = ["run-tests", "--timeout-seconds", "30", "--memory-dir", str(memory), "--"]
+    assert main([*base, "npx", "playwright", "test", "--project=chromium"]) == 0
+    rows = runtime.load_runtime_memory(memory)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["launch_integrity"] == "verified"
+    assert runtime.runtime_row_is_evidence(row)
+    assert "npx playwright test" in json.dumps(row)
+    assert row["normalized_command"].startswith("npx playwright test")
+    assert not sentinel.exists()
+
+
 def test_lookalike_env_executable_is_not_stripped_from_probe(tmp_path, monkeypatch, no_ambient_invocation):
     # A program named ``env`` that ignores its argv and exits 0 must not let
     # the probe verify the real interpreter on its behalf.

@@ -319,6 +319,90 @@ def test_evidence_reask_prompt_is_sanitized_and_bounded():
     assert len(suffix) < 2500
 
 
+def _obs_for(selector, turn_id, **state):
+    return {**_observation(**state), "execution_ref": selector, "turn_id": turn_id}
+
+
+def _claim_text(selector):
+    text = _implementation_with_claim()
+    return text.replace(_SELECTOR, selector)
+
+
+def _real_validator(runner):
+    """Mirror the approved-plan call site: the catalog is re-read per acquisition."""
+    from coding_review_agent_loop.response_validation import _current_test_turn_observations
+
+    def validate(text):
+        return validate_structured_issue_implementation(
+            text,
+            delivered_risk_test_matrix_row_ids=["row-1"],
+            execution_catalog=_current_test_turn_observations(runner),
+        )
+
+    return validate
+
+
+def _turn_result(text, turn_id, observations, session_id=None):
+    return AgentResult(
+        text=text,
+        returncode=0,
+        session_id=session_id,
+        test_turn_id=turn_id,
+        test_turn_observations=tuple(observations),
+    )
+
+
+def _run_real(tmp_path, results):
+    runner = FakeRunner()
+    with patch.object(orchestrator_module, "run_agent_result", side_effect=list(results)) as invoke:
+        try:
+            response = _run_validated_agent(
+                runner,
+                agent="claude",
+                config=make_config(tmp_path, agent_max_retries=0),
+                prompt="Implement the issue.",
+                marker_description="structured issue_implementation result",
+                validate=_real_validator(runner),
+                role="coder",
+                use_repair=True,
+                repair_expected_kind="issue_implementation",
+                reask_on_evidence_rejection=True,
+            )
+            return response, None, invoke
+        except AgentInvocationError as exc:
+            return None, exc, invoke
+
+
+def test_reask_validates_against_the_second_turns_own_catalog(tmp_path, no_repair):
+    first = _turn_result(
+        _claim_text("turn1:obs-1"), "t1", [_obs_for("turn1:obs-1", "t1", suite_start="unknown")], "s1"
+    )
+    fresh = _obs_for("turn2:obs-1", "t2")
+    second = _turn_result(_claim_text("turn2:obs-1"), "t2", [fresh], "s1")
+    response, error, invoke = _run_real(tmp_path, [first, second])
+    assert error is None
+    assert invoke.call_count == 2
+    assert invoke.call_args_list[1].kwargs["session_id"] == "s1"
+    claims = response.marker_value.risk_test_matrix_claims.claims
+    assert claims[0].execution_refs == ("turn2:obs-1",)
+
+
+def test_reask_cannot_cite_the_rejected_turns_observation(tmp_path, no_repair):
+    bad = _obs_for("turn1:obs-1", "t1", suite_start="unknown")
+    first = _turn_result(_claim_text("turn1:obs-1"), "t1", [bad])
+    # The re-ask turn's closed catalog holds only turn 2; citing turn 1 again
+    # must never be accepted as a verified claim.
+    second = _turn_result(
+        _claim_text("turn1:obs-1"), "t2", [_obs_for("turn2:obs-1", "t2")]
+    )
+    response, error, invoke = _run_real(tmp_path, [first, second])
+    assert invoke.call_count == 2
+    assert error is None
+    claims = response.marker_value.risk_test_matrix_claims.claims
+    assert claims[0].execution_refs == ()
+    assert claims[0].dropped_execution_refs == ("turn1:obs-1",)
+
+
 def test_approved_plan_call_site_enables_reask():
     import inspect
 
