@@ -5309,7 +5309,7 @@ def test_pr_peer_publishes_between_freeze_and_rerun_changes_scheduler_inputs(tmp
 
     from coding_review_agent_loop.round_transport import attachment_keys
 
-    runner, config, carrier = _exhausted_pr(tmp_path, monkeypatch)
+    runner, config, carrier = _exhausted_pr(tmp_path, monkeypatch, slow_reviewer="gemini")
     frozen = carrier["bodies"]
     peer_marker = "Gemini approves independently."
     # B is not public while A freezes and exhausts: its settled review is still spooled.
