@@ -104,6 +104,27 @@ def _coder(index, round_number, *, entries=(), raw=None, status=None):
     )
 
 
+def _qualify(records):
+    """Give every primary review a same-round primary checkpoint just before it."""
+    have = {
+        (r.metadata.round_number, r.index)
+        for r in records
+        if r.metadata.role == "summary" and r.metadata.phase == "scheduler-prelaunch"
+    }
+    rounds_with_checkpoint = {number for number, _index in have}
+    extra = []
+    for record in records:
+        metadata = record.metadata
+        if metadata.role == "reviewer" and metadata.round_number not in rounds_with_checkpoint:
+            rounds_with_checkpoint.add(metadata.round_number)
+            extra.append(_checkpoint(record.index - 0.5, metadata.round_number, digest=None))
+    return [*records, *extra]
+
+
+def _derive(records, **kwargs):
+    return derive_plan_step_back_state(_qualify(list(records)), **kwargs)
+
+
 def _new(n):
     return _item(f"item-{n}", "blocking", round_number=n, text=f"Gap {n}\nmore detail")
 
@@ -158,7 +179,7 @@ def test_pr_phase_counts_same_pr_items():
 
 
 def test_trigger_streak_counts_consecutive_new_findings():
-    state = derive_plan_step_back_state(_chain([1, 2, 3]), primary=PRIMARY)
+    state = _derive(_chain([1, 2, 3]), primary=PRIMARY)
     assert state.streak_since(1) == 3
     assert state.streak_since(2) == 2
     # Reviews before the crossing never count.
@@ -168,26 +189,26 @@ def test_trigger_streak_counts_consecutive_new_findings():
 def test_repeat_only_review_ends_the_streak():
     records = [*_chain([1]), _checkpoint(10, 2), _review(11, 2), *_chain([3])[0:0]]
     records += [_checkpoint(12, 3), _review(13, 3, items=[_new(3)])]
-    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    state = _derive(records, primary=PRIMARY)
     assert state.streak_since(1) == 1
 
 
 def test_approval_ends_the_streak():
     records = [*_chain([1]), _review(5, 2, state="approved"), _review(6, 3, items=[_new(3)])]
-    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    state = _derive(records, primary=PRIMARY)
     assert state.streak_since(1) == 1
 
 
 def test_other_reviewers_never_count():
     records = [*_chain([1, 2]), _review(9, 3, items=[_new(3)], agent="Gemini")]
-    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    state = _derive(records, primary=PRIMARY)
     assert state.streak_since(1) == 2
     assert [review.round_number for review in state.reviews] == [1, 2]
 
 
 def test_a_later_record_for_a_round_supersedes_an_earlier_one():
     records = [_review(0, 1, items=[_new(1)]), _review(1, 1)]
-    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    state = _derive(records, primary=PRIMARY)
     assert state.reviews[0].classification == CLASS_REPEAT_ONLY
 
 
@@ -201,14 +222,14 @@ def _episode_records(*extra_reviews):
 
 
 def test_no_entry_means_no_episode():
-    state = derive_plan_step_back_state(_chain([1, 2]), primary=PRIMARY)
+    state = _derive(_chain([1, 2]), primary=PRIMARY)
     assert state.episode is None
     assert state.escalation_count == 0
 
 
 def test_episode_counts_the_step_back_candidates_own_block_first():
     records = _episode_records(_review(11, 3, items=[_new(3)]))
-    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    state = _derive(records, primary=PRIMARY)
     assert state.episode is not None
     assert (state.episode.candidate_round, state.episode.trigger_round) == (3, 2)
     assert state.escalation_count == 1
@@ -221,7 +242,7 @@ def test_new_repeat_new_after_a_step_back_keeps_one_episode_and_counts_all():
         _review(12, 4),
         _review(13, 5, items=[_new(5)]),
     )
-    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    state = _derive(records, primary=PRIMARY)
     assert state.episode is not None
     assert state.escalation_count == 3
     # The streak never spans the start of an episode.
@@ -229,28 +250,28 @@ def test_new_repeat_new_after_a_step_back_keeps_one_episode_and_counts_all():
 
 
 def test_reviews_before_the_step_back_candidate_do_not_count_toward_escalation():
-    state = derive_plan_step_back_state(_episode_records(), primary=PRIMARY)
+    state = _derive(_episode_records(), primary=PRIMARY)
     assert state.episode is not None
     assert state.escalation_count == 0
 
 
 def test_primary_approval_closes_the_episode():
     records = _episode_records(_review(11, 3, state="approved"))
-    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    state = _derive(records, primary=PRIMARY)
     assert state.episode is None
     assert state.escalation_count == 0
 
 
 def test_panel_opening_closes_the_episode():
     records = _episode_records(_review(11, 3, items=[_new(3)]))
-    state = derive_plan_step_back_state(records, primary=PRIMARY, panel_opening_index=11)
+    state = _derive(records, primary=PRIMARY, panel_opening_index=11)
     assert state.episode is None
 
 
 def test_entry_owned_by_another_reviewer_does_not_open_the_primarys_episode():
     entry = entry_payload_for_plan(reviewer="Gemini", trigger_round=2)
     records = [*_chain([1, 2]), _coder(10, 3, entries=[entry])]
-    assert derive_plan_step_back_state(records, primary=PRIMARY).episode is None
+    assert _derive(records, primary=PRIMARY).episode is None
 
 
 def test_the_newest_entry_wins():
@@ -262,7 +283,7 @@ def test_the_newest_entry_wins():
         _coder(20, 6, entries=[second]),
         _review(21, 6, items=[_new(6)]),
     ]
-    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    state = _derive(records, primary=PRIMARY)
     assert state.episode.candidate_round == 6
     assert state.escalation_count == 1
 
@@ -276,7 +297,7 @@ def test_operator_reset_retires_earlier_rounds_and_the_episode():
         _checkpoint(30, 5, digest=DIGEST, reset=True),
         _review(31, 5, items=[_new(5)]),
     ]
-    state = derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=DIGEST)
+    state = _derive(records, primary=PRIMARY, current_issue_digest=DIGEST)
     assert state.episode is None
     assert state.escalation_count == 0
     assert [review.round_number for review in state.reviews] == [5]
@@ -287,7 +308,7 @@ def test_issue_digest_change_retires_rounds_reviewed_against_other_text():
     records = _episode_records(_review(11, 3, items=[_new(3)]))
     # Rounds 1 and 2 were checkpointed against the old digest; round 3's was too.
     records.insert(-1, _checkpoint(10, 3, digest=DIGEST))
-    state = derive_plan_step_back_state(
+    state = _derive(
         records, primary=PRIMARY, current_issue_digest="fedcba9876543210"
     )
     assert state.episode is None
@@ -297,7 +318,7 @@ def test_issue_digest_change_retires_rounds_reviewed_against_other_text():
 def test_rounds_without_a_recorded_digest_are_not_retired_by_an_edit():
     records = _episode_records(_review(11, 3, items=[_new(3)]))
     records = [r for r in records if r.metadata.role != "summary"]
-    state = derive_plan_step_back_state(
+    state = _derive(
         records, primary=PRIMARY, current_issue_digest="fedcba9876543210"
     )
     assert state.episode is not None
@@ -313,7 +334,7 @@ def test_phase_advance_record_is_a_history_boundary():
         body="",
     )
     records = _episode_records(advance, _review(12, 4, items=[_new(4)]))
-    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    state = _derive(records, primary=PRIMARY)
     assert state.episode is None
     assert [review.round_number for review in state.reviews] == [4]
 
@@ -334,6 +355,9 @@ def test_phase_advance_record_is_a_history_boundary():
         [{"phase": "plan", "reviewer": "Codex", "trigger_round": 2, "anchor": {}}],
         [{"phase": "plan", "reviewer": "Codex", "trigger_round": 2, "extra": 1}],
         [{"phase": "pr", "reviewer": "Codex", "trigger_round": 2}],
+        [{"phase": [], "reviewer": "Codex", "trigger_round": 2}],
+        [{"phase": {}, "reviewer": "Codex", "trigger_round": 2}],
+        [{"phase": ["plan"], "reviewer": "Codex", "trigger_round": 2}],
     ],
 )
 def test_malformed_entries_decode_as_degraded_not_as_an_error(value):
@@ -346,7 +370,7 @@ def test_malformed_entries_decode_as_degraded_not_as_an_error(value):
 
 def test_degraded_history_suppresses_the_state_with_a_flag():
     bad = _coder(10, 3, status="invalid")
-    state = derive_plan_step_back_state([*_chain([1, 2]), bad], primary=PRIMARY)
+    state = _derive([*_chain([1, 2]), bad], primary=PRIMARY)
     assert state.degraded
     assert state.episode is None
 
@@ -470,7 +494,7 @@ def test_alternative_summary_is_read_from_the_stored_structured_response():
     entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
     raw = json.dumps({"summary": "simpler design: round boundaries only"}) + "\n<!-- X -->"
     records = [*_chain([1, 2]), _coder(10, 3, entries=[entry], raw=raw)]
-    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    state = _derive(records, primary=PRIMARY)
     assert step_back_alternative_summary(records, state.episode) == (
         "simpler design: round boundaries only"
     )
@@ -480,7 +504,7 @@ def test_alternative_summary_tolerates_missing_or_unreadable_responses():
     entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
     for raw in (None, "not json"):
         records = [*_chain([1, 2]), _coder(10, 3, entries=[entry], raw=raw)]
-        state = derive_plan_step_back_state(records, primary=PRIMARY)
+        state = _derive(records, primary=PRIMARY)
         assert step_back_alternative_summary(records, state.episode) is None
 
 
@@ -534,3 +558,50 @@ def test_agent_loop_error_is_the_config_error_type(tmp_path):
             reviewer=("codex", "gemini"),
             plan_step_back_rounds=-1,
         )
+
+
+def test_reset_checkpoint_in_the_step_back_candidates_own_round_closes_the_episode():
+    """A reset recorded after the step-back turn closes it, even in the same round."""
+    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
+    records = [
+        *_chain([1, 2]),
+        _coder(10, 3, entries=[entry]),
+        _checkpoint(11, 3, digest=DIGEST, reset=True),
+        _review(12, 3, items=[_new(3)]),
+    ]
+    state = _derive(records, primary=PRIMARY, current_issue_digest=DIGEST)
+    assert state.episode is None
+    assert state.escalation_count == 0
+    # The reset round's own review still counts toward a fresh streak.
+    assert [review.round_number for review in state.reviews] == [3]
+
+
+def test_a_non_reset_checkpoint_in_the_candidates_round_keeps_the_episode():
+    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
+    records = [
+        *_chain([1, 2]),
+        _coder(10, 3, entries=[entry]),
+        _checkpoint(11, 3, digest=DIGEST),
+        _review(12, 3, items=[_new(3)]),
+    ]
+    state = _derive(records, primary=PRIMARY, current_issue_digest=DIGEST)
+    assert state.episode is not None and state.escalation_count == 1
+
+
+def test_reviews_without_a_qualifying_primary_checkpoint_are_not_counted():
+    """Legacy or full-board history ends the streak instead of lengthening it."""
+    records = [
+        _review(1, 1, items=[_new(1)]),  # no checkpoint at all (legacy)
+        _checkpoint(2, 2, digest=DIGEST, phase="full-board"),
+        _review(3, 2, items=[_new(2)]),  # non-primary checkpoint
+        _checkpoint(4, 3, digest=DIGEST),
+        _review(5, 3, items=[_new(3)]),
+    ]
+    state = derive_plan_step_back_state(records, primary=PRIMARY)
+    assert [review.round_number for review in state.reviews] == [3]
+    assert state.streak_since(1) == 1
+
+
+def test_a_checkpoint_recorded_after_its_review_does_not_qualify_it():
+    records = [_review(1, 1, items=[_new(1)]), _checkpoint(2, 1, digest=DIGEST)]
+    assert derive_plan_step_back_state(records, primary=PRIMARY).reviews == ()

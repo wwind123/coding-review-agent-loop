@@ -2451,7 +2451,7 @@ def step_back_entry_is_valid(entry: object) -> bool:
     phase = entry.get("phase")
     reviewer = entry.get("reviewer")
     trigger_round = entry.get("trigger_round")
-    if phase not in STEP_BACK_PHASES:
+    if not isinstance(phase, str) or phase not in STEP_BACK_PHASES:
         return False
     if not isinstance(reviewer, str) or not reviewer.strip():
         return False

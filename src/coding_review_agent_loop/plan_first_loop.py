@@ -1666,6 +1666,8 @@ def _run_plan_first_loop(
         )
         plan_scheduler_decision = None
         step_back_candidate_review = False
+        step_back_history_intact = False
+        step_back_history_class = "unclassified"
         plan_posted_checkpoint: PostedRoundMetadata | None = None
         plan_panel_evidence = PlanPanelEvidence()
         plan_qualifying_approvals: tuple[str, ...] = ()
@@ -1785,6 +1787,8 @@ def _run_plan_first_loop(
             latest_scheduler_record = plan_history.latest_scheduler_record
             plan_previous_key = plan_history.previous_key
             plan_history_class = plan_history.history_class
+            step_back_history_intact = plan_history_class == PLAN_HISTORY_INTACT
+            step_back_history_class = str(plan_history_class)
             if config.plan_step_back_rounds > 0 and plan_primary_name is not None:
                 step_back_candidate_review = (
                     current_plan_sidecar.round_number
@@ -1807,6 +1811,39 @@ def _run_plan_first_loop(
                     "(--plan-reset-stall-streak)",
                 )
             if (
+                config.plan_step_back_rounds > 0
+                and not plan_reset_round
+                and plan_primary_name is not None
+                and not plan_panel_evidence.opened
+                and not plan_operator_force_full
+                and plan_primary_name not in plan_qualifying_approvals
+                and not (
+                    current_resume is not None
+                    and any(
+                        record.metadata.agent == plan_primary_name
+                        for record in current_resume.completed_reviews
+                    )
+                )
+            ):
+                # Independent of --plan-primary-stall-rounds: only
+                # --plan-step-back-rounds 0 disables the step-back stop.  Whichever
+                # stop is reached first wins, so this runs before the stall stop.
+                if not step_back_history_intact:
+                    log(
+                        config,
+                        f"Planning round {round_number}: step-back stop suppressed: degraded "
+                        f"planning history ({step_back_history_class})",
+                    )
+                else:
+                    step_back_stop = plan_step_back_escalation(
+                        plan_records,
+                        panel_opening_index=plan_panel_evidence.opening_index,
+                        assessment=plan_growth_assessment,
+                        measurements=plan_growth_measurements,
+                    )
+                    if step_back_stop is not None:
+                        stop_plan_pre_panel(step_back_stop, round_number=round_number)
+            if (
                 config.plan_primary_stall_rounds > 0
                 and not plan_reset_round
                 and plan_primary_name is not None
@@ -1828,15 +1865,6 @@ def _run_plan_first_loop(
                         f"planning history ({plan_history_class})",
                     )
                 else:
-                    step_back_stop = plan_step_back_escalation(
-                        plan_records,
-                        panel_opening_index=plan_panel_evidence.opening_index,
-                        assessment=plan_growth_assessment,
-                        measurements=plan_growth_measurements,
-                    )
-                    if step_back_stop is not None:
-                        # Same early-stop contract as the stall stop below.
-                        stop_plan_pre_panel(step_back_stop, round_number=round_number)
                     plan_primary_streak = plan_primary_blocking_streak_detail(
                         plan_records,
                         primary=plan_primary_name,
@@ -3731,6 +3759,43 @@ def _run_plan_first_loop(
                 )
             raise AgentLoopError(f"Unknown plan execution mode: {mode}")
 
+        # The round's reviews are already posted, so refresh the durable history:
+        # the pre-round comment snapshot cannot hold them, and the trigger and the
+        # stop must land on exactly the K-th and M-th block.  The stop is checked
+        # before the generic max-rounds exit so the M-th block at the limit still
+        # posts the human-decision diagnostic.
+        step_back_records: tuple[PostedRoundRecord, ...] | None = None
+        if (
+            config.plan_step_back_rounds > 0
+            and staged_planning
+            and plan_primary_name is not None
+            and current_plan_sidecar is not None
+            and not plan_panel_evidence.opened
+            and not plan_phase_advance_pending
+            and inherited_guard_revision is None
+            and growth_guard_revision is None
+            and not supersession_revision_pending
+        ):
+            if not step_back_history_intact:
+                log(
+                    config,
+                    f"Planning round {round_number}: step-back suppressed: degraded "
+                    f"planning history ({step_back_history_class})",
+                )
+            else:
+                step_back_records = plan_history_records(
+                    refresh=True, round_number=round_number
+                )
+                step_back_stop = plan_step_back_escalation(
+                    step_back_records,
+                    panel_opening_index=plan_panel_evidence.opening_index,
+                    assessment=plan_growth_assessment,
+                    measurements=plan_growth_measurements,
+                )
+                if step_back_stop is not None:
+                    # Before the planner turn, so no further planner turn runs.
+                    stop_plan_pre_panel(step_back_stop, round_number=round_number)
+
         if round_number == config.max_rounds:
             if growth_guard_revision is not None:
                 raise AgentLoopError(
@@ -3832,29 +3897,7 @@ def _run_plan_first_loop(
             )
             plan_automatic_force_full = True
         step_back_context: PlanStepBackContext | None = None
-        if (
-            config.plan_step_back_rounds > 0
-            and staged_planning
-            and plan_primary_name is not None
-            and current_plan_sidecar is not None
-            and not plan_panel_evidence.opened
-            and inherited_guard_revision is None
-            and growth_guard_revision is None
-            and not supersession_revision_pending
-        ):
-            # The round's reviews are already posted, so refresh the durable
-            # history: the pre-round comment snapshot cannot hold them, and the
-            # trigger and the stop must land on exactly the K-th and M-th block.
-            step_back_records = plan_history_records(refresh=True, round_number=round_number)
-            step_back_stop = plan_step_back_escalation(
-                step_back_records,
-                panel_opening_index=plan_panel_evidence.opening_index,
-                assessment=plan_growth_assessment,
-                measurements=plan_growth_measurements,
-            )
-            if step_back_stop is not None:
-                # Before the planner turn, so no further planner turn runs.
-                stop_plan_pre_panel(step_back_stop, round_number=round_number)
+        if step_back_records is not None and current_plan_sidecar is not None:
             step_back_state = plan_step_back_state(
                 step_back_records, panel_opening_index=plan_panel_evidence.opening_index
             )

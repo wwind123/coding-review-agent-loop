@@ -147,6 +147,10 @@ def derive_plan_step_back_state(
         default=-1,
     )
     retired_through = 0
+    reset_indices: list[int] = []
+    # Indices of the usable primary-phase checkpoints of each round: a counted
+    # review must follow one of its own round (as the primary stall streak does).
+    checkpoint_indices: dict[int, list[int]] = {}
     for record in ordered:
         metadata = record.metadata
         if (
@@ -157,7 +161,9 @@ def derive_plan_step_back_state(
             or metadata.scheduler_phase != "primary"
         ):
             continue
+        checkpoint_indices.setdefault(metadata.round_number, []).append(record.index)
         if metadata.scheduler_stall_reset:
+            reset_indices.append(record.index)
             retired_through = max(retired_through, metadata.round_number - 1)
         recorded = metadata.scheduler_issue_digest
         if (
@@ -178,15 +184,25 @@ def derive_plan_step_back_state(
             continue
         # A later record for the same round supersedes an earlier one.
         latest_review[metadata.round_number] = record
-    reviews = tuple(
-        PrimaryReview(
-            round_number=number,
-            index=record.index,
-            classification=classify_review(record.metadata),
+    counted: list[PrimaryReview] = []
+    for number, record in sorted(latest_review.items()):
+        if number <= retired_through:
+            continue
+        if not any(
+            index < record.index for index in checkpoint_indices.get(number, ())
+        ):
+            # Legacy, full-board or otherwise unqualified history ends the
+            # streak: degraded history can only shorten it, never lengthen it.
+            counted.clear()
+            continue
+        counted.append(
+            PrimaryReview(
+                round_number=number,
+                index=record.index,
+                classification=classify_review(record.metadata),
+            )
         )
-        for number, record in sorted(latest_review.items())
-        if number > retired_through
-    )
+    reviews = tuple(counted)
 
     episode: StepBackEntry | None = None
     for record in ordered:
@@ -212,6 +228,10 @@ def derive_plan_step_back_state(
             )
     if panel_opening_index is not None:
         # Opening the panel ends the primary phase, and with it the episode.
+        episode = None
+    if episode is not None and any(index > episode.record_index for index in reset_indices):
+        # A reset checkpoint recorded after the step-back turn closes the episode
+        # even when it carries the same round number as the step-back candidate.
         episode = None
     escalation_count = 0
     if episode is not None:

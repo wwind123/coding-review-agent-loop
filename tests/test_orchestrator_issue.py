@@ -16192,3 +16192,158 @@ def test_a_primary_approval_of_the_step_back_candidate_ends_the_episode(tmp_path
     # Every reviewer of the step-back candidate, panel included, sees the notice.
     gemini = _m1251_prompts(runner, "gemini")
     assert len(gemini) == 1 and _STEP_BACK_NOTICE in gemini[0]
+
+
+def test_the_mth_block_at_max_rounds_still_posts_the_human_decision_diagnostic(tmp_path):
+    """The stop is evaluated before the generic max-rounds exit."""
+    runner, error = _m1251_run(tmp_path, last_round=6, max_rounds=6)
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert str(error).startswith("human decision required")
+    assert "stepped back at round 5" in str(error)
+    # No planner turn after the M-th block, and the plain diagnostic was posted.
+    assert len(_m1251_prompts(runner, "claude")) == 6
+    diagnostics = [
+        comment["body"]
+        for comment in runner.issue_comments
+        if comment["body"].startswith("Plan review scheduling diagnostic (round 6)")
+    ]
+    assert len(diagnostics) == 1 and "AGENT_LOOP_META" not in diagnostics[0]
+
+
+def test_round_start_step_back_stop_is_independent_of_the_stall_threshold(tmp_path):
+    """`--plan-primary-stall-rounds 0` disables only the stall stop, not the step-back stop."""
+    first, first_error = _m1251_run(
+        tmp_path, last_round=6, max_rounds=8, plan_primary_stall_rounds=0,
+        plan_step_back_escalation_rounds=5,
+    )
+    assert not isinstance(first_error, orchestrator_module.PlanPrePanelSafetyError)
+    # Rounds 5 and 6 blocked since the step-back; candidate 7 is published unreviewed.
+    history = list(first.issue_comments)
+    assert _m1251_coder_record(first, 7)
+
+    rerun = _FakeRunner(issue_comments=history)
+    config = _staged_plan_config(
+        tmp_path, max_rounds=8, plan_growth_max_chars=4500, plan_growth_max_revisions=3,
+        plan_primary_stall_rounds=0, plan_step_back_escalation_rounds=2,
+    )
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+
+    assert "blocked 2 round(s)" in str(excinfo.value)
+    assert _m1103_agent_calls(rerun) == []
+
+
+def _m1251_new_repeat_new_script():
+    """Scripted outputs: step-back after round 4, then new (5), repeat-only (6), new (7)."""
+    fresh, base0 = _m1103_fresh_base()
+    codex1, claude1, base_round2 = _m1103_blocking_chain(1, 1, base=base0)
+    codex2, _claude2, _base = _m1103_blocking_chain(2, 2, base=base_round2)
+    justify, base_round3 = _m1251_justify_patch(base_round2, resolved_item="item-2")
+    codex_rest, claude_rest, base_round6 = _m1103_blocking_chain(3, 5, base=base_round3)
+    repeat_only = structured_plan_review(
+        state="blocking",
+        summary="Gap 5 still open.",
+        prior_plan_item_dispositions=[{"item_id": "item-5", "disposition": "blocking"}],
+    )
+    patch6, _base = _m1251_steps_patch(
+        base_round6, resolved_item="item-5", summary="Close gap 5 for real."
+    )
+    round7 = structured_plan_review(
+        state="blocking",
+        summary="Gap 7 remains.",
+        blocking_plan_issues=["Close gap 7."],
+        prior_plan_item_dispositions=[{"item_id": "item-5", "disposition": "resolved"}],
+    )
+    claude = [fresh, *claude1, justify, *claude_rest, patch6]
+    codex = [*codex1, *codex2, *codex_rest, repeat_only, round7]
+    return claude, codex
+
+
+def _m1251_new_repeat_new_config(tmp_path):
+    return _staged_plan_config(
+        tmp_path, max_rounds=8, plan_growth_max_chars=4500, plan_growth_max_revisions=3,
+        plan_step_back_escalation_rounds=3,
+    )
+
+
+def test_new_repeat_new_after_a_step_back_counts_all_three_blocks_live(tmp_path):
+    """`plan-episode-new-repeat-new` (live): one step-back, stop on the third block."""
+    claude, codex = _m1251_new_repeat_new_script()
+    runner = _FakeRunner(claude_outputs=claude, codex_outputs=codex)
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+        run_issue_loop(
+            runner, issue_number=56, config=_m1251_new_repeat_new_config(tmp_path),
+            plan_first=True,
+        )
+
+    assert "stepped back at round 5" in str(excinfo.value)
+    assert "blocked 3 round(s)" in str(excinfo.value)
+    planner = _m1251_prompts(runner, "claude")
+    # fresh, p1, justification, p3, step-back, p5, p6; none after the third block.
+    assert len(planner) == 7
+    assert sum(_STEP_BACK_MARKER in prompt for prompt in planner) == 1
+    entries = [
+        record.round_number
+        for record in _plan_round_records(runner)
+        if record.role == "coder" and record.step_back_entries
+    ]
+    assert entries == [5]
+    assert len(_m1251_prompts(runner, "codex")) == 7
+
+
+def test_new_repeat_new_after_a_step_back_counts_all_three_blocks_on_resume(tmp_path):
+    """`plan-episode-new-repeat-new` (resume between the blocks)."""
+    claude, codex = _m1251_new_repeat_new_script()
+    # The first process dies after publishing candidate 6, before its review.
+    first = _FakeRunner(claude_outputs=claude[:6], codex_outputs=codex[:5])
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(
+            first, issue_number=56, config=_m1251_new_repeat_new_config(tmp_path),
+            plan_first=True,
+        )
+    assert _m1251_coder_record(first, 6)
+    rerun = _FakeRunner(
+        issue_comments=list(first.issue_comments), claude_outputs=claude[6:],
+        codex_outputs=codex[5:],
+    )
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+        run_issue_loop(
+            rerun, issue_number=56, config=_m1251_new_repeat_new_config(tmp_path),
+            plan_first=True,
+        )
+
+    assert "blocked 3 round(s)" in str(excinfo.value)
+    planner = _m1251_prompts(rerun, "claude")
+    assert len(planner) == 1 and _STEP_BACK_MARKER not in planner[0]
+    assert _m1103_agent_calls(rerun) == ["codex", "claude", "codex"]
+
+
+def test_unqualified_legacy_blocks_do_not_count_toward_the_trigger(tmp_path):
+    """Reviews without a primary-phase checkpoint end the streak (degraded history)."""
+    real_records = plan_first_loop_module._extract_round_metadata_records
+
+    def legacy(comments, *, flow):
+        records = real_records(comments, flow=flow)
+        return tuple(
+            record
+            for record in records
+            if not (
+                record.metadata.role == "summary"
+                and record.metadata.phase == "scheduler-prelaunch"
+                and record.metadata.round_number <= 3
+            )
+        )
+
+    with patch.object(
+        plan_first_loop_module, "_extract_round_metadata_records", side_effect=legacy
+    ):
+        runner, _error = _m1251_run(
+            tmp_path, last_round=6, max_rounds=6, plan_step_back_escalation_rounds=5
+        )
+
+    planner = _m1251_prompts(runner, "claude")
+    # Round 3's block is unqualified, so rounds 3+4 do not make K=2; rounds 4+5 do.
+    assert [_STEP_BACK_MARKER in prompt for prompt in planner] == [
+        False, False, False, False, False, True,
+    ]
