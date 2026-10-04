@@ -126,3 +126,19 @@ def _isolate_store_locks(tmp_path_factory):
     run_worktrees._set_store_lock_root_for_tests(tmp_path_factory.mktemp("workdir-stores"))
     yield
     run_worktrees._set_store_lock_root_for_tests(None)
+
+
+pytest_plugins = ["_ci_shard"]
+
+
+@pytest.fixture(autouse=True)
+def _scrub_ci_shard_environment(monkeypatch):
+    """Nested pytest sessions must not inherit shard settings (#1235).
+
+    The outer session cached its shard configuration at configure time, so
+    scrubbing here is safe; tests that exercise sharding opt in explicitly.
+    """
+    from _ci_shard import SHARD_ENV_VARS
+
+    for name in SHARD_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)

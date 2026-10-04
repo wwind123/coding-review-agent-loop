@@ -806,7 +806,14 @@ allowance, and a no-status retry must be the immediate next attempt of the same
 run after its recorded terminal attempt. Only after validation does the
 exact-head job receive the target SHA;
 it verifies checkout, installs editable development dependencies, and runs the
-complete pytest suite once. An always-evaluated publisher writes the
+complete pytest suite once, split across three duration-balanced shard legs
+(#1235) that each test the same validated SHA. A small aggregate keeps the
+original `Test validated exact head` check name: it fails unless every shard
+succeeded, using a workflow-literal result gate before any repository code,
+and then runs the trusted-revision `tests/ci_shard_verify.py` to prove from the
+per-shard manifests that the shards covered the full collection exactly once.
+The ordinary `Python 3.12 full suite` check is sharded the same way. An
+always-evaluated publisher writes the
 `final-ci/exact-head` status only for that validated SHA, correlating nonce,
 run ID, attempt, and Actions URL. Authorization failures before target
 establishment produce no status; downstream checkout/test failures cannot

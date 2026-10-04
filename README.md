@@ -153,9 +153,14 @@ handoff record before exposing `expected_head_sha`. Freshness is measured on
 the base runner: `created_at` must be at most 15 minutes old and no more than
 5 minutes ahead of the runner clock. A no-status retry may advance only from
 the recorded terminal attempt to the immediate next attempt of that same run.
-A separate job checks out
+A separate set of three shard jobs checks out
 that exact SHA, installs the editable development dependencies, and runs the
-full `python -m pytest` suite once. The always-evaluated publisher writes
+full `python -m pytest` suite once between them; an aggregate job named
+`Test validated exact head` succeeds only if every shard passed and the shard
+manifests prove exactly-once coverage. The ordinary `Python 3.12 full suite`
+check is sharded the same way. Shard balance comes from `tests/.test_durations`,
+refreshed with
+`CI_SHARD_STORE_DURATIONS=tests/.test_durations python -m pytest -n auto`. The always-evaluated publisher writes
 `final-ci/exact-head` only for that validated target, with the nonce, run ID,
 attempt, and Actions URL correlated in the status. Authorization failures
 before target validation write no status; checkout or test failures publish a

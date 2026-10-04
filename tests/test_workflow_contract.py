@@ -55,8 +55,8 @@ def _fixture_source_digest(text: str) -> str:
 
 def _job_if_expression(text: str) -> str:
     marker = "    if: >-\n"
-    start = text.index(marker) + len(marker)
-    end = text.index("    name: Python 3.12 full suite", start)
+    start = text.index(marker, text.index("\n  test-shard:\n")) + len(marker)
+    end = text.index("    name: Python 3.12 full suite (shard", start)
     return textwrap.dedent(text[start:end]).strip()
 
 
@@ -945,3 +945,68 @@ def test_agent_envelope_admits_footer_only_when_the_workflow_advertises_it():
     assert managed_ci.match_intent_envelope(body, visible_capable=True, host_footer_capable=False) is None
     visible = VISIBLE + _record_text(_record())
     assert managed_ci.match_intent_envelope(visible, visible_capable=False, host_footer_capable=True) is None
+
+
+def _job_text(text: str, job_id: str) -> str:
+    match = re.search(rf"^  {re.escape(job_id)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text, re.S | re.M)
+    assert match, job_id
+    return match.group(1)
+
+
+def test_ordinary_suite_is_sharded_with_original_aggregate_name():
+    text = _workflow_text()
+    shard = _job_text(text, "test-shard")
+    assert "name: Python 3.12 full suite (shard ${{ matrix.shard }}/3)" in shard
+    assert "fail-fast: false" in shard and "shard: [1, 2, 3]" in shard
+    assert "- run: python -m pytest -n auto\n" in shard
+    assert "CI_SHARD_INDEX: ${{ matrix.shard }}" in shard and "CI_SHARD_COUNT: 3" in shard
+    assert "if: success()" in shard
+    assert "name: shard-manifest-full-${{ matrix.shard }}-attempt-${{ github.run_attempt }}" in shard
+    aggregate = _job_text(text, "test")
+    assert "name: Python 3.12 full suite\n" in aggregate
+    assert "needs: test-shard" in aggregate
+    assert "if: always() && needs.test-shard.result != 'skipped'" in aggregate
+
+
+def test_exact_head_is_sharded_on_the_validated_target_with_one_aggregate():
+    text = _workflow_text()
+    shard = _job_text(text, "exact-head-shard")
+    assert "needs: validate-managed" in shard
+    assert "name: Test validated exact head (shard ${{ matrix.shard }}/3)" in shard
+    assert "fail-fast: false" in shard and "shard: [1, 2, 3]" in shard
+    assert "ref: ${{ needs.validate-managed.outputs.target_sha }}" in shard
+    assert 'test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"' in shard
+    assert "-head-${{ needs.validate-managed.outputs.target_sha }}-shard-${{ matrix.shard }}" in shard
+    assert "cancel-in-progress: false" in shard
+    assert "shard-manifest-exact-${{ matrix.shard }}-attempt-${{ github.run_attempt }}" in shard
+    aggregate = _job_text(text, "exact-head")
+    assert "name: Test validated exact head\n" in aggregate
+    assert "needs: [validate-managed, exact-head-shard]" in aggregate
+    assert "if: always() && needs.validate-managed.result == 'success'" in aggregate
+    publish = _job_text(text, "publish-exact-head")
+    assert "needs: [validate-managed, exact-head]" in publish
+    assert "TEST_RESULT: ${{ needs.exact-head.result }}" in publish
+
+
+@pytest.mark.parametrize(
+    "job,needs,head",
+    [
+        ("test", "test-shard", "${{ github.sha }}"),
+        ("exact-head", "exact-head-shard", "${{ needs.validate-managed.outputs.target_sha }}"),
+    ],
+)
+def test_aggregates_gate_literally_and_verify_with_the_trusted_revision(job, needs, head):
+    block = _job_text(_workflow_text(), job)
+    env_part, steps_part = block.split("    steps:\n", 1)
+    assert f"      SHARD_RESULT: ${{{{ needs.{needs}.result }}}}\n" in env_part
+    gate = steps_part.index('run: test "$SHARD_RESULT" = success')
+    checkout = steps_part.index("actions/checkout@v4")
+    verify = steps_part.index("python tests/ci_shard_verify.py")
+    assert gate < checkout < verify
+    assert "SHARD_RESULT:" not in steps_part
+    assert "ref: ${{ github.sha }}" in steps_part
+    assert "target_sha }}\n          sparse" not in steps_part
+    assert "sparse-checkout: tests/ci_shard_verify.py" in steps_part
+    assert "python-version: '3.12'" in steps_part
+    assert f"--head {head}" in steps_part and '--result "$SHARD_RESULT"' in steps_part
+    assert "--count 3" in steps_part and "--run-id ${{ github.run_id }}" in steps_part
