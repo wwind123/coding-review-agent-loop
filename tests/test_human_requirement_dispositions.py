@@ -260,3 +260,98 @@ def test_a_premature_secondary_plan_approval_is_never_carried():
 
     # Only the primary can hold a pre-opening approval.
     assert carried == ("Codex",)
+
+
+# --- #1241: surfaced-gated `requirement_label` alias on plan_review ---------
+
+import logging
+
+from coding_review_agent_loop.protocol import parse_plan_review, parse_structured_plan_review
+from coding_review_agent_loop.unresolved_items import _validate_plan_review_response
+
+_HR_ID = "hr-" + "ab12" * 16
+_OTHER_HR_ID = "hr-" + "cd34" * 16
+_ALIAS_LOG = "normalized disposition key alias requirement_label -> requirement_id"
+
+
+def _plan_review(disposition_entry):
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_review",
+        "state": "approved",
+        "summary": "Plan looks good.",
+        "prior_plan_item_dispositions": [],
+        "human_requirement_dispositions": [disposition_entry],
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: approved -->\n-- reviewer"
+
+
+def _aliased(value):
+    return {"requirement_label": value, "disposition": "addressed", "evidence": "Step 2 covers it."}
+
+
+def _validate(text, surfaced):
+    return _validate_plan_review_response(
+        text,
+        reviewer="Codex",
+        unresolved_items=(),
+        surfaced_requirement_ids=surfaced,
+        architecture_status_mode="legacy",
+    )
+
+
+def test_plan_review_alias_with_surfaced_id_is_accepted_and_logged(caplog):
+    text = _plan_review(_aliased(_HR_ID))
+    with caplog.at_level(logging.WARNING):
+        parsed = _validate(text, (_HR_ID,))
+    assert [d.requirement_id for d in parsed.human_requirement_dispositions] == [_HR_ID]
+    assert parsed.human_requirement_dispositions[0].evidence == "Step 2 covers it."
+    assert _ALIAS_LOG in caplog.text
+
+
+def test_parse_structured_plan_review_alias_with_surfaced_ids():
+    parsed = parse_structured_plan_review(
+        _plan_review(_aliased(_HR_ID)),
+        reviewer="Codex",
+        architecture_status_mode="legacy",
+        surfaced_requirement_ids=(_HR_ID,),
+    )
+    assert parsed.human_requirement_dispositions[0].requirement_id == _HR_ID
+
+
+@pytest.mark.parametrize(
+    "value, surfaced",
+    [
+        (_OTHER_HR_ID, (_HR_ID,)),
+        (f" {_HR_ID} ", (_HR_ID,)),
+        (f"{_HR_ID}\n", (_HR_ID,)),
+        ("hr-" + ("AB12" * 16), (_HR_ID,)),
+        ("Requirement 1", (_HR_ID,)),
+        ("Requirement 1", ("Requirement 1",)),
+        (123, (_HR_ID,)),
+    ],
+)
+def test_plan_review_alias_rejected_for_inexact_or_unsurfaced_value(value, surfaced, caplog):
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(AgentLoopError, match="requirement_id"):
+            _validate(_plan_review(_aliased(value)), surfaced)
+    assert _ALIAS_LOG not in caplog.text
+
+
+def test_plan_review_alias_with_both_keys_is_rejected():
+    entry = _aliased(_HR_ID)
+    entry["requirement_id"] = _HR_ID
+    with pytest.raises(AgentLoopError, match="requirement_label"):
+        _validate(_plan_review(entry), (_HR_ID,))
+
+
+def test_plan_review_alias_not_honored_without_surfaced_set():
+    with pytest.raises(AgentLoopError, match="requirement_id"):
+        parse_plan_review(
+            _plan_review(_aliased(_HR_ID)), reviewer="Codex", architecture_status_mode="legacy"
+        )
+
+
+def test_plan_state_alias_is_not_honored():
+    with pytest.raises(AgentLoopError, match="requirement_id"):
+        validate_structured_plan_state(_plan([_aliased(_HR_ID)]))

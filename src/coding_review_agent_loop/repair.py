@@ -2123,9 +2123,17 @@ def _reviewer_human_requirements_instruction(
     if expected_kind == "plan_review":
         disposition_instruction = (
             "The JSON must include one `human_requirement_dispositions` object per listed requirement, "
-            "with the exact surfaced requirement label, disposition `addressed`, `blocked`, or `not-applicable`, "
-            "and non-empty evidence.\n"
+            "with `requirement_id` set to the exact surfaced requirement label (the key must be spelled "
+            "`requirement_id`; rename `requirement_label` if present), disposition `addressed`, `blocked`, "
+            "or `not-applicable`, and non-empty evidence.\n"
         )
+        if reviewer_requirement_ids:
+            example = json.dumps({
+                "requirement_id": reviewer_requirement_ids[0],
+                "disposition": "addressed",
+                "evidence": "Step 2 of the plan covers this requirement.",
+            })
+            disposition_instruction += f"Example object: `{example}`\n"
     if not reviewer_requirement_ids:
         empty_field = (
             "Set `human_requirement_dispositions` to `[]` and remove any fabricated "

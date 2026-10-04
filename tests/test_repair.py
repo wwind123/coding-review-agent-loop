@@ -5049,3 +5049,21 @@ def test_execute_repair_default_antigravity_chain_ends_with_opus(tmp_path, monke
         "Claude Opus 5.5 (Medium)",
     ]
     assert agy_mod._run_memories == memory_before  # repair never touches quota memory
+
+
+def test_plan_review_repair_prompt_names_requirement_id_with_example():
+    """#1241: the repair prompt shows the literal key so the model can rename it."""
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = "repaired"
+    with patch("coding_review_agent_loop.repair.subprocess.run", return_value=mock_result) as mock_run:
+        attempt_repair(
+            "malformed review",
+            "gemini",
+            expected_kind="plan_review",
+            reviewer_requirement_ids=["hr-" + "ab12" * 16],
+        )
+    cmd = mock_run.call_args.args[0]
+    prompt = cmd[cmd.index("--prompt") + 1]
+    assert "`requirement_id` set to the exact surfaced requirement label" in prompt
+    assert '"requirement_id": "hr-' + "ab12" * 16 + '"' in prompt

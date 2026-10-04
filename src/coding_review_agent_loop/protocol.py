@@ -4743,6 +4743,14 @@ PLAN_REVIEW_FINDING_KEY_ALIASES: Mapping[str, str] = MappingProxyType(
 )
 
 
+# #1241: plan reviewers sometimes key a disposition `requirement_label`.  The
+# alias is admitted only for an exact surfaced stable ID (see
+# `_expect_human_requirement_dispositions`).
+HUMAN_REQUIREMENT_DISPOSITION_KEY_ALIASES: Mapping[str, str] = MappingProxyType(
+    {"requirement_label": "requirement_id"}
+)
+
+
 def _normalize_plan_review_finding_key_aliases(raw: dict, *, item_context: str) -> dict:
     """Return a copy of ``raw`` with alias keys renamed; values are untouched.
 
@@ -5469,13 +5477,35 @@ def _expect_human_requirement_dispositions(
     value: object,
     *,
     context: str,
+    alias_surfaced_requirement_ids: Sequence[str] | None = None,
 ) -> tuple[HumanRequirementDisposition, ...]:
     if not isinstance(value, list):
         raise AgentLoopError(f"{context} must be a JSON array.")  # shape-check: fatal:no-conservative-reading
+    alias_ids = frozenset(alias_surfaced_requirement_ids or ())
     result: list[HumanRequirementDisposition] = []
     for index, item in enumerate(value):
         item_context = f"{context}[{index}]"
         payload = _expect_object(item, context=item_context)  # shape-check: fatal:no-conservative-reading
+        if alias_ids:
+            for alias, canonical in HUMAN_REQUIREMENT_DISPOSITION_KEY_ALIASES.items():
+                alias_value = payload.get(alias)
+                if (
+                    alias in payload
+                    and canonical not in payload
+                    and isinstance(alias_value, str)
+                    and alias_value in alias_ids
+                    and HUMAN_REQUIREMENT_STABLE_ID_RE.fullmatch(alias_value)
+                ):
+                    payload = {
+                        (canonical if key == alias else key): val
+                        for key, val in payload.items()
+                    }
+                    _logger.warning(
+                        "%s: normalized disposition key alias %s -> %s",
+                        item_context,
+                        alias,
+                        canonical,
+                    )
         _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
             payload,
             context=item_context,
@@ -6262,7 +6292,11 @@ def _reject_evidence_request_overlap(
 
 
 def parse_structured_plan_review(
-    text: str, *, reviewer: str, architecture_status_mode: str = "strict"
+    text: str,
+    *,
+    reviewer: str,
+    architecture_status_mode: str = "strict",
+    surfaced_requirement_ids: Sequence[str] | None = None,
 ) -> ParsedPlanReview | None:
     payload = _extract_structured_plan_review_payload(text)  # shape-check: fatal:unparseable-envelope
     if payload is None:
@@ -6312,6 +6346,7 @@ def parse_structured_plan_review(
     human_requirement_dispositions = _expect_human_requirement_dispositions(  # shape-check: fatal:no-conservative-reading
         payload.get("human_requirement_dispositions", []),
         context="plan_review.human_requirement_dispositions",
+        alias_surfaced_requirement_ids=surfaced_requirement_ids,
     )
     architecture_impact, architecture_impact_degradations = _degradable_response_impact(  # shape-check: fatal:no-conservative-reading
         payload, mode=architecture_status_mode, context="plan_review.architecture_impact"
@@ -7438,11 +7473,18 @@ def parse_pr_review(
 
 
 def parse_plan_review(
-    text: str, *, reviewer: str, architecture_status_mode: str = "strict"
+    text: str,
+    *,
+    reviewer: str,
+    architecture_status_mode: str = "strict",
+    surfaced_requirement_ids: Sequence[str] | None = None,
 ) -> ParsedPlanReview:
     """Parse a plan review, including state, structured plan items, and dispositions."""
     parsed = parse_structured_plan_review(  # shape-check: fatal:unparseable-envelope
-        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
+        text,
+        reviewer=reviewer,
+        architecture_status_mode=architecture_status_mode,
+        surfaced_requirement_ids=surfaced_requirement_ids,
     )
     if parsed is not None:
         return parsed

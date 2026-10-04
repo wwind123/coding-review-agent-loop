@@ -1650,7 +1650,10 @@ def _validate_plan_review_response(
     architecture_status_mode: str,
 ) -> ParsedPlanReview:
     parsed = parse_plan_review(
-        text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
+        text,
+        reviewer=reviewer,
+        architecture_status_mode=architecture_status_mode,
+        surfaced_requirement_ids=surfaced_requirement_ids,
     )
     validate_human_requirement_dispositions(
         parsed.human_requirement_dispositions,

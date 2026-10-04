@@ -15652,3 +15652,74 @@ def test_issue_level_unrecoverable_matrix_replays_once_and_is_accepted(tmp_path,
     assert len(repair_calls) == 1
     assert posted
     assert _posted_matrix_1229(posted[0])["rows"][0]["forbidden_side_effects"] == ["Replay accepted"]
+
+
+def test_issue_loop_plan_first_resume_reparses_alias_keyed_requirement_disposition(tmp_path):
+    """#1241: a stored review accepted through the `requirement_label` alias resumes."""
+    issue_body = "Keep the public API unchanged.\n\n-- Human Reviewer"
+    requirement = HumanReviewRequirement(
+        source_type="Issue body",
+        author=None,
+        created_at=None,
+        url="https://github.com/OWNER/REPO/issues/56",
+        body="Keep the public API unchanged.",
+    )
+    requirement_id = requirement.requirement_id
+    current_plan = _plan_with_requirement_disposition(
+        kind="plan_state",
+        summary="Keep the public API unchanged.",
+        plan_steps=["Keep the public API unchanged."],
+        evidence="The plan keeps the public API unchanged.",
+    ).replace('"Requirement 1"', f'"{requirement_id}"').replace("- Requirement 1:", f"- Requirement {requirement_id}:")
+    subject = _plan_subject(current_plan)
+    aliased_review = (
+        structured_plan_review(state="approved", summary="Plan covers the requirement.").replace(
+            '"human_requirement_dispositions": []',
+            json.dumps(
+                {
+                    "human_requirement_dispositions": [{
+                        "requirement_label": requirement_id,
+                        "disposition": "addressed",
+                        "evidence": "The plan keeps the public API unchanged.",
+                    }]
+                }
+            )[1:-1],
+        )
+    )
+    aliased_review = aliased_review.replace(
+        "\n<!-- AGENT_PLAN_STATE: approved -->",
+        "\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->\n<!-- AGENT_PLAN_STATE: approved -->",
+    )
+    assert "requirement_label" in aliased_review
+    assert "HUMAN_REQUIREMENTS_RESOLVED" in aliased_review
+    coder_comment = _attach_round_metadata(
+        current_plan,
+        PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=1, subject=subject, prior_items=()
+        ),
+    )
+    codex_comment = _attach_round_metadata(
+        aliased_review,
+        PostedRoundMetadata(
+            flow="plan",
+            role="reviewer",
+            agent="Codex",
+            round_number=1,
+            subject=subject,
+            state="approved",
+            canonical_reviewer_response=aliased_review,
+        ),
+    )
+    runner = FakeRunner(
+        issue_payload={"body": issue_body},
+        issue_comments=[
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": coder_comment},
+            {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:05:00Z", "body": codex_comment},
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex",), plan_execution_mode="plan-only")
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    agent_commands = [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
+    assert agent_commands == []
