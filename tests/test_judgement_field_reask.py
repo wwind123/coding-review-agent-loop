@@ -361,7 +361,28 @@ def test_invented_status_from_repair_is_never_accepted(tmp_path, drop_kind, sour
         with pytest.raises(AgentLoopError) as info:
             _run_real(runner, config)
     assert calls, "repair was never attempted"
-    assert "architecture_impact.status" in str(info.value) or "repair" in str(info.value).lower()
+    assert (
+        "Repair content preservation failed for architecture_impact.status" in str(info.value)
+    )
+
+
+@pytest.mark.parametrize("drop_kind", [False, True])
+def test_control_masked_source_with_declared_status_is_repaired(tmp_path, drop_kind):
+    # Same masked structural defect, but the reviewer declared the status: the
+    # guard must let a status-preserving format repair through.
+    head, _, tail = structured_pr_review(summary="Masked.").partition("\n")
+    payload = json.loads(head)
+    payload["architecture_impact"] = _imp("unchanged")
+    payload["blocking_items"] = "not-a-list"
+    if drop_kind:
+        del payload["kind"]
+    bad = json.dumps(payload) + "\n" + tail
+    fixed = _with_impact(structured_pr_review(summary="Masked."), _imp("unchanged"))
+    runner = FakeRunner(codex_outputs=[bad])
+    config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
+    with patch.object(orchestrator, "attempt_repair", lambda raw, cmd, **kw: fixed):
+        response = _run_real(runner, config)
+    assert "Masked." in response.text
 
 
 def _pr_panel(target_round2):

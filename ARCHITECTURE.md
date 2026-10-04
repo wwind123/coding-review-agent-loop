@@ -1307,6 +1307,25 @@ attempt bound. This applies to a primary response, a response-file artifact
 from a timeout or nonzero exit, a completion-recovery response, and a repair
 candidate. The refused response is kept on the final error.
 
+A reviewer's own `architecture_impact.status` that is the sole defect in its
+assessment (absent, null, blank, non-string, or outside `changed | unchanged`)
+is a different transition from that ordinary contract retry (#1185). The
+validator raises a typed `MissingJudgementFieldError` with the unchanged message,
+and `_run_validated_agent` re-asks the same reviewer once with the frozen prompt
+and original session plus a short section naming the field and its allowed
+values, so peer visibility matches the original turn and nothing is published or
+spooled between the two turns. The re-ask shares the single slot of the carried
+disposition re-ask, so one invocation never re-asks twice, and it consumes
+neither `--agent-max-retries` nor the Antigravity model fallback. A second
+failure, or a flag-off invocation, makes no repair call and ends as a
+deterministic reviewer failure that names the field and the allowed values.
+Repair is skipped because it cannot supply the reviewer's decision. Any repair
+still reached for a reviewer, such as when a structural defect masks the status,
+is refused by repair preservation if the candidate introduces, changes, or drops
+an `architecture_impact.status` that the source did not decide, whether or not
+the source carries a `kind`. Mixed defects, near-miss aliases, and planner
+responses keep their existing routing.
+
 Semantic patch values stay strict. Canonical plan assembly and topology
 checkpoint publication refuse a degraded status. Repair normalizes a near miss
 before the repair prompt is built. It pins the absence of any removed
