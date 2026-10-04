@@ -27,6 +27,7 @@ from .errors import (
     QuotaResetExceededError,
     ReviewSubstanceIntegrityError,
     SemanticPatchPayloadRejection,
+    MissingJudgementFieldError,
     MissingPriorItemDispositionError,
     UnknownPriorItemDispositionError,
 )
@@ -118,6 +119,7 @@ from .architecture_contract import (
     _fresh_matrix_contract_retry_prompt,
     _evidence_rejection_reask_prompt,
     _prior_disposition_omission_reask_prompt,
+    _missing_judgement_field_reask_prompt,
     _ArchitectureImpactContractUnsatisfied,
 )
 
@@ -994,6 +996,7 @@ def _run_validated_agent(
     degrade_architecture_impact: bool = False,
     strict_revalidate: Callable[[str], object] | None = None,
     reask_on_prior_disposition_omission: bool = False,
+    reask_on_missing_judgement_field: bool = False,
     reask_on_evidence_rejection: bool = False,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
@@ -1089,8 +1092,8 @@ def _run_validated_agent(
         if antigravity_attempts is not None
         else config.agent_max_retries + 2
     )
-    if reask_on_prior_disposition_omission:
-        # One dedicated slot that never consumes agent_max_retries.
+    if reask_on_prior_disposition_omission or reask_on_missing_judgement_field:
+        # One dedicated slot shared by both re-ask kinds (#1167, #1185); that never consumes agent_max_retries.
         max_attempts += 1
     if reask_on_evidence_rejection:
         # One dedicated slot that never consumes agent_max_retries (#1240).
@@ -1138,6 +1141,7 @@ def _run_validated_agent(
     terminal_integrity_contract: str | None = None
     pending_matrix_integrity_reprompt: str | None = None
     pending_omission_reask_ids: tuple[str, ...] | None = None
+    pending_judgement_reask: tuple[str, tuple[str, ...], str | None] | None = None
     evidence_reask_used = False
     pending_evidence_reask_detail: str | None = None
     pending_evidence_reask_session: str | None = None
@@ -1250,6 +1254,14 @@ def _run_validated_agent(
             if agent == "claude":
                 invocation_kwargs["attempt_suffix"] = "matrix-integrity-replay"
             pending_matrix_integrity_reprompt = None
+        elif pending_judgement_reask is not None:
+            # Same frozen prompt and session as the original turn (#1185).
+            attempt_prompt = _missing_judgement_field_reask_prompt(
+                prompt, *pending_judgement_reask
+            )
+            if agent == "claude":
+                invocation_kwargs["attempt_suffix"] = "judgement-reask"
+            pending_judgement_reask = None
         elif pending_omission_reask_ids is not None:
             # Reuse the frozen prompt and session: publishing or rebuilding the
             # prompt between the two turns would reopen #1156.
@@ -1729,6 +1741,30 @@ def _run_validated_agent(
                 if result.command_result is not None and result.command_result.capture_diagnostics:
                     last_failure_category = "transient"
                     public_text_is_transient = True
+                if (
+                    reask_on_missing_judgement_field
+                    and not omission_reask_used
+                    and isinstance(exc, MissingJudgementFieldError)
+                    and not public_text_is_transient
+                    and not marker_safety_failure
+                    and last_failure_category != "unsupported_model"
+                    and not contract_unsatisfied
+                ):
+                    # A missing reviewer judgement cannot be supplied by repair:
+                    # re-ask the same reviewer once through the shared slot (#1185).
+                    omission_reask_used = True
+                    pending_judgement_reask = (
+                        exc.field_path, exc.allowed_values, exc.observed_preview
+                    )
+                    if usage_record is not None:
+                        usage_record.validation_status = "invalid"
+                    log(
+                        config,
+                        f"{agent_name}: review gave no valid {exc.field_path} (allowed: "
+                        f"{' | '.join(exc.allowed_values)}); re-asking the same reviewer "
+                        "once (no repair)",
+                    )
+                    continue
                 if (
                     reask_on_prior_disposition_omission
                     and not omission_reask_used
@@ -2307,6 +2343,24 @@ def _run_validated_agent(
                         )
                         last_classification_text = _SEMANTIC_EVIDENCE_REJECTION_CLASSIFICATION
                         should_retry = False
+                        last_failure_category = "deterministic"
+                    elif (
+                        repair_expected_kind in {"plan_review", "pr_review"}
+                        and isinstance(exc, MissingJudgementFieldError)
+                    ):
+                        # Reformatting cannot supply the reviewer's decision (#1185).
+                        allowed = " | ".join(exc.allowed_values)
+                        log(
+                            config,
+                            f"{agent_name}: reviewer gave no valid {exc.field_path} "
+                            f"(allowed: {allowed}); not repairable by reformatting, "
+                            "skipping repair pass",
+                        )
+                        last_error = (
+                            f"{exc} (repair skipped because the reviewer did not supply "
+                            f"{exc.field_path} (allowed: {allowed}); a repair pass cannot "
+                            "supply the reviewer's decision)"
+                        )
                         last_failure_category = "deterministic"
                     elif (
                         use_repair

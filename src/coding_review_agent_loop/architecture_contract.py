@@ -573,6 +573,35 @@ def _prior_disposition_omission_reask_prompt(prompt: str, missing_ids: Sequence[
     )
 
 
+_JUDGEMENT_REASK_MAX_CHARS = 200
+
+
+def _missing_judgement_field_reask_prompt(
+    prompt: str,
+    field_path: str,
+    allowed_values: Sequence[str],
+    observed_preview: str | None = None,
+) -> str:
+    """Append one bounded, marker-free section naming a missing judgement field (#1185)."""
+
+    def _clean(text: str) -> str:
+        cleaned = " ".join(sanitize_historical_text(text).replace("<", "(").replace(">", ")").split())
+        if len(cleaned) > _JUDGEMENT_REASK_MAX_CHARS:
+            cleaned = cleaned[: _JUDGEMENT_REASK_MAX_CHARS - 3] + "..."
+        return cleaned
+
+    allowed = " | ".join(_clean(value) for value in allowed_values)
+    observed = (
+        f" Your previous value was: {_clean(observed_preview)}." if observed_preview else ""
+    )
+    return (
+        f"{prompt}\n\n## Previous response not accepted: required judgement field\n\n"
+        f"Your previous review did not supply a valid `{_clean(field_path)}` "
+        f"(allowed: {allowed}).{observed} Decide the value from your own assessment, "
+        "then re-emit your complete review.\n"
+    )
+
+
 _EVIDENCE_REASK_MAX_CHARS = 1500
 
 

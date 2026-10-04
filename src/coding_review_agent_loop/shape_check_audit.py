@@ -862,6 +862,14 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "discussion answer rather than a claim."
         ),
     ),
+    "_missing_status_error": ShapeCheckClassification(
+        "fatal",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Fatal sites: authentication-or-forgery: marker neutralization of the observed "
+            "status preview through _bounded_single_line."
+        ),
+    ),
     "_parse_architecture_impact_payload": ShapeCheckClassification(
         "fatal",
         frozenset({"no-conservative-reading"}),

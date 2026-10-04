@@ -97,7 +97,7 @@ Source paths below are relative to
 | Entry points and effective configuration | `cli.py`, `config.py` | Parse modes; resolve role-specific models, effort, base, and policy before invocation. |
 | Lifecycle facade | `orchestrator.py` | Import/re-export facade only: a docstring plus import statements that keep the historical `coding_review_agent_loop.orchestrator` surface (used by `cli.py` and tests) bound to the owning modules below; it defines nothing itself. Together with the rows below it composes planning, implementation, review, recovery, and finalization; control decisions are never delegated to free-form agent prose. |
 | Agent failure classification | `agent_failure.py`, `reset_parsing.py` | Validated agent response types, rate-limit reset parsing (the pure parsers live in the stdlib-only leaf module `reset_parsing.py`, which `agent_failure` re-exports and `transient` imports, so `transient` never imports `agent_failure`), transient/unsupported-model classification, structured-candidate recovery, and failed-run diagnostics. |
-| Architecture-impact contract | `architecture_contract.py` | Prompt-architecture freezing, PR architecture identity revalidation, and accepted-candidate carriers for the architecture-impact contract. |
+| Architecture-impact contract | `architecture_contract.py` | Prompt-architecture freezing, PR architecture identity revalidation, and accepted-candidate carriers for the architecture-impact contract. A reviewer whose `architecture_impact.status` is the sole defect in the assessment (absent, null, blank, non-string, or out of enum) is re-asked once with the frozen prompt and session through the single re-ask slot shared with the carried-disposition re-ask, outside retries, Antigravity fallback, and repair. After exhaustion the turn fails as a reviewer failure with repair skipped, and any repair still reached is refused if it introduces a status the source did not decide (#1185). |
 | Validated agent turn | `validated_agent.py` | Run telemetry and usage contexts, structured repair, completion recovery, and the validated agent turn shared by every role. |
 | Response validation | `response_validation.py` | Coder and plan response validators, human-requirement checks, and post-PR test/observation validation. |
 | Panel evidence | `panel_evidence.py` | PR/plan panel evidence, board-amendment notes, plan primary streak, and plan-growth gates. |
@@ -114,7 +114,7 @@ Source paths below are relative to
 | Agent-facing context | `prompts.py`, `memory.py` | Render issue/plan/human/feedback context and advisory repository orientation. |
 | Provider invocation | `agents/base.py`, `agents/registry.py`, provider adapters | Translate a common invocation into backend-specific commands and return `AgentResult` with output, provenance, usage, and failure evidence. |
 | Process execution | `runner.py`, `containment.py`, `agents/replacement.py` | Capture subprocess output, enforce supported process-tree limits, and support bounded evidence-based startup recovery. |
-| Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. |
+| Response contracts and repair | `protocol.py`, `repair.py`, `repair_preservation.py`, `agents/format_repair.py` | Validate structured responses; accept bounded semantic coverage claims; derive canonical implementation evidence after head authentication; and reject content-loss or semantic rewrites. Reviewer repair is refused fail-closed when a `plan_review`/`pr_review` source carries no recoverable payload of the expected kind, and a repaired reviewer verdict, finding, or carried disposition must be grounded in the reviewer's own source text; a refusal is a reviewer unavailability, never a synthesized verdict. A repaired reviewer `architecture_impact.status` must likewise be the status the reviewer's own source declared; repair never supplies the decision (#1185). |
 | Finding identity and scheduling | `unresolved_items.py`, `review_scheduling.py`, `plan_review_scheduling.py` | Carry stable findings/dispositions and decide which reviewers must inspect a head or a candidate plan. |
 | Durable review transport | `round_state.py`, `round_transport.py`, `comment_rendering.py`, `issue_body_limits.py` | Reconstruct rounds, persist authenticated structured plan/matrix payloads in bounded sidecars, and render readable comments from semantic data. `issue_body_limits.py` bounds tool-created issue bodies that embed plan-derived text, shortening those sections against a pointer to the canonical source and failing with a surface- and section-specific diagnostic when a body still does not fit. Structured plan coder comments additionally have a bounded visible digest, selected only when the full comment overflows the body budget (see *Compact-on-overflow plan presentation*). The visible coder matrix-evidence section is collapsed and, on PR coder follow-ups, projected as a delta against the previous coder round, while canonical evidence stays complete (see *Delta matrix-evidence presentation*). |
 | GitHub and protocol trust | `github.py`, `protocol_markers.py` | Fetch live state and perform controlled writes; separate untrusted text from tool-owned protocol records. Trusted issue-created managed-CI authorization is PR-comment-only. `protocol_markers.py` also owns the deterministic visible-label invariant for tool-owned records, and `github.py` owns the shared write read-back verifier, which tolerates exactly one known host comment footer (#1043). |
@@ -1306,6 +1306,25 @@ and its accepted values, within the existing `--agent-max-retries` budget and
 attempt bound. This applies to a primary response, a response-file artifact
 from a timeout or nonzero exit, a completion-recovery response, and a repair
 candidate. The refused response is kept on the final error.
+
+A reviewer's own `architecture_impact.status` that is the sole defect in its
+assessment (absent, null, blank, non-string, or outside `changed | unchanged`)
+is a different transition from that ordinary contract retry (#1185). The
+validator raises a typed `MissingJudgementFieldError` with the unchanged message,
+and `_run_validated_agent` re-asks the same reviewer once with the frozen prompt
+and original session plus a short section naming the field and its allowed
+values, so peer visibility matches the original turn and nothing is published or
+spooled between the two turns. The re-ask shares the single slot of the carried
+disposition re-ask, so one invocation never re-asks twice, and it consumes
+neither `--agent-max-retries` nor the Antigravity model fallback. A second
+failure, or a flag-off invocation, makes no repair call and ends as a
+deterministic reviewer failure that names the field and the allowed values.
+Repair is skipped because it cannot supply the reviewer's decision. Any repair
+still reached for a reviewer, such as when a structural defect masks the status,
+is refused by repair preservation if the candidate introduces, changes, or drops
+an `architecture_impact.status` that the source did not decide, whether or not
+the source carries a `kind`. Mixed defects, near-miss aliases, and planner
+responses keep their existing routing.
 
 Semantic patch values stay strict. Canonical plan assembly and topology
 checkpoint publication refuse a degraded status. Repair normalizes a near miss

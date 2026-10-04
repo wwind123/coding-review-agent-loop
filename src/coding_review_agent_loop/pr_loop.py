@@ -3841,6 +3841,7 @@ def run_pr_loop(
                                     role="reviewer",
                                     operation_description="PR review",
                                     reask_on_prior_disposition_omission=True,
+                                    reask_on_missing_judgement_field=True,
                                 )
                             except AgentLoopError as exc:
                                 # Includes QuotaResetExceededError: captured here
@@ -4182,6 +4183,7 @@ def run_pr_loop(
                             role="reviewer",
                             operation_description="PR review",
                             reask_on_prior_disposition_omission=True,
+                            reask_on_missing_judgement_field=True,
                             ),
                         )
                     )
