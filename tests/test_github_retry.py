@@ -240,3 +240,73 @@ def test_run_gh_read_call_sites_are_read_only():
             assert not _WRITE_TOKENS.search(block), block
             checked += 1
     assert checked >= 20
+
+
+# --- remaining diagnostic paths (review round 1) ---------------------------------
+
+
+def test_stdout_only_failure_keeps_original_error(sleeps):
+    graphql = '{"errors":[{"message":"couldn\'t respond to your request in time"}]}'
+    runner = ScriptedRunner([(1, graphql, "")])
+    with pytest.raises(GitHubTransientExhaustedError) as info:
+        run_gh_read(runner, ["gh", "api", "graphql"], cwd=Path("."))
+    message = str(info.value)
+    assert "couldn't respond to your request in time" in message
+    assert "<no stderr>" not in message
+    assert len(runner.calls) == 3
+
+
+def test_stdout_kept_alongside_stderr(sleeps):
+    runner = ScriptedRunner([(1, "structured-detail", "HTTP 502 Bad Gateway")])
+    result = run_gh_read(runner, ["gh", "api", "x"], cwd=Path("."), check=False)
+    text = describe_gh_failure(result)
+    assert "HTTP 502 Bad Gateway" in text and "structured-detail" in text
+
+
+def test_actor_lookup_exhaustion_message(tmp_path, sleeps):
+    config = make_config(tmp_path)
+    runner = ScriptedRunner([(1, "", "HTTP 503 actor-final")])
+    with pytest.raises(AgentLoopError) as info:
+        read_authenticated_protocol_comments(runner, config=config, surface_kind="pr", number=3)
+    assert "actor-final" in str(info.value) and "attempt 3:" in str(info.value)
+
+
+def test_envelope_readback_exhaustion_message(tmp_path, sleeps):
+    config = make_config(tmp_path)
+    runner = ScriptedRunner([(1, "", "HTTP 502 envelope-final")])
+    with pytest.raises(AgentLoopError) as info:
+        github._fetch_protocol_comment_envelope(
+            runner, config=config, comment_id=9, context="Test record"
+        )
+    assert "envelope-final" in str(info.value) and "attempt 3:" in str(info.value)
+
+
+def test_merge_commit_exhaustion_message(tmp_path, sleeps):
+    config = make_config(tmp_path)
+    runner = ScriptedRunner([(1, "", "HTTP 504 merge-final")])
+    with pytest.raises(AgentLoopError) as info:
+        github.get_pr_merge_commit_sha(runner, config, 7)
+    assert "merge-final" in str(info.value) and "attempt 3:" in str(info.value)
+
+
+def test_pr_commit_query_exhaustion_keeps_history_and_refusal_type(tmp_path, sleeps):
+    config = make_config(tmp_path)
+    runner = ScriptedRunner([(1, "", "HTTP 502 commits-final")])
+    with pytest.raises(AgentLoopError) as info:
+        github._query_pr_commit_connection(runner, config=config, pr_number=7, after=None)
+    assert "commits-final" in str(info.value) and "attempt 3:" in str(info.value)
+
+
+def test_managed_ci_list_failure_reason_reaches_callers(tmp_path, sleeps):
+    from coding_review_agent_loop import managed_ci
+
+    config = make_config(tmp_path)
+    runner = ScriptedRunner([(1, "", "HTTP 503 list-final")])
+    with pytest.raises(AgentLoopError) as info:
+        managed_ci._authorization_comment_records(
+            runner, config=config, pr_number=4, actor_login="bot", actor_id=7
+        )
+    message = str(info.value)
+    assert "could not be inspected" in message
+    assert "list-final" in message and "attempt 3:" in message
+    assert managed_ci._api_list(runner, config, "repos/o/r/issues/4/comments") is None

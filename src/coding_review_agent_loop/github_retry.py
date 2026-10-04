@@ -102,6 +102,15 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _diagnostic(result: CommandResult) -> str:
+    """Trimmed stderr, plus trimmed stdout when the command printed any."""
+    err = _trim(result.stderr)
+    out = _trim(result.stdout)
+    if err and out:
+        return f"{err} | stdout: {out}"
+    return err or (f"stdout: {out}" if out else "")
+
+
 def _trim(text: str | None) -> str:
     collapsed = " ".join((text or "").split())
     if len(collapsed) > _ATTEMPT_STDERR_LIMIT:
@@ -112,9 +121,12 @@ def _trim(text: str | None) -> str:
 def describe_gh_failure(result: CommandResult) -> str:
     """Render the final stderr plus attempt history (if any)."""
     stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
     attempts = getattr(result, "attempts", ())
     if not attempts:
         return stderr
+    if stdout:
+        stderr = f"{stderr}\nstdout: {stdout}" if stderr else f"stdout: {stdout}"
     history = "\n".join(f"  {attempt.describe()}" for attempt in attempts)
     suffix = " (retry budget exhausted)" if getattr(result, "exhausted", False) else ""
     return f"{stderr}\nGitHub attempt history{suffix}:\n{history}"
@@ -155,7 +167,7 @@ def run_gh_read(
             return _with_history(result, history, exhausted=False)
         classification = classify_gh_failure(result)
         history.append(
-            GitHubAttempt(number, result.returncode, classification, _trim(result.stderr), started)
+            GitHubAttempt(number, result.returncode, classification, _diagnostic(result), started)
         )
         if classification == "permanent":
             if len(history) == 1:

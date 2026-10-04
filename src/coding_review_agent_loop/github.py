@@ -368,9 +368,10 @@ def _query_pr_commit_connection(
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         error_type = _GraphQLRefusedError if is_graphql_refusal(detail) else AgentLoopError
+        history = describe_gh_failure(result)
         raise error_type(
             f"GitHub PR commit provenance query failed for PR #{pr_number}"
-            + (f": {detail}" if detail else ".")
+            + (f": {history}" if history else ".")
         )
     try:
         payload = json.loads(result.stdout or "{}")
@@ -2704,7 +2705,9 @@ def resolve_authenticated_github_actor(
         check=False,
     )
     if result.returncode != 0:
-        raise AgentLoopError("Unable to resolve the authenticated GitHub actor.")
+        raise AgentLoopError(
+            "Unable to resolve the authenticated GitHub actor." + _failure_detail(result)
+        )
     try:
         payload = json.loads(result.stdout or "{}")
     except json.JSONDecodeError as exc:
@@ -3095,7 +3098,9 @@ def _fetch_protocol_comment_envelope(
         check=False,
     )
     if result.returncode != 0:
-        raise AgentLoopError(f"{context} could not be read back from GitHub.")
+        raise AgentLoopError(
+            f"{context} could not be read back from GitHub." + _failure_detail(result)
+        )
     try:
         payload = json.loads(result.stdout or "{}")
     except json.JSONDecodeError as exc:
@@ -3808,7 +3813,7 @@ def get_pr_merge_commit_sha(
     )
     unreadable = f"Unable to read the merge commit of PR #{pr_number}."
     if result.returncode != 0:
-        raise AgentLoopError(unreadable)
+        raise AgentLoopError(unreadable + _failure_detail(result))
     try:
         data = json.loads(result.stdout or "null")
     except json.JSONDecodeError as exc:

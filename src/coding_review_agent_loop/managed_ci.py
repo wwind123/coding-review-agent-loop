@@ -1725,11 +1725,13 @@ def _authorization_comment_records(
     actor_login: str,
     actor_id: int,
 ) -> list[tuple[int, ManagedCiIssueAuthorization]]:
-    comments = _api_list(
+    comments, reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
     if comments is None:
-        raise AgentLoopError("Managed-CI authorization comments could not be inspected.")
+        raise AgentLoopError(
+            _with_reason("Managed-CI authorization comments could not be inspected.", reason)
+        )
     records: list[tuple[int, ManagedCiIssueAuthorization]] = []
     for comment in comments:
         body = _normalized_comment_body(comment, config=config)
@@ -1863,11 +1865,15 @@ def find_actor_round_metadata_comment_ids(
     after_comment_id: int,
 ) -> tuple[int, ...]:
     """Return the exact blocking-review and coder records for one head transition."""
-    comments = _api_list(
+    comments, reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
     if comments is None:
-        raise AgentLoopError("Managed-CI continuity could not inspect PR round metadata comments.")
+        raise AgentLoopError(
+            _with_reason(
+                "Managed-CI continuity could not inspect PR round metadata comments.", reason
+            )
+        )
     by_index = _continuity_round_records(comments)
     reviewers: list[int] = []
     coders: list[int] = []
@@ -2461,14 +2467,17 @@ def publish_issue_created_continuity_authorization(
                 "Managed-CI head continuity observed a changed live PR tuple or active "
                 "managed-label event; no continuity record was written."
             )
-        current_round_comments = _api_list(
+        current_round_comments, list_reason = _api_list_detailed(
             runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
         )
         if current_round_comments is None or not _continuity_round_metadata_is_valid(
             current_round_comments, authorization=authorization
         ):
             raise AgentLoopError(
-                "Managed-CI head continuity requires authenticated, correlated round metadata."
+                _with_reason(
+                    "Managed-CI head continuity requires authenticated, correlated round metadata.",
+                    list_reason,
+                )
             )
         current_records = _authorization_comment_records(
             runner,
@@ -2543,14 +2552,17 @@ def publish_issue_created_continuity_authorization(
             f"{len(superseded_comment_ids)} earlier unbound actor-owned authorization "
             f"record(s) ({', '.join(str(value) for value in superseded_comment_ids)})",
         )
-    round_comments = _api_list(
+    round_comments, list_reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
     )
     if round_comments is None or not _continuity_round_metadata_is_valid(
         round_comments, authorization=authorization
     ):
         raise AgentLoopError(
-            "Managed-CI head continuity requires authenticated, correlated round metadata."
+            _with_reason(
+                "Managed-CI head continuity requires authenticated, correlated round metadata.",
+                list_reason,
+            )
         )
     revalidate_before_publication(authorization)
     for comment_id, record in records:
@@ -3315,11 +3327,14 @@ def _recover_issue_created_protection(
     )
     if valid_label_event_ids is None:
         raise refuse("the managed-label event history could not be inspected", remedy=retry)
-    comments = _api_list(
+    comments, reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
     if comments is None:
-        raise refuse("the authorization comments could not be inspected", remedy=retry)
+        raise refuse(
+            _with_reason("the authorization comments could not be inspected", reason),
+            remedy=retry,
+        )
     records: list[tuple[Mapping[str, object], ManagedCiIssueAuthorization]] = []
     for comment in comments:
         body = _normalized_comment_body(comment, config=config)
@@ -4775,11 +4790,11 @@ def verify_managed_pr_plan_binding(
     retired = frozenset(retired_plan_hashes)
     if approved_plan_hash in retired:
         retired = frozenset()
-    comments = _api_list(
+    comments, reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
     if comments is None:
-        raise fail("the PR authorization comments could not be inspected")
+        raise fail(_with_reason("the PR authorization comments could not be inspected", reason))
     records: list[tuple[int, ManagedCiIssueAuthorization]] = []
     for comment in comments:
         body = _normalized_comment_body(comment, config=config)
@@ -6017,26 +6032,42 @@ def _activate_v2_managed_ci(
         )
 
 
-def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[dict[str, object]] | None:
-    """Fetch a paginated GitHub list, returning None for an uninspectable response."""
+def _api_list_detailed(
+    runner: Runner, config: AgentLoopConfig, endpoint: str
+) -> tuple[list[dict[str, object]] | None, str]:
+    """Fetch a paginated GitHub list; on failure return ``(None, reason)``.
+
+    ``reason`` carries the final stderr and retry attempt history so raising
+    callers can include it while keeping their fail-closed behavior.
+    """
     result = run_gh_read(
         runner, [config.gh_cmd, "api", "--paginate", endpoint], cwd=github_api_cwd(), check=False
     )
     if result.returncode != 0:
-        log(config, f"GitHub list read of {endpoint} failed: {describe_gh_failure(result)}")
-        return None
+        reason = describe_gh_failure(result)
+        log(config, f"GitHub list read of {endpoint} failed: {reason}")
+        return None, reason
     try:
         payload = json.loads(result.stdout or "[]")
     except json.JSONDecodeError:
-        return None
+        return None, f"{endpoint} returned malformed JSON"
     if not isinstance(payload, list):
-        return None
+        return None, f"{endpoint} returned a non-list payload"
     # GitHub CLI 2.45 emits one flat array for paginated array endpoints.
     # Never silently discard malformed entries: doing so could turn an
     # incomplete timeline into an apparently complete ownership record.
     if not all(isinstance(item, dict) for item in payload):
-        return None
-    return payload
+        return None, f"{endpoint} returned malformed entries"
+    return payload, ""
+
+
+def _with_reason(message: str, reason: str) -> str:
+    return f"{message}\n{reason}" if reason else message
+
+
+def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[dict[str, object]] | None:
+    """Fetch a paginated GitHub list, returning None for an uninspectable response."""
+    return _api_list_detailed(runner, config, endpoint)[0]
 
 
 def _normalized_comment_body(
