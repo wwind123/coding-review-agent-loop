@@ -4693,10 +4693,15 @@ def build_review_prompt(
     coder_followup_context: str = "",
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     superseded_prepanel_review_context: SupersededPrepanelReview | None = None,
+    sweep_context: str = "",
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
-    coder_followup_context = coder_followup_context + superseded_prepanel_review_context_block(
-        superseded_prepanel_review_context
+    # The step-back sweep (#1251) rides the same sanitized channel in both the
+    # full and the compact branch, and exists only for the bound reviewer.
+    coder_followup_context = (
+        coder_followup_context
+        + superseded_prepanel_review_context_block(superseded_prepanel_review_context)
+        + (f"\n{sweep_context}" if sweep_context else "")
     )
     coder_name = agent_display_name(config.coder)
     reviewer_signature = agent_signature(reviewer, config, role="reviewer")
@@ -4911,6 +4916,7 @@ def build_followup_prompt(
     approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    step_back_context: str = "",
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -4923,7 +4929,7 @@ def build_followup_prompt(
 Address the review below in this local checkout. Pull/sync the PR branch if
 needed, implement fixes, run relevant tests, commit, and push to the same PR.
 Do not create a new PR.
-{_coder_workdir_guidance(config)}
+{step_back_context}{_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
@@ -4952,6 +4958,13 @@ AGENT_STATE footer. Your response must end with, in this exact order:
 """
 
 
+_SAME_PR_SMALL_CLEANUP_FRAMING = """These same-PR follow-ups are intended to be small, localized cleanup for the
+current PR. Keep the change narrowly scoped to the listed items. Do not take on
+larger redesigns or unrelated future work; call that out instead. The PR
+remains blocked pending another review round after this cleanup.
+"""
+
+
 def build_same_pr_followup_prompt(
     pr_number: int,
     round_number: int,
@@ -4966,6 +4979,7 @@ def build_same_pr_followup_prompt(
     approved_plan_max_chars: int | None = None,
     parent_issue_context: IssueContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
+    step_back_context: str = "",
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -4973,17 +4987,14 @@ def build_same_pr_followup_prompt(
     human_requirements_context = _coder_requirements_context(
         config, human_requirements, human_requirements_context
     )
+    scope_framing = step_back_context or _SAME_PR_SMALL_CLEANUP_FRAMING
     return f"""{reviewer_name} requested same-PR follow-ups on pull request #{pr_number} in {config.repo}.
 
 Address the follow-up items below in this local checkout. Pull/sync the PR
 branch if needed, implement fixes, run relevant tests, commit, and push to the
 same PR. Do not create a new PR.
 {_coder_workdir_guidance(config)}
-These same-PR follow-ups are intended to be small, localized cleanup for the
-current PR. Keep the change narrowly scoped to the listed items. Do not take on
-larger redesigns or unrelated future work; call that out instead. The PR
-remains blocked pending another review round after this cleanup.
-{_scratch_file_guidance()}
+{scope_framing}{_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}

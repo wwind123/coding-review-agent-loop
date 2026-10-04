@@ -1773,3 +1773,41 @@ def test_plan_step_back_flags_parse_from_the_cli(tmp_path):
     args = parser.parse_args([*base_argv, "--plan-step-back-rounds", "-2"])
     with pytest.raises(AgentLoopError, match="--plan-step-back-rounds must be"):
         config_from_args(args, FakeRunner())
+
+
+def test_pr_step_back_flags_default_and_validate(tmp_path):
+    """`pr-config-disable` (#1251)."""
+    config = make_config(tmp_path)
+    assert (config.pr_step_back_rounds, config.pr_step_back_line_window) == (3, 40)
+    # Unlike the plan flags, the PR flags apply under every PR review policy.
+    assert make_config(tmp_path, reviewer=("codex", "gemini"), pr_step_back_rounds=5).pr_step_back_rounds == 5
+    assert make_config(tmp_path, pr_step_back_rounds=0).pr_step_back_rounds == 0
+    assert make_config(tmp_path, pr_step_back_line_window=0).pr_step_back_line_window == 0
+    for invalid in (-1, True, 1.5, "3"):
+        with pytest.raises(AgentLoopError, match="--pr-step-back-rounds must be"):
+            make_config(tmp_path, pr_step_back_rounds=invalid)
+        with pytest.raises(AgentLoopError, match="--pr-step-back-line-window must be"):
+            make_config(tmp_path, pr_step_back_line_window=invalid)
+
+
+def test_pr_step_back_flags_parse_from_the_cli(tmp_path):
+    from coding_review_agent_loop.config import config_from_args
+
+    base_argv = [
+        "pr", "77", "--repo", "OWNER/REPO",
+        "--reviewer", "codex", "--codex-dir", str(tmp_path / "codex"),
+        "--dangerous-agent-permissions",
+    ]
+    parser = build_parser()
+    args = parser.parse_args(base_argv)
+    assert args.pr_step_back_rounds is None and args.pr_step_back_line_window is None
+    config = config_from_args(args, FakeRunner())
+    assert (config.pr_step_back_rounds, config.pr_step_back_line_window) == (3, 40)
+    args = parser.parse_args(
+        [*base_argv, "--pr-step-back-rounds", "0", "--pr-step-back-line-window", "10"]
+    )
+    config = config_from_args(args, FakeRunner())
+    assert (config.pr_step_back_rounds, config.pr_step_back_line_window) == (0, 10)
+    args = parser.parse_args([*base_argv, "--pr-step-back-line-window", "-1"])
+    with pytest.raises(AgentLoopError, match="--pr-step-back-line-window must be"):
+        config_from_args(args, FakeRunner())

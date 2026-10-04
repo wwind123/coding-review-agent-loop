@@ -1260,7 +1260,11 @@ a re-file-as-staged caveat) instead of patching the newest finding, and
 primary has blocked M rounds after it. An in-flight run already past eight such rounds stops at
 its next round after upgrading. Omitting the flags keeps today's
 full-board planning behavior unchanged, and discussion-mode cycles always stay
-full-board. A child-planning cycle inherits `--plan-review-policy`,
+full-board. In the PR fix loop, `--pr-step-back-rounds K` (default 3, `0` disables) and
+`--pr-step-back-line-window N` (default 40) apply the same idea: once a reviewer has blocked K
+consecutive rounds with new findings clustered on one file span, the next coder turn must fix
+the whole class with one rule and a parametrized test, that reviewer sweeps the resulting head
+for every remaining instance, and a further clustered sibling stops for a human decision. A child-planning cycle inherits `--plan-review-policy`,
 `--primary-plan-reviewer`, `--plan-primary-stall-rounds`, `--plan-step-back-rounds`, and `--plan-step-back-escalation-rounds` but never the parent's `--plan-review-force-full`
 override, `--plan-reset-stall-streak`, or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board

@@ -80,6 +80,9 @@ DEFAULT_MAX_ROUNDS = 10
 DEFAULT_PLAN_PRIMARY_STALL_ROUNDS = 8
 DEFAULT_PLAN_STEP_BACK_ROUNDS = 2
 DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS = 2
+# PR fix-loop step-back (#1251): K clustered new-finding blocks, and the line window.
+DEFAULT_PR_STEP_BACK_ROUNDS = 3
+DEFAULT_PR_STEP_BACK_LINE_WINDOW = 40
 DEFAULT_SUB_ITEM_STALL_ROUNDS = 3
 # `agy --print` otherwise defaults to five minutes, which is too short for
 # complex reviews and causes it to exit with "timeout waiting for response".
@@ -212,6 +215,8 @@ class AgentLoopConfig:
     # step-back candidate itself counts as the first) stop for a human decision.
     plan_step_back_rounds: int = DEFAULT_PLAN_STEP_BACK_ROUNDS
     plan_step_back_escalation_rounds: int = DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
+    pr_step_back_rounds: int = DEFAULT_PR_STEP_BACK_ROUNDS
+    pr_step_back_line_window: int = DEFAULT_PR_STEP_BACK_LINE_WINDOW
     # One-shot operator retirement of the stall streak (#1112): the run's first
     # primary-phase checkpoint is stamped as a durable streak boundary.  Never
     # inherited by child planning, isolated providers, or recovery commands.
@@ -697,6 +702,15 @@ class AgentLoopConfig:
             if value != default and self.plan_review_policy != "primary-then-panel":
                 raise AgentLoopError(
                     f"{flag} requires --plan-review-policy primary-then-panel."
+                )
+        for flag, value in (
+            ("--pr-step-back-rounds", self.pr_step_back_rounds),
+            ("--pr-step-back-line-window", self.pr_step_back_line_window),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise AgentLoopError(
+                    f"{flag} must be a non-negative integer"
+                    + (" (0 disables it)." if flag == "--pr-step-back-rounds" else ".")
                 )
         if (
             isinstance(self.sub_item_stall_rounds, bool)
@@ -2102,6 +2116,12 @@ def config_from_args(
         ),
         plan_step_back_escalation_rounds=_arg_or_default(
             args, "plan_step_back_escalation_rounds", DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
+        ),
+        pr_step_back_rounds=_arg_or_default(
+            args, "pr_step_back_rounds", DEFAULT_PR_STEP_BACK_ROUNDS
+        ),
+        pr_step_back_line_window=_arg_or_default(
+            args, "pr_step_back_line_window", DEFAULT_PR_STEP_BACK_LINE_WINDOW
         ),
         plan_reset_stall_streak=bool(getattr(args, "plan_reset_stall_streak", False)),
         plan_growth_gate=getattr(args, "plan_growth_gate", None) or "enforce",

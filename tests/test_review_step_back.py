@@ -656,3 +656,402 @@ def test_an_episode_published_after_the_edit_is_not_closed_by_it():
     ]
     state = derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=NEW_DIGEST)
     assert state.episode is not None and state.escalation_count == 1
+
+
+# ---------------------------------------------------------------------------
+# PR fix-loop step-back (#1251, stage 2)
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.protocol import ReviewItemDisposition, ReviewSubItem
+from coding_review_agent_loop import review_step_back as sb
+
+HEAD_A = "a" * 40
+HEAD_B = "b" * 40
+HEAD_C = "c" * 40
+PR_REVIEWER = "OpenAI Codex"
+
+
+def _pr_item(item_id, text, *, status="blocking", round_number=1, sub_items=(), fix_scope=None):
+    return UnresolvedReviewItem(
+        item_id=item_id,
+        reviewer=PR_REVIEWER,
+        source_round=round_number,
+        text=text,
+        status=status,
+        sub_items=tuple(sub_items),
+        fix_scope=fix_scope,
+    )
+
+
+def _pr_review(index, round_number, head, *, state="blocking", new=(), prior=(), dispositions=()):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent=PR_REVIEWER,
+            round_number=round_number,
+            subject=head,
+            state=state,
+            new_items=tuple(new),
+            prior_items=tuple(prior),
+            dispositions=tuple(dispositions),
+        ),
+        body="",
+    )
+
+
+def _pr_coder(index, round_number, head, *, entries=(), raw=None):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="pr",
+            role="coder",
+            agent="Claude",
+            round_number=round_number,
+            subject=head,
+            step_back_entries=tuple(entries),
+            raw_structured_coder_response=raw,
+        ),
+        body="",
+    )
+
+
+def _pr_entry(*, trigger_round=3, head=HEAD_A, path="src/spool.py", start=100, end=105):
+    return {
+        "phase": "pr",
+        "reviewer": PR_REVIEWER,
+        "trigger_round": trigger_round,
+        "trigger_head": head,
+        "anchor": {"path": path, "start": start, "end": end},
+    }
+
+
+def _identity_mapper(from_head, to_head, path, start, end):
+    return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+
+def test_project_finding_locations_reads_parent_fix_scope_and_sub_items():
+    item = _pr_item(
+        "item-7",
+        "Undecodable file classified absent at `src/spool.py:124-131` and see also "
+        "https://example.com/x.py:9 and src/readme.md without a line",
+        fix_scope=("src/other.py:40",),
+        sub_items=(
+            ReviewSubItem("sub-1", "invalid identity at tests/test_spool.py:12-13"),
+            ReviewSubItem("sub-2", "already fixed at src/gone.py:5", status="resolved"),
+        ),
+    )
+    locations = sb.project_finding_locations(item)
+    assert [(loc.path, loc.start, loc.end, loc.item_id, loc.sub_item_id) for loc in locations] == [
+        ("src/spool.py", 124, 131, "item-7", None),
+        ("src/other.py", 40, 40, "item-7", None),
+        ("tests/test_spool.py", 12, 13, "item-7", "sub-1"),
+    ]
+
+
+def test_map_anchor_insertion_above_is_shifted():
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 40,
+        name_status="M\tsrc/a.py\n",
+        diff_text="@@ -10,0 +11,100 @@\n+x\n",
+    )
+    assert (mapping.outcome, mapping.start, mapping.end) == (sb.OUTCOME_SHIFTED, 200, 205)
+
+
+def test_map_anchor_in_window_rewrite_is_rewritten_without_widening_to_the_hunk():
+    # Old lines 98-110 replaced by 20 lines; anchor 100-105 lies inside the hunk.
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 40,
+        name_status="M\tsrc/a.py\n",
+        diff_text="@@ -98,13 +98,20 @@\n",
+    )
+    assert mapping.outcome == sb.OUTCOME_REWRITTEN
+    assert (mapping.start, mapping.end) == (98, 117)
+
+
+def test_map_anchor_rewrite_spilling_into_unrelated_code_is_unmappable():
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 10,
+        name_status="M\tsrc/a.py\n",
+        diff_text="@@ -60,80 +60,90 @@\n",
+    )
+    assert mapping.outcome == sb.OUTCOME_UNMAPPABLE
+    assert "unrelated" in mapping.reason
+
+
+def test_map_anchor_pure_deletion_or_move_is_unmappable():
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 40,
+        name_status="M\tsrc/a.py\n",
+        diff_text="@@ -99,8 +98,0 @@\n",
+    )
+    assert mapping.outcome == sb.OUTCOME_UNMAPPABLE
+    deleted = sb.map_anchor(
+        "src/a.py", 100, 105, 40, name_status="D\tsrc/a.py\n", diff_text=""
+    )
+    assert deleted.outcome == sb.OUTCOME_UNMAPPABLE and "deleted" in deleted.reason
+    assert sb.map_anchor(
+        "src/a.py", 1, 2, 40, name_status=None, diff_text=None
+    ).outcome == sb.OUTCOME_UNMAPPABLE
+
+
+def test_map_anchor_pairs_a_rename_to_a_different_directory():
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 40,
+        name_status="R095\tsrc/a.py\tlib/core/a.py\n",
+        diff_text="@@ -1,0 +2,3 @@\n",
+    )
+    assert (mapping.outcome, mapping.path, mapping.start, mapping.end) == (
+        sb.OUTCOME_SHIFTED, "lib/core/a.py", 103, 108,
+    )
+    assert mapping.original_path == "src/a.py"
+
+
+def test_in_cluster_uses_the_window_and_the_unmappable_fallback():
+    mapped = sb.AnchorMapping(sb.OUTCOME_SHIFTED, "src/a.py", "src/a.py", 100, 105)
+    near = sb.FindingLocation("src/a.py", 135, 135, "item-9")
+    far = sb.FindingLocation("src/a.py", 146, 146, "item-9")
+    other = sb.FindingLocation("src/b.py", 100, 100, "item-9")
+    assert sb.in_cluster(near, mapped, 40)
+    assert not sb.in_cluster(far, mapped, 40)
+    assert not sb.in_cluster(other, mapped, 40)
+    lost = sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, "src/a.py", "lib/a.py", 100, 105, "moved")
+    assert sb.in_cluster(far, lost, 40)
+    assert sb.in_cluster(sb.FindingLocation("lib/a.py", 900, 900, "x"), lost, 40)
+    assert not sb.in_cluster(other, lost, 40)
+
+
+def _loc(path, start, end, item="item-1"):
+    return sb.MappedLocation(path, start, end, item)
+
+
+def test_find_cluster_adjacent_overlapping_unrelated_and_missing():
+    adjacent = [[_loc("a.py", 124, 131)], [_loc("a.py", 133, 136)], [_loc("a.py", 150, 160)]]
+    cluster = sb.find_cluster(adjacent, 40)
+    assert (cluster.path, cluster.start, cluster.end) == ("a.py", 124, 160)
+    assert sb.find_cluster([[_loc("a.py", 1, 5)], [_loc("a.py", 3, 9)]], 0).end == 9
+    assert sb.find_cluster([[_loc("a.py", 1, 5)], [_loc("b.py", 1, 5)]], 40) is None
+    assert sb.find_cluster([[_loc("a.py", 1, 5)], [_loc("a.py", 500, 505)]], 40) is None
+    assert sb.find_cluster([[_loc("a.py", 1, 5)], []], 40) is None
+
+
+def _trigger_records(texts, *, heads=None):
+    heads = heads or [HEAD_A] * len(texts)
+    return [
+        _pr_review(
+            10 + n, n + 1, heads[n], new=[_pr_item(f"item-{n + 1}", text, round_number=n + 1)]
+        )
+        for n, text in enumerate(texts)
+    ]
+
+
+def test_cluster_trigger_needs_k_consecutive_clustered_new_findings():
+    records = _trigger_records(
+        ["gap src/spool.py:124-131", "gap src/spool.py:131-136", "gap src/spool.py:140"]
+    )
+    trigger = sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=_identity_mapper
+    )
+    assert trigger is not None
+    assert (trigger.cluster.path, trigger.cluster.start, trigger.cluster.end) == (
+        "src/spool.py", 124, 140,
+    )
+    assert trigger.trigger_head == HEAD_A and trigger.trigger_round == 3
+    assert sb.pr_step_back_entry_payload(trigger)["anchor"] == {
+        "path": "src/spool.py", "start": 124, "end": 140,
+    }
+    assert sb.find_pr_cluster_trigger(
+        records[1:], PR_REVIEWER, k=3, window=40, current_round=3, mapper=_identity_mapper
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "texts",
+    [
+        ["src/a.py:10", "src/b.py:10", "src/a.py:12"],  # unrelated files
+        ["src/a.py:10", "src/a.py:900", "src/a.py:12"],  # beyond the window
+        ["src/a.py:10", "no reference here", "src/a.py:12"],  # no line reference
+    ],
+)
+def test_cluster_trigger_ignores_unrelated_unparseable_and_distant_findings(texts):
+    assert sb.find_pr_cluster_trigger(
+        _trigger_records(texts), PR_REVIEWER, k=3, window=40, current_round=3,
+        mapper=_identity_mapper,
+    ) is None
+
+
+def test_cluster_trigger_ignores_repeat_only_and_unmappable_locations():
+    records = _trigger_records(["src/a.py:10", "src/a.py:11", "src/a.py:12"])
+    repeat = _pr_review(
+        40, 3, HEAD_A,
+        prior=[_pr_item("item-2", "src/a.py:11")],
+        dispositions=[ReviewItemDisposition("item-2", PR_REVIEWER, "blocking")],
+    )
+    assert sb.find_pr_cluster_trigger(
+        [*records[:2], repeat], PR_REVIEWER, k=3, window=40, current_round=3,
+        mapper=_identity_mapper,
+    ) is None
+
+    def lost(from_head, to_head, path, start, end):
+        return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "moved")
+
+    mixed = _trigger_records(["src/a.py:10", "src/a.py:11", "src/a.py:12"], heads=[HEAD_B, HEAD_B, HEAD_A])
+    assert sb.find_pr_cluster_trigger(
+        mixed, PR_REVIEWER, k=3, window=40, current_round=3, mapper=lost
+    ) is None
+
+
+def test_cluster_trigger_maps_older_locations_to_the_newest_head():
+    def shift(from_head, to_head, path, start, end):
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start + 100, end + 100)
+
+    records = _trigger_records(
+        ["src/a.py:10", "src/a.py:110", "src/a.py:111"], heads=[HEAD_B, HEAD_A, HEAD_A]
+    )
+    trigger = sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=0, current_round=3, mapper=shift
+    )
+    assert trigger is not None and (trigger.cluster.start, trigger.cluster.end) == (110, 111)
+
+
+def test_cluster_trigger_rearms_only_from_reviews_after_a_step_back():
+    records = [
+        *_trigger_records(["src/a.py:10", "src/a.py:11", "src/a.py:12"]),
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]),
+        _pr_review(60, 4, HEAD_B, new=[_pr_item("item-9", "src/a.py:13", round_number=4)]),
+    ]
+    assert sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=4, mapper=_identity_mapper
+    ) is None
+
+
+def test_malformed_pr_step_back_entries_suppress_trigger_and_episode():
+    bad = PostedRoundRecord(
+        index=45,
+        metadata=PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=4, subject=HEAD_B,
+            step_back_status="invalid",
+        ),
+        body="",
+    )
+    records = [*_trigger_records(["src/a.py:10", "src/a.py:11", "src/a.py:12"]), bad]
+    assert sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=_identity_mapper
+    ) is None
+    assert sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=_identity_mapper).entry is None
+
+
+def _episode(*extra, window=40):
+    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]), *extra]
+    return sb.derive_pr_episode(records, PR_REVIEWER, window=window, mapper=_identity_mapper)
+
+
+def test_sweep_sibling_in_the_cluster_escalates_even_when_located_only_in_a_sub_item():
+    sibling = _pr_item(
+        "item-12",
+        "Another spool branch is misclassified",
+        round_number=4,
+        sub_items=(
+            ReviewSubItem("sub-1", "branch at src/spool.py:130 treats it as absent"),
+            ReviewSubItem("sub-2", "elsewhere at src/other.py:5"),
+        ),
+    )
+    result = _episode(_pr_review(60, 4, HEAD_B, new=[sibling]))
+    assert result.entry is not None and result.sibling_round == 4
+    assert [(loc.item_id, loc.sub_item_id) for loc in result.siblings] == [("item-12", "sub-1")]
+
+
+def test_carried_item_does_not_escalate_but_keeps_the_episode_open():
+    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
+    result = _episode(
+        _pr_review(
+            60, 4, HEAD_B, prior=[carried],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        )
+    )
+    assert result.entry is not None and not result.siblings
+
+
+def test_findings_outside_the_cluster_neither_escalate_nor_close_the_episode():
+    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
+    unrelated = _pr_item("item-12", "unrelated src/other.py:5", round_number=4)
+    result = _episode(
+        _pr_review(
+            60, 4, HEAD_B, new=[unrelated], prior=[carried],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        )
+    )
+    assert result.entry is not None and not result.siblings
+
+
+def test_clearance_and_escalation_share_the_window_membership_rule():
+    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
+    keep_open = _pr_review(
+        60, 4, HEAD_B, prior=[carried],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+    )
+    sibling = _pr_review(
+        70, 5, HEAD_B,
+        new=[_pr_item("item-13", "src/spool.py:135", round_number=5)],
+        prior=[carried],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+    )
+    live = _episode(keep_open, sibling)
+    assert live.entry is not None and live.sibling_round == 5
+    # A resume replays the same records and reaches the same decision.
+    assert _episode(keep_open, sibling).sibling_round == 5
+    # Once the carried in-window item is resolved the episode closes, so a later
+    # sibling is an ordinary finding that can re-arm the trigger.
+    resolved = _pr_review(
+        61, 4, HEAD_B, prior=[carried],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "resolved")],
+    )
+    later = _pr_review(
+        71, 5, HEAD_B, new=[_pr_item("item-13", "src/spool.py:135", round_number=5)]
+    )
+    assert _episode(resolved, later).entry is None
+
+
+def test_approval_closes_the_pr_episode():
+    assert _episode(_pr_review(60, 4, HEAD_B, state="approved")).entry is None
+
+
+def test_unmappable_anchor_escalates_on_any_same_path_finding():
+    def lost(from_head, to_head, path, start, end):
+        return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "moved")
+
+    records = [
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]),
+        _pr_review(60, 4, HEAD_B, new=[_pr_item("item-12", "src/spool.py:900", round_number=4)]),
+    ]
+    result = sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=lost)
+    assert result.siblings and not result.mapping.mappable
+    message = sb.render_pr_step_back_human_decision(
+        reviewer=PR_REVIEWER, entry=result.entry, mapping=result.mapping,
+        siblings=result.siblings, window=40, generalization=None, sibling_round=4,
+    )
+    assert "UNMAPPABLE" in message and "--pr-step-back-rounds 0" in message
+
+
+def test_sweep_entries_bind_to_the_resulting_head_and_round_only():
+    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()])]
+    assert set(sb.pr_sweep_entries(records, round_number=4, head_sha=HEAD_B)) == {PR_REVIEWER}
+    assert sb.pr_sweep_entries(records, round_number=4, head_sha=HEAD_C) == {}
+    assert sb.pr_sweep_entries(records, round_number=5, head_sha=HEAD_B) == {}
+    assert sb.pr_sweep_entries(records, round_number=4, head_sha=None) == {}
+
+
+def test_generalization_is_reconstructed_from_the_stored_structured_response():
+    raw = json.dumps({"kind": "coder_followup", "summary": "Generalization: any malformed record"})
+    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=raw)]
+    entry = sb.pr_step_back_history(records, PR_REVIEWER)[0][0]
+    assert sb.step_back_generalization(records, entry) == "Generalization: any malformed record"
+    assert sb.step_back_generalization([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()])], entry) is None
+
+
+def test_pr_step_back_entry_round_trips_through_round_metadata():
+    metadata = _pr_coder(1, 4, HEAD_B, entries=[_pr_entry()]).metadata
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.step_back_status == "valid"
+    assert decoded.step_back_entries[0]["anchor"] == {"path": "src/spool.py", "start": 100, "end": 105}

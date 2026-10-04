@@ -3158,6 +3158,55 @@ as a reviewer-owned `step_back_entries` field on the planner record; a malformed
 entry suppresses the trigger and the stop with a log line rather than failing the
 run.
 
+#### PR step-back, reviewer sweep, and sibling escalation
+
+The same pattern appears in the PR fix loop: a reviewer raises one new sibling of
+the previous finding in the same function every round, and the coder patches one
+branch per round. Two flags, valid under every PR review policy, make the loop act
+earlier.
+
+- `--pr-step-back-rounds K` (default 3, `0` disables). When a tracked reviewer
+  (each configured reviewer, or only the primary under `primary-then-panel`) has
+  blocked K consecutive rounds with **new** mandatory findings, and those findings'
+  `path:line-range` references cluster on one file span, the next coder turn is a
+  step-back: do not patch only the newest finding, name the common root, fix the
+  whole class with one rule, add a parametrized test covering every branch, and
+  begin the `summary` with `Generalization:` and the rule. Repeats of an unresolved
+  finding, future follow-ups, findings without a line reference, and blocks on
+  unrelated files do not count. Reviewers that omit line references never trigger
+  it. Several reviewers triggering at once share one coder turn.
+- `--pr-step-back-line-window N` (default 40, minimum 0). Findings join one cluster
+  when the gap between their mapped ranges is at most N lines, and a later finding
+  is a sibling when it lies within N lines of the mapped cluster.
+
+References are projected from the finding text, its `fix_scope`, and every
+sub-item statement, and are compared across heads through `git diff` hunks, so the
+coder's own pushes do not hide or invent siblings. A location is `SHIFTED`
+(unchanged lines, moved by the cumulative offset), `REWRITTEN` (replaced within the
+window), or `UNMAPPABLE` (the file was deleted with no rename pair, the rewrite
+spilled beyond the window, the code was deleted or moved elsewhere, or the diff
+could not be read). Renames are paired without a pathspec. An unmappable anchor
+falls back, with a log line and a note in the stop message, to treating any finding
+on the same path as a sibling.
+
+The review of the step-back head, and only that review, asks each triggering
+reviewer for a **sweep**: enumerate every remaining instance of the pattern with a
+`path:line` reference, as no finding (none left), a plain finding (one), one finding
+with sub-items (2-12), or several findings of at most 12 sub-items each (more). The
+general reviewer contract is unchanged in every other round.
+
+If the sweep review, or any later review while the episode is active, introduces a
+new mandatory finding in the cluster, the run stops with a human-decision message
+before any further coder turn: continue (rerun with `--pr-step-back-rounds 0`),
+accept a stated limitation, or redesign. The message names the cluster, the mapping
+outcome, the sibling findings, and the coder's `Generalization:` excerpt. A carried
+item is not a sibling and keeps the episode open while it is in the cluster; the
+episode closes when the reviewer approves or no unresolved mandatory item of theirs
+remains in the cluster. The orchestrator records the step-back as reviewer-owned
+`step_back_entries` on the coder record (never from agent output), so a resumed run
+rebuilds the sweep for any reviewer whose review of that head is unpublished and
+never re-requests a published one.
+
 #### Qualified panel evidence
 
 A qualified panel opening is derived from comment order: an operator-sourced

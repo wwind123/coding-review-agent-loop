@@ -933,6 +933,31 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--pr-step-back-rounds",
+            type=int,
+            default=None,
+            metavar="K",
+            help=(
+                "In the PR fix loop, once a tracked reviewer has blocked K consecutive "
+                "rounds with new mandatory findings whose file:line references cluster on "
+                "one file span, make the next coder turn generalize the class with one "
+                "rule and ask that reviewer to sweep for every remaining instance "
+                "(default: 3; 0 disables). A further clustered sibling afterwards stops "
+                "for a human decision."
+            ),
+        )
+        subparser.add_argument(
+            "--pr-step-back-line-window",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "Maximum line gap for PR step-back findings to count as one cluster, and "
+                "the window around a step-back anchor that counts as a sibling "
+                "(default: 40; minimum 0)."
+            ),
+        )
+        subparser.add_argument(
             "--plan-reset-stall-streak",
             dest="plan_reset_stall_streak",
             action="store_true",

@@ -5235,3 +5235,127 @@ def test_step_back_review_notice_appears_in_both_review_prompt_branches(tmp_path
         assert "Judge the alternative on its merits" in with_notice
         assert "whether the direction is acceptable" in with_notice
         assert "Step-back notice" not in without
+
+
+# --- PR fix-loop step-back (#1251, stage 2) ---------------------------------
+
+
+def _step_back_trigger():
+    from coding_review_agent_loop import review_step_back as sb
+
+    return sb.PrClusterTrigger(
+        reviewer="OpenAI Codex",
+        trigger_round=3,
+        trigger_head="a" * 40,
+        cluster=sb.Cluster("src/review_spool.py", 124, 136, ("item-1", "item-2")),
+        findings=("[item-1] (round 2) undecodable file classified absent",),
+    )
+
+
+def test_step_back_context_replaces_the_same_pr_small_cleanup_framing(tmp_path):
+    from coding_review_agent_loop import review_step_back as sb
+
+    config = make_config(tmp_path)
+    guidance = sb.render_pr_step_back_coder_guidance([_step_back_trigger()])
+    ordinary = build_same_pr_followup_prompt(77, 3, "Tighten docs.", config)
+    stepped = build_same_pr_followup_prompt(
+        77, 3, "Tighten docs.", config, step_back_context=guidance
+    )
+    assert "small, localized cleanup" in ordinary
+    assert "STEP-BACK TURN" not in ordinary
+    assert "small, localized cleanup" not in stepped
+    assert "Do not patch only the newest finding" in stepped
+    assert "src/review_spool.py` lines 124-136" in stepped
+    assert "parametrized test" in stepped and "`Generalization:`" in stepped
+    # The generalization rides the existing coder_followup summary: no new section.
+    assert "## Generalization" not in stepped
+
+
+def test_step_back_context_is_added_to_the_blocking_followup_prompt(tmp_path):
+    from coding_review_agent_loop import review_step_back as sb
+
+    config = make_config(tmp_path)
+    guidance = sb.render_pr_step_back_coder_guidance([_step_back_trigger()])
+    assert "STEP-BACK TURN" not in build_followup_prompt(77, 3, "Needs tests.", config)
+    stepped = build_followup_prompt(77, 3, "Needs tests.", config, step_back_context=guidance)
+    assert "STEP-BACK TURN" in stepped and "Needs tests." in stepped
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_sweep_context_reaches_only_the_bound_review_prompt_in_both_branches(tmp_path, compact):
+    from coding_review_agent_loop import review_step_back as sb
+
+    config = make_config(tmp_path, pr_review_context_mode="compact")
+    entry = sb.PrStepBackEntry(
+        reviewer="OpenAI Codex", trigger_round=3, trigger_head="a" * 40,
+        path="src/review_spool.py", start=124, end=136, coder_round=4,
+        resulting_head="b" * 40, record_index=9,
+    )
+    sweep = sb.render_pr_sweep_guidance(entry)
+    kwargs = dict(reviewer="codex", compact_context=compact)
+    if compact:
+        kwargs["compact_prior"] = CompactPriorContext(())
+    plain = build_review_prompt(77, 4, config, **kwargs)
+    swept = build_review_prompt(77, 4, config, sweep_context=sweep, **kwargs)
+    assert "Sweep (orchestrator" not in plain
+    assert "Enumerate ALL remaining instances" in swept
+    assert "src/review_spool.py" in swept
+
+
+def test_sweep_guidance_states_the_output_shape_for_every_instance_count():
+    from coding_review_agent_loop import review_step_back as sb
+
+    text = sb.render_pr_sweep_guidance(
+        sb.PrStepBackEntry("Codex", 3, "a" * 40, "src/x.py", 1, 5, 4, "b" * 40, 1)
+    )
+    assert "no remaining instance means no finding" in text
+    assert "one instance is one plain finding" in text
+    assert "2-12 instances are one finding whose `sub_items`" in text
+    assert "more than 12 are several findings" in text and "at most 12" in text
+
+
+def _sweep_review(blocking_items):
+    payload = {
+        "schema_version": 1, "kind": "pr_review", "state": "blocking", "summary": "s",
+        "blocking_items": blocking_items, "prior_item_dispositions": [],
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex"
+
+
+@pytest.mark.parametrize("count", [1, 2, 12])
+def test_sweep_output_with_up_to_twelve_instances_parses_without_degradation(count):
+    from coding_review_agent_loop import review_step_back as sb
+    from coding_review_agent_loop.protocol import parse_structured_pr_review
+
+    refs = [f"branch at src/spool.py:{100 + n}" for n in range(count)]
+    finding = refs[0] if count == 1 else {"text": "same class", "sub_items": refs}
+    parsed = parse_structured_pr_review(_sweep_review([finding]), reviewer="Codex")
+    assert parsed.sub_item_degradations == ()
+    item = parsed.blocking_items[0]
+    texts = [item.text, *item.sub_items]
+    located = {
+        loc.start
+        for loc in sb._scan_locations("\n".join(texts), item_id="x", sub_item_id=None)
+    }
+    assert located == {100 + n for n in range(count)}
+
+
+def test_sweep_output_over_twelve_instances_must_be_split_into_bounded_findings():
+    from coding_review_agent_loop.protocol import parse_structured_pr_review
+
+    refs = [f"branch at src/spool.py:{100 + n}" for n in range(13)]
+    single = parse_structured_pr_review(
+        _sweep_review([{"text": "all", "sub_items": refs}]), reviewer="Codex"
+    )
+    assert single.sub_item_degradations  # one 13-way finding degrades, hence the split
+    split = parse_structured_pr_review(
+        _sweep_review(
+            [
+                {"text": "first twelve", "sub_items": refs[:12]},
+                refs[12],
+            ]
+        ),
+        reviewer="Codex",
+    )
+    assert split.sub_item_degradations == ()
+    assert len(split.blocking_items[0].sub_items) == 12
