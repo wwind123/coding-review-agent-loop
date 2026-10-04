@@ -133,6 +133,11 @@ class ReviewRoundSpool:
             or any(payload.get(key) != value for key, value in self._identity().items())
             or payload.get("reviewer") != reviewer_name
         ):
+            # The path is derived from this round's identity, so a record here
+            # with a damaged schema or identity is not "foreign": when it still
+            # carries publication state it may hide a published prefix.
+            if "publication" in payload or "carrier_protocol" in payload:
+                return "malformed", None
             return "absent", None
         if "publication" in payload:
             publication = payload.get("publication")

@@ -578,3 +578,27 @@ def test_launcher_refuses_a_fresh_turn_beside_an_undecodable_record_without_publ
             spool=spool, replay_turn=lambda reviewer, fields: None,
         )
     assert invoked == [] and spool._path(REVIEWER).exists()
+
+
+@pytest.mark.parametrize("damage", ["subject", "repo", "number", "round_number", "schema_version", "reviewer"])
+def test_a_carrier_bearing_record_with_damaged_identity_is_malformed_not_absent(tmp_path, damage):
+    spool = _spool(tmp_path)
+    path = spool._path(REVIEWER)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["publication"] = {"bodies": ["x"]}
+    payload["carrier_protocol"] = 1
+    if damage == "reviewer":
+        payload["reviewer"] = "Someone Else"
+    elif damage == "schema_version":
+        payload["schema_version"] = 99
+    else:
+        payload.pop(damage)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert spool.publication_state(REVIEWER)[0] == "malformed"
+    assert spool.load(REVIEWER) is None  # load() compatibility is preserved
+    assert path.exists()
+    # Without any carrier evidence the same damage is still just a foreign record.
+    payload.pop("publication")
+    payload.pop("carrier_protocol")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert spool.publication_state(REVIEWER)[0] == "absent"
