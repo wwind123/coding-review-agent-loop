@@ -5919,6 +5919,18 @@ candidate and the surfaced requirements) and a baseline of already-identical
 comments. A rerun, at any later time, never recomposes those bodies and never
 re-invokes the reviewer:
 
+- Every existing record is checked first, before a new scheduler checkpoint and
+  before any reviewer launches, including a reviewer whose anchor is already
+  public (its carrier is never discarded unchecked). The verified missing suffix
+  is posted at that point unless some reviewer still needs a fresh turn, in which
+  case posting waits for the round to settle so no fresh reviewer reads a newly
+  public peer body.
+- Publication does not begin without a usable carrier: if the authenticated actor
+  or a complete pre-publication baseline listing is unavailable, the run stops
+  before the first post with the validated response still spooled.
+- Listings are compared exactly after the single known host footer is removed, so
+  a stored body with a doubled footer is neither adopted nor counted public, and a
+  listing comment without a text body makes the listing incomplete.
 - It re-runs the normal validation of the spooled response, checks the response
   and context digests and the anchor's round metadata, and requires the same
   authenticated actor ID. Any mismatch stops with a diagnostic, the record kept,

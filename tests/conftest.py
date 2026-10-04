@@ -129,3 +129,41 @@ def _isolate_store_locks(tmp_path_factory):
 
 
 pytest_plugins = ["_ci_shard"]
+
+
+class _InertRoundPublication:
+    """Stands in for a freeze/resume hook when a fake runner models no actor surface."""
+
+    def prepare(self, prepared):
+        from coding_review_agent_loop.publication_resume import PreparedPublication
+
+        return PreparedPublication(tuple(str(body) for body in prepared))
+
+    def gate(self, *, published=False):
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _round_publication_needs_an_actor_surface(monkeypatch):
+    """Freeze spooled bodies only for runners that model the REST actor surface (#1258).
+
+    A frozen carrier is actor-bound with a complete baseline listing, and
+    publication refuses to start without one.  The historical orchestrator fakes
+    model neither, so they get an inert hook; tests that opt in with
+    ``authenticated_actor`` and ``serve_rest_issue_comments`` exercise the real one.
+    """
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop
+    import coding_review_agent_loop.pr_loop as pr_loop
+
+    real = pr_loop.round_publication
+
+    def maybe(runner, **kwargs):
+        if (
+            getattr(runner, "authenticated_actor", None) is not None
+            and getattr(runner, "serve_rest_issue_comments", False)
+        ):
+            return real(runner, **kwargs)
+        return _InertRoundPublication()
+
+    monkeypatch.setattr(pr_loop, "round_publication", maybe)
+    monkeypatch.setattr(plan_first_loop, "round_publication", maybe)

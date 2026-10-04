@@ -31,7 +31,6 @@ from dataclasses import dataclass
 
 from .errors import AgentLoopError
 from .logging import log
-from .protocol_markers import stored_body_matches_posted
 from .review_spool import ReviewRoundSpool
 from .round_transport import ROUND_RESUME_MARKER_RE, decode_mapping, is_round_transport_sidecar
 
@@ -172,7 +171,7 @@ def classify_frozen_sequence(
         candidates = [
             c.comment_id  # type: ignore[attr-defined]
             for c in ordered
-            if stored_body_matches_posted(c.body, text)[0]  # type: ignore[attr-defined]
+            if c.body == text  # type: ignore[attr-defined]
             and c.created >= floor  # type: ignore[attr-defined]
             and c.comment_id not in baseline  # type: ignore[attr-defined]
         ]
@@ -280,6 +279,26 @@ class RoundPublication:
         )
 
     # -- entry -------------------------------------------------------------
+    def gate(self, *, published: bool = False) -> PreparedPublication | None:
+        """Run every stop condition for an existing record without posting.
+
+        Returns the resume plan of a frozen carrier, or ``None`` for a record
+        with nothing to resume.  A legacy record whose reviewer is already
+        public is not re-checked (its own anchor would look like prior
+        publication); its carrier-less record is simply discarded later.
+        """
+        state, raw = self.spool.publication_state(self.reviewer_name)
+        if state == "malformed":
+            raise self._stop("its frozen publication carrier is malformed.")
+        if state == "legacy":
+            if not published:
+                self._check_legacy()
+            return None
+        if state == "carrier":
+            assert raw is not None
+            return self._resume(raw)
+        return None
+
     def prepare(self, prepared: Sequence[object]) -> PreparedPublication:
         state, raw = self.spool.publication_state(self.reviewer_name)
         bodies = tuple(str(body) for body in prepared)
@@ -297,27 +316,30 @@ class RoundPublication:
 
     # -- freeze ------------------------------------------------------------
     def _freeze(self, bodies: tuple[str, ...]) -> None:
+        """Persist the carrier before the first post, or stop without posting.
+
+        A carrier that is not actor-bound with a complete baseline could never
+        be resumed safely, so publication does not begin without one; the
+        validated response stays spooled and a rerun retries the freeze.
+        """
         fields = self.spool.load(self.reviewer_name)
         assert fields is not None
         prepared_at = datetime.datetime.now(datetime.timezone.utc)
-        actor_id: int | None = None
-        actor_login: str | None = None
-        baseline: tuple[int, ...] | None = None
         try:
             actor_login, actor_id = self.resolve_actor()
-        except AgentLoopError:
-            actor_id = actor_login = None
-        if actor_id is not None:
-            listing = self.list_comments(True)
-            comments = getattr(listing, "comments", None)
-            if comments is not None:
-                baseline = tuple(
-                    sorted(
-                        c.comment_id
-                        for c in comments
-                        if any(stored_body_matches_posted(c.body, body)[0] for body in bodies)
-                    )
-                )
+        except AgentLoopError as exc:
+            raise self._stop(
+                f"a publication carrier could not be frozen because the authenticated actor "
+                f"is unavailable ({exc})."
+            ) from exc
+        listing = self.list_comments(True)
+        comments = getattr(listing, "comments", None)
+        if comments is None:
+            raise self._stop(
+                "a publication carrier could not be frozen because the pre-publication "
+                f"baseline listing is incomplete ({getattr(listing, 'reason', 'unknown reason')})."
+            )
+        baseline = tuple(sorted(c.comment_id for c in comments if c.body in bodies))
         carrier = PublicationCarrier(
             bodies=bodies,
             body_sha256=tuple(_sha256(body) for body in bodies),

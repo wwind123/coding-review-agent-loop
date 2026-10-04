@@ -390,6 +390,7 @@ class FakeGitHub:
         self.dry_run = False
         self.patch_applied: dict[int, str] = {}
         self.reread_fails = False
+        self.reread_override: str | None = None
 
     # -- helpers -----------------------------------------------------------
     def add(self, body, *, author=None, created=None):
@@ -447,6 +448,8 @@ class FakeGitHub:
         if match and "--method" not in cmd:
             if self.reread_fails:
                 return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+            if self.reread_override is not None:
+                return self._res(0, out=self.reread_override)
             for comment in self.comments:
                 if comment["id"] == int(match.group(1)):
                     return self._res(0, out=json.dumps(comment))
@@ -771,3 +774,16 @@ def test_patch_exhaustion_keeps_history(tmp_path, quiet, sleeps):
     with pytest.raises(GitHubTransientExhaustedError, match="attempt 3"):
         _patch(fake, tmp_path, comment["id"])
     assert len(fake.writes) == 3
+
+
+@pytest.mark.parametrize(
+    "override",
+    ["{}", '{"id": 101, "body": null}', '{"id": 9999, "body": "x"}', "[]", "{not json"],
+)
+def test_patch_malformed_readback_never_authorizes_replay(tmp_path, quiet, sleeps, override):
+    fake = FakeGitHub(["fail"])
+    comment = fake.add("old")
+    fake.reread_override = override
+    with pytest.raises(GitHubAmbiguousWriteError):
+        _patch(fake, tmp_path, comment["id"])
+    assert len(fake.writes) == 1

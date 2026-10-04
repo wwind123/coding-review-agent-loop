@@ -55,7 +55,7 @@ from .protocol_markers import (
     strip_known_host_footer,
 )
 from . import github_retry
-from .publication_resume import RoundPublication
+from .publication_resume import PreparedPublication, RoundPublication
 from .review_spool import ReviewRoundSpool
 from .github_retry import (
     DEFAULT_POLICY,
@@ -2664,6 +2664,28 @@ def round_publication(
     )
 
 
+def post_frozen_round_bodies(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    surface_kind: str,
+    number: int,
+    plan: "PreparedPublication",
+) -> int:
+    """Post exactly the frozen bodies not yet public, in order; return how many."""
+    command = [PR_THREAD_SURFACE if surface_kind == PR_THREAD_SURFACE else "issue", "comment", str(number)]
+    claimed: set[int] = set()
+    posted = 0
+    for index, body in enumerate(plan.bodies, start=1):
+        if index in plan.already_public:
+            continue
+        _post_comment_body(
+            runner, config=config, command=command, body=body, claimed=claimed, body_index=index
+        )
+        posted += 1
+    return posted
+
+
 def post_pr_comment(
     runner: Runner,
     *,
@@ -2990,7 +3012,11 @@ def note_host_footer_observed(config: AgentLoopConfig | None, context: str) -> N
 
 
 def _authenticated_comment_from_rest(
-    raw: object, *, surface: str, config: AgentLoopConfig | None = None
+    raw: object,
+    *,
+    surface: str,
+    config: AgentLoopConfig | None = None,
+    require_body: bool = False,
 ) -> AuthenticatedComment:
     """Build one authenticated envelope from a raw REST comment.
 
@@ -3005,6 +3031,11 @@ def _authenticated_comment_from_rest(
             f"Authenticated comment read of {surface} returned a comment without an author."
         )
     body = raw.get("body")
+    if require_body and not isinstance(body, str):
+        raise AgentLoopError(
+            f"Authenticated comment read of {surface} returned comment {raw.get('id')!r} "
+            "without a text body."
+        )
     if isinstance(body, str):
         body, footered = strip_known_host_footer(body)
         if footered:
@@ -3027,6 +3058,7 @@ def _read_comment_pages(
     surface: str,
     number: int,
     since: datetime.datetime | None = None,
+    require_body: bool = False,
 ) -> list[AuthenticatedComment]:
     """Page one conversation exhaustively; any defect raises (never a partial list)."""
     page_size = 100
@@ -3073,7 +3105,7 @@ def _read_comment_pages(
             )
         for raw_comment in raw_page:
             envelope = _authenticated_comment_from_rest(
-                raw_comment, surface=surface, config=config
+                raw_comment, surface=surface, config=config, require_body=require_body
             )
             if envelope.comment_id in seen_ids:
                 raise AgentLoopError(
@@ -3168,7 +3200,8 @@ def read_complete_comment_listing(
         if actor:
             actor_id = resolve_authenticated_github_actor(runner, config=config)[1]
         envelopes = _read_comment_pages(
-            runner, config=config, surface=surface, number=number, since=since
+            runner, config=config, surface=surface, number=number, since=since,
+            require_body=True,
         )
     except (AgentLoopError, OSError) as exc:
         # An unusable working directory (for example a not-yet-cloned checkout)
@@ -3255,7 +3288,7 @@ def post_comment_with_reconciliation(
     baseline_ids: set[int] | None = None
     if isinstance(baseline, CompleteCommentListing):
         baseline_ids = {
-            c.comment_id for c in baseline.comments if stored_body_matches_posted(c.body, body)[0]
+            c.comment_id for c in baseline.comments if c.body == body
         }
     history: list[GitHubAttempt] = []
     for number in range(1, active.attempts + 1):
@@ -3294,7 +3327,7 @@ def post_comment_with_reconciliation(
         candidates = [
             c
             for c in listing.comments
-            if stored_body_matches_posted(c.body, body)[0]
+            if c.body == body
             and c.created >= window_start
             and c.comment_id not in baseline_ids
             and c.comment_id not in claimed
@@ -3696,12 +3729,17 @@ def patch_verified_trusted_protocol_comment_observed(
                 envelope = json.loads(reread.stdout or "{}")
             except json.JSONDecodeError:
                 envelope = None
-        if not isinstance(envelope, dict):
+        if (
+            not isinstance(envelope, dict)
+            or envelope.get("id") != comment_id
+            or not isinstance(envelope.get("body"), str)
+        ):
             raise GitHubAmbiguousWriteError(
                 _ambiguity_message(
                     what="Protocol comment update", surface=f"comment {comment_id}",
                     body_index=None, outcome="unknown", attempts=history,
-                    detail="The comment could not be re-read." + _failure_detail(reread),
+                    detail="The comment could not be re-read as a valid envelope for this ID."
+                    + _failure_detail(reread),
                 ),
                 tuple(history),
             )

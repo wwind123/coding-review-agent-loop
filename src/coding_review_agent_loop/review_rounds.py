@@ -648,6 +648,61 @@ def _replay_spooled_review(
     )
 
 
+def _preflight_spooled_publications(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    spool: ReviewRoundSpool,
+    reviewers: Sequence[AgentName],
+    validators_for: Callable[[str], dict[str, object]],
+    publication_for: Callable[[str], object],
+    published_names: Sequence[str] = (),
+    post_frozen: Callable[[object], object] | None = None,
+    defer_posting: bool = False,
+) -> None:
+    """Check every existing spool record before any checkpoint or reviewer launch (#1258).
+
+    A frozen carrier is revalidated in the current context, then bound to its
+    response, validation context and original actor, and its whole sequence is
+    classified against a complete listing.  A legacy record is checked across
+    every author.  Any failure raises with the record kept, nothing posted and
+    nothing launched.  Reviewers whose anchor is already public are still
+    checked, so a rerun can never discard a carrier unchecked.
+
+    The missing suffix of a verified carrier is posted here (before a new
+    checkpoint) unless ``defer_posting`` -- some reviewer still needs a fresh
+    turn, which must not run beside a newly public peer body (#1025).
+    """
+    published = set(published_names)
+    for reviewer in reviewers:
+        name = agent_display_name(reviewer)
+        state, _raw = spool.publication_state(name)
+        if state in {"absent", "fresh"}:
+            continue
+        if state == "carrier":
+            fields = spool.load(name)
+            replayed = (
+                _replay_spooled_review(
+                    runner, config=config, reviewer=reviewer, fields=fields,
+                    validators=validators_for(name),
+                )
+                if fields is not None and "failure" not in fields
+                else None
+            )
+            if replayed is None:
+                raise PublicationResumeStop(
+                    f"{name}'s frozen same-round publication no longer validates in this run's "
+                    "context, so it cannot be resumed. The spool record was kept, nothing was "
+                    "posted, and no reviewer was launched; repair the round with the "
+                    "partial-round recovery list (#1142)."
+                )
+        plan = publication_for(name).gate(published=name in published)  # type: ignore[attr-defined]
+        if plan is None or post_frozen is None or defer_posting:
+            continue
+        if len(plan.already_public) < len(plan.bodies):
+            post_frozen(plan)
+
+
 def _spooled_response_fields(response: ValidatedAgentResponse) -> dict[str, object]:
     return {
         "text": response.text,

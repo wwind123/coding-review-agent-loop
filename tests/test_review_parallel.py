@@ -4397,3 +4397,141 @@ def test_pr_parallel_legacy_record_with_foreign_sidecar_stops_before_any_post_or
     assert runner.reviewer_launches == launches_before
     assert len(runner.pr_payload["comments"]) == comments_before
     assert len(_spool_files(config)) == 1
+
+
+def _selective_interrupted_after_freeze(tmp_path):
+    """Round 1 (scheduler on): freeze the second reviewer's carrier, then fail before its first post."""
+    import coding_review_agent_loop.github as github_module
+
+    markers = ("Codex found a blocker.", "Gemini approves independently.")
+    runner, _ = _pr_partial_round_runner()
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
+        pr_review_policy="selective-intermediate",
+    )
+    real_post = orchestrator.post_pr_comment
+    state = {"reviews": 0}
+
+    def fail_second_review_body(*args, **kwargs):
+        if any(marker in str(kwargs["body"]) for marker in markers):
+            state["reviews"] += 1
+            if state["reviews"] == 2:
+                with patch.object(github_module, "_post_comment_body", side_effect=KeyboardInterrupt):
+                    return real_post(*args, **kwargs)
+        return real_post(*args, **kwargs)
+
+    with patch.object(orchestrator, "post_pr_comment", side_effect=fail_second_review_body):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    carriers = _frozen_carriers(config)
+    assert len(carriers) == 1
+    return runner, config, carriers[0]
+
+
+def _audit_indexes(runner):
+    return [
+        index for index, comment in enumerate(runner.pr_payload["comments"])
+        if "PR review scheduling audit" in comment["body"]
+    ]
+
+
+def test_pr_rerun_completes_the_frozen_suffix_before_a_new_scheduler_checkpoint(tmp_path):
+    runner, config, carrier = _selective_interrupted_after_freeze(tmp_path)
+    frozen_body = carrier["bodies"][-1]
+    audits_before = len(_audit_indexes(runner))
+    launches_before = len(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    comments = runner.pr_payload["comments"]
+    frozen_at = [i for i, c in enumerate(comments) if c["body"] == frozen_body]
+    assert len(frozen_at) == 1
+    new_audits = _audit_indexes(runner)[audits_before:]
+    assert new_audits and frozen_at[0] < new_audits[0]
+    assert runner.reviewer_launches[launches_before:].count("gemini") <= 1  # round 2 only
+
+
+def test_pr_refusals_publish_no_checkpoint_and_launch_no_reviewer(tmp_path):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, _carrier = _selective_interrupted_after_freeze(tmp_path)
+    launches_before = list(runner.reviewer_launches)
+    comments_before = len(runner.pr_payload["comments"])
+    runner.authenticated_actor = ("someone-else", 99)
+    orchestrator.reset_authenticated_github_actor(runner)
+
+    with pytest.raises(PublicationResumeStop, match="id 99"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert len(runner.pr_payload["comments"]) == comments_before  # no new checkpoint either
+    assert runner.reviewer_launches == launches_before
+    assert len(_frozen_carriers(config)) == 1
+
+
+def test_pr_already_public_anchor_is_still_checked_before_the_spool_is_discarded(tmp_path):
+    import datetime as dt
+
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, carrier = _selective_interrupted_after_freeze(tmp_path)
+    # GitHub accepted the frozen body but the interruption beat the spool removal.
+    runner.pr_payload["comments"].append({
+        "author": {"login": "agent-bot"}, "_rest_author_id": 7,
+        "createdAt": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "body": carrier["bodies"][-1],
+    })
+    comments_before = len(runner.pr_payload["comments"])
+    runner.authenticated_actor = ("someone-else", 99)
+    orchestrator.reset_authenticated_github_actor(runner)
+    with pytest.raises(PublicationResumeStop, match="id 99"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_frozen_carriers(config)) == 1 and len(runner.pr_payload["comments"]) == comments_before
+
+    runner.authenticated_actor = ("agent-bot", 7)
+    orchestrator.reset_authenticated_github_actor(runner)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert sum(c["body"] == carrier["bodies"][-1] for c in runner.pr_payload["comments"]) == 1
+    assert _spool_files(config) == []
+
+
+def test_pr_carrier_is_checked_before_a_fresh_peer_is_launched(tmp_path):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, _carrier = _selective_interrupted_after_freeze(tmp_path)
+    # The other reviewer's public review and spool record are gone, so it would
+    # need a fresh turn beside the frozen reviewer's partial publication.
+    runner.pr_payload["comments"] = [
+        c for c in runner.pr_payload["comments"]
+        if "Codex found a blocker." not in c["body"] and "Gemini approves independently." not in c["body"]
+    ]
+    launches_before = list(runner.reviewer_launches)
+    runner.authenticated_actor = ("someone-else", 99)
+    orchestrator.reset_authenticated_github_actor(runner)
+
+    with pytest.raises(PublicationResumeStop):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert runner.reviewer_launches == launches_before
+
+
+def test_plan_rerun_under_a_different_actor_stops_before_any_post_or_launch(tmp_path):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, markers = _plan_partial_round_runner()
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_plan_second_review_after_freezing(runner, config, markers)
+    launches_before = list(runner.reviewer_launches)
+    comments_before = len(runner.issue_comments)
+    runner.authenticated_actor = ("someone-else", 99)
+    orchestrator.reset_authenticated_github_actor(runner)
+
+    with pytest.raises(PublicationResumeStop, match="id 99"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert runner.reviewer_launches == launches_before
+    assert len(runner.issue_comments) == comments_before
+    assert len(_frozen_carriers(config)) == 1

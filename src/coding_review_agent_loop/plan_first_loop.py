@@ -63,6 +63,7 @@ from .github import (
     get_pr_state,
     post_issue_comment,
     read_rest_issue_comments,
+    post_frozen_round_bodies,
     round_publication,
     validate_pr_body_does_not_close_issue,
 )
@@ -261,6 +262,7 @@ from .review_rounds import (
     _ReviewerTurnResult,
     _review_round_spool,
     _replay_spooled_review,
+    _preflight_spooled_publications,
     _incomplete_plan_review_error,
     _refuse_partial_round_before_sequential_turns,
     _same_round_replay_or_invoke,
@@ -1606,6 +1608,68 @@ def _run_plan_first_loop(
         plan_panel_evidence = PlanPanelEvidence()
         plan_qualifying_approvals: tuple[str, ...] = ()
         plan_previous_key: PlanCandidateKey | None = None
+        # One private spool per round, shared by the parallel launcher and the
+        # sequential resume seam (#1025).
+        plan_round_spool = _review_round_spool(
+            config, surface="plan", number=issue_number,
+            round_number=round_number, subject=current_plan_subject,
+        )
+
+        def _plan_review_validators(reviewer_name: str) -> dict[str, object]:
+            return _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_plan_review_response(
+                text,
+                reviewer=reviewer_name,
+                unresolved_items=prior_unresolved_items,
+                # Never share the mutable round_new_unresolved_items list
+                # with concurrent workers (#594): it only enriches the
+                # UnknownPriorItemDispositionError message, so an empty
+                # tuple here changes no validation outcome.
+                current_round_items=(),
+                surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
+                    issue_context.human_requirements,
+                    requirement_scope="planning requirements",
+                ), architecture_status_mode=mode,
+            ))
+
+        def _plan_publication(reviewer_name: str):
+            return round_publication(
+                runner, config=config, spool=plan_round_spool,
+                reviewer_name=reviewer_name, flow="plan", round_number=round_number,
+                subject=current_plan_subject, surface_kind="issue", number=issue_number,
+                validation_context=publication_context_digest(
+                    candidate=(
+                        current_plan_key.as_dict() if staged_planning else current_plan_subject
+                    ),
+                    surfaced=sorted(str(item) for item in plan_hr_ids),
+                ),
+            )
+
+        plan_spool_preflight_done = [False]
+
+        def _plan_spool_preflight() -> None:
+            """Check every spool record before any checkpoint or reviewer launch (#1258)."""
+            if plan_spool_preflight_done[0]:
+                return
+            plan_spool_preflight_done[0] = True
+            published = [
+                record.metadata.agent
+                for record in (current_resume.completed_reviews if current_resume is not None else ())
+            ]
+            fresh_turn_needed = any(
+                agent_display_name(reviewer) not in published
+                and plan_round_spool.load(agent_display_name(reviewer)) is None
+                for reviewer in round_reviewers
+            )
+            _preflight_spooled_publications(
+                runner, config=config, spool=plan_round_spool, reviewers=configured_reviewers,
+                validators_for=_plan_review_validators, publication_for=_plan_publication,
+                published_names=published,
+                post_frozen=lambda plan: post_frozen_round_bodies(
+                    runner, config=config, surface_kind="issue", number=issue_number, plan=plan
+                ),
+                defer_posting=fresh_turn_needed,
+            )
+
         round_reviewers = tuple(configured_reviewers)
         # Under primary-then-panel, a non-compliant candidate the primary has
         # already approved can never pass, so the panel is not scheduled on it:
@@ -1810,6 +1874,7 @@ def _run_plan_first_loop(
                 f"calls_avoided_cumulative={plan_scheduler_calls_avoided}"
                 + (f"; {plan_amendment_note}" if plan_amendment_note else ""),
             )
+            _plan_spool_preflight()
             plan_posted_checkpoint = PostedRoundMetadata(
                 flow="plan",
                 role="summary",
@@ -1880,6 +1945,7 @@ def _run_plan_first_loop(
             )
             if plan_reset_round and plan_scheduler_decision.phase == "primary":
                 plan_reset_checkpoint_written = True
+        _plan_spool_preflight()
         use_compact_context = (
             config.planning_context_mode == "compact"
             and round_number >= 2
@@ -2061,19 +2127,7 @@ def _run_plan_first_loop(
             # A spooled reviewer's bodies are frozen before the first post so a
             # rerun after an outage resumes them verbatim (#1258).
             publication_hook = (
-                {
-                    "publication": round_publication(
-                        runner, config=config, spool=plan_round_spool,
-                        reviewer_name=reviewer_name, flow="plan", round_number=round_number,
-                        subject=current_plan_subject, surface_kind="issue", number=issue_number,
-                        validation_context=publication_context_digest(
-                            candidate=(
-                                current_plan_key.as_dict() if staged_planning else current_plan_subject
-                            ),
-                            surfaced=sorted(str(item) for item in plan_hr_ids),
-                        ),
-                    )
-                }
+                {"publication": _plan_publication(reviewer_name)}
                 if phase == "publication" and identity is not None
                 else {}
             )
@@ -2116,12 +2170,6 @@ def _run_plan_first_loop(
                 ),
             )
 
-        # One private spool per round, shared by the parallel launcher and the
-        # sequential resume seam (#1025).
-        plan_round_spool = _review_round_spool(
-            config, surface="plan", number=issue_number,
-            round_number=round_number, subject=current_plan_subject,
-        )
         # A round that holds withheld outcomes began as a parallel round; finish
         # it through the same withhold-then-publish launcher even when this run
         # is sequential, so no retried reviewer sees a same-round peer's body.
@@ -2241,22 +2289,6 @@ def _run_plan_first_loop(
                     f"Planning round {round_number}: invoking {', '.join(pending_plan_names)} "
                     f"in parallel on issue #{issue_number}",
                 )
-
-                def _plan_review_validators(reviewer_name: str) -> dict[str, object]:
-                    return _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_plan_review_response(
-                        text,
-                        reviewer=reviewer_name,
-                        unresolved_items=prior_unresolved_items,
-                        # Never share the mutable round_new_unresolved_items list
-                        # with concurrent workers (#594): it only enriches the
-                        # UnknownPriorItemDispositionError message, so an empty
-                        # tuple here changes no validation outcome.
-                        current_round_items=(),
-                        surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
-                            issue_context.human_requirements,
-                            requirement_scope="planning requirements",
-                        ), architecture_status_mode=mode,
-                    ))
 
                 def _plan_reviewer_worker(reviewer: AgentName) -> _ReviewerTurnResult:
                     reviewer_name = agent_display_name(reviewer)
