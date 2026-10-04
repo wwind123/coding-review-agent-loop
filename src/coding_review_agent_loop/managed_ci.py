@@ -40,6 +40,7 @@ from .github import (
     WrittenProtocolComment,
 )
 from .logging import log
+from .github_retry import describe_gh_failure, run_gh_read
 from .runner import Runner
 from .workdirs import active_workdir, github_api_cwd
 from .protocol_markers import (
@@ -6018,10 +6019,11 @@ def _activate_v2_managed_ci(
 
 def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[dict[str, object]] | None:
     """Fetch a paginated GitHub list, returning None for an uninspectable response."""
-    result = runner.run(
-        [config.gh_cmd, "api", "--paginate", endpoint], cwd=github_api_cwd(), check=False
+    result = run_gh_read(
+        runner, [config.gh_cmd, "api", "--paginate", endpoint], cwd=github_api_cwd(), check=False
     )
     if result.returncode != 0:
+        log(config, f"GitHub list read of {endpoint} failed: {describe_gh_failure(result)}")
         return None
     try:
         payload = json.loads(result.stdout or "[]")

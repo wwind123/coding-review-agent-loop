@@ -5835,6 +5835,40 @@ equivalence cannot be inferred safely. If a disputed claim is improperly
 re-filed as a fresh item, the coder gets one additional dispute on that new ID
 before the existing continued-blocking escalation applies.
 
+## Transient GitHub failures
+
+`src/coding_review_agent_loop/github_retry.py` holds one shared, bounded
+policy for transient `gh` failures (#510, stage 1 of #1257). Agent-subprocess
+retries in `transient.py` are unchanged, and arbitrary shell commands are never
+retried.
+
+- **Classification.** A failure is transient only for HTTP 500/502/503/504
+  (including `non-200 OK status code: 50x`, `Bad Gateway`, `Service
+  Unavailable`, `Gateway Timeout`), the GraphQL "couldn't respond to your
+  request in time" error, and transport failures (connection reset/refused,
+  `i/o timeout`, `TLS handshake timeout`, `unexpected EOF`). Any 4xx marker,
+  validation, `Resource not accessible`, authentication, billing, or rate-limit
+  text forces "permanent" even when a transient phrase also appears. HTTP 429
+  and secondary rate limits are deliberately not retried.
+- **Budget.** Three total attempts with exponential backoff (about 2s then 5s,
+  base delays `2, 5, 15`) and 25% jitter. The sleep is injectable so tests never
+  wait.
+- **Read-only retry.** `run_gh_read` retries only commands the caller asserts
+  are read-only (issue/PR views, lists, check polling, `gh api` GETs and
+  `--paginate` reads). No write is routed through it; a test guards this. A
+  permanent failure is attempted once and keeps the original `Command failed with
+  exit` message.
+- **Diagnostics.** Exhaustion with `check=True` raises
+  `GitHubTransientExhaustedError` (an `AgentLoopError`) carrying the final
+  stderr and one line per attempt. `check=False` callers receive a
+  `RetriedCommandResult` (a `CommandResult` subclass with `attempts` and
+  `exhausted`), and the public read paths that raise on a failed read include the
+  same history in their message.
+- **Dry run** bypasses the policy entirely.
+- **Not yet covered.** Writes (comments, issue creation, labels, ready, merge)
+  still make a single attempt; they need operation-specific reconciliation before
+  any replay and are delivered in later stages of #510.
+
 ## Logs
 
 Agent stdout/stderr is written to `.agent-loop-logs/` under the active coder

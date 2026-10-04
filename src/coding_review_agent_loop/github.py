@@ -54,6 +54,7 @@ from .protocol_markers import (
     stored_body_matches_posted,
     strip_known_host_footer,
 )
+from .github_retry import describe_gh_failure, run_gh_read
 from .runner import Runner
 from .workdirs import active_workdir, github_api_cwd
 
@@ -363,7 +364,7 @@ def _query_pr_commit_connection(
     ]
     if after is not None:
         args.extend(("-f", f"after={after}"))
-    result = runner.run(args, cwd=active_workdir(config), check=False)
+    result = run_gh_read(runner, args, cwd=active_workdir(config), check=False)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         error_type = _GraphQLRefusedError if is_graphql_refusal(detail) else AgentLoopError
@@ -509,13 +510,17 @@ REST_PR_COMMIT_LIMIT = 250
 
 
 def _rest_pr_object(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> tuple[str, int]:
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [config.gh_cmd, "api", f"repos/{config.repo}/pulls/{pr_number}"],
         cwd=active_workdir(config),
         check=False,
     )
     if result.returncode != 0:
-        raise AgentLoopError(f"GitHub REST read of PR #{pr_number} failed during commit provenance.")
+        raise AgentLoopError(
+            f"GitHub REST read of PR #{pr_number} failed during commit provenance."
+            + _failure_detail(result)
+        )
     data = _load_json_object(result, description=f"PR #{pr_number} for commit provenance")
     head = data.get("head")
     head_sha = head.get("sha") if isinstance(head, dict) else None
@@ -549,7 +554,8 @@ def _read_pull_request_commit_metadata_rest(
     commits: list[PullRequestCommitMetadata] = []
     seen_oids: set[str] = set()
     for page in range(1, REST_PR_COMMIT_LIMIT // page_size + 2):
-        result = runner.run(
+        result = run_gh_read(
+            runner,
             [
                 config.gh_cmd,
                 "api",
@@ -559,7 +565,10 @@ def _read_pull_request_commit_metadata_rest(
             check=False,
         )
         if result.returncode != 0:
-            raise AgentLoopError(f"GitHub REST commit page {page} for PR #{pr_number} failed.")
+            raise AgentLoopError(
+                f"GitHub REST commit page {page} for PR #{pr_number} failed."
+                + _failure_detail(result)
+            )
         try:
             items = json.loads(result.stdout or "null")
         except json.JSONDecodeError as exc:
@@ -772,8 +781,15 @@ def parse_linked_issue_numbers(pr_body: str | None, *, repo: str) -> tuple[int, 
     return tuple(numbers)
 
 
+def _failure_detail(result) -> str:
+    """Render ``describe_gh_failure`` as a message suffix (empty when blank)."""
+    detail = describe_gh_failure(result)
+    return f"\n{detail}" if detail else ""
+
+
 def detect_repo(runner: Runner, cwd: Path, gh_cmd: str) -> str:
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [gh_cmd, "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
         cwd=cwd,
     )
@@ -789,7 +805,8 @@ def get_repo_default_branch(
     config: AgentLoopConfig,
     cwd: Path,
 ) -> str | None:
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "repo",
@@ -814,7 +831,8 @@ def get_pr_state(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> 
     Raises AgentLoopError when the state cannot be determined (non-zero exit or
     absent state field), so the caller can wrap it with issue-level context.
     """
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "pr",
@@ -839,7 +857,8 @@ def get_pr_state(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> 
 def validate_open_pr(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> None:
     if config.dry_run:
         return
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "pr",
@@ -972,7 +991,8 @@ def validate_pr_expected_closing_issues(
 def _get_pr_body(runner: Runner, *, config: AgentLoopConfig, pr_number: int) -> str:
     if config.dry_run:
         return ""
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "pr",
@@ -1062,7 +1082,8 @@ def find_open_pr_closing_issue(
         expected_scope = IssuePrProvenanceScope(
             repository=config.repo, issue_number=issue_number, flow="direct"
         )
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "pr",
@@ -1310,7 +1331,8 @@ def get_pr_review_context(
             human_requirements=(),
         )
 
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "pr",
@@ -1390,7 +1412,8 @@ def get_pr_mergeability(
     resolved_cwd = cwd or active_workdir(config)
     attempts = max(1, config.mergeability_poll_attempts)
     for attempt in range(attempts):
-        result = runner.run(
+        result = run_gh_read(
+            runner,
             [
                 config.gh_cmd,
                 "pr",
@@ -1633,7 +1656,8 @@ def _fetch_branch_protection_required_checks(
     if not base_branch:
         return ("unavailable", (), "PR base branch is unavailable, so branch protection could not be checked.")
 
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "api",
@@ -1722,7 +1746,8 @@ def get_pr_checks(
             base_branch=metadata.base_branch,
         )
     )
-    check_runs_result = runner.run(
+    check_runs_result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "api",
@@ -1731,7 +1756,8 @@ def get_pr_checks(
         cwd=active_workdir(config),
         check=False,
     )
-    statuses_result = runner.run(
+    statuses_result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "api",
@@ -1760,7 +1786,7 @@ def get_pr_checks(
             check_errors.extend(parse_errors)
             check_runs_complete = _listing_is_complete(payload, "check_runs", len(parsed_checks))
     else:
-        check_errors.append("check-runs query failed")
+        check_errors.append("check-runs query failed" + _failure_detail(check_runs_result))
 
     if statuses_result.returncode == 0:
         try:
@@ -1774,7 +1800,7 @@ def get_pr_checks(
             check_errors.extend(parse_errors)
             statuses_complete = _listing_is_complete(payload, "statuses", len(parsed_statuses))
     else:
-        check_errors.append("commit-status query failed")
+        check_errors.append("commit-status query failed" + _failure_detail(statuses_result))
 
     if check_runs_ok and statuses_ok:
         check_query_status: Literal["ok", "partial", "unavailable"] = "ok"
@@ -1910,7 +1936,8 @@ def _read_issue_state_projection(
     mismatch, or a payload that resolves to a pull request is an error rather
     than an implicitly open or closed issue.
     """
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "api",
@@ -1926,7 +1953,7 @@ def _read_issue_state_projection(
     if result.returncode != 0:
         raise AgentLoopError(
             f"Unable to read issue #{issue_number} from {config.repo}: "
-            f"`gh` exited {result.returncode}."
+            f"`gh` exited {result.returncode}." + _failure_detail(result)
         )
     data = _load_json_object(
         result, description=f"issue #{issue_number} from {config.repo}"
@@ -2043,7 +2070,8 @@ def read_rest_issue_comments(
     # proxy must not turn recovery into an unbounded operation.
     max_pages = 10_000
     while page <= max_pages:
-        result = runner.run(
+        result = run_gh_read(
+            runner,
             [
                 config.gh_cmd,
                 "api",
@@ -2055,7 +2083,7 @@ def read_rest_issue_comments(
         if result.returncode != 0:
             raise AgentLoopError(
                 f"GitHub issue comment recovery for issue #{issue_number} is incomplete; "
-                f"{purpose}."
+                f"{purpose}." + _failure_detail(result)
             )
         if reject_empty_output and not (result.stdout or "").strip():
             # An empty successful response is not proof of an empty history;
@@ -2191,7 +2219,8 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
             human_requirements=(),
         )
 
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "issue",
@@ -2324,7 +2353,8 @@ def _requirement_source_group(source_type: str) -> str:
 def _gh_api_json(
     runner: Runner, *, config: AgentLoopConfig, path: str, description: str
 ) -> object:
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [config.gh_cmd, "api", path],
         cwd=github_api_cwd(),
         check=False,
@@ -2332,6 +2362,7 @@ def _gh_api_json(
     if result.returncode != 0 or not (result.stdout or "").strip():
         raise AgentLoopError(
             f"GitHub {description} read is incomplete; {_HUMAN_REQUIREMENT_VERIFICATION_PURPOSE}."
+            + _failure_detail(result)
         )
     try:
         return json.loads(result.stdout)
@@ -2666,7 +2697,8 @@ def resolve_authenticated_github_actor(
             return login, actor_id
     if config.dry_run:
         raise AgentLoopError("Authenticated GitHub actor is unavailable in dry-run mode.")
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [config.gh_cmd, "api", "user"],
         cwd=active_workdir(config),
         check=False,
@@ -2933,7 +2965,8 @@ def read_authenticated_protocol_comments(
     envelopes: list[AuthenticatedComment] = []
     seen_ids: set[int] = set()
     while page <= max_pages:
-        result = runner.run(
+        result = run_gh_read(
+            runner,
             [
                 config.gh_cmd,
                 "api",
@@ -2945,7 +2978,7 @@ def read_authenticated_protocol_comments(
         if result.returncode != 0:
             raise AgentLoopError(
                 f"Authenticated comment read of {surface} failed on page {page}; "
-                "a partial view is never used."
+                "a partial view is never used." + _failure_detail(result)
             )
         try:
             raw_page = json.loads(result.stdout or "")
@@ -3055,7 +3088,8 @@ def _fetch_protocol_comment_envelope(
     context: str,
 ) -> dict[str, object]:
     """Re-read one stored comment when a write response omits its envelope."""
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [config.gh_cmd, "api", f"repos/{config.repo}/issues/comments/{comment_id}"],
         cwd=github_api_cwd(),
         check=False,
@@ -3629,7 +3663,8 @@ def search_issues(
             cwd=active_workdir(config),
         )
         return ()
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "issue",
@@ -3689,7 +3724,8 @@ def get_issue_found(
     if config.dry_run:
         return None
     try:
-        result = runner.run(
+        result = run_gh_read(
+            runner,
             [
                 config.gh_cmd,
                 "issue",
@@ -3725,7 +3761,8 @@ def get_issue_found(
 
 
 def get_pr_head_sha(runner: Runner, config: AgentLoopConfig, pr_number: int) -> str:
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "pr",
@@ -3754,7 +3791,8 @@ def get_pr_merge_commit_sha(
     A durable record that names the commit must not be published without it:
     a record written with a gap would be taken as complete by later runs.
     """
-    result = runner.run(
+    result = run_gh_read(
+        runner,
         [
             config.gh_cmd,
             "pr",
