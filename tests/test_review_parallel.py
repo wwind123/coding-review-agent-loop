@@ -5301,3 +5301,57 @@ def test_pr_peer_already_public_before_the_rerun_changes_scheduler_inputs(tmp_pa
     assert _body_positions(runner, frozen[2])[0] < _audit_indexes(runner)[audits_before]
     assert runner.reviewer_launches[launches_before:] == []  # zero reviewer reacquisition
     assert _spool_files(config) == []
+
+
+def test_pr_peer_publishes_between_freeze_and_rerun_changes_scheduler_inputs(tmp_path, monkeypatch):
+    """A freezes and partially publishes while B is not public; B then publishes before A's rerun."""
+    import copy
+
+    from coding_review_agent_loop.round_transport import attachment_keys
+
+    runner, config, carrier = _exhausted_pr(tmp_path, monkeypatch)
+    frozen = carrier["bodies"]
+    peer_marker = "Gemini approves independently."
+    # B is not public while A freezes and exhausts: its settled review is still spooled.
+    assert not any(peer_marker in c["body"] for c in runner.pr_payload["comments"])
+    assert sorted(p.name for p in _spool_files(config)) == ["Codex.json", "Gemini.json"]
+    # B's actual review is composed and published by a real, healthy run of the same round.
+    baseline, _ = _overflow_pr_runner((11,))
+    baseline.authenticated_actor = ("agent-bot", 7)
+    baseline_config = make_config(
+        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True,
+        pr_review_policy="selective-intermediate",
+    )
+    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
+    peer_comment = next(
+        copy.deepcopy(c) for c in baseline.pr_payload["comments"] if peer_marker in c["body"]
+    )
+    runner.pr_payload["comments"].append(peer_comment)
+    next(p for p in _spool_files(config) if p.name == "Gemini.json").unlink()  # published => discarded
+    assert _body_positions(runner, frozen[2]) == []  # A's anchor is still unpublished
+    _age_everything(config, runner.pr_payload["comments"])
+    frozen_keys = [attachment_keys(frozen[0]), attachment_keys(frozen[1])]
+    launches_before = len(runner.reviewer_launches)
+    audits_before = len(_audit_indexes(runner))
+    seen = []
+    real_attach = orchestrator._attach_round_metadata
+
+    def observing(body, metadata):
+        seen.append(metadata)
+        return real_attach(body, metadata)
+
+    with patch.object(orchestrator, "_attach_round_metadata", side_effect=observing):
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    comments = runner.pr_payload["comments"]
+    assert any(
+        md.phase == "reconciliation" and "Gemini" in (md.scheduler_approved_reviewers or ())
+        for md in seen
+    )  # the rerun's live scheduler inputs include B's approval, which A's frozen bodies never saw
+    for body in frozen:
+        assert len(_body_positions(runner, body)) == 1  # byte-identical, exactly once
+    assert [attachment_keys(c["body"]) for c in comments if attachment_keys(c["body"])] == frozen_keys
+    assert _body_positions(runner, frozen[2])[0] < _audit_indexes(runner)[audits_before]
+    assert sum(peer_marker in c["body"] for c in comments) == 1
+    assert runner.reviewer_launches[launches_before:] == []
+    assert _spool_files(config) == []
