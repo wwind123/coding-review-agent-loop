@@ -5865,10 +5865,10 @@ retried.
   `exhausted`), and the public read paths that raise on a failed read include the
   same history in their message.
 - **Dry run** bypasses the policy entirely.
-- **Not yet covered.** Issue creation, labels, ready transitions and merge still
-  make a single attempt; they need operation-specific reconciliation before any
-  replay and are delivered in a later stage of #510. Comment writes are covered
-  by the next section.
+- **Writes.** No other write is replayed blindly either. Comment writes,
+  issue creation, labels, ready transitions and merge each reconcile live state
+  first; see the sections below and the per-operation table at the end of this
+  chapter.
 
 ### Comment writes: reconciliation before every replay
 
@@ -5951,6 +5951,39 @@ re-invokes the reviewer:
   listing of every author must show no round-transport sidecar and no anchor for
   this reviewer and round created after the record was written; otherwise the run
   stops with a migration diagnostic, and an incomplete listing stops too.
+
+### Issue creation, labels, ready transitions and merge
+
+The remaining writes complete the shared rule (#1259, stage 3 of #510): a
+transient failure is never a licence to replay; live state is re-read, and only
+a complete, unambiguous answer decides between "it landed" and "replay".
+
+| Operation | Baseline | After a transient failure |
+| --- | --- | --- |
+| `gh issue create` (follow-up, decomposition phase, split child) | The body's creation identity record and a window start (ten minutes before the first attempt). | `recover_created_issue` pages the authenticated creator's issues through the REST list (never the search index) and drops pull-request objects. Exactly one issue with the actor's immutable user ID, created inside the window, carrying the identity record, **and** the exact title and exact stored body (known host footer tolerated) is returned and no second issue is created. No identity match replays. Every non-PR issue envelope must carry its creator id, timestamp, title and a `body` key (an explicit null is a valid empty body), otherwise the listing is unreadable. An identity match whose title or body differs, several identity matches, or an unreadable listing raise `GitHubAmbiguousWriteError` and nothing is adopted or replayed. A body without an identity record is never replayed. Exhaustion raises `GitHubTransientExhaustedError`. |
+| Label add (`agent-loop-managed`, `agent-loop-exact-head-qualified`) | The latest `labeled`/`unlabeled` event of that exact label. If this read fails, the add is a single attempt. | The exact label's event history is re-read (every label transition must be well formed and strictly increasing, otherwise it is unreadable), and the live PR labels must agree with it before any replay. A newer `labeled` event by the authenticated actor ID is success and its event ID is returned. A newer foreign or `unlabeled` event, an unexpected present label, or unreadable history fails closed through the caller's existing refusal path. No newer event with the label absent replays. |
+| Label remove | The owned `labeled` event ID the caller already holds; without one, the exact label's latest `labeled` event is captured before the first DELETE, and a removal with no readable baseline is a single attempt. | A newer `unlabeled` by the actor is success. The label still present with the owned event ID replays. A replacement `labeled` event (same actor or foreign), a foreign unlabel, or unreadable history is never replayed against, so a replacement application is never deleted. Activation and adoption keep the recovered event ID, refuse to claim a different application observed afterwards, and fresh-check it before any cleanup DELETE (unreadable or replaced ownership refuses the cleanup and leaves the label untouched). Failed label and ready outcomes carry the final diagnostic and attempt history into the callers' refusal messages. |
+| Label definition (`repos/OWNER/REPO/labels`) | None. | The label is re-read; present is success. |
+| `gh pr ready` / `--undo` | The head the caller verified before the write. | Draft state and `headRefOid` are re-read. The desired state at the expected head is success. A changed head or an unreadable PR leaves the failed result for the caller's existing fail-closed path (no replay, never ready on an unexpected head). The undesired state at the same head replays. The existing post-write verification still runs. |
+| `gh pr merge --match-head-commit` | The expected exact head. | The merge is **never replayed in-process**. State, `mergedAt`, head and merge commit are re-read. Merged at the expected head is success. Open at the same head, open at another head, closed unmerged, merged at another head, or an unreadable PR raise an error naming the observed state; for open-at-same-head the message says a rerun re-executes every source-specific gate (full-board CI authority, supersession, evidence freeze, managed qualification, ordinary-recovery capability) before any new attempt. Without an expected head the merge stays a single unreconciled attempt. |
+
+Follow-up issues carry a stable hidden creation-identity record, the first line
+of the body and outside every bounded section so body bounding cannot remove it.
+It is a `sha256` over the repository, the source kind and number (PR number for a
+review-derived follow-up; issue number plus plan hash for a plan-derived one) and
+the group's normalized text. Decomposition and split materialization already
+carry a phase identity record and a split-child record, which serve as their
+creation identity. After a failed create, the follow-up publisher consults only
+this strict lookup, never search results: a unique actor-created exact match is
+adopted, a copy created by another account is not, duplicates fail closed, and no
+match re-raises the original error. An ambiguity or exhaustion error is never
+overridden.
+
+Ordinary pre-creation semantic deduplication, managed-CI label ownership rules
+and the exact-head merge requirement are unchanged. Ambiguous-write
+reconciliation is distinct from cross-invocation spool replay: the first decides
+whether one write landed within an invocation, the second republishes a
+preserved review acquisition on a later run.
 
 ## Logs
 

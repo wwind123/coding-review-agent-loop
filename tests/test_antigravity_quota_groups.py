@@ -350,7 +350,15 @@ def test_parallel_memory_through_production_reviewer_launcher(tmp_path):
 
 
 def test_multiple_overrides_and_out_of_chain_repair_model(tmp_path, monkeypatch):
+    import sys
+
+    from coding_review_agent_loop import repair as repair_module
     from coding_review_agent_loop.repair import execute_repair
+
+    # test_antigravity_module_imports_without_fcntl re-imports the module, so
+    # the module-level ``agy`` can be stale on a shared worker; patch the live
+    # module whose backend class the repair chain really uses.
+    agy = sys.modules[repair_module.AntigravityBackend.__module__]
 
     monkeypatch.setattr(agy, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
     overrides = ((GEM1, "g1"), ("Gemini 3.7 Flash (High)", "g1"), (OPUS, "g2"))
@@ -376,6 +384,8 @@ def test_multiple_overrides_and_out_of_chain_repair_model(tmp_path, monkeypatch)
     assert captured and all(c.antigravity_quota_groups == overrides for c in captured)
     assert captured[0].antigravity_models == ("Out Of Chain Model",)
     assert agy._run_memories == memories_before
+
+
 def test_interleaved_custom_chain_never_invokes_exhausted_group(tmp_path):
     chain = ("Gemini A", "Claude B", "Gemini C")
     with patch.object(agy, "_now", FakeClock()), workdir_claims.workdir_claim_scope():

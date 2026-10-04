@@ -4072,33 +4072,244 @@ def create_issue(
             log(config, f"Created GitHub issue: {issue_url}")
         return issue_url
 
+    window_start = issue_reconciliation_window_start()
+    # One temp file serves every attempt; it is removed after success or terminal failure.
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
         handle.write(rendered_body)
         path = handle.name
     try:
-        result = runner.run(
-            [
-                config.gh_cmd,
-                "issue",
-                "create",
-                "--repo",
-                config.repo,
-                "--title",
-                title,
-                "--body-file",
-                path,
-            ],
-            cwd=active_workdir(config),
+        issue_url = _create_issue_reconciled(
+            runner,
+            config=config,
+            title=title,
+            rendered_body=rendered_body,
+            path=path,
+            window_start=window_start,
         )
-        issue_url = result.stdout.strip() or None
-        if issue_url:
-            log(config, f"Created GitHub issue: {issue_url}")
-        return issue_url
+    except AgentLoopError as exc:
+        exc.window_start = window_start  # type: ignore[attr-defined]
+        raise
     finally:
         try:
             os.unlink(path)
         except FileNotFoundError:
             pass
+    if issue_url:
+        log(config, f"Created GitHub issue: {issue_url}")
+    return issue_url
+
+
+ISSUE_CREATION_IDENTITY_RE = re.compile(
+    r"<!--\s*(?:AGENT_FOLLOWUP_CREATION_IDENTITY|AGENT_PLAN_PHASE_IDENTITY|AGENT_SPLIT_CHILD):"
+    r"[^>]*?-->",
+    re.I,
+)
+
+
+def issue_reconciliation_window_start() -> datetime.datetime:
+    return _utc_now() - COMMENT_RECONCILIATION_WINDOW
+
+
+def creation_identity_records(text: str | None) -> frozenset[str]:
+    """Canonical creation-identity records (follow-up, phase or split-child) in ``text``."""
+    return frozenset(
+        " ".join(match.group(0).split()) for match in ISSUE_CREATION_IDENTITY_RE.finditer(text or "")
+    )
+
+
+def _read_creator_issue_pages(
+    runner: Runner, *, config: AgentLoopConfig, creator: str, since: datetime.datetime
+) -> list[dict]:
+    """Page the creator's issues exhaustively via REST; any defect raises."""
+    page_size = 100
+    since_text = since.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    items: list[dict] = []
+    seen: set[int] = set()
+    for page in range(1, 10_001):
+        result = run_gh_read(
+            runner,
+            [
+                config.gh_cmd,
+                "api",
+                f"repos/{config.repo}/issues?creator={creator}&state=all&since={since_text}"
+                f"&sort=created&direction=desc&per_page={page_size}&page={page}",
+            ],
+            cwd=active_workdir(config),
+            check=False,
+        )
+        if result.returncode != 0:
+            raise AgentLoopError(
+                f"Creator issue listing failed on page {page}; a partial view is never used."
+                + _failure_detail(result)
+            )
+        try:
+            raw_page = json.loads(result.stdout or "")
+        except json.JSONDecodeError as exc:
+            raise AgentLoopError(
+                f"Creator issue listing returned malformed JSON on page {page}."
+            ) from exc
+        if not isinstance(raw_page, list) or len(raw_page) > page_size:
+            raise AgentLoopError(
+                f"Creator issue listing returned a non-list or oversized page {page}."
+            )
+        for raw in raw_page:
+            if not isinstance(raw, dict):
+                raise AgentLoopError(f"Creator issue listing page {page} held a non-object.")
+            number = raw.get("number")
+            if isinstance(number, bool) or not isinstance(number, int) or number in seen:
+                raise AgentLoopError(
+                    f"Creator issue listing page {page} held a missing or repeated issue number."
+                )
+            seen.add(number)
+            if "pull_request" not in raw:
+                # Every non-PR issue must be fully classifiable: a malformed
+                # envelope could be the accepted create, so it makes the whole
+                # listing unusable instead of being skipped.
+                user = raw.get("user")
+                user_id = user.get("id") if isinstance(user, dict) else None
+                if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+                    raise AgentLoopError(
+                        f"Creator issue listing issue #{number} lacks a creator id."
+                    )
+                parse_comment_timestamp(raw.get("created_at"))
+                if not isinstance(raw.get("title"), str):
+                    raise AgentLoopError(f"Creator issue listing issue #{number} lacks a title.")
+                if "body" not in raw:
+                    raise AgentLoopError(f"Creator issue listing issue #{number} omits its body.")
+                if raw["body"] is not None and not isinstance(raw["body"], str):
+                    raise AgentLoopError(f"Creator issue listing issue #{number} has a non-text body.")
+            items.append(raw)
+        if len(raw_page) < page_size:
+            return items
+    raise AgentLoopError("Creator issue listing exceeded its pagination bound.")
+
+
+def recover_created_issue(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    title: str,
+    body: str | TrustedBody,
+    window_start: datetime.datetime,
+    attempts: Sequence[GitHubAttempt] = (),
+) -> str | None:
+    """Find the issue an ambiguous create produced, by exact identity (#510).
+
+    Lists the authenticated creator's issues through the exhaustive REST pager
+    (never the search index), drops pull-request objects, and keeps issues whose
+    immutable creator ID is the actor, created at or after ``window_start`` and
+    carrying one of the body's creation-identity records.  Exactly one such issue
+    whose title and stored body also match exactly is returned (its URL).  Zero
+    identity matches return ``None`` (replay is safe).  An identity match with a
+    different title or body, several identity matches, or an unreadable listing
+    raise :class:`GitHubAmbiguousWriteError` and nothing is adopted or replayed.
+    """
+    rendered = str(body)
+    identities = creation_identity_records(rendered)
+    if not identities:
+        return None
+
+    def ambiguous(detail: str) -> GitHubAmbiguousWriteError:
+        return GitHubAmbiguousWriteError(
+            f"Issue creation {title!r} in {config.repo} is ambiguous: {detail} The create is "
+            "not replayed; check the repository for the issue before creating it by hand."
+            + (
+                "\nGitHub attempt history:\n" + format_attempt_history(attempts)
+                if attempts
+                else ""
+            ),
+            tuple(attempts),
+        )
+
+    try:
+        actor_login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+        listing = _read_creator_issue_pages(
+            runner, config=config, creator=actor_login, since=window_start
+        )
+    except (AgentLoopError, OSError) as exc:
+        raise ambiguous(f"the creator listing was incomplete ({exc}).") from exc
+    matches: list[dict] = []
+    for raw in listing:
+        if "pull_request" in raw:
+            continue
+        user = raw.get("user")
+        if not isinstance(user, dict) or user.get("id") != actor_id:
+            continue
+        created = parse_comment_timestamp(raw.get("created_at"))
+        if created < window_start:
+            continue
+        if not (creation_identity_records(raw.get("body") or "") & identities):
+            continue
+        matches.append(raw)
+    if not matches:
+        return None
+    if len(matches) > 1:
+        numbers = ", ".join(f"#{m.get('number')}" for m in matches)
+        raise ambiguous(f"{len(matches)} issues carry the same creation identity ({numbers}).")
+    match = matches[0]
+    exact_title = match.get("title") == title
+    exact_body, _footer = stored_body_matches_posted(match.get("body"), rendered)
+    if not (exact_title and exact_body):
+        raise ambiguous(
+            f"issue #{match.get('number')} carries the creation identity but its stored "
+            "title or body differs from this create."
+        )
+    url = match.get("html_url")
+    if not isinstance(url, str) or not url:
+        raise ambiguous(f"issue #{match.get('number')} lacks an html_url.")
+    return url
+
+
+def _create_issue_reconciled(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    title: str,
+    rendered_body: str,
+    path: str,
+    window_start: datetime.datetime,
+) -> str | None:
+    command = [
+        config.gh_cmd, "issue", "create", "--repo", config.repo,
+        "--title", title, "--body-file", path,
+    ]
+    active = DEFAULT_POLICY
+    history: list[GitHubAttempt] = []
+    for number in range(1, active.attempts + 1):
+        started = time.monotonic()
+        result = runner.run(command, cwd=active_workdir(config), check=False)
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+        attempt = attempt_from_result(number, result, started)
+        history.append(attempt)
+        if attempt.classification == "permanent":
+            raise AgentLoopError(github_retry._failure_message(result))
+        if not creation_identity_records(rendered_body):
+            raise GitHubAmbiguousWriteError(
+                f"Issue creation {title!r} failed with a transient GitHub error and the "
+                "body carries no creation identity, so an accepted create cannot be told "
+                "from an absent one; it is not replayed.\nGitHub attempt history:\n"
+                + format_attempt_history(history),
+                tuple(history),
+            )
+        recovered = recover_created_issue(
+            runner, config=config, title=title, body=rendered_body,
+            window_start=window_start, attempts=history,
+        )
+        if recovered is not None:
+            log(
+                config,
+                f"Issue creation {title!r}: GitHub accepted the create despite a transient "
+                f"error; adopted {recovered}",
+            )
+            return recovered
+        if number < active.attempts:
+            github_retry.sleep_before_retry(active, number)
+    raise GitHubTransientExhaustedError(
+        f"Issue creation {title!r} failed after {len(history)} transient attempt(s) and the "
+        "issue is verified absent.\nGitHub attempt history:\n" + format_attempt_history(history),
+        tuple(history),
+    )
 
 
 def search_issues(
@@ -4500,6 +4711,87 @@ def watch_pr_checks(
     raise AssertionError("CI watch loop must return a terminal outcome")
 
 
+def _read_pr_view_json(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, fields: str
+) -> tuple[dict | None, str]:
+    """Read ``gh pr view --json`` (read-retried); ``(None, reason)`` when unusable."""
+    result = run_gh_read(
+        runner,
+        [config.gh_cmd, "pr", "view", str(pr_number), "--repo", config.repo, "--json", fields],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return None, describe_gh_failure(result) or f"exit {result.returncode}"
+    try:
+        payload = json.loads(result.stdout or "")
+    except json.JSONDecodeError:
+        return None, "malformed JSON"
+    if not isinstance(payload, dict):
+        return None, "non-object payload"
+    return payload, ""
+
+
+def reconciled_pr_ready(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    expected_head_sha: str | None,
+    undo: bool = False,
+) -> CommandResult:
+    """Run ``gh pr ready`` (or ``--undo``) with live-state reconciliation (#510).
+
+    The caller supplies the head it verified before the write.  After a
+    transient failure the draft state and head are re-read: the desired state
+    at the expected head is success; a changed head or an unreadable PR leaves
+    the failed result for the caller's existing fail-closed path (no replay);
+    the undesired state at the same head is replayed.  Without an expected head
+    or in dry-run the command is a single attempt, as before.
+    """
+    command = [config.gh_cmd, "pr", "ready"]
+    if undo:
+        command.append("--undo")
+    command.extend([str(pr_number), "--repo", config.repo])
+    cwd = active_workdir(config)
+    if config.dry_run or not expected_head_sha:
+        return runner.run(command, cwd=cwd, check=False)
+    active = DEFAULT_POLICY
+    history: list[GitHubAttempt] = []
+    result: CommandResult | None = None
+
+    def failed(final: CommandResult, exhausted: bool = False) -> CommandResult:
+        return github_retry._with_history(final, history, exhausted=exhausted)
+
+    for number in range(1, active.attempts + 1):
+        started = time.monotonic()
+        result = runner.run(command, cwd=cwd, check=False)
+        if result.returncode == 0:
+            return result
+        if classify_gh_failure(result) == "permanent":
+            return result
+        history.append(attempt_from_result(number, result, started))
+        state, reason = _read_pr_view_json(
+            runner, config=config, pr_number=pr_number, fields="isDraft,headRefOid"
+        )
+        if state is None:
+            log(config, f"PR #{pr_number}: ready transition is ambiguous and unreadable ({reason}); not replayed")
+            return failed(result)
+        is_draft, head = state.get("isDraft"), state.get("headRefOid")
+        if not isinstance(is_draft, bool) or not isinstance(head, str):
+            return failed(result)
+        if head != expected_head_sha:
+            log(config, f"PR #{pr_number}: head changed during an ambiguous ready transition; not replayed")
+            return failed(result)
+        if is_draft == undo:
+            log(config, f"PR #{pr_number}: ready transition was accepted despite a transient error")
+            return github_retry.as_success(result)
+        if number < active.attempts:
+            github_retry.sleep_before_retry(active, number)
+    assert result is not None
+    return failed(result, exhausted=True)
+
+
 def merge_pr(
     runner: Runner,
     config: AgentLoopConfig,
@@ -4507,11 +4799,53 @@ def merge_pr(
     *,
     expected_head_sha: str | None = None,
 ) -> None:
+    """Merge with ``--match-head-commit``; a merge is never replayed in-process (#510).
+
+    After a transient failure the PR is re-read.  Merged at the expected head is
+    success.  Any other state is a terminal error naming it: an open PR at the
+    same head says the merge did not happen and a rerun re-executes every
+    source-specific gate before any new attempt.  Without an expected head, or in
+    dry-run, the merge is a single attempt with no reconciliation.
+    """
     log(config, f"Merging PR #{pr_number}")
     command = [config.gh_cmd, "pr", "merge", str(pr_number), "--repo", config.repo, "--merge"]
     if expected_head_sha:
         command.extend(["--match-head-commit", expected_head_sha])
-    runner.run(
-        command,
-        cwd=active_workdir(config),
+    if config.dry_run or not expected_head_sha:
+        runner.run(command, cwd=active_workdir(config))
+        return
+    started = time.monotonic()
+    result = runner.run(command, cwd=active_workdir(config), check=False)
+    if result.returncode == 0:
+        return
+    attempt = attempt_from_result(1, result, started)
+    if attempt.classification == "permanent":
+        raise AgentLoopError(github_retry._failure_message(result))
+    state, reason = _read_pr_view_json(
+        runner, config=config, pr_number=pr_number, fields="state,mergedAt,headRefOid,mergeCommit"
     )
+    history = "\nGitHub attempt history:\n" + format_attempt_history([attempt])
+    base = f"Merge of PR #{pr_number} (expected head {expected_head_sha}) failed with a transient GitHub error"
+    if state is None:
+        raise GitHubAmbiguousWriteError(
+            f"{base} and the PR state could not be re-read ({reason}); the merge outcome is "
+            "unknown and it is not replayed. Inspect the PR, then rerun." + history,
+            (attempt,),
+        )
+    observed, head = state.get("state"), state.get("headRefOid")
+    if observed == "MERGED" and head == expected_head_sha:
+        log(config, f"PR #{pr_number}: merge was accepted at {expected_head_sha} despite a transient error; recovered")
+        return
+    if observed == "OPEN" and head == expected_head_sha:
+        detail = (
+            "the PR is still open at the expected head, so the merge did not happen. It is not "
+            "replayed in-process; rerun to re-execute every merge gate (CI authority, "
+            "supersession, evidence freeze, managed qualification, ordinary-recovery "
+            "capability) before any new match-head-commit attempt."
+        )
+    else:
+        detail = (
+            f"the PR is now {observed} at head {head}; this is not the expected head "
+            f"{expected_head_sha} merged, so the merge is refused."
+        )
+    raise AgentLoopError(f"{base}; {detail}" + history)

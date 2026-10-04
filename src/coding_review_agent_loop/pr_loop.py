@@ -1772,7 +1772,11 @@ def run_pr_loop(
                 if not release_adopted_managed_ci(
                     runner, config=config, pr_number=pr_number, contract=managed_ci
                 ):
-                    log(config, f"PR #{pr_number}: unable to release invocation-owned managed-CI label")
+                    log(
+                        config,
+                        f"PR #{pr_number}: unable to release invocation-owned managed-CI label"
+                        + managed_ci.release_diagnostic,
+                    )
             log(config, f"PR #{pr_number}: managed-CI adoption provenance changed; using ordinary CI")
             managed_ci = None
             return False
@@ -7493,11 +7497,13 @@ def run_pr_loop(
                     force=config.managed_ci,
                 ):
                     message = f"PR #{pr_number}: unable to release invocation-owned managed-CI label"
+                    diagnostic = managed_ci.release_diagnostic
                     if config.managed_ci:
                         cleanup_failure = AgentLoopError(
                             message + "; the PR remains suppressed and requires manual label removal."
+                            + diagnostic
                         )
-                    log(config, message)
+                    log(config, message + diagnostic)
         finally:
             _end_run_telemetry(runner, telemetry_token)
         if owned_usage_context:

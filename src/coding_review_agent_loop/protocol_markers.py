@@ -145,6 +145,10 @@ def _canonical_split_child(match: re.Match[str]) -> str:
     return f"<!-- AGENT_SPLIT_CHILD: parent={int(match.group('parent'))} key={match.group('key').lower()} -->"
 
 
+def _canonical_followup_identity(match: re.Match[str]) -> str:
+    return f"<!-- AGENT_FOLLOWUP_CREATION_IDENTITY: {match.group('value').lower()} -->"
+
+
 def _canonical_key_value_comment(match: re.Match[str], *, token: str, colon: bool = True) -> str:
     raw = match.group("fields").strip()
     fields: list[tuple[str, str]] = []
@@ -390,6 +394,19 @@ def _make_registry() -> tuple[MarkerDefinition, ...]:
             surfaces=frozenset({ISSUE_BODY_SURFACE, REST_CREATE_SURFACE}),
             safe_label="[protocol split-child record]",
             canonicalizer=_canonical_split_child,
+        ),
+        # Stable creation identity of a generated follow-up issue (#510); lets an
+        # ambiguous issue create be recovered by identity rather than by title.
+        MarkerDefinition(
+            token="AGENT_FOLLOWUP_CREATION_IDENTITY",
+            pattern=re.compile(
+                r"<!--\s*AGENT_FOLLOWUP_CREATION_IDENTITY:\s*(?P<value>[0-9a-f]{64})\s*-->", re.I
+            ),
+            strictness="well-formed-only",
+            codec="bare-hex",
+            surfaces=frozenset({ISSUE_BODY_SURFACE, REST_CREATE_SURFACE}),
+            safe_label="[protocol follow-up creation-identity record]",
+            canonicalizer=_canonical_followup_identity,
         ),
         _b64_definition("AGENT_SPLIT_STAGE_HANDOFF", surfaces=_ISSUE_ONLY),
         MarkerDefinition(
