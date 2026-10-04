@@ -2103,7 +2103,10 @@ def publish_issue_created_authorization(
     event = _active_managed_label_event(runner, config=config, pr_number=handoff.pr_number)
     if event is None or event[1].casefold() != handoff.trusted_actor_login.casefold() or event[2] != handoff.trusted_actor_id:
         raise AgentLoopError(
-            "Managed-CI issue-created authorization requires an actor-owned managed-label event."
+            _with_reason(
+                "Managed-CI issue-created authorization requires an actor-owned managed-label event.",
+                _last_list_failure(),
+            )
         )
     waiver = _waiver_for_protection(handoff.protection_mode)
     if waiver is None:
@@ -2151,7 +2154,10 @@ def publish_issue_created_authorization(
     )
     if current_event != event:
         raise AgentLoopError(
-            "Managed-CI issue-created authorization label provenance changed before publication."
+            _with_reason(
+                "Managed-CI issue-created authorization label provenance changed before publication.",
+                _last_list_failure(),
+            )
         )
     records = _authorization_comment_records(
         runner,
@@ -2349,7 +2355,12 @@ def publish_issue_created_continuity_authorization(
         or event[1].casefold() != handoff.trusted_actor_login.casefold()
         or event[2] != handoff.trusted_actor_id
     ):
-        raise AgentLoopError("Managed-CI head continuity requires an actor-owned active managed-label event.")
+        raise AgentLoopError(
+            _with_reason(
+                "Managed-CI head continuity requires an actor-owned active managed-label event.",
+                _last_list_failure(),
+            )
+        )
     live_tuple = _continuity_live_pr_tuple(
         runner,
         config=config,
@@ -2457,6 +2468,7 @@ def publish_issue_created_continuity_authorization(
         current_event = _active_managed_label_event(
             runner, config=config, pr_number=handoff.pr_number
         )
+        event_reason = _last_list_failure()
         current_tuple = _continuity_live_pr_tuple(
             runner,
             config=config,
@@ -2465,8 +2477,11 @@ def publish_issue_created_continuity_authorization(
         )
         if current_event != event or current_tuple != live_tuple:
             raise AgentLoopError(
-                "Managed-CI head continuity observed a changed live PR tuple or active "
-                "managed-label event; no continuity record was written."
+                _with_reason(
+                    "Managed-CI head continuity observed a changed live PR tuple or active "
+                    "managed-label event; no continuity record was written.",
+                    event_reason,
+                )
             )
         current_round_comments, list_reason = _api_list_detailed(
             runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
@@ -3157,7 +3172,12 @@ def revalidate_issue_created_handoff(
             or event[1].casefold() != handoff.trusted_actor_login.casefold()
             or event[2] != handoff.trusted_actor_id
         ):
-            raise AgentLoopError("Managed-CI direct-resume label provenance changed before activation.")
+            raise AgentLoopError(
+                _with_reason(
+                    "Managed-CI direct-resume label provenance changed before activation.",
+                    _last_list_failure(),
+                )
+            )
         validated = replace(validated, active_label_event_id=handoff.active_label_event_id)
     # `_issue_created_tuple` deliberately returns the nonce authenticated by
     # the PR-opening body.  That nonce is only the body-validation binding;
@@ -3269,7 +3289,10 @@ def recover_issue_created_handoff(
             or event[2] != handoff.trusted_actor_id
         ):
             raise AgentLoopError(
-                "Managed-CI issue-created resume requires an actor-owned active managed-label event."
+                _with_reason(
+                    "Managed-CI issue-created resume requires an actor-owned active managed-label event.",
+                    _last_list_failure(),
+                )
             )
         handoff = replace(handoff, active_label_event_id=event[0])
     if record is not None and config.effective_managed_ci:

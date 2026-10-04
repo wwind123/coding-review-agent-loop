@@ -368,3 +368,81 @@ def test_fresh_authorization_event_history_failure_reaches_error(tmp_path, sleep
     assert events is None and "fresh-final" in reason and "attempt 3:" in reason
     message = managed_ci._with_reason("requires an association", reason)
     assert "requires an association" in message and "fresh-final" in message
+
+
+# --- round 3: active-label consumers reach terminal callers ------------------------
+
+
+def _exhausted_managed_runner():
+    return ScriptedRunner([(1, "", "HTTP 503 active-label-final")])
+
+
+def _assert_diagnostics(message):
+    assert "active-label-final" in message
+    assert all(f"attempt {n}:" in message for n in (1, 2, 3))
+
+
+def test_issue_created_authorization_publish_keeps_active_label_diagnostics(tmp_path, sleeps):
+    from coding_review_agent_loop import managed_ci
+
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = managed_ci.AuthenticatedIssueCreatedHandoff(
+        pr_number=7,
+        issue_number=643,
+        repository="OWNER/REPO",
+        base_ref="main",
+        head_sha="abc123",
+        branch="agent-loop/managed-643",
+        trusted_actor_login="agent-loop",
+        trusted_actor_id=1,
+        protection_mode="voluntary",
+        override_nonce="nonce-643",
+    )
+    metadata = github.PullRequestMetadata(7, "OWNER/REPO", "t", "head", "main", "abc123", "u")
+    runner = _exhausted_managed_runner()
+    with pytest.raises(AgentLoopError) as info:
+        managed_ci.publish_issue_created_authorization(
+            runner, config=config, handoff=handoff, metadata=metadata
+        )
+    assert "actor-owned managed-label event" in str(info.value)
+    _assert_diagnostics(str(info.value))
+
+
+def test_continuity_publish_keeps_active_label_diagnostics(tmp_path, sleeps):
+    from coding_review_agent_loop import managed_ci
+
+    config = make_config(
+        tmp_path,
+        managed_ci=True,
+        managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    handoff = managed_ci.AuthenticatedIssueCreatedHandoff(
+        pr_number=7,
+        issue_number=643,
+        repository="OWNER/REPO",
+        base_ref="main",
+        head_sha="abc123",
+        branch="agent-loop/managed-643",
+        trusted_actor_login="agent-loop",
+        trusted_actor_id=1,
+        protection_mode="voluntary",
+        override_nonce="nonce-643",
+    )
+    runner = _exhausted_managed_runner()
+    with pytest.raises(AgentLoopError) as info:
+        managed_ci.publish_issue_created_continuity_authorization(
+            runner,
+            config=config,
+            handoff=handoff,
+            predecessor_head="abc123",
+            new_head="def456",
+            round_comment_ids=(1,),
+        )
+    assert "active managed-label event" in str(info.value)
+    _assert_diagnostics(str(info.value))
