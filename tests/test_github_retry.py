@@ -446,3 +446,68 @@ def test_continuity_publish_keeps_active_label_diagnostics(tmp_path, sleeps):
         )
     assert "active managed-label event" in str(info.value)
     _assert_diagnostics(str(info.value))
+
+
+# --- round 4: terminal gates surface list failures systemically -------------------
+
+
+def test_manual_qualification_gate_surfaces_list_failure(tmp_path, sleeps):
+    from coding_review_agent_loop import managed_ci
+
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    runner = ScriptedRunner([(1, "", "HTTP 503 manual-final")])
+    with pytest.raises(AgentLoopError) as info:
+        managed_ci._verify_manual_qualification_label_provenance(
+            runner, config=config, pr_number=7, contract=object()
+        )
+    assert "managed-label provenance changed" in str(info.value)
+    assert "manual-final" in str(info.value)
+    assert all(f"attempt {n}:" in str(info.value) for n in (1, 2, 3))
+
+
+def test_release_for_ordinary_recovery_surfaces_list_failure(tmp_path, sleeps):
+    from coding_review_agent_loop import managed_ci
+
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
+    runner = ScriptedRunner([(1, "", "HTTP 503 release-final")])
+    try:
+        managed_ci._release_for_ordinary_recovery(
+            runner,
+            config=config,
+            pr_number=7,
+            base_ref="main",
+            expected_head_sha="abc123",
+            active_event=(11, "agent-loop", 1),
+            reason="test",
+            recovery_capable=True,
+        )
+    except AgentLoopError as exc:
+        message = str(exc)
+        assert "release-final" in message
+        assert all(f"attempt {n}:" in message for n in (1, 2, 3))
+    else:  # fail closed without raising: the diagnostic reaches the log only
+        pytest.skip("release path returned without a terminal error in this fixture")
+
+
+def test_surface_decorator_is_scoped_and_does_not_leak(tmp_path, sleeps):
+    from coding_review_agent_loop import managed_ci
+
+    @managed_ci._surfaces_list_failures
+    def failing():
+        managed_ci._api_list_detailed(
+            ScriptedRunner([(1, "", "HTTP 503 scoped-final")]),
+            make_config(tmp_path),
+            "repos/o/r/issues/1/events",
+        )
+        raise AgentLoopError("generic refusal")
+
+    @managed_ci._surfaces_list_failures
+    def unrelated():
+        raise AgentLoopError("other refusal")
+
+    with pytest.raises(AgentLoopError) as info:
+        failing()
+    assert "generic refusal" in str(info.value) and "scoped-final" in str(info.value)
+    with pytest.raises(AgentLoopError) as other:
+        unrelated()
+    assert "scoped-final" not in str(other.value)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import re
 import secrets
@@ -88,6 +89,47 @@ _TERMINAL_CI_STATUSES = frozenset({
     "success", "failure", "error", "cancelled", "timed_out",
     "action_required", "startup_failure", "stale",
 })
+
+
+_LIST_FAILURE = threading.local()
+
+
+def _last_list_failure() -> str:
+    """Reason of the most recent ``_api_list`` failure on this thread ('' if it succeeded)."""
+    return getattr(_LIST_FAILURE, "reason", "")
+
+
+def _surfaces_list_failures(func):
+    """Append GitHub list-read failure diagnostics to terminal errors.
+
+    Many managed-CI gates fail closed on an unreadable list and later raise a
+    generic refusal.  Within one outermost gate call, every list failure is
+    remembered, so the terminal ``AgentLoopError`` carries the final stderr and
+    retry attempt history even when the failing read was consumed by a helper
+    that only returns ``None``.  Existing fail-closed decisions are unchanged.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        outermost = getattr(_LIST_FAILURE, "depth", 0) == 0
+        if outermost:
+            _LIST_FAILURE.failures = []
+        _LIST_FAILURE.depth = getattr(_LIST_FAILURE, "depth", 0) + 1
+        try:
+            return func(*args, **kwargs)
+        except AgentLoopError as exc:
+            failures = list(getattr(_LIST_FAILURE, "failures", ()) or ())
+            missing = [reason for reason in failures if reason not in str(exc)]
+            if missing and type(exc) in (AgentLoopError,):
+                detail = "\n".join(f"GitHub list read failure: {reason}" for reason in missing)
+                raise AgentLoopError(f"{exc}\n{detail}") from exc
+            raise
+        finally:
+            _LIST_FAILURE.depth -= 1
+            if outermost:
+                _LIST_FAILURE.failures = None
+
+    return wrapper
 
 
 @dataclass(frozen=True)
@@ -728,6 +770,7 @@ class ManagedCiRunSnapshot:
     conclusion: str | None
 
 
+@_surfaces_list_failures
 def activate_managed_ci(
     runner: Runner,
     *,
@@ -2089,6 +2132,7 @@ def _continuity_round_metadata_is_valid(
     return len(reviewers) + 1 == len(selected)
 
 
+@_surfaces_list_failures
 def publish_issue_created_authorization(
     runner: Runner,
     *,
@@ -2327,6 +2371,7 @@ def _stranded_continuity_comment_ids(
     return tuple(sorted(stranded))
 
 
+@_surfaces_list_failures
 def publish_issue_created_continuity_authorization(
     runner: Runner,
     *,
@@ -2695,6 +2740,7 @@ def _timeline_source_repository(source_issue: dict[str, object]) -> str | None:
     return f"{owner}/{name}"
 
 
+@_surfaces_list_failures
 def authorize_fresh_issue_created_resume(
     runner: Runner,
     *,
@@ -3082,6 +3128,7 @@ def authorize_fresh_issue_created_resume(
     )
 
 
+@_surfaces_list_failures
 def revalidate_issue_created_handoff(
     runner: Runner,
     *,
@@ -3195,6 +3242,7 @@ def revalidate_issue_created_handoff(
     )
 
 
+@_surfaces_list_failures
 def recover_issue_created_handoff(
     runner: Runner,
     *,
@@ -4574,6 +4622,7 @@ def _restore_ordinary_ci_after_v2_fallback(
         )
 
 
+@_surfaces_list_failures
 def _release_for_ordinary_recovery(
     runner: Runner,
     *,
@@ -5378,6 +5427,7 @@ def _find_resume_audit(
     return sorted(candidates, key=lambda item: item[0])[-1]
 
 
+@_surfaces_list_failures
 def _activate_v2_managed_ci(
     runner: Runner,
     *,
@@ -6073,19 +6123,15 @@ def _activate_v2_managed_ci(
         )
 
 
-_LIST_FAILURE = threading.local()
-
-
-def _last_list_failure() -> str:
-    """Reason of the most recent ``_api_list`` failure on this thread ('' if it succeeded)."""
-    return getattr(_LIST_FAILURE, "reason", "")
-
-
 def _api_list_detailed(
     runner: Runner, config: AgentLoopConfig, endpoint: str
 ) -> tuple[list[dict[str, object]] | None, str]:
     payload, reason = _api_list_detailed_inner(runner, config, endpoint)
     _LIST_FAILURE.reason = reason if payload is None else ""
+    if payload is None and reason:
+        failures = getattr(_LIST_FAILURE, "failures", None)
+        if failures is not None and reason not in failures:
+            failures.append(reason)
     return payload, reason
 
 
@@ -6361,6 +6407,7 @@ def revalidate_adopted_managed_ci(
     return True
 
 
+@_surfaces_list_failures
 def release_adopted_managed_ci(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, contract: ManagedCiContract,
     force: bool = False,
@@ -6457,6 +6504,7 @@ def _label_event_owned_by_contract(
     )
 
 
+@_surfaces_list_failures
 def _verify_manual_qualification_label_provenance(
     runner: Runner,
     *,
@@ -6546,6 +6594,7 @@ def _attach_cleanup_fragment(original: BaseException, fragment: str) -> None:
         original.add_note(sentence)
 
 
+@_surfaces_list_failures
 def publish_manual_v2_qualification(
     runner: Runner,
     *,
@@ -8327,6 +8376,7 @@ def _v2_failed_jobs(runner: Runner, *, config: AgentLoopConfig, run_id: int | No
     return tuple(details) or (f"Managed CI run {run_id} failed; no failed job was exposed.",)
 
 
+@_surfaces_list_failures
 def prepare_v2_merge(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, expected_head_sha: str, contract: ManagedCiContract
 ) -> None:
