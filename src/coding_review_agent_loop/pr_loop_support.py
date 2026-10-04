@@ -3245,7 +3245,10 @@ def _pr_step_back_decision(
         if degraded:
             log(config, f"PR step-back suppressed for {reviewer}: malformed step-back history")
             continue
-        episode = _step_back.derive_pr_episode(fresh, reviewer, window=window, mapper=mapper)
+        episode = _step_back.derive_pr_episode(
+            fresh, reviewer, window=window, mapper=mapper,
+            current_round=round_number, current_head=head_sha,
+        )
         if episode.siblings and episode.entry is not None:
             mapping = episode.mapping
             if mapping is not None and not mapping.mappable:

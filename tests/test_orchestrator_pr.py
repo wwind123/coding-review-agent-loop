@@ -17820,3 +17820,30 @@ def test_resume_after_the_kth_review_is_published_still_issues_the_step_back_tur
     assert "STEP-BACK TURN" in prompts[-1]  # the resumed dispatch, not an ordinary follow-up
     assert len([p for p in prompts[:2] if "STEP-BACK TURN" in p]) == 0
     assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[-1]
+
+
+def test_a_rerun_after_a_sibling_stop_does_not_repeat_the_stop_for_the_old_sibling(tmp_path):
+    """The operator pushes a redesign or a documented limitation; the next review
+    blocks on something outside the cluster. The stale sibling must not stop the run."""
+    runner, message = _run_to_sibling(tmp_path, "another branch at src/spool.py:134")
+    assert "human decision required" in message
+    assert len(_sb_coder_prompts(runner)) == 3
+    runner._move_head(f"{9:040x}", cwd=None)  # the operator's push
+    runner.pr_payload["headRefOid"] = f"{9:040x}"
+    # The pushed head is recovered as an unrecorded advance: the coder checks the
+    # stopped round's item, then the reviewer blocks on something outside the cluster.
+    runner.claude_outputs.extend(
+        [
+            structured_coder_followup(addressed_items=["item-4"]),
+            structured_coder_followup(addressed_items=["item-5"]),
+        ]
+    )
+    runner.codex_outputs.extend(
+        [
+            _sb_review(["unrelated at src/other.py:5"], resolved=["item-4"]),
+            _sb_review(resolved=["item-5"]),
+        ]
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    assert len(_sb_coder_prompts(runner)) == 5  # three before the stop, two after the push
+    assert all("STEP-BACK TURN" not in p for p in _sb_coder_prompts(runner)[3:])

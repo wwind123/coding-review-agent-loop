@@ -1046,8 +1046,17 @@ def derive_pr_episode(
     *,
     window: int,
     mapper: AnchorMapper,
+    current_round: int | None = None,
+    current_head: str | None = None,
 ) -> PrEpisodeResult:
     """Replay the reviewer's reviews after its newest step-back turn.
+
+    ``current_round`` is the round being dispatched: only a sibling introduced by
+    that round's review of ``current_head`` escalates.  A sibling from an earlier
+    round, or from a head the code has since moved past (an operator's pushed
+    redesign or documented limitation), already stopped the run once and must not
+    stop it again; it stays an open member item, which keeps the episode open until
+    it is resolved.
 
     The episode stays active until the reviewer approves or no unresolved
     mandatory item of theirs has a location that is a member of the cluster
@@ -1085,7 +1094,11 @@ def derive_pr_episode(
             for location in project_finding_locations(item)
             if in_cluster(location, mapping, window)
         )
-        if siblings:
+        if (
+            siblings
+            and (current_round is None or review.round_number >= current_round)
+            and (current_head is None or review.head == current_head)
+        ):
             return PrEpisodeResult(entry, siblings, review.round_number, mapping)
         member_open = False
         for item in _remaining_mandatory_items(review.metadata):
@@ -1329,6 +1342,8 @@ def render_pr_step_back_human_decision(
         f"new sibling finding in round {sibling_round}: {sibling_text}. Cluster mapping: "
         f"{mapped}. No further coder turn was invoked. Coder generalization (excerpt): "
         f"{excerpt or '(not recorded)'} Decide one of: continue (rerun with "
-        "--pr-step-back-rounds 0), accept a stated limitation (document it and resolve or "
-        "defer the sibling), or redesign the affected code."
+        "--pr-step-back-rounds 0, which also disables step-back detection), accept a stated "
+        "limitation (document it, resolve or defer the sibling, push the commit and rerun), or "
+        "redesign the affected code (push the redesign and rerun). After a push, a rerun does "
+        "not stop again on this round's sibling; only a new sibling in a later review does."
     )

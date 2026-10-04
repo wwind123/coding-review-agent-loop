@@ -3198,7 +3198,7 @@ general reviewer contract is unchanged in every other round.
 If the sweep review, or any later review while the episode is active, introduces a
 new mandatory finding in the cluster, the run stops with a human-decision message
 before any further coder turn: continue (rerun with `--pr-step-back-rounds 0`),
-accept a stated limitation, or redesign. The message names the cluster, the mapping
+accept a stated limitation, or redesign (for the last two, push the commit and rerun: only a sibling introduced by the review of the round being dispatched stops the run, so a sibling that already stopped it does not stop it again). The message names the cluster, the mapping
 outcome, the sibling findings, and the coder's `Generalization:` excerpt. A carried
 item is not a sibling and keeps the episode open while it is in the cluster; the
 episode closes when the reviewer approves or no unresolved mandatory item of theirs

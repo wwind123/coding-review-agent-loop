@@ -1295,3 +1295,54 @@ def test_a_changed_file_whose_diff_section_is_missing_is_unmappable_not_unchange
         diff_text="diff --git a/src/b.py b/src/b.py\n@@ -1,0 +2,3 @@\n",
     )
     assert (other.outcome, other.start) == (sb.OUTCOME_SHIFTED, 100)
+
+
+def test_a_sibling_from_an_earlier_round_does_not_escalate_again_but_keeps_the_episode_open():
+    sibling = _pr_item("item-12", "another branch src/spool.py:134", round_number=4)
+    stale = _pr_review(60, 4, HEAD_B, new=[sibling])
+    later = _pr_review(
+        70, 5, HEAD_C,
+        new=[_pr_item("item-13", "unrelated src/other.py:5", round_number=5)],
+        prior=[sibling],
+        dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "blocking")],
+    )
+    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]), stale, later]
+    # Dispatching round 5: the round-4 sibling already stopped the run once.
+    result = sb.derive_pr_episode(
+        records, PR_REVIEWER, window=40, mapper=_identity_mapper, current_round=5
+    )
+    assert result.entry is not None and not result.siblings
+    # Dispatching round 4 itself still escalates, as does an unscoped replay.
+    assert sb.derive_pr_episode(
+        records, PR_REVIEWER, window=40, mapper=_identity_mapper, current_round=4
+    ).sibling_round == 4
+    assert sb.derive_pr_episode(
+        records, PR_REVIEWER, window=40, mapper=_identity_mapper
+    ).sibling_round == 4
+    # A new sibling introduced by the dispatched round's own review escalates.
+    newer = _pr_review(
+        70, 5, HEAD_C, new=[_pr_item("item-13", "another src/spool.py:136", round_number=5)],
+        prior=[sibling],
+        dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "blocking")],
+    )
+    assert sb.derive_pr_episode(
+        [records[0], stale, newer], PR_REVIEWER, window=40, mapper=_identity_mapper, current_round=5
+    ).sibling_round == 5
+
+
+def test_a_sibling_reviewed_on_a_head_the_code_has_moved_past_does_not_escalate_again():
+    sibling = _pr_item("item-12", "another branch src/spool.py:134", round_number=4)
+    records = [
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]),
+        _pr_review(60, 4, HEAD_B, new=[sibling]),
+    ]
+    same = sb.derive_pr_episode(
+        records, PR_REVIEWER, window=40, mapper=_identity_mapper,
+        current_round=4, current_head=HEAD_B,
+    )
+    assert same.sibling_round == 4  # an unchanged rerun stops again
+    pushed = sb.derive_pr_episode(
+        records, PR_REVIEWER, window=40, mapper=_identity_mapper,
+        current_round=4, current_head=HEAD_C,
+    )
+    assert pushed.entry is not None and not pushed.siblings
