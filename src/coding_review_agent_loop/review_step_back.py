@@ -527,14 +527,9 @@ class FindingLocation:
 
 
 def _looks_like_repo_path(path: str) -> bool:
-    """A repository-relative path: nested, with an extension, or a capitalized bare
-    file name such as ``Dockerfile`` or ``Makefile`` (extensionless files are valid)."""
-    base = path.rsplit("/", 1)[-1]
-    return (
-        "/" in path
-        or "." in base.lstrip(".")
-        or base[:1].isupper()
-    ) and not path.startswith("/")
+    """Any repository-relative path: extensionless files (``run``, ``Makefile``) are
+    valid.  Absolute paths are excluded here and URLs by the pattern's lookbehind."""
+    return bool(path) and not path.startswith("/")
 
 
 def _scan_locations(
@@ -614,39 +609,70 @@ class Hunk:
         return self.old_start + self.old_count - 1
 
 
+def _name_status_records(text: str) -> list[tuple[str, list[str]]]:
+    """``(status, paths)`` records from ``--name-status``, NUL-delimited (``-z``) or
+    tab-delimited."""
+    records: list[tuple[str, list[str]]] = []
+    if "\0" in (text or ""):
+        tokens = [token for token in text.split("\0")]
+        index = 0
+        while index < len(tokens) and tokens[index]:
+            status = tokens[index]
+            width = 2 if status[:1] in {"R", "C"} else 1
+            records.append((status, tokens[index + 1 : index + 1 + width]))
+            index += 1 + width
+        return records
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0]:
+            records.append((parts[0], parts[1:]))
+    return records
+
+
 def parse_name_status(text: str) -> tuple[dict[str, str], frozenset[str]]:
     """``(renames old->new, deleted paths)`` from ``git diff --name-status -M``."""
     renames: dict[str, str] = {}
     deleted: set[str] = set()
-    for line in (text or "").splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 3 and parts[0][:1] in {"R", "C"}:
-            if parts[0][:1] == "R":
-                renames[parts[1]] = parts[2]
-        elif len(parts) >= 2 and parts[0][:1] == "D":
-            deleted.add(parts[1])
+    for status, paths in _name_status_records(text):
+        if status[:1] == "R" and len(paths) >= 2:
+            renames[paths[0]] = paths[1]
+        elif status[:1] == "D" and paths:
+            deleted.add(paths[0])
     return renames, frozenset(deleted)
 
 
-def select_file_diff(text: str, old_path: str, new_path: str) -> str:
+def name_status_changed_paths(text: str) -> frozenset[str]:
+    """Every path a ``--name-status`` listing names as changed (old and new sides)."""
+    return frozenset(
+        path
+        for status, paths in _name_status_records(text)
+        if status[:1] != "C"
+        for path in paths
+    )
+
+
+def select_file_diff(text: str, old_path: str, new_path: str) -> str | None:
     """The section of a multi-file diff for exactly ``old_path`` -> ``new_path``.
 
     A pathspec naming both sides of a rename can also return other file
     identities (a rename chain), so hunks are taken only from the matching
-    ``diff --git`` section.  Output with no section headers is one file's hunks.
+    ``diff --git`` section.  Output with no section headers is one file's hunks;
+    ``None`` means sections exist but none belongs to this pair.
     """
     lines = (text or "").splitlines()
     if not any(line.startswith("diff --git ") for line in lines):
         return text or ""
     header = f"diff --git a/{old_path} b/{new_path}"
     selected: list[str] = []
+    matched = False
     active = False
     for line in lines:
         if line.startswith("diff --git "):
             active = line == header
+            matched = matched or active
         if active:
             selected.append(line)
-    return "\n".join(selected)
+    return "\n".join(selected) if matched else None
 
 
 def parse_zero_context_hunks(text: str) -> tuple[Hunk, ...]:
@@ -699,7 +725,16 @@ def map_anchor(
     if diff_text is None:
         # Keep a known rename destination so the same-path fallback still works.
         return _unmappable(path, start, end, "the diff could not be read", new_path)
-    hunks = parse_zero_context_hunks(select_file_diff(diff_text, path, new_path))
+    section = select_file_diff(diff_text, path, new_path)
+    if section is None:
+        if {path, new_path} & name_status_changed_paths(name_status):
+            # The listing says the file changed but its diff section was not found
+            # (for example a quoted path): never read that as "unchanged".
+            return _unmappable(
+                path, start, end, "the changed file's diff section was not found", new_path
+            )
+        section = ""
+    hunks = parse_zero_context_hunks(section)
     offset_before = 0
     overlapping: list[Hunk] = []
     for hunk in hunks:
@@ -922,14 +957,26 @@ def _remaining_mandatory_items(metadata: "PostedRoundMetadata") -> list:
     dispositions = {d.item_id: d for d in metadata.dispositions}
     remaining = []
     for item in metadata.prior_items:
-        if (
-            item.reviewer != metadata.agent
-            or item.status not in mandatory
-            or item.item_id in closed
-            or getattr(item, "authority", None) is not None
-        ):
+        if item.reviewer != metadata.agent or getattr(item, "authority", None) is not None:
             continue
-        remaining.append(_with_effective_sub_items(item, dispositions.get(item.item_id)))
+        disposition = dispositions.get(item.item_id)
+        # The review's own disposition decides the effective status, so a future
+        # item promoted to blocking/same-pr counts and a resolved one does not.
+        effective = disposition.disposition if disposition is not None else item.status
+        if effective not in mandatory:
+            continue
+        updated = _with_effective_sub_items(item, disposition)
+        if (
+            disposition is not None
+            and disposition.sub_item_dispositions
+            and updated.sub_items
+            and all(sub.status == "resolved" for sub in updated.sub_items)
+        ):
+            # A completing entry derives to resolved (the ledger's own semantics).
+            continue
+        if updated.status != effective:
+            updated = dataclasses.replace(updated, status=effective)
+        remaining.append(updated)
     seen = {item.item_id for item in remaining}
     remaining.extend(
         item for item in _mandatory_owned_new_items(metadata) if item.item_id not in seen

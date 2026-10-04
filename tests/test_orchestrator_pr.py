@@ -17387,12 +17387,12 @@ class _StepBackRunner(FakeRunner):
 
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         cmd = [str(arg) for arg in args]
-        if cmd[:2] == ["git", "diff"] and "--name-status" in cmd and "-M" in cmd:
+        if cmd[:1] == ["git"] and "diff" in cmd and "--name-status" in cmd and "-M" in cmd:
             cmd, cwd_path = self._record_command(cmd, cwd)
             return CommandResult(cmd, cwd_path, self.scripted_name_status, "", 0)
-        if cmd[:2] == ["git", "diff"] and "-U0" in cmd:
+        if cmd[:1] == ["git"] and "diff" in cmd and "-U0" in cmd:
             cmd, cwd_path = self._record_command(cmd, cwd)
-            touches = self.shift_head in cmd[4:7]
+            touches = self.shift_head in cmd
             return CommandResult(cmd, cwd_path, self.scripted_hunks if touches else "", "", 0)
         return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
 

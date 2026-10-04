@@ -3145,7 +3145,7 @@ def _git_anchor_mapper(
         pair = (from_head, to_head)
         if pair not in name_status_cache:
             name_status_cache[pair] = run_git(
-                ["diff", "--name-status", "-M", from_head, to_head]
+                ["-c", "core.quotePath=false", "diff", "--name-status", "-z", "-M", from_head, to_head]
             )
         name_status = name_status_cache[pair]
         diff_text: str | None = None
@@ -3153,7 +3153,9 @@ def _git_anchor_mapper(
             renames, _deleted = _step_back.parse_name_status(name_status)
             new_path = renames.get(path, path)
             pathspec = list(dict.fromkeys((path, new_path)))
-            diff_text = run_git(["diff", "-M", "-U0", from_head, to_head, "--", *pathspec])
+            diff_text = run_git(
+                ["-c", "core.quotePath=false", "diff", "-M", "-U0", from_head, to_head, "--", *pathspec]
+            )
         mapping = _step_back.map_anchor(
             path, start, end, window, name_status=name_status, diff_text=diff_text
         )

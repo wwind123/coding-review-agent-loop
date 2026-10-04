@@ -1185,6 +1185,8 @@ def test_a_failed_hunk_read_keeps_the_known_rename_destination():
         ("see Makefile:30-35", ("Makefile", 30, 35)),
         ("see scripts/run:40", ("scripts/run", 40, 40)),
         ("see src/a.py:7", ("src/a.py", 7, 7)),
+        ("see run:40", ("run", 40, 40)),
+        ("see configure:20-22", ("configure", 20, 22)),
     ],
 )
 def test_extensionless_repository_files_project_from_parent_and_sub_items(text, expected):
@@ -1198,7 +1200,98 @@ def test_extensionless_repository_files_project_from_parent_and_sub_items(text, 
 
 @pytest.mark.parametrize(
     "text",
-    ["https://example.com/x.py:9", "http://host/run:40", "/etc/passwd:3", "localhost:8080", "note:5"],
+    ["https://example.com/x.py:9", "http://host/run:40", "/etc/passwd:3"],
 )
 def test_urls_absolute_paths_and_plain_words_do_not_project(text):
     assert sb.project_finding_locations(_pr_item("item-1", text)) == ()
+
+
+# --- review round 2 fixes (#1265) -------------------------------------------
+
+
+def test_a_parent_whose_sub_items_are_all_completed_no_longer_keeps_the_episode_open():
+    parent = _pr_item(
+        "item-3", "spool gap at src/spool.py:130", round_number=3,
+        sub_items=(ReviewSubItem("sub-1", "a"), ReviewSubItem("sub-2", "b")),
+    )
+    completing = _pr_review(
+        60, 4, HEAD_B, prior=[parent],
+        dispositions=[
+            ReviewItemDisposition(
+                "item-3", PR_REVIEWER, "blocking",
+                sub_item_dispositions=(("sub-1", "resolved"), ("sub-2", "resolved")),
+            )
+        ],
+    )
+    later = _pr_review(
+        70, 5, HEAD_B, new=[_pr_item("item-9", "sibling src/spool.py:135", round_number=5)]
+    )
+    # The completing entry derives to resolved: the episode closed, so the later
+    # in-window finding is an ordinary finding rather than a sibling.
+    assert _episode(completing, later).entry is None
+
+
+def test_a_future_item_promoted_by_the_sweep_keeps_the_episode_open_and_a_sibling_escalates():
+    future = _pr_item("item-3", "retained gap src/spool.py:130", status="future", round_number=3)
+    promoted = _pr_review(
+        60, 4, HEAD_B, prior=[future],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+    )
+    sibling = _pr_review(
+        70, 5, HEAD_B, new=[_pr_item("item-9", "sibling src/spool.py:135", round_number=5)],
+        prior=[future],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+    )
+    assert _episode(promoted).entry is not None
+    assert _episode(promoted, sibling).sibling_round == 5
+    # A still-future item stays out of clearance.
+    still_future = _pr_review(
+        60, 4, HEAD_B, prior=[future],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "future")],
+    )
+    assert _episode(still_future).entry is None
+
+
+def test_nul_delimited_name_status_and_non_ascii_paths_map_through_the_runner(tmp_path):
+    from coding_review_agent_loop.pr_loop_support import _git_anchor_mapper as _git_anchor_mapper_
+    from coding_review_agent_loop.runner import CommandResult
+
+    config = make_config(tmp_path)
+    commands = []
+
+    class Runner:
+        def run(self, args, *, cwd, check=True, **_kw):
+            args = list(args)
+            commands.append(args)
+            if "--name-status" in args:
+                out = "M\0src/café.py\0R100\0src/old é.py\0lib/new é.py\0"
+                return CommandResult(args, cwd, out, "", 0)
+            diff = (
+                "diff --git a/src/café.py b/src/café.py\n@@ -10,0 +11,100 @@\n"
+                "diff --git a/src/old é.py b/lib/new é.py\n@@ -1,0 +2,3 @@\n"
+            )
+            return CommandResult(args, cwd, diff, "", 0)
+
+    mapper = _git_anchor_mapper_(Runner(), config, checkout=tmp_path, window=40)
+    moved = mapper(HEAD_A, HEAD_B, "src/café.py", 100, 105)
+    assert (moved.outcome, moved.start, moved.end) == (sb.OUTCOME_SHIFTED, 200, 205)
+    renamed = mapper(HEAD_A, HEAD_B, "src/old é.py", 100, 105)
+    assert (renamed.path, renamed.start) == ("lib/new é.py", 103)
+    assert all("core.quotePath=false" in c for c in commands)
+    assert all("-z" in c for c in commands if "--name-status" in c)
+
+
+def test_a_changed_file_whose_diff_section_is_missing_is_unmappable_not_unchanged():
+    mapping = sb.map_anchor(
+        "src/café.py", 100, 105, 40,
+        name_status="M\tsrc/café.py\n",
+        diff_text='diff --git "a/src/caf\\303\\251.py" "b/src/caf\\303\\251.py"\n@@ -10,0 +11,100 @@\n',
+    )
+    assert mapping.outcome == sb.OUTCOME_UNMAPPABLE
+    # An unchanged file (not in the listing) with unrelated sections stays SHIFTED.
+    other = sb.map_anchor(
+        "src/a.py", 100, 105, 40,
+        name_status="M\tsrc/b.py\n",
+        diff_text="diff --git a/src/b.py b/src/b.py\n@@ -1,0 +2,3 @@\n",
+    )
+    assert (other.outcome, other.start) == (sb.OUTCOME_SHIFTED, 100)
