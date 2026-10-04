@@ -1446,6 +1446,19 @@ publication barrier. The re-ask uses neither the retry budget nor the Antigravit
 model fallback, and never goes to repair. A second omission stops as before
 (#1167).
 
+The same re-ask covers a required reviewer judgement field. When a fresh
+`plan_review` or `pr_review` has an absent, null, blank, non-string, or
+out-of-enum `architecture_impact.status` and that is the only defect in the
+assessment, the same reviewer is re-asked once with the frozen prompt and
+session plus a note naming the field and its allowed values
+(`changed | unchanged`). It shares the single re-ask slot with the omission
+re-ask above, so one invocation never re-asks twice. After the slot is used the
+turn ends as a reviewer failure and repair is skipped: reformatting cannot
+supply the reviewer's decision, and repair preservation rejects any
+`architecture_impact.status` the source did not decide. Malformed structure
+still goes to repair, and near-miss aliases still normalize or degrade as
+before (#1185).
+
 Broader handoff atomicity for other envelope failures after a PR is pushed is
 owned by #827 and #828.
 

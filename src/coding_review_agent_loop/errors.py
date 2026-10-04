@@ -119,6 +119,28 @@ class MissingPriorItemDispositionError(AgentLoopError):
         )
 
 
+class MissingJudgementFieldError(AgentLoopError):
+    """A review left a required judgement field missing or invalid (#1185).
+
+    The value is a reviewer decision, not a formatting detail, so only the
+    reviewer can supply it: it is re-asked of the reviewer, never repaired.
+    ``str(exc)`` is exactly the caller-supplied message.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        field_path: str,
+        allowed_values: tuple[str, ...],
+        observed_preview: str | None = None,
+    ) -> None:
+        self.field_path = field_path
+        self.allowed_values = tuple(allowed_values)
+        self.observed_preview = observed_preview
+        super().__init__(message)
+
+
 class SemanticPatchPayloadRejection(AgentLoopError):
     """A semantic-patch rejection that names content inside the patch payload.
 

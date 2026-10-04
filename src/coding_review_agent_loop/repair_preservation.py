@@ -868,6 +868,41 @@ def _preserve_architecture_list(
         require(augment(source_index, set()), field)
 
 
+def _declared_architecture_status(payload: object) -> str | None:
+    """The exact declared status of a payload's architecture_impact, if any."""
+    if not isinstance(payload, dict):
+        return None
+    impact = payload.get("architecture_impact")
+    if not isinstance(impact, dict):
+        return None
+    status = impact.get("status")
+    if isinstance(status, str) and status.strip() in {"changed", "unchanged"}:
+        return status.strip()
+    return None
+
+
+def _validate_review_architecture_decision(source: object, target: dict) -> None:
+    """Repair may neither invent nor alter a reviewer's architecture decision (#1185)."""
+    source_decision = _declared_architecture_status(source)
+    target_impact = target.get("architecture_impact")
+    target_status = target_impact.get("status") if isinstance(target_impact, dict) else None
+    if source_decision is None:
+        # A source that carried no assessment at all keeps today's behavior; the
+        # guard covers an assessment whose decision the reviewer left undecided.
+        source_has_assessment = isinstance(source, dict) and source.get("architecture_impact") is not None
+        if source_has_assessment and target_status is not None:
+            raise AgentLoopError(
+                "Repair content preservation failed for architecture_impact.status: the "
+                "reviewer did not supply a decision, so repair must not introduce one."
+            )
+        return
+    if not isinstance(target_status, str) or target_status.strip() != source_decision:
+        raise AgentLoopError(
+            "Repair content preservation failed for architecture_impact.status: repair "
+            "must preserve the reviewer's decision."
+        )
+
+
 def validate_repair_preservation(
     raw: str,
     repaired: str,
@@ -898,6 +933,7 @@ def validate_repair_preservation(
             target_kind=target["kind"],
             allowed_prior_item_ids=allowed_prior_item_ids,
         )
+        _validate_review_architecture_decision(source, target)
     if (not source or not target or not isinstance(source.get("kind"), str)
             or source["kind"] not in _KINDS):
         return

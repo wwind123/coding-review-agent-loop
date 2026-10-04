@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from .errors import (
     AgentLoopError,
     IssueImplementationConflictError,
+    MissingJudgementFieldError,
     NonRepairableEvidenceRejection,
 )
 from .protocol_markers import sanitize_historical_text
@@ -715,9 +716,51 @@ def _parse_architecture_impact(
     )
 
 
+def _status_is_sole_defect(payload: dict[str, object], *, context: str) -> bool:
+    """True when the assessment parses once its status is made valid (#1185)."""
+    probe = dict(payload)
+    probe["status"] = "unchanged"
+    try:
+        _parse_architecture_impact_payload(probe, context=context, legacy=False)  # shape-check: handled
+    except AgentLoopError:
+        return False
+    return True
+
+
+def _missing_status_error(
+    message: str, payload: dict[str, object], *, context: str
+) -> AgentLoopError:
+    """Typed only when the status is the sole defect; otherwise the plain error."""
+    if not _status_is_sole_defect(payload, context=context):
+        return AgentLoopError(message)  # shape-check: fatal:no-conservative-reading
+    if "status" not in payload:
+        preview = None
+    else:
+        observed = payload["status"]
+        try:
+            rendered = observed if isinstance(observed, str) else json.dumps(observed)
+        except (TypeError, ValueError):
+            rendered = repr(observed)
+        preview = _bounded_single_line(rendered, 40)  # shape-check: fatal:authentication-or-forgery
+    return MissingJudgementFieldError(  # shape-check: fatal:no-conservative-reading
+        message,
+        field_path=f"{context}.status",
+        allowed_values=("changed", "unchanged"),
+        observed_preview=preview,
+    )
+
+
 def _parse_architecture_impact_payload(
     payload: dict[str, object], *, context: str, status: str | None = None, legacy: bool = False
 ) -> ArchitectureImpact:
+    if status is None and not legacy and "status" not in payload:
+        required_missing = sorted({"status", "rationale"} - set(payload))
+        if required_missing == ["status"]:
+            error = _missing_status_error(  # shape-check: fatal:no-conservative-reading
+                f"{context} is missing required field(s): status", payload, context=context
+            )
+            if isinstance(error, MissingJudgementFieldError):
+                raise error  # shape-check: fatal:no-conservative-reading
     _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
         payload,
         context=context,
@@ -731,6 +774,13 @@ def _parse_architecture_impact_payload(
     )
     normalization_note: str | None = None
     if status is None:
+        if not legacy:
+            observed_status = payload["status"]
+            if not isinstance(observed_status, str) or not observed_status.strip():
+                kind = "must be a string." if not isinstance(observed_status, str) else "must be a non-empty string."
+                raise _missing_status_error(  # shape-check: fatal:no-conservative-reading
+                    f"{context}.status {kind}", payload, context=context
+                )
         raw_status = _expect_non_empty_string(payload["status"], context=f"{context}.status")  # shape-check: fatal:no-conservative-reading
         if legacy:
             # Compatibility decode of text stored or posted before #925 (#916).
@@ -740,7 +790,9 @@ def _parse_architecture_impact_payload(
         else:
             status = raw_status
             if status not in ARCHITECTURE_IMPACT_DECLARED_STATUSES:
-                raise AgentLoopError(f"{context}.status must be `changed` or `unchanged`.")  # shape-check: fatal:no-conservative-reading
+                raise _missing_status_error(  # shape-check: fatal:no-conservative-reading
+                    f"{context}.status must be `changed` or `unchanged`.", payload, context=context
+                )
     action = _expect_non_empty_string(  # shape-check: fatal:no-conservative-reading
         payload.get("canonical_document_action", "no-change"),
         context=f"{context}.canonical_document_action",
