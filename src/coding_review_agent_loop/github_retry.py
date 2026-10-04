@@ -11,6 +11,7 @@ from __future__ import annotations
 import random
 import re
 import time
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
@@ -45,7 +46,7 @@ def classify_gh_failure(result: CommandResult) -> Classification:
     """
     if result.returncode == 0:
         return "permanent"
-    text = f"{result.stderr or ''}\n{result.stdout or ''}"
+    text = f"{getattr(result, 'stderr', None) or ''}\n{getattr(result, 'stdout', None) or ''}"
     if _PERMANENT_RE.search(text):
         return "permanent"
     if _TRANSIENT_RE.search(text):
@@ -104,8 +105,8 @@ def _sleep(seconds: float) -> None:
 
 def _diagnostic(result: CommandResult) -> str:
     """Trimmed stderr, plus trimmed stdout when the command printed any."""
-    err = _trim(result.stderr)
-    out = _trim(result.stdout)
+    err = _trim(getattr(result, "stderr", None))
+    out = _trim(getattr(result, "stdout", None))
     if err and out:
         return f"{err} | stdout: {out}"
     return err or (f"stdout: {out}" if out else "")
@@ -120,8 +121,8 @@ def _trim(text: str | None) -> str:
 
 def describe_gh_failure(result: CommandResult) -> str:
     """Render the final stderr plus attempt history (if any)."""
-    stderr = (result.stderr or "").strip()
-    stdout = (result.stdout or "").strip()
+    stderr = (getattr(result, "stderr", None) or "").strip()
+    stdout = (getattr(result, "stdout", None) or "").strip()
     attempts = getattr(result, "attempts", ())
     if not attempts:
         return stderr
@@ -134,8 +135,9 @@ def describe_gh_failure(result: CommandResult) -> str:
 
 def _failure_message(result: CommandResult) -> str:
     return (
-        f"Command failed with exit {result.returncode}: {' '.join(result.args)}\n"
-        f"stdout:\n{result.stdout}\n\nstderr:\n{result.stderr}"
+        f"Command failed with exit {result.returncode}: "
+        f"{' '.join(str(a) for a in getattr(result, 'args', ()) or ())}\n"
+        f"stdout:\n{getattr(result, 'stdout', '')}\n\nstderr:\n{getattr(result, 'stderr', '')}"
     )
 
 
@@ -194,15 +196,15 @@ def _with_history(
     result: CommandResult, history: Sequence[GitHubAttempt], *, exhausted: bool
 ) -> RetriedCommandResult:
     return RetriedCommandResult(
-        args=result.args,
-        cwd=result.cwd,
-        stdout=result.stdout,
-        stderr=result.stderr,
+        args=getattr(result, "args", None) or [],
+        cwd=getattr(result, "cwd", None) or Path("."),
+        stdout=getattr(result, "stdout", "") or "",
+        stderr=getattr(result, "stderr", "") or "",
         returncode=result.returncode,
-        observation=result.observation,
-        capture_diagnostics=result.capture_diagnostics,
-        launcher_args=result.launcher_args,
-        containment=result.containment,
+        observation=getattr(result, "observation", None),
+        capture_diagnostics=getattr(result, "capture_diagnostics", ()) or (),
+        launcher_args=getattr(result, "launcher_args", None),
+        containment=getattr(result, "containment", None),
         attempts=tuple(history),
         exhausted=exhausted,
     )
