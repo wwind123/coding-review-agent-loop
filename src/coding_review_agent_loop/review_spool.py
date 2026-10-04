@@ -121,10 +121,15 @@ class ReviewRoundSpool:
         presence is detected independently of response readability, so an
         unreadable response can never hide earlier publication.
         """
+        if not self._path(reviewer_name).exists():
+            return "absent", None
         payload = self._read_payload(reviewer_name)
+        if payload is None:
+            # The file exists but cannot be decoded into a mapping: it may hide a
+            # frozen publication carrier, so it is never treated as absent.
+            return "malformed", None
         if (
-            payload is None
-            or payload.get("schema_version") != SPOOL_SCHEMA_VERSION
+            payload.get("schema_version") != SPOOL_SCHEMA_VERSION
             or any(payload.get(key) != value for key, value in self._identity().items())
             or payload.get("reviewer") != reviewer_name
         ):

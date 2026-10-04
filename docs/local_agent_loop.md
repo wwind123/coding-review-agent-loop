@@ -5924,8 +5924,8 @@ re-invokes the reviewer:
   public (its carrier is never discarded unchecked, and a legacy record is
   migration-checked even when its anchor is public). Every record is gated and
   classified first; only when all pass is any verified missing suffix posted. A
-  `publication` field that is null, not a mapping, or beside an unreadable
-  response is malformed and stops the run. If some reviewer still needs a fresh
+  spool file that exists but cannot be decoded, or a `publication` field that is null,
+  not a mapping, or beside an unreadable response, is malformed and stops the run. If some reviewer still needs a fresh
   turn, posting waits for the round to settle, and a carrier that is already
   partly public (sidecars without an anchor) stops the run instead, because the
   fresh reviewer would read those attachments. Whether a reviewer needs a fresh

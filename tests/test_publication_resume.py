@@ -552,3 +552,29 @@ def test_a_readable_but_unvalidatable_peer_counts_as_a_fresh_turn(tmp_path, monk
     # A settled failure outcome is replayed as a failure, never relaunched.
     spool.store_failure("Gemini", message="boom", failure_category=None)
     assert [len(p.bodies) - len(p.already_public) for p in _preflight(fake, tmp_path, spool)] == [1]
+
+
+def test_an_existing_undecodable_spool_file_is_malformed_not_absent(tmp_path):
+    spool = _spool(tmp_path)
+    assert spool.publication_state(REVIEWER)[0] == "fresh"
+    path = spool._path(REVIEWER)
+    path.write_text('{"schema_version": 1, "reviewer": "Cod', encoding="utf-8")
+    assert spool.publication_state(REVIEWER)[0] == "malformed"
+    path.write_text("[1, 2]", encoding="utf-8")
+    assert spool.publication_state(REVIEWER)[0] == "malformed"
+    path.unlink()
+    assert spool.publication_state(REVIEWER)[0] == "absent"  # genuinely missing
+
+
+def test_launcher_refuses_a_fresh_turn_beside_an_undecodable_record_without_public_peers(tmp_path):
+    spool = _spool(tmp_path)
+    spool._path(REVIEWER).write_text("{broken", encoding="utf-8")
+    invoked = []
+    runner = SimpleNamespace(terminate_active_processes=lambda: None)
+    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
+        _launch_reviewer_turns(
+            runner, ["codex"], thread_name_prefix="t",
+            run_turn=lambda reviewer: invoked.append(reviewer),
+            spool=spool, replay_turn=lambda reviewer, fields: None,
+        )
+    assert invoked == [] and spool._path(REVIEWER).exists()

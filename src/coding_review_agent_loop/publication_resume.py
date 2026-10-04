@@ -291,7 +291,7 @@ class RoundPublication:
         del published  # no exception for an already-public anchor
         state, raw = self.spool.publication_state(self.reviewer_name)
         if state == "malformed":
-            raise self._stop("its frozen publication carrier is malformed or unreadable.")
+            raise self._stop("its spool record or frozen publication carrier is malformed or unreadable. " + _RECOVERY_HINT)
         if state == "legacy":
             self._check_legacy()
             return None

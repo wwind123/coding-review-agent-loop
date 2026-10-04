@@ -1034,6 +1034,19 @@ def _launch_reviewer_turns(
                 continue
             fields = spool.load(reviewer_name)
             if fields is None:
+                if spool.publication_state(reviewer_name)[0] == "malformed" and not any(
+                    peer != reviewer for peer in public_peers
+                ):
+                    # An undecodable record may hide a published prefix: stop
+                    # rather than launch a fresh turn beside it (#1258).  With a
+                    # public peer the partial-round refusal below already stops,
+                    # with its recovery list.
+                    raise PublicationResumeStop(
+                        f"{reviewer_name}'s spool record is malformed or unreadable and may "
+                        "hide a partly published round. The record was kept, nothing was "
+                        "posted, and no reviewer was launched; repair the round with the "
+                        "partial-round recovery list (#1142)."
+                    )
                 continue
             replay_fallbacks.append(reviewer)
             failure = _replay_spooled_failure(fields, reviewer_name)

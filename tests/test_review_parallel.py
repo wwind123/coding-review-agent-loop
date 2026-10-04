@@ -5044,3 +5044,162 @@ def test_plan_public_sidecar_prefix_beside_a_fresh_peer_is_refused(tmp_path, mon
     assert len(runner.issue_comments) == comments_before
     assert runner.reviewer_launches == launches_before
     assert any("publication" in json.loads(p.read_text(encoding="utf-8")) for p in _spool_files(config))
+
+
+# ---------------------------------------------------------------------------
+# Undecodable spool files, staged-plan exhaustion and peer-driven drift (#1258)
+# ---------------------------------------------------------------------------
+
+
+def _undecodable(config, reviewer_file="Codex.json"):
+    damaged = []
+    for path in _spool_files(config):
+        if path.name == reviewer_file:
+            path.write_text('{"schema_version": 1, "reviewer": "Cod', encoding="utf-8")  # truncated
+            damaged.append(path)
+    assert damaged
+    return damaged
+
+
+def test_pr_undecodable_spool_file_beside_a_public_prefix_is_refused(tmp_path, monkeypatch):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, _carrier = _exhausted_pr(tmp_path, monkeypatch)
+    _drop_peer(runner, config, peer_marker="Gemini approves independently.")
+    damaged = _undecodable(config)
+    comments_before = len(runner.pr_payload["comments"])
+    launches_before = list(runner.reviewer_launches)
+
+    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert len(runner.pr_payload["comments"]) == comments_before  # no checkpoint, no post
+    assert runner.reviewer_launches == launches_before  # no fresh turn beside the sidecars
+    assert all(path.exists() for path in damaged)
+
+
+def test_plan_undecodable_spool_file_beside_a_public_prefix_is_refused(tmp_path, monkeypatch):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, _carrier = _exhausted_plan(tmp_path, monkeypatch)
+    runner.issue_comments = [
+        c for c in runner.issue_comments if "Gemini independent plan approval." not in c["body"]
+    ]
+    for path in _spool_files(config):
+        if path.name == "Gemini.json":
+            path.unlink()
+    damaged = _undecodable(config)
+    comments_before = len(runner.issue_comments)
+    launches_before = list(runner.reviewer_launches)
+
+    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert len(runner.issue_comments) == comments_before
+    assert runner.reviewer_launches == launches_before
+    assert all(path.exists() for path in damaged)
+
+
+def test_pr_peer_publication_between_attempts_changes_live_scheduler_state(tmp_path, monkeypatch):
+    """Codex freezes and exhausts first; the peer's review is published by the rerun."""
+    from coding_review_agent_loop import github_retry
+    from coding_review_agent_loop.github_retry import GitHubTransientExhaustedError
+    from coding_review_agent_loop.round_transport import attachment_keys
+
+    monkeypatch.setattr(github_retry, "_sleep", lambda _seconds: None)
+    runner, _markers = _overflow_pr_runner((11,), slow_reviewer="gemini")
+    runner.authenticated_actor = ("agent-bot", 7)
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
+        pr_review_policy="selective-intermediate",
+    )
+    outage = _install_write_outage(
+        runner, command_prefix=["gh", "pr", "comment"],
+        should_fail=_anchor_after_sidecars({"sidecars": 0}),
+    )
+    with pytest.raises(GitHubTransientExhaustedError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    outage["active"] = False
+    frozen = next(c for c in _frozen_carriers(config) if len(c["bodies"]) == 3)["bodies"]
+    # The peer has not published yet: its review is still spooled, and the
+    # scheduler sees no approvals.
+    names = sorted(p.name for p in _spool_files(config))
+    assert names == ["Codex.json", "Gemini.json"]
+    assert not any("Gemini approves independently." in c["body"] for c in runner.pr_payload["comments"])
+    _age_everything(config, runner.pr_payload["comments"])
+    launches_before = len(runner.reviewer_launches)
+    audits_before = len(_audit_indexes(runner))
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    comments = runner.pr_payload["comments"]
+    anchor_at = _body_positions(runner, frozen[2])[0]
+    peer_at = next(i for i, c in enumerate(comments) if "Gemini approves independently." in c["body"])
+    assert anchor_at < peer_at  # the frozen suffix completes before the peer publishes
+    assert anchor_at < _audit_indexes(runner)[audits_before]  # and before the new checkpoint
+    for body in frozen:
+        assert len(_body_positions(runner, body)) == 1
+    assert [attachment_keys(c["body"]) for c in comments if attachment_keys(c["body"])] == [
+        attachment_keys(frozen[0]), attachment_keys(frozen[1]),
+    ]
+    # The peer's publication moved the live scheduler state: the reconciliation now
+    # records both approvals although the frozen anchor never saw them.
+    states = []
+    for comment in comments:
+        match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        if match:
+            states.append(orchestrator._decode_round_metadata(match["payload"]))
+    assert any(
+        md.phase == "reconciliation" and set(md.scheduler_approved_reviewers) == {"Codex", "Gemini"}
+        for md in states
+    )
+    assert runner.reviewer_launches[launches_before:] == []
+    assert _spool_files(config) == []
+
+
+def _exhausted_staged_plan(tmp_path, monkeypatch):
+    from coding_review_agent_loop import github_retry
+    from coding_review_agent_loop.github_retry import GitHubTransientExhaustedError
+    from agent_loop_helpers import structured_v1_plan_state
+
+    monkeypatch.setattr(github_retry, "_sleep", lambda _seconds: None)
+    rnd = _random.Random(23)
+    text = "".join(rnd.choice(_string.ascii_letters + " ") for _ in range(45_000))
+    runner = _PartialPublicationProbeRunner(
+        round_markers=("Codex staged plan approval.",),
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(summary=f"Codex staged plan approval. {text}")],
+        gemini_outputs=[structured_plan_review(reviewer="Google Gemini")],
+    )
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = _staged_parallel_config(tmp_path)
+    outage = _install_write_outage(
+        runner, command_prefix=["gh", "issue", "comment"],
+        should_fail=_anchor_after_sidecars({"sidecars": 0}),
+    )
+    with pytest.raises(GitHubTransientExhaustedError, match="502"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert outage["failed"] >= 3
+    outage["active"] = False
+    carriers = [c for c in _frozen_carriers(config) if len(c["bodies"]) == 3]
+    assert len(carriers) == 1
+    return runner, config, carriers[0]
+
+
+def test_staged_plan_exhausted_publication_resumes_hours_later_before_the_checkpoint(tmp_path, monkeypatch):
+    runner, config, carrier = _exhausted_staged_plan(tmp_path, monkeypatch)
+    frozen = carrier["bodies"]
+    assert len(_issue_positions(runner, frozen[0])) == 1 and _issue_positions(runner, frozen[2]) == []
+    _age_everything(config, runner.issue_comments)
+    checkpoints_before = len(_plan_checkpoint_indexes(runner))
+    launches_before = len(runner.reviewer_launches)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    for body in frozen:
+        assert len(_issue_positions(runner, body)) == 1
+    new_checkpoints = _plan_checkpoint_indexes(runner)[checkpoints_before:]
+    assert new_checkpoints and _issue_positions(runner, frozen[2])[0] < new_checkpoints[0]
+    assert runner.reviewer_launches[launches_before:].count("codex") == 0
+    assert _spool_files(config) == []
