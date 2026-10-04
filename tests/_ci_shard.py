@@ -95,6 +95,18 @@ def check_exactly_once(groups, full_ids) -> None:
         raise AssertionError("shard groups are not a disjoint cover of the full collection")
 
 
+@pytest.fixture(autouse=True)
+def _scrub_ci_shard_environment(monkeypatch):
+    """Nested pytest sessions must not inherit shard settings (#1235).
+
+    The outer session cached its shard configuration at configure time, so
+    scrubbing here is safe; tests that exercise sharding opt in explicitly.
+    Provided by the plugin so any session that loads it is protected.
+    """
+    for name in SHARD_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 def _is_worker(config) -> bool:
     return hasattr(config, "workerinput")
 

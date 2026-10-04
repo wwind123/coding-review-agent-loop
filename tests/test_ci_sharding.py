@@ -196,16 +196,7 @@ def test_d(): pass
 
 
 OUTER_CONFTEST = """
-import pytest
-from _ci_shard import SHARD_ENV_VARS
-
 pytest_plugins = ["pytester"]
-
-
-@pytest.fixture(autouse=True)
-def _scrub(monkeypatch):
-    for name in SHARD_ENV_VARS:
-        monkeypatch.delenv(name, raising=False)
 """
 
 OUTER_TEST = """
@@ -216,7 +207,9 @@ from pathlib import Path
 
 def test_nested_sessions(pytester, monkeypatch):
     manifest = Path(os.environ["OUTER_MANIFEST"])
+    durations = Path(os.environ["OUTER_DURATIONS"])
     before = manifest.read_bytes()
+    seeded = durations.read_bytes()
     pytester.makepyfile(test_inner=\"\"\"
 def test_1(): pass
 def test_2(): pass
@@ -225,6 +218,8 @@ def test_3(): pass
     # No opt-in: the scrubbed environment keeps the nested session inert.
     result = pytester.runpytest_inprocess("-p", "_ci_shard", "-q")
     result.assert_outcomes(passed=3)
+    assert manifest.read_bytes() == before
+    assert durations.read_bytes() == seeded
     # Opt-in with private outputs only.
     private = Path(os.environ["PRIVATE_DIR"])
     monkeypatch.setenv("CI_SHARD_INDEX", "1")
@@ -233,7 +228,9 @@ def test_3(): pass
     monkeypatch.setenv("CI_SHARD_STORE_DURATIONS", str(private / "durations.json"))
     pytester.runpytest_inprocess("-p", "_ci_shard", "-q")
     assert (private / "manifest.json").exists()
+    assert (private / "durations.json").exists()
     assert manifest.read_bytes() == before
+    assert durations.read_bytes() == seeded
 
 
 def test_filler_a(): pass
@@ -251,10 +248,12 @@ def test_nested_sessions_cannot_clobber_outer_sharded_outputs(pytester, shard_en
     outer_durations = tmp_path / "outer" / "durations.json"
     private = tmp_path / "private"
     private.mkdir()
+    outer_durations.parent.mkdir(exist_ok=True)
+    outer_durations.write_text('{"seed::only": 1.0}\n')
     # Count 1 keeps every outer test (including the nested-launching one) in this shard.
     shard_env(
         CI_SHARD_INDEX=1, CI_SHARD_COUNT=1, CI_SHARD_MANIFEST=outer_manifest,
-        CI_SHARD_STORE_DURATIONS=outer_durations, OUTER_MANIFEST=outer_manifest,
+        CI_SHARD_STORE_DURATIONS=outer_durations, OUTER_MANIFEST=outer_manifest, OUTER_DURATIONS=outer_durations,
         PRIVATE_DIR=private,
     )
     args = ["-p", "_ci_shard", "-q"] + (["-n", workers] if workers else [])
