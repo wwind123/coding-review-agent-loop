@@ -831,3 +831,25 @@ def test_failed_managed_activation_state_report_is_documented():
     assert "Readiness is restored automatically only when this run's own ready-to-draft" in doc
     assert "A failure report never tells you to remove the label" in doc
     assert "reports only the measured current state" in doc
+
+
+def test_antigravity_quota_group_docs_describe_five_model_chain():
+    from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_MODELS
+
+    guide = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    assert "### Quota groups and fallback" in guide
+    for model in DEFAULT_ANTIGRAVITY_MODELS:
+        assert f"`{model}`" in guide
+    for expected in (
+        "skipping heuristic, not a guarantee of independent quota",
+        "Claude Sonnet 5.5 (Medium)",
+        "--antigravity-quota-group",
+        "--antigravity-quota-cooldown-seconds",
+        "Antigravity unavailable on all models",
+    ):
+        assert expected in guide
+    for doc in (README, SKILL, SKILL_MODE_DOC):
+        assert "Claude Opus 5.5 (Medium)" in doc.read_text(encoding="utf-8")
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    assert "Antigravity quota-group fallback" in architecture
+    assert "reset_parsing.py" in architecture

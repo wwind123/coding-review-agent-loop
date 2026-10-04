@@ -122,3 +122,121 @@ def test_backgrounded_completion_phrase_matches_regardless_of_embedded_markers()
         "As discussed in the prior round (<!-- AGENT_PLAN_STATE: blocking -->), "
         "I'll wait for the background build to finish before continuing."
     )
+
+
+# --- #1236: provider-frame quota exhaustion --------------------------------
+
+import subprocess
+
+import pytest
+
+from coding_review_agent_loop import agent_failure, reset_parsing
+from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES as _SIGS
+
+_LIVE = (
+    "error: RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n"
+    'AGY_ERROR: {"status":"RESOURCE_EXHAUSTED","error_code":429,"retryable":true}'
+)
+
+
+def _classify(text: str, returncode: int = 1):
+    capacity = transient.classify_antigravity_capacity(
+        text, returncode=returncode, empty_response=False, signatures=_SIGS
+    )
+    return capacity, transient.classify_antigravity_quota_exhaustion(capacity)
+
+
+def test_live_agy_sample_is_cooldown_exhaustion() -> None:
+    capacity, quota = _classify(_LIVE)
+    assert capacity.is_capacity and "AGY_ERROR" in capacity.frame
+    assert quota is not None and quota.reset_source == "cooldown" and quota.reset_seconds is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Review quota accounting try again in 4h\nError: high traffic",
+        'quoted "quota ... try again in 4h"\nother\nstuff\nmore\nError: high traffic',
+        "Error: capacity exhausted; high traffic",
+        "Error: quota exceeded, try again in 2m",
+        "Error: 429 too many requests",
+        "429",
+        "Error: high traffic, try again in a minute",
+    ],
+)
+def test_non_exhaustion_frames_mark_nothing(text: str) -> None:
+    _capacity, quota = _classify(text)
+    assert quota is None
+
+
+def test_auth_failure_stays_non_retryable() -> None:
+    capacity, quota = _classify("Error: unauthorized, quota check failed")
+    assert not capacity.is_capacity and quota is None
+
+
+def test_indented_multiline_frame_parses_reset_and_blank_line_ends_frame() -> None:
+    text = "Error: quota exceeded\n    a\n    b\n    try again in 4h"
+    capacity, quota = _classify(text)
+    assert capacity.is_capacity and quota.reset_seconds == 14400 and quota.reset_source == "parsed"
+    _c, quota = _classify("Error: quota exceeded\n\nunrelated try again in 4h")
+    assert quota is not None and quota.reset_seconds is None
+
+
+def test_pretty_json_frame_uses_quoted_retry_delay() -> None:
+    text = (
+        '{\n  "error": {\n    "code": 429,\n    "status": "RESOURCE_EXHAUSTED",\n'
+        '    "details": [{\n      "retryDelay": "14400s"\n    }]\n  }\n}'
+    )
+    capacity, quota = _classify(text)
+    assert capacity.is_capacity and quota.reset_seconds == 14400 and quota.reset_source == "parsed"
+
+
+def test_head_only_frame_in_long_output_is_ignored() -> None:
+    head = "Error: quota exceeded, try again in 4h\n"
+    text = head + ("filler line of transcript text\n" * 200) + "final answer incomplete"
+    capacity, quota = _classify(text)
+    assert not capacity.is_capacity and quota is None
+
+
+@pytest.mark.parametrize(
+    ("frame", "expected"),
+    [
+        ('"retryDelay": "14400s"', 14400),
+        ('"retryDelay": "14400.5s"', 14400),
+        ("retryDelay: '7200s'", 7200),
+        ('{\n  "details": {\n    "retryDelay": "3600s"\n  }\n}', 3600),
+        ("a\n  b\n  try again in 4h", 14400),
+        ("Error: quota exceeded", None),
+    ],
+)
+def test_antigravity_frame_reset_seconds(frame: str, expected) -> None:
+    got = transient._antigravity_frame_reset_seconds(frame)
+    assert got == expected
+
+
+def test_previously_qualifying_capacity_inputs_still_qualify() -> None:
+    for text in (
+        "Error: failed\nquota exceeded",
+        "quota exceeded please try again",
+        '{"error": {"code": 429, "message": "quota"}}',
+        "reviewing\nError: high traffic",
+    ):
+        assert _classify(text)[0].is_capacity, text
+
+
+def test_reset_parsing_reexports_are_identical() -> None:
+    for name in (
+        "_parse_rate_limit_reset_seconds", "_parse_absolute_reset_seconds",
+        "_RETRY_AFTER_SECONDS_RE", "_TRY_AGAIN_IN_RE", "_RESET_IN_RE",
+        "_ABSOLUTE_RESET_TIME_RE", "_ISO_TIMESTAMP_RE",
+    ):
+        assert getattr(agent_failure, name) is getattr(reset_parsing, name)
+    root = str(Path(__file__).parent.parent / "src")
+    for order in (
+        "import coding_review_agent_loop.transient, coding_review_agent_loop.agent_failure",
+        "import coding_review_agent_loop.agent_failure, coding_review_agent_loop.transient",
+    ):
+        proc = subprocess.run(
+            [sys.executable, "-c", order], env={"PYTHONPATH": root}, capture_output=True, text=True
+        )
+        assert proc.returncode == 0, proc.stderr

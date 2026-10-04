@@ -1041,8 +1041,11 @@ snapshot with bounded, spillable excerpts.
 | Gemini | `gemini` | Legacy, best-effort path for accounts that still have CLI access. |
 
 The default Antigravity model chain is `Gemini 3.8 Flash (High)`, then
-`Gemini 3.7 Flash (High)`, then `Gemini 3.6 Flash (High)`, then `Gemini 3.1 Pro (High)` for eligible capacity
-failures. Override it with `--antigravity-model` or
+`Gemini 3.7 Flash (High)`, then `Gemini 3.6 Flash (High)`, then `Gemini 3.1 Pro (High)`, then
+`Claude Opus 5.5 (Medium)` (served on a separate quota) for eligible capacity
+failures. A quota-exhausted provider is skipped as a whole quota group, so a
+Gemini exhaustion goes straight to Opus; see
+[Quota groups and fallback](docs/local_agent_loop.md#quota-groups-and-fallback). Override it with `--antigravity-model` or
 `--antigravity-models`. Antigravity turns are single-shot and its usage totals
 are estimated because `agy` does not expose token counts.
 

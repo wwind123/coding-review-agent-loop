@@ -1,0 +1,314 @@
+"""Antigravity quota-group fallback, run-owned memory and early stop (#1236)."""
+import contextvars
+import threading
+from unittest.mock import patch
+
+from agent_loop_helpers import *  # noqa: F403
+from coding_review_agent_loop import validated_agent, workdir_claims
+from coding_review_agent_loop.agents import antigravity as agy
+from coding_review_agent_loop.config import (
+    DEFAULT_ANTIGRAVITY_MODELS,
+    parse_antigravity_quota_group_overrides,
+)
+from coding_review_agent_loop.errors import AgentInvocationError, QuotaResetExceededError
+
+LIVE_SAMPLE = (
+    "error: RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n"
+    'AGY_ERROR: {"status":"RESOURCE_EXHAUSTED","error_code":429,"message":"exhausted","retryable":true}'
+)
+QUOTA_4H = "Error: quota exceeded, try again in 4h"
+INDENTED_4H = "Error: quota exceeded\n    daily limit reached\n    plan: pro\n    try again in 4h"
+JSON_4H = (
+    '{\n  "error": {\n    "code": 429,\n    "status": "RESOURCE_EXHAUSTED",\n'
+    '    "details": [\n      {"retryDelay": "14400s"}\n    ]\n  }\n}'
+)
+HIGH_TRAFFIC = "Error: high traffic, try again in a minute"
+OPUS = "Claude Opus 5.5 (Medium)"
+GEM1 = "Gemini 3.8 Flash (High)"
+
+
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def _fail(text):
+    return (text, 1)
+
+
+def _turn(tmp_path, outputs, *, agent_max_retries=1, **overrides):
+    runner = FakeRunner(antigravity_outputs=list(outputs))
+    config = make_config(tmp_path, agent_max_retries=agent_max_retries, **overrides)
+    logs: list[str] = []
+    try:
+        with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
+                patch.object(agy, "log", lambda _c, m: logs.append(m)):
+            response = validated_agent._run_validated_agent(
+                runner,
+                agent="antigravity",
+                config=config,
+                prompt="PROMPT",
+                marker_description="none",
+                validate=lambda text: text,
+            )
+        error = None
+    except (AgentInvocationError, QuotaResetExceededError) as exc:
+        response, error = None, exc
+    cmds = [c for c, _cwd in runner.commands if c[:1] == ["agy"]]
+    models = [c[c.index("--model") + 1] for c in cmds if "--model" in c]
+    sleeps = [c for c, _cwd in runner.commands if c[:1] == ["sleep"]]
+    return response, error, models, sleeps, logs
+
+
+# --- config / groups -------------------------------------------------------
+
+def test_default_chain_has_opus_last():
+    assert len(DEFAULT_ANTIGRAVITY_MODELS) == 5
+    assert DEFAULT_ANTIGRAVITY_MODELS[-1] == OPUS
+
+
+def test_group_derivation_and_override():
+    assert agy.antigravity_quota_group("Gemini 3.1 Pro (High)") == "gemini"
+    assert agy.antigravity_quota_group(" claude Sonnet 5.5 (Medium)") == "claude"
+    assert agy.antigravity_quota_group("Other X") == "model:Other X"
+    assert agy.antigravity_quota_group(OPUS, ((OPUS, "gemini"),)) == "gemini"
+
+
+def test_config_validation_of_cooldown_and_overrides(tmp_path):
+    for bad in (0, -1, 3601, True):
+        with pytest.raises(AgentLoopError):
+            make_config(tmp_path, antigravity_quota_cooldown_seconds=bad)
+    with pytest.raises(AgentLoopError):
+        make_config(tmp_path, antigravity_quota_groups=(("a", ""),))
+    with pytest.raises(AgentLoopError):
+        make_config(tmp_path, antigravity_quota_groups=(("a", "g"), ("a", "h")))
+    for bad in ("nogroup", "=g", "m="):
+        with pytest.raises(AgentLoopError):
+            parse_antigravity_quota_group_overrides([bad])
+    assert parse_antigravity_quota_group_overrides(["A B (X)=g"]) == (("A B (X)", "g"),)
+
+
+def test_cli_override_must_name_a_chain_model(tmp_path):
+    parser = build_parser()
+    base = ["pr", "1", "--repo", "O/R", "--coder", "antigravity", "--reviewer", "codex",
+            "--codex-dir", str(tmp_path / "codex"), "--dangerous-agent-permissions"]
+    with pytest.raises(AgentLoopError):
+        config_from_args(parser.parse_args([*base, "--antigravity-quota-group", "Nope=g"]), FakeRunner())
+    config = config_from_args(
+        parser.parse_args([*base, "--antigravity-quota-group", f"{OPUS}=gemini"]), FakeRunner()
+    )
+    assert config.antigravity_quota_groups == ((OPUS, "gemini"),)
+    # Narrowing to a single model keeps every override and constructs cleanly.
+    state = agy.AntigravityAttemptState.from_config(config, 1)
+    assert state.groups[-1] == "gemini"
+    assert state.singleton_config(config).antigravity_quota_groups == ((OPUS, "gemini"),)
+
+
+def test_override_only_on_fallback_entry_survives_singleton(tmp_path):
+    config = make_config(tmp_path, antigravity_quota_groups=((OPUS, "x"),))
+    state = agy.AntigravityAttemptState.from_config(config, 1)
+    assert state.groups == ("gemini",) * 4 + ("x",)
+    narrowed = state.singleton_config(config)
+    assert narrowed.antigravity_models == (GEM1,)
+    assert narrowed.antigravity_quota_groups == ((OPUS, "x"),)
+
+
+# --- validated turns -------------------------------------------------------
+
+def test_quota_on_first_link_skips_gemini_group_without_sleep(tmp_path):
+    response, error, models, sleeps, logs = _turn(tmp_path, [_fail(LIVE_SAMPLE), ("ok review", 0)])
+    assert error is None and response.text == "ok review"
+    assert models == [GEM1, OPUS]
+    assert sleeps == []
+    assert any("capacity failure after" in line for line in logs)
+    assert any("skipping quota group gemini" in line for line in logs)
+    assert response.model_used == OPUS
+
+
+def test_quota_exhaustion_does_not_consume_retry_budget(tmp_path):
+    _r, error, models, sleeps, _l = _turn(
+        tmp_path, [_fail(LIVE_SAMPLE), _fail(HIGH_TRAFFIC), ("done", 0)], agent_max_retries=1
+    )
+    assert error is None
+    assert models == [GEM1, OPUS, OPUS]
+    assert len(sleeps) == 1  # only the transient retry sleeps
+
+
+def test_transient_failure_retries_same_model_first(tmp_path):
+    _r, error, models, sleeps, _l = _turn(tmp_path, [_fail(HIGH_TRAFFIC), ("done", 0)])
+    assert error is None
+    assert models == [GEM1, GEM1]
+    assert len(sleeps) == 1
+
+
+def test_run_memory_next_turn_and_expiry_with_fake_clock(tmp_path):
+    clock = FakeClock()
+    with patch.object(agy, "_now", clock), workdir_claims.workdir_claim_scope():
+        _t1 = _turn(tmp_path, [_fail(LIVE_SAMPLE), ("one", 0)])
+        r2, e2, models2, _s, logs2 = _turn(tmp_path, [("two", 0)])
+        assert e2 is None and models2 == [OPUS]
+        assert not any("exhausted until" in line for line in logs2)
+        clock.now += 601
+        r3, e3, models3, _s, logs3 = _turn(tmp_path, [("three", 0)])
+        assert models3 == [GEM1]
+        assert sum("eligible again" in line for line in logs3) == 1
+
+
+def test_parsed_long_reset_variants_fall_back_and_expire(tmp_path):
+    for frame in (QUOTA_4H, INDENTED_4H, JSON_4H):
+        clock = FakeClock()
+        with patch.object(agy, "_now", clock), workdir_claims.workdir_claim_scope():
+            _r, error, models, sleeps, _l = _turn(tmp_path, [_fail(frame), ("fine", 0)])
+            assert error is None, frame
+            assert models == [GEM1, OPUS] and sleeps == []
+            entry = agy.quota_memory_for_current_run().entry("gemini")
+            assert entry.source == "parsed"
+            assert 14390 <= entry.expires_at - clock.now <= 14400
+            clock.now += 14401
+            assert not agy.quota_memory_for_current_run().is_exhausted("gemini")
+
+
+def test_all_groups_parsed_long_reset_raises_quota_reset(tmp_path):
+    with patch.object(agy, "_now", FakeClock()), workdir_claims.workdir_claim_scope():
+        agy.quota_memory_for_current_run().mark_exhausted(
+            "gemini", 14400, "parsed", QUOTA_4H, 0.0, cooldown_seconds=600
+        )
+        _r, error, models, _s, _l = _turn(tmp_path, [_fail(QUOTA_4H)])
+        assert isinstance(error, QuotaResetExceededError)
+        assert models == [OPUS]
+        assert "quota exhausted. Reset in" in str(error)
+
+
+def test_cooldown_only_exhaustion_stops_with_unavailable_message(tmp_path):
+    with patch.object(agy, "_now", FakeClock()), workdir_claims.workdir_claim_scope():
+        agy.quota_memory_for_current_run().mark_exhausted(
+            "gemini", None, "cooldown", LIVE_SAMPLE, 0.0, cooldown_seconds=600
+        )
+        _r, error, models, sleeps, _l = _turn(tmp_path, [_fail(LIVE_SAMPLE)])
+        assert type(error) is AgentInvocationError
+        assert str(error).startswith("Antigravity unavailable on all models")
+        assert models == [OPUS] and sleeps == []
+
+
+def test_turn_start_with_every_group_cooling_makes_no_invocation(tmp_path):
+    with patch.object(agy, "_now", FakeClock()), workdir_claims.workdir_claim_scope():
+        memory = agy.quota_memory_for_current_run()
+        for group in ("gemini", "claude"):
+            memory.mark_exhausted(group, None, "cooldown", LIVE_SAMPLE, 0.0, cooldown_seconds=600)
+        _r, error, models, sleeps, _l = _turn(tmp_path, [("never", 0)])
+        assert str(error).startswith("Antigravity unavailable on all models")
+        assert models == [] and sleeps == []
+
+
+def test_second_exhaustion_after_jump_is_shared_limit_and_third_group_untried(tmp_path):
+    chain = (GEM1, OPUS, "Model X")
+    _r, error, models, sleeps, _l = _turn(
+        tmp_path, [_fail("Error: quota exceeded"), _fail(LIVE_SAMPLE), ("never", 0)],
+        antigravity_models=chain,
+    )
+    assert type(error) is AgentInvocationError
+    assert models == [GEM1, OPUS]
+    assert "failed the same way" in str(error)
+    assert sleeps == []
+
+
+def test_transient_walk_to_opus_then_exhaustion_jumps_back_to_gemini(tmp_path):
+    _r, error, models, _s, _l = _turn(
+        tmp_path,
+        [_fail(HIGH_TRAFFIC)] * 4 + [_fail(QUOTA_4H), _fail(HIGH_TRAFFIC), _fail(HIGH_TRAFFIC)],
+        agent_max_retries=0,
+    )
+    assert models[:5] == list(DEFAULT_ANTIGRAVITY_MODELS)
+    assert models[5] == GEM1  # Claude group exhausted; jump back, no raise
+    assert not isinstance(error, QuotaResetExceededError)
+
+
+def test_unverified_transcript_reset_at_end_of_chain_does_not_raise_quota_reset(tmp_path):
+    noise = "reviewing: the quota note says try again in 4h\nmore transcript\n"
+    outputs = [_fail(HIGH_TRAFFIC)] * 4 + [_fail(noise + HIGH_TRAFFIC)] * 2
+    _r, error, models, _s, _l = _turn(tmp_path, outputs, agent_max_retries=1)
+    assert type(error) is AgentInvocationError
+    assert not str(error).startswith("Antigravity unavailable")
+    assert agy.AntigravityQuotaGroupMemory().is_exhausted("gemini") is False
+
+
+def test_interleaved_custom_chain_never_invokes_exhausted_group(tmp_path):
+    chain = ("Gemini A", "Claude B", "Gemini C")
+    with patch.object(agy, "_now", FakeClock()), workdir_claims.workdir_claim_scope():
+        agy.quota_memory_for_current_run().mark_exhausted(
+            "gemini", None, "cooldown", LIVE_SAMPLE, 0.0, cooldown_seconds=600
+        )
+        _r, error, models, _s, _l = _turn(
+            tmp_path, [_fail(HIGH_TRAFFIC)] * 4, agent_max_retries=1, antigravity_models=chain
+        )
+        assert set(models) == {"Claude B"}
+        assert error is not None
+
+
+def test_non_antigravity_agent_keeps_long_reset_raise(tmp_path):
+    runner = FakeRunner(codex_outputs=[("Error: rate limit exceeded, try again in 4h", 1)])
+    config = make_config(tmp_path, agent_max_retries=1)
+    with pytest.raises(QuotaResetExceededError):
+        validated_agent._run_validated_agent(
+            runner, agent="codex", config=config, prompt="P", marker_description="none",
+            validate=lambda t: t,
+        )
+
+
+# --- run ownership / threads ----------------------------------------------
+
+def test_memory_is_owned_by_the_logical_run():
+    with patch.object(agy, "_now", FakeClock()):
+        with workdir_claims.workdir_claim_scope():
+            first = agy.quota_memory_for_current_run()
+            first.mark_exhausted("gemini", None, "cooldown", "f", 0.0, cooldown_seconds=600)
+            with workdir_claims.workdir_claim_scope():  # nested loop joins the run
+                assert agy.quota_memory_for_current_run() is first
+                assert agy.quota_memory_for_current_run().is_exhausted("gemini")
+        with workdir_claims.workdir_claim_scope():
+            assert not agy.quota_memory_for_current_run().is_exhausted("gemini")
+    assert agy._run_memories == {}
+
+
+def test_no_owner_gives_local_memory_per_state(tmp_path):
+    config = make_config(tmp_path)
+    a = agy.AntigravityAttemptState.from_config(config, 1)
+    b = agy.AntigravityAttemptState.from_config(config, 1)
+    assert a.memory is not b.memory
+
+
+def test_parallel_threads_share_run_memory_and_log_once(tmp_path):
+    config = make_config(tmp_path)
+    logs: list[str] = []
+    with patch.object(agy, "_now", FakeClock()), patch.object(agy, "log", lambda _c, m: logs.append(m)), \
+            workdir_claims.workdir_claim_scope():
+        early = agy.AntigravityAttemptState.from_config(config, 1)
+        quota = validated_agent.classify_antigravity_quota_exhaustion(
+            validated_agent.classify_antigravity_capacity(
+                LIVE_SAMPLE, returncode=1, empty_response=False,
+                signatures=config.antigravity_quota_signatures,
+            )
+        )
+        barrier = threading.Barrier(2)
+        states = []
+
+        def worker():
+            state = agy.AntigravityAttemptState.from_config(config, 1)
+            states.append(state)
+            barrier.wait()
+            state.next_after_quota_exhaustion(quota, 0.0)
+
+        threads = [
+            threading.Thread(target=contextvars.copy_context().run, args=(worker,)) for _ in range(2)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert states[0].memory is states[1].memory is early.memory
+        assert sum("exhausted until" in line for line in logs) == 1
+        assert early.ensure_eligible_before_attempt() == "ok"
+        assert early.models[early.model_index] == OPUS

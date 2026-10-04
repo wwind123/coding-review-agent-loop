@@ -378,7 +378,11 @@ def main() -> None:
         sync_checkout_to_pr,
     )
     from coding_review_agent_loop.github import PullRequestMetadata
-    from coding_review_agent_loop.transient import classify_antigravity_capacity, is_transient_agent_output
+    from coding_review_agent_loop.transient import (
+        classify_antigravity_capacity,
+        classify_antigravity_quota_exhaustion,
+        is_transient_agent_output,
+    )
     from coding_review_agent_loop.usage import estimate_usage
 
     agent_name: AgentName = args.agent
@@ -503,13 +507,14 @@ def main() -> None:
         else None
     )
     max_attempts = (
-        len(config.antigravity_models) + args.max_retries
+        len(config.antigravity_models) + args.max_retries + 1
         if antigravity_attempts is not None
         else args.max_retries + 1
     )
     backoff = args.retry_backoff_seconds
     result = None
     for attempt in range(1, max_attempts + 1):
+        attempt_started_at = time.monotonic()
         candidate = None
         mechanical_failure = False
         target_exec_retryable = False
@@ -570,11 +575,40 @@ def main() -> None:
         ) if agent_name == "antigravity" else None
         if capacity is not None and capacity.is_capacity and not mechanical_failure:
             transient = True
-        transition = (
-            antigravity_attempts.next_after_failure(
-                retryable=transient, provider_capacity=bool(capacity and capacity.is_capacity)
-            ) if antigravity_attempts is not None else ("retry" if transient and attempt < max_attempts else "stop")
+        quota = (
+            classify_antigravity_quota_exhaustion(capacity)
+            if capacity is not None and capacity.is_capacity and not mechanical_failure
+            else None
         )
+        if capacity is not None and capacity.is_capacity:
+            frame_lines = capacity.frame.strip().splitlines()
+            print(
+                f"run_external: Antigravity capacity failure after "
+                f"{time.monotonic() - attempt_started_at:.1f}s: "
+                f"{frame_lines[0] if frame_lines else 'no frame'}",
+                file=sys.stderr,
+            )
+        if quota is not None:
+            quota_transition = antigravity_attempts.next_after_quota_exhaustion(
+                quota, time.monotonic() - attempt_started_at
+            )
+            if quota_transition == "fallback":
+                print(
+                    "run_external: quota exhausted; skipping its quota group to the next "
+                    "Antigravity model",
+                    file=sys.stderr,
+                )
+                continue
+            failure_text = antigravity_attempts.unavailable_message(quota_transition == "shared-limit")
+            transient = False
+            transition = "stop"
+        else:
+            transition = (
+                antigravity_attempts.next_after_failure(
+                    retryable=transient, provider_capacity=bool(capacity and capacity.is_capacity)
+                ) if antigravity_attempts is not None
+                else ("retry" if transient and attempt < max_attempts else "stop")
+            )
         if transition == "retry":
             delay = backoff[min(attempt - 1, len(backoff) - 1)] if backoff else 1
             print(

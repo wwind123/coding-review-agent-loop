@@ -5020,3 +5020,32 @@ def test_fresh_matrix_guard_stays_strict_for_unnormalized_bare_string():
         require_recoverable_fresh_risk_test_matrix_contract(
             json.dumps(payload) + tail, expected_kind="plan_state"
         )
+
+
+def test_execute_repair_default_antigravity_chain_ends_with_opus(tmp_path, monkeypatch):
+    """The repair chain is the union of repair and chain models; Opus is now last (#1236)."""
+    from coding_review_agent_loop.agents import antigravity as agy_mod
+    from coding_review_agent_loop.config import DEFAULT_REPAIR_MODELS
+
+    monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    config = make_config(tmp_path)
+    memory_before = dict(agy_mod._run_memories)
+    _repaired, _marker, attempts = execute_repair(
+        malformed_pr_review_source(state="approved"),
+        runner=FakeRunner(antigravity_outputs=[("not structured", 0)] * 12),
+        config=config,
+        run_id="run-chain",
+        usage_context=None,
+        validate=lambda text: (_ for _ in ()).throw(AgentLoopError("invalid repaired output")),
+        expected_kind="pr_review",
+    )
+    tried = list(dict.fromkeys(attempt.model for attempt in attempts))
+    assert tried == [
+        *DEFAULT_REPAIR_MODELS,
+        "Gemini 3.8 Flash (High)",
+        "Gemini 3.7 Flash (High)",
+        "Gemini 3.6 Flash (High)",
+        "Gemini 3.1 Pro (High)",
+        "Claude Opus 5.5 (Medium)",
+    ]
+    assert agy_mod._run_memories == memory_before  # repair never touches quota memory

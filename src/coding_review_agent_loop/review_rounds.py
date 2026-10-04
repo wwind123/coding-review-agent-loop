@@ -6,6 +6,7 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+import contextvars
 import re
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -982,7 +983,11 @@ def _launch_reviewer_turns(
             thread_name_prefix=thread_name_prefix,
         )
         try:
-            futures = {executor.submit(run_turn, reviewer): reviewer for reviewer in to_launch}
+            # copy_context: reviewer threads must see the run owner (Antigravity quota memory).
+            futures = {
+                executor.submit(contextvars.copy_context().run, run_turn, reviewer): reviewer
+                for reviewer in to_launch
+            }
             for future in as_completed(futures):
                 results[futures[future]] = future.result()
         except KeyboardInterrupt:

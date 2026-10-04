@@ -6,6 +6,7 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import re
@@ -1893,7 +1894,10 @@ def _run_discuss_loop(
             try:
                 futures = {
                     agent_display_name(reviewer): executor.submit(
-                        _debater_worker, reviewer, agent_display_name(reviewer)
+                        contextvars.copy_context().run,
+                        _debater_worker,
+                        reviewer,
+                        agent_display_name(reviewer),
                     )
                     for reviewer in pending
                 }

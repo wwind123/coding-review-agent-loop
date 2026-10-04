@@ -1957,10 +1957,34 @@ class TestRunExternalRetries:
         assert calls["models"] == [
             ("Gemini 3.8 Flash (High)",),
             ("Gemini 3.8 Flash (High)",),
-            ("Gemini 3.7 Flash (High)",),
+            ("Claude Opus 5.5 (Medium)",),  # quota exhaustion skips the Gemini group (#1236)
         ]
         assert sleeps == [1]
         assert Path(output_path).read_text(encoding="utf-8") == "final review body"
+
+    def test_quota_frame_goes_straight_to_opus_without_sleep(self, monkeypatch) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+
+        outcomes = [
+            AgentResult(text="", raw_output="Error: quota exceeded", returncode=1),
+            AgentResult(text="final", returncode=0),
+        ]
+        calls, sleeps, _out, exit_code = self._invoke(monkeypatch, "antigravity", outcomes, max_retries=1)
+        assert exit_code == 0
+        assert calls["models"] == [("Gemini 3.8 Flash (High)",), ("Claude Opus 5.5 (Medium)",)]
+        assert sleeps == []
+
+    def test_high_traffic_frame_retries_same_model_with_backoff(self, monkeypatch) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+
+        outcomes = [
+            AgentResult(text="", raw_output="Error: high traffic, try again in a minute", returncode=1),
+            AgentResult(text="final", returncode=0),
+        ]
+        calls, sleeps, _out, exit_code = self._invoke(monkeypatch, "antigravity", outcomes, max_retries=1)
+        assert exit_code == 0
+        assert calls["models"] == [("Gemini 3.8 Flash (High)",)] * 2
+        assert sleeps == [1]
 
     def test_writes_minimal_response_evidence_sidecar(self, monkeypatch, tmp_path) -> None:
         import helpers.run_external as rex
@@ -6994,7 +7018,7 @@ class TestAntigravitySkill:
         [
             (
                 (),
-                ("Gemini 3.8 Flash (High)", "Gemini 3.7 Flash (High)", "Gemini 3.6 Flash (High)", "Gemini 3.1 Pro (High)"),
+                ("Gemini 3.8 Flash (High)", "Gemini 3.7 Flash (High)", "Gemini 3.6 Flash (High)", "Gemini 3.1 Pro (High)", "Claude Opus 5.5 (Medium)"),
                 ("quota", "rate limit", "too many requests", "resource exhausted", "RESOURCE_EXHAUSTED", "429", "high traffic", "try again in a minute", "overload", "no capacity", "temporarily at capacity"),
             ),
             (("--model", "Model X"), ("Model X",), ("quota", "rate limit", "too many requests", "resource exhausted", "RESOURCE_EXHAUSTED", "429", "high traffic", "try again in a minute", "overload", "no capacity", "temporarily at capacity")),
@@ -7005,7 +7029,7 @@ class TestAntigravitySkill:
             ),
             (
                 ("--antigravity-quota-signatures", "Quota Hit", "429"),
-                ("Gemini 3.8 Flash (High)", "Gemini 3.7 Flash (High)", "Gemini 3.6 Flash (High)", "Gemini 3.1 Pro (High)"),
+                ("Gemini 3.8 Flash (High)", "Gemini 3.7 Flash (High)", "Gemini 3.6 Flash (High)", "Gemini 3.1 Pro (High)", "Claude Opus 5.5 (Medium)"),
                 ("Quota Hit", "429"),
             ),
         ],
@@ -7394,3 +7418,4 @@ class TestCoderTimeoutParser:
         monkeypatch.setattr(sr, handler, lambda args: captured.update(vars(args)))
         sr.main()
         assert captured["coder_test_command_timeout_seconds"] == 7200
+
