@@ -309,6 +309,13 @@ class V2ManagedRunner(ManagedRunner):
                 return part[len(prefix):]
         return None
 
+    def _next_event_id(self) -> int:
+        ids = [
+            e["id"] for e in self.issue_events
+            if isinstance(e, dict) and isinstance(e.get("id"), int)
+        ]
+        return max(ids, default=100) + 1
+
     def _run_locked(self, args, *, cwd, check, input_text=None):
         cmd = list(args)
         endpoint = next(
@@ -361,12 +368,13 @@ class V2ManagedRunner(ManagedRunner):
             cmd, cwd_path = self._record_command(args, cwd)
             self.labels_posted = True
             self.rest_pr["labels"] = [{"name": MANAGED_LABEL}]
-            self.issue_events.append(label_event())
+            # GitHub event ids are unique and increasing.
+            self.issue_events.append(label_event(self._next_event_id()))
             return CommandResult(cmd, cwd_path, "{}", "", 0)
         if endpoint == f"repos/OWNER/REPO/issues/7/labels/{MANAGED_LABEL}" and "DELETE" in cmd:
             cmd, cwd_path = self._record_command(args, cwd)
             self.rest_pr["labels"] = []
-            self.issue_events.append(label_event(event="unlabeled"))
+            self.issue_events.append(label_event(self._next_event_id(), event="unlabeled"))
             return CommandResult(cmd, cwd_path, "", "", 0)
         if endpoint == "repos/OWNER/REPO/commits/main":
             cmd, cwd_path = self._record_command(args, cwd)
@@ -5591,7 +5599,7 @@ class PublicationRunner(ManualQualificationRunner):
             index = self.event_reads
             self.event_reads += 1
             if self.foreign_event_before_read == index:
-                self.issue_events.append(label_event(event="unlabeled"))
+                self.issue_events.append(label_event(201, event="unlabeled"))
                 self.issue_events.append(label_event(202, login="someone-else", actor_id=9))
             if index in self.event_overrides:
                 cmd, cwd_path = self._record_command(args, cwd)
@@ -5892,8 +5900,11 @@ def test_release_retained_managed_label_releases_open_ready_labeled_pr(tmp_path)
 
     assert len(_managed_label_deletes(runner)) == 1
     assert runner.live_pr["labels"] == [{"name": "bug"}]
-    # Every command (read, DELETE, read-back) runs in the supplied cwd.
-    assert {cwd for _command, cwd in runner.commands} == {tmp_path}
+    # Every command (read, DELETE, read-back) runs in the supplied cwd, except the
+    # ownership-baseline timeline read, which is a repository-scoped API list.
+    assert {
+        cwd for command, cwd in runner.commands if "--paginate" not in command
+    } == {tmp_path}
 
 
 def test_entry_release_logs_operator_label_on_adopted_ready_pr(tmp_path, capsys):
@@ -5909,8 +5920,9 @@ def test_entry_release_logs_operator_label_on_adopted_ready_pr(tmp_path, capsys)
     assert "PR #7: removed `agent-loop-managed` from the ready PR at entry" in diagnostic
     assert "label origin was not checked" in diagnostic
     assert "ordinary CI resumes" in diagnostic
+    # The only event read is the removal's ownership baseline (#510); with no
+    # readable baseline the removal stays a single attempt.
     assert len(_managed_label_deletes(runner)) == 1
-    assert not any("events" in part for command, _cwd in runner.commands for part in command)
 
 
 @pytest.mark.parametrize(
@@ -12968,6 +12980,10 @@ class _LabelHub:
         self.ready_script: list[str] = []
         self.dry_run = False
 
+    def _latest_kind(self):
+        kinds = [e["event"] for e in self.events]
+        return kinds[-1] if kinds else None
+
     def event(self, kind, actor=_BOT):
         self.next_event += 1
         record = {
@@ -13026,6 +13042,10 @@ class _LabelHub:
             if action == "accepted":
                 return self._res(1, err="HTTP 503 Service Unavailable")
             return self._res(0)
+        if joined.endswith("repos/OWNER/REPO/pulls/7"):
+            present = self._latest_kind() == "labeled"
+            payload = {"labels": [{"name": self.label}] if present else []}
+            return self._res(0, out=_json510.dumps(payload))
         if cmd[1:3] == ["pr", "view"] and "isDraft,headRefOid" in cmd:
             return self._res(0, out=_json510.dumps({"isDraft": self.draft, "headRefOid": self.head}))
         return self._res(0, out="")
@@ -13245,3 +13265,199 @@ def test_label_definition_create_503_that_landed_is_success(tmp_path, label_env)
     hub = Definitions()
     assert managed_ci.ensure_managed_label(hub, config=_lcfg(tmp_path)) is True
     assert hub.creates == 1
+
+
+# --- #510 review round 1: ownership baselines, strict history, diagnostics --------
+
+
+def _hook_after_delete(hub, actor):
+    original = hub.run
+
+    def run(args, **kw):
+        result = original(args, **kw)
+        if hub.deletes == 1 and result.returncode != 0 and not getattr(hub, "_replaced", False):
+            hub._replaced = True
+            hub.event("labeled", actor=actor)  # a replacement application lands
+        return result
+
+    hub.run = run
+
+
+@pytest.mark.parametrize("label", [MANAGED_LABEL, QUALIFIED_LABEL])
+@pytest.mark.parametrize("replacement_actor", [_BOT, _STRANGER])
+def test_remove_without_owned_id_never_deletes_a_replacement_application(
+    tmp_path, label_env, label, replacement_actor
+):
+    hub = _LabelHub(["accepted"], label=label)
+    hub.event("labeled")  # the application being removed (baseline)
+    _hook_after_delete(hub, replacement_actor)
+
+    outcome = _label_remove(hub, config=_lcfg(tmp_path), pr_number=7, label_name=label)
+
+    assert outcome.result.returncode != 0 and outcome.outcome == "replacement"
+    assert hub.deletes == 1  # the replacement was never deleted
+
+
+def test_remove_without_owned_id_and_unreadable_baseline_is_a_single_attempt(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+    hub.event("labeled")
+    hub.events_unreadable = True
+    outcome = _label_remove(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL)
+    assert outcome.result.returncode != 0 and hub.deletes == 1
+
+
+def test_remove_without_owned_id_replays_the_same_application(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+    hub.event("labeled")
+    outcome = _label_remove(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL)
+    assert outcome.result.returncode == 0 and hub.deletes == 2
+
+
+def test_remove_adoption_requires_a_newer_actor_unlabel(tmp_path, label_env):
+    hub = _LabelHub(["accepted"])
+    hub.event("labeled")
+    outcome = _label_remove(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL)
+    assert outcome.result.returncode == 0 and outcome.outcome == "adopted" and hub.deletes == 1
+
+
+def test_malformed_replacement_event_never_authorizes_a_remove_replay(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+    owned = hub.event("labeled")["id"]
+    original = hub.run
+
+    def run(args, **kw):
+        result = original(args, **kw)
+        if hub.deletes == 1 and result.returncode != 0 and len(hub.events) == 1:
+            # A replacement application whose label envelope is malformed.
+            hub.events.append({"id": 5000, "event": "labeled", "label": None, "actor": {"login": "x", "id": 1}})
+        return result
+
+    hub.run = run
+    outcome = _label_remove(
+        hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL, owned_event_id=owned
+    )
+    assert outcome.result.returncode != 0 and outcome.outcome == "unknown"
+    assert hub.deletes == 1
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"id": 1001, "event": "labeled", "label": {"name": MANAGED_LABEL}},
+        {"id": "x", "event": "labeled", "label": {"name": MANAGED_LABEL}, "actor": {"login": "a", "id": 1}},
+        {"id": 9, "event": "unlabeled", "label": {}, "actor": {"login": "a", "id": 1}},
+    ],
+)
+def test_label_history_rejects_malformed_transition_records(tmp_path, label_env, bad):
+    hub = _LabelHub()
+    hub.events.append(bad)
+    assert isinstance(
+        _label_history(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL), _Unknown
+    )
+
+
+def test_label_history_rejects_non_increasing_event_ids(tmp_path, label_env):
+    hub = _LabelHub()
+    hub.events.append({"id": 50, "event": "labeled", "label": {"name": MANAGED_LABEL}, "actor": {"login": "a", "id": 1}})
+    hub.events.append({"id": 40, "event": "unlabeled", "label": {"name": MANAGED_LABEL}, "actor": {"login": "a", "id": 1}})
+    assert isinstance(
+        _label_history(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL), _Unknown
+    )
+
+
+def test_add_replay_requires_the_live_label_to_agree_with_history(tmp_path, label_env):
+    hub = _LabelHub(["fail"])
+    original = hub.run
+
+    def run(args, **kw):
+        if "repos/OWNER/REPO/pulls/7" in " ".join(str(a) for a in args):
+            return hub._res(0, out=_json510.dumps({"labels": [{"name": MANAGED_LABEL}]}))
+        return original(args, **kw)
+
+    hub.run = run  # history says absent, the live PR says present
+    outcome = _label_add(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL)
+    assert outcome.result.returncode != 0 and outcome.outcome == "unknown" and hub.posts == 1
+
+
+def test_label_failures_carry_final_diagnostic_and_attempt_history(tmp_path, label_env):
+    hub = _LabelHub(["fail", "fail", "fail"])
+    outcome = _label_add(hub, config=_lcfg(tmp_path), pr_number=7, label_name=MANAGED_LABEL)
+    assert outcome.outcome == "exhausted" and hub.posts == 3
+    assert "502 Bad Gateway" in managed_ci.failure_suffix(outcome.result)
+    assert "attempt 3" in managed_ci.failure_suffix(outcome.result)
+
+
+def test_ready_exhaustion_carries_attempt_history(tmp_path, label_env):
+    hub = _LabelHub()
+    hub.ready_script = ["fail", "fail", "fail"]
+    result = _reconciled_ready(hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha=hub.head)
+    assert result.returncode != 0 and len(hub.readies) == 3
+    assert "503 Service Unavailable" in managed_ci.failure_suffix(result)
+    assert "attempt 3" in managed_ci.failure_suffix(result)
+
+
+def test_ready_unreadable_state_keeps_the_final_diagnostic(tmp_path, label_env):
+    hub = _LabelHub()
+    hub.ready_script = ["fail"]
+    original = hub.run
+
+    def run(args, **kw):
+        if list(map(str, args))[1:3] == ["pr", "view"]:
+            return hub._res(1, err="HTTP 404: Not Found")
+        return original(args, **kw)
+
+    hub.run = run
+    result = _reconciled_ready(hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha=hub.head)
+    assert result.returncode != 0 and len(hub.readies) == 1
+    assert "503 Service Unavailable" in managed_ci.failure_suffix(result)
+
+
+def test_publish_manual_readiness_refusal_carries_the_ready_diagnostic(tmp_path):
+    runner = PublicationRunner(ready_returncode=1)  # the fake prints "ready failed"
+
+    with pytest.raises(AgentLoopError, match="Unable to mark qualified PR #7 ready") as raised:
+        _publish(runner, tmp_path)
+
+    assert "ready failed" in str(raised.value)
+
+
+class _ReplacedAdoptionRunner(V2ManagedRunner):
+    """The label POST lands but reports 502; a same-actor replacement follows."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.event_reads = 0
+        self.deletes = 0
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(a) for a in args]
+        if "POST" in cmd and "repos/OWNER/REPO/issues/7/labels" in cmd:
+            super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+            return CommandResult(cmd, cwd, "", "non-200 OK status code: 502 Bad Gateway", 1)
+        if "DELETE" in cmd and any(a.endswith(f"/labels/{MANAGED_LABEL}") for a in cmd):
+            self.deletes += 1
+        result = super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+        if cmd[-1].startswith("repos/OWNER/REPO/issues/7/events?"):
+            self.event_reads += 1
+            if self.event_reads == 3:  # after the reconciliation read, before the ownership read
+                base = self._next_event_id()
+                self.issue_events.append(label_event(base, event="unlabeled"))
+                self.issue_events.append(label_event(base + 1))
+        return result
+
+
+def test_adoption_never_claims_a_replacement_of_the_recovered_label_event(tmp_path):
+    config = make_config(
+        tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+    runner = _ReplacedAdoptionRunner(
+        workflow=adoption_workflow(),
+        rest_pr={"draft": False, "state": "open", "labels": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+    )
+
+    contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
+
+    assert contract is None  # fail closed: the observed application is not the recovered one
+    assert runner.deletes == 0  # and the replacement application is left untouched

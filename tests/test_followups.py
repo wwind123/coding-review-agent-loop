@@ -1223,3 +1223,59 @@ def test_followup_fallback_never_overrides_ambiguity_or_exhaustion(tmp_path, iss
     with pytest.raises(type(error)):
         _publish_one(hub, tmp_path, monkeypatch, stub)
     assert hub.listing_pages == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"created_at": "not-a-timestamp"},
+        {"created_at": None},
+        {"body": 42},
+        {"user": None},
+        {"user": {"login": "agent-bot"}},
+        {"title": None},
+    ],
+    ids=["bad-timestamp", "null-timestamp", "non-text-body", "null-user", "no-creator-id", "no-title"],
+)
+def test_malformed_issue_envelope_is_unknown_not_absence(tmp_path, issue_env, mutation):
+    hub = FakeIssueHub(["accepted"])
+    body = _canonical_followup_body()
+    # Even the matching accepted create is unusable when its envelope is malformed.
+    original_run = hub.run
+
+    def run(args, **kw):
+        result = original_run(args, **kw)
+        if hub.issues and hub.issues[-1].get("_mutated") is None:
+            hub.issues[-1].update(mutation)
+            hub.issues[-1]["_mutated"] = True
+        return result
+
+    hub.run = run
+    with pytest.raises(GitHubAmbiguousWriteError, match="incomplete"):
+        create_issue(hub, config=make_config(tmp_path), title="T", body=body)
+    assert len(hub.creates) == 1  # never replayed, so no duplicate issue
+
+
+def test_malformed_later_page_envelope_fails_closed(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    for index in range(100):
+        hub.add(f"filler {index}", "filler")
+    hub.add("broken", "x", created="garbage")  # lands on page 2
+    with pytest.raises(GitHubAmbiguousWriteError, match="incomplete"):
+        create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
+    assert len(hub.creates) == 1
+
+
+def test_null_issue_body_is_a_valid_non_matching_envelope(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    hub.add("T", None)
+    url = create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
+    assert url and len(hub.creates) == 2
+
+
+def test_malformed_pull_request_envelope_is_ignored_but_numbered(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    pr = hub.add("T", "x", pull_request=True)
+    pr["created_at"] = "garbage"  # a PR object is dropped before classification
+    url = create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
+    assert url and len(hub.creates) == 2

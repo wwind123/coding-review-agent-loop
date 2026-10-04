@@ -577,17 +577,8 @@ def test_merge_without_expected_head_is_a_single_unreconciled_attempt(tmp_path, 
     assert "--match-head-commit" not in runner.merges[0]
 
 
-@_pytest.mark.parametrize("source", ["full-board", "managed exact-head", "ordinary recovery"])
-def test_every_merge_mode_performs_exactly_one_merge_call_on_a_same_head_502(tmp_path, merge_env, source):
-    runner = _MergeRunner(view={"state": "OPEN", "mergedAt": None, "headRefOid": _HEAD, "mergeCommit": None})
-    with _pytest.raises(_AgentLoopError, match="rerun to re-execute every merge gate"):
-        _merge_with_proof(
-            runner,
-            config=_merge_cfg(tmp_path),
-            pr_number=7,
-            proof=_ExactHeadCiProof(head_sha=_HEAD, source=source),
-        )
-    assert len(runner.merges) == 1
+# The full-board, managed and ordinary-recovery entry paths are exercised as
+# workflows in tests/test_orchestrator_pr.py (test_*_merge_502_*).
 
 
 def test_merged_at_head_recovery_succeeds_through_the_proof_path(tmp_path, merge_env):

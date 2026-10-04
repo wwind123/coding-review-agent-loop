@@ -47,6 +47,8 @@ from .logging import log
 from . import github_retry
 from .github_retry import (
     DEFAULT_POLICY,
+    GitHubAttempt,
+    attempt_from_result,
     classify_gh_failure,
     describe_gh_failure,
     run_gh_read,
@@ -934,7 +936,9 @@ def activate_managed_ci(
             runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL
         ).result
         if apply_result.returncode != 0:
-            raise AgentLoopError(f"Unable to apply `{MANAGED_LABEL}` to PR #{pr_number}.")
+            raise AgentLoopError(
+                f"Unable to apply `{MANAGED_LABEL}` to PR #{pr_number}.{failure_suffix(apply_result)}"
+            )
         try:
             _wait_for_label_handoff(
                 runner,
@@ -950,7 +954,7 @@ def activate_managed_ci(
             if remove_result.returncode != 0:
                 raise AgentLoopError(
                     f"{exc} Cleanup also failed: `{MANAGED_LABEL}` remains applied and "
-                    "suppresses hosted CI until it is removed."
+                    f"suppresses hosted CI until it is removed.{failure_suffix(remove_result)}"
                 ) from exc
             raise
     log(config, f"PR #{pr_number}: activated managed exact-head CI")
@@ -4409,7 +4413,7 @@ def _evaluate_ready_restoration(
         return (
             "Readiness was not restored: the readiness command failed"
             + (f"; the PR is now {after.render()}" if after is not None else "; the state could not be re-read")
-            + ".",
+            + "." + failure_suffix(ready),
             "A" if after_safe else "C",
             after,
             True,
@@ -4589,7 +4593,7 @@ def _restore_ordinary_ci_after_v2_fallback(
         )
         if report_context is None:
             message += " " + _measured_state_line(runner, config, pr_number)
-        raise AgentLoopError(message)
+        raise AgentLoopError(message + failure_suffix(result))
     if report_context is not None:
         report_context.label_released = True
     log(config, f"PR #{pr_number}: label DELETE acknowledged ({reason})")
@@ -4680,7 +4684,7 @@ def _release_for_ordinary_recovery(
         message = f"Managed-CI v2 could not activate ({reason}); the label DELETE was not confirmed."
         if report_context is None:
             message += " " + _measured_state_line(runner, config, pr_number)
-        raise AgentLoopError(message)
+        raise AgentLoopError(message + failure_suffix(result))
     if report_context is not None:
         report_context.label_released = True
     log(
@@ -5794,7 +5798,7 @@ def _activate_v2_managed_ci(
                     f"--managed-ci re-entry could not make PR #{pr_number} provably draft and "
                     "unlabeled; the ready-to-draft request was "
                     f"{'acknowledged' if undo.returncode == 0 else 'not confirmed'} and no "
-                    "qualification was claimed."
+                    f"qualification was claimed.{failure_suffix(undo) if undo.returncode != 0 else ''}"
                 )
             pr = refreshed
             head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -5861,20 +5865,23 @@ def _activate_v2_managed_ci(
                 f"expected draft/labeled, draft/unlabeled, or authenticated ready/unlabeled. "
                 f"The PR was left unchanged. Resume with `{command}`."
             )
+        recovered_label_event_id: int | None = None
         if MANAGED_LABEL not in labels:
             if not ensure_managed_label(runner, config=config):
                 raise AgentLoopError(f"Unable to create the `{MANAGED_LABEL}` label.")
             context.label_post_attempted = True
-            applied_label = _label_add(
+            label_outcome = _label_add(
                 runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL
-            ).result
+            )
+            applied_label = label_outcome.result
+            recovered_label_event_id = label_outcome.event_id
             if applied_label.returncode != 0:
                 # GitHub may still have applied the label; this is an
                 # ambiguous request, never evidence of label ownership.
                 context.label_post_ambiguous = True
                 raise AgentLoopError(
                     f"Unable to apply `{MANAGED_LABEL}` to PR #{pr_number}; the label request "
-                    "was not confirmed."
+                    f"was not confirmed.{failure_suffix(applied_label)}"
                 )
             context.label_post_acknowledged = True
             label_applied = True
@@ -5900,6 +5907,16 @@ def _activate_v2_managed_ci(
                     fresh_authorization_allowed=origin == "issue-created",
                 )
                 return _ordinary_fallback_contract(runner, config=config, pr_number=pr_number, context=context, recovery=recovery)
+            if recovered_label_event_id is not None and active_event[0] != recovered_label_event_id:
+                # The label write was recovered as application E, but the timeline
+                # now shows a different application; never claim or delete it.
+                context.release_reason_kind = "event-changed"
+                raise AgentLoopError(
+                    f"PR #{pr_number} `{MANAGED_LABEL}` application changed after the recovered "
+                    f"label write (recovered event {recovered_label_event_id}, observed "
+                    f"{active_event[0]}); the label was left untouched and no qualification "
+                    "is claimed."
+                )
             if active_event[1].casefold() != actor_login.casefold() or active_event[2] != actor_id:
                 context.release_reason_kind = "foreign-actor"
                 _release_for_ordinary_recovery(
@@ -6202,22 +6219,32 @@ def label_event_history(
     )
     if events is None:
         return UnknownLabelHistory(reason or "event list unreadable")
-    latest: dict[str, object] | None = None
+    latest: LabelEvent | None = None
     for event in events:
-        label = event.get("label") if isinstance(event.get("label"), dict) else {}
-        if label.get("name") == label_name and event.get("event") in {"labeled", "unlabeled"}:
-            latest = event
-    if latest is None:
-        return CompleteLabelHistory(None)
-    actor = latest.get("actor") if isinstance(latest.get("actor"), dict) else {}
-    event_id = latest.get("id")
-    login, actor_id = actor.get("login"), actor.get("id")
-    if (
-        isinstance(event_id, bool) or not isinstance(event_id, int)
-        or not isinstance(login, str) or isinstance(actor_id, bool) or not isinstance(actor_id, int)
-    ):
-        return UnknownLabelHistory("latest label event lacked an id or actor")
-    return CompleteLabelHistory(LabelEvent(event_id, str(latest["event"]), login, actor_id))
+        if event.get("event") not in {"labeled", "unlabeled"}:
+            continue
+        # A label transition whose label cannot be identified might belong to
+        # this label; the history is then unreadable, never merely absent.
+        label = event.get("label")
+        name = label.get("name") if isinstance(label, dict) else None
+        if not isinstance(name, str) or not name:
+            return UnknownLabelHistory("a label transition event lacked a label name")
+        if name != label_name:
+            continue
+        actor = event.get("actor")
+        event_id = event.get("id")
+        login = actor.get("login") if isinstance(actor, dict) else None
+        actor_id = actor.get("id") if isinstance(actor, dict) else None
+        if (
+            isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 1
+            or not isinstance(login, str) or not login
+            or isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id < 1
+        ):
+            return UnknownLabelHistory(f"a `{label_name}` event lacked an id or actor")
+        if latest is not None and event_id <= latest.event_id:
+            return UnknownLabelHistory(f"`{label_name}` event ids were not strictly increasing")
+        latest = LabelEvent(event_id, str(event["event"]), login, actor_id)
+    return CompleteLabelHistory(latest)
 
 
 def _active_managed_label_event(
@@ -6254,6 +6281,26 @@ class ReconciledLabelWrite:
     outcome: str = "direct"
 
 
+def _live_label_presence(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, label_name: str
+) -> bool | None:
+    """Whether the live PR carries ``label_name``; ``None`` when unreadable."""
+    try:
+        payload = _read_pr_payload(
+            runner, config=config, pr_number=pr_number, cwd=active_workdir(config)
+        )
+    except Exception:
+        return None
+    names = _label_names_or_none(payload)
+    return None if names is None else label_name in names
+
+
+def failure_suffix(result: object) -> str:
+    """The final diagnostic plus attempt history, as a message suffix (may be empty)."""
+    detail = describe_gh_failure(result)  # type: ignore[arg-type]
+    return f"\n{detail}" if detail else ""
+
+
 def reconciled_label_write(
     runner: Runner,
     *,
@@ -6266,42 +6313,66 @@ def reconciled_label_write(
 ) -> ReconciledLabelWrite:
     """Add (``op='add'``) or remove (``op='remove'``) one label with reconciliation (#510).
 
-    After a transient failure that exact label's event history is re-read before
-    any replay.  Add: a newer ``labeled`` event by the authenticated actor id is
-    success; a newer foreign or ``unlabeled`` event, or unreadable history,
-    fails closed; no newer event with the label absent replays.  Remove: a newer
-    ``unlabeled`` by the actor is success; the label still present with the owned
-    ``labeled`` event id replays; a replacement ``labeled`` event (same actor or
-    foreign), a foreign unlabel, or unreadable history is never replayed against.
-    A failed baseline read allows a single attempt only.  Permanent failures and
-    dry-run are returned untouched.
+    Before the first attempt the exact label's latest event is captured: for an
+    add, the baseline a newer event is judged against; for a remove, the
+    application being removed (``owned_event_id`` when the caller holds it).
+    Without a readable baseline the write is a single attempt.  After a
+    transient failure the exact label's event history is re-read (every label
+    transition must be well formed) and, before any replay, the live label
+    presence must agree with it.
+
+    Add: a newer ``labeled`` event by the authenticated actor id is success; a
+    newer foreign or ``unlabeled`` event fails closed; no newer event with the
+    label absent replays.  Remove: a newer ``unlabeled`` by the actor is success;
+    the label still present as the same application replays; a replacement
+    ``labeled`` event (same actor or foreign), a foreign unlabel, or an
+    unreadable or inconsistent history is never replayed against.  Failed
+    outcomes carry the final diagnostic and attempt history.  Permanent failures
+    pass through unchanged; dry-run bypasses all of it.
     """
     if config.dry_run:
         return ReconciledLabelWrite(write())
+    history_log: list[GitHubAttempt] = []
+
+    def failed(result: CommandResult, outcome: str) -> ReconciledLabelWrite:
+        return ReconciledLabelWrite(
+            github_retry._with_history(result, history_log, exhausted=outcome == "exhausted"),
+            outcome=outcome,
+        )
+
+    target_id: int | None = owned_event_id
     baseline: CompleteLabelHistory | UnknownLabelHistory | None = None
-    if op == "add":
+    if op == "add" or target_id is None:
         baseline = label_event_history(
             runner, config=config, pr_number=pr_number, label_name=label_name
         )
+    if op == "remove" and target_id is None and isinstance(baseline, CompleteLabelHistory):
+        if baseline.latest is not None and baseline.latest.kind == "labeled":
+            target_id = baseline.latest.event_id
+    reconcilable = (
+        isinstance(baseline, CompleteLabelHistory) if op == "add" else target_id is not None
+    )
     active = DEFAULT_POLICY
     result: CommandResult | None = None
     for number in range(1, active.attempts + 1):
+        started = time.monotonic()
         result = write()
         if result.returncode == 0 or classify_gh_failure(result) == "permanent":
             return ReconciledLabelWrite(result)
-        if op == "add" and not isinstance(baseline, CompleteLabelHistory):
-            log(config, f"PR #{pr_number}: `{label_name}` add is ambiguous and had no baseline; not replayed")
-            return ReconciledLabelWrite(result, outcome="unknown")
+        history_log.append(attempt_from_result(number, result, started))
+        if not reconcilable:
+            log(config, f"PR #{pr_number}: `{label_name}` {op} is ambiguous and its ownership baseline is unavailable; not replayed")
+            return failed(result, "unknown")
         history = label_event_history(
             runner, config=config, pr_number=pr_number, label_name=label_name
         )
         if not isinstance(history, CompleteLabelHistory):
             log(config, f"PR #{pr_number}: `{label_name}` {op} is ambiguous and its history is unreadable; not replayed")
-            return ReconciledLabelWrite(result, outcome="unknown")
+            return failed(result, "unknown")
         try:
             actor_id = resolve_authenticated_github_actor(runner, config=config)[1]
         except Exception:
-            return ReconciledLabelWrite(result, outcome="unknown")
+            return failed(result, "unknown")
         latest = history.latest
         if op == "add":
             assert isinstance(baseline, CompleteLabelHistory)
@@ -6312,25 +6383,35 @@ def reconciled_label_write(
                     return ReconciledLabelWrite(
                         github_retry.as_success(result), latest.event_id, "adopted"
                     )
-                return ReconciledLabelWrite(result, outcome="foreign")
+                return failed(result, "foreign")
             if latest is not None and latest.kind == "labeled":
                 # Present with no newer event: not the state this add expects.
-                return ReconciledLabelWrite(result, outcome="unknown")
+                return failed(result, "unknown")
+            if _live_label_presence(
+                runner, config=config, pr_number=pr_number, label_name=label_name
+            ) is not False:
+                # History says absent but the live label is present or unreadable.
+                return failed(result, "unknown")
         else:
+            assert target_id is not None
             if latest is None:
-                return ReconciledLabelWrite(result, outcome="unknown")
+                return failed(result, "unknown")
             if latest.kind == "unlabeled":
-                if latest.actor_id == actor_id:
+                if latest.event_id > target_id and latest.actor_id == actor_id:
                     log(config, f"PR #{pr_number}: `{label_name}` was removed despite a transient error")
                     return ReconciledLabelWrite(github_retry.as_success(result), outcome="adopted")
-                return ReconciledLabelWrite(result, outcome="foreign")
-            if owned_event_id is not None and latest.event_id != owned_event_id:
+                return failed(result, "foreign")
+            if latest.event_id != target_id:
                 log(config, f"PR #{pr_number}: `{label_name}` was re-applied by a different event; not removed")
-                return ReconciledLabelWrite(result, outcome="replacement")
+                return failed(result, "replacement")
+            if _live_label_presence(
+                runner, config=config, pr_number=pr_number, label_name=label_name
+            ) is not True:
+                return failed(result, "unknown")
         if number < active.attempts:
             github_retry.sleep_before_retry(active, number)
     assert result is not None
-    return ReconciledLabelWrite(result, outcome="exhausted")
+    return failed(result, "exhausted")
 
 
 def _label_add(
@@ -6491,21 +6572,33 @@ def _activate_v2_existing_pr_adoption(
         return None
     existing = _active_managed_label_event(runner, config=config, pr_number=pr_number)
     applied = False
+    recovered_event_id: int | None = None
     if MANAGED_LABEL not in labels:
         if not ensure_managed_label(runner, config=config):
             return None
-        created = _label_add(
+        label_outcome = _label_add(
             runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL
-        ).result
+        )
+        created = label_outcome.result
         if created.returncode != 0:
             return None
         applied = True
+        recovered_event_id = label_outcome.event_id
         existing = _active_managed_label_event(runner, config=config, pr_number=pr_number)
-    if existing is None or existing[1].casefold() != actor_login.casefold() or existing[2] != actor_id:
+    replaced = (
+        recovered_event_id is not None
+        and (existing is None or existing[0] != recovered_event_id)
+    )
+    if replaced or existing is None or existing[1].casefold() != actor_login.casefold() or existing[2] != actor_id:
         # A newly-created but unprovable label must not remain as our claimed
-        # suppression.  The release helper fresh-checks event ownership.
+        # suppression.  The release helper fresh-checks event ownership, so a
+        # replacement application (not the recovered one) is left untouched.
         provisional = ManagedCiContract(
-            protocol_version=2, adopted_existing_pr=True, active_label_event_id=existing[0] if existing else None,
+            protocol_version=2, adopted_existing_pr=True,
+            active_label_event_id=(
+                recovered_event_id if recovered_event_id is not None
+                else existing[0] if existing else None
+            ),
             invocation_applied_label=applied,
         )
         release_adopted_managed_ci(runner, config=config, pr_number=pr_number, contract=provisional)
@@ -6810,7 +6903,9 @@ def _publish_manual_v2_qualification(
             runner, config=config, pr_number=pr_number, label_name=QUALIFIED_LABEL
         ).result
         if removed.returncode != 0:
-            raise AgentLoopError(f"Unable to clear stale `{QUALIFIED_LABEL}` from PR #{pr_number}.")
+            raise AgentLoopError(
+                f"Unable to clear stale `{QUALIFIED_LABEL}` from PR #{pr_number}.{failure_suffix(removed)}"
+            )
 
     not_published = (
         f"PR #{pr_number} changed before manual qualification publication; "
@@ -6835,7 +6930,9 @@ def _publish_manual_v2_qualification(
             runner, config=config, pr_number=pr_number, expected_head_sha=expected_head_sha,
         )
         if ready.returncode != 0:
-            raise AgentLoopError(f"Unable to mark qualified PR #{pr_number} ready for manual review.")
+            raise AgentLoopError(
+                f"Unable to mark qualified PR #{pr_number} ready for manual review.{failure_suffix(ready)}"
+            )
         changed = (
             f"PR #{pr_number} changed while being made ready; the approved head is not safely published."
         )
@@ -8535,14 +8632,18 @@ def prepare_v2_merge(
         runner, config=config, pr_number=pr_number, label_name=QUALIFIED_LABEL
     ).result
     if labelled.returncode != 0:
-        raise AgentLoopError(f"Unable to apply `{QUALIFIED_LABEL}` before readying PR #{pr_number}.")
+        raise AgentLoopError(
+            f"Unable to apply `{QUALIFIED_LABEL}` before readying PR #{pr_number}.{failure_suffix(labelled)}"
+        )
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     if pr.get("draft") is True:
         ready = reconciled_pr_ready(
             runner, config=config, pr_number=pr_number, expected_head_sha=expected_head_sha,
         )
         if ready.returncode != 0:
-            raise AgentLoopError(f"Unable to mark qualified PR #{pr_number} ready for review.")
+            raise AgentLoopError(
+                f"Unable to mark qualified PR #{pr_number} ready for review.{failure_suffix(ready)}"
+            )
     if get_pr_head_sha(runner, config, pr_number) != expected_head_sha:
         raise AgentLoopError(f"PR #{pr_number} head changed while it was being readied for merge.")
 

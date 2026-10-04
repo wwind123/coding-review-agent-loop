@@ -38,6 +38,7 @@ from .errors import (
     HumanDecisionRequiredError,
     IssueImplementationConflictError,
 )
+from .github_retry import describe_gh_failure
 from .github import (
     _classify_check_status,
     IssueContext,
@@ -206,6 +207,11 @@ def _print_unprotected_managed_ci_warning(protection_mode: str) -> None:
             "invocation."
         )
     print(message)
+
+
+def _ready_failure_suffix(result) -> str:
+    detail = describe_gh_failure(result)
+    return f"\n{detail}" if detail else ""
 
 
 def _merge_with_exact_head_proof(
@@ -566,7 +572,10 @@ def _finalize_ordinary_recovery_merge(
         expected_head_sha=capability.expected_head_sha,
     )
     if ready.returncode != 0:
-        raise AgentLoopError(f"Unable to mark recovered PR #{pr_number} ready for review.")
+        raise AgentLoopError(
+            f"Unable to mark recovered PR #{pr_number} ready for review."
+            f"{_ready_failure_suffix(ready)}"
+        )
     if not validate_ordinary_recovery_capability(
         runner, config=config, capability=capability, require_draft=None,
     ):

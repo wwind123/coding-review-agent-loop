@@ -4161,6 +4161,21 @@ def _read_creator_issue_pages(
                     f"Creator issue listing page {page} held a missing or repeated issue number."
                 )
             seen.add(number)
+            if "pull_request" not in raw:
+                # Every non-PR issue must be fully classifiable: a malformed
+                # envelope could be the accepted create, so it makes the whole
+                # listing unusable instead of being skipped.
+                user = raw.get("user")
+                user_id = user.get("id") if isinstance(user, dict) else None
+                if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+                    raise AgentLoopError(
+                        f"Creator issue listing issue #{number} lacks a creator id."
+                    )
+                parse_comment_timestamp(raw.get("created_at"))
+                if not isinstance(raw.get("title"), str):
+                    raise AgentLoopError(f"Creator issue listing issue #{number} lacks a title.")
+                if raw.get("body") is not None and not isinstance(raw.get("body"), str):
+                    raise AgentLoopError(f"Creator issue listing issue #{number} has a non-text body.")
             items.append(raw)
         if len(raw_page) < page_size:
             return items
@@ -4218,13 +4233,10 @@ def recover_created_issue(
         user = raw.get("user")
         if not isinstance(user, dict) or user.get("id") != actor_id:
             continue
-        try:
-            created = parse_comment_timestamp(raw.get("created_at"))
-        except AgentLoopError:
-            continue
+        created = parse_comment_timestamp(raw.get("created_at"))
         if created < window_start:
             continue
-        if not (creation_identity_records(raw.get("body") if isinstance(raw.get("body"), str) else "") & identities):
+        if not (creation_identity_records(raw.get("body") or "") & identities):
             continue
         matches.append(raw)
     if not matches:
@@ -4743,32 +4755,39 @@ def reconciled_pr_ready(
     if config.dry_run or not expected_head_sha:
         return runner.run(command, cwd=cwd, check=False)
     active = DEFAULT_POLICY
+    history: list[GitHubAttempt] = []
     result: CommandResult | None = None
+
+    def failed(final: CommandResult, exhausted: bool = False) -> CommandResult:
+        return github_retry._with_history(final, history, exhausted=exhausted)
+
     for number in range(1, active.attempts + 1):
+        started = time.monotonic()
         result = runner.run(command, cwd=cwd, check=False)
         if result.returncode == 0:
             return result
         if classify_gh_failure(result) == "permanent":
             return result
+        history.append(attempt_from_result(number, result, started))
         state, reason = _read_pr_view_json(
             runner, config=config, pr_number=pr_number, fields="isDraft,headRefOid"
         )
         if state is None:
             log(config, f"PR #{pr_number}: ready transition is ambiguous and unreadable ({reason}); not replayed")
-            return result
+            return failed(result)
         is_draft, head = state.get("isDraft"), state.get("headRefOid")
         if not isinstance(is_draft, bool) or not isinstance(head, str):
-            return result
+            return failed(result)
         if head != expected_head_sha:
             log(config, f"PR #{pr_number}: head changed during an ambiguous ready transition; not replayed")
-            return result
+            return failed(result)
         if is_draft == undo:
             log(config, f"PR #{pr_number}: ready transition was accepted despite a transient error")
             return github_retry.as_success(result)
         if number < active.attempts:
             github_retry.sleep_before_retry(active, number)
     assert result is not None
-    return result
+    return failed(result, exhausted=True)
 
 
 def merge_pr(

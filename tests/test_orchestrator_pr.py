@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
+from coding_review_agent_loop.runner import CommandResult
+
 import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.ci_health import CiInfrastructureStall, StalledCheck
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop, run_pr_loop
@@ -17050,3 +17052,178 @@ def test_pr1166_stale_attempt_failure_does_not_end_run_or_partial_the_approved_r
     assert state2["dispatches"] == []
     assert state2["waited"] == [(1000, "abc123-coder-1")]
     assert state2["merges"] == [{"expected_head_sha": "abc123-coder-1"}]
+
+
+# --- #510: merge ambiguity through every real merge entry path -----------------------
+
+
+class _AmbiguousMergeRunner(FakeRunner):
+    """A FakeRunner whose ``gh pr merge`` fails with a scripted 502.
+
+    ``events`` records every merge attempt so a test can order merges against
+    gate re-execution; the PR is reported OPEN at the approved head afterwards.
+    """
+
+    def __init__(self, *args, merge_script=("502",), events=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.merge_script = list(merge_script)
+        self.events = events if events is not None else []
+        self.merge_view = {
+            "state": "OPEN", "mergedAt": None, "headRefOid": "abc123", "mergeCommit": None,
+        }
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        cmd = [str(a) for a in args]
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            super().run(args, cwd=cwd, input_text=input_text, check=False, env=env)
+            self.events.append("merge")
+            action = self.merge_script.pop(0) if self.merge_script else "ok"
+            where = Path(cwd) if cwd else Path(".")
+            if action == "502":
+                return CommandResult(cmd, where, "", "non-200 OK status code: 502 Bad Gateway", 1)
+            return CommandResult(cmd, where, "", "", 0)
+        if cmd[:3] == ["gh", "pr", "view"] and "state,mergedAt,headRefOid,mergeCommit" in cmd:
+            where = Path(cwd) if cwd else Path(".")
+            return CommandResult(cmd, where, json.dumps(self.merge_view), "", 0)
+        return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+
+def _merge_commands(runner):
+    return [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "merge"]]
+
+
+def test_full_board_merge_502_is_one_attempt_and_a_rerun_regates_before_merging(tmp_path):
+    events = []
+    approval = "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+    runner = _AmbiguousMergeRunner(codex_outputs=[approval, approval], events=events)
+    config = make_config(tmp_path, auto_merge=True, test_command=("pytest", "tests/test_agent_loop.py"))
+    original = orchestrator.get_pr_checks
+    with patch.object(
+        orchestrator, "get_pr_checks",
+        side_effect=lambda *a, **k: events.append("full-board-gate") or original(*a, **k),
+    ):
+        with pytest.raises(AgentLoopError, match="rerun to re-execute every merge gate"):
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert len(_merge_commands(runner)) == 1
+        assert "--match-head-commit" in _merge_commands(runner)[0]
+        assert events.count("merge") == 1
+
+        # The rerun re-executes the full-board gate before any new merge attempt.
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(_merge_commands(runner)) == 2
+    first_merge = events.index("merge")
+    second_merge = len(events) - 1 - events[::-1].index("merge")
+    assert "full-board-gate" in events[first_merge + 1:second_merge]
+
+
+def test_managed_merge_502_is_one_attempt_and_a_rerun_requalifies_before_merging(tmp_path, monkeypatch):
+    events = []
+    approval = structured_pr_review(state="approved", summary="Approved.")
+    runner = _AmbiguousMergeRunner(codex_outputs=[approval, approval], events=events)
+    config = make_config(tmp_path, watch_pending_ci=True, auto_merge=True)
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: ManagedCiContract())
+    monkeypatch.setattr(
+        orchestrator, "dispatch_final_qualification", lambda *a, **k: events.append("dispatch")
+    )
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification",
+        lambda *a, **k: events.append("qualified") or ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+
+    with pytest.raises(AgentLoopError, match="rerun to re-execute every merge gate"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_merge_commands(runner)) == 1
+    assert "--match-head-commit" in _merge_commands(runner)[0]
+    assert events == ["dispatch", "qualified", "merge"]
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert len(_merge_commands(runner)) == 2
+    assert events == [
+        "dispatch", "qualified", "merge", "dispatch", "qualified", "merge",
+    ]  # no merge without a fresh exact-head qualification
+
+
+def test_ordinary_recovery_merge_502_is_one_attempt_and_a_rerun_revalidates_before_merging(
+    monkeypatch, tmp_path
+):
+    events = []
+    runner = _AmbiguousMergeRunner(events=events)
+    config = make_config(tmp_path, auto_merge=True)
+    capability = OrdinaryRecoveryCapability(
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100,
+    )
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
+    monkeypatch.setattr(
+        orchestrator, "wait_for_ordinary_recovery",
+        lambda *a, **k: events.append("recovery-gate") or ManagedCiOutcome(
+            status="passed", checks=_watch_check_board("passing"), head_sha="abc123",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "get_pr_review_context",
+        lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
+            number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
+            base_branch="main", head_sha="abc123", url=None,
+        )),
+    )
+    monkeypatch.setattr(
+        orchestrator, "validate_ordinary_recovery_capability",
+        lambda *a, **k: events.append("capability") or True,
+    )
+
+    with pytest.raises(AgentLoopError, match="rerun to re-execute every merge gate"):
+        orchestrator._finalize_ordinary_recovery_merge(
+            runner, config=config, pr_number=77, capability=capability,
+        )
+    assert len(_merge_commands(runner)) == 1
+    assert "--match-head-commit" in _merge_commands(runner)[0]
+    first_pass = list(events)
+    assert first_pass[-1] == "merge" and "recovery-gate" in first_pass and "capability" in first_pass
+
+    orchestrator._finalize_ordinary_recovery_merge(
+        runner, config=config, pr_number=77, capability=capability,
+    )
+
+    assert len(_merge_commands(runner)) == 2
+    second_pass = events[len(first_pass):]
+    assert second_pass[-1] == "merge"
+    assert "recovery-gate" in second_pass and "capability" in second_pass  # gates re-ran first
+
+
+@pytest.mark.parametrize("path", ["full-board", "ordinary-recovery"])
+def test_merge_502_that_actually_merged_is_recovered_with_no_second_merge(tmp_path, monkeypatch, path):
+    runner = _AmbiguousMergeRunner()
+    runner.merge_view = {"state": "MERGED", "mergedAt": "t", "headRefOid": "abc123", "mergeCommit": {"oid": "m"}}
+    if path == "full-board":
+        approval = "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
+        runner.codex_outputs = [approval]
+        config = make_config(tmp_path, auto_merge=True, test_command=("pytest", "tests/test_agent_loop.py"))
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    else:
+        config = make_config(tmp_path, auto_merge=True)
+        capability = OrdinaryRecoveryCapability(
+            pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+            released_label_event_id=101, released_at=100,
+        )
+        monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
+        monkeypatch.setattr(
+            orchestrator, "wait_for_ordinary_recovery",
+            lambda *a, **k: ManagedCiOutcome(
+                status="passed", checks=_watch_check_board("passing"), head_sha="abc123",
+            ),
+        )
+        monkeypatch.setattr(
+            orchestrator, "get_pr_review_context",
+            lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
+                number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
+                base_branch="main", head_sha="abc123", url=None,
+            )),
+        )
+        monkeypatch.setattr(orchestrator, "validate_ordinary_recovery_capability", lambda *a, **k: True)
+        orchestrator._finalize_ordinary_recovery_merge(
+            runner, config=config, pr_number=77, capability=capability,
+        )
+    assert len(_merge_commands(runner)) == 1
