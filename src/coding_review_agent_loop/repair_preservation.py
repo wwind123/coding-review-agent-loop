@@ -887,10 +887,7 @@ def _validate_review_architecture_decision(source: object, target: dict) -> None
     target_impact = target.get("architecture_impact")
     target_status = target_impact.get("status") if isinstance(target_impact, dict) else None
     if source_decision is None:
-        # A source that carried no assessment at all keeps today's behavior; the
-        # guard covers an assessment whose decision the reviewer left undecided.
-        source_has_assessment = isinstance(source, dict) and source.get("architecture_impact") is not None
-        if source_has_assessment and target_status is not None:
+        if target_status is not None:
             raise AgentLoopError(
                 "Repair content preservation failed for architecture_impact.status: the "
                 "reviewer did not supply a decision, so repair must not introduce one."

@@ -2240,7 +2240,8 @@ def test_repair_cannot_fabricate_an_assessment_under_a_required_contract(
 
 
 @pytest.mark.parametrize("path", ["legacy", "execute"])
-def test_non_required_review_repair_keeps_todays_behavior(tmp_path, path):
+def test_non_required_review_repair_cannot_invent_a_reviewer_status(tmp_path, path):
+    """A reviewer's architecture decision is never supplied by repair (#1185)."""
     from agent_loop_helpers import malformed_pr_review_source
 
     source = malformed_pr_review_source(state="approved", summary="Looks good overall.")
@@ -2250,8 +2251,9 @@ def test_non_required_review_repair_keeps_todays_behavior(tmp_path, path):
     (repaired, parsed, attempts), _refusals = _deg_run_repair(
         tmp_path, source, repaired_text, path=path, required=False, kind="pr_review"
     )
-    assert parsed is not None
-    assert parsed.architecture_impact.status == "unchanged"
+    assert parsed is None
+    assert attempts[-1].outcome == "invalid_output"
+    assert "architecture_impact.status" in attempts[-1].diagnostic
 
 
 def _deg_review_text(kind, impact, *, extra_key=False):

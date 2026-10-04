@@ -2345,6 +2345,24 @@ def _run_validated_agent(
                         should_retry = False
                         last_failure_category = "deterministic"
                     elif (
+                        repair_expected_kind in {"plan_review", "pr_review"}
+                        and isinstance(exc, MissingJudgementFieldError)
+                    ):
+                        # Reformatting cannot supply the reviewer's decision (#1185).
+                        allowed = " | ".join(exc.allowed_values)
+                        log(
+                            config,
+                            f"{agent_name}: reviewer gave no valid {exc.field_path} "
+                            f"(allowed: {allowed}); not repairable by reformatting, "
+                            "skipping repair pass",
+                        )
+                        last_error = (
+                            f"{exc} (repair skipped because the reviewer did not supply "
+                            f"{exc.field_path} (allowed: {allowed}); a repair pass cannot "
+                            "supply the reviewer's decision)"
+                        )
+                        last_failure_category = "deterministic"
+                    elif (
                         use_repair
                         and not public_text_is_transient
                         and not response_failure_is_unsupported
@@ -2357,11 +2375,6 @@ def _run_validated_agent(
                         # so a response whose only defect is the unsatisfied
                         # contract has nothing left for a repair model to fix.
                         and not contract_unsatisfied
-                        # A reviewer's judgement cannot be supplied by reformatting.
-                        and not (
-                            repair_expected_kind in {"plan_review", "pr_review"}
-                            and isinstance(exc, MissingJudgementFieldError)
-                        )
                     ):
                         log(config, f"{agent_name}: schema validation failed ({exc}); attempting repair pass")
                         repair_kwargs: dict[str, object] = {"expected_kind": repair_expected_kind}
