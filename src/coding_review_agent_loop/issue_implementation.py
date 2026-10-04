@@ -528,6 +528,7 @@ def _implement_approved_issue(
         )),
         usage_context=usage_context,
         role="coder",
+        reask_on_evidence_rejection=True,
         use_repair=True,
         repair_expected_kind="issue_implementation",
         repair_surfaced_requirement_ids=implementation_human_requirements_context.surfaced_requirement_ids,

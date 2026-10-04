@@ -4355,7 +4355,8 @@ def _parse_semantic_risk_coverage_claims(
                 continue
             if execution_ref in catalog_by_ref:
                 raise NonRepairableEvidenceRejection(  # shape-check: fatal:orchestrator-authored
-                    f"{context} cannot validate a colliding execution_ref `{execution_ref}`."
+                    f"{context} cannot validate a colliding execution_ref `{execution_ref}`.",
+                    reason="catalog-collision",
                 )
             catalog_by_ref[execution_ref] = observation
     degradations: list[ParseDegradation] = []
@@ -4496,7 +4497,8 @@ def _parse_semantic_risk_coverage_claims(
                         f"{refs_context} selector `{ref}` is not an admissible passing observation: "
                         f"{'; '.join(_observation_outcome_failure_reasons(observation))}; "
                         f"command: {_observation_command_label(observation)}; "
-                        f"observed at {_observation_timestamp_label(observation)}."
+                        f"observed at {_observation_timestamp_label(observation)}.",
+                        reason="non-passing-selector",
                     )
                 if not _known_launch_integrity_passes(observation):
                     raise NonRepairableEvidenceRejection(  # shape-check: fatal:authority-decision
@@ -4505,7 +4507,8 @@ def _parse_semantic_risk_coverage_claims(
                         f"{'; '.join(_launch_integrity_failure_reasons(observation))}; "
                         f"command: {_observation_command_label(observation)}; "
                         f"observed at {_observation_timestamp_label(observation)}. "
-                        "Cite a different observation whose launch was fully verified."
+                        "Cite a different observation whose launch was fully verified.",
+                        reason="launch-integrity",
                     )
         # Then the first degradable defect wins, in a fixed order, so every
         # dropped claim yields exactly one record.  The #926 row-ID rules come

@@ -573,6 +573,24 @@ def _prior_disposition_omission_reask_prompt(prompt: str, missing_ids: Sequence[
     )
 
 
+_EVIDENCE_REASK_MAX_CHARS = 1500
+
+
+def _evidence_rejection_reask_prompt(prompt: str, detail: str) -> str:
+    """Append one bounded, marker-free section quoting a rejected test citation."""
+    quoted = " ".join(sanitize_historical_text(detail).replace("<", "(").replace(">", ")").split())
+    if len(quoted) > _EVIDENCE_REASK_MAX_CHARS:
+        quoted = quoted[: _EVIDENCE_REASK_MAX_CHARS - 3] + "..."
+    return (
+        f"{prompt}\n\n## Previous response not accepted: test evidence\n\n"
+        f"The test observation you selected is not citable: {quoted}\n\n"
+        "Observations from the previous turn are no longer selectable. Rerun the test "
+        "command that covers this change in this turn through the test wrapper, then cite "
+        "the new verified, passing observation. If you cannot obtain one, return a "
+        "blocking result instead.\n"
+    )
+
+
 def _surface_decomposition_degradations(
     runner: Runner, *, config: AgentLoopConfig, issue_number: int, decomposition: object
 ) -> None:

@@ -2453,10 +2453,37 @@ def _split_env_prefix(
     return assignments, remaining, env_path
 
 
+_NPX_PLAYWRIGHT_SAFE_OPTIONS = frozenset({"--no-install", "--no"})
+
+
+def _npx_local_playwright_target(tokens: tuple[str, ...], *, cwd: Path) -> tuple[str, ...] | None:
+    """Rewrite ``npx [--no-install|--no] playwright ...`` to the local binary.
+
+    Only the offline-safe npx options are accepted and only when
+    ``<cwd>/node_modules/.bin/playwright`` exists, so npx can never resolve or
+    download a package; the rewritten argv is what both the probe and the real
+    launch run (issue #1240).
+    """
+    if not tokens or Path(tokens[0]).name != "npx":
+        return None
+    index = 1
+    while index < len(tokens) and tokens[index] in _NPX_PLAYWRIGHT_SAFE_OPTIONS:
+        index += 1
+    if index >= len(tokens) or tokens[index] != "playwright":
+        return None
+    local = cwd / "node_modules" / ".bin" / "playwright"
+    if not local.is_file():
+        return None
+    return (str(local), *tokens[index + 1:])
+
+
 def _recognized_inner_probe_with_environment(
     argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None
-) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, str], tuple[str, ...]] | None:
-    """Return ``(probe, target, env_assignments, launch_argv)`` if recognized.
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, str], tuple[str, ...], tuple[str, ...]] | None:
+    """Return ``(probe, target, env_assignments, launch_argv, env_prefix)`` if recognized.
+
+    ``env_prefix`` holds the original tokens preceding the original target
+    (empty without an ``env`` prefix); ``target`` may be rewritten (npx).
 
     A leading plain ``env NAME=VALUE...`` prefix is normalized away so the
     probe runs the real interpreter; the stripped assignments must be applied
@@ -2472,11 +2499,15 @@ def _recognized_inner_probe_with_environment(
         # ``env`` resolves the command with the modified PATH, so resolve the
         # interpreter against the same merged environment.
         values = {**values, **assignments}
+    env_prefix = tokens[: len(tokens) - len(target)]
+    rewritten = _npx_local_playwright_target(target, cwd=cwd)
+    if rewritten is not None:
+        target = rewritten
     probe = _recognized_inner_probe_tokens(target, cwd=cwd, environment=values)
     if probe is None:
         return None
-    launch = (env_path, *tokens[1:]) if env_path is not None else tokens
-    return probe, target, assignments, launch
+    launch = (env_path, *env_prefix[1:], *target) if env_path is not None else target
+    return probe, target, assignments, launch, env_prefix
 
 
 def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None) -> tuple[str, ...] | None:
@@ -2697,15 +2728,15 @@ def probe_inner_launcher(
     recognized = _recognized_inner_probe_with_environment(original, cwd=cwd, environment=values)
     if recognized is None:
         return LauncherProbeResult(original, "unknown", "unrecognized inner launcher")
-    probe, target, env_assignments, launch_argv = recognized
+    probe, target, env_assignments, launch_argv, env_prefix = recognized
     if env_assignments:
         values = {**values, **env_assignments}
     identity = launcher_candidate_identity(target, cwd=cwd, environment=values, kind="inner")
-    if target != original:
+    if env_prefix:
         # Distinguish ``env A=1 python -m pytest`` from ``env A=2 ...`` and
         # from the unprefixed spelling in the per-invocation probe cache.
         identity["env_prefix_sha256"] = hashlib.sha256(
-            json.dumps([launch_argv[0], *original[1: len(original) - len(target)]]).encode("utf-8")
+            json.dumps([launch_argv[0], *env_prefix[1:]]).encode("utf-8")
         ).hexdigest()
     identity_key = _identity_key(identity)
     rebound = launch_argv if launch_argv != original else ()

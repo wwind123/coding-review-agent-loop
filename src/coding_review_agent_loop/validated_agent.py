@@ -17,6 +17,7 @@ from .agents.antigravity import AntigravityAttemptState
 from .agents.registry import agent_display_name, agent_signature, run_agent_result
 from .config import AgentLoopConfig
 from .errors import (
+    CITATION_REASKABLE_REASONS,
     AgentInvocationError,
     AgentLoopError,
     DeterministicPlanValidationExhaustion,
@@ -115,6 +116,7 @@ from .architecture_contract import (
     _accepted_validated_response,
     _architecture_contract_retry_prompt,
     _fresh_matrix_contract_retry_prompt,
+    _evidence_rejection_reask_prompt,
     _prior_disposition_omission_reask_prompt,
     _ArchitectureImpactContractUnsatisfied,
 )
@@ -992,6 +994,7 @@ def _run_validated_agent(
     degrade_architecture_impact: bool = False,
     strict_revalidate: Callable[[str], object] | None = None,
     reask_on_prior_disposition_omission: bool = False,
+    reask_on_evidence_rejection: bool = False,
 ) -> ValidatedAgentResponse:
     # Agent responses are current untrusted visible text.  Keep this guard in
     # the validation seam so every artifact recovery and repair path receives
@@ -1089,6 +1092,9 @@ def _run_validated_agent(
     if reask_on_prior_disposition_omission:
         # One dedicated slot that never consumes agent_max_retries.
         max_attempts += 1
+    if reask_on_evidence_rejection:
+        # One dedicated slot that never consumes agent_max_retries (#1240).
+        max_attempts += 1
     if require_risk_test_matrix_contract:
         # One dedicated planner replay for a fresh matrix integrity refusal;
         # never consumes agent_max_retries or Antigravity fallback state.
@@ -1132,6 +1138,9 @@ def _run_validated_agent(
     terminal_integrity_contract: str | None = None
     pending_matrix_integrity_reprompt: str | None = None
     pending_omission_reask_ids: tuple[str, ...] | None = None
+    evidence_reask_used = False
+    pending_evidence_reask_detail: str | None = None
+    pending_evidence_reask_session: str | None = None
     executable_replacement_policies: dict[AgentName, tuple[str, str, str, bool]] = {
         "claude": (
             config.claude_cmd,
@@ -1257,6 +1266,18 @@ def _run_validated_agent(
                 else prompt
             )
         pending_contract_reprompt = None
+        attempt_session_id = session_id
+        if pending_evidence_reask_detail is not None:
+            # Same frozen prompt plus the sanitized rejection; resume the
+            # rejected acquisition's own session when one exists (#1240).
+            attempt_prompt = _evidence_rejection_reask_prompt(
+                prompt, pending_evidence_reask_detail
+            )
+            attempt_session_id = pending_evidence_reask_session
+            if agent == "claude":
+                invocation_kwargs["attempt_suffix"] = "evidence-reask"
+            pending_evidence_reask_detail = None
+            pending_evidence_reask_session = None
         if usage_context is not None:
             usage_context.note_agent_dispatch()
         result = run_agent_result(
@@ -1264,7 +1285,7 @@ def _run_validated_agent(
             agent=agent,
             config=attempt_config,
             prompt=attempt_prompt,
-            session_id=session_id,
+            session_id=attempt_session_id,
             run_id=usage_context.run_id if usage_context is not None else None,
             role=role,
             label=label,
@@ -2246,6 +2267,35 @@ def _run_validated_agent(
                         # the coder's claims, so it cannot satisfy this; running
                         # it (and its fallback chain) only burns its timeout and
                         # then misreports the stop as that timeout (#990).
+                        if (
+                            reask_on_evidence_rejection
+                            and not evidence_reask_used
+                            and evidence_rejection.reason in CITATION_REASKABLE_REASONS
+                            and not public_text_is_transient
+                            and not marker_safety_failure
+                            and not response_failure_is_unsupported
+                        ):
+                            # A non-citable selected observation is missing
+                            # judgement only the coder can supply (rerun and
+                            # re-cite): re-ask once, outside the retry budget
+                            # and fallback, never via repair (#1240).
+                            evidence_reask_used = True
+                            pending_evidence_reask_detail = str(evidence_rejection)
+                            pending_evidence_reask_session = result.session_id or session_id
+                            if usage_record is not None:
+                                usage_record.validation_status = "invalid"
+                            log(
+                                config,
+                                f"{agent_name}: semantic evidence rejected ({evidence_rejection}); "
+                                "re-asking the coder once to cite a verified passing observation "
+                                "(no repair)"
+                                + (
+                                    "; resuming session"
+                                    if pending_evidence_reask_session
+                                    else "; fresh turn"
+                                ),
+                            )
+                            continue
                         log(
                             config,
                             f"{agent_name}: semantic evidence rejected ({evidence_rejection}); "
