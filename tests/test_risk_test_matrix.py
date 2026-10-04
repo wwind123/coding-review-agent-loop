@@ -3109,3 +3109,66 @@ def test_row_id_only_drop_still_bounds_a_truncated_fact_tail_927(duplicate):
     claim["test_identifiers"] = claim["test_identifiers"][:20]
     parsed = _parse_927(claims, row_ids=("row-a",))
     assert parsed.degradations and parsed.claims == ()
+
+
+# --- #1229: lossless normalization of lone-string list fields ---------------
+
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    normalize_risk_test_matrix_string_lists,
+    parse_risk_test_matrix_changes,
+)
+
+
+def _plan_payload_1229() -> dict[str, object]:
+    return {
+        "risk_test_matrix": _matrix(),
+        "risk_test_matrix_changes": [
+            {"operation": "add", "row_ids": ["row-ordinary"], "rationale": "New row."}
+        ],
+    }
+
+
+_STRING_LIST_SETTERS_1229 = {
+    "risk_test_matrix.rows[0].forbidden_side_effects": lambda p, v: p["risk_test_matrix"]["rows"][0].__setitem__("forbidden_side_effects", v),
+    "risk_test_matrix.rows[0].related_scope_item_ids": lambda p, v: p["risk_test_matrix"]["rows"][0].__setitem__("related_scope_item_ids", v),
+    "risk_test_matrix.important_exclusions": lambda p, v: p["risk_test_matrix"].__setitem__("important_exclusions", v),
+    "risk_test_matrix_changes[0].row_ids": lambda p, v: p["risk_test_matrix_changes"][0].__setitem__("row_ids", v),
+}
+
+
+@pytest.mark.parametrize("path", sorted(_STRING_LIST_SETTERS_1229))
+def test_matrix_string_list_normalization_wraps_each_field(path):
+    payload = _plan_payload_1229()
+    value = "row-ordinary" if path.endswith("row_ids") else "A lone string"
+    _STRING_LIST_SETTERS_1229[path](payload, value)
+    before = json.dumps(payload, sort_keys=True)
+    normalized, paths = normalize_risk_test_matrix_string_lists(payload)
+    assert paths == (path,)
+    assert json.dumps(payload, sort_keys=True) == before
+    parse_risk_test_matrix(normalized["risk_test_matrix"])
+    parse_risk_test_matrix_changes(normalized["risk_test_matrix_changes"])
+    again, again_paths = normalize_risk_test_matrix_string_lists(normalized)
+    assert again_paths == () and again == normalized
+
+
+@pytest.mark.parametrize("bad", ["", "   ", None, 3, True, {}])
+@pytest.mark.parametrize("path", sorted(_STRING_LIST_SETTERS_1229))
+def test_matrix_string_list_normalization_leaves_invalid_values(path, bad):
+    payload = _plan_payload_1229()
+    _STRING_LIST_SETTERS_1229[path](payload, bad)
+    normalized, paths = normalize_risk_test_matrix_string_lists(payload)
+    assert paths == ()
+    assert normalized == payload
+    with pytest.raises(AgentLoopError):
+        parse_risk_test_matrix(normalized["risk_test_matrix"])
+        parse_risk_test_matrix_changes(normalized["risk_test_matrix_changes"])
+
+
+def test_matrix_string_list_normalization_keeps_scalar_fields_and_wrapper_changes():
+    payload = _plan_payload_1229()
+    payload["risk_test_matrix_changes"] = {"changes": payload["risk_test_matrix_changes"]}
+    payload["risk_test_matrix_changes"]["changes"][0]["row_ids"] = "row-ordinary"
+    payload["risk_test_matrix"]["rows"][0]["label"] = "label stays a string"
+    normalized, paths = normalize_risk_test_matrix_string_lists(payload)
+    assert paths == ("risk_test_matrix_changes[0].row_ids",)
+    assert normalized["risk_test_matrix"]["rows"][0]["label"] == "label stays a string"

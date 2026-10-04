@@ -44,6 +44,7 @@ from .repair import (
     CandidateDecision,
     RepairAttemptResult,
     attempt_envelope_normalization,
+    attempt_risk_test_matrix_string_list_normalization,
     attempt_semantic_patch_disposition_normalization,
     attempt_repair,
     execute_repair,
@@ -109,6 +110,7 @@ from .architecture_contract import (
     _accept_candidate,
     _accepted_validated_response,
     _architecture_contract_retry_prompt,
+    _fresh_matrix_contract_retry_prompt,
     _prior_disposition_omission_reask_prompt,
     _ArchitectureImpactContractUnsatisfied,
 )
@@ -288,6 +290,16 @@ def _run_structured_repair(
     if repair_kwargs.get("require_risk_test_matrix_contract"):
         expected_kind = repair_kwargs.get("expected_kind")
         if isinstance(expected_kind, str):
+            matrix_normalized = attempt_risk_test_matrix_string_list_normalization(
+                raw, expected_kind=expected_kind
+            )
+            if matrix_normalized is not None:
+                raw = matrix_normalized[0]
+                log(
+                    config,
+                    "repair guard: normalized risk test matrix string field(s) "
+                    f"to one-element list(s): {', '.join(matrix_normalized[1])}",
+                )
             try:
                 require_recoverable_fresh_risk_test_matrix_contract(
                     raw, expected_kind=expected_kind
@@ -787,6 +799,24 @@ def _attempt_claude_completion_recovery(
     )
 
 
+def _refresh_plan_validation_capture(
+    exhaustion: DeterministicPlanValidationExhaustion | None,
+    *,
+    eligible: bool,
+    text: str,
+    diagnostic: str,
+) -> DeterministicPlanValidationExhaustion | None:
+    """Re-point an eligible capture at a normalized candidate; never create one."""
+    if not eligible or exhaustion is None:
+        return exhaustion
+    return DeterministicPlanValidationExhaustion(
+        candidate_kind=exhaustion.candidate_kind,
+        candidate_text=text,
+        diagnostic=diagnostic,
+        candidate_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+    )
+
+
 def _refused_contract_attempt(
     attempts: Sequence[RepairAttemptResult],
 ) -> RepairAttemptResult | None:
@@ -1055,6 +1085,10 @@ def _run_validated_agent(
     if reask_on_prior_disposition_omission:
         # One dedicated slot that never consumes agent_max_retries.
         max_attempts += 1
+    if require_risk_test_matrix_contract:
+        # One dedicated planner replay for a fresh matrix integrity refusal;
+        # never consumes agent_max_retries or Antigravity fallback state.
+        max_attempts += 1
     last_error =f"{agent_name} produced no output."
     last_result: AgentResult | None = None
     last_classification_text = ""
@@ -1090,6 +1124,9 @@ def _run_validated_agent(
     # unsatisfied architecture-impact contract and consumed by one attempt.
     pending_contract_reprompt: str | None = None
     omission_reask_used = False
+    matrix_integrity_replay_used = False
+    terminal_integrity_contract: str | None = None
+    pending_matrix_integrity_reprompt: str | None = None
     pending_omission_reask_ids: tuple[str, ...] | None = None
     executable_replacement_policies: dict[AgentName, tuple[str, str, str, bool]] = {
         "claude": (
@@ -1135,7 +1172,14 @@ def _run_validated_agent(
             )
         elif is_executable_replacement_replay:
             invocation_kwargs["attempt_suffix"] = executable_replacement_policies[agent][2]
-        if pending_omission_reask_ids is not None:
+        if pending_matrix_integrity_reprompt is not None:
+            attempt_prompt = _fresh_matrix_contract_retry_prompt(
+                prompt, pending_matrix_integrity_reprompt
+            )
+            if agent == "claude":
+                invocation_kwargs["attempt_suffix"] = "matrix-integrity-replay"
+            pending_matrix_integrity_reprompt = None
+        elif pending_omission_reask_ids is not None:
             # Reuse the frozen prompt and session: publishing or rebuilding the
             # prompt between the two turns would reopen #1156.
             attempt_prompt = _prior_disposition_omission_reask_prompt(
@@ -1793,6 +1837,47 @@ def _run_validated_agent(
                         use_repair
                         and not public_text_is_transient
                         and not response_failure_is_unsupported
+                        and repair_expected_kind in {"plan_state", "plan_revision"}
+                    ):
+                        matrix_normalized = attempt_risk_test_matrix_string_list_normalization(
+                            text, expected_kind=repair_expected_kind
+                        )
+                        if matrix_normalized is not None:
+                            matrix_text, matrix_paths = matrix_normalized
+                            matrix_notice = (
+                                f"{agent_name}: normalized risk test matrix string field(s) "
+                                f"to one-element list(s): {', '.join(matrix_paths)}"
+                            )
+                            try:
+                                marker_value = validate(matrix_text)
+                            except AgentLoopError as norm_exc:
+                                log(config, matrix_notice)
+                                # The normalized candidate is now the state every
+                                # later check, prompt and capture must describe.
+                                text = matrix_text
+                                exc = norm_exc
+                                last_error = str(norm_exc)
+                                plan_validation_exhaustion = _refresh_plan_validation_capture(
+                                    plan_validation_exhaustion,
+                                    eligible=plan_validation_capture_eligible,
+                                    text=matrix_text,
+                                    diagnostic=str(norm_exc),
+                                )
+                            else:
+                                log(config, matrix_notice)
+                                if usage_record is not None:
+                                    usage_record.validation_status = "validated"
+                                return _accepted_validated_response(
+                                    accept_candidate(matrix_text, marker_value),
+                                    session_id=result.session_id,
+                                    usage=usage,
+                                    model_used=result.model_used,
+                                    **_response_identity_fields(result),
+                                )
+                    if (
+                        use_repair
+                        and not public_text_is_transient
+                        and not response_failure_is_unsupported
                         and repair_expected_kind == "plan_revision_patch"
                     ):
                         disposition_normalized = attempt_semantic_patch_disposition_normalization(text)
@@ -2231,6 +2316,13 @@ def _run_validated_agent(
                             # The original structured validator rejection remains
                             # authoritative for terminal diagnostic persistence.
                             should_retry = terminal_repair.integrity_contract == "execution_recommendation"
+                            if (
+                                terminal_repair.integrity_contract == "risk_test_matrix"
+                                and not matrix_integrity_replay_used
+                            ):
+                                matrix_integrity_replay_used = True
+                                pending_matrix_integrity_reprompt = original_validation_error
+                            terminal_integrity_contract = terminal_repair.integrity_contract
                             last_failure_category = "fresh-contract-integrity"
                             last_classification_text = (
                                 "fresh planning execution recommendation requires a new planner turn"
@@ -2377,6 +2469,15 @@ def _run_validated_agent(
                     **_response_identity_fields(result),
                 )
 
+        if pending_matrix_integrity_reprompt is not None:
+            if usage_record is not None:
+                usage_record.validation_status = "invalid"
+            log(
+                config,
+                f"{agent_name}: retrying planner turn once (fresh risk-test-matrix "
+                "contract; outside retry budget)",
+            )
+            continue
         if should_retry:
             if _QUOTA_RATE_LIMIT_RE.search(classification_text):
                 reset_secs = _parse_rate_limit_reset_seconds(classification_text)
@@ -2490,6 +2591,18 @@ def _run_validated_agent(
         last_classification_text = "\n".join(
             part for part in (last_classification_text, latest_replay_refusal_detail) if part
         ).strip()
+    if matrix_integrity_replay_used and last_failure_category == "fresh-contract-integrity":
+        if terminal_integrity_contract == "risk_test_matrix":
+            replay_note = (
+                "one automatic planner replay was already attempted "
+                "and also failed the fresh risk-test-matrix contract"
+            )
+        else:
+            replay_note = (
+                "one automatic planner replay for the risk-test-matrix contract was "
+                f"already attempted; the final failure is the {terminal_integrity_contract} contract"
+            )
+        last_error = f"{last_error}; {replay_note}"
     diagnostics = _failed_run_diagnostics(
         runner=runner,
         config=config,

@@ -540,6 +540,19 @@ def _architecture_contract_retry_prompt(prompt: str, diagnostic: str) -> str:
     )
 
 
+def _fresh_matrix_contract_retry_prompt(prompt: str, diagnostic: str) -> str:
+    """Append one bounded, marker-free section quoting the matrix validation error."""
+    detail = " ".join(sanitize_historical_text(diagnostic).replace("<", "(").replace(">", ")").split())
+    if len(detail) > _ARCHITECTURE_CONTRACT_RETRY_SECTION_CHARS:
+        detail = detail[:_ARCHITECTURE_CONTRACT_RETRY_SECTION_CHARS] + "..."
+    return (
+        f"{prompt}\n\n## Previous response not accepted: risk_test_matrix\n\n"
+        "The risk test matrix in the previous response failed strict validation. Re-emit "
+        "the complete response with every matrix list field as a JSON array of strings.\n"
+        f"Validation error: {detail}\n"
+    )
+
+
 _OMISSION_REASK_MAX_IDS = 50
 
 

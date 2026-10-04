@@ -2299,11 +2299,11 @@ def test_exhausted_plan_validation_persists_from_the_planning_orchestration_path
     ("missing_contract", "agent_max_retries", "expected_planner_calls"),
     [
         ("execution", 0, 1),
-        ("matrix", 0, 1),
+        ("matrix", 0, 2),
         ("execution", 1, 2),
-        ("matrix", 1, 1),
-        ("matrix-malformed", 0, 1),
-        ("matrix-malformed", 1, 1),
+        ("matrix", 1, 2),
+        ("matrix-malformed", 0, 2),
+        ("matrix-malformed", 1, 2),
     ],
 )
 def test_exhausted_fresh_contract_integrity_persists_validation_diagnostic(
@@ -15514,3 +15514,141 @@ def test_all_reviewers_policy_writes_no_digest_or_reset_fields(tmp_path):
     assert not any(
         r.scheduler_issue_digest is not None or r.scheduler_stall_reset for r in records
     )
+
+
+def _matrix_plan_candidate_1229(**row_overrides):
+    payload = json.loads(structured_v1_plan_state().split("\n", 1)[0])
+    row = {
+        "row_id": "row-a", "label": "L", "entry_path_or_mode": "m", "initial_state": "i",
+        "event": "e", "expected_outcome": "o",
+        "forbidden_side_effects": ["Must not refuse"],
+        "proposed_test_level": "unit", "proposed_test_location": "tests/x.py",
+        "applicability": "required", "related_scope_item_ids": ["scope-1"],
+        "execution_owner": "one-shot",
+    }
+    row.update(row_overrides)
+    payload["risk_test_matrix"] = {
+        "applicability": "applicable", "rows": [row], "important_exclusions": [],
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _claude_prompts_1229(runner):
+    return [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+
+
+def test_normalized_remaining_defect_is_quoted_and_persisted(tmp_path):
+    bad = _matrix_plan_candidate_1229(forbidden_side_effects="Must not refuse", related_scope_item_ids="")
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = [bad, bad]
+    config = make_config(tmp_path, agent_max_retries=1, execution_strategy_contract_required=True)
+    with pytest.raises(AgentInvocationError) as error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    exhaustion = error.value.plan_validation_exhaustion
+    assert exhaustion is not None
+    assert "related_scope_item_ids" in exhaustion.diagnostic
+    assert "forbidden_side_effects" not in exhaustion.diagnostic
+    assert "one automatic planner replay" in str(error.value)
+    assert '"forbidden_side_effects": ["Must not refuse"]' in exhaustion.candidate_text
+    independent = _matrix_plan_candidate_1229(
+        forbidden_side_effects=["Must not refuse"], related_scope_item_ids=""
+    )
+    assert exhaustion.candidate_text == independent
+    assert exhaustion.candidate_digest == hashlib.sha256(independent.encode()).hexdigest()
+    assert len(runner.diagnostic_posts) == 1
+    assert len(_claude_prompts_1229(runner)) == 2
+    replay_prompt = "\n".join(_claude_prompts_1229(runner)[1])
+    assert "Previous response not accepted: risk_test_matrix" in replay_prompt
+    assert "related_scope_item_ids" in replay_prompt
+    assert "forbidden_side_effects must be a JSON array" not in replay_prompt
+    assert error.value.failure_category == "fresh-contract-integrity"
+
+
+def _issue_level_run_1229(tmp_path, outputs, **config_overrides):
+    runner = _PlanDiagnosticRunner(issue_number=56)
+    runner.claude_outputs = list(outputs)
+    config = make_config(
+        tmp_path, execution_strategy_contract_required=True, quiet=False, **config_overrides
+    )
+    repair_calls = []
+    real_repair = orchestrator_module._run_structured_repair
+
+    def spy(*args, **kwargs):
+        repair_calls.append(args)
+        return real_repair(*args, **kwargs)
+
+    return runner, config, repair_calls, spy
+
+
+def _run_issue_level_1229(tmp_path, monkeypatch, outputs, retries=0):
+    runner, config, repair_calls, spy = _issue_level_run_1229(
+        tmp_path, outputs, agent_max_retries=retries
+    )
+    posted = []
+    real_post = orchestrator_module.post_issue_comment
+
+    def capture(_runner, *, config, issue_number, body):
+        posted.append(str(body))
+        return real_post(_runner, config=config, issue_number=issue_number, body=body)
+
+    monkeypatch.setattr(orchestrator_module, "_run_structured_repair", spy)
+    monkeypatch.setattr(orchestrator_module, "post_issue_comment", capture)
+    # Later stages have no scripted output; only the planning turn is under test.
+    with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    return runner, repair_calls, posted
+
+
+def _posted_matrix_1229(body):
+    import re
+    from coding_review_agent_loop.comment_rendering import decode_risk_test_matrix_marker
+
+    match = re.search(r"<!-- AGENT_RISK_TEST_MATRIX: ([A-Za-z0-9+/=_-]+) -->", body)
+    assert match, "published plan carries no canonical matrix"
+    return decode_risk_test_matrix_marker(match.group(1), bodies=[body])["matrix"]
+
+
+def test_issue_level_bare_strings_are_accepted_on_first_planner_call(tmp_path, monkeypatch, capsys):
+    good = _matrix_plan_candidate_1229(
+        forbidden_side_effects="Slip one", related_scope_item_ids="scope-1"
+    )
+    payload = json.loads(good.split("\n<!--", 1)[0])
+    payload["risk_test_matrix"]["important_exclusions"] = "Lone exclusion"
+    good = json.dumps(payload) + good[len(good.split("\n<!--", 1)[0]):]
+    runner, repair_calls, posted = _run_issue_level_1229(tmp_path, monkeypatch, [good])
+    assert len(_claude_prompts_1229(runner)) == 1
+    assert repair_calls == []
+    assert posted
+    matrix = _posted_matrix_1229(posted[0])
+    assert matrix["rows"][0]["forbidden_side_effects"] == ["Slip one"]
+    assert matrix["rows"][0]["related_scope_item_ids"] == ["scope-1"]
+    assert matrix["important_exclusions"] == ["Lone exclusion"]
+    err = capsys.readouterr().err
+    assert "normalized risk test matrix string field(s)" in err
+    for path in ("forbidden_side_effects", "related_scope_item_ids", "important_exclusions"):
+        assert path in err
+
+
+def test_issue_level_unrecoverable_matrix_replays_once_and_is_accepted(tmp_path, monkeypatch, capsys):
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+
+    bad = _matrix_plan_candidate_1229(forbidden_side_effects="")
+    with pytest.raises(AgentLoopError) as expected:
+        validate_structured_plan_state(
+            bad, require_execution_strategy_contract=1, require_risk_test_matrix_contract=1
+        )
+    good = _matrix_plan_candidate_1229(forbidden_side_effects=["Replay accepted"])
+    runner, repair_calls, posted = _run_issue_level_1229(tmp_path, monkeypatch, [bad, good])
+    prompts = ["\n".join(c) for c in _claude_prompts_1229(runner)]
+    assert len(prompts) == 2
+    heading = "Previous response not accepted: risk_test_matrix"
+    assert heading not in prompts[0] and heading in prompts[1]
+    appended = prompts[1].split(heading, 1)[1]
+    assert str(expected.value) in appended
+    err = capsys.readouterr().err
+    assert err.count("repair backend=none model=fresh-matrix-contract-integrity") == 1
+    assert err.count("repair backend=") == 1
+    # Only the deterministic guard ran (backend=none); no repair model rewrote the matrix.
+    assert len(repair_calls) == 1
+    assert posted
+    assert _posted_matrix_1229(posted[0])["rows"][0]["forbidden_side_effects"] == ["Replay accepted"]
