@@ -39,6 +39,7 @@ from .round_state import (
     _extract_round_metadata_records,
 )
 from .partial_round_recovery import PartialRoundRecovery, RecoveryTarget
+from .publication_resume import PublicationResumeStop
 from .review_spool import ReviewRoundSpool, review_spool_root
 from .agent_failure import ValidatedAgentResponse
 from .architecture_contract import (
@@ -647,6 +648,100 @@ def _replay_spooled_review(
     )
 
 
+def _preflight_spooled_publications(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    spool: ReviewRoundSpool,
+    reviewers: Sequence[AgentName],
+    validators_for: Callable[[str], dict[str, object]],
+    publication_for: Callable[[str], object],
+    published_names: Sequence[str] = (),
+    post_frozen: Callable[[object], object] | None = None,
+    selected_reviewers: Sequence[AgentName] | None = None,
+) -> None:
+    """Check every existing spool record before any checkpoint or reviewer launch (#1258).
+
+    A frozen carrier is revalidated in the current context, then bound to its
+    response, validation context and original actor, and its whole sequence is
+    classified against a complete listing.  A legacy record is checked across
+    every author.  Any failure raises with the record kept, nothing posted and
+    nothing launched.  Reviewers whose anchor is already public are still
+    checked, so a rerun can never discard a carrier unchecked.
+
+    The missing suffix of a verified carrier is posted here (before a new
+    checkpoint) unless some selected reviewer still needs a fresh turn, which
+    must not run beside a newly public peer body (#1025).  Fresh-turn necessity
+    is decided here from *validated replayability*: a selected reviewer that is
+    not already public needs a fresh turn unless its spooled outcome is a
+    settled failure or its spooled response still validates in this context.
+    """
+    published = set(published_names)
+    plans: list[tuple[str, object]] = []
+    # Phase 1: gate and classify EVERY record.  Nothing is posted until all pass,
+    # so a later refusing record can never follow an earlier record's posts.
+    for reviewer in reviewers:
+        name = agent_display_name(reviewer)
+        state, _raw = spool.publication_state(name)
+        if state in {"absent", "fresh"}:
+            continue
+        if state == "carrier":
+            fields = spool.load(name)
+            replayed = (
+                _replay_spooled_review(
+                    runner, config=config, reviewer=reviewer, fields=fields,
+                    validators=validators_for(name),
+                )
+                if fields is not None and "failure" not in fields
+                else None
+            )
+            if replayed is None:
+                raise PublicationResumeStop(
+                    f"{name}'s frozen same-round publication no longer validates in this run's "
+                    "context, so it cannot be resumed. The spool record was kept, nothing was "
+                    "posted, and no reviewer was launched; repair the round with the "
+                    "partial-round recovery list (#1142)."
+                )
+        plan = publication_for(name).gate(published=name in published)  # type: ignore[attr-defined]
+        if plan is not None:
+            plans.append((name, plan))
+    defer_posting = False
+    for reviewer in selected_reviewers if selected_reviewers is not None else reviewers:
+        name = agent_display_name(reviewer)
+        if name in published:
+            continue
+        outcome = spool.load(name)
+        if outcome is None:
+            defer_posting = True
+        elif "failure" not in outcome and _replay_spooled_review(
+            runner, config=config, reviewer=reviewer, fields=outcome,
+            validators=validators_for(name),
+        ) is None:
+            defer_posting = True
+        if defer_posting:
+            break
+    partial = [
+        name for name, plan in plans
+        if 0 < len(plan.already_public) < len(plan.bodies)  # type: ignore[attr-defined]
+    ]
+    if defer_posting and partial:
+        # Public sidecars carry no round metadata, so the peer-visibility guard
+        # cannot see them; a fresh turn now would read them.
+        raise PublicationResumeStop(
+            f"{', '.join(partial)}'s frozen publication is partly public (sidecars without "
+            "an anchor) while another reviewer still needs a fresh turn, which would read "
+            "those attachments. The spool record was kept, nothing was posted, and no "
+            "reviewer was launched; repair the round with the partial-round recovery list "
+            "(#1142)."
+        )
+    if defer_posting or post_frozen is None:
+        return
+    # Phase 2: every gate passed, so publish the verified suffixes.
+    for _name, plan in plans:
+        if len(plan.already_public) < len(plan.bodies):  # type: ignore[attr-defined]
+            post_frozen(plan)
+
+
 def _spooled_response_fields(response: ValidatedAgentResponse) -> dict[str, object]:
     return {
         "text": response.text,
@@ -939,6 +1034,19 @@ def _launch_reviewer_turns(
                 continue
             fields = spool.load(reviewer_name)
             if fields is None:
+                if spool.publication_state(reviewer_name)[0] == "malformed" and not any(
+                    peer != reviewer for peer in public_peers
+                ):
+                    # An undecodable record may hide a published prefix: stop
+                    # rather than launch a fresh turn beside it (#1258).  With a
+                    # public peer the partial-round refusal below already stops,
+                    # with its recovery list.
+                    raise PublicationResumeStop(
+                        f"{reviewer_name}'s spool record is malformed or unreadable and may "
+                        "hide a partly published round. The record was kept, nothing was "
+                        "posted, and no reviewer was launched; repair the round with the "
+                        "partial-round recovery list (#1142)."
+                    )
                 continue
             replay_fallbacks.append(reviewer)
             failure = _replay_spooled_failure(fields, reviewer_name)
@@ -947,6 +1055,16 @@ def _launch_reviewer_turns(
                 if failure is not None
                 else replay_turn(reviewer, fields)
             )
+            if result is None and spool.publication_state(reviewer_name)[0] in {"carrier", "malformed"}:
+                # A frozen publication may already be partly public: a fresh
+                # turn would read its own sidecars, and an unvalidated body must
+                # never be published.  Stop with the record kept (#1258).
+                raise PublicationResumeStop(
+                    f"{reviewer_name}'s frozen same-round publication no longer validates in "
+                    "this run's context, so it cannot be resumed. The spool record was kept, "
+                    "nothing was posted, and no reviewer was launched; repair the round with "
+                    "the partial-round recovery list (#1142)."
+                )
             if result is not None:
                 results[reviewer] = result
                 replayed.add(reviewer)

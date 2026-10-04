@@ -977,6 +977,7 @@ from .review_rounds import (
     _ReviewerTurnResult,
     _review_round_spool,
     _replay_spooled_review,
+    _preflight_spooled_publications,
     _spooled_response_fields,
     _incomplete_plan_review_error,
     _incomplete_pr_review_error,

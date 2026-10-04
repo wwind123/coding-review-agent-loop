@@ -5865,9 +5865,92 @@ retried.
   `exhausted`), and the public read paths that raise on a failed read include the
   same history in their message.
 - **Dry run** bypasses the policy entirely.
-- **Not yet covered.** Writes (comments, issue creation, labels, ready, merge)
-  still make a single attempt; they need operation-specific reconciliation before
-  any replay and are delivered in later stages of #510.
+- **Not yet covered.** Issue creation, labels, ready transitions and merge still
+  make a single attempt; they need operation-specific reconciliation before any
+  replay and are delivered in a later stage of #510. Comment writes are covered
+  by the next section.
+
+### Comment writes: reconciliation before every replay
+
+A comment create that fails transiently may still have reached GitHub, so it is
+never replayed blindly (#1258, stage 2 of #510). Every comment writer shares one
+path: ordinary and trusted `gh pr|issue comment`, the verified trusted PR and
+issue protocol records, the expected-closing contract record, round sidecars and
+anchors, and the managed-CI audit comments.
+
+- **Baseline.** Before the first attempt, a complete listing of the surface
+  (windowed to the last ten minutes) records the authenticated actor's comments
+  that already carry this exact body. A pre-existing identical comment is
+  therefore never adopted, and an intentionally repeated publication is never
+  suppressed. If the baseline cannot be read, the write still proceeds once, but
+  a transient failure on it is reported as ambiguous and not replayed.
+- **Complete listing.** `read_complete_comment_listing` pages the thread
+  exhaustively and fails closed: a failed (after read retry), malformed,
+  non-list, oversized or self-contradictory page yields `Unknown`, which never
+  authorizes a replay. `actor=False` returns every author's comments with the
+  same rules.
+- **Decision after every transient failure.** Exactly one new, unclaimed comment
+  by the authenticated actor (immutable user ID) with the exact stored body (the
+  known host footer tolerated) created inside the window is adopted as success;
+  verified seams still return their `WrittenProtocolComment` / `IssueComment`
+  wrapper, read back by ID. No candidate on a complete listing backs off and
+  replays. Several candidates, or an unreadable listing, raise
+  `GitHubAmbiguousWriteError` with the attempt history. Exhaustion raises
+  `GitHubTransientExhaustedError`. Both state whether the last attempt is
+  verified absent or unknown, name the surface and body index, and say that a
+  rerun resumes from the spool without re-invoking reviewers.
+- **Round transport.** Bodies are posted strictly in order; reconciliation runs
+  inside each body, so a sidecar accepted despite a 5xx is recovered before the
+  next body, and adopted IDs are claimed so two identical bodies cannot match
+  one comment.
+- **Updates.** A PATCH is idempotent by comment ID: after a transient failure the
+  comment is re-read, a stored body equal to the target is success, an unequal
+  one is replayed, and an unreadable comment fails closed.
+- **Temp body file.** One file serves every attempt and is removed after success
+  or terminal failure. Dry run bypasses all of it.
+
+### Resuming a spooled review publication
+
+A parallel review round keeps each reviewer's validated response in a private
+local spool (#1025). Just before its first post, the exact prepared bodies are
+frozen into that reviewer's record together with the authenticated actor, a
+digest of the response, a digest of the validation context (the head or plan
+candidate and the surfaced requirements) and a baseline of already-identical
+comments. A rerun, at any later time, never recomposes those bodies and never
+re-invokes the reviewer:
+
+- Every existing record is checked first, before a new scheduler checkpoint and
+  before any reviewer launches, including a reviewer whose anchor is already
+  public (its carrier is never discarded unchecked, and a legacy record is
+  migration-checked even when its anchor is public). Every record is gated and
+  classified first; only when all pass is any verified missing suffix posted. A
+  spool file that exists but cannot be decoded, or a `publication` field that is null,
+  not a mapping, or beside an unreadable response, is malformed and stops the run, as is a record carrying publication state whose schema or identity (for example the subject) is damaged: it is never treated as absent or foreign. If some reviewer still needs a fresh
+  turn, posting waits for the round to settle, and a carrier that is already
+  partly public (sidecars without an anchor) stops the run instead, because the
+  fresh reviewer would read those attachments. Whether a reviewer needs a fresh
+  turn is decided from validated replayability: a not-yet-public reviewer whose
+  spooled response is readable but no longer validates counts as a fresh turn.
+- Publication does not begin without a usable carrier: if the authenticated actor
+  or a complete pre-publication baseline listing is unavailable, the run stops
+  before the first post with the validated response still spooled.
+- Listings are compared exactly after the single known host footer is removed, so
+  a stored body with a doubled footer is neither adopted nor counted public, and a
+  listing comment without a text body makes the listing incomplete.
+- It re-runs the normal validation of the spooled response, checks the response
+  and context digests and the anchor's round metadata, and requires the same
+  authenticated actor ID. Any mismatch stops with a diagnostic, the record kept,
+  nothing posted and no reviewer launched.
+- It then classifies the whole frozen sequence against a complete listing bound
+  to the original actor. All bodies public: nothing is posted and the record is
+  removed. A strictly public prefix: only the missing suffix is posted verbatim.
+  A gap (an absent body followed by a public later one), an ambiguous or
+  out-of-order match, or an unreadable listing stops without posting; repair it
+  with the partial-round recovery list (#1142).
+- Records written before this protocol are legacy and carry no actor. A complete
+  listing of every author must show no round-transport sidecar and no anchor for
+  this reviewer and round created after the record was written; otherwise the run
+  stops with a migration diagnostic, and an incomplete listing stops too.
 
 ## Logs
 

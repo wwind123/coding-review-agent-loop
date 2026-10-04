@@ -12,7 +12,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Literal
 
 from .ci_health import (
@@ -54,8 +54,22 @@ from .protocol_markers import (
     stored_body_matches_posted,
     strip_known_host_footer,
 )
-from .github_retry import describe_gh_failure, run_gh_read
-from .runner import Runner
+from . import github_retry
+from .publication_resume import PreparedPublication, RoundPublication
+from .review_spool import ReviewRoundSpool
+from .github_retry import (
+    DEFAULT_POLICY,
+    GitHubAmbiguousWriteError,
+    GitHubAttempt,
+    GitHubRetryPolicy,
+    GitHubTransientExhaustedError,
+    attempt_from_result,
+    classify_gh_failure,
+    describe_gh_failure,
+    format_attempt_history,
+    run_gh_read,
+)
+from .runner import CommandResult, Runner
 from .workdirs import active_workdir, github_api_cwd
 
 if TYPE_CHECKING:
@@ -2607,21 +2621,95 @@ def verify_human_requirement_authors(
     return deduplicate_human_requirements(admitted)
 
 
+def _apply_publication(
+    publication: RoundPublication | None,
+    config: AgentLoopConfig,
+    bodies: Sequence[object],
+) -> tuple[Sequence[object], frozenset[int]]:
+    """Freeze the composed bodies or substitute the frozen ones (#1258)."""
+    if publication is None or config.dry_run:
+        return bodies, frozenset()
+    prepared = publication.prepare(bodies)
+    return prepared.bodies, prepared.already_public
+
+
+def round_publication(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    spool: ReviewRoundSpool,
+    reviewer_name: str,
+    flow: str,
+    round_number: int,
+    subject: str,
+    surface_kind: str,
+    number: int,
+    validation_context: str,
+) -> RoundPublication:
+    """Build the freeze/resume hook for one spooled reviewer's round comment."""
+    surface = comment_thread_surface(surface_kind, number)
+    return RoundPublication(
+        spool=spool,
+        reviewer_name=reviewer_name,
+        flow=flow,
+        round_number=round_number,
+        subject=subject,
+        validation_context=validation_context,
+        surface=surface,
+        resolve_actor=lambda: resolve_authenticated_github_actor(runner, config=config),
+        list_comments=lambda actor: read_complete_comment_listing(
+            runner, config=config, surface=surface, actor=actor
+        ),
+        config=config,
+    )
+
+
+def post_frozen_round_bodies(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    surface_kind: str,
+    number: int,
+    plan: "PreparedPublication",
+) -> int:
+    """Post exactly the frozen bodies not yet public, in order; return how many."""
+    command = [PR_THREAD_SURFACE if surface_kind == PR_THREAD_SURFACE else "issue", "comment", str(number)]
+    claimed: set[int] = set()
+    posted = 0
+    for index, body in enumerate(plan.bodies, start=1):
+        if index in plan.already_public:
+            continue
+        _post_comment_body(
+            runner, config=config, command=command, body=body, claimed=claimed, body_index=index
+        )
+        posted += 1
+    return posted
+
+
 def post_pr_comment(
     runner: Runner,
     *,
     config: AgentLoopConfig,
     pr_number: int,
     body: str | TrustedBody,
+    publication: RoundPublication | None = None,
 ) -> None:
     carrier = body if isinstance(body, TrustedBody) else TrustedBody.current_untrusted_visible(body)
     bodies = prepare_round_comment(carrier)
     if len(bodies) > 1:
         log(config, f"Posting round transport with {len(bodies) - 1} sidecars to PR #{pr_number}")
     log(config, f"Posting agent output to PR #{pr_number}")
+    claimed: set[int] = set()
     for prepared in bodies:
         prepared.validate_for_surface(PR_COMMENT_SURFACE)
-        _post_comment_body(runner, config=config, command=["pr", "comment", str(pr_number)], body=prepared)
+    outgoing, already_public = _apply_publication(publication, config, bodies)
+    for index, prepared in enumerate(outgoing, start=1):
+        if index in already_public:
+            continue
+        _post_comment_body(
+            runner, config=config, command=["pr", "comment", str(pr_number)], body=prepared,
+            claimed=claimed, body_index=index,
+        )
 
 
 def post_issue_comment(
@@ -2630,15 +2718,24 @@ def post_issue_comment(
     config: AgentLoopConfig,
     issue_number: int,
     body: str | TrustedBody,
+    publication: RoundPublication | None = None,
 ) -> None:
     carrier = body if isinstance(body, TrustedBody) else TrustedBody.current_untrusted_visible(body)
     bodies = prepare_round_comment(carrier)
     if len(bodies) > 1:
         log(config, f"Posting round transport with {len(bodies) - 1} sidecars to issue #{issue_number}")
     log(config, f"Posting agent output to issue #{issue_number}")
+    claimed: set[int] = set()
     for prepared in bodies:
         prepared.validate_for_surface(ISSUE_COMMENT_SURFACE)
-        _post_comment_body(runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared)
+    outgoing, already_public = _apply_publication(publication, config, bodies)
+    for index, prepared in enumerate(outgoing, start=1):
+        if index in already_public:
+            continue
+        _post_comment_body(
+            runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared,
+            claimed=claimed, body_index=index,
+        )
 
 
 def reject_forged_protocol_markers(
@@ -2915,7 +3012,11 @@ def note_host_footer_observed(config: AgentLoopConfig | None, context: str) -> N
 
 
 def _authenticated_comment_from_rest(
-    raw: object, *, surface: str, config: AgentLoopConfig | None = None
+    raw: object,
+    *,
+    surface: str,
+    config: AgentLoopConfig | None = None,
+    require_body: bool = False,
 ) -> AuthenticatedComment:
     """Build one authenticated envelope from a raw REST comment.
 
@@ -2930,6 +3031,11 @@ def _authenticated_comment_from_rest(
             f"Authenticated comment read of {surface} returned a comment without an author."
         )
     body = raw.get("body")
+    if require_body and not isinstance(body, str):
+        raise AgentLoopError(
+            f"Authenticated comment read of {surface} returned comment {raw.get('id')!r} "
+            "without a text body."
+        )
     if isinstance(body, str):
         body, footered = strip_known_host_footer(body)
         if footered:
@@ -2945,26 +3051,24 @@ def _authenticated_comment_from_rest(
     )
 
 
-def read_authenticated_protocol_comments(
+def _read_comment_pages(
     runner: Runner,
     *,
     config: AgentLoopConfig,
-    surface_kind: str,
+    surface: str,
     number: int,
-) -> AuthenticatedCommentView:
-    """Read one issue or PR conversation completely, bound to the invocation actor.
-
-    Pagination is exhaustive and fail-closed: a failed, malformed, or
-    self-contradictory page raises instead of returning a partial view.  Only
-    comments whose immutable author user ID equals the authenticated actor are
-    authoritative; a byte-exact record from anyone else is reported as
-    ignored-foreign and can never be adopted (#827).
-    """
-    surface = comment_thread_surface(surface_kind, number)
-    actor_login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+    since: datetime.datetime | None = None,
+    require_body: bool = False,
+) -> list[AuthenticatedComment]:
+    """Page one conversation exhaustively; any defect raises (never a partial list)."""
     page_size = 100
     # Loop guard only; see _merge_issue_comment_transport_identity.
     max_pages = 10_000
+    since_query = (
+        "&since=" + since.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if since is not None
+        else ""
+    )
     page = 1
     envelopes: list[AuthenticatedComment] = []
     seen_ids: set[int] = set()
@@ -2974,7 +3078,8 @@ def read_authenticated_protocol_comments(
             [
                 config.gh_cmd,
                 "api",
-                f"repos/{config.repo}/issues/{number}/comments?per_page={page_size}&page={page}",
+                f"repos/{config.repo}/issues/{number}/comments?per_page={page_size}&page={page}"
+                + since_query,
             ],
             cwd=active_workdir(config),
             check=False,
@@ -3000,7 +3105,7 @@ def read_authenticated_protocol_comments(
             )
         for raw_comment in raw_page:
             envelope = _authenticated_comment_from_rest(
-                raw_comment, surface=surface, config=config
+                raw_comment, surface=surface, config=config, require_body=require_body
             )
             if envelope.comment_id in seen_ids:
                 raise AgentLoopError(
@@ -3017,6 +3122,27 @@ def read_authenticated_protocol_comments(
             f"Authenticated comment read of {surface} exceeded its pagination bound."
         )
     envelopes.sort(key=lambda item: item.comment_id)
+    return envelopes
+
+
+def read_authenticated_protocol_comments(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    surface_kind: str,
+    number: int,
+) -> AuthenticatedCommentView:
+    """Read one issue or PR conversation completely, bound to the invocation actor.
+
+    Pagination is exhaustive and fail-closed: a failed, malformed, or
+    self-contradictory page raises instead of returning a partial view.  Only
+    comments whose immutable author user ID equals the authenticated actor are
+    authoritative; a byte-exact record from anyone else is reported as
+    ignored-foreign and can never be adopted (#827).
+    """
+    surface = comment_thread_surface(surface_kind, number)
+    actor_login, actor_id = resolve_authenticated_github_actor(runner, config=config)
+    envelopes = _read_comment_pages(runner, config=config, surface=surface, number=number)
     return AuthenticatedCommentView(
         surface=surface,
         actor_login=actor_login,
@@ -3030,15 +3156,226 @@ def read_authenticated_protocol_comments(
     )
 
 
+@dataclass(frozen=True)
+class CompleteCommentListing:
+    """An exhaustive, internally consistent read of one conversation (#510).
+
+    ``actor_id`` is the author the listing is bound to, or ``None`` when it
+    holds every author's comments.  Only a complete listing can show that a
+    comment is absent.
+    """
+
+    surface: str
+    actor_id: int | None
+    comments: tuple[AuthenticatedComment, ...]
+
+
+@dataclass(frozen=True)
+class UnknownCommentListing:
+    """The surface could not be read completely; absence is unprovable."""
+
+    surface: str
+    reason: str
+
+
+def read_complete_comment_listing(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    surface: str,
+    since: datetime.datetime | None = None,
+    actor: bool = True,
+) -> CompleteCommentListing | UnknownCommentListing:
+    """Return a complete listing or ``Unknown``; never a partial list.
+
+    ``actor=True`` binds the listing to the authenticated actor's immutable user
+    ID; ``actor=False`` returns every author's comments with the same
+    completeness rules.  A failed (after read retry), malformed, non-list or
+    self-contradictory page, or an unresolvable actor, yields ``Unknown``.
+    """
+    kind, number = parse_comment_thread_surface(surface)
+    del kind
+    try:
+        actor_id: int | None = None
+        if actor:
+            actor_id = resolve_authenticated_github_actor(runner, config=config)[1]
+        envelopes = _read_comment_pages(
+            runner, config=config, surface=surface, number=number, since=since,
+            require_body=True,
+        )
+    except (AgentLoopError, OSError) as exc:
+        # An unusable working directory (for example a not-yet-cloned checkout)
+        # makes absence unprovable; it never authorizes a replay.
+        return UnknownCommentListing(surface=surface, reason=str(exc))
+    if actor_id is not None:
+        envelopes = [item for item in envelopes if item.author_id == actor_id]
+    return CompleteCommentListing(
+        surface=surface, actor_id=actor_id, comments=tuple(envelopes)
+    )
+
+
+COMMENT_RECONCILIATION_WINDOW = datetime.timedelta(minutes=10)
+
+
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+@dataclass(frozen=True)
+class ReconciledComment:
+    """Outcome of a reconciled comment write.
+
+    ``result`` is the last write command result (a failure only when it was
+    non-transient, left for the caller's own message); ``adopted`` is the comment
+    that proved an earlier ambiguous attempt had been accepted.
+    """
+
+    result: CommandResult | None
+    adopted: AuthenticatedComment | None = None
+
+
+def _ambiguity_message(
+    *,
+    what: str,
+    surface: str,
+    body_index: int | None,
+    outcome: str,
+    attempts: Sequence[GitHubAttempt],
+    detail: str = "",
+) -> str:
+    position = f" (body {body_index})" if body_index is not None else ""
+    return (
+        f"{what} on {surface}{position} failed with a transient GitHub error and the "
+        f"last attempt is {outcome}. {detail}".rstrip()
+        + "\nGitHub attempt history:\n"
+        + format_attempt_history(attempts)
+        + "\nA rerun resumes from the local review spool without re-invoking reviewers; "
+        "check the conversation for the comment before publishing it by hand."
+    )
+
+
+def post_comment_with_reconciliation(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    surface: str,
+    body: str,
+    write: Callable[[], CommandResult],
+    claimed: set[int] | None = None,
+    body_index: int | None = None,
+    what: str = "Comment publication",
+    policy: GitHubRetryPolicy | None = None,
+) -> ReconciledComment:
+    """Run one comment create with bounded retry and complete-listing reconciliation.
+
+    ``write`` performs the create with ``check=False``.  Before the first attempt a
+    baseline records the actor's comments that already carry this exact body, so
+    a pre-existing identical comment is never adopted and an intentionally
+    repeated publication is never suppressed.  After every transient failure
+    (including the last) a complete listing must show exactly one new unclaimed
+    exact-body comment to adopt it; zero authorize a replay; several, or an
+    unreadable listing, fail closed.  ``claimed`` carries adopted IDs across the
+    bodies of one publication sequence.  Dry-run bypasses all of it.
+    """
+    if config.dry_run:
+        return ReconciledComment(result=write())
+    claimed = claimed if claimed is not None else set()
+    active = policy or DEFAULT_POLICY
+    window_start = _utc_now() - COMMENT_RECONCILIATION_WINDOW
+    baseline = read_complete_comment_listing(
+        runner, config=config, surface=surface, since=window_start
+    )
+    baseline_ids: set[int] | None = None
+    if isinstance(baseline, CompleteCommentListing):
+        baseline_ids = {
+            c.comment_id for c in baseline.comments if c.body == body
+        }
+    history: list[GitHubAttempt] = []
+    for number in range(1, active.attempts + 1):
+        started = time.monotonic()
+        result = write()
+        if result.returncode == 0:
+            return ReconciledComment(result=result)
+        attempt = attempt_from_result(number, result, started)
+        history.append(attempt)
+        if attempt.classification == "permanent":
+            return ReconciledComment(result=result)
+        if baseline_ids is None:
+            raise GitHubAmbiguousWriteError(
+                _ambiguity_message(
+                    what=what, surface=surface, body_index=body_index, outcome="unknown",
+                    attempts=history,
+                    detail="The pre-write baseline could not be read, so a pre-existing "
+                    "identical comment cannot be told apart from this write's. "
+                    + baseline.reason  # type: ignore[union-attr]
+                ),
+                tuple(history),
+            )
+        listing = read_complete_comment_listing(
+            runner, config=config, surface=surface, since=window_start
+        )
+        if isinstance(listing, UnknownCommentListing):
+            raise GitHubAmbiguousWriteError(
+                _ambiguity_message(
+                    what=what, surface=surface, body_index=body_index, outcome="unknown",
+                    attempts=history,
+                    detail="The reconciliation listing was incomplete, so absence is "
+                    "unprovable and the write is not replayed. " + listing.reason,
+                ),
+                tuple(history),
+            )
+        candidates = [
+            c
+            for c in listing.comments
+            if c.body == body
+            and c.created >= window_start
+            and c.comment_id not in baseline_ids
+            and c.comment_id not in claimed
+        ]
+        if len(candidates) == 1:
+            claimed.add(candidates[0].comment_id)
+            log(
+                config,
+                f"{what} on {surface}: GitHub accepted the write despite a transient "
+                f"error; adopted comment {candidates[0].comment_id}",
+            )
+            return ReconciledComment(result=None, adopted=candidates[0])
+        if len(candidates) > 1:
+            ids = ", ".join(str(c.comment_id) for c in candidates)
+            raise GitHubAmbiguousWriteError(
+                _ambiguity_message(
+                    what=what, surface=surface, body_index=body_index, outcome="unknown",
+                    attempts=history,
+                    detail=f"{len(candidates)} identical unclaimed comments ({ids}) exist; "
+                    "none is chosen and the write is not replayed.",
+                ),
+                tuple(history),
+            )
+        if number < active.attempts:
+            github_retry.sleep_before_retry(active, number)
+    raise GitHubTransientExhaustedError(
+        _ambiguity_message(
+            what=what, surface=surface, body_index=body_index, outcome="verified absent",
+            attempts=history,
+            detail="The retry budget is exhausted.",
+        ),
+        tuple(history),
+    )
+
+
 def _post_trusted_protocol_comment(
     runner: Runner,
     *,
     config: AgentLoopConfig,
     command: list[str],
     body: str,
+    claimed: set[int] | None = None,
+    body_index: int | None = None,
 ) -> None:
     """Post canonical protocol output after validating its marker encoding."""
-    _post_comment_body(runner, config=config, command=command, body=body)
+    _post_comment_body(
+        runner, config=config, command=command, body=body, claimed=claimed, body_index=body_index
+    )
 
 
 def _validate_canonical_json_marker_payload(
@@ -3077,10 +3414,12 @@ def post_trusted_pr_comment(
     if not isinstance(body, TrustedBody):
         raise AgentLoopError("Trusted PR comment posting requires a TrustedBody.")
     bodies = prepare_round_comment(body)
-    for prepared in bodies:
+    claimed: set[int] = set()
+    for index, prepared in enumerate(bodies, start=1):
         prepared.validate_for_surface(PR_COMMENT_SURFACE)
         _post_trusted_protocol_comment(
-            runner, config=config, command=["pr", "comment", str(pr_number)], body=prepared
+            runner, config=config, command=["pr", "comment", str(pr_number)], body=prepared,
+            claimed=claimed, body_index=index,
         )
 
 
@@ -3248,31 +3587,45 @@ def post_verified_trusted_pr_protocol_comment_observed(
     if not isinstance(body, TrustedBody):
         raise AgentLoopError("Verified trusted PR protocol posting requires a TrustedBody.")
     body.validate_for_surface(PR_COMMENT_SURFACE)
-    result = runner.run(
-        [
-            config.gh_cmd,
-            "api",
-            "--method",
-            "POST",
-            f"repos/{config.repo}/issues/{pr_number}/comments",
-            "-f",
-            f"body={body}",
-        ],
-        cwd=github_api_cwd(),
-        check=False,
+    outcome = post_comment_with_reconciliation(
+        runner,
+        config=config,
+        surface=comment_thread_surface(PR_THREAD_SURFACE, pr_number),
+        body=str(body),
+        write=lambda: runner.run(
+            [
+                config.gh_cmd,
+                "api",
+                "--method",
+                "POST",
+                f"repos/{config.repo}/issues/{pr_number}/comments",
+                "-f",
+                f"body={body}",
+            ],
+            cwd=github_api_cwd(),
+            check=False,
+        ),
+        what="Trusted PR protocol record",
     )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise AgentLoopError(
-            f"Unable to persist the trusted PR protocol record for PR #{pr_number}."
-            + (f" {detail}" if detail else "")
-        )
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise AgentLoopError(
-            f"Trusted PR protocol record for PR #{pr_number} returned invalid JSON."
-        ) from exc
+    result = outcome.result
+    if outcome.adopted is not None:
+        # The verifier re-reads the adopted comment by ID, so adoption passes the
+        # same stored-body and author checks as a response-carried envelope.
+        payload: object = {"id": outcome.adopted.comment_id}
+    else:
+        assert result is not None
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise AgentLoopError(
+                f"Unable to persist the trusted PR protocol record for PR #{pr_number}."
+                + (f" {detail}" if detail else "")
+            )
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise AgentLoopError(
+                f"Trusted PR protocol record for PR #{pr_number} returned invalid JSON."
+            ) from exc
     if not isinstance(payload, dict):
         raise AgentLoopError(
             f"Trusted PR protocol record for PR #{pr_number} returned no comment ID."
@@ -3328,30 +3681,83 @@ def patch_verified_trusted_protocol_comment_observed(
     if not isinstance(body, TrustedBody):
         raise AgentLoopError("Verified trusted protocol update requires a TrustedBody.")
     body.validate_for_surface(surface)
-    result = runner.run(
-        [
-            config.gh_cmd,
-            "api",
-            "--method",
-            "PATCH",
-            f"repos/{config.repo}/issues/comments/{comment_id}",
-            "-f",
-            f"body={body}",
-        ],
-        cwd=active_workdir(config),
-        check=False,
-    )
     context = f"Trusted protocol comment update for comment {comment_id}"
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise AgentLoopError(
-            f"Unable to persist the trusted protocol comment update for comment {comment_id}."
-            + (f" {detail}" if detail else "")
+    active = DEFAULT_POLICY
+    history: list[GitHubAttempt] = []
+    payload: object = None
+    for number in range(1, active.attempts + 1):
+        started = time.monotonic()
+        result = runner.run(
+            [
+                config.gh_cmd,
+                "api",
+                "--method",
+                "PATCH",
+                f"repos/{config.repo}/issues/comments/{comment_id}",
+                "-f",
+                f"body={body}",
+            ],
+            cwd=active_workdir(config),
+            check=False,
         )
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise AgentLoopError(f"{context} returned invalid JSON.") from exc
+        if result.returncode == 0:
+            try:
+                payload = json.loads(result.stdout or "{}")
+            except json.JSONDecodeError as exc:
+                raise AgentLoopError(f"{context} returned invalid JSON.") from exc
+            break
+        attempt = attempt_from_result(number, result, started)
+        history.append(attempt)
+        if config.dry_run or attempt.classification == "permanent":
+            detail = (result.stderr or result.stdout).strip()
+            raise AgentLoopError(
+                f"Unable to persist the trusted protocol comment update for comment {comment_id}."
+                + (f" {detail}" if detail else "")
+            )
+        # An update is idempotent by comment ID: re-read the comment and accept
+        # it when the stored body already equals the target.  An unreadable
+        # comment proves nothing and is never replayed against.
+        reread = run_gh_read(
+            runner,
+            [config.gh_cmd, "api", f"repos/{config.repo}/issues/comments/{comment_id}"],
+            cwd=active_workdir(config),
+            check=False,
+        )
+        envelope: object = None
+        if reread.returncode == 0:
+            try:
+                envelope = json.loads(reread.stdout or "{}")
+            except json.JSONDecodeError:
+                envelope = None
+        if (
+            not isinstance(envelope, dict)
+            or envelope.get("id") != comment_id
+            or not isinstance(envelope.get("body"), str)
+        ):
+            raise GitHubAmbiguousWriteError(
+                _ambiguity_message(
+                    what="Protocol comment update", surface=f"comment {comment_id}",
+                    body_index=None, outcome="unknown", attempts=history,
+                    detail="The comment could not be re-read as a valid envelope for this ID."
+                    + _failure_detail(reread),
+                ),
+                tuple(history),
+            )
+        if stored_body_matches_posted(envelope.get("body"), str(body))[0]:
+            log(config, f"{context}: GitHub applied the update despite a transient error; adopted")
+            payload = envelope
+            break
+        if number < active.attempts:
+            github_retry.sleep_before_retry(active, number)
+    else:
+        raise GitHubTransientExhaustedError(
+            _ambiguity_message(
+                what="Protocol comment update", surface=f"comment {comment_id}",
+                body_index=None, outcome="verified unapplied", attempts=history,
+                detail="The retry budget is exhausted.",
+            ),
+            tuple(history),
+        )
     if not isinstance(payload, dict):
         raise AgentLoopError(f"{context} returned no comment envelope.")
     if payload.get("id") is None:
@@ -3381,20 +3787,31 @@ def post_trusted_pr_contract_record(
     if not isinstance(body, TrustedBody):
         raise AgentLoopError("Trusted PR contract posting requires a TrustedBody.")
     body.validate_for_surface(PR_COMMENT_SURFACE)
-    result = runner.run(
-        [
-            config.gh_cmd,
-            "api",
-            f"repos/{config.repo}/issues/{pr_number}/comments",
-            "--method",
-            "POST",
-            "--input",
-            "-",
-        ],
-        cwd=active_workdir(config),
-        input_text=json.dumps({"body": str(body)}),
-        check=False,
+    outcome = post_comment_with_reconciliation(
+        runner,
+        config=config,
+        surface=comment_thread_surface(PR_THREAD_SURFACE, pr_number),
+        body=str(body),
+        write=lambda: runner.run(
+            [
+                config.gh_cmd,
+                "api",
+                f"repos/{config.repo}/issues/{pr_number}/comments",
+                "--method",
+                "POST",
+                "--input",
+                "-",
+            ],
+            cwd=active_workdir(config),
+            input_text=json.dumps({"body": str(body)}),
+            check=False,
+        ),
+        what="Expected-closing PR contract record",
     )
+    result = outcome.result
+    if outcome.adopted is not None:
+        return
+    assert result is not None
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise AgentLoopError(
@@ -3413,10 +3830,12 @@ def post_trusted_issue_comment(
     if not isinstance(body, TrustedBody):
         raise AgentLoopError("Trusted issue comment posting requires a TrustedBody.")
     bodies = prepare_round_comment(body)
-    for prepared in bodies:
+    claimed: set[int] = set()
+    for index, prepared in enumerate(bodies, start=1):
         prepared.validate_for_surface(ISSUE_COMMENT_SURFACE)
         _post_trusted_protocol_comment(
-            runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared
+            runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared,
+            claimed=claimed, body_index=index,
         )
 
 
@@ -3428,37 +3847,58 @@ def post_verified_trusted_issue_protocol_comment(
     body: TrustedBody,
     expected_author_login: str,
     expected_author_id: int,
+    claimed: set[int] | None = None,
+    body_index: int | None = None,
 ) -> IssueComment:
     """Post one issue protocol record and verify the live server envelope."""
     if not isinstance(body, TrustedBody):
         raise AgentLoopError("Verified trusted issue protocol posting requires a TrustedBody.")
     body.validate_for_surface(ISSUE_COMMENT_SURFACE)
-    result = runner.run(
-        [
-            config.gh_cmd,
-            "api",
-            "--method",
-            "POST",
-            f"repos/{config.repo}/issues/{issue_number}/comments",
-            "--input",
-            "-",
-        ],
-        cwd=active_workdir(config),
-        input_text=json.dumps({"body": str(body)}, separators=(",", ":")),
-        check=False,
+    outcome = post_comment_with_reconciliation(
+        runner,
+        config=config,
+        surface=comment_thread_surface(ISSUE_THREAD_SURFACE, issue_number),
+        body=str(body),
+        write=lambda: runner.run(
+            [
+                config.gh_cmd,
+                "api",
+                "--method",
+                "POST",
+                f"repos/{config.repo}/issues/{issue_number}/comments",
+                "--input",
+                "-",
+            ],
+            cwd=active_workdir(config),
+            input_text=json.dumps({"body": str(body)}, separators=(",", ":")),
+            check=False,
+        ),
+        claimed=claimed,
+        body_index=body_index,
+        what="Trusted issue protocol record",
     )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
-        raise AgentLoopError(
-            f"Unable to persist the trusted issue protocol record for issue #{issue_number}."
-            + (f" {detail}" if detail else "")
+    result = outcome.result
+    if outcome.adopted is not None:
+        payload = _fetch_protocol_comment_envelope(
+            runner,
+            config=config,
+            comment_id=outcome.adopted.comment_id,
+            context=f"Trusted issue protocol record for issue #{issue_number}",
         )
-    try:
-        payload = json.loads(result.stdout or "{}")
-    except json.JSONDecodeError as exc:
-        raise AgentLoopError(
-            f"Trusted issue protocol record for issue #{issue_number} returned invalid JSON."
-        ) from exc
+    else:
+        assert result is not None
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise AgentLoopError(
+                f"Unable to persist the trusted issue protocol record for issue #{issue_number}."
+                + (f" {detail}" if detail else "")
+            )
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise AgentLoopError(
+                f"Trusted issue protocol record for issue #{issue_number} returned invalid JSON."
+            ) from exc
     if (
         not isinstance(payload, dict)
         or not isinstance(payload.get("id"), int)
@@ -3532,7 +3972,8 @@ def post_verified_trusted_issue_round_comment(
     """
     bodies = prepare_round_comment(body)
     posted: IssueComment | None = None
-    for prepared in bodies:
+    claimed: set[int] = set()
+    for index, prepared in enumerate(bodies, start=1):
         posted = post_verified_trusted_issue_protocol_comment(
             runner,
             config=config,
@@ -3540,23 +3981,55 @@ def post_verified_trusted_issue_round_comment(
             body=prepared,
             expected_author_login=expected_author_login,
             expected_author_id=expected_author_id,
+            claimed=claimed,
+            body_index=index,
         )
     if posted is None:  # pragma: no cover - prepare_round_comment always returns an anchor
         raise AgentLoopError("Verified issue round posting produced no comment wrapper.")
     return posted
 
 
-def _post_comment_body(runner: Runner, *, config: AgentLoopConfig, command: list[str], body: str) -> None:
+def _command_comment_surface(command: list[str]) -> str:
+    """Name the conversation a ``gh pr|issue comment N`` command writes to."""
+    return comment_thread_surface(
+        PR_THREAD_SURFACE if command[0] == "pr" else ISSUE_THREAD_SURFACE, int(command[2])
+    )
+
+
+def _post_comment_body(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    command: list[str],
+    body: str,
+    claimed: set[int] | None = None,
+    body_index: int | None = None,
+) -> None:
     if len(body) > MAX_GITHUB_BODY_CHARS:
         raise AgentLoopError(f"GitHub comment body exceeds {MAX_GITHUB_BODY_CHARS} characters; shorten the response.")
     if config.dry_run:
         runner.run([config.gh_cmd, *command, "--repo", config.repo, "--body", body], cwd=active_workdir(config))
         return
+    # One temp file serves every attempt; it is removed after success or terminal failure.
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
         handle.write(body)
         path = handle.name
     try:
-        runner.run([config.gh_cmd, *command, "--repo", config.repo, "--body-file", path], cwd=active_workdir(config))
+        outcome = post_comment_with_reconciliation(
+            runner,
+            config=config,
+            surface=_command_comment_surface(command),
+            body=str(body),
+            write=lambda: runner.run(
+                [config.gh_cmd, *command, "--repo", config.repo, "--body-file", path],
+                cwd=active_workdir(config),
+                check=False,
+            ),
+            claimed=claimed,
+            body_index=body_index,
+        )
+        if outcome.result is not None and outcome.result.returncode != 0:
+            raise AgentLoopError(github_retry._failure_message(outcome.result))
     finally:
         try:
             os.unlink(path)

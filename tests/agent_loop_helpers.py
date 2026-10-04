@@ -1234,13 +1234,20 @@ class FakeRunner(Runner):
             else:
                 raw_body = ""
             self.comments.append(_strip_round_metadata(raw_body))
-            self.pr_payload.setdefault("comments", []).append(
-                {
-                    "author": {"login": "coding-review-agent-loop"},
-                    "createdAt": f"2026-05-23T00:00:{len(self.pr_payload.get('comments', [])):02d}Z",
-                    "body": raw_body,
-                }
-            )
+            posted_pr = {
+                "author": {"login": "coding-review-agent-loop"},
+                "createdAt": f"2026-05-23T00:00:{len(self.pr_payload.get('comments', [])):02d}Z",
+                "body": raw_body,
+            }
+            if self.authenticated_actor is not None:
+                # Opt-in REST identity (#1258): the comment is attributable to the
+                # actor and created now, so reconciliation windows apply.
+                posted_pr["author"] = {"login": self.authenticated_actor[0]}
+                posted_pr["_rest_author_id"] = self.authenticated_actor[1]
+                posted_pr["createdAt"] = datetime.datetime.now(datetime.timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+            self.pr_payload.setdefault("comments", []).append(posted_pr)
             return CommandResult(cmd, cwd_path, "", "", 0)
 
         if cmd[:3] == ["gh", "issue", "comment"]:
@@ -1262,6 +1269,10 @@ class FakeRunner(Runner):
                 # login; the immutable user ID is visible through REST alone.
                 posted["author"] = {"login": self.authenticated_actor[0]}
                 posted["_rest_author_id"] = self.authenticated_actor[1]
+                # Created now, so reconciliation windows apply (#1258).
+                posted["createdAt"] = datetime.datetime.now(datetime.timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
             self.issue_comments.append(posted)
             return CommandResult(cmd, cwd_path, "", "", 0)
 
@@ -1380,7 +1391,7 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
 
         rest_comments = (
-            re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments\?per_page=(\d+)&page=(\d+)", cmd[2])
+            re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments\?per_page=(\d+)&page=(\d+)(?:&since=[^&]+)?", cmd[2])
             if cmd[:2] == ["gh", "api"] and len(cmd) > 2 and self.serve_rest_issue_comments
             else None
         )

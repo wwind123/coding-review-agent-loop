@@ -8747,7 +8747,9 @@ class _SidecarPostingRunner:
         if "--body-file" in args:
             self.bodies.append(Path(args[args.index("--body-file") + 1]).read_text())
             return SimpleNamespace(returncode=0, stdout="", stderr="")
-        assert input_text is not None
+        if input_text is None:
+            # Reconciliation baseline reads (#510) are unsupported here.
+            return SimpleNamespace(returncode=1, stdout="", stderr="unsupported read")
         body = json.loads(input_text)["body"]
         self.bodies.append(body)
         returned = body

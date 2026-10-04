@@ -82,12 +82,15 @@ from .github import (
     post_pr_comment,
     post_trusted_pr_comment,
     read_rest_issue_comments,
+    post_frozen_round_bodies,
+    round_publication,
     reject_forged_protocol_markers,
     validate_open_issue,
     validate_open_pr,
     validate_pr_expected_closing_issues,
     watch_pr_checks,
 )
+from .publication_resume import context_digest as publication_context_digest
 from .issue_pr_handoff import (
     find_latest_issue_pr_handoff,
     post_issue_pr_handoff_comment,
@@ -328,6 +331,7 @@ from .review_rounds import (
     _ReviewerTurnResult,
     _review_round_spool,
     _replay_spooled_review,
+    _preflight_spooled_publications,
     _incomplete_pr_review_error,
     _refuse_partial_round_before_sequential_turns,
     _same_round_replay_or_invoke,
@@ -2922,6 +2926,65 @@ def run_pr_loop(
                     "record without redispatching completed reviewer work",
                 )
             skip_reviewers_for_recovery = skip_reviewers_for_recovery or evidence_skip_reviewers
+            # One private spool per round, shared by the parallel launcher and
+            # the sequential resume seam (#1025).
+            pr_round_spool = _review_round_spool(
+                config, surface="pr", number=pr_number,
+                round_number=round_number, subject=current_pr_subject,
+            )
+
+            def _pr_review_validators(reviewer_name: str) -> dict[str, object]:
+                return _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_review_response(
+                    text,
+                    reviewer=reviewer_name,
+                    unresolved_items=prior_unresolved_items,
+                    # Never share the mutable round_new_unresolved_items
+                    # list with concurrent workers (#594): it only
+                    # enriches the UnknownPriorItemDispositionError
+                    # message, so an empty tuple changes no outcome.
+                    current_round_items=(), architecture_status_mode=mode,
+                ))
+
+            def _pr_publication(reviewer_name: str):
+                return round_publication(
+                    runner, config=config, spool=pr_round_spool,
+                    reviewer_name=reviewer_name, flow="pr", round_number=round_number,
+                    subject=current_pr_subject, surface_kind="pr", number=pr_number,
+                    validation_context=publication_context_digest(
+                        head=current_pr_subject,
+                        surfaced=sorted(str(item) for item in surfaced_reviewer_requirement_ids),
+                    ),
+                )
+
+            pr_spool_preflight_done = [False]
+
+            def _pr_spool_preflight(selected_names: set[str]) -> None:
+                """Check every spool record before any checkpoint or reviewer launch (#1258)."""
+                if (
+                    pr_spool_preflight_done[0]
+                    or skip_reviewers_for_recovery
+                    or conflict_pending
+                    or evidence_pass is not None
+                ):
+                    return
+                pr_spool_preflight_done[0] = True
+                published = [
+                    agent_display_name(reviewer) for reviewer in configured_reviewers
+                    if resumed_by_name.get(agent_display_name(reviewer)) is not None
+                ]
+                _preflight_spooled_publications(
+                    runner, config=config, spool=pr_round_spool, reviewers=configured_reviewers,
+                    validators_for=_pr_review_validators, publication_for=_pr_publication,
+                    published_names=published,
+                    post_frozen=lambda plan: post_frozen_round_bodies(
+                        runner, config=config, surface_kind="pr", number=pr_number, plan=plan
+                    ),
+                    selected_reviewers=[
+                        reviewer for reviewer in configured_reviewers
+                        if agent_display_name(reviewer) in selected_names
+                    ],
+                )
+
             scheduler_metadata_recovery_full_board = False
             metadata_recovery_reasons: list[str] = []
             if selective_policy:
@@ -3321,6 +3384,7 @@ def run_pr_loop(
                 # The amendment's activation round always persists a fresh
                 # digest-bound scheduler decision (#943), even when every
                 # remaining reviewer's review is reused and nobody is invoked.
+                _pr_spool_preflight(selected_reviewer_names)
                 amendment_checkpoint_due = bool(
                     pr_amendment_checkpoint_pending
                     and pr_contract_lineage.active_amendment is not None
@@ -3389,6 +3453,7 @@ def run_pr_loop(
                 final_sweep = False
                 scheduler_recorded_force_full, scheduler_recorded_force_full_source = False, None
                 superseded_audit_text = ""
+                _pr_spool_preflight(selected_reviewer_names)
             skip_reviewers_this_round = skip_reviewers_for_recovery or conflict_pending
 
             pr_fatal_errors: list[tuple[str, AgentLoopError]] = []
@@ -3421,8 +3486,15 @@ def run_pr_loop(
                     phase = (
                         EVIDENCE_RESPONSE_PHASE if evidence_pass is not None else "authoritative"
                     )
+                # A spooled reviewer's bodies are frozen before the first post so
+                # a rerun after an outage resumes them verbatim (#1258).
+                publication_hook = (
+                    {"publication": _pr_publication(reviewer_name)}
+                    if phase == "publication" and identity is not None
+                    else {}
+                )
                 post_pr_comment(
-                    runner, config=config, pr_number=pr_number,
+                    runner, config=config, pr_number=pr_number, **publication_hook,
                     body=_attach_round_metadata(
                         render_public_agent_comment(
                             kind="pr_review", parsed=parsed, agent=reviewer_name,
@@ -3540,12 +3612,6 @@ def run_pr_loop(
                 for reviewer in configured_reviewers
             }
 
-            # One private spool per round, shared by the parallel launcher and
-            # the sequential resume seam (#1025).
-            pr_round_spool = _review_round_spool(
-                config, surface="pr", number=pr_number,
-                round_number=round_number, subject=current_pr_subject,
-            )
             pr_launch_phase = (
                 scheduler_decision.phase if selective_policy and scheduler_decision is not None else None
             )
@@ -3798,18 +3864,6 @@ def run_pr_loop(
                             f"Round {round_number}: invoking {', '.join(launchable_pr_names)} "
                             f"in parallel on PR #{pr_number}",
                         )
-
-                        def _pr_review_validators(reviewer_name: str) -> dict[str, object]:
-                            return _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_review_response(
-                                text,
-                                reviewer=reviewer_name,
-                                unresolved_items=prior_unresolved_items,
-                                # Never share the mutable round_new_unresolved_items
-                                # list with concurrent workers (#594): it only
-                                # enriches the UnknownPriorItemDispositionError
-                                # message, so an empty tuple changes no outcome.
-                                current_round_items=(), architecture_status_mode=mode,
-                            ))
 
                         def _pr_reviewer_worker(reviewer: AgentName) -> _ReviewerTurnResult:
                             reviewer_name = agent_display_name(reviewer)

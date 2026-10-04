@@ -29,6 +29,12 @@ from pathlib import Path
 
 SPOOL_SCHEMA_VERSION = 1
 
+# Written into every record stored from #1258 on.  A record carrying it and no
+# publication carrier provably never began publishing, because the carrier is
+# always persisted before the first post; a record without it is legacy, with
+# unknown publication progress.
+CARRIER_PROTOCOL = 1
+
 # ValidatedAgentResponse fields that are persisted verbatim.  Usage metadata is
 # excluded on purpose: the original invocation already accounted for it.
 SPOOLED_RESPONSE_FIELDS: tuple[str, ...] = (
@@ -85,8 +91,75 @@ class ReviewRoundSpool:
         """Atomically persist one reviewer's validated response fields."""
         self._write(
             reviewer_name,
-            {"response": {name: fields.get(name) for name in SPOOLED_RESPONSE_FIELDS}},
+            {
+                "carrier_protocol": CARRIER_PROTOCOL,
+                "response": {name: fields.get(name) for name in SPOOLED_RESPONSE_FIELDS},
+            },
         )
+
+    def store_publication(self, reviewer_name: str, carrier: dict[str, object]) -> None:
+        """Atomically add a frozen publication carrier to a reviewer's response record.
+
+        Everything else in the record is preserved.  Raises ``ValueError`` when
+        there is no readable response record to attach the carrier to.
+        """
+        payload = self._read_payload(reviewer_name)
+        if payload is None or not isinstance(payload.get("response"), dict):
+            raise ValueError(f"No spooled response record for {reviewer_name} to freeze.")
+        payload = {**payload, "carrier_protocol": CARRIER_PROTOCOL, "publication": carrier}
+        self._replace(reviewer_name, payload)
+
+    def publication_state(self, reviewer_name: str) -> tuple[str, dict[str, object] | None]:
+        """Classify a record's publication progress.
+
+        ``absent``: no record that belongs to this reviewer and round.
+        ``legacy``: a readable response record written before the carrier
+        protocol.  ``fresh``: a protocol record whose carrier was never frozen.
+        ``carrier``: a frozen carrier (returned).  ``malformed``: a record that
+        has a ``publication`` field of any kind (including ``null``) but is not
+        a readable protocol response record with a mapping carrier.  Carrier
+        presence is detected independently of response readability, so an
+        unreadable response can never hide earlier publication.
+        """
+        if not self._path(reviewer_name).exists():
+            return "absent", None
+        payload = self._read_payload(reviewer_name)
+        if payload is None:
+            # The file exists but cannot be decoded into a mapping: it may hide a
+            # frozen publication carrier, so it is never treated as absent.
+            return "malformed", None
+        if (
+            payload.get("schema_version") != SPOOL_SCHEMA_VERSION
+            or any(payload.get(key) != value for key, value in self._identity().items())
+            or payload.get("reviewer") != reviewer_name
+        ):
+            # The path is derived from this round's identity, so a record here
+            # with a damaged schema or identity is not "foreign": when it still
+            # carries publication state it may hide a published prefix.
+            if "publication" in payload or "carrier_protocol" in payload:
+                return "malformed", None
+            return "absent", None
+        if "publication" in payload:
+            publication = payload.get("publication")
+            if (
+                not isinstance(publication, dict)
+                or payload.get("carrier_protocol") != CARRIER_PROTOCOL
+                or self.load(reviewer_name) is None
+                or "response" not in payload
+            ):
+                return "malformed", None
+            return "carrier", publication
+        if self.load(reviewer_name) is None or "response" not in payload:
+            return "absent", None
+        if payload.get("carrier_protocol") == CARRIER_PROTOCOL:
+            return "fresh", None
+        return "legacy", None
+
+    def record_mtime(self, reviewer_name: str) -> float | None:
+        try:
+            return self._path(reviewer_name).stat().st_mtime
+        except OSError:
+            return None
 
     def store_failure(self, reviewer_name: str, *, message: str, failure_category: str | None) -> None:
         """Atomically persist a failure that settled the reviewer as unavailable."""
@@ -102,6 +175,16 @@ class ReviewRoundSpool:
             "reviewer": reviewer_name,
             **outcome,
         }
+        self._replace(reviewer_name, payload)
+
+    def _read_payload(self, reviewer_name: str) -> dict[str, object] | None:
+        try:
+            payload = json.loads(self._path(reviewer_name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _replace(self, reviewer_name: str, payload: dict[str, object]) -> None:
         directory = self.directory
         directory.mkdir(parents=True, exist_ok=True)
         try:

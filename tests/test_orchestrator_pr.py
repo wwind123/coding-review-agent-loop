@@ -12697,6 +12697,9 @@ def _post_oversized_pr_round(monkeypatch, role: str) -> list[str]:
 
     class _Runner:
         def run(self, args, *, cwd, input_text=None, check=True, env=None):
+            if "--body-file" not in args:
+                # Reconciliation baseline reads (#510) are unsupported here.
+                return SimpleNamespace(returncode=1, stdout="", stderr="unsupported read")
             posted.append(Path(args[args.index("--body-file") + 1]).read_text())
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
