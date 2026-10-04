@@ -125,9 +125,10 @@ def derive_plan_step_back_state(
 ) -> StepBackState:
     """Derive the primary's streak inputs and active episode from plan records.
 
-    Retirement mirrors the primary stall streak: a checkpoint recorded for a
-    different issue digest retires its round and everything before it, and the
-    operator reset marker retires the rounds *before* the checkpoint's round.
+    Retirement mirrors the primary stall streak: a review whose latest preceding
+    same-round checkpoint recorded a different issue digest retires itself and
+    everything before it, and the operator reset marker retires the rounds
+    *before* the checkpoint's round.
     A panel opening, an invalid scheduler record or a phase-advance record ends
     the primary phase, so nothing at or before it counts.  An approval by the
     primary closes the episode.
@@ -150,7 +151,9 @@ def derive_plan_step_back_state(
     reset_indices: list[int] = []
     # Indices of the usable primary-phase checkpoints of each round: a counted
     # review must follow one of its own round (as the primary stall streak does).
-    checkpoint_indices: dict[int, list[int]] = {}
+    checkpoint_indices: dict[int, list[tuple[int, str | None]]] = {}
+    # Every usable primary checkpoint in order, for episode digest closure.
+    all_checkpoints: list[tuple[int, str | None]] = []
     for record in ordered:
         metadata = record.metadata
         if (
@@ -161,17 +164,13 @@ def derive_plan_step_back_state(
             or metadata.scheduler_phase != "primary"
         ):
             continue
-        checkpoint_indices.setdefault(metadata.round_number, []).append(record.index)
+        checkpoint_indices.setdefault(metadata.round_number, []).append(
+            (record.index, metadata.scheduler_issue_digest)
+        )
+        all_checkpoints.append((record.index, metadata.scheduler_issue_digest))
         if metadata.scheduler_stall_reset:
             reset_indices.append(record.index)
             retired_through = max(retired_through, metadata.round_number - 1)
-        recorded = metadata.scheduler_issue_digest
-        if (
-            recorded is not None
-            and current_issue_digest is not None
-            and recorded != current_issue_digest
-        ):
-            retired_through = max(retired_through, metadata.round_number)
 
     latest_review: dict[int, "PostedRoundRecord"] = {}
     for record in ordered:
@@ -188,11 +187,26 @@ def derive_plan_step_back_state(
     for number, record in sorted(latest_review.items()):
         if number <= retired_through:
             continue
-        if not any(
-            index < record.index for index in checkpoint_indices.get(number, ())
-        ):
+        preceding = [
+            digest
+            for index, digest in checkpoint_indices.get(number, ())
+            if index < record.index
+        ]
+        if not preceding:
             # Legacy, full-board or otherwise unqualified history ends the
             # streak: degraded history can only shorten it, never lengthen it.
+            counted.clear()
+            continue
+        recorded = preceding[-1]
+        if (
+            recorded is not None
+            and current_issue_digest is not None
+            and recorded != current_issue_digest
+        ):
+            # The latest checkpoint before this review (not any same-round
+            # checkpoint) names the issue text it judged: an edit retires this
+            # review and everything before it, while a fresh re-checkpoint of the
+            # same round under the edited issue keeps its own review.
             counted.clear()
             continue
         counted.append(
@@ -229,6 +243,19 @@ def derive_plan_step_back_state(
     if panel_opening_index is not None:
         # Opening the panel ends the primary phase, and with it the episode.
         episode = None
+    if episode is not None and current_issue_digest is not None:
+        # An issue edit closes the episode.  The turn was produced under the issue
+        # text of the latest checkpoint before its record (the trigger round's), so
+        # check that one, which covers an edit between publication and the
+        # candidate's first checkpoint, and every checkpoint after it.
+        before = [
+            digest for index, digest in all_checkpoints if index < episode.record_index
+        ]
+        digests = ([before[-1]] if before else []) + [
+            digest for index, digest in all_checkpoints if index > episode.record_index
+        ]
+        if any(d is not None and d != current_issue_digest for d in digests):
+            episode = None
     if episode is not None and any(index > episode.record_index for index in reset_indices):
         # A reset checkpoint recorded after the step-back turn closes the episode
         # even when it carries the same round number as the step-back candidate.

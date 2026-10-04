@@ -605,3 +605,54 @@ def test_reviews_without_a_qualifying_primary_checkpoint_are_not_counted():
 def test_a_checkpoint_recorded_after_its_review_does_not_qualify_it():
     records = [_review(1, 1, items=[_new(1)]), _checkpoint(2, 1, digest=DIGEST)]
     assert derive_plan_step_back_state(records, primary=PRIMARY).reviews == ()
+
+
+OLD_DIGEST = "aaaaaaaaaaaaaaaa"
+NEW_DIGEST = "bbbbbbbbbbbbbbbb"
+
+
+def test_a_same_round_re_checkpoint_under_the_edited_issue_keeps_its_review():
+    records = [
+        _checkpoint(1, 3, digest=OLD_DIGEST),
+        _review(2, 3, items=[_new(3)]),
+        _checkpoint(3, 4, digest=OLD_DIGEST),  # obsolete: interrupted before its review
+        _checkpoint(4, 4, digest=NEW_DIGEST),
+        _review(5, 4, items=[_new(4)]),
+        _checkpoint(6, 5, digest=NEW_DIGEST),
+        _review(7, 5, items=[_new(5)]),
+    ]
+    state = derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=NEW_DIGEST)
+    assert [review.round_number for review in state.reviews] == [4, 5]
+    assert state.streak_since(1) == 2
+
+
+def test_an_edit_closes_an_episode_published_before_its_first_checkpoint():
+    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=4)
+    records = [
+        _checkpoint(1, 4, digest=OLD_DIGEST),
+        _review(2, 4, items=[_new(4)]),
+        _coder(3, 5, entries=[entry]),
+        _checkpoint(4, 5, digest=NEW_DIGEST),
+        _review(5, 5, items=[_new(5)]),
+    ]
+    state = derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=NEW_DIGEST)
+    assert state.episode is None and state.escalation_count == 0
+    assert [review.round_number for review in state.reviews] == [5]
+    # Without an edit the same history keeps the episode and counts the block.
+    same = derive_plan_step_back_state(records[:3], primary=PRIMARY, current_issue_digest=OLD_DIGEST)
+    assert same.episode is not None
+
+
+def test_an_episode_published_after_the_edit_is_not_closed_by_it():
+    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=4)
+    records = [
+        _checkpoint(1, 3, digest=OLD_DIGEST),
+        _review(2, 3, items=[_new(3)]),
+        _checkpoint(3, 4, digest=NEW_DIGEST),
+        _review(4, 4, items=[_new(4)]),
+        _coder(5, 5, entries=[entry]),
+        _checkpoint(6, 5, digest=NEW_DIGEST),
+        _review(7, 5, items=[_new(5)]),
+    ]
+    state = derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=NEW_DIGEST)
+    assert state.episode is not None and state.escalation_count == 1

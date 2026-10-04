@@ -16347,3 +16347,63 @@ def test_unqualified_legacy_blocks_do_not_count_toward_the_trigger(tmp_path):
     assert [_STEP_BACK_MARKER in prompt for prompt in planner] == [
         False, False, False, False, False, True,
     ]
+
+
+def _m1251_edit_resume(tmp_path, *, drop_round5_checkpoint):
+    """Interrupt in round 5 (candidate 5 is the step-back), edit the issue, resume."""
+    first, _error = _m1251_run(tmp_path, last_round=4, max_rounds=8)
+    assert _m1251_coder_record(first, 5).step_back_entries
+    history = []
+    for comment in first.issue_comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if drop_round5_checkpoint and match is not None:
+            metadata = _decode_round_metadata(match.group("payload"))
+            if metadata.phase == "scheduler-prelaunch" and metadata.round_number == 5:
+                continue
+        history.append(comment)
+
+    fresh, base0 = _m1103_fresh_base()
+    _c, _cl, base_round2 = _m1103_blocking_chain(1, 1, base=base0)
+    _justify, base_round3 = _m1251_justify_patch(base_round2, resolved_item="item-2")
+    codex, claude, _base = _m1103_blocking_chain(3, 7, base=base_round3)
+    rerun = _FakeRunner(
+        issue_comments=history,
+        issue_payload={"body": "Narrowed issue body with explicit non-goals."},
+        claude_outputs=[claude[2], claude[3]],
+        codex_outputs=[codex[2], codex[3], codex[4]],
+    )
+    config = _staged_plan_config(
+        tmp_path, max_rounds=8, plan_growth_max_chars=4500, plan_growth_max_revisions=3,
+        plan_step_back_escalation_rounds=1,
+    )
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    return rerun, str(excinfo.value)
+
+
+def test_issue_edit_closes_an_episode_published_before_its_first_checkpoint(tmp_path):
+    """The edited issue restarts from fresh blocks; the old rejection does not escalate."""
+    rerun, message = _m1251_edit_resume(tmp_path, drop_round5_checkpoint=True)
+
+    # M=1 would have stopped at round 5 had the old episode survived the edit.
+    assert "stepped back at round 7" in message
+    planner = _m1251_prompts(rerun, "claude")
+    assert [_STEP_BACK_MARKER in prompt for prompt in planner] == [False, True]
+    assert _m1103_agent_calls(rerun) == ["codex", "claude", "codex", "claude", "codex"]
+
+
+def test_obsolete_same_round_checkpoint_does_not_discard_a_fresh_review(tmp_path):
+    """Fresh blocks in rounds 5 and 6 trigger exactly at K=2 after an issue edit."""
+    rerun, message = _m1251_edit_resume(tmp_path, drop_round5_checkpoint=False)
+
+    assert "stepped back at round 7" in message
+    planner = _m1251_prompts(rerun, "claude")
+    # Round 5's block is fresh (1); the step-back lands at round 6's boundary (2).
+    assert [_STEP_BACK_MARKER in prompt for prompt in planner] == [False, True]
+    checkpoints = [
+        record.round_number
+        for record in _plan_round_records(rerun)
+        if record.phase == "scheduler-prelaunch" and record.round_number == 5
+    ]
+    # The old-issue checkpoint plus the fresh one published on resume.
+    assert len(checkpoints) == 2
