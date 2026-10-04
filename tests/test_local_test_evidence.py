@@ -3182,7 +3182,7 @@ def test_probe_owner_and_inflight_follower_are_cancelled_without_publication(tmp
     argv = (sys.executable, "-c", "pass")
     monkeypatch.setattr(
         runtime, "_recognized_inner_probe_with_environment",
-        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a)),
+        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a), ()),
     )
     spawned = []
     real_popen = subprocess.Popen
@@ -3331,7 +3331,7 @@ def test_broker_stop_cancels_a_real_probe_owner_and_inflight_follower(tmp_path, 
     argv = (sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
     monkeypatch.setattr(
         runtime, "_recognized_inner_probe_with_environment",
-        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a)),
+        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a), ()),
     )
     spawned = []
     real_popen = subprocess.Popen
@@ -3549,7 +3549,7 @@ def test_broker_request_following_an_external_inflight_probe_is_cancelled_by_sto
     argv = (sys.executable, "-c", f"open({str(marker)!r}, 'w').close()")
     monkeypatch.setattr(
         runtime, "_recognized_inner_probe_with_environment",
-        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a)),
+        lambda a, **_kw: (("sleep", "30"), tuple(a), {}, tuple(a), ()),
     )
     spawned = []
     real_popen = subprocess.Popen

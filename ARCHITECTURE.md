@@ -334,7 +334,25 @@ fields. The
 catalog-authority rejections (collisions and non-passing or non-authoritative
 selectors) never route to structured repair, since reformatting cannot change
 them: the rejection names the failing launch condition(s) or outcome/provenance and carries the redacted, bounded command and observation timestamp, and the run stops once, naming the rejection as a
-`semantic-evidence-rejection` rather than a repair timeout (#990). Repair
+`semantic-evidence-rejection` rather than a repair timeout (#990). Collisions, and every
+caller that has not opted in, stop once as described. The approved-plan
+implementation hand-off opts into exactly one coder re-ask for non-passing or
+non-authoritative selector rejections: it quotes the sanitized, bounded
+rejection, resumes the rejected acquisition's session when the provider supports
+it, and requires a rerun and a citation from the re-ask turn's invocation-local
+catalog, outside `agent_max_retries`, model fallback, and repair. A second
+rejection stops with the same classification (#1240).
+
+Inner-launcher authentication also covers a local Playwright spelling (#1240):
+`npx [--no-install|--no] playwright test ...` is recognized only when
+`<cwd>/node_modules/.bin/playwright` exists, in which case both the bounded
+`--version` probe and the real launch use that local binary (through the probe
+result's `launch_argv`), while the recorded command keeps the npx spelling.
+npx is never executed by the recognizer or probe. Any other npx option
+(`-y`/`--yes`, `-p`/`--package`, `-c`, `--`, a version-pinned `playwright@x`),
+the existing unsafe `playwright test` forms, and a non-empty `NODE_OPTIONS` or
+`PW_TEST_REPORTER` (ambient or via an `env` prefix) leave the launcher
+unrecognized, so the observation stays `suite_start=unknown`. Repair
 does not generate matrix identities, canonical rows, receipt IDs, mappings,
 statuses, or evidence envelopes. Derived evidence and diagnostics are the
 durable replay artifact; live execution selectors are not. Historical accepted

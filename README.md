@@ -1464,7 +1464,9 @@ as the first argument and every other option on a fixed allow-list in
 `--name=value` form, so `--list`, `--help`, `--version`, zero-test-success
 flags (including `--shard`), `--config`/`--tsconfig`/global-setup options, custom reporters, and a
 non-empty `NODE_OPTIONS` or `PW_TEST_REPORTER` stay unrecognized; probed as
-`playwright --version`); other
+`playwright --version`; `npx [--no-install|--no] playwright test ...` is recognized only
+when `<cwd>/node_modules/.bin/playwright` exists and is then probed and launched as
+that local binary, never letting npx resolve or download a package); other
 commands remain
 unknown rather than being judged from text or exit codes. The runtime result
 keeps independent `wrapper_bootstrap`, `inner_exec`, and `suite_start` states,

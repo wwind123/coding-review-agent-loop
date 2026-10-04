@@ -1085,8 +1085,95 @@ def test_playwright_unsafe_forms_stay_unrecognized(tmp_path, monkeypatch, no_amb
     assert calls == []
 
 
-def test_npx_playwright_stays_unrecognized(tmp_path, no_ambient_invocation):
-    assert runtime.recognized_inner_probe(["npx", "playwright", "test"], cwd=tmp_path) is None
+@pytest.mark.parametrize(
+    "prefix", [["npx"], ["npx", "--no-install"], ["npx", "--no"]],
+)
+def test_npx_playwright_with_local_binary_probes_local_binary(tmp_path, monkeypatch, no_ambient_invocation, prefix):
+    launcher = _fake_playwright(tmp_path)
+    argv = [*prefix, "playwright", "test", "--project=x"]
+    probe = runtime.recognized_inner_probe(argv, cwd=tmp_path)
+    assert probe == (str(tmp_path / "node_modules/.bin/playwright"), "--version")
+
+    def fake_run(a, **kwargs):
+        return type("Completed", (), {"returncode": 0, "stdout": "1.50.0", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+    result = runtime.probe_inner_launcher(argv, cwd=tmp_path)
+    assert result.state == "verified"
+    assert result.candidate == tuple(argv)
+    assert result.launch_argv == (str(launcher), "test", "--project=x")
+
+
+def test_npx_playwright_without_local_binary_stays_unknown(tmp_path, monkeypatch, no_ambient_invocation):
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *a, **k: calls.append(a))
+    argv = ["npx", "playwright", "test"]
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path) is None
+    assert runtime.probe_inner_launcher(argv, cwd=tmp_path).state == "unknown"
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["npx", "-y", "playwright", "test"],
+        ["npx", "--yes", "playwright", "test"],
+        ["npx", "-p", "x", "playwright", "test"],
+        ["npx", "--package", "x", "playwright", "test"],
+        ["npx", "-c", "playwright test"],
+        ["npx", "playwright@1.50", "test"],
+        ["npx", "--", "playwright", "test"],
+        ["npx", "playwright", "test", "--list"],
+        ["npx", "playwright", "test", "--config=x.js"],
+    ],
+)
+def test_npx_playwright_unsafe_forms_stay_unrecognized(tmp_path, no_ambient_invocation, argv):
+    _fake_playwright(tmp_path)
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path) is None
+
+
+@pytest.mark.parametrize("name", ["NODE_OPTIONS", "PW_TEST_REPORTER"])
+def test_npx_playwright_code_loading_environment_stays_unrecognized(tmp_path, no_ambient_invocation, name):
+    _fake_playwright(tmp_path)
+    argv = ["npx", "playwright", "test"]
+    environment = {**os.environ, name: "./evil.js"}
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path, environment=environment) is None
+    assert runtime.recognized_inner_probe(
+        ["env", f"{name}=./evil.js", *argv], cwd=tmp_path, environment={**os.environ, name: ""}
+    ) is None
+
+
+def test_npx_playwright_env_prefix_keeps_distinct_identity(tmp_path, monkeypatch, no_ambient_invocation):
+    launcher = _fake_playwright(tmp_path)
+    monkeypatch.setattr(
+        runtime, "_run_bounded_probe",
+        lambda *a, **k: type("C", (), {"returncode": 0, "stdout": "1", "stderr": ""})(),
+    )
+    one = runtime.probe_inner_launcher(["env", "A=1", "npx", "playwright", "test"], cwd=tmp_path)
+    two = runtime.probe_inner_launcher(["env", "A=2", "npx", "playwright", "test"], cwd=tmp_path)
+    assert one.state == two.state == "verified"
+    assert one.launch_argv[1:] == ("A=1", str(launcher), "test")
+    assert two.launch_argv[1:] == ("A=2", str(launcher), "test")
+    assert one.identity != two.identity
+
+
+def test_foreground_npx_playwright_launches_local_binary_not_npx(tmp_path, monkeypatch, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    _fake_playwright(tmp_path)
+    sentinel = tmp_path / "npx-ran"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake_npx = bindir / "npx"
+    fake_npx.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 0\n", encoding="utf-8")
+    fake_npx.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    result = runner_module.run_foreground_test(
+        ["npx", "playwright", "test", "--project=chromium"], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+    assert result.suite_start == "verified"
+    assert runtime.launch_integrity_state(result, wrapper_boundary=False) == "verified"
+    assert not sentinel.exists()
 
 
 @pytest.mark.parametrize("name", ["NODE_OPTIONS", "PW_TEST_REPORTER"])
@@ -1158,6 +1245,35 @@ def test_cli_records_playwright_run_as_evidence_and_list_as_non_evidence(tmp_pat
     row = new_rows[0]
     assert row["launch_integrity"] == "unverified"
     assert not runtime.runtime_row_is_evidence(row)
+
+
+def test_cli_records_npx_playwright_run_as_evidence_with_npx_command(tmp_path, monkeypatch, no_ambient_invocation):
+    memory = tmp_path / "memory"
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "AGENT_LOOP_TEST_BROKER_ENDPOINT",
+        "AGENT_LOOP_TEST_BROKER_CAPABILITY",
+        "AGENT_LOOP_TEST_BROKER_PROTOCOL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    _fake_playwright(tmp_path)
+    sentinel = tmp_path / "npx-ran"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake_npx = bindir / "npx"
+    fake_npx.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 0\n", encoding="utf-8")
+    fake_npx.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    base = ["run-tests", "--timeout-seconds", "30", "--memory-dir", str(memory), "--"]
+    assert main([*base, "npx", "playwright", "test", "--project=chromium"]) == 0
+    rows = runtime.load_runtime_memory(memory)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["launch_integrity"] == "verified"
+    assert runtime.runtime_row_is_evidence(row)
+    assert "npx playwright test" in json.dumps(row)
+    assert row["normalized_command"].startswith("npx playwright test")
+    assert not sentinel.exists()
 
 
 def test_lookalike_env_executable_is_not_stripped_from_probe(tmp_path, monkeypatch, no_ambient_invocation):

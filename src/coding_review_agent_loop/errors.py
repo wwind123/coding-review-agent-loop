@@ -141,7 +141,18 @@ class NonRepairableEvidenceRejection(AgentLoopError):
     authoritatively launched passing observation is an authority decision,
     not a formatting defect: repair may only reshape the envelope around the
     coder's own claims, so it is never invoked for this class (#990).
+
+    ``reason`` classifies the rejection: only selector rejections
+    (``CITATION_REASKABLE_REASONS``) may be re-asked of the coder; anything
+    unclassified defaults to the terminal ``catalog-collision`` (#1240).
     """
+
+    def __init__(self, message: str = "", *, reason: str = "catalog-collision") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+CITATION_REASKABLE_REASONS = frozenset({"non-passing-selector", "launch-integrity"})
 
 
 class IssueImplementationConflictError(AgentLoopError):
