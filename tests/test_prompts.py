@@ -5134,3 +5134,24 @@ def test_mixed_verification_is_treated_as_unverified():
     listing = format_human_requirements(requirements)
     assert "Their author identity was not verified by the tool" in listing
     assert "override AI reviewer preferences" not in prompts_module._human_requirements_review_guidance(requirements)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_plan_review_prompt_names_requirement_id_key_with_populated_example(tmp_path, compact):
+    """#1241: surfaced requirements get a populated `requirement_id` example."""
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    issue_context = _compact_issue_context()
+    surfaced_id = issue_context.human_requirements[0].requirement_id
+    prompt = build_plan_review_prompt(
+        56, 1, "Plan.", config, reviewer="codex", issue_context=issue_context, compact_context=compact
+    )
+    assert f'"requirement_id": "{surfaced_id}"' in prompt
+    assert "its `requirement_id` (the exact surfaced" in prompt
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_plan_review_prompt_keeps_empty_disposition_example_when_none_surfaced(tmp_path, compact):
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    prompt = build_plan_review_prompt(56, 1, "Plan.", config, reviewer="codex", compact_context=compact)
+    assert '"human_requirement_dispositions": []' in prompt
+    assert '"requirement_id"' not in prompt

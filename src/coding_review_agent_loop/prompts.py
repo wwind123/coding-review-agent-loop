@@ -1229,6 +1229,42 @@ def _coder_human_requirements_guidance(
     return "\n".join(lines) + "\n"
 
 
+def _plan_review_disposition_example_json(
+    human_requirements: Sequence[HumanReviewRequirement] | None,
+) -> str:
+    """Render the example `human_requirement_dispositions` value (#1241).
+
+    Populated with the first surfaced ID, the same source validation uses, so
+    the example always validates; `[]` when nothing is surfaced.
+    """
+    surfaced = (
+        render_coder_human_requirements_prompt_context(
+            human_requirements, requirement_scope="planning requirements"
+        ).surfaced_requirement_ids
+        if human_requirements
+        else ()
+    )
+    if not surfaced:
+        return "[]"
+    return json.dumps([{
+        "requirement_id": surfaced[0],
+        "disposition": "addressed",
+        "evidence": "Step 2 of the plan covers this requirement.",
+    }])
+
+
+def _plan_disposition_example_guidance(
+    human_requirements: Sequence[HumanReviewRequirement] | None,
+) -> str:
+    example = _plan_review_disposition_example_json(human_requirements)
+    if example == "[]":
+        return ""
+    return (
+        "Example (the `[]` in the schema example applies only when no requirements are "
+        f"surfaced):\n\"human_requirement_dispositions\": {example}\n"
+    )
+
+
 def _human_requirements_review_guidance(
     human_requirements: Sequence[HumanReviewRequirement] | None,
     *,
@@ -1264,15 +1300,16 @@ include exactly:
 
 If any signed human requirement in this set is unresolved, return blocking.
 """ + ("""For every surfaced requirement, the JSON must include exactly one
-`human_requirement_dispositions` object with its exact surfaced requirement label, an
-`addressed`, `blocked`, or `not-applicable` disposition, and non-empty evidence.
+`human_requirement_dispositions` object with its `requirement_id` (the exact surfaced
+requirement label), an `addressed`, `blocked`, or `not-applicable` disposition, and
+non-empty evidence. The key must be spelled `requirement_id`.
 For an `addressed` disposition, compare the evidence to the canonical plan and
 return blocking when it lacks concrete coverage. A named external integration
 is distinct from a similarly purposed local UI: a Grafana request requires the
 Grafana dashboard/provisioning or another named integration artifact, not merely
 an `admin.html` view. Use `blocked` or `not-applicable` only with a visible
 reason that you explicitly accept before approving.
-""" if require_plan_dispositions else "")
+""" + _plan_disposition_example_guidance(human_requirements) if require_plan_dispositions else "")
 
 
 PR_REVIEW_SUB_ITEM_GUIDANCE = """A `blocking_items` or `same_pr_followups` object may also carry an optional
@@ -3052,6 +3089,9 @@ def build_plan_review_prompt(
         requirement_label="signed human issue requirements",
         require_plan_dispositions=True,
     )
+    plan_dispositions_example = _plan_review_disposition_example_json(
+        issue_context.human_requirements if issue_context is not None else ()
+    )
     unresolved_items_guidance = _build_unresolved_plan_items_guidance() if unresolved_items else ""
     superseded_prepanel_block = superseded_prepanel_plan_review_context_block(
         superseded_prepanel_review
@@ -3087,7 +3127,7 @@ strategy, and ambiguity. Use this mandatory structured JSON response format:
   "prior_plan_item_dispositions": [
     {{"item_id": "item-1", "disposition": "resolved", "note": "Covered by the revised tests."}}
   ],
-  "human_requirement_dispositions": [],
+  "human_requirement_dispositions": {plan_dispositions_example},
   "architecture_impact": {{"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}}
 }}
 <!-- AGENT_PLAN_STATE: approved -->

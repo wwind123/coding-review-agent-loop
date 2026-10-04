@@ -2345,6 +2345,10 @@ def _run_plan_first_loop(
                     review_output,
                     architecture_status_mode="legacy",
                     reviewer=reviewer_name,
+                    surfaced_requirement_ids=_surfaced_reviewer_requirement_ids(
+                        issue_context.human_requirements,
+                        requirement_scope="planning requirements",
+                    ),
                 )
                 resumed_impact, resumed_records = _resumed_review_architecture(
                     resumed_record.metadata,
