@@ -19,6 +19,7 @@ a resumed run agree at exactly K and M.  A malformed entry marks the history
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -504,8 +505,8 @@ OUTCOME_UNMAPPABLE = "UNMAPPABLE"
 
 _LOCATION_RE = re.compile(
     r"(?<![\w./:@-])"
-    r"((?:[\w.\-]+/)*[\w\-][\w.\-]*\.[A-Za-z0-9_]+)"
-    r":(\d+)(?:\s*[-–]\s*(\d+))?(?!\d)"
+    r"((?:[\w.\-]+/)*[\w\-][\w.\-]*)"
+    r":(\d+)(?:\s*[-\u2013]\s*(\d+))?(?!\d)"
 )
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -525,11 +526,24 @@ class FindingLocation:
     sub_item_id: str | None = None
 
 
+def _looks_like_repo_path(path: str) -> bool:
+    """A repository-relative path: nested, with an extension, or a capitalized bare
+    file name such as ``Dockerfile`` or ``Makefile`` (extensionless files are valid)."""
+    base = path.rsplit("/", 1)[-1]
+    return (
+        "/" in path
+        or "." in base.lstrip(".")
+        or base[:1].isupper()
+    ) and not path.startswith("/")
+
+
 def _scan_locations(
     text: str, *, item_id: str, sub_item_id: str | None
 ) -> list[FindingLocation]:
     found: list[FindingLocation] = []
     for match in _LOCATION_RE.finditer(text or ""):
+        if not _looks_like_repo_path(match.group(1)):
+            continue
         start = int(match.group(2))
         end = int(match.group(3)) if match.group(3) else start
         if start < 1:
@@ -614,6 +628,27 @@ def parse_name_status(text: str) -> tuple[dict[str, str], frozenset[str]]:
     return renames, frozenset(deleted)
 
 
+def select_file_diff(text: str, old_path: str, new_path: str) -> str:
+    """The section of a multi-file diff for exactly ``old_path`` -> ``new_path``.
+
+    A pathspec naming both sides of a rename can also return other file
+    identities (a rename chain), so hunks are taken only from the matching
+    ``diff --git`` section.  Output with no section headers is one file's hunks.
+    """
+    lines = (text or "").splitlines()
+    if not any(line.startswith("diff --git ") for line in lines):
+        return text or ""
+    header = f"diff --git a/{old_path} b/{new_path}"
+    selected: list[str] = []
+    active = False
+    for line in lines:
+        if line.startswith("diff --git "):
+            active = line == header
+        if active:
+            selected.append(line)
+    return "\n".join(selected)
+
+
 def parse_zero_context_hunks(text: str) -> tuple[Hunk, ...]:
     """Hunks of a ``git diff -U0`` output, in order."""
     hunks: list[Hunk] = []
@@ -655,13 +690,16 @@ def map_anchor(
     (a deletion, which includes a move elsewhere), or the diff failed.  Ranges
     are never widened to a whole hunk beyond the window.
     """
-    if name_status is None or diff_text is None:
+    if name_status is None:
         return _unmappable(path, start, end, "the diff could not be read")
     renames, deleted = parse_name_status(name_status)
     new_path = renames.get(path, path)
     if new_path == path and path in deleted:
         return _unmappable(path, start, end, "the file was deleted with no rename pair")
-    hunks = parse_zero_context_hunks(diff_text)
+    if diff_text is None:
+        # Keep a known rename destination so the same-path fallback still works.
+        return _unmappable(path, start, end, "the diff could not be read", new_path)
+    hunks = parse_zero_context_hunks(select_file_diff(diff_text, path, new_path))
     offset_before = 0
     overlapping: list[Hunk] = []
     for hunk in hunks:
@@ -740,32 +778,37 @@ class Cluster:
 def find_cluster(
     per_review: Sequence[Sequence[MappedLocation]], window: int
 ) -> Cluster | None:
-    """One path with a mapped finding in every review whose ranges form one span.
+    """One connected span on one path with a mapped finding from every review.
 
     ``per_review`` holds the head-mapped locations of each of the K consecutive
-    reviews.  Ranges are connected when the gap between neighbours is at most
-    ``window``; unrelated paths and reviews without a location never cluster.
+    reviews.  Each path's ranges are split into connected components (a gap of at
+    most ``window`` connects neighbours) and a component must contain a finding
+    from every review; a distant unrelated finding on the same path does not
+    prevent a cluster elsewhere on it.
     """
     if not per_review or any(not locations for locations in per_review):
         return None
     paths = set.intersection(*({loc.path for loc in locations} for locations in per_review))
     for path in sorted(paths):
         ranges = sorted(
-            (loc.start, loc.end, loc.item_id)
-            for locations in per_review
+            (loc.start, loc.end, loc.item_id, number)
+            for number, locations in enumerate(per_review)
             for loc in locations
             if loc.path == path
         )
-        span_end = ranges[0][1]
-        connected = True
-        for start, end, _item in ranges[1:]:
-            if start - span_end - 1 > window:
-                connected = False
-                break
-            span_end = max(span_end, end)
-        if connected:
-            ids = tuple(dict.fromkeys(item for _s, _e, item in ranges))
-            return Cluster(path, ranges[0][0], span_end, ids)
+        components: list[list[tuple[int, int, str, int]]] = []
+        span_end = None
+        for entry in ranges:
+            if span_end is not None and entry[0] - span_end - 1 <= window:
+                components[-1].append(entry)
+                span_end = max(span_end, entry[1])
+            else:
+                components.append([entry])
+                span_end = entry[1]
+        for component in components:
+            if {entry[3] for entry in component} == set(range(len(per_review))):
+                ids = tuple(dict.fromkeys(entry[2] for entry in component))
+                return Cluster(path, component[0][0], max(e[1] for e in component), ids)
     return None
 
 
@@ -876,19 +919,68 @@ def _remaining_mandatory_items(metadata: "PostedRoundMetadata") -> list:
         for d in metadata.dispositions
         if d.disposition not in mandatory
     }
-    remaining = [
-        item
-        for item in metadata.prior_items
-        if item.reviewer == metadata.agent
-        and item.status in mandatory
-        and item.item_id not in closed
-        and getattr(item, "authority", None) is None
-    ]
+    dispositions = {d.item_id: d for d in metadata.dispositions}
+    remaining = []
+    for item in metadata.prior_items:
+        if (
+            item.reviewer != metadata.agent
+            or item.status not in mandatory
+            or item.item_id in closed
+            or getattr(item, "authority", None) is not None
+        ):
+            continue
+        remaining.append(_with_effective_sub_items(item, dispositions.get(item.item_id)))
     seen = {item.item_id for item in remaining}
     remaining.extend(
         item for item in _mandatory_owned_new_items(metadata) if item.item_id not in seen
     )
     return remaining
+
+
+def _with_effective_sub_items(item, disposition):
+    """The item with this review's own sub-item dispositions applied.
+
+    ``resolved`` closes a sub-item and ``unresolved`` reopens one, so location
+    projection sees the post-review state rather than the prior ledger's.
+    """
+    if disposition is None or not disposition.sub_item_dispositions or not item.sub_items:
+        return item
+    outcomes = dict(disposition.sub_item_dispositions)
+    updated = tuple(
+        dataclasses.replace(
+            sub,
+            status={"resolved": "resolved", "unresolved": "open"}.get(
+                outcomes.get(sub.sub_item_id, ""), sub.status
+            ),
+        )
+        for sub in item.sub_items
+    )
+    return dataclasses.replace(item, sub_items=updated)
+
+
+def _location_is_member(
+    location: FindingLocation,
+    source_head: str,
+    head: str,
+    mapping: AnchorMapping,
+    window: int,
+    mapper: AnchorMapper,
+) -> bool:
+    """Membership of a carried location, with anchor and location in ``head``'s coordinates.
+
+    The anchor ``mapping`` is already in ``head``'s coordinates; the location is
+    mapped forward from the head its review was taken on.  A location that cannot
+    be mapped falls back to same-path membership against the anchor's paths.
+    """
+    moved = map_between_heads(
+        mapper, source_head, head, location.path, location.start, location.end
+    )
+    if moved.mappable:
+        location = dataclasses.replace(
+            location, path=moved.path, start=moved.start, end=moved.end
+        )
+        return in_cluster(location, mapping, window)
+    return location.path in {mapping.original_path, mapping.path}
 
 
 @dataclass(frozen=True)
@@ -951,9 +1043,10 @@ def derive_pr_episode(
         member_open = False
         for item in _remaining_mandatory_items(review.metadata):
             source_head = heads.get(item.source_round, review.head)
-            item_mapping = mapping_to(source_head)
             if any(
-                in_cluster(location, item_mapping, window)
+                _location_is_member(
+                    location, source_head, review.head, mapping, window, mapper
+                )
                 for location in project_finding_locations(item)
             ):
                 member_open = True

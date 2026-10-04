@@ -6798,6 +6798,18 @@ def run_pr_loop(
                             + approved_pr_reopen_hint(pr_number)
                         )
                         return 0
+            # A clustered sibling after a step-back stops for a human decision
+            # here, before the round-limit exit and any coder invocation; K clustered blocks otherwise
+            # turn this follow-up into one generalize-the-class step-back turn.
+            step_back_decision = _pr_step_back_decision(
+                runner,
+                config,
+                pr_number=pr_number,
+                round_number=round_number,
+                snapshot_comments=pr_comments,
+                tracked=_pr_step_back_tracked_reviewers(config, configured_reviewers),
+                head_sha=pr_metadata.head_sha,
+            )
             if round_number == allowed_rounds:
                 raise AgentLoopError(
                     _round_limit_diagnostic(
@@ -6938,18 +6950,6 @@ def run_pr_loop(
                     "commit's intent.\n\n"
                     + summary_context
                 )
-            # A clustered sibling after a step-back stops for a human decision
-            # here, before any coder invocation; K clustered blocks otherwise
-            # turn this follow-up into one generalize-the-class step-back turn.
-            step_back_decision = _pr_step_back_decision(
-                runner,
-                config,
-                pr_number=pr_number,
-                round_number=round_number,
-                snapshot_comments=pr_comments,
-                tracked=_pr_step_back_tracked_reviewers(config, configured_reviewers),
-                head_sha=pr_metadata.head_sha,
-            )
             step_back_guidance = (
                 step_back_decision.coder_guidance() if not has_merge_conflict_item else ""
             )

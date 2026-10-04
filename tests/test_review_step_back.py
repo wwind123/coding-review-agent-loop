@@ -1055,3 +1055,150 @@ def test_pr_step_back_entry_round_trips_through_round_metadata():
     decoded = _decode_round_metadata(_encode_round_metadata(metadata))
     assert decoded.step_back_status == "valid"
     assert decoded.step_back_entries[0]["anchor"] == {"path": "src/spool.py", "start": 100, "end": 105}
+
+
+# --- review round 1 fixes (#1265) -------------------------------------------
+
+
+def test_clearance_applies_the_reviews_own_sub_item_dispositions():
+    sub_items = (
+        ReviewSubItem("sub-1", "in cluster at src/spool.py:130"),
+        ReviewSubItem("sub-2", "distant at src/spool.py:900"),
+    )
+    parent = _pr_item("item-3", "conjunctive gap", round_number=3, sub_items=sub_items)
+
+    def episode(outcomes):
+        review = _pr_review(
+            60, 4, HEAD_B, prior=[parent],
+            dispositions=[
+                ReviewItemDisposition("item-3", PR_REVIEWER, "blocking", sub_item_dispositions=outcomes)
+            ],
+        )
+        return _episode(review)
+
+    # Resolving the in-cluster sub-item while the distant one stays open clears the episode.
+    assert episode((("sub-1", "resolved"), ("sub-2", "unresolved"))).entry is None
+    # Reopening an in-cluster sub-item (previously resolved) keeps it open.
+    closed_first = _pr_item(
+        "item-3", "conjunctive gap", round_number=3,
+        sub_items=(
+            ReviewSubItem("sub-1", "in cluster at src/spool.py:130", status="resolved"),
+            ReviewSubItem("sub-2", "distant at src/spool.py:900"),
+        ),
+    )
+    review = _pr_review(
+        60, 4, HEAD_B, prior=[closed_first],
+        dispositions=[
+            ReviewItemDisposition(
+                "item-3", PR_REVIEWER, "blocking",
+                sub_item_dispositions=(("sub-1", "unresolved"), ("sub-2", "resolved")),
+            )
+        ],
+    )
+    assert _episode(review).entry is not None
+
+
+def _shifting_mapper(from_head, to_head, path, start, end):
+    # The coder inserted 100 lines between the anchor (100-105) and later code.
+    if (from_head, to_head) == (HEAD_A, HEAD_B) and start >= 110:
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start + 100, end + 100)
+    if (from_head, to_head) == (HEAD_B, HEAD_A) and start >= 210:
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start - 100, end - 100)
+    return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+
+def test_clearance_maps_carried_locations_into_the_current_heads_coordinates():
+    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
+    records = [
+        _pr_review(40, 3, HEAD_A, new=[carried]),
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A)]),
+        _pr_review(
+            60, 4, HEAD_B, prior=[carried],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        ),
+    ]
+    # Line 130 moved to 230, outside 100-105 +/- 40: no member remains.
+    result = sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=_shifting_mapper)
+    assert result.entry is None
+    # Without the shift the carried item is still a member (control).
+    kept = sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=_identity_mapper)
+    assert kept.entry is not None
+
+
+def test_a_formerly_distant_carried_item_that_moves_into_the_window_keeps_the_episode_open():
+    carried = _pr_item("item-3", "old gap src/spool.py:300", round_number=3)
+
+    def pulled_in(from_head, to_head, path, start, end):
+        if (from_head, to_head) == (HEAD_A, HEAD_B) and start >= 290:
+            return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start - 190, end - 190)
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    records = [
+        _pr_review(40, 3, HEAD_A, new=[carried]),
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A)]),
+        _pr_review(
+            60, 4, HEAD_B, prior=[carried],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        ),
+    ]
+    assert sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=pulled_in).entry is not None
+
+
+def test_find_cluster_ignores_a_distant_finding_on_the_same_path():
+    cluster = sb.find_cluster(
+        [[_loc("a.py", 100, 100), _loc("a.py", 900, 900)], [_loc("a.py", 110, 110)], [_loc("a.py", 120, 120)]],
+        40,
+    )
+    assert (cluster.path, cluster.start, cluster.end) == ("a.py", 100, 120)
+    # A component missing one review's finding is not a cluster.
+    assert sb.find_cluster(
+        [[_loc("a.py", 100, 100)], [_loc("a.py", 110, 110)], [_loc("a.py", 900, 900)]], 40
+    ) is None
+
+
+def test_map_anchor_uses_only_the_matching_file_section_of_a_rename_chain():
+    name_status = "R100\ta.py\tb.py\nR100\tb.py\tc.py\n"
+    diff = (
+        "diff --git a/b.py b/c.py\nsimilarity index 90%\n@@ -1,0 +2,50 @@\n"
+        "diff --git a/a.py b/b.py\nsimilarity index 100%\n"
+    )
+    mapping = sb.map_anchor("a.py", 100, 105, 40, name_status=name_status, diff_text=diff)
+    assert (mapping.outcome, mapping.path, mapping.start, mapping.end) == (
+        sb.OUTCOME_SHIFTED, "b.py", 100, 105,
+    )
+    other = sb.map_anchor("b.py", 100, 105, 40, name_status=name_status, diff_text=diff)
+    assert (other.path, other.start) == ("c.py", 150)
+
+
+def test_a_failed_hunk_read_keeps_the_known_rename_destination():
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 40, name_status="R100\tsrc/a.py\tlib/a.py\n", diff_text=None
+    )
+    assert mapping.outcome == sb.OUTCOME_UNMAPPABLE and mapping.path == "lib/a.py"
+    assert sb.in_cluster(sb.FindingLocation("lib/a.py", 7, 7, "x"), mapping, 40)
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("see Dockerfile:20", ("Dockerfile", 20, 20)),
+        ("see Makefile:30-35", ("Makefile", 30, 35)),
+        ("see scripts/run:40", ("scripts/run", 40, 40)),
+        ("see src/a.py:7", ("src/a.py", 7, 7)),
+    ],
+)
+def test_extensionless_repository_files_project_from_parent_and_sub_items(text, expected):
+    parent = sb.project_finding_locations(_pr_item("item-1", text))
+    assert [(l.path, l.start, l.end) for l in parent] == [expected]
+    sub = sb.project_finding_locations(
+        _pr_item("item-1", "plain", sub_items=(ReviewSubItem("sub-1", text), ReviewSubItem("sub-2", "x")))
+    )
+    assert [(l.path, l.start, l.end, l.sub_item_id) for l in sub] == [(*expected, "sub-1")]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["https://example.com/x.py:9", "http://host/run:40", "/etc/passwd:3", "localhost:8080", "note:5"],
+)
+def test_urls_absolute_paths_and_plain_words_do_not_project(text):
+    assert sb.project_finding_locations(_pr_item("item-1", text)) == ()

@@ -17747,3 +17747,58 @@ def test_a_carried_in_window_item_keeps_the_episode_open_and_a_later_sibling_esc
         run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
     assert "human decision required" in str(excinfo.value)
     assert len(_sb_coder_prompts(runner)) == 4  # no fifth coder turn
+
+
+# --- review round 1 fixes (#1265) -------------------------------------------
+
+
+def test_a_sweep_sibling_arriving_exactly_at_the_round_limit_still_stops_for_a_human_decision(tmp_path):
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(["sibling at src/spool.py:134"], resolved=["item-3"])],
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, max_rounds=4))
+    message = str(excinfo.value)
+    assert "human decision required" in message and "Reached max rounds" not in message
+    assert "Generalization:" in message
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_primary_then_panel_step_back_sweeps_only_the_primary_before_any_secondary(tmp_path):
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+        gemini_outputs=[_gemini_review()],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=8,
+        pr_review_policy="primary-then-panel", primary_reviewer="codex",
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    commands = [c[0] for c, _cwd in runner.commands if c and c[0] in {"codex", "gemini"}]
+    first_gemini = commands.index("gemini")
+    assert commands[:first_gemini] == ["codex"] * 4  # no secondary before exact-head primary approval
+    assert len([p for p in _sb_coder_prompts(runner) if "STEP-BACK TURN" in p]) == 1
+    assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[3]
+    assert all("Enumerate ALL remaining instances" not in p for p in _sb_gemini_prompts(runner))
+
+
+def test_resume_after_a_carried_in_window_sweep_review_keeps_the_episode_and_stops_on_a_sibling(tmp_path):
+    runner = _StepBackRunner(
+        claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-3"])],
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(carried=["item-3"])],
+    )
+    config = _sb_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        # Round 4's sweep review (carrying the in-window item) and the ordinary fourth
+        # coder turn are published; the run is interrupted before round 5's review.
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_sb_coder_prompts(runner)) == 4
+    runner.codex_outputs.append(_sb_review(["late sibling at src/spool.py:135"], carried=["item-3"]))
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(excinfo.value)
+    assert "human decision required" in message
+    assert "Generalization: any spool record that fails a validation step is malformed." in message
+    assert len(_sb_coder_prompts(runner)) == 4  # no coder turn after the sibling
