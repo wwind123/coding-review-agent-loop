@@ -17273,3 +17273,87 @@ def test_pr_loop_cleanup_refusal_carries_the_release_diagnostic(tmp_path, monkey
     assert "requires manual label removal" in notes or "requires manual label removal" in str(raised.value)
     assert "503 Service Unavailable" in notes + str(raised.value)
     assert runner.deletes >= 1
+
+
+class _ReadyAmbiguityRunner(FakeRunner):
+    """``gh pr ready`` returns a 503; the PR then drifts or has actually changed."""
+
+    def __init__(self, *args, drift=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.drift = drift
+        self.pr_payload["isDraft"] = True
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        cmd = [str(a) for a in args]
+        if cmd[:3] == ["gh", "pr", "ready"]:
+            super().run(args, cwd=cwd, input_text=input_text, check=False, env=env)
+            if self.drift:
+                self.pr_payload["headRefOid"] = "d" * 40
+            else:
+                self.pr_payload["isDraft"] = False  # accepted despite the 503
+            where = Path(cwd) if cwd else Path(".")
+            return CommandResult(cmd, where, "", "HTTP 503 Service Unavailable", 1)
+        return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+
+def _ordinary_recovery_ready_setup(monkeypatch, runner_tmp):
+    capability = OrdinaryRecoveryCapability(
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        released_label_event_id=101, released_at=100,
+    )
+    validations = []
+    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
+    monkeypatch.setattr(
+        orchestrator, "wait_for_ordinary_recovery",
+        lambda *a, **k: ManagedCiOutcome(
+            status="passed", checks=_watch_check_board("passing"), head_sha="abc123",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "get_pr_review_context",
+        lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
+            number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
+            base_branch="main", head_sha="abc123", url=None,
+        )),
+    )
+    monkeypatch.setattr(
+        orchestrator, "validate_ordinary_recovery_capability",
+        lambda *a, **k: validations.append(k.get("require_draft", True)) or True,
+    )
+    return capability, validations
+
+
+def test_ordinary_recovery_ready_503_with_head_drift_refuses_with_one_ready_and_no_merge(
+    monkeypatch, tmp_path
+):
+    runner = _ReadyAmbiguityRunner(drift=True)
+    config = make_config(tmp_path, auto_merge=True)
+    capability, validations = _ordinary_recovery_ready_setup(monkeypatch, tmp_path)
+
+    with pytest.raises(AgentLoopError, match="Unable to mark recovered PR #77 ready") as raised:
+        orchestrator._finalize_ordinary_recovery_merge(
+            runner, config=config, pr_number=77, capability=capability,
+        )
+
+    ready = [c for c, _ in runner.commands if c[:3] == ["gh", "pr", "ready"]]
+    assert len(ready) == 1  # never replayed against the drifted head
+    assert _merge_commands(runner) == []
+    assert validations == [True]  # the post-write verification was never reached
+    assert "503 Service Unavailable" in str(raised.value)
+
+
+def test_ordinary_recovery_same_head_accepted_ready_reaches_post_write_verification(
+    monkeypatch, tmp_path
+):
+    runner = _ReadyAmbiguityRunner(drift=False)
+    config = make_config(tmp_path, auto_merge=True)
+    capability, validations = _ordinary_recovery_ready_setup(monkeypatch, tmp_path)
+
+    orchestrator._finalize_ordinary_recovery_merge(
+        runner, config=config, pr_number=77, capability=capability,
+    )
+
+    ready = [c for c, _ in runner.commands if c[:3] == ["gh", "pr", "ready"]]
+    assert len(ready) == 1
+    assert validations == [True, None]  # the existing post-write verification ran
+    assert len(_merge_commands(runner)) == 1  # and only then was the exact head merged

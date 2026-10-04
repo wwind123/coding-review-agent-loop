@@ -13637,3 +13637,117 @@ def test_successful_release_clears_the_diagnostic(tmp_path, label_env):
     contract.release_diagnostic = "stale"
     assert _release510(hub, config=_lcfg(tmp_path), pr_number=7, contract=contract) is True
     assert contract.release_diagnostic == ""
+
+
+# --- #510 review round 4: provisional cleanup diagnostics, ready through workflows --
+
+
+class _ProvisionalCleanupFailureRunner(V2ManagedRunner):
+    """The label add is acknowledged, provenance is unreadable and cleanup 503s."""
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(a) for a in args]
+        if "DELETE" in cmd and any(a.endswith(f"/labels/{MANAGED_LABEL}") for a in cmd):
+            record, _ = self._record_command(args, cwd)
+            return CommandResult(record, cwd, "", "HTTP 503 Service Unavailable", 1)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def test_provisional_adoption_cleanup_failure_carries_its_diagnostic(tmp_path):
+    runner = _ProvisionalCleanupFailureRunner(
+        workflow=adoption_workflow(),
+        rest_pr={"draft": False, "state": "open", "labels": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+        unreadable_issue_events_after_label=True,
+    )
+
+    with pytest.raises(AgentLoopError, match="could not safely adopt") as raised:
+        activate_managed_ci(
+            runner, config=_adoption_config(tmp_path), pr_number=7, metadata=metadata(),
+        )
+
+    text = str(raised.value)
+    assert "could not be released" in text
+    assert "503 Service Unavailable" in text
+    assert "attempt 1" in text
+
+
+class _ReadyFlowHub(_LabelHub):
+    """Qualified-label add plus draft/ready state for prepare_v2_merge."""
+
+    def __init__(self, *args, drift_after_ready=False, **kwargs):
+        super().__init__(*args, label=QUALIFIED_LABEL, **kwargs)
+        self.drift_after_ready = drift_after_ready
+        self.merges = 0
+
+    def run(self, args, *, cwd, check=True, input_text=None, env=None):
+        cmd = [str(a) for a in args]
+        joined = " ".join(cmd)
+        if cmd[1:3] == ["pr", "merge"]:
+            self.merges += 1
+            return self._res(0)
+        if joined.endswith("repos/OWNER/REPO/pulls/7"):
+            return self._res(0, out=_json510.dumps({
+                "draft": self.draft,
+                "labels": [{"name": QUALIFIED_LABEL}] if self._latest_kind() == "labeled" else [],
+                "head": {"sha": self.head},
+            }))
+        if cmd[1:3] == ["pr", "view"] and "--jq" in cmd:
+            return self._res(0, out=self.head + "\n")
+        result = super().run(args, cwd=cwd, check=check, input_text=input_text, env=env)
+        if cmd[1:3] == ["pr", "ready"] and self.drift_after_ready:
+            self.head = "b" * 40  # a push lands while the transition is ambiguous
+        return result
+
+
+def test_prepare_v2_merge_ready_503_with_head_drift_refuses_with_one_ready_and_no_merge(
+    tmp_path, label_env
+):
+    hub = _ReadyFlowHub(drift_after_ready=True)
+    hub.ready_script = ["fail"]
+    contract = managed_ci.ManagedCiContract(protocol_version=2)
+
+    with pytest.raises(AgentLoopError, match="Unable to mark qualified PR #7 ready") as raised:
+        managed_ci.prepare_v2_merge(
+            hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha="a" * 40, contract=contract,
+        )
+
+    assert len(hub.readies) == 1  # never replayed against the drifted head
+    assert hub.merges == 0
+    assert "503 Service Unavailable" in str(raised.value)
+
+
+def test_prepare_v2_merge_same_head_accepted_ready_reaches_post_write_verification(
+    tmp_path, label_env
+):
+    hub = _ReadyFlowHub()
+    hub.ready_script = ["accepted"]
+    contract = managed_ci.ManagedCiContract(protocol_version=2)
+
+    managed_ci.prepare_v2_merge(
+        hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha="a" * 40, contract=contract,
+    )
+
+    assert len(hub.readies) == 1 and hub.draft is False
+    assert hub.merges == 0  # prepare only readies; the head was re-verified afterwards
+
+
+def test_prepare_v2_merge_post_write_verification_still_refuses_a_later_head_change(
+    tmp_path, label_env
+):
+    hub = _ReadyFlowHub()
+    hub.ready_script = ["ok"]
+    original = hub.run
+
+    def run(args, **kw):
+        result = original(args, **kw)
+        if [str(a) for a in args][1:3] == ["pr", "ready"]:
+            hub.head = "c" * 40  # changes after a clean ready, so only the post-write check can catch it
+        return result
+
+    hub.run = run
+    with pytest.raises(AgentLoopError, match="head changed while it was being readied"):
+        managed_ci.prepare_v2_merge(
+            hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha="a" * 40,
+            contract=managed_ci.ManagedCiContract(protocol_version=2),
+        )

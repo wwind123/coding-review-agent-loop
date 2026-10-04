@@ -6661,7 +6661,13 @@ def _activate_v2_existing_pr_adoption(
             ),
             invocation_applied_label=applied,
         )
-        release_adopted_managed_ci(runner, config=config, pr_number=pr_number, contract=provisional)
+        if not release_adopted_managed_ci(
+            runner, config=config, pr_number=pr_number, contract=provisional
+        ) and diagnostics is not None:
+            diagnostics.append(
+                f"\nThe unprovable `{MANAGED_LABEL}` label could not be released."
+                + provisional.release_diagnostic
+            )
         return None
     revision = _api_json(runner, config, f"repos/{config.repo}/commits/{base_ref}", quiet=True).get("sha")
     log(config, f"PR #{pr_number}: activated authenticated managed exact-head CI v2 adoption")
