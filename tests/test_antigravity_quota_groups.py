@@ -281,6 +281,7 @@ def test_turn_start_stop_reports_most_recent_remembered_frame(tmp_path):
         memory.mark_exhausted("gemini", None, "cooldown", "Error: quota (latest, gemini)", 0.0, cooldown_seconds=600)
         _r, error, models, _s, _l = _turn(tmp_path, [("never", 0)])
         assert models == [] and "latest, gemini" in str(error)
+        assert error.failure_category == "transient"
 
 
 def test_expiry_while_opus_runs_then_quota_jumps_back_to_gemini_once(tmp_path):
@@ -493,3 +494,31 @@ def test_format_repair_never_reads_or_marks_quota_memory(tmp_path, monkeypatch):
             expected_kind="pr_review",
         )
     assert touched == []
+
+
+def test_every_unavailable_stop_is_a_transient_category(tmp_path):
+    _r, shared, *_ = _turn(
+        tmp_path, [_fail("Error: quota exceeded"), _fail(LIVE_SAMPLE)],
+        antigravity_models=(GEM1, OPUS, "Model X"),
+    )
+    assert shared.failure_category == "transient"
+    with patch.object(agy, "_now", FakeClock()), workdir_claims.workdir_claim_scope():
+        _r, error, *_ = _turn(tmp_path, [_fail(LIVE_SAMPLE)] * 2)
+        assert str(error).startswith("Antigravity unavailable")
+        assert error.failure_category == "transient"
+
+
+def test_exhausted_antigravity_is_marked_unavailable_not_fatal_in_a_pr_round(tmp_path):
+    from test_orchestrator_pr import structured_pr_review  # noqa: F401
+
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(summary="Codex ok.")],
+        antigravity_outputs=[_fail(LIVE_SAMPLE)] * 3,
+    )
+    config = make_config(tmp_path, reviewer=("antigravity", "codex"), review_parallel=False)
+    with workdir_claims.workdir_claim_scope():
+        with pytest.raises(AgentLoopError) as excinfo:
+            run_pr_loop(runner, pr_number=77, config=config)
+    # The round finished Codex's review and then stopped for the unavailable reviewer.
+    assert any("Codex ok." in c for c in runner.comments)
+    assert "unavailable" in str(excinfo.value).lower()

@@ -1204,7 +1204,11 @@ def _run_validated_agent(
         state = antigravity_attempts
         if state.stop_is_verified_long_reset():
             return _quota_reset_error(state.earliest_reset_seconds() or 1, classification_text)
-        return AgentInvocationError(state.unavailable_message(shared_limit))
+        # Transient, like the ordinary chain-exhausted failure it replaces: multi-reviewer
+        # rounds then mark Antigravity unavailable instead of aborting the round.
+        return AgentInvocationError(
+            state.unavailable_message(shared_limit), failure_category="transient"
+        )
 
     for attempt in range(1, max_attempts + 1):
         replacement_stability_failed = False
