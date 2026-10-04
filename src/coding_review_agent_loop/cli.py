@@ -906,6 +906,33 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--plan-step-back-rounds",
+            type=int,
+            default=None,
+            metavar="K",
+            help=(
+                "Under --plan-review-policy primary-then-panel, once a one-shot plan has "
+                "crossed a plan-growth signal and the primary has blocked K consecutive "
+                "rounds on new mandatory findings, make the next planner turn a "
+                "simplify-or-re-scope revision instead of another patch (default: 2; 0 "
+                "disables). Findings that only repeat an unresolved item, or that are "
+                "future follow-ups, do not count."
+            ),
+        )
+        subparser.add_argument(
+            "--plan-step-back-escalation-rounds",
+            type=int,
+            default=None,
+            metavar="M",
+            help=(
+                "Under --plan-review-policy primary-then-panel, after a step-back turn, stop "
+                "for a human decision once the primary has blocked M rounds since it "
+                "(default: 2, minimum 1). The block of the step-back candidate itself is the "
+                "first, so 1 stops as soon as the simplify turn is rejected. This fires "
+                "before --plan-primary-stall-rounds."
+            ),
+        )
+        subparser.add_argument(
             "--plan-reset-stall-streak",
             dest="plan_reset_stall_streak",
             action="store_true",

@@ -101,6 +101,7 @@ Source paths below are relative to
 | Validated agent turn | `validated_agent.py` | Run telemetry and usage contexts, structured repair, completion recovery, and the validated agent turn shared by every role. |
 | Response validation | `response_validation.py` | Coder and plan response validators, human-requirement checks, and post-PR test/observation validation. |
 | Panel evidence | `panel_evidence.py` | PR/plan panel evidence, board-amendment notes, plan primary streak, and plan-growth gates. |
+| Review step-back | `review_step_back.py` | Pure, history-derived step-back bookkeeping (#1251): classifies each primary review from its historical record as `new-finding`, `repeat-only`, or `approved`; derives the trigger streak and the active episode separately; and renders the step-back planner guidance, the step-back reviewer notice, and the human-decision stop message. It performs no I/O. |
 | Review rounds | `review_rounds.py` | Review outcome classification, round-ledger helpers, parallel reviewer-turn launch, spool replay, and partial-round refusal. |
 | Discuss loop | `discuss_loop.py` | The discuss mode entry point and its consensus and split-proposal analyzers. |
 | Execution policy | `execution_policy.py` | Execution-policy resolution, child routing and provenance, staged reporting, typed plan-stage extraction, and fresh-topology preflights. |
@@ -634,6 +635,42 @@ when unset and invalid on PR-flow records. Comment-only narrowing never retires
 the streak, because loop-posted comments share the operator's account and cannot
 be authenticated as operator intent; it is routed to the reset flag. `--plan-review-force-full` stays the only way to convene the panel
 without an exact-plan primary approval.
+
+**Plan step-back episode** (#1251; `--plan-step-back-rounds` K, default 2, `0`
+disables; `--plan-step-back-escalation-rounds` M, default 2, minimum 1). The
+stall stop fires only after the time is spent, so a second, earlier mechanism
+targets the "new edge case every round" pattern. Under `primary-then-panel`,
+`review_step_back.classify_review` reads the primary's *historical* review record
+for a round (never the surviving unresolved ledger) and calls it `new-finding`
+when the review blocked and introduced at least one `blocking` or `same-plan`
+item it owns, `repeat-only` when it blocked with only carried-forward items or
+future follow-ups, and `approved` otherwise. The **trigger streak** counts
+consecutive `new-finding` primary reviews since the current contiguous run of
+crossed one-shot plan candidates began (growth crossings are recomputed from each
+candidate's canonical plan and assembled sidecar and are never persisted). At the
+revision boundary, after refreshing the durable history so the round's own review
+is included, a streak of K makes the next planner turn a simplify-or-re-scope
+revision: `step_back_context` replaces the "address the reviewer items" framing
+in the semantic-patch, compact, and full planner prompts, and
+`step_back_review_notice` tells every reviewer of that candidate to judge the
+alternative on its merits. The orchestrator records the turn as one optional
+reviewer-owned round-metadata field on the planner record,
+`step_back_entries` (`{phase, reviewer, trigger_round}`; the PR-phase shape adds
+`trigger_head` and `anchor`). It is never taken from agent output; an absent
+field is legacy, and a malformed one marks step-back history degraded, which
+suppresses the trigger and the stop with a log line instead of failing the run.
+The **active episode** is derived separately from the newest entry: only an
+exact-plan primary approval, a `scheduler_stall_reset` checkpoint, a changed
+`scheduler_issue_digest`, or a panel opening closes it, so a repeat-only review
+neither closes it nor permits a second step-back. The escalation count is the
+number of blocking primary reviews of any classification on the step-back
+candidate or later (the candidate's own block is the first). At M the loop
+stops through `stop_plan_pre_panel` with a human-decision diagnostic (growth
+measurements, the step-back round, a bounded excerpt of the step-back summary,
+and the continue, adopt, or split options) before invoking any planner turn,
+whichever of that stop and the stall stop is reached first. The same derivation
+runs at round start, so live and resumed runs trigger and stop at exactly K and
+M. The approval-time growth gate and scope-ledger preservation are unchanged.
 
 Planning scheduler metadata is a flow-discriminated branch of the same durable
 round-metadata transport. A planning record carries the candidate key in place

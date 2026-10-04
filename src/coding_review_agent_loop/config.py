@@ -78,6 +78,8 @@ MAX_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS = 3600
 DEFAULT_MAX_ROUNDS = 10
 # Primary-phase plan stall stop threshold (#1103); 0 disables it.
 DEFAULT_PLAN_PRIMARY_STALL_ROUNDS = 8
+DEFAULT_PLAN_STEP_BACK_ROUNDS = 2
+DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS = 2
 DEFAULT_SUB_ITEM_STALL_ROUNDS = 3
 # `agy --print` otherwise defaults to five minutes, which is too short for
 # complex reviews and causes it to exit with "timeout waiting for response".
@@ -203,6 +205,13 @@ class AgentLoopConfig:
     # primary-then-panel run stops instead of re-invoking the primary.  0
     # disables the stop.
     plan_primary_stall_rounds: int = DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
+    # Plan step-back turn (#1251): once a one-shot plan has crossed a growth
+    # signal and the primary has blocked this many consecutive rounds on new
+    # findings, the next planner turn is a simplify-or-re-scope revision.  0
+    # disables it.  After it, this many further primary blocks (the block of the
+    # step-back candidate itself counts as the first) stop for a human decision.
+    plan_step_back_rounds: int = DEFAULT_PLAN_STEP_BACK_ROUNDS
+    plan_step_back_escalation_rounds: int = DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
     # One-shot operator retirement of the stall streak (#1112): the run's first
     # primary-phase checkpoint is stamped as a durable streak boundary.  Never
     # inherited by child planning, isolated providers, or recovery commands.
@@ -659,6 +668,36 @@ class AgentLoopConfig:
             raise AgentLoopError(
                 "--plan-primary-stall-rounds requires --plan-review-policy primary-then-panel."
             )
+        step_back_rounds = self.plan_step_back_rounds
+        if (
+            isinstance(step_back_rounds, bool)
+            or not isinstance(step_back_rounds, int)
+            or step_back_rounds < 0
+        ):
+            raise AgentLoopError(
+                "--plan-step-back-rounds must be a non-negative integer (0 disables it)."
+            )
+        escalation_rounds = self.plan_step_back_escalation_rounds
+        if (
+            isinstance(escalation_rounds, bool)
+            or not isinstance(escalation_rounds, int)
+            or escalation_rounds < 1
+        ):
+            raise AgentLoopError(
+                "--plan-step-back-escalation-rounds must be a positive integer."
+            )
+        for flag, value, default in (
+            ("--plan-step-back-rounds", step_back_rounds, DEFAULT_PLAN_STEP_BACK_ROUNDS),
+            (
+                "--plan-step-back-escalation-rounds",
+                escalation_rounds,
+                DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
+            ),
+        ):
+            if value != default and self.plan_review_policy != "primary-then-panel":
+                raise AgentLoopError(
+                    f"{flag} requires --plan-review-policy primary-then-panel."
+                )
         if (
             isinstance(self.sub_item_stall_rounds, bool)
             or not isinstance(self.sub_item_stall_rounds, int)
@@ -2057,6 +2096,12 @@ def config_from_args(
         plan_review_force_full=bool(getattr(args, "plan_review_force_full", False)),
         plan_primary_stall_rounds=_arg_or_default(
             args, "plan_primary_stall_rounds", DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
+        ),
+        plan_step_back_rounds=_arg_or_default(
+            args, "plan_step_back_rounds", DEFAULT_PLAN_STEP_BACK_ROUNDS
+        ),
+        plan_step_back_escalation_rounds=_arg_or_default(
+            args, "plan_step_back_escalation_rounds", DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS
         ),
         plan_reset_stall_streak=bool(getattr(args, "plan_reset_stall_streak", False)),
         plan_growth_gate=getattr(args, "plan_growth_gate", None) or "enforce",
