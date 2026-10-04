@@ -39,6 +39,19 @@ def _executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def _private_tempdir(tmp_path, monkeypatch):
+    # Keep every test off the host's real $TMPDIR/coding-review-agent-loop,
+    # whose permission bits are host state (#1206).
+    private = tmp_path / "agent-permissions-private-tmp"
+    private.mkdir()
+    private.chmod(0o700)
+    monkeypatch.setattr(tempfile, "tempdir", str(private))
+    ap.reset_sandbox_state()
+    yield private
+    ap.reset_sandbox_state()
+
+
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
     # Pin the umask: fixture directories (agent checkouts nested in the
@@ -886,10 +899,39 @@ def test_non_reviewer_refusal_omits_the_board_trade(tmp_path):
 
 
 @pytest.mark.parametrize("provider", ["antigravity", "gemini"])
-def test_role_permission_args_refuses_unsandboxable_provider_with_reason(tmp_path, provider):
+def test_role_permission_args_refuses_unsandboxable_provider_with_reason(
+    tmp_path, sandbox, provider
+):
     config = sandboxed_config(tmp_path)
     with pytest.raises(AgentLoopError, match="has no CLI-enforced read-only grant"):
         ap.role_permission_args(config, provider, "reviewer")
+
+
+def test_unsandboxable_refusal_ignores_group_writable_host_scratch(tmp_path, monkeypatch):
+    # Regression for #1206: a mode-775 host $TMPDIR/coding-review-agent-loop
+    # must not change what these tests observe.
+    decoy_base = tmp_path / "host-tmp"
+    decoy = decoy_base / "coding-review-agent-loop"
+    decoy.mkdir(parents=True)
+    decoy.chmod(0o775)
+    monkeypatch.setenv("TMPDIR", str(decoy_base))
+    private = tmp_path / "agent-permissions-private-tmp"
+    assert Path(tempfile.gettempdir()) == private
+    config = sandboxed_config(tmp_path)
+    root = ap.response_root(config)
+    assert private in root.parents
+    assert decoy_base not in root.parents
+    with pytest.raises(AgentLoopError, match="has no CLI-enforced read-only grant") as info:
+        ap.role_permission_args(config, "gemini", "reviewer")
+    assert not isinstance(info.value, ap.SandboxBoundaryError)
+    assert stat.S_IMODE(decoy.stat().st_mode) == 0o775
+    assert not (decoy / "responses").exists()
+
+    # Control: the decoy really is hostile when it is the scratch root.
+    monkeypatch.setattr(tempfile, "tempdir", str(decoy_base))
+    ap.reset_sandbox_state()
+    with pytest.raises(ap.SandboxBoundaryError, match="group- or world-writable"):
+        ap.establish_response_root_boundary(config)
 
 
 @pytest.mark.parametrize("field_name", ["primary_reviewer", "primary_plan_reviewer"])
