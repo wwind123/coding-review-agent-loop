@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import re
 import secrets
 import shlex
+import threading
 import time
 from collections.abc import Collection, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -40,6 +42,7 @@ from .github import (
     WrittenProtocolComment,
 )
 from .logging import log
+from .github_retry import describe_gh_failure, run_gh_read
 from .runner import Runner
 from .workdirs import active_workdir, github_api_cwd
 from .protocol_markers import (
@@ -86,6 +89,47 @@ _TERMINAL_CI_STATUSES = frozenset({
     "success", "failure", "error", "cancelled", "timed_out",
     "action_required", "startup_failure", "stale",
 })
+
+
+_LIST_FAILURE = threading.local()
+
+
+def _last_list_failure() -> str:
+    """Reason of the most recent ``_api_list`` failure on this thread ('' if it succeeded)."""
+    return getattr(_LIST_FAILURE, "reason", "")
+
+
+def _surfaces_list_failures(func):
+    """Append GitHub list-read failure diagnostics to terminal errors.
+
+    Many managed-CI gates fail closed on an unreadable list and later raise a
+    generic refusal.  Within one outermost gate call, every list failure is
+    remembered, so the terminal ``AgentLoopError`` carries the final stderr and
+    retry attempt history even when the failing read was consumed by a helper
+    that only returns ``None``.  Existing fail-closed decisions are unchanged.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        outermost = getattr(_LIST_FAILURE, "depth", 0) == 0
+        if outermost:
+            _LIST_FAILURE.failures = []
+        _LIST_FAILURE.depth = getattr(_LIST_FAILURE, "depth", 0) + 1
+        try:
+            return func(*args, **kwargs)
+        except AgentLoopError as exc:
+            failures = list(getattr(_LIST_FAILURE, "failures", ()) or ())
+            missing = [reason for reason in failures if reason not in str(exc)]
+            if missing and type(exc) in (AgentLoopError,):
+                detail = "\n".join(f"GitHub list read failure: {reason}" for reason in missing)
+                raise AgentLoopError(f"{exc}\n{detail}") from exc
+            raise
+        finally:
+            _LIST_FAILURE.depth -= 1
+            if outermost:
+                _LIST_FAILURE.failures = None
+
+    return wrapper
 
 
 @dataclass(frozen=True)
@@ -726,6 +770,7 @@ class ManagedCiRunSnapshot:
     conclusion: str | None
 
 
+@_surfaces_list_failures
 def activate_managed_ci(
     runner: Runner,
     *,
@@ -1724,11 +1769,13 @@ def _authorization_comment_records(
     actor_login: str,
     actor_id: int,
 ) -> list[tuple[int, ManagedCiIssueAuthorization]]:
-    comments = _api_list(
+    comments, reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
     if comments is None:
-        raise AgentLoopError("Managed-CI authorization comments could not be inspected.")
+        raise AgentLoopError(
+            _with_reason("Managed-CI authorization comments could not be inspected.", reason)
+        )
     records: list[tuple[int, ManagedCiIssueAuthorization]] = []
     for comment in comments:
         body = _normalized_comment_body(comment, config=config)
@@ -1862,11 +1909,15 @@ def find_actor_round_metadata_comment_ids(
     after_comment_id: int,
 ) -> tuple[int, ...]:
     """Return the exact blocking-review and coder records for one head transition."""
-    comments = _api_list(
+    comments, reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
     if comments is None:
-        raise AgentLoopError("Managed-CI continuity could not inspect PR round metadata comments.")
+        raise AgentLoopError(
+            _with_reason(
+                "Managed-CI continuity could not inspect PR round metadata comments.", reason
+            )
+        )
     by_index = _continuity_round_records(comments)
     reviewers: list[int] = []
     coders: list[int] = []
@@ -2081,6 +2132,7 @@ def _continuity_round_metadata_is_valid(
     return len(reviewers) + 1 == len(selected)
 
 
+@_surfaces_list_failures
 def publish_issue_created_authorization(
     runner: Runner,
     *,
@@ -2095,7 +2147,10 @@ def publish_issue_created_authorization(
     event = _active_managed_label_event(runner, config=config, pr_number=handoff.pr_number)
     if event is None or event[1].casefold() != handoff.trusted_actor_login.casefold() or event[2] != handoff.trusted_actor_id:
         raise AgentLoopError(
-            "Managed-CI issue-created authorization requires an actor-owned managed-label event."
+            _with_reason(
+                "Managed-CI issue-created authorization requires an actor-owned managed-label event.",
+                _last_list_failure(),
+            )
         )
     waiver = _waiver_for_protection(handoff.protection_mode)
     if waiver is None:
@@ -2143,7 +2198,10 @@ def publish_issue_created_authorization(
     )
     if current_event != event:
         raise AgentLoopError(
-            "Managed-CI issue-created authorization label provenance changed before publication."
+            _with_reason(
+                "Managed-CI issue-created authorization label provenance changed before publication.",
+                _last_list_failure(),
+            )
         )
     records = _authorization_comment_records(
         runner,
@@ -2313,6 +2371,7 @@ def _stranded_continuity_comment_ids(
     return tuple(sorted(stranded))
 
 
+@_surfaces_list_failures
 def publish_issue_created_continuity_authorization(
     runner: Runner,
     *,
@@ -2341,7 +2400,12 @@ def publish_issue_created_continuity_authorization(
         or event[1].casefold() != handoff.trusted_actor_login.casefold()
         or event[2] != handoff.trusted_actor_id
     ):
-        raise AgentLoopError("Managed-CI head continuity requires an actor-owned active managed-label event.")
+        raise AgentLoopError(
+            _with_reason(
+                "Managed-CI head continuity requires an actor-owned active managed-label event.",
+                _last_list_failure(),
+            )
+        )
     live_tuple = _continuity_live_pr_tuple(
         runner,
         config=config,
@@ -2449,6 +2513,7 @@ def publish_issue_created_continuity_authorization(
         current_event = _active_managed_label_event(
             runner, config=config, pr_number=handoff.pr_number
         )
+        event_reason = _last_list_failure()
         current_tuple = _continuity_live_pr_tuple(
             runner,
             config=config,
@@ -2457,17 +2522,23 @@ def publish_issue_created_continuity_authorization(
         )
         if current_event != event or current_tuple != live_tuple:
             raise AgentLoopError(
-                "Managed-CI head continuity observed a changed live PR tuple or active "
-                "managed-label event; no continuity record was written."
+                _with_reason(
+                    "Managed-CI head continuity observed a changed live PR tuple or active "
+                    "managed-label event; no continuity record was written.",
+                    event_reason,
+                )
             )
-        current_round_comments = _api_list(
+        current_round_comments, list_reason = _api_list_detailed(
             runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
         )
         if current_round_comments is None or not _continuity_round_metadata_is_valid(
             current_round_comments, authorization=authorization
         ):
             raise AgentLoopError(
-                "Managed-CI head continuity requires authenticated, correlated round metadata."
+                _with_reason(
+                    "Managed-CI head continuity requires authenticated, correlated round metadata.",
+                    list_reason,
+                )
             )
         current_records = _authorization_comment_records(
             runner,
@@ -2542,14 +2613,17 @@ def publish_issue_created_continuity_authorization(
             f"{len(superseded_comment_ids)} earlier unbound actor-owned authorization "
             f"record(s) ({', '.join(str(value) for value in superseded_comment_ids)})",
         )
-    round_comments = _api_list(
+    round_comments, list_reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
     )
     if round_comments is None or not _continuity_round_metadata_is_valid(
         round_comments, authorization=authorization
     ):
         raise AgentLoopError(
-            "Managed-CI head continuity requires authenticated, correlated round metadata."
+            _with_reason(
+                "Managed-CI head continuity requires authenticated, correlated round metadata.",
+                list_reason,
+            )
         )
     revalidate_before_publication(authorization)
     for comment_id, record in records:
@@ -2666,6 +2740,7 @@ def _timeline_source_repository(source_issue: dict[str, object]) -> str | None:
     return f"{owner}/{name}"
 
 
+@_surfaces_list_failures
 def authorize_fresh_issue_created_resume(
     runner: Runner,
     *,
@@ -2753,7 +2828,10 @@ def authorize_fresh_issue_created_resume(
     )
     if not label_events:
         raise AgentLoopError(
-            "Managed-CI fresh authorization requires an actor-owned managed-label event."
+            _with_reason(
+                "Managed-CI fresh authorization requires an actor-owned managed-label event.",
+                _last_list_failure() if label_events is None else "",
+            )
         )
     label_event = label_events[-1]
     valid_label_event_ids = {event_id for event_id, _login, _actor_id in label_events}
@@ -2907,7 +2985,7 @@ def authorize_fresh_issue_created_resume(
             approved_plan_hash=record.approved_plan_hash,
             retired_plan_hashes=retired,
         )
-    issue_timeline = _api_list(
+    issue_timeline, timeline_reason = _api_list_detailed(
         runner,
         config,
         f"repos/{config.repo}/issues/{issue_number}/timeline?per_page=100",
@@ -2933,8 +3011,11 @@ def authorize_fresh_issue_created_resume(
                 break
     if not associated:
         raise AgentLoopError(
-            "Managed-CI fresh authorization requires a server-observed issue-to-PR "
-            "association for the explicit issue scope."
+            _with_reason(
+                "Managed-CI fresh authorization requires a server-observed issue-to-PR "
+                "association for the explicit issue scope.",
+                timeline_reason,
+            )
         )
     if incompatible_records and not supersede:
         raise AgentLoopError(
@@ -3047,6 +3128,7 @@ def authorize_fresh_issue_created_resume(
     )
 
 
+@_surfaces_list_failures
 def revalidate_issue_created_handoff(
     runner: Runner,
     *,
@@ -3123,7 +3205,10 @@ def revalidate_issue_created_handoff(
             event_id for event_id, _login, _actor_id in history
         }:
             raise AgentLoopError(
-                "Managed-CI direct-resume label provenance changed before activation."
+                _with_reason(
+                    "Managed-CI direct-resume label provenance changed before activation.",
+                    _last_list_failure() if history is None else "",
+                )
             )
         validated = replace(validated, active_label_event_id=handoff.active_label_event_id)
     elif handoff.active_label_event_id is not None:
@@ -3134,7 +3219,12 @@ def revalidate_issue_created_handoff(
             or event[1].casefold() != handoff.trusted_actor_login.casefold()
             or event[2] != handoff.trusted_actor_id
         ):
-            raise AgentLoopError("Managed-CI direct-resume label provenance changed before activation.")
+            raise AgentLoopError(
+                _with_reason(
+                    "Managed-CI direct-resume label provenance changed before activation.",
+                    _last_list_failure(),
+                )
+            )
         validated = replace(validated, active_label_event_id=handoff.active_label_event_id)
     # `_issue_created_tuple` deliberately returns the nonce authenticated by
     # the PR-opening body.  That nonce is only the body-validation binding;
@@ -3152,6 +3242,7 @@ def revalidate_issue_created_handoff(
     )
 
 
+@_surfaces_list_failures
 def recover_issue_created_handoff(
     runner: Runner,
     *,
@@ -3246,7 +3337,10 @@ def recover_issue_created_handoff(
             or event[2] != handoff.trusted_actor_id
         ):
             raise AgentLoopError(
-                "Managed-CI issue-created resume requires an actor-owned active managed-label event."
+                _with_reason(
+                    "Managed-CI issue-created resume requires an actor-owned active managed-label event.",
+                    _last_list_failure(),
+                )
             )
         handoff = replace(handoff, active_label_event_id=event[0])
     if record is not None and config.effective_managed_ci:
@@ -3313,12 +3407,20 @@ def _recover_issue_created_protection(
         actor_login=handoff.trusted_actor_login, actor_id=handoff.trusted_actor_id,
     )
     if valid_label_event_ids is None:
-        raise refuse("the managed-label event history could not be inspected", remedy=retry)
-    comments = _api_list(
+        raise refuse(
+            _with_reason(
+                "the managed-label event history could not be inspected", _last_list_failure()
+            ),
+            remedy=retry,
+        )
+    comments, reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
     if comments is None:
-        raise refuse("the authorization comments could not be inspected", remedy=retry)
+        raise refuse(
+            _with_reason("the authorization comments could not be inspected", reason),
+            remedy=retry,
+        )
     records: list[tuple[Mapping[str, object], ManagedCiIssueAuthorization]] = []
     for comment in comments:
         body = _normalized_comment_body(comment, config=config)
@@ -4520,6 +4622,7 @@ def _restore_ordinary_ci_after_v2_fallback(
         )
 
 
+@_surfaces_list_failures
 def _release_for_ordinary_recovery(
     runner: Runner,
     *,
@@ -4774,11 +4877,11 @@ def verify_managed_pr_plan_binding(
     retired = frozenset(retired_plan_hashes)
     if approved_plan_hash in retired:
         retired = frozenset()
-    comments = _api_list(
+    comments, reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
     if comments is None:
-        raise fail("the PR authorization comments could not be inspected")
+        raise fail(_with_reason("the PR authorization comments could not be inspected", reason))
     records: list[tuple[int, ManagedCiIssueAuthorization]] = []
     for comment in comments:
         body = _normalized_comment_body(comment, config=config)
@@ -5324,6 +5427,7 @@ def _find_resume_audit(
     return sorted(candidates, key=lambda item: item[0])[-1]
 
 
+@_surfaces_list_failures
 def _activate_v2_managed_ci(
     runner: Runner,
     *,
@@ -5651,7 +5755,10 @@ def _activate_v2_managed_ci(
                 actor_id=actor_id,
             )
             if historical_label_events is None:
-                reason = "the actor-owned managed-label history is temporarily unreadable"
+                reason = _with_reason(
+                    "the actor-owned managed-label history is temporarily unreadable",
+                    _last_list_failure(),
+                )
             elif not historical_label_events:
                 reason = "no actor-owned historical managed-label event authenticates strict re-entry"
             else:
@@ -6016,25 +6123,54 @@ def _activate_v2_managed_ci(
         )
 
 
-def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[dict[str, object]] | None:
-    """Fetch a paginated GitHub list, returning None for an uninspectable response."""
-    result = runner.run(
-        [config.gh_cmd, "api", "--paginate", endpoint], cwd=github_api_cwd(), check=False
+def _api_list_detailed(
+    runner: Runner, config: AgentLoopConfig, endpoint: str
+) -> tuple[list[dict[str, object]] | None, str]:
+    payload, reason = _api_list_detailed_inner(runner, config, endpoint)
+    _LIST_FAILURE.reason = reason if payload is None else ""
+    if payload is None and reason:
+        failures = getattr(_LIST_FAILURE, "failures", None)
+        if failures is not None and reason not in failures:
+            failures.append(reason)
+    return payload, reason
+
+
+def _api_list_detailed_inner(
+    runner: Runner, config: AgentLoopConfig, endpoint: str
+) -> tuple[list[dict[str, object]] | None, str]:
+    """Fetch a paginated GitHub list; on failure return ``(None, reason)``.
+
+    ``reason`` carries the final stderr and retry attempt history so raising
+    callers can include it while keeping their fail-closed behavior.
+    """
+    result = run_gh_read(
+        runner, [config.gh_cmd, "api", "--paginate", endpoint], cwd=github_api_cwd(), check=False
     )
     if result.returncode != 0:
-        return None
+        reason = describe_gh_failure(result)
+        log(config, f"GitHub list read of {endpoint} failed: {reason}")
+        return None, reason
     try:
         payload = json.loads(result.stdout or "[]")
     except json.JSONDecodeError:
-        return None
+        return None, f"{endpoint} returned malformed JSON"
     if not isinstance(payload, list):
-        return None
+        return None, f"{endpoint} returned a non-list payload"
     # GitHub CLI 2.45 emits one flat array for paginated array endpoints.
     # Never silently discard malformed entries: doing so could turn an
     # incomplete timeline into an apparently complete ownership record.
     if not all(isinstance(item, dict) for item in payload):
-        return None
-    return payload
+        return None, f"{endpoint} returned malformed entries"
+    return payload, ""
+
+
+def _with_reason(message: str, reason: str) -> str:
+    return f"{message}\n{reason}" if reason else message
+
+
+def _api_list(runner: Runner, config: AgentLoopConfig, endpoint: str) -> list[dict[str, object]] | None:
+    """Fetch a paginated GitHub list, returning None for an uninspectable response."""
+    return _api_list_detailed(runner, config, endpoint)[0]
 
 
 def _normalized_comment_body(
@@ -6271,6 +6407,7 @@ def revalidate_adopted_managed_ci(
     return True
 
 
+@_surfaces_list_failures
 def release_adopted_managed_ci(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, contract: ManagedCiContract,
     force: bool = False,
@@ -6367,6 +6504,7 @@ def _label_event_owned_by_contract(
     )
 
 
+@_surfaces_list_failures
 def _verify_manual_qualification_label_provenance(
     runner: Runner,
     *,
@@ -6456,6 +6594,7 @@ def _attach_cleanup_fragment(original: BaseException, fragment: str) -> None:
         original.add_note(sentence)
 
 
+@_surfaces_list_failures
 def publish_manual_v2_qualification(
     runner: Runner,
     *,
@@ -8237,6 +8376,7 @@ def _v2_failed_jobs(runner: Runner, *, config: AgentLoopConfig, run_id: int | No
     return tuple(details) or (f"Managed CI run {run_id} failed; no failed job was exposed.",)
 
 
+@_surfaces_list_failures
 def prepare_v2_merge(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, expected_head_sha: str, contract: ManagedCiContract
 ) -> None:

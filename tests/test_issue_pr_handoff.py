@@ -491,10 +491,13 @@ def test_single_candidate_recovery_without_reconstructable_scope_gives_safe_reme
     assert runner.pr_commit_calls == 0
 
 
-def test_single_candidate_recovery_distinguishes_commit_query_unavailability(tmp_path):
+def test_single_candidate_recovery_distinguishes_commit_query_unavailability(tmp_path, monkeypatch):
+    # A transient transport failure is retried by the read policy, so the query
+    # is unavailable only once the whole retry budget is exhausted.
+    monkeypatch.setattr("coding_review_agent_loop.github_retry._sleep", lambda _seconds: None)
     runner = FakeRunner(
         open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
-        pr_commit_query_failures=["connection reset"],
+        pr_commit_query_failures=["connection reset"] * 3,
     )
     config = make_config(tmp_path)
 

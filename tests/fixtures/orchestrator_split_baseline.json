@@ -27,6 +27,7 @@
   "followups",
   "gh_rest_shim",
   "github",
+  "github_retry",
   "github_transport",
   "inspect_tool",
   "issue_body_limits",
