@@ -112,19 +112,35 @@ class ReviewRoundSpool:
     def publication_state(self, reviewer_name: str) -> tuple[str, dict[str, object] | None]:
         """Classify a record's publication progress.
 
-        ``absent``: no valid response record.  ``legacy``: a response record
-        written before the carrier protocol.  ``fresh``: protocol record whose
-        carrier was never frozen.  ``carrier``: a frozen carrier (returned).
-        ``malformed``: a carrier field that is not a mapping.
+        ``absent``: no record that belongs to this reviewer and round.
+        ``legacy``: a readable response record written before the carrier
+        protocol.  ``fresh``: a protocol record whose carrier was never frozen.
+        ``carrier``: a frozen carrier (returned).  ``malformed``: a record that
+        has a ``publication`` field of any kind (including ``null``) but is not
+        a readable protocol response record with a mapping carrier.  Carrier
+        presence is detected independently of response readability, so an
+        unreadable response can never hide earlier publication.
         """
         payload = self._read_payload(reviewer_name)
-        if payload is None or self.load(reviewer_name) is None or "response" not in payload:
+        if (
+            payload is None
+            or payload.get("schema_version") != SPOOL_SCHEMA_VERSION
+            or any(payload.get(key) != value for key, value in self._identity().items())
+            or payload.get("reviewer") != reviewer_name
+        ):
             return "absent", None
-        publication = payload.get("publication")
-        if publication is not None:
-            if not isinstance(publication, dict) or payload.get("carrier_protocol") != CARRIER_PROTOCOL:
+        if "publication" in payload:
+            publication = payload.get("publication")
+            if (
+                not isinstance(publication, dict)
+                or payload.get("carrier_protocol") != CARRIER_PROTOCOL
+                or self.load(reviewer_name) is None
+                or "response" not in payload
+            ):
                 return "malformed", None
             return "carrier", publication
+        if self.load(reviewer_name) is None or "response" not in payload:
+            return "absent", None
         if payload.get("carrier_protocol") == CARRIER_PROTOCOL:
             return "fresh", None
         return "legacy", None

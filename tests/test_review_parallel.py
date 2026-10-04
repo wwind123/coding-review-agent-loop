@@ -4535,3 +4535,262 @@ def test_plan_rerun_under_a_different_actor_stops_before_any_post_or_launch(tmp_
     assert runner.reviewer_launches == launches_before
     assert len(runner.issue_comments) == comments_before
     assert len(_frozen_carriers(config)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Frozen multi-body recovery through the real PR workflow (#1258)
+# ---------------------------------------------------------------------------
+
+
+def _prefix_interrupted_pr(tmp_path, *, fail_at_index=3):
+    """Round 1 with a scheduler: Codex's overflowing review exhausts mid-publication.
+
+    Uses the real publication hook (actor and REST surface modelled), so the
+    carrier is frozen with the sidecar prefix already public.
+    """
+    import coding_review_agent_loop.github as github_module
+
+    runner, markers = _overflow_pr_runner((11,))
+    runner.authenticated_actor = ("agent-bot", 7)
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
+        pr_review_policy="selective-intermediate",
+    )
+    real = github_module._post_comment_body
+
+    def flaky(runner_, *, config, command, body, claimed=None, body_index=None):
+        if body_index == fail_at_index:
+            raise KeyboardInterrupt
+        return real(
+            runner_, config=config, command=command, body=body, claimed=claimed,
+            body_index=body_index,
+        )
+
+    with patch.object(github_module, "_post_comment_body", side_effect=flaky):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    carriers = [c for c in _frozen_carriers(config) if len(c["bodies"]) == 3]
+    assert len(carriers) == 1
+    return runner, config, carriers[0]
+
+
+def _body_positions(runner, body):
+    return [i for i, c in enumerate(runner.pr_payload["comments"]) if c["body"] == body]
+
+
+def _public_comment(runner, body, *, actor=("agent-bot", 7)):
+    import datetime as dt
+
+    runner.pr_payload["comments"].append({
+        "author": {"login": actor[0]}, "_rest_author_id": actor[1],
+        "createdAt": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "body": body,
+    })
+
+
+def test_pr_rerun_after_a_sidecar_prefix_completes_the_frozen_suffix_before_the_checkpoint(tmp_path):
+    from coding_review_agent_loop.round_transport import attachment_keys
+
+    runner, config, carrier = _prefix_interrupted_pr(tmp_path)
+    frozen = carrier["bodies"]
+    assert len(_body_positions(runner, frozen[0])) == 1 and len(_body_positions(runner, frozen[1])) == 1
+    assert _body_positions(runner, frozen[2]) == []
+    audits_before = len(_audit_indexes(runner))
+    launches_before = len(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # Hours-old prefix reused, remainder posted verbatim, nothing duplicated.
+    for body in frozen:
+        assert len(_body_positions(runner, body)) == 1
+    anchor_at = _body_positions(runner, frozen[2])[0]
+    new_audits = _audit_indexes(runner)[audits_before:]
+    assert new_audits and anchor_at < new_audits[0]  # before the new checkpoint
+    assert runner.reviewer_launches[launches_before:] == []  # zero reviewer calls
+    # Attachment identities are the frozen ones, not recomposed.
+    posted_keys = [attachment_keys(c["body"]) for c in runner.pr_payload["comments"] if attachment_keys(c["body"])]
+    assert posted_keys == [attachment_keys(frozen[0]), attachment_keys(frozen[1])]
+    assert _spool_files(config) == []
+
+
+def test_pr_gap_in_the_frozen_sequence_refuses_with_zero_posts(tmp_path):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, carrier = _prefix_interrupted_pr(tmp_path)
+    frozen = carrier["bodies"]
+    # Sidecar 1 is deleted (or edited) while sidecar 2 stays public.
+    runner.pr_payload["comments"] = [
+        c for c in runner.pr_payload["comments"] if c["body"] != frozen[0]
+    ]
+    comments_before = len(runner.pr_payload["comments"])
+    launches_before = list(runner.reviewer_launches)
+
+    with pytest.raises(PublicationResumeStop, match="absent while a later body"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert runner.reviewer_launches == launches_before
+    assert len(_frozen_carriers(config)) == 1
+
+
+def test_pr_public_anchor_with_a_surplus_match_or_swapped_response_is_refused(tmp_path):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, carrier = _prefix_interrupted_pr(tmp_path)
+    frozen = carrier["bodies"]
+    _public_comment(runner, frozen[2])  # anchor accepted; spool removal never happened
+    _public_comment(runner, frozen[0])  # surplus identical match for sidecar 1
+    comments_before = len(runner.pr_payload["comments"])
+    with pytest.raises(PublicationResumeStop, match="identical candidates"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert len(_frozen_carriers(config)) == 1
+
+    runner.pr_payload["comments"].pop()  # drop the surplus match
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "publication" in payload:
+            payload["response"]["text"] = payload["response"]["text"] + " tampered"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(PublicationResumeStop):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(runner.pr_payload["comments"]) == comments_before - 1
+    assert len(_frozen_carriers(config)) == 1
+
+
+def test_pr_null_or_unreadable_carrier_stops_before_checkpoint_and_launch(tmp_path):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, _carrier = _prefix_interrupted_pr(tmp_path)
+    comments_before = len(runner.pr_payload["comments"])
+    launches_before = list(runner.reviewer_launches)
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "publication" in payload:
+            payload["publication"] = None
+            path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert runner.reviewer_launches == launches_before
+    assert _spool_files(config)
+
+
+def test_pr_legacy_record_with_a_public_anchor_is_still_refused(tmp_path):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, carrier = _prefix_interrupted_pr(tmp_path)
+    # Age the surviving records into the pre-carrier format; the anchor is public.
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("carrier_protocol", None)
+        payload.pop("publication", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    _public_comment(runner, carrier["bodies"][2], actor=("old-bot", 99))
+    comments_before = len(runner.pr_payload["comments"])
+    launches_before = list(runner.reviewer_launches)
+
+    with pytest.raises(PublicationResumeStop, match="possible earlier publication"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert runner.reviewer_launches == launches_before
+    assert _spool_files(config)
+
+
+def _plan_checkpoint_indexes(runner):
+    indexes = []
+    for index, comment in enumerate(runner.issue_comments):
+        match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        if not match:
+            continue
+        try:
+            metadata = orchestrator._decode_round_metadata(match["payload"])
+        except AgentLoopError:
+            continue
+        if metadata.role == "summary" and metadata.phase == "scheduler-prelaunch":
+            indexes.append(index)
+    return indexes
+
+
+def _prefix_interrupted_staged_plan(tmp_path, *, fail_at_index=3):
+    """Staged planning: the primary's overflowing plan review exhausts mid-publication."""
+    import coding_review_agent_loop.github as github_module
+    from agent_loop_helpers import structured_v1_plan_state
+
+    rnd = _random.Random(23)
+    text = "".join(rnd.choice(_string.ascii_letters + " ") for _ in range(45_000))
+    runner = _PartialPublicationProbeRunner(
+        round_markers=("Codex staged plan approval.",),
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(summary=f"Codex staged plan approval. {text}")],
+        gemini_outputs=[structured_plan_review(reviewer="Google Gemini")],
+    )
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = _staged_parallel_config(tmp_path)
+    real = github_module._post_comment_body
+
+    def flaky(runner_, *, config, command, body, claimed=None, body_index=None):
+        if body_index == fail_at_index:
+            raise KeyboardInterrupt
+        return real(
+            runner_, config=config, command=command, body=body, claimed=claimed,
+            body_index=body_index,
+        )
+
+    with patch.object(github_module, "_post_comment_body", side_effect=flaky):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    carriers = [c for c in _frozen_carriers(config) if len(c["bodies"]) == 3]
+    assert len(carriers) == 1
+    return runner, config, carriers[0]
+
+
+def _issue_positions(runner, body):
+    return [i for i, c in enumerate(runner.issue_comments) if c["body"] == body]
+
+
+def test_staged_plan_rerun_after_a_sidecar_prefix_completes_before_the_checkpoint(tmp_path):
+    runner, config, carrier = _prefix_interrupted_staged_plan(tmp_path)
+    frozen = carrier["bodies"]
+    assert _issue_positions(runner, frozen[2]) == []
+    checkpoints_before = len(_plan_checkpoint_indexes(runner))
+    launches_before = len(runner.reviewer_launches)
+
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except AgentLoopError:
+        pass  # later staged rounds may have no further scripted output
+
+    for body in frozen:
+        assert len(_issue_positions(runner, body)) == 1
+    new_checkpoints = _plan_checkpoint_indexes(runner)[checkpoints_before:]
+    assert new_checkpoints and _issue_positions(runner, frozen[2])[0] < new_checkpoints[0]
+    # The primary is never re-invoked for the spooled round.
+    assert runner.reviewer_launches[launches_before:].count("codex") == 0
+
+
+def test_staged_plan_gap_and_null_carrier_refuse_with_zero_posts(tmp_path):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, carrier = _prefix_interrupted_staged_plan(tmp_path)
+    frozen = carrier["bodies"]
+    runner.issue_comments = [c for c in runner.issue_comments if c["body"] != frozen[0]]
+    comments_before = len(runner.issue_comments)
+    launches_before = list(runner.reviewer_launches)
+    with pytest.raises(PublicationResumeStop, match="absent while a later body"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert len(runner.issue_comments) == comments_before
+    assert runner.reviewer_launches == launches_before
+
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "publication" in payload:
+            payload["publication"] = None
+            path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert len(runner.issue_comments) == comments_before
+    assert runner.reviewer_launches == launches_before
+    assert _spool_files(config)

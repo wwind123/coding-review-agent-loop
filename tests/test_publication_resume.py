@@ -393,3 +393,140 @@ def test_launcher_never_invokes_a_reviewer_whose_frozen_carrier_no_longer_valida
             spool=spool, replay_turn=lambda reviewer, fields: None,
         )
     assert invoked == [] and spool.record_exists(REVIEWER)
+
+
+# ---------------------------------------------------------------------------
+# Preflight over every spool record (round 2 of the #1261 review)
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop import review_rounds
+
+
+def _two_reviewer_spool(tmp_path):
+    spool = ReviewRoundSpool(
+        root=tmp_path / "spool2", repo="OWNER/REPO", surface="pr", number=7,
+        round_number=1, subject=SUBJECT,
+    )
+    for name in ("Codex", "Gemini"):
+        spool.store(name, FIELDS)
+    return spool
+
+
+def _publication_for(fake, tmp_path, spool, *, contexts):
+    def build(name):
+        return round_publication(
+            fake, config=make_config(tmp_path), spool=spool, reviewer_name=name,
+            flow="pr", round_number=1, subject=SUBJECT, surface_kind="pr", number=7,
+            validation_context=contexts.get(name, CONTEXT),
+        )
+
+    return build
+
+
+def _freeze_with_prefix(fake, tmp_path, spool, name, *, bodies, post_count):
+    """Freeze ``name``'s carrier and post only the first ``post_count`` bodies."""
+    import datetime as dt
+
+    from coding_review_agent_loop.github import read_complete_comment_listing
+
+    del dt, read_complete_comment_listing
+    hook = round_publication(
+        fake, config=make_config(tmp_path), spool=spool, reviewer_name=name, flow="pr",
+        round_number=1, subject=SUBJECT, surface_kind="pr", number=7, validation_context=CONTEXT,
+    )
+    hook.prepare([_Prepared(body) for body in bodies])
+    for body in bodies[:post_count]:
+        fake.add(body)
+
+
+def _anchor_for(name):
+    metadata = PostedRoundMetadata(
+        flow="pr", role="reviewer", agent=name, round_number=1, subject=SUBJECT, phase="publication",
+    )
+    return str(_attach_round_metadata(f"{name} review", metadata))
+
+
+def _preflight(fake, tmp_path, spool, *, defer=False, contexts=None, published=()):
+    posted = []
+    review_rounds._preflight_spooled_publications(
+        fake, config=make_config(tmp_path), spool=spool,
+        reviewers=["codex", "gemini"],
+        validators_for=lambda name: {},
+        publication_for=_publication_for(fake, tmp_path, spool, contexts=contexts or {}),
+        published_names=published,
+        post_frozen=lambda plan: posted.append(plan),
+        defer_posting=defer,
+    )
+    return posted
+
+
+@pytest.fixture
+def replayable(monkeypatch):
+    monkeypatch.setattr(review_rounds, "_replay_spooled_review", lambda *a, **k: object())
+
+
+def test_preflight_posts_nothing_when_a_later_record_refuses(tmp_path, replayable):
+    spool = _two_reviewer_spool(tmp_path)
+    fake = FakeGitHub()
+    _freeze_with_prefix(fake, tmp_path, spool, "Codex", bodies=["c-side", _anchor_for("Codex")], post_count=1)
+    _freeze_with_prefix(fake, tmp_path, spool, "Gemini", bodies=[_anchor_for("Gemini")], post_count=0)
+    comments_before = len(fake.comments)
+    contexts = {"Gemini": context_digest(head="moved", surfaced=[])}
+    with pytest.raises(PublicationResumeStop, match="validation context"):
+        _preflight(fake, tmp_path, spool, contexts=contexts)
+    assert len(fake.comments) == comments_before and fake.writes == []
+    # With both valid, the verified suffix of every record is handed to the poster.
+    posted = _preflight(fake, tmp_path, spool)
+    assert [len(plan.bodies) - len(plan.already_public) for plan in posted] == [1, 1]
+
+
+def test_preflight_refuses_a_partly_public_carrier_beside_a_fresh_reviewer(tmp_path, replayable):
+    spool = _two_reviewer_spool(tmp_path)
+    fake = FakeGitHub()
+    _freeze_with_prefix(fake, tmp_path, spool, "Codex", bodies=["c-side", _anchor_for("Codex")], post_count=1)
+    spool.remove("Gemini")
+    writes = len(fake.writes)
+    with pytest.raises(PublicationResumeStop, match="partly public"):
+        _preflight(fake, tmp_path, spool, defer=True)
+    assert len(fake.writes) == writes
+    # No public prefix: a deferral alone is fine (the suffix waits for settlement).
+    clean = _two_reviewer_spool(tmp_path / "clean")
+    clean_fake = FakeGitHub()
+    _freeze_with_prefix(clean_fake, tmp_path, clean, "Codex", bodies=["c-side", _anchor_for("Codex")], post_count=0)
+    assert _preflight(clean_fake, tmp_path, clean, defer=True) == []
+
+
+@pytest.mark.parametrize("damage", ["null_carrier", "unreadable_response"])
+def test_malformed_or_null_carrier_stops_before_anything(tmp_path, replayable, damage):
+    spool = _two_reviewer_spool(tmp_path)
+    fake = FakeGitHub()
+    _freeze_with_prefix(fake, tmp_path, spool, "Codex", bodies=["c-side", _anchor_for("Codex")], post_count=1)
+    path = spool._path("Codex")
+    payload = json.loads(path.read_text())
+    if damage == "null_carrier":
+        payload["publication"] = None
+    else:
+        payload["response"] = {"text": 5}
+    path.write_text(json.dumps(payload))
+    assert spool.publication_state("Codex")[0] == "malformed"
+    with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
+        _preflight(fake, tmp_path, spool, defer=True)
+    assert fake.writes == [] and path.exists()
+
+
+def test_legacy_record_is_checked_even_when_its_anchor_is_already_public(tmp_path, replayable):
+    spool = _two_reviewer_spool(tmp_path)
+    for name in ("Codex", "Gemini"):
+        path = spool._path(name)
+        payload = json.loads(path.read_text())
+        payload.pop("carrier_protocol")
+        path.write_text(json.dumps(payload))
+    fake = FakeGitHub(actor=OTHER_ACTOR)
+    fake.add(_anchor_for("Codex"), author=ACTOR)  # the old invocation's public anchor
+    with pytest.raises(PublicationResumeStop, match="possible earlier publication"):
+        _preflight(fake, tmp_path, spool, published=("Codex",))
+    blind = FakeGitHub()
+    blind.list_failure_page = 1
+    with pytest.raises(PublicationResumeStop, match="could not be read completely"):
+        _preflight(blind, tmp_path, spool, published=("Codex",))
+    assert spool.record_exists("Codex") and spool.record_exists("Gemini")

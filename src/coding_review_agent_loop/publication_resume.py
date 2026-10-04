@@ -283,16 +283,17 @@ class RoundPublication:
         """Run every stop condition for an existing record without posting.
 
         Returns the resume plan of a frozen carrier, or ``None`` for a record
-        with nothing to resume.  A legacy record whose reviewer is already
-        public is not re-checked (its own anchor would look like prior
-        publication); its carrier-less record is simply discarded later.
+        with nothing to resume.  A legacy record is checked across every author
+        even when its reviewer's anchor is already public: there is no
+        already-public exception, so the migration check can never be skipped
+        by reusing the anchor and discarding the record.
         """
+        del published  # no exception for an already-public anchor
         state, raw = self.spool.publication_state(self.reviewer_name)
         if state == "malformed":
-            raise self._stop("its frozen publication carrier is malformed.")
+            raise self._stop("its frozen publication carrier is malformed or unreadable.")
         if state == "legacy":
-            if not published:
-                self._check_legacy()
+            self._check_legacy()
             return None
         if state == "carrier":
             assert raw is not None

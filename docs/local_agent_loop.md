@@ -5921,10 +5921,14 @@ re-invokes the reviewer:
 
 - Every existing record is checked first, before a new scheduler checkpoint and
   before any reviewer launches, including a reviewer whose anchor is already
-  public (its carrier is never discarded unchecked). The verified missing suffix
-  is posted at that point unless some reviewer still needs a fresh turn, in which
-  case posting waits for the round to settle so no fresh reviewer reads a newly
-  public peer body.
+  public (its carrier is never discarded unchecked, and a legacy record is
+  migration-checked even when its anchor is public). Every record is gated and
+  classified first; only when all pass is any verified missing suffix posted. A
+  `publication` field that is null, not a mapping, or beside an unreadable
+  response is malformed and stops the run. If some reviewer still needs a fresh
+  turn, posting waits for the round to settle, and a carrier that is already
+  partly public (sidecars without an anchor) stops the run instead, because the
+  fresh reviewer would read those attachments.
 - Publication does not begin without a usable carrier: if the authenticated actor
   or a complete pre-publication baseline listing is unavailable, the run stops
   before the first post with the validated response still spooled.

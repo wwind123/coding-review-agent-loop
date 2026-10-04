@@ -674,6 +674,9 @@ def _preflight_spooled_publications(
     turn, which must not run beside a newly public peer body (#1025).
     """
     published = set(published_names)
+    plans: list[tuple[str, object]] = []
+    # Phase 1: gate and classify EVERY record.  Nothing is posted until all pass,
+    # so a later refusing record can never follow an earlier record's posts.
     for reviewer in reviewers:
         name = agent_display_name(reviewer)
         state, _raw = spool.publication_state(name)
@@ -697,9 +700,27 @@ def _preflight_spooled_publications(
                     "partial-round recovery list (#1142)."
                 )
         plan = publication_for(name).gate(published=name in published)  # type: ignore[attr-defined]
-        if plan is None or post_frozen is None or defer_posting:
-            continue
-        if len(plan.already_public) < len(plan.bodies):
+        if plan is not None:
+            plans.append((name, plan))
+    partial = [
+        name for name, plan in plans
+        if 0 < len(plan.already_public) < len(plan.bodies)  # type: ignore[attr-defined]
+    ]
+    if defer_posting and partial:
+        # Public sidecars carry no round metadata, so the peer-visibility guard
+        # cannot see them; a fresh turn now would read them.
+        raise PublicationResumeStop(
+            f"{', '.join(partial)}'s frozen publication is partly public (sidecars without "
+            "an anchor) while another reviewer still needs a fresh turn, which would read "
+            "those attachments. The spool record was kept, nothing was posted, and no "
+            "reviewer was launched; repair the round with the partial-round recovery list "
+            "(#1142)."
+        )
+    if defer_posting or post_frozen is None:
+        return
+    # Phase 2: every gate passed, so publish the verified suffixes.
+    for _name, plan in plans:
+        if len(plan.already_public) < len(plan.bodies):  # type: ignore[attr-defined]
             post_frozen(plan)
 
 
