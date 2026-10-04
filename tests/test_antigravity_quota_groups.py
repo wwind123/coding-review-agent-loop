@@ -364,6 +364,7 @@ def test_multiple_overrides_and_out_of_chain_repair_model(tmp_path, monkeypatch)
         captured.append(cfg)
         return real_run(self, runner, cfg, *args, **kwargs)
 
+    monkeypatch.setattr(agy, "_run_memories", {})
     memories_before = dict(agy._run_memories)
     with patch.object(agy.AntigravityBackend, "run", spy):
         execute_repair(
