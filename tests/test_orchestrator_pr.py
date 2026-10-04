@@ -17847,3 +17847,38 @@ def test_a_rerun_after_a_sibling_stop_does_not_repeat_the_stop_for_the_old_sibli
     assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
     assert len(_sb_coder_prompts(runner)) == 5  # three before the stop, two after the push
     assert all("STEP-BACK TURN" not in p for p in _sb_coder_prompts(runner)[3:])
+
+
+def _external_push_after_the_kth_review(tmp_path, hunks):
+    """Interrupt between the K-th clustered review and its coder dispatch, then push."""
+    pushed = f"{9:040x}"
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders()[:2],
+        codex_outputs=_three_clustered_blocks(),
+        hunks=hunks,
+        shift_head=pushed,
+    )
+    config = _sb_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    runner._move_head(pushed, cwd=None)  # an operator's refactor lands first
+    runner.pr_payload["headRefOid"] = pushed
+    runner.claude_outputs.append(structured_coder_followup(addressed_items=["item-3"]))
+    runner.codex_outputs.append(_sb_review(resolved=["item-3"]))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    return runner
+
+
+def test_an_external_push_that_deletes_the_cluster_suppresses_the_stale_step_back(tmp_path):
+    runner = _external_push_after_the_kth_review(tmp_path, "@@ -100,60 +99,0 @@\n")
+    prompts = _sb_coder_prompts(runner)
+    # The first (interrupted) dispatch was a step-back on the then-current head; the
+    # resumed one, on the pushed head, is ordinary because the code is now unmappable.
+    assert "STEP-BACK TURN" in prompts[2]
+    assert "STEP-BACK TURN" not in prompts[-1]
+    assert all("Enumerate ALL remaining" not in p for p in _sb_codex_prompts(runner)[3:])
+
+
+def test_an_external_push_that_shifts_the_cluster_maps_the_step_back_to_the_pushed_head(tmp_path):
+    runner = _external_push_after_the_kth_review(tmp_path, "@@ -10,0 +11,100 @@\n")
+    assert "src/spool.py` lines 224-240" in _sb_coder_prompts(runner)[-1]

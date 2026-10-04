@@ -3272,7 +3272,8 @@ def _pr_step_back_decision(
         if episode.entry is not None:
             continue
         trigger = _step_back.find_pr_cluster_trigger(
-            fresh, reviewer, k=k, window=window, current_round=round_number, mapper=mapper
+            fresh, reviewer, k=k, window=window, current_round=round_number, mapper=mapper,
+            current_head=head_sha,
         )
         if trigger is not None and not _is_followup_dispatch_head(trigger.trigger_head):
             log(

@@ -1027,7 +1027,12 @@ def _location_is_member(
             location, path=moved.path, start=moved.start, end=moved.end
         )
         return in_cluster(location, mapping, window)
-    return location.path in {mapping.original_path, mapping.path}
+    # The path-wide fallback belongs to an UNMAPPABLE anchor only.  A mappable anchor
+    # requires the mapped window, so a location that cannot be placed (moved or
+    # deleted code, a failed diff) is not declared a member by path alone.
+    return (
+        not mapping.mappable and location.path in {mapping.original_path, mapping.path}
+    )
 
 
 @dataclass(frozen=True)
@@ -1135,6 +1140,7 @@ def find_pr_cluster_trigger(
     window: int,
     current_round: int,
     mapper: AnchorMapper,
+    current_head: str | None = None,
 ) -> PrClusterTrigger | None:
     """The reviewer's cluster after K consecutive new-finding blocks, if any.
 
@@ -1163,7 +1169,9 @@ def find_pr_cluster_trigger(
         for earlier, later in zip(tail, tail[1:])
     ):
         return None
-    head = tail[-1].head
+    # Locations are mapped to the head being dispatched, which an operator may have
+    # pushed past the newest review; unmappable ones never contribute.
+    head = current_head or tail[-1].head
     per_review: list[list[MappedLocation]] = []
     for review in tail:
         mapped: list[MappedLocation] = []

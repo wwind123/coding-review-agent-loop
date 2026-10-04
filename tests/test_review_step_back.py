@@ -1346,3 +1346,74 @@ def test_a_sibling_reviewed_on_a_head_the_code_has_moved_past_does_not_escalate_
         current_round=4, current_head=HEAD_C,
     )
     assert pushed.entry is not None and not pushed.siblings
+
+
+# --- review round 6 fixes (#1265) -------------------------------------------
+
+
+def test_trigger_locations_are_mapped_to_the_dispatch_head_not_the_newest_reviews_head():
+    records = _trigger_records(["src/a.py:124", "src/a.py:130", "src/a.py:136"], heads=[HEAD_A] * 3)
+
+    def deleted_since(from_head, to_head, path, start, end):
+        if to_head == HEAD_B:
+            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "deleted")
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    # Reviewed on HEAD_A, dispatched on HEAD_B where the code is gone: no trigger.
+    assert sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=deleted_since,
+        current_head=HEAD_B,
+    ) is None
+    assert sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=deleted_since,
+    ) is not None  # without the dispatch head the stale review head was used
+
+    def shifted(from_head, to_head, path, start, end):
+        if to_head == HEAD_B:
+            return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start + 100, end + 100)
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    trigger = sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=shifted,
+        current_head=HEAD_B,
+    )
+    assert trigger.trigger_head == HEAD_B
+    assert (trigger.cluster.start, trigger.cluster.end) == (224, 236)
+
+
+def test_a_moved_distant_carried_item_does_not_keep_a_mappable_anchors_episode_open():
+    near = _pr_item("item-3", "gap src/spool.py:130", round_number=3)
+    far = _pr_item("item-6", "elsewhere src/spool.py:900", round_number=3)
+
+    def mapper(from_head, to_head, path, start, end):
+        if start >= 900:  # that code moved away: it cannot be placed on the new head
+            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "moved")
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    sweep = _pr_review(
+        60, 4, HEAD_B, prior=[near, far],
+        dispositions=[
+            ReviewItemDisposition("item-3", PR_REVIEWER, "resolved"),
+            ReviewItemDisposition("item-6", PR_REVIEWER, "blocking"),
+        ],
+    )
+    later = _pr_review(
+        70, 5, HEAD_B, new=[_pr_item("item-9", "ordinary src/spool.py:135", round_number=5)],
+        prior=[far], dispositions=[ReviewItemDisposition("item-6", PR_REVIEWER, "blocking")],
+    )
+    # Round 3's review (on HEAD_A) is the carried items' source head.
+    source = _pr_review(40, 3, HEAD_A, new=[near, far])
+    records = [source, _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A)]), sweep, later]
+    # The only in-window item was resolved, so the episode closed at the sweep; the
+    # later in-window finding is ordinary.  Replaying the same records (a resume) agrees.
+    for _ in range(2):
+        result = sb.derive_pr_episode(
+            records, PR_REVIEWER, window=40, mapper=mapper, current_round=5, current_head=HEAD_B
+        )
+        assert result.entry is None and not result.siblings
+    # An unmappable ANCHOR still uses the same-path fallback for a carried item.
+    lost = lambda *a: sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, a[2], a[2], a[3], a[4], "moved")
+    kept = sb.derive_pr_episode(
+        records[:3], PR_REVIEWER, window=40, mapper=lost, current_round=4, current_head=HEAD_B
+    )
+    assert kept.entry is not None
