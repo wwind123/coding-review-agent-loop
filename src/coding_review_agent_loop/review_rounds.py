@@ -658,7 +658,7 @@ def _preflight_spooled_publications(
     publication_for: Callable[[str], object],
     published_names: Sequence[str] = (),
     post_frozen: Callable[[object], object] | None = None,
-    defer_posting: bool = False,
+    selected_reviewers: Sequence[AgentName] | None = None,
 ) -> None:
     """Check every existing spool record before any checkpoint or reviewer launch (#1258).
 
@@ -670,8 +670,11 @@ def _preflight_spooled_publications(
     checked, so a rerun can never discard a carrier unchecked.
 
     The missing suffix of a verified carrier is posted here (before a new
-    checkpoint) unless ``defer_posting`` -- some reviewer still needs a fresh
-    turn, which must not run beside a newly public peer body (#1025).
+    checkpoint) unless some selected reviewer still needs a fresh turn, which
+    must not run beside a newly public peer body (#1025).  Fresh-turn necessity
+    is decided here from *validated replayability*: a selected reviewer that is
+    not already public needs a fresh turn unless its spooled outcome is a
+    settled failure or its spooled response still validates in this context.
     """
     published = set(published_names)
     plans: list[tuple[str, object]] = []
@@ -702,6 +705,21 @@ def _preflight_spooled_publications(
         plan = publication_for(name).gate(published=name in published)  # type: ignore[attr-defined]
         if plan is not None:
             plans.append((name, plan))
+    defer_posting = False
+    for reviewer in selected_reviewers if selected_reviewers is not None else reviewers:
+        name = agent_display_name(reviewer)
+        if name in published:
+            continue
+        outcome = spool.load(name)
+        if outcome is None:
+            defer_posting = True
+        elif "failure" not in outcome and _replay_spooled_review(
+            runner, config=config, reviewer=reviewer, fields=outcome,
+            validators=validators_for(name),
+        ) is None:
+            defer_posting = True
+        if defer_posting:
+            break
     partial = [
         name for name, plan in plans
         if 0 < len(plan.already_public) < len(plan.bodies)  # type: ignore[attr-defined]

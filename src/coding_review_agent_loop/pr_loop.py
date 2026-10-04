@@ -2972,12 +2972,6 @@ def run_pr_loop(
                     agent_display_name(reviewer) for reviewer in configured_reviewers
                     if resumed_by_name.get(agent_display_name(reviewer)) is not None
                 ]
-                fresh_turn_needed = any(
-                    agent_display_name(reviewer) in selected_names
-                    and agent_display_name(reviewer) not in published
-                    and pr_round_spool.load(agent_display_name(reviewer)) is None
-                    for reviewer in configured_reviewers
-                )
                 _preflight_spooled_publications(
                     runner, config=config, spool=pr_round_spool, reviewers=configured_reviewers,
                     validators_for=_pr_review_validators, publication_for=_pr_publication,
@@ -2985,7 +2979,10 @@ def run_pr_loop(
                     post_frozen=lambda plan: post_frozen_round_bodies(
                         runner, config=config, surface_kind="pr", number=pr_number, plan=plan
                     ),
-                    defer_posting=fresh_turn_needed,
+                    selected_reviewers=[
+                        reviewer for reviewer in configured_reviewers
+                        if agent_display_name(reviewer) in selected_names
+                    ],
                 )
 
             scheduler_metadata_recovery_full_board = False

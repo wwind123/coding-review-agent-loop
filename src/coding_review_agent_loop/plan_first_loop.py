@@ -1655,11 +1655,6 @@ def _run_plan_first_loop(
                 record.metadata.agent
                 for record in (current_resume.completed_reviews if current_resume is not None else ())
             ]
-            fresh_turn_needed = any(
-                agent_display_name(reviewer) not in published
-                and plan_round_spool.load(agent_display_name(reviewer)) is None
-                for reviewer in round_reviewers
-            )
             _preflight_spooled_publications(
                 runner, config=config, spool=plan_round_spool, reviewers=configured_reviewers,
                 validators_for=_plan_review_validators, publication_for=_plan_publication,
@@ -1667,7 +1662,7 @@ def _run_plan_first_loop(
                 post_frozen=lambda plan: post_frozen_round_bodies(
                     runner, config=config, surface_kind="issue", number=issue_number, plan=plan
                 ),
-                defer_posting=fresh_turn_needed,
+                selected_reviewers=round_reviewers,
             )
 
         round_reviewers = tuple(configured_reviewers)

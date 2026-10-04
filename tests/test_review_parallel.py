@@ -2495,6 +2495,7 @@ def test_plan_partial_round_refusal_lists_posted_review(tmp_path):
 
 # --- #1142 review: recovery-list unit coverage (boundaries, authors, attachments) ---
 
+
 import random as _random
 import string as _string
 
@@ -4758,10 +4759,9 @@ def test_staged_plan_rerun_after_a_sidecar_prefix_completes_before_the_checkpoin
     checkpoints_before = len(_plan_checkpoint_indexes(runner))
     launches_before = len(runner.reviewer_launches)
 
-    try:
-        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    except AgentLoopError:
-        pass  # later staged rounds may have no further scripted output
+    rc = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert rc == 0
+    assert _spool_files(config) == []  # removed after the frozen anchor was confirmed
 
     for body in frozen:
         assert len(_issue_positions(runner, body)) == 1
@@ -4794,3 +4794,253 @@ def test_staged_plan_gap_and_null_carrier_refuse_with_zero_posts(tmp_path):
     assert len(runner.issue_comments) == comments_before
     assert runner.reviewer_launches == launches_before
     assert _spool_files(config)
+
+
+# ---------------------------------------------------------------------------
+# Real transient exhaustion, aged state, drift and peer visibility (#1258)
+# ---------------------------------------------------------------------------
+
+
+def _install_write_outage(runner, *, command_prefix, should_fail):
+    """Make selected comment writes fail with a transient 502 through the real writer."""
+    from pathlib import Path as _P
+
+    real_run = runner.run
+    state = {"active": True, "failed": 0}
+
+    def run(args, **kwargs):
+        cmd = [str(arg) for arg in args]
+        if state["active"] and cmd[:3] == command_prefix and "--body-file" in cmd:
+            body = _P(cmd[cmd.index("--body-file") + 1]).read_text(encoding="utf-8")
+            if should_fail(body):
+                state["failed"] += 1
+                return CommandResult(cmd, _P("."), "", "non-200 OK status code: 502 Bad Gateway", 1)
+        return real_run(args, **kwargs)
+
+    runner.run = run
+    return state
+
+
+def _anchor_after_sidecars(counter):
+    from coding_review_agent_loop.round_transport import (
+        ROUND_RESUME_MARKER_RE,
+        is_round_transport_sidecar,
+    )
+
+    def should_fail(body):
+        if is_round_transport_sidecar(body):
+            counter["sidecars"] += 1
+            return False
+        return bool(ROUND_RESUME_MARKER_RE.search(body)) and counter["sidecars"] >= 2
+
+    return should_fail
+
+
+def _age_everything(config, comments, *, hours=6):
+    """Pretend the failed invocation happened hours ago."""
+    import datetime as dt
+
+    then = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    for comment in comments:
+        comment["createdAt"] = then.strftime("%Y-%m-%dT%H:%M:%SZ")
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "publication" in payload:
+            payload["publication"]["prepared_at"] = (then - dt.timedelta(seconds=30)).isoformat()
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _exhausted_pr(tmp_path, monkeypatch, *, policy="selective-intermediate"):
+    from coding_review_agent_loop import github_retry
+    from coding_review_agent_loop.github_retry import GitHubTransientExhaustedError
+
+    monkeypatch.setattr(github_retry, "_sleep", lambda _seconds: None)
+    runner, markers = _overflow_pr_runner((11,))
+    runner.authenticated_actor = ("agent-bot", 7)
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), review_parallel=True, pr_review_policy=policy,
+    )
+    outage = _install_write_outage(
+        runner, command_prefix=["gh", "pr", "comment"],
+        should_fail=_anchor_after_sidecars({"sidecars": 0}),
+    )
+    with pytest.raises(GitHubTransientExhaustedError, match="502"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert outage["failed"] >= 3  # the whole retry budget was spent on the anchor
+    outage["active"] = False
+    carriers = [c for c in _frozen_carriers(config) if len(c["bodies"]) == 3]
+    assert len(carriers) == 1
+    return runner, config, carriers[0]
+
+
+def test_pr_exhausted_publication_resumes_hours_later_before_the_checkpoint(tmp_path, monkeypatch):
+    from coding_review_agent_loop.round_transport import attachment_keys
+
+    runner, config, carrier = _exhausted_pr(tmp_path, monkeypatch)
+    frozen = carrier["bodies"]
+    assert len(_body_positions(runner, frozen[0])) == 1 and _body_positions(runner, frozen[2]) == []
+    _age_everything(config, runner.pr_payload["comments"])
+    audits_before = len(_audit_indexes(runner))
+    launches_before = len(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    for body in frozen:
+        assert len(_body_positions(runner, body)) == 1
+    anchor_at = _body_positions(runner, frozen[2])[0]
+    assert anchor_at < _audit_indexes(runner)[audits_before]  # before the new checkpoint
+    assert runner.reviewer_launches[launches_before:] == []
+    assert [attachment_keys(b) for b in frozen[:2]] == [
+        attachment_keys(c["body"]) for c in runner.pr_payload["comments"] if attachment_keys(c["body"])
+    ]
+    assert _spool_files(config) == []
+
+
+def test_pr_frozen_bodies_survive_scheduler_and_peer_drift(tmp_path, monkeypatch):
+    runner, config, carrier = _exhausted_pr(tmp_path, monkeypatch)
+    frozen = carrier["bodies"]
+    _age_everything(config, runner.pr_payload["comments"])
+    real_attach = orchestrator._attach_round_metadata
+
+    composed = []
+
+    def drifting(body, metadata):
+        # The scheduler counters moved on while the publication was stuck: anything
+        # composed live now would carry different round metadata.
+        if metadata.role == "reviewer":
+            metadata = dataclasses.replace(
+                metadata, scheduler_calls_avoided=(metadata.scheduler_calls_avoided or 0) + 99
+            )
+            composed.append(metadata)
+        return real_attach(body, metadata)
+
+    launches_before = len(runner.reviewer_launches)
+    with patch.object(orchestrator, "_attach_round_metadata", side_effect=drifting):
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert composed, "the drifting composition was never exercised"
+    for body in frozen:  # byte-identical, never recomposed from live metadata
+        assert len(_body_positions(runner, body)) == 1
+    from coding_review_agent_loop.round_transport import attachment_keys
+
+    assert [attachment_keys(c["body"]) for c in runner.pr_payload["comments"] if attachment_keys(c["body"])] == [
+        attachment_keys(frozen[0]), attachment_keys(frozen[1]),
+    ]  # no second set of sidecars with new attachment keys
+    assert runner.reviewer_launches[launches_before:] == []
+    assert _spool_files(config) == []
+
+
+def _drop_peer(runner, config, *, peer_marker, peer_name="Gemini", invalid_record=False):
+    """Remove the peer's public review and spool record; optionally leave an unvalidatable one."""
+    runner.pr_payload["comments"] = [
+        c for c in runner.pr_payload["comments"] if peer_marker not in c["body"]
+    ]
+    holder = next(
+        p for p in _spool_files(config) if "publication" in json.loads(p.read_text(encoding="utf-8"))
+    )
+    peer_path = holder.with_name(f"{peer_name}.json")
+    if peer_path.exists():
+        peer_path.unlink()
+    if invalid_record:
+        payload = json.loads(holder.read_text(encoding="utf-8"))
+        payload.pop("publication")
+        payload["reviewer"] = peer_name
+        payload["response"]["text"] = "not a valid structured review"
+        peer_path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.mark.parametrize("invalid_record", [False, True])
+def test_pr_public_sidecar_prefix_beside_a_fresh_peer_is_refused(tmp_path, monkeypatch, invalid_record):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, carrier = _exhausted_pr(tmp_path, monkeypatch)
+    _drop_peer(runner, config, peer_marker="Gemini approves independently.", invalid_record=invalid_record)
+    comments_before = len(runner.pr_payload["comments"])
+    launches_before = list(runner.reviewer_launches)
+    audits_before = len(_audit_indexes(runner))
+
+    with pytest.raises(PublicationResumeStop, match="partly public"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert len(runner.pr_payload["comments"]) == comments_before  # no checkpoint, no post
+    assert len(_audit_indexes(runner)) == audits_before
+    assert runner.reviewer_launches == launches_before
+    assert any("publication" in json.loads(p.read_text(encoding="utf-8")) for p in _spool_files(config))
+
+
+def _exhausted_plan(tmp_path, monkeypatch):
+    from coding_review_agent_loop import github_retry
+    from coding_review_agent_loop.github_retry import GitHubTransientExhaustedError
+
+    monkeypatch.setattr(github_retry, "_sleep", lambda _seconds: None)
+    rnd = _random.Random(31)
+    text = "".join(rnd.choice(_string.ascii_letters + " ") for _ in range(45_000))
+    marker = "Codex plan approval with a unique note."
+    runner = _PartialPublicationProbeRunner(
+        round_markers=(marker, "Gemini independent plan approval."),
+        claude_outputs=[_initial_plan()],
+        codex_outputs=[structured_plan_review(summary=f"{marker} {text}")],
+        gemini_outputs=[structured_plan_review(
+            summary="Gemini independent plan approval.", reviewer="Google Gemini"
+        )],
+    )
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    outage = _install_write_outage(
+        runner, command_prefix=["gh", "issue", "comment"],
+        should_fail=_anchor_after_sidecars({"sidecars": 0}),
+    )
+    with pytest.raises(GitHubTransientExhaustedError, match="502"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert outage["failed"] >= 3
+    outage["active"] = False
+    carriers = [c for c in _frozen_carriers(config) if len(c["bodies"]) == 3]
+    assert len(carriers) == 1
+    return runner, config, carriers[0]
+
+
+def test_plan_exhausted_publication_resumes_hours_later_and_removes_the_spool(tmp_path, monkeypatch):
+    runner, config, carrier = _exhausted_plan(tmp_path, monkeypatch)
+    frozen = carrier["bodies"]
+    assert len(_issue_positions(runner, frozen[0])) == 1 and _issue_positions(runner, frozen[2]) == []
+    _age_everything(config, runner.issue_comments)
+    launches_before = len(runner.reviewer_launches)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    for body in frozen:
+        assert len(_issue_positions(runner, body)) == 1
+    assert runner.reviewer_launches[launches_before:] == []
+    assert _spool_files(config) == []  # removed after the anchor was confirmed
+
+
+@pytest.mark.parametrize("invalid_record", [False, True])
+def test_plan_public_sidecar_prefix_beside_a_fresh_peer_is_refused(tmp_path, monkeypatch, invalid_record):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, config, _carrier = _exhausted_plan(tmp_path, monkeypatch)
+    runner.issue_comments = [
+        c for c in runner.issue_comments if "Gemini independent plan approval." not in c["body"]
+    ]
+    holder = next(
+        p for p in _spool_files(config) if "publication" in json.loads(p.read_text(encoding="utf-8"))
+    )
+    peer_path = holder.with_name("Gemini.json")
+    if peer_path.exists():
+        peer_path.unlink()
+    if invalid_record:
+        payload = json.loads(holder.read_text(encoding="utf-8"))
+        payload.pop("publication")
+        payload["reviewer"] = "Gemini"
+        payload["response"]["text"] = "not a valid structured plan review"
+        peer_path.write_text(json.dumps(payload), encoding="utf-8")
+    comments_before = len(runner.issue_comments)
+    launches_before = list(runner.reviewer_launches)
+
+    with pytest.raises(PublicationResumeStop, match="partly public"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert len(runner.issue_comments) == comments_before
+    assert runner.reviewer_launches == launches_before
+    assert any("publication" in json.loads(p.read_text(encoding="utf-8")) for p in _spool_files(config))

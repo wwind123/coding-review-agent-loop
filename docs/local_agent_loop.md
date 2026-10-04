@@ -5928,7 +5928,9 @@ re-invokes the reviewer:
   response is malformed and stops the run. If some reviewer still needs a fresh
   turn, posting waits for the round to settle, and a carrier that is already
   partly public (sidecars without an anchor) stops the run instead, because the
-  fresh reviewer would read those attachments.
+  fresh reviewer would read those attachments. Whether a reviewer needs a fresh
+  turn is decided from validated replayability: a not-yet-public reviewer whose
+  spooled response is readable but no longer validates counts as a fresh turn.
 - Publication does not begin without a usable carrier: if the authenticated actor
   or a complete pre-publication baseline listing is unavailable, the run stops
   before the first post with the validated response still spooled.

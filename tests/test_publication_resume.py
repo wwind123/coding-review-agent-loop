@@ -446,7 +446,7 @@ def _anchor_for(name):
     return str(_attach_round_metadata(f"{name} review", metadata))
 
 
-def _preflight(fake, tmp_path, spool, *, defer=False, contexts=None, published=()):
+def _preflight(fake, tmp_path, spool, *, contexts=None, published=()):
     posted = []
     review_rounds._preflight_spooled_publications(
         fake, config=make_config(tmp_path), spool=spool,
@@ -455,7 +455,7 @@ def _preflight(fake, tmp_path, spool, *, defer=False, contexts=None, published=(
         publication_for=_publication_for(fake, tmp_path, spool, contexts=contexts or {}),
         published_names=published,
         post_frozen=lambda plan: posted.append(plan),
-        defer_posting=defer,
+        selected_reviewers=["codex", "gemini"],
     )
     return posted
 
@@ -487,13 +487,14 @@ def test_preflight_refuses_a_partly_public_carrier_beside_a_fresh_reviewer(tmp_p
     spool.remove("Gemini")
     writes = len(fake.writes)
     with pytest.raises(PublicationResumeStop, match="partly public"):
-        _preflight(fake, tmp_path, spool, defer=True)
+        _preflight(fake, tmp_path, spool)
     assert len(fake.writes) == writes
     # No public prefix: a deferral alone is fine (the suffix waits for settlement).
     clean = _two_reviewer_spool(tmp_path / "clean")
+    clean.remove("Gemini")  # a fresh turn is still needed, but nothing is public yet
     clean_fake = FakeGitHub()
     _freeze_with_prefix(clean_fake, tmp_path, clean, "Codex", bodies=["c-side", _anchor_for("Codex")], post_count=0)
-    assert _preflight(clean_fake, tmp_path, clean, defer=True) == []
+    assert _preflight(clean_fake, tmp_path, clean) == []
 
 
 @pytest.mark.parametrize("damage", ["null_carrier", "unreadable_response"])
@@ -510,7 +511,7 @@ def test_malformed_or_null_carrier_stops_before_anything(tmp_path, replayable, d
     path.write_text(json.dumps(payload))
     assert spool.publication_state("Codex")[0] == "malformed"
     with pytest.raises(PublicationResumeStop, match="malformed or unreadable"):
-        _preflight(fake, tmp_path, spool, defer=True)
+        _preflight(fake, tmp_path, spool)
     assert fake.writes == [] and path.exists()
 
 
@@ -530,3 +531,24 @@ def test_legacy_record_is_checked_even_when_its_anchor_is_already_public(tmp_pat
     with pytest.raises(PublicationResumeStop, match="could not be read completely"):
         _preflight(blind, tmp_path, spool, published=("Codex",))
     assert spool.record_exists("Codex") and spool.record_exists("Gemini")
+
+
+def test_a_readable_but_unvalidatable_peer_counts_as_a_fresh_turn(tmp_path, monkeypatch):
+    """Fresh-turn necessity follows validated replayability, not spool readability."""
+    spool = _two_reviewer_spool(tmp_path)
+    fake = FakeGitHub()
+    _freeze_with_prefix(fake, tmp_path, spool, "Codex", bodies=["c-side", _anchor_for("Codex")], post_count=1)
+
+    def replay(runner, *, config, reviewer, fields, validators):
+        return None if reviewer == "gemini" else object()
+
+    monkeypatch.setattr(review_rounds, "_replay_spooled_review", replay)
+    writes = len(fake.writes)
+    # Gemini's record is readable, but the current validator rejects it: it would
+    # launch fresh beside Codex's public sidecar, so the run stops with zero posts.
+    with pytest.raises(PublicationResumeStop, match="partly public"):
+        _preflight(fake, tmp_path, spool)
+    assert len(fake.writes) == writes and spool.record_exists("Gemini")
+    # A settled failure outcome is replayed as a failure, never relaunched.
+    spool.store_failure("Gemini", message="boom", failure_category=None)
+    assert [len(p.bodies) - len(p.already_public) for p in _preflight(fake, tmp_path, spool)] == [1]
