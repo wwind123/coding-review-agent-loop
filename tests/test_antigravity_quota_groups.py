@@ -452,3 +452,44 @@ def test_parallel_threads_share_run_memory_and_log_once(tmp_path):
         assert sum("exhausted until" in line for line in logs) == 1
         assert early.ensure_eligible_before_attempt() == "ok"
         assert early.models[early.model_index] == OPUS
+
+
+def test_unverified_reset_with_retry_budget_on_opus_retries_same_model_then_fails(tmp_path):
+    noise = "reviewing: the quota note says try again in 4h\nmore transcript\n"
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, sleeps, _l = _turn(
+            tmp_path, [_fail(noise + HIGH_TRAFFIC)] * 2, agent_max_retries=1,
+            antigravity_models=(OPUS,),
+        )
+        memory = agy.quota_memory_for_current_run()
+        assert memory.entry("claude") is None
+    assert models == [OPUS, OPUS]  # same-model retry inside the budget
+    assert len(sleeps) == 1
+    assert type(error) is AgentInvocationError
+    assert not isinstance(error, QuotaResetExceededError)
+
+
+def test_format_repair_never_reads_or_marks_quota_memory(tmp_path, monkeypatch):
+    from coding_review_agent_loop.repair import execute_repair
+
+    monkeypatch.setattr(agy, "_antigravity_settings_path", lambda: tmp_path / "settings.json")
+    touched = []
+
+    def boom(*_a, **_k):
+        touched.append("access")
+        raise AssertionError("repair touched quota memory")
+
+    config = make_config(tmp_path, repair_models=("Out Of Chain Model",))
+    with workdir_claims.workdir_claim_scope(), \
+            patch.object(agy, "quota_memory_for_current_run", boom), \
+            patch.object(agy.AntigravityQuotaGroupMemory, "mark_exhausted", boom), \
+            patch.object(agy.AntigravityQuotaGroupMemory, "is_exhausted", boom), \
+            patch.object(agy.AntigravityAttemptState, "from_config", boom):
+        execute_repair(
+            malformed_pr_review_source(state="approved"),
+            runner=FakeRunner(antigravity_outputs=[(LIVE_SAMPLE, 1)] * 8),
+            config=config, run_id="r", usage_context=None,
+            validate=lambda t: (_ for _ in ()).throw(AgentLoopError("invalid")),
+            expected_kind="pr_review",
+        )
+    assert touched == []

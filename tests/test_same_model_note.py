@@ -236,3 +236,114 @@ def test_carried_prior_round_approval_never_contributes_and_note_resets_per_roun
     round3 = next(c for c in runner.comments if c.startswith("PR review round 3 reconciliation"))
     assert "reviewed with" not in round3
     assert sum("reviewed with shared-model-1" in line for line in logs) == 1
+
+
+# --- review round 2: checkpoint resume, evidence pass, unknown models ----------
+
+@pytest.mark.parametrize("kind", ["pr", "plan"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_resume_after_reconciliation_posted_before_finalization(tmp_path, kind, parallel):
+    runner = _fallback_pair_runner(fall_back=True, plan=kind == "plan")
+    config = _pair_config(tmp_path, parallel)
+    attr = "post_pr_comment" if kind == "pr" else "post_issue_comment"
+    real_post = getattr(orchestrator, attr)
+
+    def post_then_interrupt(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        if "reconciliation" in kwargs["body"]:
+            raise KeyboardInterrupt
+        return result
+
+    with patch.object(orchestrator, attr, side_effect=post_then_interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            _run(kind, runner, config)
+    assert len([c for c in runner.comments if "reconciliation" in c]) == 1
+    calls = _agent_calls(runner)
+    logs: list[str] = []
+    module = pr_loop if kind == "pr" else plan_first_loop
+    with patch.object(module, "log", lambda _c, m: logs.append(m)):
+        assert _run(kind, runner, config) == 0
+    assert _agent_calls(runner) == calls
+    posted = [c for c in runner.comments if "reconciliation" in c]
+    assert len(posted) == 1 and NOTE_OPUS in posted[0]
+    assert any(NOTE_OPUS in line for line in logs)
+
+
+@pytest.mark.parametrize("kind", ["pr", "plan"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_resume_before_reconciliation_logs_the_note(tmp_path, kind, parallel):
+    runner = _fallback_pair_runner(fall_back=True, plan=kind == "plan")
+    config = _pair_config(tmp_path, parallel)
+    attr = "post_pr_comment" if kind == "pr" else "post_issue_comment"
+    real_post = getattr(orchestrator, attr)
+
+    def interrupt(*args, **kwargs):
+        if "reconciliation" in kwargs["body"]:
+            raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    with patch.object(orchestrator, attr, side_effect=interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            _run(kind, runner, config)
+    logs: list[str] = []
+    module = pr_loop if kind == "pr" else plan_first_loop
+    with patch.object(module, "log", lambda _c, m: logs.append(m)):
+        assert _run(kind, runner, config) == 0
+    assert any(NOTE_OPUS in line for line in logs)
+
+
+@pytest.mark.parametrize("kind", ["pr", "plan"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_unknown_resolved_models_never_produce_a_note(tmp_path, kind, parallel):
+    if kind == "plan":
+        from test_review_parallel import _initial_plan
+
+        runner = FakeRunner(
+            claude_outputs=[structured_plan_review(summary="C ok.", reviewer="Claude")],
+            codex_outputs=[_initial_plan(), structured_plan_review(summary="X ok.")],
+        )
+        config = make_config(tmp_path, reviewer=("claude", "codex"), coder="codex",
+                             review_parallel=parallel)
+    else:
+        runner = FakeRunner(
+            claude_outputs=[structured_pr_review(summary="C ok.", reviewer="Claude")],
+            codex_outputs=[structured_pr_review(summary="X ok.")],
+        )
+        config = make_config(tmp_path, reviewer=("claude", "codex"), review_parallel=parallel)
+    assert _run(kind, runner, config) == 0
+    assert not any("reviewed with" in c for c in runner.comments)
+    if not parallel:
+        assert not any("reconciliation" in c for c in runner.comments)
+
+
+def test_evidence_response_pass_gains_no_reconciliation_summary(tmp_path):
+    from test_orchestrator_pr import _EVIDENCE_TEXT, _evidence_review, _signed
+
+    runner = FakeRunner(
+        codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])],
+        gemini_outputs=[_evidence_review(reviewer="Google Gemini")],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), codex_model="shared-model-1",
+        gemini_model="shared-model-1",
+    )
+    with pytest.raises(orchestrator.HumanDecisionRequiredError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    before = len([c for c in runner.comments if "reconciliation" in c])
+    assert before == 1  # the authoritative round carries the note
+    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    from test_orchestrator_pr import _resolve
+
+    runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
+    runner.gemini_outputs.append(
+        _evidence_review(
+            reviewer="Google Gemini", hr=True,
+            dispositions=[_resolve("item-1", "Codex owns this request.")],
+        )
+    )
+    logs: list[str] = []
+    with patch.object(pr_loop, "log", lambda _c, m: logs.append(m)):
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert runner.codex_outputs == [] and runner.gemini_outputs == []  # pass really ran
+    assert len([c for c in runner.comments if "reconciliation" in c]) == before
+    assert any("reviewed with shared-model-1" in line for line in logs)  # log line only
