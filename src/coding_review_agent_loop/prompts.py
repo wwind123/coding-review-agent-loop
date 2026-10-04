@@ -59,6 +59,11 @@ from .protocol import (
     semantic_risk_claim_schema_text,
 )
 from .protocol_markers import sanitize_historical_text, sanitize_untrusted_prose
+from .review_step_back import (
+    PlanStepBackContext,
+    render_plan_step_back_guidance,
+    render_plan_step_back_review_notice,
+)
 from .workdirs import agent_workdir
 from .test_runtime import (
     preflight_wrapper_candidates,
@@ -2899,6 +2904,11 @@ def _plan_growth_planner_guidance(
     return "\n".join(lines) + "\n"
 
 
+def _step_back_planner_block(context: PlanStepBackContext | None) -> str:
+    """Step-back planner instruction, identical in every revision branch (#1251)."""
+    return render_plan_step_back_guidance(context) + "\n" if context is not None else ""
+
+
 def _plan_growth_review_guidance(
     config: AgentLoopConfig,
     growth_notice: str | None = None,
@@ -3052,6 +3062,7 @@ def build_plan_review_prompt(
     inherited_check_failure: str | None = None,
     plan_growth_notice: str | None = None,
     plan_growth_measurements: str | None = None,
+    step_back_review_notice: bool = False,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -3072,6 +3083,7 @@ def build_plan_review_prompt(
             inherited_check_failure=inherited_check_failure,
             plan_growth_notice=plan_growth_notice,
             plan_growth_measurements=plan_growth_measurements,
+            step_back_review_notice=step_back_review_notice,
         )
         return compact_prompt
     coder_name = agent_display_name(config.coder)
@@ -3112,7 +3124,7 @@ Plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}
+{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_plan_step_back_review_notice() if step_back_review_notice else ''}
 Review the plan for correctness, architecture fit, missing edge cases, test
 strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -3199,6 +3211,7 @@ def _build_compact_plan_review_prompt(
     inherited_check_failure: str | None = None,
     plan_growth_notice: str | None = None,
     plan_growth_measurements: str | None = None,
+    step_back_review_notice: bool = False,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_name = agent_display_name(reviewer)
@@ -3262,7 +3275,7 @@ Current implementation plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{(plan_growth_measurements + chr(10)) if plan_growth_measurements else ""}{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{_agent_unavailable_guidance(reviewer_signature)}
+{(plan_growth_measurements + chr(10)) if plan_growth_measurements else ""}{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{render_plan_step_back_review_notice() if step_back_review_notice else ""}{_agent_unavailable_guidance(reviewer_signature)}
 {_plan_review_scheduling_guidance(config, reviewer_group, compact=True)}Use approved only if there are no
 blocking plan issues, no Same-plan follow-ups, and no carried-forward plan
 items left active for this planning round. Do not place your signature before
@@ -3369,6 +3382,7 @@ def _build_semantic_plan_revision_prompt(
     plan_validation_diagnostic: object | None,
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     plan_growth_notice: str | None = None,
+    step_back_context: PlanStepBackContext | None = None,
 ) -> str:
     """Prompt for the revision-only semantic contract.
 
@@ -3407,7 +3421,7 @@ Current canonical plan (read-only context):
 
 {previous_plan}
 
-Blocking plan review payload:
+{_step_back_planner_block(step_back_context)}Blocking plan review payload:
 
 {review}
 
@@ -3493,6 +3507,7 @@ def build_plan_revision_prompt(
     base_state_identity: str | None = None,
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     plan_growth_notice: str | None = None,
+    step_back_context: PlanStepBackContext | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if response_form == "semantic-patch-v1":
@@ -3512,6 +3527,7 @@ def build_plan_revision_prompt(
             plan_validation_diagnostic=plan_validation_diagnostic,
             inherited_matrix_binding=inherited_matrix_binding,
             plan_growth_notice=plan_growth_notice,
+            step_back_context=step_back_context,
         )
     if compact_context:
         return _build_compact_plan_revision_prompt(
@@ -3529,6 +3545,7 @@ def build_plan_revision_prompt(
             plan_validation_diagnostic=plan_validation_diagnostic,
             inherited_matrix_binding=inherited_matrix_binding,
             plan_growth_notice=plan_growth_notice,
+            step_back_context=step_back_context,
         )
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -3564,7 +3581,7 @@ Previous plan:
 
 {previous_plan}
 
-{reviewer_name} plan review:
+{_step_back_planner_block(step_back_context)}{reviewer_name} plan review:
 
 {review}
 
@@ -3662,6 +3679,7 @@ def _build_compact_plan_revision_prompt(
     plan_validation_diagnostic: object | None,
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     plan_growth_notice: str | None = None,
+    step_back_context: PlanStepBackContext | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -3718,7 +3736,7 @@ Previous implementation plan:
 
 {previous_plan}
 
-Blocking plan review payload:
+{_step_back_planner_block(step_back_context)}Blocking plan review payload:
 
 {review}
 

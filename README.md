@@ -1251,11 +1251,17 @@ convened automatically. Editing the issue title or body retires rounds reviewed
 against earlier text (a comment alone does not, and rounds recorded before
 issue-text tracking carry no digest, so an edit cannot retire them), and the one-shot
 `--plan-reset-stall-streak` durably retires the counted rounds; otherwise rerun
-with `--plan-review-force-full` or a higher threshold. An in-flight run already past eight such rounds stops at
+with `--plan-review-force-full` or a higher threshold. `--plan-step-back-rounds K` (default 2, `0` disables) acts earlier on the "new edge
+case every round" pattern: once the one-shot plan has crossed a plan-growth signal and
+the primary has blocked K consecutive rounds on new mandatory findings, the next planner
+turn must propose a materially simpler design (or a split, or under `implement-one-shot`
+a re-file-as-staged caveat) instead of patching the newest finding, and
+`--plan-step-back-escalation-rounds M` (default 2) stops for a human decision once the
+primary has blocked M rounds after it. An in-flight run already past eight such rounds stops at
 its next round after upgrading. Omitting the flags keeps today's
 full-board planning behavior unchanged, and discussion-mode cycles always stay
 full-board. A child-planning cycle inherits `--plan-review-policy`,
-`--primary-plan-reviewer`, and `--plan-primary-stall-rounds` but never the parent's `--plan-review-force-full`
+`--primary-plan-reviewer`, `--plan-primary-stall-rounds`, `--plan-step-back-rounds`, and `--plan-step-back-escalation-rounds` but never the parent's `--plan-review-force-full`
 override, `--plan-reset-stall-streak`, or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board
 planning can be compared on calls, tokens, latency, overlap, severity-weighted

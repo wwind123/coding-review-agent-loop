@@ -853,3 +853,20 @@ def test_antigravity_quota_group_docs_describe_five_model_chain():
     architecture = ARCHITECTURE.read_text(encoding="utf-8")
     assert "Antigravity quota-group fallback" in architecture
     assert "reset_parsing.py" in architecture
+
+
+def test_operator_docs_document_the_plan_step_back_mechanism():
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "docs" / "local_agent_loop.md").read_text()
+    readme = (root / "README.md").read_text()
+    architecture = (root / "ARCHITECTURE.md").read_text()
+
+    for flag in ("--plan-step-back-rounds", "--plan-step-back-escalation-rounds"):
+        assert flag in text and flag in readme and flag in architecture
+    assert "#### Plan step-back turn and early human decision" in text
+    assert "human-decision-required" in text
+    assert "re-filed as staged work" in text
+    assert "`review_step_back.py`" in architecture
+    assert "step_back_entries" in architecture and "step_back_entries" in text

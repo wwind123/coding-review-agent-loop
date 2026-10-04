@@ -291,10 +291,28 @@ class PostedRoundMetadata:
     evidence_freeze: "EvidenceFreezeRecord | None" = None
     evidence_release: "EvidenceReleaseRecord | None" = None
     evidence_clearances: tuple[tuple[str, str], ...] = ()
+    # Reviewer-owned step-back episode entries (#1251), written by the
+    # orchestrator on the planner (or coder) record of a step-back turn and
+    # never taken from agent output.  Absent is legacy/no step-back.  The status
+    # is an in-memory decode-quality signal, never serialized: a malformed
+    # value decodes as ``invalid`` with no entries instead of failing the
+    # record, so the step-back trigger can be suppressed for that history.
+    step_back_entries: tuple[Mapping[str, object], ...] = ()
+    step_back_status: str = "absent"
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid scheduler metadata status")
+        if self.step_back_status not in {"absent", "valid", "invalid"}:
+            raise ValueError("invalid step-back status")
+        if self.step_back_entries:
+            if self.step_back_status == "invalid":
+                raise ValueError("an invalid step-back status cannot carry entries")
+            for entry in self.step_back_entries:
+                if not step_back_entry_is_valid(entry):
+                    raise ValueError("invalid step-back entry")
+            if self.step_back_status == "absent":
+                object.__setattr__(self, "step_back_status", "valid")
         if self.risk_test_matrix_evidence_full_round_status not in {"absent", "valid", "invalid"}:
             raise ValueError("invalid matrix evidence full-round status")
         if self.risk_test_matrix_evidence_full_round is not None:
@@ -2330,6 +2348,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
     if metadata.followup_dispatch_head is not None:
         payload["followup_dispatch_head"] = metadata.followup_dispatch_head
+    if metadata.step_back_entries:
+        payload["step_back_entries"] = [dict(entry) for entry in metadata.step_back_entries]
     if metadata.risk_test_matrix_evidence_full_round is not None:
         payload["risk_test_matrix_evidence_full_round"] = (
             metadata.risk_test_matrix_evidence_full_round
@@ -2416,6 +2436,58 @@ def _decode_followup_dispatch_head(payload: Mapping[str, object]) -> str | None:
     if not _is_followup_dispatch_head(value):
         raise ValueError("followup_dispatch_head must be a hex Git commit SHA")
     return str(value)
+
+
+STEP_BACK_PHASES = frozenset({"plan", "pr"})
+
+
+def step_back_entry_is_valid(entry: object) -> bool:
+    """Whether ``entry`` is a well-formed reviewer-owned step-back entry (#1251)."""
+    if not isinstance(entry, Mapping):
+        return False
+    allowed = {"phase", "reviewer", "trigger_round", "trigger_head", "anchor"}
+    if not set(entry) <= allowed:
+        return False
+    phase = entry.get("phase")
+    reviewer = entry.get("reviewer")
+    trigger_round = entry.get("trigger_round")
+    if phase not in STEP_BACK_PHASES:
+        return False
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        return False
+    if isinstance(trigger_round, bool) or not isinstance(trigger_round, int) or trigger_round < 1:
+        return False
+    if phase == "plan":
+        return "trigger_head" not in entry and "anchor" not in entry
+    if not _is_followup_dispatch_head(entry.get("trigger_head")):
+        return False
+    anchor = entry.get("anchor")
+    if not isinstance(anchor, Mapping) or set(anchor) != {"path", "start", "end"}:
+        return False
+    start, end = anchor.get("start"), anchor.get("end")
+    return (
+        isinstance(anchor.get("path"), str)
+        and bool(str(anchor["path"]).strip())
+        and all(isinstance(value, int) and not isinstance(value, bool) for value in (start, end))
+        and 1 <= start <= end
+    )
+
+
+def _decode_step_back_fields(payload: Mapping[str, object]) -> dict[str, object]:
+    """Decode the optional step-back entries; malformed degrades, never raises."""
+    if "step_back_entries" not in payload:
+        return {}
+    value = payload["step_back_entries"]
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(step_back_entry_is_valid(entry) for entry in value)
+    ):
+        return {"step_back_status": "invalid"}
+    return {
+        "step_back_entries": tuple(dict(entry) for entry in value),
+        "step_back_status": "valid",
+    }
 
 
 def _decode_evidence_fields(payload: Mapping[str, object]) -> dict[str, object]:
@@ -2736,6 +2808,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 payload, "reviewer_board_amendment_digest"
             ),
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
+            **_decode_step_back_fields(payload),
             **_decode_evidence_fields(payload),
             **_decode_matrix_evidence_full_round(payload),
             **_decode_scheduler_fields(payload),

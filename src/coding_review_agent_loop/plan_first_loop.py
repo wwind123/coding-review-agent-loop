@@ -253,6 +253,16 @@ from .panel_evidence import (
     _resumed_plan_transition_inputs,
     _plan_revision_descriptor,
 )
+from .review_step_back import (
+    PlanStepBackContext,
+    derive_plan_step_back_state,
+    entry_payload_for_plan,
+    mandatory_plan_findings_since,
+    plan_growth_crossing_round,
+    plan_step_back_candidate_rounds,
+    render_step_back_human_decision,
+    step_back_alternative_summary,
+)
 from .review_rounds import (
     _is_incomplete_plan_review,
     _describe_plan_review_outcome,
@@ -770,6 +780,57 @@ def _run_plan_first_loop(
             body=f"Plan review scheduling diagnostic ({label}): {message}",
         )
         raise PlanPrePanelSafetyError(message)
+
+    def plan_step_back_measurements(assessment: object | None, text: str | None) -> str:
+        if text:
+            return text
+        describe = getattr(assessment, "describe", None)
+        return f"Plan-growth measurements: {describe()}." if callable(describe) else ""
+
+    def plan_step_back_state(
+        records: Sequence[PostedRoundRecord], *, panel_opening_index: int | None
+    ):
+        """The primary's step-back state, or ``None`` when degraded or disabled (#1251)."""
+        if config.plan_step_back_rounds <= 0 or plan_primary_name is None:
+            return None
+        state = derive_plan_step_back_state(
+            records,
+            primary=plan_primary_name,
+            panel_opening_index=panel_opening_index,
+            current_issue_digest=plan_issue_digest,
+        )
+        if state.degraded:
+            log(
+                config,
+                "Planning step-back suppressed: a malformed step-back history entry "
+                "degrades the planning history",
+            )
+            return None
+        return state
+
+    def plan_step_back_escalation(
+        records: Sequence[PostedRoundRecord],
+        *,
+        panel_opening_index: int | None,
+        assessment: object | None,
+        measurements: str | None,
+    ) -> str | None:
+        """Human-decision message once the primary rejected the step-back, else ``None``."""
+        state = plan_step_back_state(records, panel_opening_index=panel_opening_index)
+        if (
+            state is None
+            or state.episode is None
+            or state.escalation_count < config.plan_step_back_escalation_rounds
+        ):
+            return None
+        return render_step_back_human_decision(
+            phase="plan",
+            measurements=plan_step_back_measurements(assessment, measurements),
+            step_back_round=state.episode.candidate_round,
+            blocks=state.escalation_count,
+            threshold=config.plan_step_back_escalation_rounds,
+            alternative=step_back_alternative_summary(records, state.episode),
+        )
 
     if inherited_matrix_binding is not None:
         inherited_measured = inherited_obligations_enforceable_size(inherited_matrix_binding)
@@ -1604,6 +1665,7 @@ def _run_plan_first_loop(
             else None
         )
         plan_scheduler_decision = None
+        step_back_candidate_review = False
         plan_posted_checkpoint: PostedRoundMetadata | None = None
         plan_panel_evidence = PlanPanelEvidence()
         plan_qualifying_approvals: tuple[str, ...] = ()
@@ -1723,6 +1785,12 @@ def _run_plan_first_loop(
             latest_scheduler_record = plan_history.latest_scheduler_record
             plan_previous_key = plan_history.previous_key
             plan_history_class = plan_history.history_class
+            if config.plan_step_back_rounds > 0 and plan_primary_name is not None:
+                step_back_candidate_review = (
+                    current_plan_sidecar.round_number
+                    if current_plan_sidecar is not None
+                    else round_number
+                ) in plan_step_back_candidate_rounds(plan_records)
             if plan_history_class == PLAN_HISTORY_CONTRADICTORY_KEY:
                 # A contradictory persisted key can supply neither an approval
                 # nor a panel opening.
@@ -1760,6 +1828,15 @@ def _run_plan_first_loop(
                         f"planning history ({plan_history_class})",
                     )
                 else:
+                    step_back_stop = plan_step_back_escalation(
+                        plan_records,
+                        panel_opening_index=plan_panel_evidence.opening_index,
+                        assessment=plan_growth_assessment,
+                        measurements=plan_growth_measurements,
+                    )
+                    if step_back_stop is not None:
+                        # Same early-stop contract as the stall stop below.
+                        stop_plan_pre_panel(step_back_stop, round_number=round_number)
                     plan_primary_streak = plan_primary_blocking_streak_detail(
                         plan_records,
                         primary=plan_primary_name,
@@ -2093,6 +2170,7 @@ def _run_plan_first_loop(
                 inherited_check_failure=inherited_review_failure,
                 plan_growth_notice=plan_growth_notice,
                 plan_growth_measurements=plan_growth_measurements,
+                step_back_review_notice=step_back_candidate_review,
             )
 
         plan_fatal_errors: list[tuple[str, AgentLoopError]] = []
@@ -3753,6 +3831,65 @@ def _run_plan_first_loop(
                 f"{authorization}\n\n{combined_review}" if combined_review else authorization
             )
             plan_automatic_force_full = True
+        step_back_context: PlanStepBackContext | None = None
+        if (
+            config.plan_step_back_rounds > 0
+            and staged_planning
+            and plan_primary_name is not None
+            and current_plan_sidecar is not None
+            and not plan_panel_evidence.opened
+            and inherited_guard_revision is None
+            and growth_guard_revision is None
+            and not supersession_revision_pending
+        ):
+            # The round's reviews are already posted, so refresh the durable
+            # history: the pre-round comment snapshot cannot hold them, and the
+            # trigger and the stop must land on exactly the K-th and M-th block.
+            step_back_records = plan_history_records(refresh=True, round_number=round_number)
+            step_back_stop = plan_step_back_escalation(
+                step_back_records,
+                panel_opening_index=plan_panel_evidence.opening_index,
+                assessment=plan_growth_assessment,
+                measurements=plan_growth_measurements,
+            )
+            if step_back_stop is not None:
+                # Before the planner turn, so no further planner turn runs.
+                stop_plan_pre_panel(step_back_stop, round_number=round_number)
+            step_back_state = plan_step_back_state(
+                step_back_records, panel_opening_index=plan_panel_evidence.opening_index
+            )
+            if (
+                step_back_state is not None
+                and step_back_state.episode is None
+                and step_back_state.reviews
+                and step_back_state.reviews[-1].round_number == round_number
+            ):
+                crossing_round = plan_growth_crossing_round(
+                    step_back_records,
+                    config=config,
+                    current_round=current_plan_sidecar.round_number,
+                )
+                if crossing_round is not None:
+                    streak = step_back_state.streak_since(crossing_round)
+                    if streak >= config.plan_step_back_rounds:
+                        step_back_context = PlanStepBackContext(
+                            measurements=plan_step_back_measurements(
+                                plan_growth_assessment, plan_growth_measurements
+                            ),
+                            findings=mandatory_plan_findings_since(
+                                step_back_records,
+                                primary=plan_primary_name,
+                                first_round=crossing_round,
+                            ),
+                            execution_mode=config.plan_execution_mode,
+                            streak=streak,
+                        )
+                        log(
+                            config,
+                            f"Planning round {round_number}: step-back revision: the plan "
+                            f"crossed a growth signal at round {crossing_round} and the "
+                            f"primary blocked {streak} consecutive round(s) on new findings",
+                        )
         log(
             config,
             f"Planning round {round_number}: {coder_name} revising the plan "
@@ -3793,7 +3930,12 @@ def _run_plan_first_loop(
                     compact_prior=CompactPriorContext(tuple(compact_prior_summaries)),
                     compact_tail=CompactPlanTailContext(
                         subject=current_plan_subject,
-                        action="Revise the implementation plan to address the blocking plan review.",
+                        action=(
+                            "Step back: propose a materially simpler alternative or a "
+                            "re-scope instead of patching the newest finding."
+                            if step_back_context is not None
+                            else "Revise the implementation plan to address the blocking plan review."
+                        ),
                     ),
                     require_risk_test_matrix_contract=require_fresh_matrix_contract,
                     plan_validation_diagnostic=turn_diagnostic,
@@ -3802,6 +3944,7 @@ def _run_plan_first_loop(
                     base_round_number=(semantic_base.round_number if semantic_base is not None else None),
                     base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
                     plan_growth_notice=plan_growth_notice,
+                    step_back_context=step_back_context,
                 ),
                 session_id=coder_session_id,
                 marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
@@ -4144,6 +4287,14 @@ def _run_plan_first_loop(
                     plan_supersession_superseded_hash=(
                         plan_supersession.superseded_hash
                         if plan_supersession is not None else None
+                    ),
+                    # Orchestrator-written, reviewer-owned, never from agent output.
+                    step_back_entries=(
+                        (entry_payload_for_plan(
+                            reviewer=plan_primary_name, trigger_round=round_number
+                        ),)
+                        if step_back_context is not None and plan_primary_name is not None
+                        else ()
                     ),
             )
         except ValueError as exc:

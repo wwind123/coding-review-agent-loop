@@ -1713,3 +1713,63 @@ def test_plan_reset_stall_streak_requires_primary_then_panel(tmp_path):
         plan_reset_stall_streak=True,
     )
     assert ok.plan_reset_stall_streak is True
+
+
+def test_plan_step_back_flags_default_and_validate(tmp_path):
+    """`config-disable-and-validation` (#1251)."""
+    staged = {
+        "reviewer": ("codex", "gemini"),
+        "plan_review_policy": "primary-then-panel",
+        "primary_plan_reviewer": "codex",
+    }
+    config = make_config(tmp_path, **staged)
+    assert config.plan_step_back_rounds == 2
+    assert config.plan_step_back_escalation_rounds == 2
+    assert make_config(tmp_path, reviewer=("codex", "gemini")).plan_step_back_rounds == 2
+    assert make_config(tmp_path, plan_step_back_rounds=0, **staged).plan_step_back_rounds == 0
+    assert make_config(tmp_path, plan_step_back_rounds=5, **staged).plan_step_back_rounds == 5
+    assert (
+        make_config(tmp_path, plan_step_back_escalation_rounds=1, **staged)
+        .plan_step_back_escalation_rounds == 1
+    )
+    for invalid in (-1, True, 1.5, "2"):
+        with pytest.raises(AgentLoopError, match="--plan-step-back-rounds must be"):
+            make_config(tmp_path, plan_step_back_rounds=invalid, **staged)
+    for invalid in (0, -1, True, 1.5):
+        with pytest.raises(
+            AgentLoopError, match="--plan-step-back-escalation-rounds must be a positive"
+        ):
+            make_config(tmp_path, plan_step_back_escalation_rounds=invalid, **staged)
+    for flag, value in (("plan_step_back_rounds", 0), ("plan_step_back_rounds", 3),
+                        ("plan_step_back_escalation_rounds", 3)):
+        with pytest.raises(
+            AgentLoopError,
+            match=r"--plan-step-back-(escalation-)?rounds requires --plan-review-policy primary-then-panel",
+        ):
+            make_config(tmp_path, reviewer=("codex", "gemini"), **{flag: value})
+
+
+def test_plan_step_back_flags_parse_from_the_cli(tmp_path):
+    from coding_review_agent_loop.config import config_from_args
+
+    base_argv = [
+        "issue", "56", "--repo", "OWNER/REPO", "--plan-first",
+        "--reviewer", "codex", "--reviewer", "gemini",
+        "--codex-dir", str(tmp_path / "codex"), "--gemini-dir", str(tmp_path / "gemini"),
+        "--dangerous-agent-permissions",
+        "--plan-review-policy", "primary-then-panel", "--primary-plan-reviewer", "codex",
+    ]
+    parser = build_parser()
+    args = parser.parse_args(base_argv)
+    assert args.plan_step_back_rounds is None
+    assert args.plan_step_back_escalation_rounds is None
+    config = config_from_args(args, FakeRunner())
+    assert (config.plan_step_back_rounds, config.plan_step_back_escalation_rounds) == (2, 2)
+    args = parser.parse_args(
+        [*base_argv, "--plan-step-back-rounds", "0", "--plan-step-back-escalation-rounds", "3"]
+    )
+    config = config_from_args(args, FakeRunner())
+    assert (config.plan_step_back_rounds, config.plan_step_back_escalation_rounds) == (0, 3)
+    args = parser.parse_args([*base_argv, "--plan-step-back-rounds", "-2"])
+    with pytest.raises(AgentLoopError, match="--plan-step-back-rounds must be"):
+        config_from_args(args, FakeRunner())

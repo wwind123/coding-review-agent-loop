@@ -3108,6 +3108,56 @@ turn.
 or more trailing blocking primary rounds stops at its next round after
 upgrading. Pass a higher `--plan-primary-stall-rounds` or `0` to continue it.
 
+#### Plan step-back turn and early human decision
+
+The stall stop fires only after the time is spent. A run can also deadlock
+long before it, when the plan has grown past a plan-growth signal and the
+primary raises a **new** edge case every round: each planner revision patches
+that one case and the plan grows. Under `--plan-review-policy primary-then-panel`
+two flags make the loop act on that pattern earlier. The trigger is code; the
+content of the alternative stays with the planner and the reviewers.
+
+- `--plan-step-back-rounds K` (default 2, `0` disables). When the current one-shot
+  plan has crossed a plan-growth signal and the primary has blocked K consecutive
+  rounds on **new** mandatory findings since the crossing, the next planner turn
+  is a dedicated simplify-or-re-scope revision. It must not patch the newest
+  finding: it proposes a materially simpler alternative design (or, when
+  `--plan-execution-mode` is `auto`, `plan-only`, or `implement-by-phase`, a split
+  into stages, with scope-ledger preservation still enforced), states the
+  trade-offs, and says which prior findings the alternative dissolves or defers.
+  Under `implement-one-shot` a split cannot become staged execution in the same
+  run, so the planner offers a simpler one-shot design or an explicit caveat
+  recommending that the issue be re-filed as staged work. Reviewers of that
+  candidate are told to judge the alternative on its merits. Blocks that only
+  repeat an unresolved finding, and findings classified as future follow-ups,
+  do not count.
+- `--plan-step-back-escalation-rounds M` (default 2, minimum 1). After a step-back,
+  once the primary has blocked M rounds since it (the block of the step-back
+  candidate itself is the first, so `1` stops as soon as the simplify turn is
+  rejected), the run stops with a human-decision-required diagnostic instead of
+  running to `--plan-primary-stall-rounds`. It shows the current growth
+  measurements, the step-back round, and an excerpt of the latest alternative. No
+  planner turn runs after it, and the stop writes no record a resume could read as
+  a checkpoint. Whichever of this stop and the stall stop is reached first wins.
+
+To continue after the stop, pick one: continue patching (rerun with
+`--plan-step-back-rounds 0`, or `--plan-reset-stall-streak`, which also ends the
+episode); adopt the simpler alternative (narrow the issue text, which ends the
+episode through the issue-digest change); or split (rerun with
+`--plan-execution-mode auto`, or re-file the issue as staged work). A primary
+approval of the step-back candidate, a panel opening, a reset, or an issue edit
+ends the episode and re-arms the trigger from fresh blocks. Both flags require
+`--plan-review-policy primary-then-panel` when set to a non-default value, and
+child-planning cycles inherit them. The approval-time plan-growth gate is
+unchanged: a crossed one-shot plan still cannot be approved without a reviewed
+`one_shot_growth_justification`.
+
+The state is derived from durable round records, so a resumed run triggers and
+stops at exactly the same K and M. The orchestrator records the step-back turn
+as a reviewer-owned `step_back_entries` field on the planner record; a malformed
+entry suppresses the trigger and the stop with a log line rather than failing the
+run.
+
 #### Qualified panel evidence
 
 A qualified panel opening is derived from comment order: an operator-sourced

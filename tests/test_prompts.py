@@ -5155,3 +5155,83 @@ def test_plan_review_prompt_keeps_empty_disposition_example_when_none_surfaced(t
     prompt = build_plan_review_prompt(56, 1, "Plan.", config, reviewer="codex", compact_context=compact)
     assert '"human_requirement_dispositions": []' in prompt
     assert '"requirement_id"' not in prompt
+
+
+# --- Plan step-back guidance in every prompt branch (#1251) -----------------------
+
+from coding_review_agent_loop.review_step_back import PlanStepBackContext  # noqa: E402
+from coding_review_agent_loop.prompts import build_plan_review_prompt  # noqa: E402
+
+
+def _step_back_context(mode="implement-one-shot"):
+    return PlanStepBackContext(
+        measurements="Plan-growth measurements: canonical plan size 130744 characters.",
+        findings=("[item-3] (round 3) Gate the budget per call.",),
+        execution_mode=mode,
+        streak=2,
+    )
+
+
+def _step_back_revision_prompts(config, context):
+    semantic = build_plan_revision_prompt(
+        1251, 4, "Authenticated prior plan.", "Blocking review.", config,
+        response_form="semantic-patch-v1", base_round_number=3,
+        base_state_identity="a" * 64, step_back_context=context,
+    )
+    compact = build_plan_revision_prompt(
+        1251, 4, "Previous plan", "Blocking review", config,
+        compact_context=True, step_back_context=context,
+    )
+    full = build_plan_revision_prompt(
+        1251, 4, "Previous plan", "Blocking review", config, step_back_context=context,
+    )
+    return {"semantic-patch": semantic, "compact": compact, "full": full}
+
+
+def test_step_back_context_appears_in_every_revision_prompt_branch(tmp_path):
+    """`plan-prompt-branches`: semantic-patch, compact and full planner prompts."""
+    config = make_config(tmp_path)
+    for branch, prompt in _step_back_revision_prompts(config, _step_back_context()).items():
+        assert "STEP-BACK REVISION" in prompt, branch
+        assert "Patching the newest finding is not an acceptable response" in prompt, branch
+        assert "[item-3] (round 3) Gate the budget per call." in prompt, branch
+        assert "canonical plan size 130744 characters" in prompt, branch
+        assert "which prior findings the alternative dissolves or defers" in prompt, branch
+        # The step-back block precedes the review payload it replaces as the frame.
+        assert prompt.index("STEP-BACK REVISION") < prompt.index("Blocking review"), branch
+
+
+def test_ordinary_revision_prompts_carry_no_step_back_text(tmp_path):
+    config = make_config(tmp_path)
+    for branch, prompt in _step_back_revision_prompts(config, None).items():
+        assert "STEP-BACK" not in prompt, branch
+
+
+def test_step_back_options_depend_on_the_execution_mode(tmp_path):
+    """`plan-mode-specific-prompt`."""
+    config = make_config(tmp_path)
+    one_shot = _step_back_revision_prompts(config, _step_back_context("implement-one-shot"))
+    auto = _step_back_revision_prompts(config, _step_back_context("auto"))
+    for branch in one_shot:
+        assert "re-filed as staged work" in one_shot[branch], branch
+        assert "split cannot become staged execution" in one_shot[branch], branch
+        assert "Scope-ledger preservation still applies" not in one_shot[branch], branch
+        assert "Scope-ledger preservation still applies" in auto[branch], branch
+        assert "split cannot become staged execution" not in auto[branch], branch
+
+
+def test_step_back_review_notice_appears_in_both_review_prompt_branches(tmp_path):
+    """`plan-prompt-branches`: compact and full plan review prompts."""
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    for compact in (False, True):
+        with_notice = build_plan_review_prompt(
+            1251, 5, "Plan.", config, reviewer="codex", compact_context=compact,
+            step_back_review_notice=True,
+        )
+        without = build_plan_review_prompt(
+            1251, 5, "Plan.", config, reviewer="codex", compact_context=compact,
+        )
+        assert "Step-back notice" in with_notice
+        assert "Judge the alternative on its merits" in with_notice
+        assert "whether the direction is acceptable" in with_notice
+        assert "Step-back notice" not in without

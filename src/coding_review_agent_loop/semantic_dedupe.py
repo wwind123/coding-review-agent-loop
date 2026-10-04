@@ -191,7 +191,11 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
     isolated: Path | None = None
     try:
         isolated = Path(tempfile.mkdtemp(prefix="coding-review-followup-dedupe-"))
-        from .config import DEFAULT_PLAN_PRIMARY_STALL_ROUNDS
+        from .config import (
+            DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
+            DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
+            DEFAULT_PLAN_STEP_BACK_ROUNDS,
+        )
 
         values: dict[str, object] = {
             "coder": backend,
@@ -221,6 +225,8 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
             "plan_review_force_full": False,
             "plan_reset_stall_streak": False,
             "plan_primary_stall_rounds": DEFAULT_PLAN_PRIMARY_STALL_ROUNDS,
+            "plan_step_back_rounds": DEFAULT_PLAN_STEP_BACK_ROUNDS,
+            "plan_step_back_escalation_rounds": DEFAULT_PLAN_STEP_BACK_ESCALATION_ROUNDS,
         }
         if backend == "claude":
             values["claude_model"] = model
