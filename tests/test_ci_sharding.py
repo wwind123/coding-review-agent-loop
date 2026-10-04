@@ -195,23 +195,79 @@ def test_d(): pass
     assert data["test_suite.py::test_a"] >= 0.15
 
 
-def test_nested_session_does_not_clobber_outer_outputs(pytester, shard_env, tmp_path, monkeypatch):
-    """The conftest scrubs shard variables, so a nested session stays inert."""
-    outer = tmp_path / "outer" / "manifest.json"
-    outer.parent.mkdir()
-    outer.write_text("outer-bytes")
-    # Variables are scrubbed for every test (see conftest); a nested run
-    # launched here therefore sees none of them.
-    assert "CI_SHARD_INDEX" not in os.environ and "CI_SHARD_MANIFEST" not in os.environ
-    pytester.makepyfile(test_suite=SUITE)
+OUTER_CONFTEST = """
+import pytest
+from _ci_shard import SHARD_ENV_VARS
+
+pytest_plugins = ["pytester"]
+
+
+@pytest.fixture(autouse=True)
+def _scrub(monkeypatch):
+    for name in SHARD_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+"""
+
+OUTER_TEST = """
+import json
+import os
+from pathlib import Path
+
+
+def test_nested_sessions(pytester, monkeypatch):
+    manifest = Path(os.environ["OUTER_MANIFEST"])
+    before = manifest.read_bytes()
+    pytester.makepyfile(test_inner=\"\"\"
+def test_1(): pass
+def test_2(): pass
+def test_3(): pass
+\"\"\")
+    # No opt-in: the scrubbed environment keeps the nested session inert.
     result = pytester.runpytest_inprocess("-p", "_ci_shard", "-q")
-    result.assert_outcomes(passed=5)
-    assert outer.read_text() == "outer-bytes"
-    # Explicit opt-in writes only to its own private outputs.
-    private = tmp_path / "private" / "manifest.json"
-    shard_env(CI_SHARD_INDEX=1, CI_SHARD_COUNT=2, CI_SHARD_MANIFEST=private)
+    result.assert_outcomes(passed=3)
+    # Opt-in with private outputs only.
+    private = Path(os.environ["PRIVATE_DIR"])
+    monkeypatch.setenv("CI_SHARD_INDEX", "1")
+    monkeypatch.setenv("CI_SHARD_COUNT", "2")
+    monkeypatch.setenv("CI_SHARD_MANIFEST", str(private / "manifest.json"))
+    monkeypatch.setenv("CI_SHARD_STORE_DURATIONS", str(private / "durations.json"))
     pytester.runpytest_inprocess("-p", "_ci_shard", "-q")
-    assert private.exists() and outer.read_text() == "outer-bytes"
+    assert (private / "manifest.json").exists()
+    assert manifest.read_bytes() == before
+
+
+def test_filler_a(): pass
+def test_filler_b(): pass
+"""
+
+
+@pytest.mark.parametrize("workers", [None, "2"])
+def test_nested_sessions_cannot_clobber_outer_sharded_outputs(pytester, shard_env, tmp_path, workers):
+    if workers:
+        pytest.importorskip("xdist")
+    pytester.makeconftest(OUTER_CONFTEST)
+    pytester.makepyfile(test_outer=OUTER_TEST)
+    outer_manifest = tmp_path / "outer" / "manifest.json"
+    outer_durations = tmp_path / "outer" / "durations.json"
+    private = tmp_path / "private"
+    private.mkdir()
+    # Count 1 keeps every outer test (including the nested-launching one) in this shard.
+    shard_env(
+        CI_SHARD_INDEX=1, CI_SHARD_COUNT=1, CI_SHARD_MANIFEST=outer_manifest,
+        CI_SHARD_STORE_DURATIONS=outer_durations, OUTER_MANIFEST=outer_manifest,
+        PRIVATE_DIR=private,
+    )
+    args = ["-p", "_ci_shard", "-q"] + (["-n", workers] if workers else [])
+    result = pytester.runpytest_subprocess(*args)
+    assert result.ret == 0, result.stdout.str()
+    manifest = json.loads(outer_manifest.read_text())
+    assert manifest["selected_ids"] == sorted(manifest["selected_ids"])
+    assert all(i.startswith("test_outer.py::") for i in manifest["selected_ids"])
+    assert manifest["full_collection_size"] == 3
+    durations = json.loads(outer_durations.read_text())
+    assert set(durations) == set(manifest["selected_ids"])
+    assert not any("test_inner" in key for key in durations)
+    assert json.loads((private / "manifest.json").read_text())["full_collection_size"] == 3
 
 
 def test_ownership_comes_from_session_state_not_inherited_env(monkeypatch):
