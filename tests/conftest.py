@@ -126,3 +126,6 @@ def _isolate_store_locks(tmp_path_factory):
     run_worktrees._set_store_lock_root_for_tests(tmp_path_factory.mktemp("workdir-stores"))
     yield
     run_worktrees._set_store_lock_root_for_tests(None)
+
+
+pytest_plugins = ["_ci_shard"]

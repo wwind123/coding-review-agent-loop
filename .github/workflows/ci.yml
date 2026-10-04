@@ -38,7 +38,7 @@ on:
 run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.managed_nonce != '' && format('managed-ci-v2 nonce={0}', inputs.managed_nonce) || github.workflow }}
 
 jobs:
-  test:
+  test-shard:
     # The expression is fail-open.  Only a complete, trusted, same-repository
     # managed draft may suppress a matrix.  `opened` is checked without the
     # label because the opening event can race the separate label write;
@@ -61,10 +61,18 @@ jobs:
           (github.event.action == 'opened' ||
            ((github.event.action == 'synchronize' || github.event.action == 'reopened') &&
             contains(github.event.pull_request.labels.*.name, 'agent-loop-managed'))))))
-    name: Python 3.12 full suite
+    name: Python 3.12 full suite (shard ${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     permissions:
       contents: read
+    env:
+      CI_SHARD_INDEX: ${{ matrix.shard }}
+      CI_SHARD_COUNT: 3
+      CI_SHARD_MANIFEST: shard-manifest/manifest.json
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -72,6 +80,45 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -e '.[dev]'
       - run: python -m pytest -n auto
+      # Only passing legs publish a manifest; the attempt suffix keeps a
+      # "Re-run failed jobs" attempt from colliding with retained artifacts.
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: shard-manifest-full-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: shard-manifest/manifest.json
+          if-no-files-found: error
+
+  # Aggregate keeping the original check name (#1235).  The literal gate runs
+  # no repository code, so a PR-modified verifier can never turn a non-success
+  # shard result into success.  The verifier comes from the trusted workflow
+  # revision (github.sha), never from the tested commit.
+  test:
+    needs: test-shard
+    if: always() && needs.test-shard.result != 'skipped'
+    name: Python 3.12 full suite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SHARD_RESULT: ${{ needs.test-shard.result }}
+    steps:
+      - name: Require every shard to succeed
+        run: test "$SHARD_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: tests/ci_shard_verify.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-manifest-full-*
+          path: shard-manifests
+      - name: Verify exactly-once shard coverage
+        run: python tests/ci_shard_verify.py shard-manifests --count 3 --head ${{ github.sha }} --run-id ${{ github.run_id }} --result "$SHARD_RESULT"
 
   validate-managed:
     # All-empty manual dispatch is ordinary CI.  Every partial or non-empty
@@ -486,16 +533,26 @@ jobs:
           print('Managed dispatch validated for the exact live PR head.')
           PY
 
-  exact-head:
+  exact-head-shard:
     needs: validate-managed
     if: needs.validate-managed.result == 'success'
-    name: Test validated exact head
+    name: Test validated exact head (shard ${{ matrix.shard }}/3)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    # One group per shard: GitHub keeps a single pending job per group, so a
+    # shared group would replace (cancel) sibling legs.
     concurrency:
-      group: managed-ci-v2-pr-${{ needs.validate-managed.outputs.pr_number }}-head-${{ needs.validate-managed.outputs.target_sha }}
+      group: managed-ci-v2-pr-${{ needs.validate-managed.outputs.pr_number }}-head-${{ needs.validate-managed.outputs.target_sha }}-shard-${{ matrix.shard }}
       cancel-in-progress: false
     permissions:
       contents: read
+    env:
+      CI_SHARD_INDEX: ${{ matrix.shard }}
+      CI_SHARD_COUNT: 3
+      CI_SHARD_MANIFEST: shard-manifest/manifest.json
     steps:
       - uses: actions/checkout@v4
         with:
@@ -510,6 +567,42 @@ jobs:
         run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
       - run: python -m pip install -e '.[dev]'
       - run: python -m pytest -n auto
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: shard-manifest-exact-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: shard-manifest/manifest.json
+          if-no-files-found: error
+
+  # Aggregate keeping the original check name; publish-exact-head reads this
+  # job's result.  It never checks out target_sha: PR-controlled code must not
+  # decide the result the publisher sees.
+  exact-head:
+    needs: [validate-managed, exact-head-shard]
+    if: always() && needs.validate-managed.result == 'success'
+    name: Test validated exact head
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SHARD_RESULT: ${{ needs.exact-head-shard.result }}
+    steps:
+      - name: Require every shard to succeed
+        run: test "$SHARD_RESULT" = success
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: tests/ci_shard_verify.py
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-manifest-exact-*
+          path: shard-manifests
+      - name: Verify exactly-once shard coverage
+        run: python tests/ci_shard_verify.py shard-manifests --count 3 --head ${{ needs.validate-managed.outputs.target_sha }} --run-id ${{ github.run_id }} --result "$SHARD_RESULT"
 
   publish-exact-head:
     needs: [validate-managed, exact-head]
