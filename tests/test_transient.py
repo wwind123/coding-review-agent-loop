@@ -240,3 +240,10 @@ def test_reset_parsing_reexports_are_identical() -> None:
             [sys.executable, "-c", order], env={"PYTHONPATH": root}, capture_output=True, text=True
         )
         assert proc.returncode == 0, proc.stderr
+
+
+def test_sparse_newline_head_header_has_no_frame() -> None:
+    text = "Error: quota exceeded, try again in 4h\n" + "x" * 3000
+    capacity, quota = _classify(text)
+    assert capacity.is_capacity and capacity.frame == ""
+    assert quota is None

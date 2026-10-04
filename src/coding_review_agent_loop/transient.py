@@ -246,8 +246,10 @@ def classify_antigravity_capacity(
                     "\n".join(chunk) for chunk, _last in window_frames
                     if chunk[0].strip() == line
                 ]
+                # No verified raw-window frame (e.g. the header only survives in
+                # the head/tail splice): keep capacity, never exhaustion provenance.
                 return AntigravityCapacityClassification(
-                    True, diagnostic, header_frames[-1] if header_frames else line
+                    True, diagnostic, header_frames[-1] if header_frames else ""
                 )
 
     # Older agy versions emitted bare provider diagnostics (for example,

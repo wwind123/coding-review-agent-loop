@@ -104,3 +104,135 @@ def test_resume_before_reconciliation_posts_note_exactly_once(tmp_path):
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     posted = [c for c in runner.comments if "reconciliation" in c]
     assert len(posted) == 1 and "both reviewed with shared-model-1" in posted[0]
+
+
+# --- loop-level publication contract (#1236) --------------------------------
+
+from coding_review_agent_loop import pr_loop, plan_first_loop
+
+AGY_QUOTA = (
+    "error: RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).",
+    1,
+)
+NOTE_OPUS = "note: Claude and Antigravity both reviewed with Claude Opus 5.5"
+
+
+def _agent_calls(runner):
+    return [c[0] for c, _cwd in runner.commands if c and c[0] in {"claude", "codex", "gemini", "agy"}]
+
+
+def _fallback_pair_runner(*, fall_back: bool, plan: bool = False):
+    if plan:
+        from test_review_parallel import _initial_plan
+
+        review = structured_plan_review(summary="Plan ok.", reviewer="Google Antigravity")
+        claude_review = structured_plan_review(summary="Claude plan ok.", reviewer="Claude")
+        outputs = {"codex_outputs": [_initial_plan()]}
+    else:
+        review = structured_pr_review(summary="Agy ok.", reviewer="Google Antigravity")
+        claude_review = structured_pr_review(summary="Claude ok.", reviewer="Claude")
+        outputs = {}
+    agy = ([AGY_QUOTA] if fall_back else []) + [(review, 0)]
+    return FakeRunner(claude_outputs=[claude_review], antigravity_outputs=agy, **outputs)
+
+
+def _pair_config(tmp_path, parallel, plan=False):
+    return make_config(
+        tmp_path, reviewer=("claude", "antigravity"), claude_model="claude-opus-5-5",
+        coder="codex", review_parallel=parallel,
+    )
+
+
+def _run(kind, runner, config):
+    if kind == "pr":
+        return run_pr_loop(runner, pr_number=77, config=config)
+    return run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+
+@pytest.mark.parametrize("kind", ["pr", "plan"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_claude_agy_opus_fallback_pair_posts_note_once_and_resume_is_idempotent(
+    tmp_path, kind, parallel
+):
+    runner = _fallback_pair_runner(fall_back=True, plan=kind == "plan")
+    config = _pair_config(tmp_path, parallel)
+    logs: list[str] = []
+    module = pr_loop if kind == "pr" else plan_first_loop
+    with patch.object(module, "log", lambda _c, m: logs.append(m)):
+        assert _run(kind, runner, config) == 0
+    posted = [c for c in runner.comments if "reconciliation" in c]
+    assert len(posted) == 1 and NOTE_OPUS in posted[0]
+    assert any(NOTE_OPUS in line for line in logs)
+    calls = _agent_calls(runner)
+    # Resume after the summary was posted: no re-invocation and no duplicate.
+    assert _run(kind, runner, config) == 0
+    assert _agent_calls(runner) == calls
+    assert len([c for c in runner.comments if "reconciliation" in c]) == 1
+
+
+@pytest.mark.parametrize("kind", ["pr", "plan"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_resolved_models_not_configured_models_decide_the_note(tmp_path, kind, parallel):
+    # Opus is in the configured chain, but agy served Gemini: no shared model.
+    runner = _fallback_pair_runner(fall_back=False, plan=kind == "plan")
+    config = _pair_config(tmp_path, parallel)
+    assert _run(kind, runner, config) == 0
+    assert not any("reviewed with" in c for c in runner.comments)
+    if not parallel:
+        assert not any("reconciliation" in c for c in runner.comments)
+
+
+@pytest.mark.parametrize("kind", ["pr", "plan"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_resume_before_reconciliation_posts_note_once(tmp_path, kind, parallel):
+    runner = _fallback_pair_runner(fall_back=True, plan=kind == "plan")
+    config = _pair_config(tmp_path, parallel)
+    attr = "post_pr_comment" if kind == "pr" else "post_issue_comment"
+    real_post = getattr(orchestrator, attr)
+
+    def interrupt(*args, **kwargs):
+        if "reconciliation" in kwargs["body"]:
+            raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    with patch.object(orchestrator, attr, side_effect=interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            _run(kind, runner, config)
+    assert not any("reconciliation" in c for c in runner.comments)
+    calls = _agent_calls(runner)
+    assert _run(kind, runner, config) == 0
+    assert _agent_calls(runner) == calls  # same-round reviews resumed, not re-invoked
+    posted = [c for c in runner.comments if "reconciliation" in c]
+    assert len(posted) == 1 and NOTE_OPUS in posted[0]
+
+
+def test_carried_prior_round_approval_never_contributes_and_note_resets_per_round(tmp_path):
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(summary="Codex ok.")] * 3,
+        gemini_outputs=[structured_pr_review(summary="G ok.", reviewer="Google Gemini")],
+        antigravity_outputs=[
+            (structured_pr_review(
+                state="blocking", summary="A blocks.", reviewer="Google Antigravity",
+                blocking_items=["Fix it."]), 0),
+            (structured_pr_review(
+                summary="A ok.", reviewer="Google Antigravity",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}]), 0),
+        ],
+        claude_outputs=[structured_coder_followup(summary="Fixed.", addressed_items=["item-1"])],
+    )
+    runner.advance_pr_head_on_coder_followup = False
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="primary-then-panel", primary_reviewer="codex",
+        gemini_model="shared-model-1", antigravity_models=("shared-model-1",), max_rounds=6,
+    )
+    logs: list[str] = []
+    with patch.object(pr_loop, "log", lambda _c, m: logs.append(m)):
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    # Round 2: Gemini and Antigravity both reviewed fresh; round 3: Gemini's
+    # approval is only carried, so no note even though the models match.
+    notes = [c for c in runner.comments if "reviewed with shared-model-1" in c]
+    assert len(notes) == 1 and "reconciliation: settled reviewers: Antigravity, Gemini" in notes[0]
+    round3 = next(c for c in runner.comments if c.startswith("PR review round 3 reconciliation"))
+    assert "reviewed with" not in round3
+    assert sum("reviewed with shared-model-1" in line for line in logs) == 1

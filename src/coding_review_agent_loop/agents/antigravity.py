@@ -80,6 +80,7 @@ class _QuotaGroupEntry:
     source: str
     frame: str
     failed_attempt_seconds: float
+    seq: int = 0
 
 
 def _now() -> float:
@@ -94,6 +95,7 @@ class AntigravityQuotaGroupMemory:
         self._clock = clock if clock is not None else _now
         self._lock = threading.Lock()
         self._entries: dict[str, _QuotaGroupEntry] = {}
+        self._seq = 0
 
     def _utc(self, expires_at: float) -> str:
         moment = datetime.now(timezone.utc) + timedelta(seconds=expires_at - self._clock())
@@ -116,7 +118,10 @@ class AntigravityQuotaGroupMemory:
             current = self._entries.get(group)
             if current is not None and current.expires_at >= expires_at:
                 return
-            self._entries[group] = _QuotaGroupEntry(expires_at, source, frame, failed_attempt_seconds)
+            self._seq += 1
+            self._entries[group] = _QuotaGroupEntry(
+                expires_at, source, frame, failed_attempt_seconds, self._seq
+            )
             detail = "parsed reset" if source == "parsed" else f"cooldown {cooldown_seconds}s"
             message = (
                 f"Antigravity quota group {group} exhausted until {self._utc(expires_at)} ({detail})"
@@ -167,11 +172,9 @@ class AntigravityQuotaGroupMemory:
         return self._utc(min(times)) if times else "unknown"
 
     def last_frame(self, groups) -> str:
-        for group in reversed(tuple(dict.fromkeys(groups))):
-            entry = self.entry(group)
-            if entry is not None and entry.frame:
-                return entry.frame
-        return ""
+        """Frame of the most recently recorded exhaustion among ``groups``."""
+        entries = [e for g in dict.fromkeys(groups) if (e := self.entry(g)) is not None and e.frame]
+        return max(entries, key=lambda e: e.seq).frame if entries else ""
 
 
 _run_memories: dict[str, AntigravityQuotaGroupMemory] = {}
@@ -216,6 +219,7 @@ class AntigravityAttemptState:
     exhaustion_jumps: int = 0
     config: "AgentLoopConfig | None" = None
     models_tried: list[str] = field(default_factory=list)
+    last_frame: str = ""
 
     def __post_init__(self) -> None:
         if not self.groups:
@@ -285,6 +289,7 @@ class AntigravityAttemptState:
         """
         self.attempts += 1
         group = self.groups[self.model_index]
+        self.last_frame = quota.frame
         self.memory.mark_exhausted(
             group,
             quota.reset_seconds,
@@ -310,7 +315,7 @@ class AntigravityAttemptState:
         return self.memory.earliest_expiry(self.groups)
 
     def unavailable_message(self, shared_limit: bool = False) -> str:
-        frame = self.memory.last_frame(self.groups).strip().splitlines()
+        frame = (self.last_frame or self.memory.last_frame(self.groups)).strip().splitlines()
         first_line = frame[0] if frame else "provider quota exhausted"
         message = (
             f"Antigravity unavailable on all models: {first_line}; "
