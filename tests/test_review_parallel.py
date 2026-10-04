@@ -4217,3 +4217,183 @@ def test_plan_secondary_remediation_verdict_is_a_peer_beside_the_retained_gate(t
     assert "Gemini already posted" in message and "provisional" not in message, message
     assert "Gemini review (round 3)" in message
     assert "Codex review" not in message
+
+
+def _frozen_carriers(config):
+    carriers = []
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "publication" in payload:
+            carriers.append(payload["publication"])
+    return carriers
+
+
+def test_pr_parallel_rerun_resumes_the_frozen_publication_without_reinvoking(tmp_path):
+    import coding_review_agent_loop.github as github_module
+
+    markers = ("Codex found a blocker.", "Gemini approves independently.")
+    runner, _ = _pr_partial_round_runner()
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    real_post = orchestrator.post_pr_comment
+    state = {"reviews": 0}
+
+    def fail_second_review_body(*args, **kwargs):
+        if any(marker in str(kwargs["body"]) for marker in markers):
+            state["reviews"] += 1
+            if state["reviews"] == 2:
+                # The carrier is frozen, then the outage hits before the first post.
+                with patch.object(github_module, "_post_comment_body", side_effect=KeyboardInterrupt):
+                    return real_post(*args, **kwargs)
+        return real_post(*args, **kwargs)
+
+    with patch.object(orchestrator, "post_pr_comment", side_effect=fail_second_review_body):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert sorted(_published_count(runner, marker) for marker in markers) == [0, 1]
+    carriers = _frozen_carriers(config)
+    assert len(carriers) == 1 and carriers[0]["actor_id"] == 7 and carriers[0]["bodies"]
+    frozen_body = carriers[0]["bodies"][-1]
+    launches_before = len(runner.reviewer_launches)
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    rerun_launches = runner.reviewer_launches[launches_before:]
+    assert rerun_launches.count("gemini") == 1 and rerun_launches.count("codex") == 1  # round 2 only
+    assert [_published_count(runner, marker) for marker in markers] == [1, 1]
+    # The frozen body itself was published verbatim, exactly once.
+    assert sum(comment["body"] == frozen_body for comment in runner.pr_payload["comments"]) == 1
+    assert _spool_files(config) == []
+
+
+def test_pr_parallel_rerun_under_a_different_actor_stops_without_posts_or_reviewers(tmp_path):
+    import coding_review_agent_loop.github as github_module
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    markers = ("Codex found a blocker.", "Gemini approves independently.")
+    runner, _ = _pr_partial_round_runner()
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    real_post = orchestrator.post_pr_comment
+    state = {"reviews": 0}
+
+    def fail_second_review_body(*args, **kwargs):
+        if any(marker in str(kwargs["body"]) for marker in markers):
+            state["reviews"] += 1
+            if state["reviews"] == 2:
+                with patch.object(github_module, "_post_comment_body", side_effect=KeyboardInterrupt):
+                    return real_post(*args, **kwargs)
+        return real_post(*args, **kwargs)
+
+    with patch.object(orchestrator, "post_pr_comment", side_effect=fail_second_review_body):
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    launches_before = len(runner.reviewer_launches)
+    comments_before = len(runner.pr_payload["comments"])
+    runner.authenticated_actor = ("someone-else", 99)
+    orchestrator.reset_authenticated_github_actor(runner)
+
+    with pytest.raises(PublicationResumeStop, match="id 99"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert runner.reviewer_launches[launches_before:] == []
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert len(_frozen_carriers(config)) == 1
+
+
+def _interrupt_plan_second_review_after_freezing(runner, config, markers):
+    import coding_review_agent_loop.github as github_module
+
+    real_post = orchestrator.post_issue_comment
+    state = {"reviews": 0}
+
+    def fail_second_review_body(*args, **kwargs):
+        if any(marker in str(kwargs["body"]) for marker in markers):
+            state["reviews"] += 1
+            if state["reviews"] == 2:
+                with patch.object(github_module, "_post_comment_body", side_effect=KeyboardInterrupt):
+                    return real_post(*args, **kwargs)
+        return real_post(*args, **kwargs)
+
+    with patch.object(orchestrator, "post_issue_comment", side_effect=fail_second_review_body):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+
+def test_plan_parallel_rerun_resumes_the_frozen_publication_without_reinvoking(tmp_path):
+    runner, markers = _plan_partial_round_runner()
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_plan_second_review_after_freezing(runner, config, markers)
+    assert sorted(_published_count(runner, marker) for marker in markers) == [0, 1]
+    carriers = _frozen_carriers(config)
+    assert len(carriers) == 1 and carriers[0]["actor_id"] == 7
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    assert sorted(runner.reviewer_launches) == ["codex", "gemini"]
+    assert not runner.peer_body_visible_at_launch
+    assert [_published_count(runner, marker) for marker in markers] == [1, 1]
+    assert _spool_files(config) == []
+
+
+def test_plan_parallel_rerun_with_a_changed_validation_context_stops_before_any_launch(tmp_path):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, markers = _plan_partial_round_runner()
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_plan_second_review_after_freezing(runner, config, markers)
+    launches_before = list(runner.reviewer_launches)
+    comments_before = len(runner.issue_comments)
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if "publication" in payload:
+            payload["publication"]["validation_context_digest"] = "0" * 64
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(PublicationResumeStop, match="validation context"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert runner.reviewer_launches == launches_before
+    assert len(runner.issue_comments) == comments_before
+    assert len(_frozen_carriers(config)) == 1
+
+
+def test_pr_parallel_legacy_record_with_foreign_sidecar_stops_before_any_post_or_launch(tmp_path):
+    from coding_review_agent_loop.publication_resume import PublicationResumeStop
+
+    runner, markers = _pr_partial_round_runner()
+    runner.authenticated_actor = ("agent-bot", 7)
+    runner.serve_rest_issue_comments = True
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_pr_round_between_publications(runner, config, markers)
+    # Age the surviving record into the pre-carrier format.
+    legacy = 0
+    for path in _spool_files(config):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload.pop("carrier_protocol", None)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        legacy += 1
+    assert legacy == 1
+    # An earlier invocation, authenticated as a different actor, left a sidecar.
+    runner.pr_payload.setdefault("comments", []).append({
+        "author": {"login": "old-bot"}, "_rest_author_id": 99,
+        "createdAt": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "body": "Agent-loop review attachment 1/1 <!-- AGENT_LOOP_SIDECAR: e30= -->",
+    })
+    launches_before = list(runner.reviewer_launches)
+    comments_before = len(runner.pr_payload["comments"])
+
+    with pytest.raises(PublicationResumeStop, match="old-bot"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert runner.reviewer_launches == launches_before
+    assert len(runner.pr_payload["comments"]) == comments_before
+    assert len(_spool_files(config)) == 1

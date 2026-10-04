@@ -39,6 +39,7 @@ from .round_state import (
     _extract_round_metadata_records,
 )
 from .partial_round_recovery import PartialRoundRecovery, RecoveryTarget
+from .publication_resume import PublicationResumeStop
 from .review_spool import ReviewRoundSpool, review_spool_root
 from .agent_failure import ValidatedAgentResponse
 from .architecture_contract import (
@@ -947,6 +948,16 @@ def _launch_reviewer_turns(
                 if failure is not None
                 else replay_turn(reviewer, fields)
             )
+            if result is None and spool.publication_state(reviewer_name)[0] in {"carrier", "malformed"}:
+                # A frozen publication may already be partly public: a fresh
+                # turn would read its own sidecars, and an unvalidated body must
+                # never be published.  Stop with the record kept (#1258).
+                raise PublicationResumeStop(
+                    f"{reviewer_name}'s frozen same-round publication no longer validates in "
+                    "this run's context, so it cannot be resumed. The spool record was kept, "
+                    "nothing was posted, and no reviewer was launched; repair the round with "
+                    "the partial-round recovery list (#1142)."
+                )
             if result is not None:
                 results[reviewer] = result
                 replayed.add(reviewer)

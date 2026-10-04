@@ -49,6 +49,7 @@
   "prompts",
   "protocol",
   "protocol_markers",
+  "publication_resume",
   "pytest_plugin._agent_loop_worker_cap",
   "repair",
   "repair_preservation",

@@ -82,12 +82,14 @@ from .github import (
     post_pr_comment,
     post_trusted_pr_comment,
     read_rest_issue_comments,
+    round_publication,
     reject_forged_protocol_markers,
     validate_open_issue,
     validate_open_pr,
     validate_pr_expected_closing_issues,
     watch_pr_checks,
 )
+from .publication_resume import context_digest as publication_context_digest
 from .issue_pr_handoff import (
     find_latest_issue_pr_handoff,
     post_issue_pr_handoff_comment,
@@ -3421,8 +3423,25 @@ def run_pr_loop(
                     phase = (
                         EVIDENCE_RESPONSE_PHASE if evidence_pass is not None else "authoritative"
                     )
+                # A spooled reviewer's bodies are frozen before the first post so
+                # a rerun after an outage resumes them verbatim (#1258).
+                publication_hook = (
+                    {
+                        "publication": round_publication(
+                            runner, config=config, spool=pr_round_spool,
+                            reviewer_name=reviewer_name, flow="pr", round_number=round_number,
+                            subject=current_pr_subject, surface_kind="pr", number=pr_number,
+                            validation_context=publication_context_digest(
+                                head=current_pr_subject,
+                                surfaced=sorted(str(item) for item in surfaced_reviewer_requirement_ids),
+                            ),
+                        )
+                    }
+                    if phase == "publication" and identity is not None
+                    else {}
+                )
                 post_pr_comment(
-                    runner, config=config, pr_number=pr_number,
+                    runner, config=config, pr_number=pr_number, **publication_hook,
                     body=_attach_round_metadata(
                         render_public_agent_comment(
                             kind="pr_review", parsed=parsed, agent=reviewer_name,

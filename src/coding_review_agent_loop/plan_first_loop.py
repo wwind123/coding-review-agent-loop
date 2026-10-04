@@ -63,8 +63,10 @@ from .github import (
     get_pr_state,
     post_issue_comment,
     read_rest_issue_comments,
+    round_publication,
     validate_pr_body_does_not_close_issue,
 )
+from .publication_resume import context_digest as publication_context_digest
 from .issue_pr_handoff import (
     post_issue_pr_handoff_comment,
     require_pr_metadata_for_handoff,
@@ -2056,8 +2058,27 @@ def _run_plan_first_loop(
             phase: str = "authoritative",
         ) -> None:
             """Post one plan review using the same rendering and durable record."""
+            # A spooled reviewer's bodies are frozen before the first post so a
+            # rerun after an outage resumes them verbatim (#1258).
+            publication_hook = (
+                {
+                    "publication": round_publication(
+                        runner, config=config, spool=plan_round_spool,
+                        reviewer_name=reviewer_name, flow="plan", round_number=round_number,
+                        subject=current_plan_subject, surface_kind="issue", number=issue_number,
+                        validation_context=publication_context_digest(
+                            candidate=(
+                                current_plan_key.as_dict() if staged_planning else current_plan_subject
+                            ),
+                            surfaced=sorted(str(item) for item in plan_hr_ids),
+                        ),
+                    )
+                }
+                if phase == "publication" and identity is not None
+                else {}
+            )
             post_issue_comment(
-                runner, config=config, issue_number=issue_number,
+                runner, config=config, issue_number=issue_number, **publication_hook,
                 body=_attach_round_metadata(
                     render_public_agent_comment(
                         kind="plan_review", parsed=parsed, agent=reviewer_name,

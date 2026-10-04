@@ -135,6 +135,9 @@ class _FooteringHost:
     """Store every posted issue comment with the known host footer."""
 
     def run(self, args, *, cwd, check=True, input_text=None, **_kwargs):
+        if input_text is None:
+            # Reconciliation baseline reads (#510) are unsupported here.
+            return SimpleNamespace(returncode=1, stdout="", stderr="unsupported read")
         posted = json.loads(input_text)["body"]
         envelope = {
             "id": 900,

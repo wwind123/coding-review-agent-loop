@@ -55,6 +55,8 @@ from .protocol_markers import (
     strip_known_host_footer,
 )
 from . import github_retry
+from .publication_resume import RoundPublication
+from .review_spool import ReviewRoundSpool
 from .github_retry import (
     DEFAULT_POLICY,
     GitHubAmbiguousWriteError,
@@ -2619,12 +2621,56 @@ def verify_human_requirement_authors(
     return deduplicate_human_requirements(admitted)
 
 
+def _apply_publication(
+    publication: RoundPublication | None,
+    config: AgentLoopConfig,
+    bodies: Sequence[object],
+) -> tuple[Sequence[object], frozenset[int]]:
+    """Freeze the composed bodies or substitute the frozen ones (#1258)."""
+    if publication is None or config.dry_run:
+        return bodies, frozenset()
+    prepared = publication.prepare(bodies)
+    return prepared.bodies, prepared.already_public
+
+
+def round_publication(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    spool: ReviewRoundSpool,
+    reviewer_name: str,
+    flow: str,
+    round_number: int,
+    subject: str,
+    surface_kind: str,
+    number: int,
+    validation_context: str,
+) -> RoundPublication:
+    """Build the freeze/resume hook for one spooled reviewer's round comment."""
+    surface = comment_thread_surface(surface_kind, number)
+    return RoundPublication(
+        spool=spool,
+        reviewer_name=reviewer_name,
+        flow=flow,
+        round_number=round_number,
+        subject=subject,
+        validation_context=validation_context,
+        surface=surface,
+        resolve_actor=lambda: resolve_authenticated_github_actor(runner, config=config),
+        list_comments=lambda actor: read_complete_comment_listing(
+            runner, config=config, surface=surface, actor=actor
+        ),
+        config=config,
+    )
+
+
 def post_pr_comment(
     runner: Runner,
     *,
     config: AgentLoopConfig,
     pr_number: int,
     body: str | TrustedBody,
+    publication: RoundPublication | None = None,
 ) -> None:
     carrier = body if isinstance(body, TrustedBody) else TrustedBody.current_untrusted_visible(body)
     bodies = prepare_round_comment(carrier)
@@ -2632,8 +2678,12 @@ def post_pr_comment(
         log(config, f"Posting round transport with {len(bodies) - 1} sidecars to PR #{pr_number}")
     log(config, f"Posting agent output to PR #{pr_number}")
     claimed: set[int] = set()
-    for index, prepared in enumerate(bodies, start=1):
+    for prepared in bodies:
         prepared.validate_for_surface(PR_COMMENT_SURFACE)
+    outgoing, already_public = _apply_publication(publication, config, bodies)
+    for index, prepared in enumerate(outgoing, start=1):
+        if index in already_public:
+            continue
         _post_comment_body(
             runner, config=config, command=["pr", "comment", str(pr_number)], body=prepared,
             claimed=claimed, body_index=index,
@@ -2646,6 +2696,7 @@ def post_issue_comment(
     config: AgentLoopConfig,
     issue_number: int,
     body: str | TrustedBody,
+    publication: RoundPublication | None = None,
 ) -> None:
     carrier = body if isinstance(body, TrustedBody) else TrustedBody.current_untrusted_visible(body)
     bodies = prepare_round_comment(carrier)
@@ -2653,8 +2704,12 @@ def post_issue_comment(
         log(config, f"Posting round transport with {len(bodies) - 1} sidecars to issue #{issue_number}")
     log(config, f"Posting agent output to issue #{issue_number}")
     claimed: set[int] = set()
-    for index, prepared in enumerate(bodies, start=1):
+    for prepared in bodies:
         prepared.validate_for_surface(ISSUE_COMMENT_SURFACE)
+    outgoing, already_public = _apply_publication(publication, config, bodies)
+    for index, prepared in enumerate(outgoing, start=1):
+        if index in already_public:
+            continue
         _post_comment_body(
             runner, config=config, command=["issue", "comment", str(issue_number)], body=prepared,
             claimed=claimed, body_index=index,
@@ -3115,7 +3170,9 @@ def read_complete_comment_listing(
         envelopes = _read_comment_pages(
             runner, config=config, surface=surface, number=number, since=since
         )
-    except AgentLoopError as exc:
+    except (AgentLoopError, OSError) as exc:
+        # An unusable working directory (for example a not-yet-cloned checkout)
+        # makes absence unprovable; it never authorizes a replay.
         return UnknownCommentListing(surface=surface, reason=str(exc))
     if actor_id is not None:
         envelopes = [item for item in envelopes if item.author_id == actor_id]

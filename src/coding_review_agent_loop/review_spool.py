@@ -29,6 +29,12 @@ from pathlib import Path
 
 SPOOL_SCHEMA_VERSION = 1
 
+# Written into every record stored from #1258 on.  A record carrying it and no
+# publication carrier provably never began publishing, because the carrier is
+# always persisted before the first post; a record without it is legacy, with
+# unknown publication progress.
+CARRIER_PROTOCOL = 1
+
 # ValidatedAgentResponse fields that are persisted verbatim.  Usage metadata is
 # excluded on purpose: the original invocation already accounted for it.
 SPOOLED_RESPONSE_FIELDS: tuple[str, ...] = (
@@ -85,8 +91,49 @@ class ReviewRoundSpool:
         """Atomically persist one reviewer's validated response fields."""
         self._write(
             reviewer_name,
-            {"response": {name: fields.get(name) for name in SPOOLED_RESPONSE_FIELDS}},
+            {
+                "carrier_protocol": CARRIER_PROTOCOL,
+                "response": {name: fields.get(name) for name in SPOOLED_RESPONSE_FIELDS},
+            },
         )
+
+    def store_publication(self, reviewer_name: str, carrier: dict[str, object]) -> None:
+        """Atomically add a frozen publication carrier to a reviewer's response record.
+
+        Everything else in the record is preserved.  Raises ``ValueError`` when
+        there is no readable response record to attach the carrier to.
+        """
+        payload = self._read_payload(reviewer_name)
+        if payload is None or not isinstance(payload.get("response"), dict):
+            raise ValueError(f"No spooled response record for {reviewer_name} to freeze.")
+        payload = {**payload, "carrier_protocol": CARRIER_PROTOCOL, "publication": carrier}
+        self._replace(reviewer_name, payload)
+
+    def publication_state(self, reviewer_name: str) -> tuple[str, dict[str, object] | None]:
+        """Classify a record's publication progress.
+
+        ``absent``: no valid response record.  ``legacy``: a response record
+        written before the carrier protocol.  ``fresh``: protocol record whose
+        carrier was never frozen.  ``carrier``: a frozen carrier (returned).
+        ``malformed``: a carrier field that is not a mapping.
+        """
+        payload = self._read_payload(reviewer_name)
+        if payload is None or self.load(reviewer_name) is None or "response" not in payload:
+            return "absent", None
+        publication = payload.get("publication")
+        if publication is not None:
+            if not isinstance(publication, dict) or payload.get("carrier_protocol") != CARRIER_PROTOCOL:
+                return "malformed", None
+            return "carrier", publication
+        if payload.get("carrier_protocol") == CARRIER_PROTOCOL:
+            return "fresh", None
+        return "legacy", None
+
+    def record_mtime(self, reviewer_name: str) -> float | None:
+        try:
+            return self._path(reviewer_name).stat().st_mtime
+        except OSError:
+            return None
 
     def store_failure(self, reviewer_name: str, *, message: str, failure_category: str | None) -> None:
         """Atomically persist a failure that settled the reviewer as unavailable."""
@@ -102,6 +149,16 @@ class ReviewRoundSpool:
             "reviewer": reviewer_name,
             **outcome,
         }
+        self._replace(reviewer_name, payload)
+
+    def _read_payload(self, reviewer_name: str) -> dict[str, object] | None:
+        try:
+            payload = json.loads(self._path(reviewer_name).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _replace(self, reviewer_name: str, payload: dict[str, object]) -> None:
         directory = self.directory
         directory.mkdir(parents=True, exist_ok=True)
         try:
