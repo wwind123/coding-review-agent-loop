@@ -79,6 +79,16 @@ class _EchoRunner:
     def run(self, args, *, cwd, check=True, input_text=None, **_kwargs):
         cmd = list(args)
         self.calls.append(cmd)
+        # Reconciliation baseline reads (#510): the actor lookup and an empty listing.
+        if cmd[1:3] == ["api", "user"]:
+            return SimpleNamespace(
+                returncode=0, stderr="",
+                stdout=json.dumps({"login": ACTOR[0], "id": ACTOR[1]}),
+            )
+        if "--method" not in cmd and "--input" not in cmd and any(
+            isinstance(part, str) and "/comments?per_page=" in part for part in cmd
+        ):
+            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
         posted = None
         for part in cmd:
             if isinstance(part, str) and part.startswith("body="):
@@ -323,3 +333,441 @@ def test_footer_log_latch_is_per_invocation(tmp_path, logged):
     reset_host_footer_log_latch()
     note_host_footer_observed(config, "third")
     assert len(logged) == 2
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 of #510: reconciled retry for comment writes (#1258)
+# ---------------------------------------------------------------------------
+
+import datetime as _dt
+import os as _os
+import re as _re
+from pathlib import Path as _Path
+
+from coding_review_agent_loop import github_retry as _github_retry
+from coding_review_agent_loop.github import (
+    CompleteCommentListing,
+    UnknownCommentListing,
+    post_issue_comment,
+    post_pr_comment,
+    post_trusted_pr_contract_record,
+    read_complete_comment_listing,
+)
+from coding_review_agent_loop.github_retry import (
+    GitHubAmbiguousWriteError,
+    GitHubTransientExhaustedError,
+)
+
+OTHER_ACTOR = ("someone-else", 99)
+
+
+def _iso(delta_seconds: float = 0.0) -> str:
+    moment = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=delta_seconds)
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class FakeGitHub:
+    """A stateful comment surface with scripted write outcomes.
+
+    ``script`` is consumed one entry per write: ``ok``; ``fail`` (a 502 that
+    stored nothing); ``accepted`` (a 502 after the comment was stored);
+    ``fail422`` (a permanent failure).  Once the script is spent writes succeed.
+    """
+
+    def __init__(self, script=(), *, actor=ACTOR):
+        self.script = list(script)
+        self.actor = actor
+        self.comments: list[dict] = []
+        self.next_id = 100
+        self.writes: list[list[str]] = []
+        self.listings = 0
+        self.body_paths: list[str] = []
+        self.path_alive_during_write: list[bool] = []
+        self.list_failure_page: int | None = None
+        self.list_malformed_page: int | None = None
+        self.fail_user = False
+        self.duplicate_on_accept = 0
+        self.dry_run = False
+        self.patch_applied: dict[int, str] = {}
+        self.reread_fails = False
+
+    # -- helpers -----------------------------------------------------------
+    def add(self, body, *, author=None, created=None):
+        author = author or self.actor
+        self.next_id += 1
+        comment = {
+            "id": self.next_id,
+            "body": body,
+            "user": {"login": author[0], "id": author[1]},
+            "created_at": created or _iso(),
+            "updated_at": created or _iso(),
+        }
+        self.comments.append(comment)
+        return comment
+
+    def terminate_active_processes(self):  # pragma: no cover - interface parity
+        pass
+
+    @staticmethod
+    def _res(rc, out="", err=""):
+        return SimpleNamespace(returncode=rc, stdout=out, stderr=err, args=[], cwd=None)
+
+    def _write(self, body):
+        action = self.script.pop(0) if self.script else "ok"
+        if action == "fail":
+            return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+        if action == "fail422":
+            return self._res(1, err="HTTP 422: Validation Failed")
+        comment = self.add(body)
+        for _ in range(self.duplicate_on_accept):
+            self.add(body)
+        if action == "accepted":
+            return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+        return self._res(0, out=json.dumps(comment))
+
+    # -- Runner surface ----------------------------------------------------
+    def run(self, args, *, cwd, check=True, input_text=None, env=None):
+        cmd = [str(part) for part in args]
+        if cmd[1:3] == ["api", "user"]:
+            if self.fail_user:
+                return self._res(1, err="HTTP 401: Bad credentials")
+            return self._res(0, out=json.dumps({"login": self.actor[0], "id": self.actor[1]}))
+        joined = " ".join(cmd)
+        match = _re.search(r"issues/(\d+)/comments\?per_page=100&page=(\d+)", joined)
+        if match and "--method" not in cmd:
+            self.listings += 1
+            page = int(match.group(2))
+            if self.list_failure_page == page:
+                return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+            if self.list_malformed_page == page:
+                return self._res(0, out="{not json")
+            ordered = sorted(self.comments, key=lambda item: item["id"])
+            return self._res(0, out=json.dumps(ordered[(page - 1) * 100 : page * 100]))
+        match = _re.search(r"issues/comments/(\d+)", joined)
+        if match and "--method" not in cmd:
+            if self.reread_fails:
+                return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+            for comment in self.comments:
+                if comment["id"] == int(match.group(1)):
+                    return self._res(0, out=json.dumps(comment))
+            return self._res(1, err="HTTP 404: Not Found")
+        if "--method" in cmd and cmd[cmd.index("--method") + 1] == "PATCH":
+            comment_id = int(match.group(1))
+            target = next(part[5:] for part in cmd if part.startswith("body="))
+            action = self.script.pop(0) if self.script else "ok"
+            self.writes.append(cmd)
+            if action == "fail":
+                return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+            for comment in self.comments:
+                if comment["id"] == comment_id:
+                    comment["body"] = target
+                    if action == "accepted":
+                        return self._res(1, err="non-200 OK status code: 502 Bad Gateway")
+                    return self._res(0, out=json.dumps(comment))
+            return self._res(1, err="HTTP 404: Not Found")
+        # Writes.
+        self.writes.append(cmd)
+        if "--body-file" in cmd:
+            path = cmd[cmd.index("--body-file") + 1]
+            self.body_paths.append(path)
+            self.path_alive_during_write.append(_os.path.exists(path))
+            return self._write(_Path(path).read_text(encoding="utf-8"))
+        if "--body" in cmd:
+            return self._write(cmd[cmd.index("--body") + 1])
+        if input_text is not None:
+            return self._write(json.loads(input_text)["body"])
+        body = next(part[5:] for part in cmd if part.startswith("body="))
+        return self._write(body)
+
+
+@pytest.fixture
+def sleeps(monkeypatch):
+    recorded: list[float] = []
+    monkeypatch.setattr(_github_retry, "_sleep", recorded.append)
+    return recorded
+
+
+@pytest.fixture
+def quiet(monkeypatch):
+    monkeypatch.setattr(github_module, "log", lambda _config, _message: None)
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+
+
+def _cfg(tmp_path, **overrides):
+    return make_config(tmp_path, **overrides)
+
+
+def _bodies(fake):
+    return [comment["body"] for comment in fake.comments]
+
+
+def _post_ordinary(fake, tmp_path, body="agent output", pr=7):
+    post_pr_comment(fake, config=_cfg(tmp_path), pr_number=pr, body=body)
+
+
+def _rendered(body):
+    return str(TrustedBody.current_untrusted_visible(body))
+
+
+def test_comment_fail_then_succeed_posts_exactly_one(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["fail"])
+    _post_ordinary(fake, tmp_path)
+    assert len(fake.writes) == 2
+    assert _bodies(fake) == [_rendered("agent output")]
+    assert len(sleeps) == 1
+
+
+def test_comment_accepted_but_response_failed_is_adopted_without_replay(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["accepted"])
+    _post_ordinary(fake, tmp_path)
+    assert len(fake.writes) == 1
+    assert len(fake.comments) == 1
+    assert sleeps == []
+
+
+def test_preexisting_identical_comment_is_never_adopted(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["fail"])
+    fake.add(_rendered("agent output"), created=_iso(-30))
+    _post_ordinary(fake, tmp_path)
+    assert len(fake.writes) == 2
+    assert len(fake.comments) == 2  # the old one plus exactly one new comment
+
+
+def test_repeated_identical_publication_is_not_suppressed(tmp_path, quiet, sleeps):
+    fake = FakeGitHub()
+    fake.add(_rendered("agent output"), created=_iso(-30))
+    _post_ordinary(fake, tmp_path)
+    assert len(fake.comments) == 2 and len(fake.writes) == 1
+
+
+def test_foreign_actor_and_prewindow_comments_are_not_adopted(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["fail"])
+    fake.add(_rendered("agent output"), author=OTHER_ACTOR)
+    fake.add(_rendered("agent output"), created=_iso(-3600))
+    _post_ordinary(fake, tmp_path)
+    assert len(fake.writes) == 2
+    assert len(fake.comments) == 3
+
+
+def test_multiple_unclaimed_matches_fail_closed_without_replay(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["accepted"])
+    fake.duplicate_on_accept = 1
+    with pytest.raises(GitHubAmbiguousWriteError) as excinfo:
+        _post_ordinary(fake, tmp_path)
+    assert len(fake.writes) == 1
+    assert "attempt 1" in str(excinfo.value)
+    assert excinfo.value.attempts
+
+
+def test_exhausted_budget_keeps_history_and_cleans_temp_file(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["fail", "fail", "fail"])
+    with pytest.raises(GitHubTransientExhaustedError) as excinfo:
+        _post_ordinary(fake, tmp_path)
+    message = str(excinfo.value)
+    assert len(fake.writes) == 3
+    assert message.count("attempt ") >= 3 and "502" in message
+    assert "verified absent" in message
+    assert "rerun resumes from the local review spool" in message
+    assert fake.comments == []
+    assert not any(_os.path.exists(path) for path in fake.body_paths)
+
+
+def test_temp_body_file_is_the_same_across_attempts_and_removed_after_success(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["fail", "fail"])
+    _post_ordinary(fake, tmp_path)
+    assert len(fake.body_paths) == 3 and len(set(fake.body_paths)) == 1
+    assert all(fake.path_alive_during_write)
+    assert not _os.path.exists(fake.body_paths[0])
+
+
+def test_non_transient_failure_is_not_retried_or_reconciled(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["fail422"])
+    with pytest.raises(AgentLoopError, match="Command failed with exit"):
+        _post_ordinary(fake, tmp_path)
+    assert len(fake.writes) == 1
+    assert fake.listings == 1  # only the pre-write baseline
+    assert sleeps == []
+
+
+def test_unreadable_baseline_still_posts_once_but_never_replays(tmp_path, quiet, sleeps):
+    ok = FakeGitHub()
+    ok.fail_user = True
+    _post_ordinary(ok, tmp_path)
+    assert len(ok.comments) == 1
+    bad = FakeGitHub(["accepted"])
+    bad.fail_user = True
+    with pytest.raises(GitHubAmbiguousWriteError, match="baseline"):
+        _post_ordinary(bad, tmp_path)
+    assert len(bad.writes) == 1 and len(bad.comments) == 1
+
+
+def test_incomplete_reconciliation_listing_fails_closed(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["accepted"])
+    for index in range(100):
+        fake.add(f"filler {index}", author=OTHER_ACTOR, created=_iso(-3600))
+    # Baseline page 2 is readable; the reconciliation read of it then fails.
+    original = fake.run
+    state = {"seen_page2": 0}
+
+    def run(args, **kwargs):
+        if "page=2" in " ".join(str(part) for part in args):
+            state["seen_page2"] += 1
+            if state["seen_page2"] >= 2:
+                fake.list_failure_page = 2
+        return original(args, **kwargs)
+
+    fake.run = run  # type: ignore[method-assign]
+    with pytest.raises(GitHubAmbiguousWriteError, match="incomplete"):
+        _post_ordinary(fake, tmp_path)
+    assert len(fake.writes) == 1
+
+
+def test_malformed_page_never_authorizes_replay(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["accepted"])
+    for index in range(100):
+        fake.add(f"filler {index}", author=OTHER_ACTOR, created=_iso(-3600))
+    original = fake.run
+    state = {"page2": 0}
+
+    def run(args, **kwargs):
+        if "page=2" in " ".join(str(part) for part in args):
+            state["page2"] += 1
+            if state["page2"] >= 2:
+                fake.list_malformed_page = 2
+        return original(args, **kwargs)
+
+    fake.run = run  # type: ignore[method-assign]
+    with pytest.raises(GitHubAmbiguousWriteError):
+        _post_ordinary(fake, tmp_path)
+    assert len(fake.writes) == 1
+
+
+def test_later_page_match_is_adopted(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["accepted"])
+    for index in range(100):
+        fake.add(f"filler {index}", author=OTHER_ACTOR, created=_iso(-3600))
+    _post_ordinary(fake, tmp_path)
+    assert len(fake.writes) == 1
+    assert len(fake.comments) == 101
+
+
+def test_listing_reports_unknown_for_a_failed_page(tmp_path, quiet):
+    fake = FakeGitHub()
+    fake.list_failure_page = 1
+    listing = read_complete_comment_listing(fake, config=_cfg(tmp_path), surface="pr#7")
+    assert isinstance(listing, UnknownCommentListing)
+    fake.list_failure_page = None
+    fake.add("x")
+    fake.add("y", author=OTHER_ACTOR)
+    mine = read_complete_comment_listing(fake, config=_cfg(tmp_path), surface="pr#7")
+    everyone = read_complete_comment_listing(
+        fake, config=_cfg(tmp_path), surface="pr#7", actor=False
+    )
+    assert isinstance(mine, CompleteCommentListing) and len(mine.comments) == 1
+    assert len(everyone.comments) == 2 and everyone.actor_id is None
+
+
+def test_dry_run_issues_a_single_call_and_no_reconciliation_reads(tmp_path, quiet, sleeps):
+    fake = FakeGitHub()
+    post_pr_comment(fake, config=_cfg(tmp_path, dry_run=True), pr_number=7, body="agent output")
+    assert fake.listings == 0 and len(fake.writes) == 1
+
+
+class _Prepared(str):
+    def validate_for_surface(self, _surface):
+        return None
+
+
+def test_partial_sidecar_is_recovered_once_before_the_next_body(tmp_path, quiet, sleeps, monkeypatch):
+    bodies = [_Prepared("sidecar one"), _Prepared("sidecar two"), _Prepared("anchor")]
+    monkeypatch.setattr(github_module, "prepare_round_comment", lambda carrier: bodies)
+    fake = FakeGitHub(["ok", "accepted", "ok"])
+    post_pr_comment(fake, config=_cfg(tmp_path), pr_number=7, body="ignored")
+    assert [c["body"] for c in fake.comments] == ["sidecar one", "sidecar two", "anchor"]
+    assert len(fake.writes) == 3
+    issue = FakeGitHub(["ok", "fail", "ok"])
+    post_issue_comment(issue, config=_cfg(tmp_path), issue_number=9, body="ignored")
+    assert [c["body"] for c in issue.comments] == ["sidecar one", "sidecar two", "anchor"]
+    assert len(issue.writes) == 4
+
+
+def test_identical_sidecar_bodies_cannot_both_match_one_comment(tmp_path, quiet, sleeps, monkeypatch):
+    bodies = [_Prepared("same"), _Prepared("same"), _Prepared("anchor")]
+    monkeypatch.setattr(github_module, "prepare_round_comment", lambda carrier: bodies)
+    fake = FakeGitHub(["ok", "fail", "ok"])
+    post_pr_comment(fake, config=_cfg(tmp_path), pr_number=7, body="ignored")
+    assert [c["body"] for c in fake.comments] == ["same", "same", "anchor"]
+
+
+def test_verified_pr_seam_adopts_and_returns_the_wrapper(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["accepted"])
+    written = _post_pr(tmp_path, fake)
+    assert isinstance(written, github_module.WrittenProtocolComment)
+    assert written.comment_id == fake.comments[0]["id"]
+    assert len(fake.writes) == 1
+
+
+def test_verified_issue_seam_adopts_and_returns_the_comment(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["accepted"])
+    comment = post_verified_trusted_issue_protocol_comment(
+        fake, config=_cfg(tmp_path), issue_number=5, body=_issue_body(),
+        expected_author_login=ACTOR[0], expected_author_id=ACTOR[1],
+    )
+    assert isinstance(comment, github_module.IssueComment)
+    assert comment.comment_id == fake.comments[0]["id"] and len(fake.writes) == 1
+    replay = FakeGitHub(["fail"])
+    post_verified_trusted_issue_protocol_comment(
+        replay, config=_cfg(tmp_path), issue_number=5, body=_issue_body(),
+        expected_author_login=ACTOR[0], expected_author_id=ACTOR[1],
+    )
+    assert len(replay.writes) == 2 and len(replay.comments) == 1
+
+
+def test_contract_record_is_reconciled(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["accepted"])
+    post_trusted_pr_contract_record(fake, config=_cfg(tmp_path), pr_number=7, body=_body())
+    assert len(fake.writes) == 1 and len(fake.comments) == 1
+    again = FakeGitHub(["fail"])
+    post_trusted_pr_contract_record(again, config=_cfg(tmp_path), pr_number=7, body=_body())
+    assert len(again.writes) == 2 and len(again.comments) == 1
+
+
+def test_trusted_pr_comment_writer_is_reconciled(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["accepted"])
+    github_module.post_trusted_pr_comment(fake, config=_cfg(tmp_path), pr_number=7, body=_body())
+    assert len(fake.writes) == 1 and len(fake.comments) == 1
+
+
+def _patch(fake, tmp_path, comment_id):
+    return patch_verified_trusted_protocol_comment_observed(
+        fake, config=_cfg(tmp_path), comment_id=comment_id, body=_body("Updated label\n\n<!-- AGENT_MANAGED_CI_INTENT_V2 {} -->"),
+        expected_author_login=ACTOR[0], expected_author_id=ACTOR[1],
+    )
+
+
+def test_patch_transient_failure_is_idempotent_by_comment_id(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["accepted"])
+    comment = fake.add("old")
+    written = _patch(fake, tmp_path, comment["id"])
+    assert written.comment_id == comment["id"] and len(fake.writes) == 1
+    replay = FakeGitHub(["fail"])
+    comment = replay.add("old")
+    _patch(replay, tmp_path, comment["id"])
+    assert len(replay.writes) == 2
+
+
+def test_patch_unreadable_comment_fails_closed(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["fail"])
+    comment = fake.add("old")
+    fake.reread_fails = True
+    with pytest.raises(GitHubAmbiguousWriteError):
+        _patch(fake, tmp_path, comment["id"])
+    assert len(fake.writes) == 1
+
+
+def test_patch_exhaustion_keeps_history(tmp_path, quiet, sleeps):
+    fake = FakeGitHub(["fail", "fail", "fail"])
+    comment = fake.add("old")
+    with pytest.raises(GitHubTransientExhaustedError, match="attempt 3"):
+        _patch(fake, tmp_path, comment["id"])
+    assert len(fake.writes) == 3

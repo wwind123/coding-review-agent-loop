@@ -208,3 +208,30 @@ def _with_history(
         attempts=tuple(history),
         exhausted=exhausted,
     )
+
+
+class GitHubAmbiguousWriteError(AgentLoopError):
+    """A write failed transiently and live state could not prove it absent.
+
+    Raised when reconciliation is incomplete (unreadable or partial listing),
+    finds several candidates, or had no baseline to tell a pre-existing
+    identical object from this write's.  The write is never replayed.
+    """
+
+    def __init__(self, message: str, attempts: tuple[GitHubAttempt, ...] = ()):
+        super().__init__(message)
+        self.attempts = attempts
+
+
+def attempt_from_result(number: int, result: CommandResult, started: float) -> GitHubAttempt:
+    return GitHubAttempt(
+        number, result.returncode, classify_gh_failure(result), _diagnostic(result), started
+    )
+
+
+def sleep_before_retry(policy: GitHubRetryPolicy, failed_attempts: int) -> None:
+    _sleep(policy.delay_before_retry(failed_attempts))
+
+
+def format_attempt_history(attempts: Sequence[GitHubAttempt]) -> str:
+    return "\n".join(f"  {attempt.describe()}" for attempt in attempts)
