@@ -4174,7 +4174,9 @@ def _read_creator_issue_pages(
                 parse_comment_timestamp(raw.get("created_at"))
                 if not isinstance(raw.get("title"), str):
                     raise AgentLoopError(f"Creator issue listing issue #{number} lacks a title.")
-                if raw.get("body") is not None and not isinstance(raw.get("body"), str):
+                if "body" not in raw:
+                    raise AgentLoopError(f"Creator issue listing issue #{number} omits its body.")
+                if raw["body"] is not None and not isinstance(raw["body"], str):
                     raise AgentLoopError(f"Creator issue listing issue #{number} has a non-text body.")
             items.append(raw)
         if len(raw_page) < page_size:

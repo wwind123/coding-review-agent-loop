@@ -866,16 +866,19 @@ def activate_managed_ci(
         # A complete ordinary v2 workflow is not an adoption contract.  This
         # path is intentionally quiet/fallback-compatible when the optional
         # marker has not been deployed.
+        adoption_diagnostics: list[str] = []
         adopted = _activate_v2_existing_pr_adoption(
             runner,
             config=config,
             pr_number=pr_number,
             metadata=metadata,
+            diagnostics=adoption_diagnostics,
         )
         if adopted is None and config.managed_ci:
             raise AgentLoopError(
                 f"--managed-ci-adopt-existing-pr could not safely adopt PR #{pr_number}; "
                 "no suppression or qualification was claimed."
+                + "".join(adoption_diagnostics)
             )
         return adopted
 
@@ -4048,6 +4051,9 @@ class _FailedActivationContext:
     label_post_attempted: bool = False
     label_post_acknowledged: bool = False
     label_post_ambiguous: bool = False
+    # Application id proven by a recovered (ambiguous) label add; any later
+    # cleanup DELETE is fresh-checked against it so a replacement is never removed.
+    recovered_label_event_id: int | None = None
     label_release_attempted: bool = False
     label_released: bool = False
     release_reason: str | None = None
@@ -4543,6 +4549,38 @@ def _failed_activation_guard(
         raise
 
 
+def _require_recovered_label_ownership(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    context: _FailedActivationContext | None,
+) -> int | None:
+    """Fresh-check a recovered label application before any cleanup DELETE.
+
+    Returns the recovered event id (to pass as the removal's owned id), or
+    ``None`` when no label write was recovered.  When ownership cannot be
+    established (unreadable history, or a different application is now the
+    latest event) cleanup is refused and the label left untouched.
+    """
+    recovered = context.recovered_label_event_id if context is not None else None
+    if recovered is None:
+        return None
+    history = label_event_history(
+        runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL
+    )
+    latest = history.latest if isinstance(history, CompleteLabelHistory) else None
+    if latest is None or latest.kind != "labeled" or latest.event_id != recovered:
+        if context is not None:
+            context.release_reason_kind = "event-changed"
+        raise AgentLoopError(
+            f"PR #{pr_number} `{MANAGED_LABEL}` ownership could not be re-established after "
+            f"the recovered label write (recovered event {recovered}); cleanup was refused and "
+            "the label was left untouched."
+        )
+    return recovered
+
+
 def _restore_ordinary_ci_after_v2_fallback(
     runner: Runner,
     *,
@@ -4583,8 +4621,12 @@ def _restore_ordinary_ci_after_v2_fallback(
         return
     if report_context is not None:
         report_context.label_release_attempted = True
+    recovered_owned = _require_recovered_label_ownership(
+        runner, config=config, pr_number=pr_number, context=report_context,
+    )
     result = _label_remove(
         runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL,
+        owned_event_id=recovered_owned,
     ).result
     if result.returncode != 0:
         message = (
@@ -4676,9 +4718,12 @@ def _release_for_ordinary_recovery(
             )
     if report_context is not None:
         report_context.label_release_attempted = True
+    recovered_owned = _require_recovered_label_ownership(
+        runner, config=config, pr_number=pr_number, context=report_context,
+    )
     result = _label_remove(
         runner, config=config, pr_number=pr_number, label_name=MANAGED_LABEL,
-        owned_event_id=active_event[0] if active_event is not None else None,
+        owned_event_id=active_event[0] if active_event is not None else recovered_owned,
     ).result
     if result.returncode != 0:
         message = f"Managed-CI v2 could not activate ({reason}); the label DELETE was not confirmed."
@@ -5875,6 +5920,7 @@ def _activate_v2_managed_ci(
             )
             applied_label = label_outcome.result
             recovered_label_event_id = label_outcome.event_id
+            context.recovered_label_event_id = recovered_label_event_id
             if applied_label.returncode != 0:
                 # GitHub may still have applied the label; this is an
                 # ambiguous request, never evidence of label ownership.
@@ -6521,6 +6567,7 @@ def _activate_v2_existing_pr_adoption(
     config: AgentLoopConfig,
     pr_number: int,
     metadata: PullRequestMetadata,
+    diagnostics: list[str] | None = None,
 ) -> ManagedCiContract | None:
     """Explicitly adopt an already-open same-repository PR into v2.
 
@@ -6581,6 +6628,11 @@ def _activate_v2_existing_pr_adoption(
         )
         created = label_outcome.result
         if created.returncode != 0:
+            if diagnostics is not None:
+                diagnostics.append(
+                    f"\nThe `{MANAGED_LABEL}` label write failed ({label_outcome.outcome})."
+                    + failure_suffix(created)
+                )
             return None
         applied = True
         recovered_event_id = label_outcome.event_id

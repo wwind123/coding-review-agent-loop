@@ -1279,3 +1279,30 @@ def test_malformed_pull_request_envelope_is_ignored_but_numbered(tmp_path, issue
     pr["created_at"] = "garbage"  # a PR object is dropped before classification
     url = create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
     assert url and len(hub.creates) == 2
+
+
+def test_missing_body_key_is_a_malformed_envelope_not_absence(tmp_path, issue_env):
+    hub = FakeIssueHub(["accepted"])
+    original_run = hub.run
+
+    def run(args, **kw):
+        result = original_run(args, **kw)
+        if hub.issues:
+            hub.issues[-1].pop("body", None)  # the accepted create omits its body key
+        return result
+
+    hub.run = run
+    with pytest.raises(GitHubAmbiguousWriteError, match="incomplete"):
+        create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
+    assert len(hub.creates) == 1
+
+
+def test_missing_body_key_on_a_later_page_fails_closed(tmp_path, issue_env):
+    hub = FakeIssueHub(["fail"])
+    for index in range(100):
+        hub.add(f"filler {index}", "filler")
+    broken = hub.add("broken", "x")
+    del broken["body"]
+    with pytest.raises(GitHubAmbiguousWriteError, match="incomplete"):
+        create_issue(hub, config=make_config(tmp_path), title="T", body=_canonical_followup_body())
+    assert len(hub.creates) == 1

@@ -13461,3 +13461,103 @@ def test_adoption_never_claims_a_replacement_of_the_recovered_label_event(tmp_pa
 
     assert contract is None  # fail closed: the observed application is not the recovered one
     assert runner.deletes == 0  # and the replacement application is left untouched
+
+
+# --- #510 review round 2: recovered ownership through activation cleanup ----------
+
+
+class _RecoveredCleanupRunner(M1067Runner):
+    """A label add lands but reports 502; ownership reads then degrade."""
+
+    def __init__(self, *, replacement_actor=("agent-loop", 1), **kwargs):
+        super().__init__(**kwargs)
+        self.post_seen = False
+        self.post_events_reads = 0
+        self.replacement_actor = replacement_actor
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(a) for a in args]
+        endpoint = next((p for p in cmd if p.startswith("repos/")), "")
+        if endpoint.startswith("repos/OWNER/REPO/issues/7/events?") and self.post_seen:
+            self.post_events_reads += 1
+            record, _ = self._record_command(args, cwd)
+            n = self.post_events_reads
+            if n == 1:  # reconciliation read: the recovered application E
+                return CommandResult(record, cwd, json.dumps([label_event(500)]), "", 0)
+            if n == 2:  # the ownership read is unavailable
+                return CommandResult(record, cwd, "", "events unavailable", 1)
+            actor = self.replacement_actor
+            events = [
+                label_event(500),
+                label_event(501, event="unlabeled"),
+                label_event(502, login=actor[0], actor_id=actor[1]),
+            ]
+            return CommandResult(record, cwd, json.dumps(events), "", 0)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+@pytest.mark.parametrize("replacement_actor", [("agent-loop", 1), ("someone", 9)])
+def test_activation_cleanup_never_deletes_a_replacement_of_the_recovered_application(
+    tmp_path, replacement_actor
+):
+    rest_pr = {"state": "open", "draft": False, "labels": [], "body": "Fixes #643"}
+    runner = _RecoveredCleanupRunner(
+        rest_pr=rest_pr, workflow=SUPPRESSING_V2_WORKFLOW, issue_events=[],
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+        post_returncode=1, post_applies=True,
+        hooks={"post": lambda r: setattr(r, "post_seen", True)},
+        replacement_actor=replacement_actor,
+    )
+
+    _error, text = _m1067_fail(runner, _m1067_config(tmp_path))
+
+    assert "ownership could not be re-established" in text
+    assert _m1067_label_deletes(runner) == []  # the replacement application survives
+
+
+def _adoption_config(tmp_path):
+    return make_config(
+        tmp_path, auto_merge=True, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        managed_ci_adopt_existing_pr=True,
+    )
+
+
+class _AdoptionLabelFailureRunner(V2ManagedRunner):
+    def __init__(self, *, unreadable_after_post=False, **kwargs):
+        super().__init__(**kwargs)
+        self.unreadable_after_post = unreadable_after_post
+        self.posted = False
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        cmd = [str(a) for a in args]
+        if "POST" in cmd and "repos/OWNER/REPO/issues/7/labels" in cmd:
+            self.posted = True
+            record, _ = self._record_command(args, cwd)
+            return CommandResult(record, cwd, "", "non-200 OK status code: 502 Bad Gateway", 1)
+        if self.unreadable_after_post and self.posted and cmd[-1].startswith(
+            "repos/OWNER/REPO/issues/7/events?"
+        ):
+            record, _ = self._record_command(args, cwd)
+            return CommandResult(record, cwd, "", "HTTP 404: Not Found", 1)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+@pytest.mark.parametrize("unreadable", [False, True], ids=["exhausted", "unreadable-reconciliation"])
+def test_explicit_adoption_refusal_carries_the_label_write_diagnostic(tmp_path, unreadable):
+    runner = _AdoptionLabelFailureRunner(
+        workflow=adoption_workflow(),
+        rest_pr={"draft": False, "state": "open", "labels": []},
+        pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
+        unreadable_after_post=unreadable,
+    )
+
+    with pytest.raises(AgentLoopError, match="could not safely adopt") as raised:
+        activate_managed_ci(
+            runner, config=_adoption_config(tmp_path), pr_number=7, metadata=metadata(),
+        )
+
+    text = str(raised.value)
+    assert "502 Bad Gateway" in text
+    assert "attempt 1" in text
+    if not unreadable:
+        assert "attempt 3" in text
