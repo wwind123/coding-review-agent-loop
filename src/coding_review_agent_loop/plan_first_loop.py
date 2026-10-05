@@ -265,6 +265,7 @@ from .review_step_back import (
     DISPOSITION_DEFER_EPISODE,
     DISPOSITION_DEFER_PENDING,
     DISPOSITION_ESCALATED,
+    PlanStepBackAnchor,
     PlanStepBackContext,
     StallStepBackDisposition,
     derive_plan_step_back_state,
@@ -272,7 +273,9 @@ from .review_step_back import (
     mandatory_plan_findings_since,
     plan_growth_crossing_round,
     plan_stall_step_back_disposition,
+    plan_step_back_anchor,
     plan_step_back_candidate_rounds,
+    reintroduced_dissolved_items,
     render_step_back_human_decision,
     step_back_alternative_summary,
 )
@@ -846,6 +849,7 @@ def _run_plan_first_loop(
         panel_opening_index: int | None,
         assessment: object | None,
         measurements: str | None,
+        post_review: bool = False,
     ) -> str | None:
         """Human-decision message once the primary rejected the step-back, else ``None``."""
         state = plan_step_back_state(records, panel_opening_index=panel_opening_index)
@@ -855,6 +859,7 @@ def _run_plan_first_loop(
             or state.escalation_count < config.plan_step_back_escalation_rounds
         ):
             return None
+        anchor = plan_step_back_anchor(records, state.episode)
         return render_step_back_human_decision(
             phase="plan",
             measurements=plan_step_back_measurements(assessment, measurements),
@@ -862,6 +867,9 @@ def _run_plan_first_loop(
             blocks=state.escalation_count,
             threshold=config.plan_step_back_escalation_rounds,
             alternative=step_back_alternative_summary(records, state.episode),
+            dissolved=anchor.dissolved_ids,
+            reintroduced=reintroduced_dissolved_items(records, state.episode, anchor),
+            post_review=post_review,
         )
 
     def _stall_step_back_disposition() -> StallStepBackDisposition:
@@ -1748,6 +1756,8 @@ def _run_plan_first_loop(
         plan_scheduler_decision = None
         stall_deferred_for_step_back = False
         step_back_candidate_review = False
+        step_back_review_anchor: PlanStepBackAnchor | None = None
+        pre_round_step_back_episode = None
         step_back_history_intact = False
         step_back_history_class = "unclassified"
         plan_posted_checkpoint: PostedRoundMetadata | None = None
@@ -1922,6 +1932,22 @@ def _run_plan_first_loop(
                     f"Planning round {round_number}: stall streak reset by operator "
                     "(--plan-reset-stall-streak)",
                 )
+            if (
+                config.plan_step_back_rounds > 0
+                and plan_primary_name is not None
+                and step_back_history_intact
+                and not plan_panel_evidence.opened
+            ):
+                pre_round_state = plan_step_back_state(
+                    plan_records, panel_opening_index=plan_panel_evidence.opening_index
+                )
+                if pre_round_state is not None and pre_round_state.episode is not None:
+                    pre_round_step_back_episode = pre_round_state.episode
+                    # A reset on this round closes the episode before reviewers run.
+                    if not plan_reset_round:
+                        step_back_review_anchor = plan_step_back_anchor(
+                            plan_records, pre_round_state.episode
+                        )
             if (
                 config.plan_step_back_rounds > 0
                 and not staged_mode_revision
@@ -2347,6 +2373,7 @@ def _run_plan_first_loop(
                 plan_growth_notice=plan_growth_notice,
                 plan_growth_measurements=plan_growth_measurements,
                 step_back_review_notice=step_back_candidate_review,
+                step_back_anchor=step_back_review_anchor,
                 prior_execution_mode=prior_execution_mode,
                 execution_mode_history_present=execution_mode_history_present,
             )
@@ -3979,6 +4006,7 @@ def _run_plan_first_loop(
                     panel_opening_index=plan_panel_evidence.opening_index,
                     assessment=plan_growth_assessment,
                     measurements=plan_growth_measurements,
+                    post_review=True,
                 )
                 if step_back_stop is not None:
                     # Before the planner turn, so no further planner turn runs.
@@ -4136,6 +4164,34 @@ def _run_plan_first_loop(
                             f"crossed a growth signal at round {crossing_round} and the "
                             f"primary blocked {streak} consecutive round(s) on new findings",
                         )
+        step_back_anchor: PlanStepBackAnchor | None = None
+        if (
+            step_back_context is None
+            and config.plan_step_back_rounds > 0
+            and plan_primary_name is not None
+            and step_back_history_intact
+            and not plan_panel_evidence.opened
+            and pre_round_step_back_episode is not None
+        ):
+            # Independent of eligibility for a new step-back turn: narrowing, guard
+            # and supersession revisions inside an episode carry the anchor too.
+            anchor_records = (
+                step_back_records
+                if step_back_records is not None
+                else plan_history_records(refresh=True, round_number=round_number)
+            )
+            anchor_state = plan_step_back_state(
+                anchor_records, panel_opening_index=plan_panel_evidence.opening_index
+            )
+            if anchor_state is not None and anchor_state.episode is not None:
+                step_back_anchor = plan_step_back_anchor(anchor_records, anchor_state.episode)
+                log(
+                    config,
+                    f"Planning round {round_number}: step-back anchor: revision "
+                    "constrained to the simplified design from round "
+                    f"{anchor_state.episode.candidate_round} "
+                    f"({len(step_back_anchor.dissolved_ids)} dissolved item(s))",
+                )
         log(
             config,
             f"Planning round {round_number}: {coder_name} revising the plan "
@@ -4191,6 +4247,7 @@ def _run_plan_first_loop(
                     base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
                     plan_growth_notice=plan_growth_notice,
                     step_back_context=step_back_context,
+                    step_back_anchor=step_back_anchor,
                     generalization_guidance=True,
                     finding_history=plan_finding_history.view(round_number),
                     prior_execution_mode=prior_execution_mode,

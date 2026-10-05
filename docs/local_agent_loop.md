@@ -3160,6 +3160,33 @@ child-planning cycles inherit them. The approval-time plan-growth gate is
 unchanged: a crossed one-shot plan still cannot be approved without a reviewed
 `one_shot_growth_justification`.
 
+**Episode anchor (#1278).** While a step-back episode is active, the simplified
+design stays the anchor. The orchestrator derives it from the step-back
+candidate's recorded structured response: the dissolved items are its resolved
+prior-item dispositions (notes starting `dissolved:` are preferred, which the
+step-back turn asks for; a candidate without that prefix falls back to every
+resolved entry) and the trade-offs are its `summary`. Every planner revision
+prompt in the episode, whatever the revision kind (the narrowing revision under
+`--plan-narrow-staged` included), says to address the findings
+within the simplified design. Growth-guard, inherited-guard and supersession
+revisions follow a primary approval, which closes the episode, so they carry no
+anchor. Reversing a dissolution needs a line
+`reintroduces dissolved item <ID>: <why the simpler design cannot meet the
+requirement otherwise>` in the summary or a disposition note. Primary-phase
+reviewer prompts, the step-back candidate's review included, list the dissolved
+items and trade-offs and ask whether each blocking finding `requires reversing
+dissolved item <ID>` or is `satisfiable within the simplified design`. That is
+the reviewer's judgement only; findings are never filtered or reclassified on
+it. Prompts show notes for the first 12 dissolved IDs and bare IDs up to 100, but
+matching and reporting always use the complete ID set. A reset round's reviewer
+prompts carry no anchor, and the anchor ends with the episode. At the
+human-decision stop the message lists the dissolved items and every item a later
+revision declared reintroduced, with its round and reason. Detection depends on
+the declaration: a silent reintroduction is not detected, and the message says
+`none declared (undeclared reintroductions are not detected)` instead of
+claiming nothing came back. When the stop fires after the round's reviews were
+posted, the message says so rather than claiming no reviewer turn ran.
+
 The state is derived from durable round records, so a resumed run triggers and
 stops at exactly the same K and M. The orchestrator records the step-back turn
 as a reviewer-owned `step_back_entries` field on the planner record; a malformed
