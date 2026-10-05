@@ -17907,3 +17907,78 @@ def test_an_external_push_that_deletes_the_cluster_suppresses_the_stale_step_bac
 def test_an_external_push_that_shifts_the_cluster_maps_the_step_back_to_the_pushed_head(tmp_path):
     runner = _external_push_after_the_kth_review(tmp_path, "@@ -10,0 +11,100 @@\n")
     assert "src/spool.py` lines 224-240" in _sb_coder_prompts(runner)[-1]
+
+
+# --- #1273: proactive generalization guidance and finding history ------------
+
+
+def _history_runner(coder_outputs):
+    return _StepBackRunner(
+        claude_outputs=coder_outputs,
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+
+
+def test_coder_prompts_show_prior_findings_and_fixes_when_a_sibling_arrives(tmp_path):
+    """`fix-cutoff-sibling`, `pr-followup-and-same-pr`: no step-back involved."""
+    runner = _history_runner(_step_back_coders())
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, pr_step_back_rounds=0)) == 0
+    prompts = _sb_coder_prompts(runner)
+    assert all("Proactive generalization" in prompt for prompt in prompts)
+    assert all("Generalization: this generalizes the fix for" in prompt for prompt in prompts)
+    assert "no earlier-round findings or fixes" in prompts[0]
+    # Round 2 prompt: the round-1 finding (resolved) with its location, and the
+    # round-1 fix published under round 2; the round-2 sibling is only in the review.
+    second = prompts[1]
+    assert "Codex finding item-1 (resolved) src/spool.py:124-131" in second
+    assert "fix by " in second
+    history = second.split("Earlier-round history for this run", 1)[1].split("review:", 1)[0]
+    assert "item-2" not in history and "src/spool.py:131-136" not in history
+
+
+def test_declared_generalization_is_logged_with_its_tag(tmp_path, capsys):
+    """`generalization-logged`: the step-back turn's declaration is step-back-directed."""
+    runner = _history_runner(_step_back_coders())
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, quiet=False)) == 0
+    err = capsys.readouterr().err
+    assert err.count("declared a generalization") == 1
+    assert "declared a generalization (step-back-directed): Generalization: any spool record" in err
+
+
+def test_undeclared_generalization_logs_nothing_and_proactive_tag_without_step_back(
+    tmp_path, capsys
+):
+    coders = [
+        structured_coder_followup(addressed_items=["item-1"]),
+        structured_coder_followup(
+            addressed_items=["item-2"],
+            addressed_item_notes={
+                "item-2": "Generalization: this generalizes the fix for [item-1]: any decode error"
+            },
+        ),
+        structured_coder_followup(addressed_items=["item-3"]),
+    ]
+    runner = _history_runner(coders)
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, pr_step_back_rounds=0, quiet=False)) == 0
+    err = capsys.readouterr().err
+    assert err.count("declared a generalization") == 1
+    assert "(proactive)" in err
+
+
+def test_an_advisory_history_failure_keeps_guidance_and_the_run_continues(
+    tmp_path, monkeypatch, capsys
+):
+    """`history-decode-failure` case A."""
+    from coding_review_agent_loop import finding_history
+
+    def boom(item):
+        raise RuntimeError("projection exploded")
+
+    monkeypatch.setattr(finding_history, "project_finding", boom)
+    runner = _history_runner(_step_back_coders())
+    config = _sb_config(tmp_path, pr_step_back_rounds=0, quiet=False)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    prompts = _sb_coder_prompts(runner)
+    assert all("Proactive generalization" in prompt for prompt in prompts)
+    assert all("history is unavailable this turn" in prompt for prompt in prompts)
+    assert "finding history unavailable: RuntimeError: projection exploded" in capsys.readouterr().err

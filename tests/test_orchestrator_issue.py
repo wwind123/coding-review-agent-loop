@@ -16974,3 +16974,43 @@ def test_narrow_staged_flat_board_resume_over_complete_approvals_does_not_approv
     assert "Operator directive (orchestrator" in _m1268_prompts(resumed, "claude")[0]
     assert calls[-1] == "claude"
     assert not resumed.issues
+
+
+def test_planner_revisions_carry_guidance_and_in_memory_history_without_step_back(tmp_path):
+    """#1273 `planner-live-history`: no step-back records, no extra GitHub read."""
+    runner, _error = _m1251_run(
+        tmp_path, last_round=4, max_rounds=4, plan_step_back_rounds=0,
+        plan_step_back_escalation_rounds=1,
+    )
+    revisions = [
+        prompt for prompt in _m1251_prompts(runner, "claude")
+        if "Proactive generalization" in prompt
+    ]
+    assert len(revisions) >= 2
+    assert not any(_STEP_BACK_MARKER in prompt for prompt in revisions)
+    assert "no earlier-round findings or fixes" in revisions[0] or "[item-1]" in revisions[0]
+    later = revisions[-1]
+    assert "Earlier-round history for this run" in later
+    assert "Codex finding item-1" in later
+    assert "fix by " in later
+
+
+def test_planner_history_failure_is_advisory_and_keeps_the_guidance(tmp_path, monkeypatch):
+    """#1273 `history-decode-failure` case A for the plan loop."""
+    from coding_review_agent_loop import finding_history
+
+    def boom(item):
+        raise RuntimeError("projection exploded")
+
+    monkeypatch.setattr(finding_history, "project_finding", boom)
+    runner, error = _m1251_run(
+        tmp_path, last_round=3, max_rounds=3, plan_step_back_rounds=0,
+        plan_step_back_escalation_rounds=1,
+    )
+    revisions = [
+        prompt for prompt in _m1251_prompts(runner, "claude")
+        if "Proactive generalization" in prompt
+    ]
+    assert revisions
+    assert all("history is unavailable this turn" in prompt for prompt in revisions)
+    assert "projection exploded" not in str(error)

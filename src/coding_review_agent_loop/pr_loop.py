@@ -139,6 +139,11 @@ from .managed_pr import (
     validate_managed_pr_body,
 )
 from .migrations import validate_pr_migration_topology
+from .finding_history import (
+    PHASE_PR as _HISTORY_PHASE_PR,
+    FindingHistoryLedger,
+    log_declared_generalization,
+)
 from .prompts import (
     CompactPriorContext,
     CompactPrReviewTailContext,
@@ -1848,6 +1853,20 @@ def run_pr_loop(
             # no-reviewer diagnostic path as an in-round decode failure.
             stop_pre_panel(undecodable_history_message(exc), round_number=None)
             raise
+        # Advisory per-run finding history (#1273), seeded once from the records
+        # just extracted through the authoritative path above.
+        pr_finding_history = FindingHistoryLedger(
+            _HISTORY_PHASE_PR, log=lambda message: log(config, message)
+        )
+        pr_finding_history.seed_from_records(
+            startup_records,
+            reconciliation_mode=(
+                "owner-scoped"
+                if scheduler_capabilities.owner_scoped_reconciliation
+                else "aggregate"
+            ),
+            same_status="same-pr",
+        )
         # Signed reviewer-board amendments (#943) live on the PR itself, in
         # the same comment list as the PR scheduler records, for issue-mode
         # and standalone runs alike.  A PR amendment on the owning issue is
@@ -4672,6 +4691,7 @@ def run_pr_loop(
             unresolved_items = list(
                 pr_ledger_view([*unresolved_items, *round_new_unresolved_items])
             )
+            pr_finding_history.observe_reconciled(unresolved_items, future_from_prior_items)
             # Confirmed sub-item outcome of this round (#958): published after
             # reconciliation and before any coder turn, approval, budget check
             # or exit, so a terminal approval round is never silent.
@@ -6950,6 +6970,9 @@ def run_pr_loop(
                     "commit's intent.\n\n"
                     + summary_context
                 )
+            # Machine obligations inserted since reconciliation (CI failures).
+            pr_finding_history.observe_reconciled(unresolved_items)
+            finding_history_view = pr_finding_history.view(round_number)
             step_back_guidance = (
                 step_back_decision.coder_guidance() if not has_merge_conflict_item else ""
             )
@@ -7017,6 +7040,8 @@ def run_pr_loop(
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
                     step_back_context=step_back_guidance,
+                    generalization_guidance=True,
+                    finding_history=finding_history_view,
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             else:
@@ -7037,6 +7062,8 @@ def run_pr_loop(
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
                     step_back_context=step_back_guidance,
+                    generalization_guidance=True,
+                    finding_history=finding_history_view,
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             repair_unresolved_item_ids = tuple(
@@ -7272,6 +7299,19 @@ def run_pr_loop(
             # The coder metadata record posted below is numbered one past the
             # loop round; the matrix-evidence anchor must use that number.
             coder_record_round = round_number + 1
+            if isinstance(coder_response.marker_value, StructuredCoderFollowup):
+                pr_finding_history.record_fix(
+                    coder_response.marker_value,
+                    published_round=coder_record_round,
+                    agent=coder_name,
+                )
+                log_declared_generalization(
+                    coder_response.marker_value,
+                    log=lambda message: log(config, message),
+                    round_number=round_number,
+                    agent=coder_name,
+                    step_back_directed=bool(step_back_guidance),
+                )
             matrix_evidence_render_decision = None
             if (
                 isinstance(coder_response.marker_value, StructuredCoderFollowup)

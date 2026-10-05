@@ -61,6 +61,13 @@ from .protocol import (
     semantic_risk_claim_schema_text,
 )
 from .protocol_markers import sanitize_historical_text, sanitize_untrusted_prose
+from .finding_history import (
+    PHASE_PLAN as _HISTORY_PHASE_PLAN,
+    PHASE_PR as _HISTORY_PHASE_PR,
+    FindingHistoryView,
+    render_finding_history_block,
+    render_generalization_guidance,
+)
 from .review_step_back import (
     PlanStepBackContext,
     render_plan_step_back_guidance,
@@ -2993,6 +3000,24 @@ def _plan_growth_planner_guidance(
     return "\n".join(lines) + "\n"
 
 
+def _proactive_generalization_block(
+    phase: str, guidance: bool, history: FindingHistoryView | None
+) -> str:
+    """Standing guidance plus bounded history (#1273); empty when both are off.
+
+    Rendered immediately before any step-back instruction so a step-back turn's
+    text still comes last and governs.
+    """
+    if not guidance and history is None:
+        return ""
+    parts: list[str] = []
+    if guidance:
+        parts.append(render_generalization_guidance(phase))
+    if history is not None:
+        parts.append(render_finding_history_block(history))
+    return "\n".join(parts) + "\n"
+
+
 def _step_back_planner_block(context: PlanStepBackContext | None) -> str:
     """Step-back planner instruction, identical in every revision branch (#1251)."""
     return render_plan_step_back_guidance(context) + "\n" if context is not None else ""
@@ -3474,6 +3499,8 @@ def _build_semantic_plan_revision_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     plan_growth_notice: str | None = None,
     step_back_context: PlanStepBackContext | None = None,
+    generalization_guidance: bool = False,
+    finding_history: FindingHistoryView | None = None,
 ) -> str:
     """Prompt for the revision-only semantic contract.
 
@@ -3512,7 +3539,7 @@ Current canonical plan (read-only context):
 
 {previous_plan}
 
-{_step_back_planner_block(step_back_context)}Blocking plan review payload:
+{_proactive_generalization_block(_HISTORY_PHASE_PLAN, generalization_guidance, finding_history)}{_step_back_planner_block(step_back_context)}Blocking plan review payload:
 
 {review}
 
@@ -3600,6 +3627,8 @@ def build_plan_revision_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     plan_growth_notice: str | None = None,
     step_back_context: PlanStepBackContext | None = None,
+    generalization_guidance: bool = False,
+    finding_history: FindingHistoryView | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if response_form == "semantic-patch-v1":
@@ -3620,6 +3649,8 @@ def build_plan_revision_prompt(
             inherited_matrix_binding=inherited_matrix_binding,
             plan_growth_notice=plan_growth_notice,
             step_back_context=step_back_context,
+            generalization_guidance=generalization_guidance,
+            finding_history=finding_history,
         )
     if compact_context:
         return _build_compact_plan_revision_prompt(
@@ -3638,6 +3669,8 @@ def build_plan_revision_prompt(
             inherited_matrix_binding=inherited_matrix_binding,
             plan_growth_notice=plan_growth_notice,
             step_back_context=step_back_context,
+            generalization_guidance=generalization_guidance,
+            finding_history=finding_history,
         )
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -3673,7 +3706,7 @@ Previous plan:
 
 {previous_plan}
 
-{_step_back_planner_block(step_back_context)}{reviewer_name} plan review:
+{_proactive_generalization_block(_HISTORY_PHASE_PLAN, generalization_guidance, finding_history)}{_step_back_planner_block(step_back_context)}{reviewer_name} plan review:
 
 {review}
 
@@ -3772,6 +3805,8 @@ def _build_compact_plan_revision_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     plan_growth_notice: str | None = None,
     step_back_context: PlanStepBackContext | None = None,
+    generalization_guidance: bool = False,
+    finding_history: FindingHistoryView | None = None,
 ) -> str:
     reviewer_name = format_agent_list(reviewers(config))
     coder_signature = agent_signature(config.coder, config, role="coder")
@@ -3803,7 +3838,12 @@ def _build_compact_plan_revision_prompt(
         ),
         response_protocol=_plan_revision_schema_and_rules(
             include_risk_test_matrix_contract=require_risk_test_matrix_contract
-        ) + "\n" + _plan_growth_planner_guidance(config),
+        ) + "\n" + _plan_growth_planner_guidance(config)
+        + (
+            "\n" + render_generalization_guidance(_HISTORY_PHASE_PLAN)
+            if generalization_guidance
+            else ""
+        ),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
     action = (
@@ -3828,7 +3868,7 @@ Previous implementation plan:
 
 {previous_plan}
 
-{_step_back_planner_block(step_back_context)}Blocking plan review payload:
+{render_finding_history_block(finding_history) + chr(10) if finding_history is not None else ""}{_step_back_planner_block(step_back_context)}Blocking plan review payload:
 
 {review}
 
@@ -5009,6 +5049,8 @@ def build_followup_prompt(
     parent_issue_context: IssueContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     step_back_context: str = "",
+    generalization_guidance: bool = False,
+    finding_history: FindingHistoryView | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -5021,7 +5063,7 @@ def build_followup_prompt(
 Address the review below in this local checkout. Pull/sync the PR branch if
 needed, implement fixes, run relevant tests, commit, and push to the same PR.
 Do not create a new PR.
-{step_back_context}{_coder_workdir_guidance(config)}
+{_proactive_generalization_block(_HISTORY_PHASE_PR, generalization_guidance, finding_history)}{step_back_context}{_coder_workdir_guidance(config)}
 {_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
@@ -5072,6 +5114,8 @@ def build_same_pr_followup_prompt(
     parent_issue_context: IssueContext | None = None,
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     step_back_context: str = "",
+    generalization_guidance: bool = False,
+    finding_history: FindingHistoryView | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     reviewer_name = format_agent_list(reviewers(config))
@@ -5086,7 +5130,7 @@ Address the follow-up items below in this local checkout. Pull/sync the PR
 branch if needed, implement fixes, run relevant tests, commit, and push to the
 same PR. Do not create a new PR.
 {_coder_workdir_guidance(config)}
-{scope_framing}{_scratch_file_guidance()}
+{_proactive_generalization_block(_HISTORY_PHASE_PR, generalization_guidance, finding_history)}{scope_framing}{_scratch_file_guidance()}
 {_coder_test_reporting_guidance(structured=True)}{_coder_local_test_scope_guidance(config, structured=True)}{_coder_ci_wait_guidance()}{_coder_documentation_guidance()}{_coder_github_body_file_guidance()}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_issue_context_block(issue_context)}
