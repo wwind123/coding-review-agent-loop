@@ -17014,3 +17014,53 @@ def test_planner_history_failure_is_advisory_and_keeps_the_guidance(tmp_path, mo
     assert revisions
     assert all("history is unavailable this turn" in prompt for prompt in revisions)
     assert "projection exploded" not in str(error)
+
+
+def _m1273_run_all_reviewers(tmp_path, *, declare, rounds=3):
+    fresh, base0 = _m1103_fresh_base()
+    codex, claude, _base = _m1103_blocking_chain(1, rounds, base=base0)
+    if declare:
+        claude = [
+            output.replace(
+                '"summary": "Close gap 2."',
+                '"summary": "Generalization: this generalizes the fix for [item-1]: every gap"',
+            )
+            for output in claude
+        ]
+    runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
+    config = make_config(
+        tmp_path, reviewer=("codex",), max_rounds=rounds, quiet=False,
+    )
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    return runner
+
+
+def test_all_reviewers_planner_history_shows_resolved_finding_and_prior_fix_not_sibling(
+    tmp_path,
+):
+    """`planner-live-history`/`fix-cutoff-sibling` under the compatibility policy."""
+    runner = _m1273_run_all_reviewers(tmp_path, declare=False, rounds=4)
+    revisions = [
+        prompt for prompt in _m1251_prompts(runner, "claude")
+        if "Proactive generalization" in prompt
+    ]
+    assert len(revisions) >= 3
+    third = revisions[2]
+    history = third.split("Earlier-round history for this run", 1)[1]
+    history = history.split("Blocking plan review payload", 1)[0].split("plan review:", 1)[0]
+    assert "Codex finding item-1 (resolved)" in history
+    assert "fix by " in history and "Close gap 1." in history
+    assert "item-3" not in history
+
+
+def test_planner_declared_generalization_is_logged_with_a_tag_and_silent_otherwise(
+    tmp_path, capsys
+):
+    """`generalization-logged` for the planner (proactive, no step-back)."""
+    _m1273_run_all_reviewers(tmp_path, declare=True)
+    err = capsys.readouterr().err
+    assert err.count("declared a generalization") == 1
+    assert "declared a generalization (proactive): Generalization: this generalizes" in err
+    _m1273_run_all_reviewers(tmp_path / "quiet", declare=False)
+    assert "declared a generalization" not in capsys.readouterr().err

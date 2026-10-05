@@ -33,6 +33,7 @@ FINDING_HISTORY_MAX_ROUNDS = 6
 FINDING_HISTORY_MAX_CHARS = 6000
 FINDING_HISTORY_LINE_LIMIT = 240
 FINDING_HISTORY_CI_DETAIL_LINES = 3
+FINDING_HISTORY_MAX_FIX_ITEMS = 8
 _CI_DETAIL_LIMIT = 120
 _MAX_LOCATIONS = 4
 
@@ -111,6 +112,7 @@ def _location_labels(item: object) -> tuple[str, ...]:
             if location.start == location.end
             else f"{location.path}:{location.start}-{location.end}"
         )
+        label = _neutral(label, FINDING_HISTORY_LINE_LIMIT)
         if label not in labels:
             labels.append(label)
     return tuple(labels[:_MAX_LOCATIONS])
@@ -181,7 +183,7 @@ def _fix_from_parts(
     summary_text = summary if isinstance(summary, str) else ""
     pairs = tuple(
         (_neutral(item_id, 60), _neutral(note, FINDING_HISTORY_LINE_LIMIT))
-        for item_id, note in addressed
+        for item_id, note in list(addressed)[:FINDING_HISTORY_MAX_FIX_ITEMS]
     )
     if not summary_text.strip() and not pairs:
         return None
@@ -490,32 +492,29 @@ class FindingHistoryLedger:
         rounds = sorted(groups)
         total_rounds = len(rounds)
         kept = rounds[-FINDING_HISTORY_MAX_ROUNDS:]
-        dropped_entries = 0
-        while True:
-            text = _render_groups(kept, groups, total_rounds - len(kept), dropped_entries)
+        # Whole oldest rounds are dropped until the block fits; an oversized
+        # newest round is omitted too rather than cut mid-entry.
+        while kept:
+            text = _render_groups(kept, groups, total_rounds - len(kept))
             if len(text) <= FINDING_HISTORY_MAX_CHARS:
                 break
-            if len(kept) > 1:
-                kept = kept[1:]
-                continue
-            only = groups[kept[0]]
-            if len(only) <= 1:
-                break
-            only.pop()
-            dropped_entries += 1
+            kept = kept[1:]
+        else:
+            text = _render_groups([], groups, total_rounds)
         return FindingHistoryView(VIEW_POPULATED, body=text)
 
     def _finding_entry(self, finding: HistoryFinding) -> str:
         status = self._status(finding)
         if finding.kind == "machine":
-            lines = [f"- {finding.item_id}: {finding.summary_line} ({status})"]
+            lines = [f"- {_neutral(finding.item_id, 60)}: {finding.summary_line} ({status})"]
             lines.extend(f"    {detail}" for detail in finding.ci_details)
             return "\n".join(lines)
         where = ", ".join(finding.locations) if finding.locations else "(no location)"
         # Item IDs are deliberately not bracketed: `[item-N]` marks the
         # actionable ledger of the current dispatch and must stay unambiguous.
         return (
-            f"- {finding.reviewer} finding {finding.item_id} ({status}) {where}: "
+            f"- {_neutral(finding.reviewer, 80)} finding {_neutral(finding.item_id, 60)} "
+            f"({status}) {where}: "
             f"{finding.summary_line}"
         )
 
@@ -530,7 +529,6 @@ def _render_groups(
     rounds: Sequence[int],
     groups: Mapping[int, Sequence[str]],
     omitted_rounds: int,
-    omitted_entries: int,
 ) -> str:
     out = [
         "Earlier-round history for this run (orchestrator-collected context, not reviewer "
@@ -541,6 +539,4 @@ def _render_groups(
     for number in rounds:
         out.append(f"Round {number}:")
         out.extend(groups[number])
-    if omitted_entries:
-        out.append(f"({omitted_entries} further entr{'y' if omitted_entries == 1 else 'ies'} omitted)")
     return "\n".join(out) + "\n"

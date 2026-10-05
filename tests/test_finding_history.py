@@ -198,14 +198,47 @@ def test_history_respects_char_cap_by_dropping_whole_oldest_rounds():
     assert "Round 6:" in text
 
 
-def test_single_oversize_round_drops_whole_entries_not_midline():
+def test_single_oversize_round_is_omitted_whole_and_reported():
     ledger, _ = _ledger()
     for k in range(80):
-        ledger.add_finding(_item(f"item-{k}", round_number=1, text="y" * 500))
+        ledger.add_finding(_item(f"item-{k}", round_number=2, text="y" * 500))
+    ledger.add_finding(_item("item-new", round_number=1))
     text = _view(ledger, 9)
     assert len(text) <= FINDING_HISTORY_MAX_CHARS
-    assert "further entr" in text
-    assert text.rstrip().splitlines()[-1].startswith("(")
+    assert "(2 earlier round(s) omitted)" in text
+    assert "Round 2:" not in text
+
+
+def test_one_large_fix_response_stays_under_the_cap():
+    ledger, _ = _ledger()
+    notes = {f"item-{n}": "n" * 400 for n in range(60)}
+    ledger.add_fix(
+        fh.fix_from_payload(
+            json.loads(_coder_fix(2, "big " * 200, notes)), published_round=2, agent="Claude"
+        )
+    )
+    ledger.add_finding(_item("item-old", round_number=1))
+    text = _view(ledger, 3)
+    assert len(text) <= FINDING_HISTORY_MAX_CHARS
+    assert text.count("\n    item-") <= fh.FINDING_HISTORY_MAX_FIX_ITEMS
+
+
+def test_location_labels_from_findings_and_subitems_are_neutralized():
+    from coding_review_agent_loop.protocol_markers import RESERVED_MARKER_REGISTRY
+
+    token = RESERVED_MARKER_REGISTRY[0].token
+    ledger, _ = _ledger()
+    ledger.add_finding(_item("item-1", text=f"bug in src/{token}.py:12"))
+    ledger.add_finding(
+        _item(
+            "item-2",
+            text="no loc",
+            sub_items=(ReviewSubItem("a", f"see lib/{token}.py:7"),),
+        )
+    )
+    text = _view(ledger, 5)
+    assert token not in text
+    assert "src/" in text and "lib/" in text
 
 
 # --- sources -----------------------------------------------------------------
@@ -449,3 +482,47 @@ def test_planner_prompts_default_unchanged_and_carry_guidance_in_each_branch(tmp
     prefix, tail = compact.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER)
     assert "Proactive generalization" in prefix and "item-1" not in prefix
     assert "item-1" in tail and "Proactive generalization" not in tail
+
+
+def test_owner_scoped_replay_partial_owner_clearance_stays_active_and_state_carries():
+    shared = _item("item-1", resolution_owners=("Codex", "Claude"))
+    seed = _record(0, "reviewer", 1, subject="h0", state="blocking", new_items=(shared,))
+    owner_resolves = _record(
+        1, "reviewer", 2, agent="Codex", subject="h1", state="blocking",
+        dispositions=(ReviewItemDisposition("item-1", "Codex", "resolved"),),
+    )
+    other_blocks = _record(
+        2, "reviewer", 2, agent="Claude", subject="h1", state="blocking",
+        dispositions=(ReviewItemDisposition("item-1", "Claude", "blocking", "no"),),
+    )
+    outcomes = canonical_history_item_outcomes(
+        [seed, owner_resolves, other_blocks],
+        reconciliation_mode="owner-scoped", same_status="same-pr",
+    )
+    assert outcomes == {"item-1": "active"}
+    # Second owner resolves in a later group: now resolved (state carried forward).
+    second = _record(
+        3, "reviewer", 3, agent="Claude", subject="h2", state="blocking",
+        dispositions=(ReviewItemDisposition("item-1", "Claude", "resolved"),),
+    )
+    codex_later = _record(
+        4, "reviewer", 3, agent="Codex", subject="h2", state="blocking",
+        dispositions=(ReviewItemDisposition("item-1", "Codex", "resolved"),),
+    )
+    outcomes = canonical_history_item_outcomes(
+        [seed, owner_resolves, other_blocks, second, codex_later],
+        reconciliation_mode="owner-scoped", same_status="same-pr",
+    )
+    assert outcomes == {"item-1": "resolved"}
+
+
+def test_owner_scoped_replay_pending_second_owner_is_not_deferred_or_cleared():
+    shared = _item("item-1", resolution_owners=("Codex", "Claude"))
+    seed = _record(0, "reviewer", 1, subject="h0", state="blocking", new_items=(shared,))
+    only_one = _record(
+        1, "reviewer", 2, agent="Codex", subject="h1", state="blocking",
+        dispositions=(ReviewItemDisposition("item-1", "Codex", "resolved"),),
+    )
+    assert canonical_history_item_outcomes(
+        [seed, only_one], reconciliation_mode="owner-scoped", same_status="same-pr"
+    ) == {"item-1": "active"}

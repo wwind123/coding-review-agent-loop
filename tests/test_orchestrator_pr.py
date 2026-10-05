@@ -17982,3 +17982,63 @@ def test_an_advisory_history_failure_keeps_guidance_and_the_run_continues(
     assert all("Proactive generalization" in prompt for prompt in prompts)
     assert all("history is unavailable this turn" in prompt for prompt in prompts)
     assert "finding history unavailable: RuntimeError: projection exploded" in capsys.readouterr().err
+
+
+def test_ci_repair_dispatch_shows_the_earlier_ci_failure_by_check_name(
+    tmp_path, monkeypatch, capsys
+):
+    """`ci-repair-dispatch`: a CI failure on head A is history when head B fails."""
+    runner = FakeRunner(
+        codex_outputs=[
+            "Fix the application bug.\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Still failing CI."
+            + prior_item_dispositions("[item-1] resolved", "[item-2] still blocking: the unit-a check still fails in src/app.py:3 and needs a test fix")
+            + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "All good."
+            + prior_item_dispositions("[item-2] resolved", "[item-3] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=[
+            "Fixed the application and CI.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Fixed lint.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+    )
+    counter = iter(range(1, 10))
+    original = orchestrator._run_validated_agent
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+
+    def boards(*_a, **_k):
+        head = runner.pr_payload["headRefOid"]
+        if head == "repaired-2":
+            return _watch_check_board("passing")
+        name = "unit-a" if head != "repaired-1" else "lint-b"
+        failed = PullRequestCheck(
+            name=name, kind="check_run", status="failure", url=f"https://example.test/{name}"
+        )
+        return _watch_check_board("failing", failing=(failed,))
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    assert run_pr_loop(
+        runner, pr_number=77,
+        config=make_config(tmp_path, watch_pending_ci=True, quiet=False, max_rounds=4),
+    ) == 0
+    prompts = [
+        "\n".join(cmd) for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"
+    ]
+    assert len(prompts) == 2
+    assert all("Proactive generalization" in prompt for prompt in prompts)
+    second = prompts[1]
+    history = second.split("Earlier-round history for this run", 1)[1]
+    assert "CI github-pr-checks on" in history
+    assert "unit-a" in history
