@@ -18104,3 +18104,39 @@ def test_staged_step_back_candidate_then_narrowing_carries_directive_and_anchor(
     assert _STEP_BACK_ANCHOR_PLANNER in narrowing
     assert "[item-4]" in narrowing
     assert _STEP_BACK_MARKER not in narrowing
+
+
+def test_growth_guard_revision_after_an_in_episode_approval_carries_no_anchor(tmp_path):
+    """`narrow-revision-in-episode` (guard branch): the approval closes the episode.
+
+    The episode is active when round 8's review starts (that review carries the
+    anchor).  Tightening the growth thresholds on resume makes the justified candidate
+    non-compliant, the primary approves it, and the orchestrator-owned growth-guard
+    revision follows.  The approval closes the episode: the guard notice is delivered
+    with no planner anchor, no anchor log line and no second step-back entry.
+    """
+    history = _m1278_episode_history(tmp_path)
+    approve = structured_plan_review(
+        state="approved",
+        prior_plan_item_dispositions=[{"item_id": "item-7", "disposition": "resolved"}],
+    )
+    rerun = _FakeRunner(issue_comments=history, claude_outputs=[], codex_outputs=[approve])
+    config = _staged_plan_config(
+        tmp_path, max_rounds=12, plan_growth_max_chars=1000, plan_growth_max_revisions=3,
+        plan_step_back_rounds=2, plan_step_back_escalation_rounds=9,
+    )
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+
+    codex = _m1251_prompts(rerun, "codex")
+    planner = _m1251_prompts(rerun, "claude")
+    assert _STEP_BACK_ANCHOR_REVIEW in codex[0]
+    guard = planner[0]
+    assert "plan-growth" in guard.lower()
+    assert _STEP_BACK_ANCHOR_PLANNER not in guard
+    assert _STEP_BACK_MARKER not in guard
+    assert not any("step-back anchor" in str(c.args[-1]) for c in logged.call_args_list)
+    assert sum(1 for r in _plan_round_records(rerun) if r.step_back_entries) == 1
