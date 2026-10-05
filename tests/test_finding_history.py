@@ -752,3 +752,38 @@ def test_replay_lets_a_resolved_disposition_clear_a_carried_future_item():
     assert canonical_history_item_outcomes(
         [seed, carried, clears], reconciliation_mode="aggregate", same_status="same-pr"
     ) == {"item-1": "resolved"}
+
+
+def test_clearance_in_the_first_resumed_round_overrides_the_seeded_deferral():
+    """Resume before clearance: the carried future item is known before reconciliation."""
+    item = _item("item-1")
+    carried = UnresolvedReviewItem(
+        item_id="item-1", reviewer="Codex", source_round=1, text=item.text, status="future"
+    )
+    seed = _record(0, "reviewer", 1, subject="h0", state="blocking", new_items=(item,))
+    stored = _record(1, "coder", 2, agent="Claude", subject="h1", prior_items=(carried,))
+    ledger, _ = _ledger()
+    ledger.seed_from_records([seed, stored], reconciliation_mode="aggregate", same_status="same-pr")
+    assert "Codex finding item-1 (deferred)" in _view(ledger, 3)
+    # New invocation, round starts from the stored ledger, reconciler clears the item.
+    ledger.note_carried_ledger([carried])
+    ledger.observe_reconciled([_item("item-2", round_number=3)])
+    assert "Codex finding item-1 (resolved)" in _view(ledger, 4)
+
+
+def test_compact_resume_keeps_the_deferral_when_the_stored_ledger_omits_the_item():
+    item = _item("item-1")
+    seed = _record(0, "reviewer", 1, subject="h0", state="blocking", new_items=(item,))
+    future_disposition = _record(
+        1, "reviewer", 2, subject="h1", state="blocking",
+        dispositions=(_future_disposition("item-1"),),
+    )
+    stored = _record(2, "coder", 3, agent="Claude", subject="h2", prior_items=())
+    ledger, _ = _ledger()
+    ledger.seed_from_records(
+        [seed, future_disposition, stored],
+        reconciliation_mode="aggregate", same_status="same-pr",
+    )
+    ledger.note_carried_ledger([])
+    ledger.observe_reconciled([_item("item-2", round_number=4)])
+    assert "Codex finding item-1 (deferred)" in _view(ledger, 5)

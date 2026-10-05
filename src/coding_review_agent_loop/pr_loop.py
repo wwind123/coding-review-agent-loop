@@ -2661,6 +2661,7 @@ def run_pr_loop(
             if evidence_pass is not None:
                 evidence_skip_reviewers = False
             prior_unresolved_items = tuple(unresolved_items)
+            pr_finding_history.note_carried_ledger(prior_unresolved_items)
             prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
                 item.item_id: [] for item in prior_unresolved_items
             }

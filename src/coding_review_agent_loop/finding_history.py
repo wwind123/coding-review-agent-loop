@@ -398,6 +398,26 @@ class FindingHistoryLedger:
         except Exception as exc:  # advisory: never stop the run
             self._fail(exc)
 
+    def note_carried_ledger(self, prior_items: Sequence[object]) -> None:
+        """Record the authoritative ledger a round starts from, before reconciliation.
+
+        On a resumed run the first observation happens only after the round's
+        reconciliation, so the future items already carried in the stored ledger
+        must be known beforehand: if the reconciler then clears one, its absence
+        is explicit clearance rather than the compact-mode move to the separate
+        future collection.
+        """
+        try:
+            for item in prior_items:
+                finding = self.add_finding(item)
+                if finding is None or finding.kind != "reviewer":
+                    continue
+                if getattr(item, "status", None) == "future":
+                    self._deferred.add(finding.key)
+                    self._ledger_future.add(finding.key)
+        except Exception as exc:
+            self._fail(exc)
+
     def record_fix(self, parsed: object, *, published_round: int, agent: str) -> None:
         try:
             self.add_fix(fix_from_parsed(parsed, published_round=published_round, agent=agent))

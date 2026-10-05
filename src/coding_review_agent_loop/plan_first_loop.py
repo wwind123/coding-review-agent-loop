@@ -1624,6 +1624,7 @@ def _run_plan_first_loop(
     for round_number in range(start_round_number, config.max_rounds + 1):
         current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
         prior_unresolved_items = current_resume.prior_items if current_resume is not None else tuple(unresolved_items)
+        plan_finding_history.note_carried_ledger(prior_unresolved_items)
         prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
             item.item_id: [] for item in prior_unresolved_items
         }
