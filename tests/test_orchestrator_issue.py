@@ -18023,3 +18023,84 @@ def test_narrowing_revision_inside_an_active_episode_carries_directive_and_ancho
     assert _STEP_BACK_MARKER not in revision
     assert any("step-back anchor" in m for m in messages)
     assert sum(1 for r in _plan_round_records(rerun) if r.step_back_entries) == 1
+
+
+def _m1278_staged_step_back_run(tmp_path):
+    """A durable staged step-back candidate, then a primary block under --plan-narrow-staged."""
+    fresh, base0 = _m1103_fresh_base()
+    codex1, claude1, base_round2 = _m1103_blocking_chain(1, 1, base=base0)
+    codex2, _claude2, _base = _m1103_blocking_chain(2, 2, base=base_round2)
+    justify, base_round3 = _m1251_justify_patch(base_round2, resolved_item="item-2")
+    codex_34, claude_3, base_round4 = _m1103_blocking_chain(3, 3, base=base_round3)
+    codex_4, _claude_4, _base = _m1103_blocking_chain(4, 4, base=base_round4)
+    staged_recommendation = json.loads(_m1268_staged_raw().split("\n<!--")[0])[
+        "execution_recommendation"
+    ]
+    # Converting to staged must keep the one-shot plan's scope ledger verbatim.
+    one_shot_scope = json.loads(structured_v1_plan_state().split("\n<!--")[0])[
+        "execution_recommendation"
+    ]["scope_items"]
+    staged_recommendation["scope_items"][0] = one_shot_scope[0]
+    step_back_payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "split: two stages dissolve the earlier findings.",
+        "prior_plan_item_dispositions": [
+            {"item_id": "item-4", "disposition": "resolved", "note": "dissolved: staged"}
+        ],
+        "base_round_number": 4,
+        "base_state_identity": base_round4.state_identity,
+        "operations": [
+            {"op": "replace", "field": "execution_recommendation", "value": staged_recommendation},
+            {"op": "replace", "field": "one_shot_growth_justification", "value": None},
+        ],
+    }
+    base_round5 = AuthenticatedPlanState.from_plan(
+        assemble_plan_revision(base_round4, step_back_payload), round_number=5
+    )
+    step_back = (
+        json.dumps(step_back_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    codex5 = structured_plan_review(
+        state="blocking", summary="Gap 5 remains.", blocking_plan_issues=["Close gap 5."],
+        prior_plan_item_dispositions=[{"item_id": "item-4", "disposition": "resolved"}],
+    )
+    narrowing = _m1268_narrowing_patch(
+        base_round5, round_number=5,
+        dispositions=[{"item_id": "item-5", "disposition": "resolved"}],
+    )
+    runner = _FakeRunner(
+        claude_outputs=[fresh, *claude1, justify, *claude_3, step_back, narrowing],
+        codex_outputs=[*codex1, *codex2, *codex_34, *codex_4, codex5],
+    )
+    config = _staged_plan_config(
+        tmp_path, max_rounds=8, plan_growth_max_chars=4500, plan_growth_max_revisions=3,
+        plan_step_back_escalation_rounds=9, plan_narrow_staged=True,
+        plan_execution_mode="implement-one-shot",
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    return runner, excinfo.value
+
+
+def test_staged_step_back_candidate_then_narrowing_carries_directive_and_anchor(tmp_path):
+    """`narrow-revision-in-episode`: authentic staged step-back history, no patching.
+
+    Narrowing is the only orchestrator-owned revision reachable inside an active
+    episode: the growth-guard, inherited-guard and supersession revisions all
+    require ``all_approved`` (the primary approved), which closes the episode, so
+    they carry no anchor (see the approval closure tests).
+    """
+    runner, error = _m1278_staged_step_back_run(tmp_path)
+
+    entries = [r for r in _plan_round_records(runner) if r.step_back_entries]
+    assert len(entries) == 1 and entries[0].round_number == 5
+    planner = _m1251_prompts(runner, "claude")
+    narrowing = planner[5]
+    assert "Operator directive (orchestrator, not a reviewer finding)" in narrowing
+    assert _STEP_BACK_ANCHOR_PLANNER in narrowing
+    assert "[item-4]" in narrowing
+    assert _STEP_BACK_MARKER not in narrowing

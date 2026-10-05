@@ -3166,8 +3166,11 @@ candidate's recorded structured response: the dissolved items are its resolved
 prior-item dispositions (notes starting `dissolved:` are preferred, which the
 step-back turn asks for; a candidate without that prefix falls back to every
 resolved entry) and the trade-offs are its `summary`. Every planner revision
-prompt in the episode, whatever the revision kind, says to address the findings
-within the simplified design. Reversing a dissolution needs a line
+prompt in the episode, whatever the revision kind (the narrowing revision under
+`--plan-narrow-staged` included), says to address the findings
+within the simplified design. Growth-guard, inherited-guard and supersession
+revisions follow a primary approval, which closes the episode, so they carry no
+anchor. Reversing a dissolution needs a line
 `reintroduces dissolved item <ID>: <why the simpler design cannot meet the
 requirement otherwise>` in the summary or a disposition note. Primary-phase
 reviewer prompts, the step-back candidate's review included, list the dissolved
