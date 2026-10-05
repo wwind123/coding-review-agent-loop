@@ -1264,7 +1264,10 @@ the primary has blocked K consecutive rounds on new mandatory findings, the next
 turn must propose a materially simpler design (or a split, or under `implement-one-shot`
 a re-file-as-staged caveat) instead of patching the newest finding, and
 `--plan-step-back-escalation-rounds M` (default 2) stops for a human decision once the
-primary has blocked M rounds after it. An in-flight run already past eight such rounds stops at
+primary has blocked M rounds after it. A reached `--plan-primary-stall-rounds` stop is
+deferred while a step-back is pending or an episode is active, so a stalled history
+still gets its step-back, and the stall message says why the step-back did not apply
+otherwise. An in-flight run already past eight such rounds stops at
 its next round after upgrading. Omitting the flags keeps today's
 full-board planning behavior unchanged, and discussion-mode cycles always stay
 full-board. In the PR fix loop, `--pr-step-back-rounds K` (default 3, `0` disables) and

@@ -44,6 +44,7 @@ CLASS_OTHER = "other"
 # A blocking publication record whose round has no later reconciliation: its
 # new items are unknowable, so it can only end a streak, never start one.
 CLASS_BLOCKING_UNRESOLVED = "blocking-unresolved"
+BLOCKING_CLASSES = frozenset({CLASS_NEW_FINDING, CLASS_REPEAT_ONLY, CLASS_BLOCKING_UNRESOLVED})
 
 PHASE_PLAN = "plan"
 PHASE_PR = "pr"
@@ -150,6 +151,24 @@ class StepBackState:
     reviews: tuple[PrimaryReview, ...]
     episode: StepBackEntry | None
     escalation_count: int
+    # Rounds whose round-start stall stop was deferred for a pending step-back
+    # (#1275), from usable primary checkpoints that survive the same retirement
+    # rules as the counted reviews.
+    deferral_rounds: tuple[int, ...] = ()
+
+    def streak_before(self, first_round: int, before_round: int) -> int:
+        """Like :meth:`streak_since`, ignoring reviews of rounds ``>= before_round``."""
+        floor = first_round if self.episode is None else max(
+            first_round, self.episode.candidate_round
+        )
+        count = 0
+        for review in reversed(self.reviews):
+            if review.round_number >= before_round:
+                continue
+            if review.round_number < floor or review.classification != CLASS_NEW_FINDING:
+                break
+            count += 1
+        return count
 
     def streak_since(self, first_round: int) -> int:
         """Consecutive newest-first ``new-finding`` reviews at or after ``first_round``.
@@ -205,6 +224,7 @@ def derive_plan_step_back_state(
     checkpoint_indices: dict[int, list[tuple[int, str | None]]] = {}
     # Every usable primary checkpoint in order, for episode digest closure.
     all_checkpoints: list[tuple[int, str | None]] = []
+    deferrals: list[tuple[int, int, str | None]] = []
     for record in ordered:
         metadata = record.metadata
         if (
@@ -222,6 +242,12 @@ def derive_plan_step_back_state(
         if metadata.scheduler_stall_reset:
             reset_indices.append(record.index)
             retired_through = max(retired_through, metadata.round_number - 1)
+        if metadata.scheduler_step_back_deferral and (
+            panel_opening_index is None or record.index < panel_opening_index
+        ):
+            deferrals.append(
+                (record.index, metadata.round_number, metadata.scheduler_issue_digest)
+            )
 
     latest_review: dict[int, "PostedRoundRecord"] = {}
     for record in ordered:
@@ -331,11 +357,97 @@ def derive_plan_step_back_state(
                 and review.classification
                 in {CLASS_NEW_FINDING, CLASS_REPEAT_ONLY, CLASS_BLOCKING_UNRESOLVED}
             )
+    # An issue edit retires the latest mismatching deferral and everything before it.
+    if current_issue_digest is not None:
+        for position in range(len(deferrals) - 1, -1, -1):
+            recorded = deferrals[position][2]
+            if recorded is not None and recorded != current_issue_digest:
+                deferrals = deferrals[position + 1 :]
+                break
+    deferral_rounds = tuple(
+        sorted({number for _index, number, _digest in deferrals if number > retired_through})
+    )
     return StepBackState(
         degraded=degraded,
         reviews=reviews,
         episode=episode,
         escalation_count=escalation_count,
+        deferral_rounds=deferral_rounds,
+    )
+
+
+DISPOSITION_DEFER_PENDING = "defer-pending"
+DISPOSITION_DEFER_EPISODE = "defer-episode"
+DISPOSITION_ESCALATED = "escalated"
+DISPOSITION_NOT_APPLICABLE = "not-applicable"
+
+
+@dataclass(frozen=True)
+class StallStepBackDisposition:
+    """What a reached primary stall limit does about the plan step-back (#1275)."""
+
+    kind: str
+    reason: str
+
+
+def plan_stall_step_back_disposition(
+    state: StepBackState | None,
+    *,
+    round_number: int,
+    crossing_round: int | None,
+    growth_gate_enforced: bool,
+    step_back_rounds: int,
+    escalation_rounds: int,
+) -> StallStepBackDisposition:
+    """Fixed-precedence decision the round-start stall stop consults.
+
+    Eligibility is judged from rounds before ``round_number`` so the answer does
+    not change when that round's own primary review is posted.  The stall streak
+    is deliberately not an input: an eligible history above the threshold is
+    granted too.
+    """
+    na = DISPOSITION_NOT_APPLICABLE
+    if step_back_rounds <= 0:
+        return StallStepBackDisposition(na, "step-back disabled (--plan-step-back-rounds 0)")
+    if state is None or state.degraded:
+        return StallStepBackDisposition(na, "planning step-back history degraded")
+    episode = state.episode
+    if episode is not None:
+        if state.escalation_count >= escalation_rounds:
+            return StallStepBackDisposition(
+                DISPOSITION_ESCALATED,
+                f"step-back episode from round {episode.candidate_round} reached "
+                f"{state.escalation_count}/{escalation_rounds} escalation block(s)",
+            )
+        return StallStepBackDisposition(
+            DISPOSITION_DEFER_EPISODE,
+            f"step-back episode from round {episode.candidate_round} at "
+            f"{state.escalation_count}/{escalation_rounds} escalation block(s)",
+        )
+    if not growth_gate_enforced:
+        return StallStepBackDisposition(na, "plan-growth gate is off")
+    if crossing_round is None:
+        return StallStepBackDisposition(
+            na, "the current candidate crosses no plan-growth signal"
+        )
+    for deferred in state.deferral_rounds:
+        if crossing_round <= deferred < round_number:
+            return StallStepBackDisposition(
+                na,
+                f"a step-back was already deferred at round {deferred} and no step-back "
+                "turn followed (an orchestrator-owned revision took precedence)",
+            )
+    streak = state.streak_before(crossing_round, round_number)
+    if streak < step_back_rounds:
+        return StallStepBackDisposition(
+            na,
+            f"only {streak} new-finding primary block(s) since the crossing at round "
+            f"{crossing_round}, below --plan-step-back-rounds {step_back_rounds}",
+        )
+    return StallStepBackDisposition(
+        DISPOSITION_DEFER_PENDING,
+        f"growth signal crossed at round {crossing_round}; {streak} new-finding "
+        "primary block(s) before this round",
     )
 
 
@@ -472,8 +584,8 @@ def render_step_back_human_decision(
         "human decision required: the planner stepped back at round "
         f"{step_back_round} (a simplify-or-re-scope revision), and the primary plan "
         f"reviewer has since blocked {blocks} round(s), reaching "
-        f"--plan-step-back-escalation-rounds {threshold}, before "
-        "--plan-primary-stall-rounds. No reviewer and no planner turn were invoked. "
+        f"--plan-step-back-escalation-rounds {threshold} (the stall stop is deferred "
+        "while a step-back is pending or in progress). No reviewer and no planner turn were invoked. "
         f"{measurements} Latest alternative (excerpt of the step-back candidate "
         f"summary): {excerpt or '(not recorded)'} Decide one of: continue patching "
         "(rerun with --plan-step-back-rounds 0, or with --plan-reset-stall-streak, "

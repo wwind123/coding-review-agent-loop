@@ -1019,8 +1019,14 @@ def plan_primary_stall_message(
     threshold: int,
     plan_chars: int,
     legacy_undigested: bool = False,
+    step_back_status: str | None = None,
 ) -> str:
     """Operator diagnostic for the primary-phase stall stop (#1103, #1112)."""
+    step_back_note = (
+        f" Plan step-back did not apply: {step_back_status}."
+        if step_back_status
+        else ""
+    )
     legacy_note = (
         " The newest counted rounds predate issue-text tracking and by themselves "
         "reach the threshold, so editing the issue cannot retire them or clear "
@@ -1044,7 +1050,9 @@ def plan_primary_stall_message(
         "streak resumes with the primary review of the current candidate plan, which "
         "the planner then revises against the narrowed issue. If you changed "
         "--plan-execution-mode since these rounds and they predate execution-mode "
-        "recording, rerun with --plan-reset-stall-streak to retire them." + legacy_note
+        "recording, rerun with --plan-reset-stall-streak to retire them."
+        + legacy_note
+        + step_back_note
     )
 
 

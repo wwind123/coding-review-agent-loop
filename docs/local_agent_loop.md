@@ -3140,10 +3140,13 @@ content of the alternative stays with the planner and the reviewers.
   once the primary has blocked M rounds since it (the block of the step-back
   candidate itself is the first, so `1` stops as soon as the simplify turn is
   rejected), the run stops with a human-decision-required diagnostic instead of
-  running to `--plan-primary-stall-rounds`. It shows the current growth
+  running on to the stall stop. It shows the current growth
   measurements, the step-back round, and an excerpt of the latest alternative. No
   planner turn runs after it, and the stop writes no record a resume could read as
-  a checkpoint. Whichever of this stop and the stall stop is reached first wins.
+  a checkpoint. A pending step-back (crossed plan, K new-finding blocks in earlier rounds) or an
+  active episode below M defers `--plan-primary-stall-rounds`, so a stalled history
+  gets its step-back turn on resume (the deferral is recorded once on the round's
+  checkpoint); otherwise the stall message names why the step-back did not apply.
 
 To continue after the stop, pick one: continue patching (rerun with
 `--plan-step-back-rounds 0`, or `--plan-reset-stall-streak`, which also ends the

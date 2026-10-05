@@ -684,7 +684,18 @@ candidate or later (the candidate's own block is the first). At M the loop
 stops through `stop_plan_pre_panel` with a human-decision diagnostic (growth
 measurements, the step-back round, a bounded excerpt of the step-back summary,
 and the continue, adopt, or split options) before invoking any planner turn,
-whichever of that stop and the stall stop is reached first. The same derivation
+before the stall stop. A step-back pending at round R (no episode, a crossed
+one-shot candidate, and at least K new-finding primary blocks since the crossing
+in rounds before R) defers a reached primary stall stop at any stall streak, and
+any blocking primary review of round R, repeat-only included, triggers the step-back
+turn. The optional planning-only primary checkpoint field
+`scheduler_step_back_deferral` (written next to `scheduler_stall_reset`, strict
+`true` only, primary phase only, omitted when unset) records that deferral and bounds
+it to one per pending episode: a later stalled round whose earlier deferral produced
+no step-back turn stops with the stall message. An active episode below M also defers
+the stall stop, so M ends the run in a human decision. Otherwise the stall diagnostic
+appends why the step-back did not apply (disabled, degraded history, gate off, no
+crossing, already deferred, or below K). The same derivation
 runs at round start, so live and resumed runs trigger and stop at exactly K and
 M. The approval-time growth gate and scope-ledger preservation are unchanged.
 
