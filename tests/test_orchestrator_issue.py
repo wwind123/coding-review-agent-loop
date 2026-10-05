@@ -18143,6 +18143,8 @@ def test_growth_guard_revision_after_an_in_episode_approval_carries_no_anchor(tm
 
 
 from coding_review_agent_loop.round_state import _encode_round_metadata  # noqa: E402
+from coding_review_agent_loop.review_step_back import derive_plan_step_back_state  # noqa: E402
+from coding_review_agent_loop.round_state import PostedRoundRecord  # noqa: E402
 
 
 def _m1278_inject_step_back_entry(comments):
@@ -18176,25 +18178,63 @@ def test_inherited_guard_revision_after_an_episode_closed_by_approval_has_no_anc
 ):
     """`narrow-revision-in-episode` (inherited-guard branch): approval closed the episode.
 
-    The inherited-guard revision only applies to a plan the primary already
-    approved, so any step-back episode opened on that plan's candidate was closed by
-    that approval before the round starts.  The revision gets its own correction
-    record and no planner anchor, no anchor log line and no second step-back entry.
+    Runs under primary-then-panel so the step-back machinery is live.  The inherited
+    guard only applies to a plan the primary already approved, so the episode opened on
+    that plan's candidate was closed by the approval before the round starts.  The
+    revision gets its own correction record and no planner anchor, no anchor log line
+    and no second step-back entry; the machinery is shown to have run and found no
+    episode.
     """
-    weak, history = _m936_historical_approved_plan(tmp_path)
-    history = _m1278_inject_step_back_entry(history)
+    def config(**overrides):
+        return _m936_cpp._plan_config(
+            tmp_path,
+            reviewer=("codex", "gemini"),
+            plan_review_policy="primary-then-panel",
+            primary_plan_reviewer="codex",
+            **overrides,
+        )
+
+    approve_gemini = _m936_cpp.structured_plan_review(
+        state="approved", reviewer="Google Gemini"
+    )
+    weak = _m936_cpp._child_plan_state(_m936_cpp._weak_child_row())
+    first = _m936_cpp._ChildPlanningRunner(
+        claude_outputs=[weak],
+        codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
+        gemini_outputs=[approve_gemini],
+    )
+    assert orchestrator_module.run_issue_loop(
+        first, issue_number=56, config=config(), plan_first=True
+    ) == 0
+    history = _m1278_inject_step_back_entry(list(first.issue_comments))
+
     _m936_cpp._bind_child_planning(monkeypatch)
     good = _m936_patch(weak, _m936_cpp._child_row(), summary="Inherited rows restored.")
     resumed = _m936_cpp._ChildPlanningRunner(
         issue_comments=list(history),
         claude_outputs=[good],
         codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
+        gemini_outputs=[approve_gemini],
     )
+    # The injected episode is live until the primary's approval closes it.
+    records = []
+    for position, comment in enumerate(history):
+        marker = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if marker is not None:
+            metadata = _decode_round_metadata(marker.group("payload"))
+            if metadata.flow == "plan":
+                records.append(PostedRoundRecord(index=position, metadata=metadata, body=""))
+    primary = next(r.metadata.agent for r in records if r.metadata.role == "reviewer")
+    first_reviewer = min(r.index for r in records if r.metadata.role == "reviewer")
+    before_approval = [r for r in records if r.index < first_reviewer]
+    assert derive_plan_step_back_state(before_approval, primary=primary).episode is not None
+    assert derive_plan_step_back_state(list(records), primary=primary).episode is None
+
     with patch.object(
         plan_first_loop_module, "log", wraps=plan_first_loop_module.log
     ) as logged:
         assert orchestrator_module.run_issue_loop(
-            resumed, issue_number=56, config=_m936_cpp._plan_config(tmp_path), plan_first=True
+            resumed, issue_number=56, config=config(), plan_first=True
         ) == 0
 
     planner = _m936_cpp._agent_prompts(resumed, "claude")

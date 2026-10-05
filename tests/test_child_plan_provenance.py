@@ -4347,3 +4347,86 @@ def test_rerun_preflight_finds_children_with_truncated_titles(
     ]
     assert [c.origin for c in result] == ["adopted", "adopted"]
     assert not runner.issues
+
+
+# --- #1278: the signed supersession revision after an approval-closed episode -----
+
+from unittest.mock import patch as _m1278_patch  # noqa: E402
+
+from coding_review_agent_loop import plan_first_loop as _m1278_plan_loop  # noqa: E402
+from coding_review_agent_loop.review_step_back import (  # noqa: E402
+    derive_plan_step_back_state as _m1278_derive,
+)
+from coding_review_agent_loop.round_state import (  # noqa: E402
+    _decode_round_metadata as _m1278_decode,
+    _encode_round_metadata as _m1278_encode,
+)
+
+
+def test_m1278_supersession_revision_after_an_approval_closed_episode_has_no_anchor(
+    tmp_path, monkeypatch
+):
+    """The signed re-plan applies to an approved plan, so approval already closed any episode.
+
+    The history is planned under primary-then-panel so the step-back machinery is live.
+    A step-back entry is injected on the plan's candidate (an episode opens), the primary
+    then approved it (the episode closes) and the signed authorization names that plan.
+    The supersession revision receives its own rationale directive with no planner
+    anchor, no anchor log line and no second step-back entry.
+    """
+    world = _M936World(tmp_path, monkeypatch, weak=False, staged=True)
+    entry = {"phase": "plan", "reviewer": "Codex", "trigger_round": 1}
+    injected = 0
+    comments = []
+    for item in world.comments:
+        marker = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", item.body)
+        if marker is not None and not injected:
+            metadata = _m1278_decode(marker.group("payload"))
+            if metadata.flow == "plan" and metadata.role == "coder":
+                metadata = dataclasses.replace(
+                    metadata, step_back_status="valid", step_back_entries=(entry,)
+                )
+                item = dataclasses.replace(
+                    item,
+                    body=item.body.replace(
+                        marker.group("payload"), _m1278_encode(metadata)
+                    ),
+                )
+                injected += 1
+        comments.append(item)
+    assert injected == 1
+    world.comments = comments
+    world.comments[-1] = comment(world.signed_record(rationale="Reduce scope to the seam writers."))
+
+    records = _extract_round_metadata_records(world.comments, flow="plan")
+    primary = next(r.metadata.agent for r in records if r.metadata.role == "reviewer")
+    first_reviewer = min(r.index for r in records if r.metadata.role == "reviewer")
+    before_approval = [r for r in records if r.index < first_reviewer]
+    assert _m1278_derive(before_approval, primary=primary).episode is not None
+    assert _m1278_derive(list(records), primary=primary).episode is None
+
+    patch_text = _m936_patch(world.old_state, None, summary="Reduced scope plan.")
+    with _m1278_patch.object(
+        _m1278_plan_loop, "log", wraps=_m1278_plan_loop.log
+    ) as logged:
+        # Only the supersession revision matters here; the later board turns may
+        # exhaust the scripted outputs.
+        try:
+            world.run_issue(
+                config=world.config(max_rounds=8, **_M936_STAGED),
+                claude_outputs=[patch_text],
+                codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
+                gemini_outputs=[
+                    structured_plan_review(state="approved", reviewer="Google Gemini")
+                ],
+            )
+        except AgentInvocationError:
+            pass
+
+    planner = world.agent_calls("claude")
+    assert len(planner) == 1
+    assert "Reduce scope to the seam writers." in planner[0]
+    assert "STEP-BACK ANCHOR" not in planner[0]
+    assert not any("step-back anchor" in str(c.args[-1]) for c in logged.call_args_list)
+    posted = _extract_round_metadata_records(world.all_comments(), flow="plan")
+    assert sum(1 for r in posted if r.metadata.step_back_entries) == 1
