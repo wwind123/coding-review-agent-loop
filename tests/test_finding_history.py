@@ -694,3 +694,19 @@ def test_owner_scoped_replay_carries_the_earlier_subitem_closure_into_the_next_g
     )
     assert seen[0]["item-1"] == {"a": "open", "b": "open"}
     assert seen[1]["item-1"] == {"a": "resolved", "b": "open"}
+
+
+def test_legacy_ci_snapshots_without_failed_head_seed_once_and_clear():
+    """Legacy fallback key (kind, round, text digest): repeats dedupe, clearance resolves."""
+    legacy = UnresolvedReviewItem(
+        item_id="ci-item", reviewer="Orchestrator", source_round=1,
+        text="Legacy\n- old-check: failure", status="blocking", authority="machine",
+        obligation_kind="github-pr-checks", lifecycle="qualification_ready",
+    )
+    again = _record(1, "coder", 2, agent="Claude", subject="h1", prior_items=(legacy,))
+    first = _record(0, "coder", 1, agent="Claude", subject="h0", prior_items=(legacy,))
+    ledger, _ = _ledger()
+    ledger.seed([first, again])
+    body = ledger.view(5).body
+    assert body.count("CI github-pr-checks") == 1
+    assert "- old-check: failure" in body and "(resolved)" in body

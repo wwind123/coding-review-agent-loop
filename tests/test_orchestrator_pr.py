@@ -18041,8 +18041,10 @@ def test_ci_repair_dispatch_shows_the_earlier_ci_failure_by_check_name(
     second = prompts[1]
     history = second.split("Earlier-round history for this run", 1)[1].split("\n\n", 1)[0]
     assert history.count("CI github-pr-checks on") == 1
-    assert "(resolved)" in history or "(superseded" in history
-    assert "- unit-a" in history or "unit-a" in history
+    # The head-A failure is superseded by the live failure on head B (round 2).
+    assert "CI github-pr-checks on abc123 (superseded by the failure on repaired-1)" in history
+    assert "Failing checks: unit-a" in history
+    assert "lint-b" not in history
     assert "Failing checks: unit-a" in history
     assert "GitHub PR checks are failing" not in history
     assert "Reviewed head" not in history
