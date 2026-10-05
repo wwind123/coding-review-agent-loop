@@ -18140,3 +18140,67 @@ def test_growth_guard_revision_after_an_in_episode_approval_carries_no_anchor(tm
     assert _STEP_BACK_MARKER not in guard
     assert not any("step-back anchor" in str(c.args[-1]) for c in logged.call_args_list)
     assert sum(1 for r in _plan_round_records(rerun) if r.step_back_entries) == 1
+
+
+from coding_review_agent_loop.round_state import _encode_round_metadata  # noqa: E402
+
+
+def _m1278_inject_step_back_entry(comments):
+    """Mark the plan's first coder record as a step-back candidate (an episode opens)."""
+    out = []
+    injected = 0
+    for comment in comments:
+        body = comment["body"]
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", body)
+        if match is not None and not injected:
+            metadata = _decode_round_metadata(match.group("payload"))
+            if metadata.flow == "plan" and metadata.role == "coder":
+                metadata = replace(
+                    metadata,
+                    step_back_status="valid",
+                    step_back_entries=(
+                        {"phase": "plan", "reviewer": "Codex", "trigger_round": 1},
+                    ),
+                )
+                payload = _encode_round_metadata(metadata)
+                body = body.replace(match.group("payload"), payload)
+                comment = {**comment, "body": body}
+                injected += 1
+        out.append(comment)
+    assert injected == 1
+    return out
+
+
+def test_inherited_guard_revision_after_an_episode_closed_by_approval_has_no_anchor(
+    tmp_path, monkeypatch
+):
+    """`narrow-revision-in-episode` (inherited-guard branch): approval closed the episode.
+
+    The inherited-guard revision only applies to a plan the primary already
+    approved, so any step-back episode opened on that plan's candidate was closed by
+    that approval before the round starts.  The revision gets its own correction
+    record and no planner anchor, no anchor log line and no second step-back entry.
+    """
+    weak, history = _m936_historical_approved_plan(tmp_path)
+    history = _m1278_inject_step_back_entry(history)
+    _m936_cpp._bind_child_planning(monkeypatch)
+    good = _m936_patch(weak, _m936_cpp._child_row(), summary="Inherited rows restored.")
+    resumed = _m936_cpp._ChildPlanningRunner(
+        issue_comments=list(history),
+        claude_outputs=[good],
+        codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
+    )
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        assert orchestrator_module.run_issue_loop(
+            resumed, issue_number=56, config=_m936_cpp._plan_config(tmp_path), plan_first=True
+        ) == 0
+
+    planner = _m936_cpp._agent_prompts(resumed, "claude")
+    assert len(planner) == 1
+    assert "Orchestrator inherited-matrix check (not a reviewer finding)" in planner[0]
+    assert _STEP_BACK_ANCHOR_PLANNER not in planner[0]
+    assert not any("step-back anchor" in str(c.args[-1]) for c in logged.call_args_list)
+    posted = _plan_round_records(resumed)
+    assert sum(1 for r in posted if r.step_back_entries) == 1
