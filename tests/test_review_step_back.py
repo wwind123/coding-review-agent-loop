@@ -1794,3 +1794,35 @@ def test_deferral_rounds_follow_the_same_retirement_rules():
     # A non-primary phase checkpoint never counts.
     other = [*base, _checkpoint(2, 4, digest=DIGEST, deferral=True, phase="secondary-audit")]
     assert derive(other).deferral_rounds == ()
+
+
+def test_deferral_retired_by_an_intervening_unmarked_digest_boundary():
+    """A -> B -> A: a round-4 deferral under A is retired by the unmarked B checkpoint."""
+    other = "f" * 16
+    records = [
+        _checkpoint(0, 3, digest=DIGEST),
+        _review(1, 3, items=[_new(3)]),
+        _checkpoint(2, 4, digest=DIGEST, deferral=True),
+        _review(3, 4, items=[_new(4)]),
+        _checkpoint(4, 5, digest=other),
+        _review(5, 5, items=[_new(5)]),
+        _checkpoint(6, 6, digest=DIGEST),
+        _review(7, 6, items=[_new(6)]),
+        _checkpoint(8, 7, digest=DIGEST),
+        _review(9, 7, items=[_new(7)]),
+    ]
+    state = derive_plan_step_back_state(
+        records, primary=PRIMARY, current_issue_digest=DIGEST
+    )
+    assert state.deferral_rounds == ()
+    result = plan_stall_step_back_disposition(
+        state, round_number=8, crossing_round=6, growth_gate_enforced=True,
+        step_back_rounds=2, escalation_rounds=3,
+    )
+    assert result.kind == DISPOSITION_DEFER_PENDING
+    # Without the edit in between, the same deferral still counts.
+    kept = derive_plan_step_back_state(
+        [r for r in records if r.index not in (4, 5)],
+        primary=PRIMARY, current_issue_digest=DIGEST,
+    )
+    assert kept.deferral_rounds == (4,)

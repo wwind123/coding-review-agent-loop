@@ -357,13 +357,17 @@ def derive_plan_step_back_state(
                 and review.classification
                 in {CLASS_NEW_FINDING, CLASS_REPEAT_ONLY, CLASS_BLOCKING_UNRESOLVED}
             )
-    # An issue edit retires the latest mismatching deferral and everything before it.
+    # An issue edit retires every deferral recorded at or before the latest primary
+    # checkpoint (marked or not) whose issue digest differs from the current one.
     if current_issue_digest is not None:
-        for position in range(len(deferrals) - 1, -1, -1):
-            recorded = deferrals[position][2]
-            if recorded is not None and recorded != current_issue_digest:
-                deferrals = deferrals[position + 1 :]
-                break
+        mismatched = [
+            index
+            for index, digest in all_checkpoints
+            if digest is not None and digest != current_issue_digest
+        ]
+        if mismatched:
+            latest = max(mismatched)
+            deferrals = [entry for entry in deferrals if entry[0] > latest]
     deferral_rounds = tuple(
         sorted({number for _index, number, _digest in deferrals if number > retired_through})
     )
