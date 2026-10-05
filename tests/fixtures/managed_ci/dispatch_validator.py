@@ -2,7 +2,7 @@
 
 Source repository: wwind123/coding-review-agent-loop
 Source commit: b9be3320a11ae9bb610d027e07565e35ef82c0a2
-Source block SHA-256: c1abdfa09b3a598e4e819023f2acab3033b541076ff63888fa34b978698bda2c
+Source block SHA-256: c2d8ae24ef07872a6a8fe1ddc54bb76157710788fcffb154e2f80136fbec693b
 Source path: .github/workflows/managed-ci.yml
 Extraction boundary: ``validate_dispatch`` through its return value.
 The contract tests invoke this copy with offline API callbacks and compare its
@@ -71,17 +71,22 @@ def validate_dispatch(
     # The trusted workflow always executes from the live default branch.
     default_branch = live_repo.get('default_branch')
     if (
-        not isinstance(default_branch, str)
-        or not re.fullmatch(r'[A-Za-z0-9._/-]+', default_branch)
-        or '..' in default_branch
-        or default_branch.startswith('/')
-        or default_branch.endswith('/')
+        type(default_branch) is not str
+        or default_branch in {'', '@'}
+        or re.search(r'[\x00-\x20\x7f~^:?*\[\\]', default_branch)
+        or re.search(r'\.\.|@\{|//|\.lock(/|$)|(^|/)\.|[./]$|^[/-]', default_branch)
     ):
         raise ValueError('managed dispatch default branch is unavailable')
     if ref != 'refs/heads/' + default_branch:
         raise ValueError('managed dispatch must execute the base workflow from the default branch')
     pr = api_json('repos/' + repo + '/pulls/' + pr_number_text)
-    base_commit = api_json('repos/' + repo + '/commits/' + default_branch)
+    base_commit = api_json(
+        'repos/' + repo + '/commits/' + ''.join(
+            ch if re.fullmatch(r'[A-Za-z0-9._~/-]', ch)
+            else ''.join('%%%02X' % byte for byte in ch.encode('utf-8'))
+            for ch in default_branch
+        )
+    )
     revision = base_commit.get('sha') if isinstance(base_commit, dict) else None
     if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40}', revision):
         raise ValueError('managed dispatch base workflow revision is unavailable')

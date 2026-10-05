@@ -35,8 +35,15 @@ def validate(
 
     # The live repository default branch, never a literal: a project's
     # default branch is whatever the repository API reports (#1210).
-    exact_string(default_branch, 'default_branch', r'[A-Za-z0-9._/-]+')
-    if '..' in default_branch or default_branch.startswith('/') or default_branch.endswith('/'):
+    def valid_branch(name):
+        # git check-ref-format rules for a branch name (#1284).
+        return (
+            type(name) is str and name not in {'', '@'}
+            and not re.search(r'[\x00-\x20\x7f~^:?*\[\\]', name)
+            and not re.search(r'\.\.|@\{|//|\.lock(/|$)|(^|/)\.|[./]$|^[/-]', name)
+        )
+
+    if not valid_branch(default_branch):
         fail('invalid default_branch')
     if not isinstance(pr, dict):
         fail('live PR response is not an object')

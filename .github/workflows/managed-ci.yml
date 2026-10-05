@@ -155,8 +155,15 @@ jobs:
 
               # The live repository default branch, never a literal: a project's
               # default branch is whatever the repository API reports (#1210).
-              exact_string(default_branch, 'default_branch', r'[A-Za-z0-9._/-]+')
-              if '..' in default_branch or default_branch.startswith('/') or default_branch.endswith('/'):
+              def valid_branch(name):
+                  # git check-ref-format rules for a branch name (#1284).
+                  return (
+                      type(name) is str and name not in {'', '@'}
+                      and not re.search(r'[\x00-\x20\x7f~^:?*\[\\]', name)
+                      and not re.search(r'\.\.|@\{|//|\.lock(/|$)|(^|/)\.|[./]$|^[/-]', name)
+                  )
+
+              if not valid_branch(default_branch):
                   fail('invalid default_branch')
               if not isinstance(pr, dict):
                   fail('live PR response is not an object')
@@ -428,17 +435,22 @@ jobs:
               # The trusted workflow always executes from the live default branch.
               default_branch = live_repo.get('default_branch')
               if (
-                  not isinstance(default_branch, str)
-                  or not re.fullmatch(r'[A-Za-z0-9._/-]+', default_branch)
-                  or '..' in default_branch
-                  or default_branch.startswith('/')
-                  or default_branch.endswith('/')
+                  type(default_branch) is not str
+                  or default_branch in {'', '@'}
+                  or re.search(r'[\x00-\x20\x7f~^:?*\[\\]', default_branch)
+                  or re.search(r'\.\.|@\{|//|\.lock(/|$)|(^|/)\.|[./]$|^[/-]', default_branch)
               ):
                   raise ValueError('managed dispatch default branch is unavailable')
               if ref != 'refs/heads/' + default_branch:
                   raise ValueError('managed dispatch must execute the base workflow from the default branch')
               pr = api_json('repos/' + repo + '/pulls/' + pr_number_text)
-              base_commit = api_json('repos/' + repo + '/commits/' + default_branch)
+              base_commit = api_json(
+                  'repos/' + repo + '/commits/' + ''.join(
+                      ch if re.fullmatch(r'[A-Za-z0-9._~/-]', ch)
+                      else ''.join('%%%02X' % byte for byte in ch.encode('utf-8'))
+                      for ch in default_branch
+                  )
+              )
               revision = base_commit.get('sha') if isinstance(base_commit, dict) else None
               if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40}', revision):
                   raise ValueError('managed dispatch base workflow revision is unavailable')

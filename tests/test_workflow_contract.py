@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import textwrap
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -443,7 +444,7 @@ def _dispatch_validate(*, record=None, default_branch="main", repo_payload=None,
             else {"full_name": "OWNER/REPO", "default_branch": default_branch}
         ),
         "repos/OWNER/REPO/pulls/7": _pr(base={"ref": default_branch}),
-        "repos/OWNER/REPO/commits/" + default_branch: {"sha": revision},
+        "repos/OWNER/REPO/commits/" + urllib.parse.quote(default_branch, safe="/._~-"): {"sha": revision},
     }
 
     def api_json(path):
@@ -1209,7 +1210,7 @@ def test_default_branch_is_never_a_literal_in_the_trust_blocks():
         assert "'main'" not in block and '"main"' not in block
         assert "refs/heads/main" not in block and "commits/main" not in block
     assert "refs/heads/' + default_branch" in _dispatch_block(text)
-    assert "'/commits/' + default_branch" in _dispatch_block(text)
+    assert "'/commits/' + ''.join(" in _dispatch_block(text)
     assert "'base_ref': default_branch" in _validator_block(text)
     assert "pull_request.base.ref == github.event.repository.default_branch" in _caller_text()
 
@@ -1224,7 +1225,7 @@ def test_validator_binds_the_base_to_the_live_default_branch():
     # An intent replayed for another target is rejected.
     with pytest.raises(ValueError, match="binding drifted"):
         _validate(_record(base_ref="main"), pr=pr, default_branch="trunk")
-    for bad in (None, "", "a b", "../x", "/x", "x/"):
+    for bad in INVALID_BRANCHES:
         with pytest.raises(ValueError):
             _validate(_record(), default_branch=bad)
 
@@ -1267,3 +1268,30 @@ def test_dispatch_validator_rejects_a_workflow_revision_bound_to_another_branch(
 def test_dispatch_validator_fails_closed_without_a_usable_default_branch(payload):
     with pytest.raises(ValueError, match="default branch is unavailable"):
         _dispatch_validate(repo_payload=payload)
+
+
+# Valid git branch names outside [A-Za-z0-9._/-] must work (git check-ref-format).
+VALID_BRANCHES = ["release+stable", "ünï/ブランチ", "feat#1", "a=b,c", "x@y", "main-2", "v1.0/rc"]
+INVALID_BRANCHES = [
+    None, 7, "", "@", "a b", "a\tb", "../x", "a..b", "/x", "x/", "a//b", "-x", "x.", ".x", "a/.b",
+    "a.lock", "a.lock/b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "a@{b", "a\x7fb",
+]
+
+
+@pytest.mark.parametrize("branch", VALID_BRANCHES)
+def test_every_valid_branch_name_is_accepted_as_the_default_branch(branch):
+    record = _record(base_ref=branch)
+    pr = _pr(base={"ref": branch})
+    assert _validate(record, pr=pr, default_branch=branch)["base_ref"] == branch
+    result, calls = _dispatch_validate(record=record, default_branch=branch)
+    assert result["target_sha"] == "b" * 40
+    # The branch is percent-encoded into the commit API path.
+    assert "repos/OWNER/REPO/commits/" + urllib.parse.quote(branch, safe="/._~-") in calls
+
+
+@pytest.mark.parametrize("branch", [b for b in INVALID_BRANCHES if b is not None])
+def test_invalid_branch_names_are_rejected_by_both_validators(branch):
+    with pytest.raises(ValueError):
+        _validate(_record(), default_branch=branch)
+    with pytest.raises(ValueError, match="default branch is unavailable"):
+        _dispatch_validate(repo_payload={"full_name": "OWNER/REPO", "default_branch": branch}, ref="refs/heads/x")
