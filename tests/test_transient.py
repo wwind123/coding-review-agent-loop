@@ -372,8 +372,14 @@ def test_oversized_structured_errors_keep_authority() -> None:
     big = _ev(type="turn.failed", error={"message": "x" * 30000, "status": 503})
     v = transient.classify_codex_failure(_stream(big, "ERROR: 401 Unauthorized"))
     assert (v.source, v.category) == ("structured", "transient")
-    assert len(v.text) < 13000
     many = [_ev(type="error", message=f"warning {i}: something odd " + "y" * 900) for i in range(40)]
     many.append(_ev(type="error", message="429 insufficient_quota: check your plan"))
     v = transient.classify_codex_failure(_stream(*many))
     assert (v.category, v.billing) == ("non-retryable", True)
+
+
+def test_stderr_verdict_text_keeps_decisive_middle() -> None:
+    stderr = "timeout " + "n" * 7000 + " 401 Unauthorized " + "n" * 7000 + " timeout"
+    v = transient.classify_codex_failure(_stream(_ev(type="thread.started", thread_id="t"), stderr))
+    assert (v.source, v.category) == ("stderr", "non-retryable")
+    assert "401 Unauthorized" in v.text

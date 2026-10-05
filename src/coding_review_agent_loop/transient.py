@@ -46,7 +46,6 @@ def is_transient_agent_output(text: str) -> bool:
 
 # --- Codex provider error channel (#1269) -----------------------------------
 
-_CODEX_BUDGET = 12000
 _CODEX_EVENT_SHAPED_RE = re.compile(r'^\s*\{\s*"(?:type|id|item|thread_id)"\s*:')
 _CODEX_STDIN_BANNER = "Reading prompt from stdin..."
 _CODEX_NEUTRAL_TEXT = "codex exited without a provider error event"
@@ -132,14 +131,6 @@ def _render_codex_error(error: object) -> CodexStructuredError | None:
     return CodexStructuredError("; ".join(parts), tuple(dict.fromkeys(statuses)))
 
 
-def _bounded_text(text: str) -> str:
-    """Head/tail bound for display text only; classification sees every error."""
-    if len(text) <= _CODEX_BUDGET:
-        return text
-    half = _CODEX_BUDGET // 2
-    return f"{text[:half]}\n...\n{text[-half:]}"
-
-
 def extract_codex_error_channel(raw_output: str) -> CodexErrorChannel | None:
     """Split a Codex ``--json`` capture into provider errors and stderr lines.
 
@@ -201,7 +192,7 @@ def classify_codex_failure(raw_output: str) -> ProviderFailureVerdict | None:
         return None
     if channel.structured_errors:
         results = [_classify_structured_provider_error(e) for e in channel.structured_errors]
-        text = _bounded_text("\n".join(e.rendered for e in channel.structured_errors))
+        text = "\n".join(e.rendered for e in channel.structured_errors)
         bad = [r for r in results if r[0] == "non-retryable"]
         if bad:
             return ProviderFailureVerdict(
@@ -211,8 +202,10 @@ def classify_codex_failure(raw_output: str) -> ProviderFailureVerdict | None:
             return ProviderFailureVerdict("transient", False, text, "structured")
         return ProviderFailureVerdict("deterministic", False, text, "structured")
     if channel.stderr_lines:
+        # Never truncate: consumers re-classify this text, so decisive evidence
+        # in the middle must survive (the capture itself is already bounded).
         full = "\n".join(channel.stderr_lines)
-        text = _bounded_text(full)
+        text = full
         if NON_RETRYABLE_AGENT_OUTPUT_RE.search(full):
             category = "non-retryable"
         elif TRANSIENT_AGENT_OUTPUT_RE.search(full):

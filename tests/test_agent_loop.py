@@ -7709,3 +7709,30 @@ def test_public_response_envelope_with_capacity_phrase_is_not_transient():
     envelope = json.dumps({"schema_version": 1, "kind": "plan_state", "summary": _CAPACITY})
     assert not agent_failure.PUBLIC_RESPONSE_TRANSIENT_DIAGNOSTIC_RE.search(envelope)
     assert not agent_failure._is_transient_public_response(envelope)
+
+
+def test_codex_valid_event_then_truncated_item_is_deterministic_without_retry(tmp_path):
+    raw = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "t"}),
+        '{"type":"item.completed","item":{"aggregated_output":"auth.captureOwner() invalid api key timeout',
+    ])
+    n, sleeps, out = _drive_codex(tmp_path, [raw])
+    assert n == 1 and sleeps == []
+    text = str(out)
+    assert "deterministic" in text and "transient" not in text and "authenticated" not in text
+
+
+def test_codex_stderr_decisive_evidence_in_omitted_middle_is_not_retried(tmp_path):
+    stderr = "timeout " + "n" * 7000 + " 401 Unauthorized " + "n" * 7000 + " timeout"
+    raw = json.dumps({"type": "thread.started", "thread_id": "t"}) + "\n" + stderr
+    n, sleeps, out = _drive_codex(tmp_path, [raw, None])
+    assert n == 1 and sleeps == []
+    assert "non-retryable" in str(out)
+
+
+def test_codex_oversized_structured_billing_error_gets_billing_suggestion(tmp_path):
+    msg = "n" * 7000 + " insufficient_quota " + "n" * 7000
+    n, sleeps, out = _drive_codex(tmp_path, [_codex_stream(message=msg)])
+    assert n == 1 and sleeps == []
+    text = str(out)
+    assert "non-retryable" in text and "billing" in text and "authenticated" not in text

@@ -7477,3 +7477,8 @@ class TestRunExternalCodexErrorChannel:
         assert self._run(monkeypatch, ev(message="request failed", status="503")) == (2, 0)
         assert self._run(monkeypatch, ev(message="request failed", status=401))[0] == 1
         assert self._run(monkeypatch, ev(status=429, code="insufficient_quota"))[0] == 1
+
+    def test_stderr_decisive_middle_is_not_retried(self, monkeypatch) -> None:
+        stderr = "timeout " + "n" * 7000 + " 401 Unauthorized " + "n" * 7000 + " timeout"
+        raw = json.dumps({"type": "thread.started", "thread_id": "t"}) + "\n" + stderr
+        assert self._run(monkeypatch, raw)[0] == 1
