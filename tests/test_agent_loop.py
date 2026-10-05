@@ -2434,10 +2434,17 @@ def test_preapproval_plan_execution_mode_reads_have_explicit_auto_coverage():
     from coding_review_agent_loop.config import PLAN_EXECUTION_MODES
 
     assert "auto" in PLAN_EXECUTION_MODES
-    sources = (
-        inspect.getsource(cli_module.main),
-        inspect.getsource(prompts_module._phased_plan_guard),
-    )
+    # The prompt guard reads the mode only through the shared predicate, which
+    # is defined once in config and pinned against all five modes below.
+    guard_source = inspect.getsource(prompts_module._phased_plan_guard)
+    assert "phased_delivery_guard_active(config.plan_execution_mode)" in guard_source
+    assert "in {" not in guard_source
+    from coding_review_agent_loop.config import phased_delivery_guard_active
+
+    assert {m for m in PLAN_EXECUTION_MODES if not phased_delivery_guard_active(m)} == {
+        "decompose-only", "implement-by-phase", "auto",
+    }
+    sources = (inspect.getsource(cli_module.main),)
     for source in sources:
         tree = ast.parse(textwrap.dedent(source))
         mode_branches = []

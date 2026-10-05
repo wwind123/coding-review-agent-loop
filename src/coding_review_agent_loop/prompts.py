@@ -22,7 +22,7 @@ from .architecture_context import (
     render_architecture_pair,
     render_architecture_snapshot,
 )
-from .config import AgentLoopConfig, reviewers
+from .config import AgentLoopConfig, phased_delivery_guard_active, reviewers
 from .decomposition import (
     INHERITED_SCENARIO_FIELDS,
     InheritedMatrixBinding,
@@ -2095,9 +2095,9 @@ def _compact_prior_ledger_block(compact_prior: CompactPriorContext | None) -> st
 
 
 def _phased_plan_guard(config: AgentLoopConfig) -> str:
-    # Must stay equivalent to ``config.phased_delivery_guard_active`` (pinned by
-    # a unit test); the inline set keeps the explicit-auto coverage test intact.
-    if config.plan_execution_mode in {"decompose-only", "implement-by-phase", "auto"}:
+    # One shared predicate with the staged-plan stop and --plan-narrow-staged
+    # validation, so the prompt and the orchestrator cannot drift (#1268).
+    if not phased_delivery_guard_active(config.plan_execution_mode):
         return ""
     return (
         "Phased-delivery guard: if the plan defers any implementation to future PRs, "
