@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator_module
+import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 from agent_loop_helpers import (
     FakeRunner,
     make_config,
@@ -863,7 +864,9 @@ def _conversion_patch(requirement):
 
 
 @pytest.mark.parametrize("gate", ["enforce", "off"])
-def test_staged_conversion_revision_is_ledger_checked_with_the_gate_on_or_off(tmp_path, gate):
+def test_staged_conversion_revision_is_ledger_checked_with_the_gate_on_or_off(
+    tmp_path, monkeypatch, gate
+):
     """Rows `staged-conversion` and `legacy-or-off` through the live loop."""
     runner = FakeRunner(
         claude_outputs=[
@@ -882,8 +885,16 @@ def test_staged_conversion_revision_is_ledger_checked_with_the_gate_on_or_off(tm
             ),
         ],
     )
-    config = _config(tmp_path, plan_growth_gate=gate)
-    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    # decompose-only: a staged candidate is deliverable, so the round-start
+    # staged-plan stop (#1268) does not apply and approval reaches decomposition.
+    config = _config(tmp_path, plan_growth_gate=gate, plan_execution_mode="decompose-only")
+    monkeypatch.setattr(
+        plan_first_loop_module,
+        "_decompose_approved_plan",
+        lambda *a, **k: (_ for _ in ()).throw(AgentLoopError("decomposition reached")),
+    )
+    with pytest.raises(AgentLoopError, match="decomposition reached"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     planner = _prompts(runner, "claude")
     assert len(planner) == 3
     assert "must preserve the scope ledger" in planner[2]
