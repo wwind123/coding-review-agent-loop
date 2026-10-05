@@ -41,6 +41,9 @@ CLASS_NEW_FINDING = "new-finding"
 CLASS_REPEAT_ONLY = "repeat-only"
 CLASS_APPROVED = "approved"
 CLASS_OTHER = "other"
+# A blocking publication record whose round has no later reconciliation: its
+# new items are unknowable, so it can only end a streak, never start one.
+CLASS_BLOCKING_UNRESOLVED = "blocking-unresolved"
 
 PHASE_PLAN = "plan"
 PHASE_PR = "pr"
@@ -55,21 +58,67 @@ _MANDATORY_STATUSES = {
 ALTERNATIVE_EXCERPT_LIMIT = 2000
 
 
-def classify_review(metadata: "PostedRoundMetadata", *, phase: str = PHASE_PLAN) -> str:
-    """Classify one reviewer record from its own historical review payload.
+_USE_RECORD_ITEMS = object()
 
-    Reads ``new_items`` and the dispositions stored on that round's record,
-    never the surviving unresolved ledger: an old blocker kept active plus one
-    new ``future`` item is ``repeat-only``.
+
+def effective_new_items(
+    records: Sequence["PostedRoundRecord"], record: "PostedRoundRecord"
+) -> "tuple | None":
+    """The new items a reviewer record introduced, or ``None`` when unknowable.
+
+    Under ``--review-parallel`` the reviewer comment is posted early as a
+    provisional ``publication`` record with no ``new_items``; the minted items land
+    on the round's later reconciliation summary.  A publication record therefore
+    takes the reviewer-owned items of the latest same-flow, same-round,
+    same-subject reconciliation recorded after it, and is unresolvable (``None``)
+    when none exists.  Every other record carries its own ``new_items``.
+    """
+    metadata = record.metadata
+    if metadata.phase != "publication":
+        return metadata.new_items
+    best = None
+    for candidate in records:
+        meta = candidate.metadata
+        if (
+            meta.role == "summary"
+            and meta.phase == "reconciliation"
+            and meta.flow == metadata.flow
+            and meta.round_number == metadata.round_number
+            and meta.subject == metadata.subject
+            and candidate.index > record.index
+            and (best is None or candidate.index > best.index)
+        ):
+            best = candidate
+    if best is None:
+        return None
+    return tuple(item for item in best.metadata.new_items if item.reviewer == metadata.agent)
+
+
+def classify_review(
+    metadata: "PostedRoundMetadata",
+    *,
+    phase: str = PHASE_PLAN,
+    new_items: object = _USE_RECORD_ITEMS,
+) -> str:
+    """Classify one reviewer record from its historical review payload.
+
+    Reads the review's new items and the dispositions stored on that round's
+    record, never the surviving unresolved ledger: an old blocker kept active plus
+    one new ``future`` item is ``repeat-only``.  ``new_items`` defaults to the
+    record's own; pass :func:`effective_new_items` output for a provisional
+    publication record (``None`` means unresolvable).
     """
     if metadata.state == "approved":
         return CLASS_APPROVED
     if metadata.state != "blocking":
         return CLASS_OTHER
+    items = metadata.new_items if new_items is _USE_RECORD_ITEMS else new_items
+    if items is None:
+        return CLASS_BLOCKING_UNRESOLVED
     mandatory = _MANDATORY_STATUSES[phase]
     if any(
         item.status in mandatory and item.reviewer == metadata.agent
-        for item in metadata.new_items
+        for item in items
     ):
         return CLASS_NEW_FINDING
     return CLASS_REPEAT_ONLY
@@ -215,7 +264,9 @@ def derive_plan_step_back_state(
             PrimaryReview(
                 round_number=number,
                 index=record.index,
-                classification=classify_review(record.metadata),
+                classification=classify_review(
+                    record.metadata, new_items=effective_new_items(ordered, record)
+                ),
             )
         )
     reviews = tuple(counted)
@@ -277,7 +328,8 @@ def derive_plan_step_back_state(
                 1
                 for review in reviews
                 if review.round_number >= episode.candidate_round
-                and review.classification in {CLASS_NEW_FINDING, CLASS_REPEAT_ONLY}
+                and review.classification
+                in {CLASS_NEW_FINDING, CLASS_REPEAT_ONLY, CLASS_BLOCKING_UNRESOLVED}
             )
     return StepBackState(
         degraded=degraded,
@@ -454,16 +506,17 @@ def mandatory_plan_findings_since(
 ) -> tuple[str, ...]:
     """The primary's mandatory findings from ``first_round`` on, as ``id: first line``."""
     mandatory = _MANDATORY_STATUSES[PHASE_PLAN]
-    latest: dict[int, "PostedRoundMetadata"] = {}
-    for record in sorted(records, key=lambda item: item.index):
+    ordered = sorted(records, key=lambda item: item.index)
+    latest: dict[int, "PostedRoundRecord"] = {}
+    for record in ordered:
         metadata = record.metadata
         if metadata.role == "reviewer" and metadata.agent == primary:
-            latest[metadata.round_number] = metadata
+            latest[metadata.round_number] = record
     lines: list[str] = []
     for number in sorted(latest):
-        if number < first_round or latest[number].state != "blocking":
+        if number < first_round or latest[number].metadata.state != "blocking":
             continue
-        for item in latest[number].new_items:
+        for item in effective_new_items(ordered, latest[number]) or ():
             if item.status in mandatory and item.reviewer == primary:
                 first_line = next((line.strip() for line in item.text.splitlines() if line.strip()), "")
                 lines.append(f"[{item.item_id}] (round {number}) {first_line[:240]}")
@@ -854,6 +907,8 @@ class PrReviewRecord:
     head: str
     classification: str
     metadata: "PostedRoundMetadata"
+    # Resolved via effective_new_items; ``None`` means unresolvable.
+    new_items: "tuple | None" = ()
 
 
 @dataclass(frozen=True)
@@ -875,21 +930,28 @@ def pr_reviews_for(
     records: Sequence["PostedRoundRecord"], reviewer: str
 ) -> tuple[PrReviewRecord, ...]:
     """The reviewer's latest PR review record per round, in round order."""
+    ordered = sorted(records, key=lambda item: item.index)
     latest: dict[int, "PostedRoundRecord"] = {}
-    for record in sorted(records, key=lambda item: item.index):
+    for record in ordered:
         metadata = record.metadata
         if metadata.flow == "pr" and metadata.role == "reviewer" and metadata.agent == reviewer:
             latest[metadata.round_number] = record
-    return tuple(
-        PrReviewRecord(
-            round_number=number,
-            index=record.index,
-            head=str(record.metadata.subject),
-            classification=classify_review(record.metadata, phase=PHASE_PR),
-            metadata=record.metadata,
+    result = []
+    for number, record in sorted(latest.items()):
+        items = effective_new_items(ordered, record)
+        result.append(
+            PrReviewRecord(
+                round_number=number,
+                index=record.index,
+                head=str(record.metadata.subject),
+                classification=classify_review(
+                    record.metadata, phase=PHASE_PR, new_items=items
+                ),
+                metadata=record.metadata,
+                new_items=items,
+            )
         )
-        for number, record in sorted(latest.items())
-    )
+    return tuple(result)
 
 
 def pr_step_back_history(
@@ -937,17 +999,18 @@ def map_between_heads(
     return mapper(from_head, to_head, path, start, end)
 
 
-def _mandatory_owned_new_items(metadata: "PostedRoundMetadata") -> list:
+def _mandatory_owned_new_items(review: PrReviewRecord) -> list:
     mandatory = _MANDATORY_STATUSES[PHASE_PR]
     return [
         item
-        for item in metadata.new_items
-        if item.status in mandatory and item.reviewer == metadata.agent
+        for item in review.new_items or ()
+        if item.status in mandatory and item.reviewer == review.metadata.agent
     ]
 
 
-def _remaining_mandatory_items(metadata: "PostedRoundMetadata") -> list:
+def _remaining_mandatory_items(review: PrReviewRecord) -> list:
     """The reviewer's mandatory items still open after this review's own record."""
+    metadata = review.metadata
     mandatory = _MANDATORY_STATUSES[PHASE_PR]
     closed = {
         d.item_id
@@ -979,7 +1042,7 @@ def _remaining_mandatory_items(metadata: "PostedRoundMetadata") -> list:
         remaining.append(updated)
     seen = {item.item_id for item in remaining}
     remaining.extend(
-        item for item in _mandatory_owned_new_items(metadata) if item.item_id not in seen
+        item for item in _mandatory_owned_new_items(review) if item.item_id not in seen
     )
     return remaining
 
@@ -1093,11 +1156,15 @@ def derive_pr_episode(
             continue
         if review.classification == CLASS_APPROVED:
             return PrEpisodeResult(entry=None)
+        if review.classification == CLASS_BLOCKING_UNRESOLVED:
+            # Its new items are unknowable without a reconciliation: it can
+            # neither escalate nor decide the episode's membership.
+            continue
         mapping = mapping_to(review.head)
         last_mapping = mapping
         siblings = tuple(
             location
-            for item in _mandatory_owned_new_items(review.metadata)
+            for item in _mandatory_owned_new_items(review)
             for location in project_finding_locations(item)
             if in_cluster(location, mapping, window)
         )
@@ -1108,7 +1175,7 @@ def derive_pr_episode(
         ):
             return PrEpisodeResult(entry, siblings, review.round_number, mapping)
         member_open = False
-        for item in _remaining_mandatory_items(review.metadata):
+        for item in _remaining_mandatory_items(review):
             source_head = heads.get(item.source_round, review.head)
             if any(
                 _location_is_member(
@@ -1177,7 +1244,7 @@ def find_pr_cluster_trigger(
     per_review: list[list[MappedLocation]] = []
     for review in tail:
         mapped: list[MappedLocation] = []
-        for item in _mandatory_owned_new_items(review.metadata):
+        for item in _mandatory_owned_new_items(review):
             for location in project_finding_locations(item):
                 mapping = map_between_heads(
                     mapper, review.head, head, location.path, location.start, location.end
@@ -1193,7 +1260,7 @@ def find_pr_cluster_trigger(
     first_lines: list[str] = []
     wanted = set(cluster.item_ids)
     for review in tail:
-        for item in _mandatory_owned_new_items(review.metadata):
+        for item in _mandatory_owned_new_items(review):
             if item.item_id in wanted:
                 line = next(
                     (part.strip() for part in item.text.splitlines() if part.strip()), ""

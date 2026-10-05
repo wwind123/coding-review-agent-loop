@@ -15975,6 +15975,38 @@ def test_crossed_plan_gets_the_step_back_prompt_at_exactly_the_kth_new_block(tmp
     assert "Plan-growth lever" in codex[4]
 
 
+def test_crossed_plan_gets_the_step_back_prompt_under_review_parallel(tmp_path):
+    """`plan-parallel-live-trigger` (#1271): provisional publication + reconciliation."""
+    runner, error = _m1251_run(
+        tmp_path,
+        last_round=5,
+        max_rounds=5,
+        plan_step_back_escalation_rounds=5,
+        review_parallel=True,
+    )
+
+    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    records = _plan_round_records(runner)
+    # The primary's reviewer records really take the parallel (provisional) path.
+    primary = [r for r in records if r.role == "reviewer" and r.agent == "Codex"]
+    assert primary
+    assert all(r.phase == "publication" and r.new_items == () for r in primary)
+    # The minted items live on the reconciliation summaries.
+    assert any(
+        r.role == "summary" and r.phase == "reconciliation" and r.new_items for r in records
+    )
+    planner = _m1251_prompts(runner, "claude")
+    assert [_STEP_BACK_MARKER in prompt for prompt in planner] == [
+        False, False, False, False, True,
+    ]
+    assert "[item-3] (round 3) Close gap 3." in planner[4]
+    assert "[item-4] (round 4) Close gap 4." in planner[4]
+    assert _m1251_coder_record(runner, 5).step_back_entries == (
+        {"phase": "plan", "reviewer": "Codex", "trigger_round": 4},
+    )
+    assert sum(1 for r in records if r.step_back_entries) == 1
+
+
 def test_uncrossed_plan_keeps_the_ordinary_revision_prompt(tmp_path):
     """`plan-uncrossed-blocks`: K new-finding blocks on a plan that never crosses."""
     fresh, base = _m1103_fresh_base()
