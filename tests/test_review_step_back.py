@@ -11,12 +11,14 @@ from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.plan_assembly import make_assembled_plan_sidecar
 from coding_review_agent_loop.review_step_back import (
     CLASS_APPROVED,
+    CLASS_BLOCKING_UNRESOLVED,
     CLASS_NEW_FINDING,
     CLASS_OTHER,
     CLASS_REPEAT_ONLY,
     PlanStepBackContext,
     classify_review,
     derive_plan_step_back_state,
+    effective_new_items,
     entry_payload_for_plan,
     mandatory_plan_findings_since,
     plan_growth_crossing_round,
@@ -1465,3 +1467,208 @@ def test_a_carried_locations_known_rename_destination_keeps_an_unmappable_anchor
     assert sb.derive_pr_episode(
         records[:4], PR_REVIEWER, window=40, mapper=mapper, current_round=5, current_head=HEAD_C
     ).entry is not None
+
+
+# ---------------------------------------------------------------------------
+# --review-parallel: publication reviewer records resolve via reconciliation (#1271)
+# ---------------------------------------------------------------------------
+
+
+def _publication(index, round_number, *, state="blocking", agent=PRIMARY, flow="plan",
+                 subject="plan", phase="publication", prior=(), dispositions=()):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow=flow, role="reviewer", agent=agent, round_number=round_number,
+            subject=subject, state=state, phase=phase, new_items=(),
+            prior_items=tuple(prior), dispositions=tuple(dispositions),
+        ),
+        body="",
+    )
+
+
+def _recon(index, round_number, items, *, flow="plan", subject="plan"):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow=flow, role="summary", agent="Orchestrator", round_number=round_number,
+            subject=subject, phase="reconciliation", new_items=tuple(items),
+        ),
+        body="",
+    )
+
+
+def _parallel_chain(rounds):
+    records = []
+    index = 0
+    for n in rounds:
+        records.append(_checkpoint(index, n, digest=DIGEST))
+        records.append(_publication(index + 1, n))
+        records.append(_recon(index + 2, n, [_new(n)]))
+        index += 3
+    return records
+
+
+def test_parallel_publication_records_classify_new_finding_and_build_a_streak():
+    state = _derive(_parallel_chain([6, 7]), primary=PRIMARY)
+    assert [r.classification for r in state.reviews] == [CLASS_NEW_FINDING] * 2
+    assert state.streak_since(6) == 2
+
+
+def test_publication_without_reconciliation_is_unresolved_and_ends_the_streak():
+    records = _parallel_chain([6]) + [
+        _checkpoint(10, 7, digest=DIGEST),
+        _publication(11, 7),
+    ]
+    state = _derive(records, primary=PRIMARY)
+    assert state.reviews[-1].classification == CLASS_BLOCKING_UNRESOLVED
+    assert state.streak_since(6) == 0
+
+
+def test_reconciliation_binding_ignores_earlier_other_round_and_other_subject():
+    review = _publication(5, 7)
+    records = [
+        _recon(1, 7, [_new(7)]),  # before the reviewer record
+        _recon(6, 8, [_new(8)]),  # other round
+        _recon(7, 7, [_new(7)], subject="other"),  # other subject
+        _recon(8, 7, [_new(7)], flow="pr"),  # other flow
+        review,
+    ]
+    assert effective_new_items(records, review) is None
+
+
+def test_latest_reconciliation_after_the_record_wins():
+    review = _publication(5, 7)
+    records = [review, _recon(6, 7, [_new(7)]), _recon(9, 7, [])]
+    assert effective_new_items(records, review) == ()
+    assert classify_review(review.metadata, new_items=()) == CLASS_REPEAT_ONLY
+
+
+def test_only_the_reviewers_own_reconciliation_items_count():
+    review = _publication(5, 7)
+    other = _item("item-7", "blocking", reviewer="Claude", round_number=7)
+    items = effective_new_items([review, _recon(6, 7, [other])], review)
+    assert items == ()
+
+
+def test_findings_since_lists_reconciliation_items():
+    lines = mandatory_plan_findings_since(
+        _parallel_chain([6, 7]), primary=PRIMARY, first_round=6
+    )
+    assert lines == ("[item-6] (round 6) Gap 6", "[item-7] (round 7) Gap 7")
+
+
+def test_non_publication_records_use_their_own_items_and_ignore_reconciliations():
+    review = _review(5, 7, items=[_new(7)])
+    assert effective_new_items([review, _recon(6, 7, [])], review) == (_new(7),)
+    assert classify_review(review.metadata) == CLASS_NEW_FINDING
+
+
+def test_escalation_count_includes_an_unresolved_block():
+    records = _parallel_chain([6]) + [
+        _coder(10, 7, entries=[entry_payload_for_plan(reviewer=PRIMARY, trigger_round=6)]),
+        _checkpoint(11, 7, digest=DIGEST),
+        _publication(12, 7),
+    ]
+    state = _derive(records, primary=PRIMARY)
+    assert state.episode is not None
+    assert state.escalation_count == 1
+
+
+def test_approved_publication_closes_the_episode_without_a_reconciliation():
+    records = _parallel_chain([6]) + [
+        _coder(10, 7, entries=[entry_payload_for_plan(reviewer=PRIMARY, trigger_round=6)]),
+        _checkpoint(11, 7, digest=DIGEST),
+        _publication(12, 7, state="approved"),
+    ]
+    state = _derive(records, primary=PRIMARY)
+    assert state.reviews[-1].classification == CLASS_APPROVED
+    assert state.episode is None
+
+
+def _pr_publication(index, round_number, head, **kwargs):
+    return _publication(index, round_number, agent=PR_REVIEWER, flow="pr", subject=head, **kwargs)
+
+
+def _pr_recon(index, round_number, head, items):
+    return _recon(index, round_number, items, flow="pr", subject=head)
+
+
+def test_pr_cluster_trigger_fires_on_parallel_publication_plus_reconciliation_rounds():
+    texts = ["gap src/spool.py:124-131", "gap src/spool.py:131-136", "gap src/spool.py:140"]
+    records = []
+    for n, text in enumerate(texts):
+        records.append(_pr_publication(10 + 2 * n, n + 1, HEAD_A))
+        records.append(
+            _pr_recon(11 + 2 * n, n + 1, HEAD_A,
+                      [_pr_item(f"item-{n + 1}", text, round_number=n + 1)])
+        )
+    trigger = sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=_identity_mapper
+    )
+    assert trigger is not None and len(trigger.findings) == 3
+    # An unresolved newest round breaks the K-tail.
+    assert sb.find_pr_cluster_trigger(
+        records[:-1], PR_REVIEWER, k=3, window=40, current_round=3, mapper=_identity_mapper
+    ) is None
+
+
+def test_pr_episode_detects_a_sibling_found_only_on_the_reconciliation():
+    sibling = _pr_item("item-12", "spool branch src/spool.py:130", round_number=4)
+    result = _episode(_pr_publication(60, 4, HEAD_B), _pr_recon(61, 4, HEAD_B, [sibling]))
+    assert result.entry is not None and result.sibling_round == 4
+
+
+def test_pr_unresolved_post_entry_review_neither_escalates_nor_closes_the_episode():
+    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
+    result = _episode(
+        _pr_review(
+            55, 4, HEAD_B, prior=[carried],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        ),
+        _pr_publication(60, 5, HEAD_B),
+    )
+    assert result.entry is not None and not result.siblings
+    only = _episode(_pr_publication(60, 4, HEAD_B))
+    assert only.entry is not None and not only.siblings
+
+
+def test_pr_approved_publication_closes_the_episode():
+    assert _episode(_pr_publication(60, 4, HEAD_B, state="approved")).entry is None
+
+
+def test_pr_reconciliation_member_item_keeps_the_episode_open_until_resolved():
+    member = _pr_item("item-12", "spool branch src/spool.py:130", round_number=4)
+
+    def replay(*extra):
+        records = [
+            _pr_publication(60, 4, HEAD_B),
+            _pr_recon(61, 4, HEAD_B, [member]),
+            *extra,
+        ]
+        # current_round=5: round 4's sibling is stale, so escalation is suppressed
+        # and the open member is evaluated through _remaining_mandatory_items.
+        return sb.derive_pr_episode(
+            [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]), *records],
+            PR_REVIEWER, window=40, mapper=_identity_mapper,
+            current_round=5, current_head=HEAD_B,
+        )
+
+    kept = replay()
+    assert kept.entry is not None and not kept.siblings
+    still_open = replay(
+        _pr_publication(
+            70, 5, HEAD_B, prior=[member],
+            dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "blocking")],
+        ),
+        _pr_recon(71, 5, HEAD_B, []),
+    )
+    assert still_open.entry is not None and not still_open.siblings
+    closed = replay(
+        _pr_publication(
+            70, 5, HEAD_B, prior=[member],
+            dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "resolved")],
+        ),
+        _pr_recon(71, 5, HEAD_B, []),
+    )
+    assert closed.entry is None

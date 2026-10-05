@@ -17478,6 +17478,31 @@ def test_clustered_new_finding_blocks_trigger_a_step_back_turn_and_a_bound_sweep
     assert "Enumerate ALL remaining instances" in review_prompts[3]
 
 
+def test_clustered_blocks_trigger_a_step_back_turn_under_review_parallel(tmp_path):
+    """`pr-parallel-trigger` (#1271): provisional publication + reconciliation records."""
+    from coding_review_agent_loop.github import get_pr_review_context
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+    config = _sb_config(tmp_path, review_parallel=True)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    records = _extract_round_metadata_records(
+        get_pr_review_context(runner, config=config, pr_number=77).comments, flow="pr"
+    )
+    reviews = [r.metadata for r in records if r.metadata.role == "reviewer"]
+    assert any(m.phase == "publication" and m.new_items == () for m in reviews)
+    assert any(
+        r.metadata.phase == "reconciliation" and r.metadata.new_items for r in records
+    )
+    coder_prompts = _sb_coder_prompts(runner)
+    assert len(coder_prompts) == 3
+    assert all("STEP-BACK TURN" not in prompt for prompt in coder_prompts[:2])
+    assert "STEP-BACK TURN" in coder_prompts[2]
+
+
 def test_step_back_entry_is_recorded_on_the_coder_record_and_not_repeated(tmp_path):
     from coding_review_agent_loop.github import get_pr_review_context
     from coding_review_agent_loop.round_state import _extract_round_metadata_records
