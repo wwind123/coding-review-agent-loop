@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pytest
 
 import orchestrator_split_guard
+import coding_review_agent_loop.agent_failure as agent_failure
 import coding_review_agent_loop.cli as cli_module
 import coding_review_agent_loop.orchestrator as orchestrator_module
 import coding_review_agent_loop.prompts as prompts_module
@@ -7543,3 +7544,195 @@ def test_repair_backend_help_names_default_and_alternative(capsys):
     assert "default: antigravity" in help_text
     assert "agy CLI even when no role uses Antigravity" in help_text
     assert "--repair-backend codex|claude --repair-model MODEL" in help_text
+
+
+def test_at_capacity_message_is_transient_and_public_diagnostic() -> None:
+    msg = "Selected model is at capacity. Please try a different model."
+    assert agent_failure._failure_category(msg) == "transient"
+    assert agent_failure.PUBLIC_RESPONSE_TRANSIENT_DIAGNOSTIC_RE.search(msg)
+    assert agent_failure._is_transient_public_response(msg)
+    assert not agent_failure.PUBLIC_RESPONSE_TRANSIENT_DIAGNOSTIC_RE.search(
+        "The reviewer noted that the selected model is at capacity today."
+    )
+
+
+def test_provider_verdict_drives_failure_category_and_suggestion() -> None:
+    from coding_review_agent_loop.transient import classify_codex_failure
+
+    def cat(message):
+        raw = json.dumps({"type": "error", "message": message})
+        verdict = classify_codex_failure(raw)
+        return agent_failure._failure_category(verdict.text, provider_verdict=verdict)
+
+    assert cat("429 RESOURCE_EXHAUSTED") == "transient"
+    assert cat("429 insufficient_quota: please check your plan") == "non-retryable"
+    assert cat("Selected model is at capacity; auth proxy busy") == "transient"
+    assert "billing" in agent_failure._failure_suggestion(
+        "non-retryable", "x", "codex", classification_text="insufficient_quota"
+    )
+
+
+def test_codex_classification_ignores_tool_output() -> None:
+    tool = json.dumps({"type": "item.completed", "item": {"aggregated_output": "auth timeout"}})
+    result = AgentResult(text="", raw_output=tool, returncode=1, provider="codex")
+    text, verdict = agent_failure._agent_failure_classification(result, phase="command")
+    assert verdict is not None and "auth" not in text
+    assert agent_failure._failure_category(text, provider_verdict=verdict) == "deterministic"
+    legacy = AgentResult(text="", raw_output="invalid api key", returncode=1, provider="claude")
+    assert agent_failure._agent_failure_classification(legacy, phase="command") == ("invalid api key", None)
+
+
+# ── #1269: validated-agent loop driven with Codex provider-error streams ──────
+
+
+def _codex_stream(*, message=None, error=None, stderr=None, tool=True):
+    lines = []
+    if tool:
+        lines.append(json.dumps({"type": "item.completed", "item": {
+            "type": "command_execution", "aggregated_output": "auth.captureOwner() billing"}}))
+    if message is not None:
+        lines.append(json.dumps({"type": "error", "message": message}))
+        lines.append(json.dumps({"type": "turn.failed", "error": {"message": message}}))
+    if error is not None:
+        lines.append(json.dumps({"type": "turn.failed", "error": error}))
+    if stderr:
+        lines.append(stderr)
+    return "\n".join(lines)
+
+
+def _drive_codex(tmp_path, raws, *, retries=2, containment=None):
+    """Run _run_validated_agent with a Codex fake; return (calls, sleeps, response|exc)."""
+    from coding_review_agent_loop.errors import AgentInvocationError
+    from unittest.mock import patch
+
+    config = make_config(tmp_path, reviewer="codex", agent_max_retries=retries)
+    outcomes = list(raws)
+    calls = {"n": 0}
+
+    def mock_run(_runner, **_kwargs):
+        raw = outcomes[min(calls["n"], len(outcomes) - 1)]
+        calls["n"] += 1
+        if raw is None:
+            return AgentResult(text="valid", returncode=0, provider="codex")
+        return AgentResult(text="", raw_output=raw, returncode=1, provider="codex", containment=containment)
+
+    runner = FakeRunner()
+    with patch("coding_review_agent_loop.orchestrator.run_agent_result", mock_run):
+        try:
+            out = _run_validated_agent(
+                runner, agent="codex", config=config, prompt="Review.",
+                marker_description="test", validate=lambda text: text, role="reviewer",
+            )
+        except AgentInvocationError as exc:
+            out = exc
+    sleeps = [c for c, _cwd in runner.commands if c and c[0] == "sleep"]
+    return calls["n"], sleeps, out
+
+
+_CAPACITY = "Selected model is at capacity. Please try a different model."
+
+
+def test_codex_capacity_with_auth_tool_output_is_retried_then_succeeds(tmp_path):
+    n, sleeps, out = _drive_codex(tmp_path, [_codex_stream(message=_CAPACITY), None])
+    assert n == 2 and out.text == "valid"
+    assert len(sleeps) == 1
+
+
+def test_codex_capacity_retry_exhausted_reports_transient(tmp_path):
+    n, sleeps, out = _drive_codex(tmp_path, [_codex_stream(message=_CAPACITY)], retries=2)
+    assert n == 3 and len(sleeps) == 2
+    text = str(out)
+    assert "transient" in text
+    assert "billing" not in text.lower() and "authenticated" not in text
+
+
+@pytest.mark.parametrize(
+    "raw,expected_calls,needle",
+    [
+        (_codex_stream(message="401 Unauthorized"), 1, "authenticated"),
+        (_codex_stream(message="invalid api key"), 1, "authenticated"),
+        (_codex_stream(message="401 Unauthorized", stderr="warning: model at capacity, retrying"), 1, "authenticated"),
+        (_codex_stream(message="429 insufficient_quota: You exceeded your current quota, please check your plan."), 1, "billing"),
+        (_codex_stream(error={"message": "request failed", "status": 401}), 1, "authenticated"),
+        (_codex_stream(error={"status": 429, "code": "insufficient_quota"}), 1, "billing"),
+    ],
+)
+def test_codex_non_retryable_structured_errors_are_not_retried(tmp_path, raw, expected_calls, needle):
+    n, sleeps, out = _drive_codex(tmp_path, [raw])
+    assert n == expected_calls and sleeps == []
+    assert "non-retryable" in str(out) and needle in str(out)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _codex_stream(message="429 Too Many Requests: rate limit reached", stderr="billing notice"),
+        _codex_stream(error={"message": "request failed", "status": 503}),
+        _codex_stream(error={"message": "request failed", "status": "503"}),
+        _codex_stream(message="429 RESOURCE_EXHAUSTED"),
+    ],
+)
+def test_codex_transient_structured_errors_are_retried(tmp_path, raw):
+    n, sleeps, out = _drive_codex(tmp_path, [raw, None])
+    assert n == 2 and out.text == "valid" and len(sleeps) == 1
+
+
+def test_codex_provider_resource_exhausted_is_transient_not_host(tmp_path):
+    n, _sleeps, out = _drive_codex(tmp_path, [_codex_stream(message="429 RESOURCE_EXHAUSTED")], retries=0)
+    assert "transient" in str(out) and "resource-exhausted" not in str(out)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"type":"item.completed","item":{"aggregated_output":"auth.captureOwner() invalid api key timeout',
+        _codex_stream(tool=True),
+    ],
+)
+def test_codex_streams_without_error_evidence_are_deterministic(tmp_path, raw):
+    n, sleeps, out = _drive_codex(tmp_path, [raw])
+    assert n == 1 and sleeps == []
+    assert "deterministic" in str(out)
+
+
+def test_typed_host_exhaustion_beats_provider_capacity(tmp_path):
+    evidence = ContainmentEvidence(
+        backend="systemd-cgroup-v2", termination_cause="oom", cleanup_confirmed=True,
+        applicable_limit="MemoryMax",
+    )
+    n, sleeps, out = _drive_codex(tmp_path, [_codex_stream(message=_CAPACITY)], containment=evidence)
+    assert n == 1 and sleeps == []
+    assert "resource-exhausted" in str(out)
+
+
+def test_public_response_envelope_with_capacity_phrase_is_not_transient():
+    envelope = json.dumps({"schema_version": 1, "kind": "plan_state", "summary": _CAPACITY})
+    assert not agent_failure.PUBLIC_RESPONSE_TRANSIENT_DIAGNOSTIC_RE.search(envelope)
+    assert not agent_failure._is_transient_public_response(envelope)
+
+
+def test_codex_valid_event_then_truncated_item_is_deterministic_without_retry(tmp_path):
+    raw = "\n".join([
+        json.dumps({"type": "thread.started", "thread_id": "t"}),
+        '{"type":"item.completed","item":{"aggregated_output":"auth.captureOwner() invalid api key timeout',
+    ])
+    n, sleeps, out = _drive_codex(tmp_path, [raw])
+    assert n == 1 and sleeps == []
+    text = str(out)
+    assert "deterministic" in text and "transient" not in text and "authenticated" not in text
+
+
+def test_codex_stderr_decisive_evidence_in_omitted_middle_is_not_retried(tmp_path):
+    stderr = "timeout " + "n" * 7000 + " 401 Unauthorized " + "n" * 7000 + " timeout"
+    raw = json.dumps({"type": "thread.started", "thread_id": "t"}) + "\n" + stderr
+    n, sleeps, out = _drive_codex(tmp_path, [raw, None])
+    assert n == 1 and sleeps == []
+    assert "non-retryable" in str(out)
+
+
+def test_codex_oversized_structured_billing_error_gets_billing_suggestion(tmp_path):
+    msg = "n" * 7000 + " insufficient_quota " + "n" * 7000
+    n, sleeps, out = _drive_codex(tmp_path, [_codex_stream(message=msg)])
+    assert n == 1 and sleeps == []
+    text = str(out)
+    assert "non-retryable" in text and "billing" in text and "authenticated" not in text

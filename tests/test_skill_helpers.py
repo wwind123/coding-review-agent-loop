@@ -7419,3 +7419,66 @@ class TestCoderTimeoutParser:
         sr.main()
         assert captured["coder_test_command_timeout_seconds"] == 7200
 
+
+
+class TestRunExternalCodexErrorChannel:
+    """#1269: run_external classifies Codex failures from the provider error channel."""
+
+    _invoke = TestRunExternalRetries._invoke
+
+    _CAP = "Selected model is at capacity. Please try a different model."
+    _TOOL = json.dumps({
+        "type": "item.completed",
+        "item": {"aggregated_output": "auth.captureOwner() billing"},
+    })
+
+    def _run(self, monkeypatch, raw):
+        from coding_review_agent_loop.agents.base import AgentResult
+        outcomes = [
+            AgentResult(text="", raw_output=raw, returncode=1, provider="codex"),
+            AgentResult(text="ok", returncode=0),
+        ]
+        calls, _sleeps, _out, code = self._invoke(monkeypatch, "codex", outcomes)
+        return calls["n"], code
+
+    def test_capacity_stream_with_auth_tool_output_retries(self, monkeypatch) -> None:
+        raw = "\n".join([
+            self._TOOL,
+            json.dumps({"type": "error", "message": self._CAP}),
+            json.dumps({"type": "turn.failed", "error": {"message": self._CAP}}),
+        ])
+        assert self._run(monkeypatch, raw) == (2, 0)
+
+    def test_status_503_retries(self, monkeypatch) -> None:
+        raw = json.dumps({"type": "turn.failed", "error": {"message": "request failed", "status": 503}})
+        assert self._run(monkeypatch, raw) == (2, 0)
+
+    def test_structured_auth_and_mixed_stderr_do_not_retry(self, monkeypatch) -> None:
+        err = json.dumps({"type": "error", "message": "401 Unauthorized"})
+        assert self._run(monkeypatch, err)[0] == 1
+        assert self._run(monkeypatch, err + "\nwarning: model at capacity")[0] == 1
+
+    def test_billing_quota_and_malformed_only_do_not_retry(self, monkeypatch) -> None:
+        quota = json.dumps({
+            "type": "error",
+            "message": "429 insufficient_quota: You exceeded your current quota, please check your plan.",
+        })
+        assert self._run(monkeypatch, quota)[0] == 1
+        trunc = '{"type":"item.completed","item":{"aggregated_output":"timeout invalid api key'
+        assert self._run(monkeypatch, trunc)[0] == 1
+
+    def test_mixed_429_with_stderr_billing_retries(self, monkeypatch) -> None:
+        raw = json.dumps({"type": "error", "message": "429 Too Many Requests: rate limit reached"}) + "\nbilling notice"
+        assert self._run(monkeypatch, raw) == (2, 0)
+
+    def test_numeric_status_variants(self, monkeypatch) -> None:
+        def ev(**err):
+            return json.dumps({"type": "turn.failed", "error": err})
+        assert self._run(monkeypatch, ev(message="request failed", status="503")) == (2, 0)
+        assert self._run(monkeypatch, ev(message="request failed", status=401))[0] == 1
+        assert self._run(monkeypatch, ev(status=429, code="insufficient_quota"))[0] == 1
+
+    def test_stderr_decisive_middle_is_not_retried(self, monkeypatch) -> None:
+        stderr = "timeout " + "n" * 7000 + " 401 Unauthorized " + "n" * 7000 + " timeout"
+        raw = json.dumps({"type": "thread.started", "thread_id": "t"}) + "\n" + stderr
+        assert self._run(monkeypatch, raw)[0] == 1

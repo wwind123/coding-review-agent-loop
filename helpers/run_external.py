@@ -381,6 +381,7 @@ def main() -> None:
     from coding_review_agent_loop.transient import (
         classify_antigravity_capacity,
         classify_antigravity_quota_exhaustion,
+        classify_codex_failure,
         is_transient_agent_output,
     )
     from coding_review_agent_loop.usage import estimate_usage
@@ -516,6 +517,7 @@ def main() -> None:
     for attempt in range(1, max_attempts + 1):
         attempt_started_at = time.monotonic()
         candidate = None
+        provider_verdict = None
         mechanical_failure = False
         target_exec_retryable = False
         try:
@@ -530,12 +532,22 @@ def main() -> None:
         else:
             if candidate.returncode != 0 or not candidate.text.strip():
                 failure_text = candidate.raw_output or candidate.text
+                if agent_name == "codex":
+                    provider_verdict = classify_codex_failure(candidate.raw_output or "")
+                    if provider_verdict is not None:
+                        failure_text = provider_verdict.text
             else:
                 result = candidate
                 break
 
         if candidate is not None and candidate.containment is not None:
             evidence = candidate.containment
+            if (
+                evidence.resource_exhausted
+                or evidence.termination_cause == "target-exec-error"
+                or (evidence.backend == "systemd-cgroup-v2" and not evidence.cleanup_confirmed)
+            ):
+                provider_verdict = None  # typed containment evidence is authoritative
             if evidence.resource_exhausted:
                 failure_text = (
                     "resource-exhausted: "
@@ -565,7 +577,12 @@ def main() -> None:
         transient = (
             False
             if mechanical_failure
-            else target_exec_retryable or is_transient_agent_output(failure_text or "")
+            else target_exec_retryable
+            or (
+                provider_verdict.category == "transient"
+                if provider_verdict is not None and provider_verdict.source == "structured"
+                else is_transient_agent_output(failure_text or "")
+            )
         )
         capacity = classify_antigravity_capacity(
             failure_text or "",

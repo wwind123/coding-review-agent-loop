@@ -47,6 +47,8 @@ from .salvage import (
 from .transient import (
     NON_RETRYABLE_AGENT_OUTPUT_RE,
     TRANSIENT_AGENT_OUTPUT_RE,
+    ProviderFailureVerdict,
+    classify_codex_failure,
     is_transient_agent_output,
 )
 from .usage import UsageMetadata
@@ -85,6 +87,7 @@ PUBLIC_RESPONSE_TRANSIENT_DIAGNOSTIC_RE = re.compile(
     r"rate.?limit(?:ed)?\b|quota\b.{0,40}\b(?:exceeded|exhausted)\b|"
     r"resource[_-]?exhausted\b|ratelimitexceeded\b|retry[- ]after\b|retry[_-]?delay\b|"
     r"no capacity available\b|model_capacity_exhausted\b|"
+    r"(?:selected\s+)?model\s+is\s+(?:currently\s+)?at\s+capacity\b|"
     r"capacity\b.{0,80}\b(?:unavailable|exceeded|exhausted)\b|"
     r"(?:gemini|claude|codex|provider|cli)\b.{0,120}"
     r"(?:429|rate.?limit|resource.?exhausted|no capacity|overloaded)"
@@ -505,10 +508,19 @@ def _failure_category(
     *,
     public_response: bool = False,
     repair_expected_kind: str | None = None,
+    provider_verdict: ProviderFailureVerdict | None = None,
 ) -> str:
     """Classify a failure for logging: helps users decide whether to rerun or fix config/code."""
     if not text.strip():
         return "empty-response"
+    if provider_verdict is not None and provider_verdict.source == "structured":
+        if _looks_like_unsupported_effort_text(text):
+            return "unsupported_effort"
+        if _unsupported_model_classification_text(
+            text, public_response=public_response, repair_expected_kind=repair_expected_kind
+        ):
+            return "unsupported_model"
+        return provider_verdict.category
     if (
         public_response
         and _recognized_structured_public_response_kind(text) is not None
@@ -1092,7 +1104,11 @@ def _failure_suggestion(
             "this is a transient failure and a retry may succeed."
         )
     if category == "non-retryable":
-        if re.search(r"\b(?:credit|billing)\b", combined, re.I):
+        if re.search(
+            r"\b(?:credit|billing)\b|insufficient_quota|check your plan|payment required|\b402\b",
+            combined,
+            re.I,
+        ):
             return "Suggestion: check your API billing / credit balance, then re-run."
         if re.search(r"\bdirty\b", combined, re.I):
             return "Suggestion: clean up the dirty working tree or workdir, then re-run."
@@ -1537,12 +1553,25 @@ def _failed_run_diagnostics(
     )
 
 
+def _agent_failure_classification(
+    result: AgentResult,
+    *,
+    phase: str,
+) -> tuple[str, ProviderFailureVerdict | None]:
+    """Choose the classification text and, for Codex, the provider verdict (#1269)."""
+    if phase in {"command", "empty"}:
+        if result.provider == "codex":
+            verdict = classify_codex_failure(result.raw_output or "")
+            if verdict is not None:
+                return verdict.text, verdict
+        return result.raw_output or result.text, None
+    return result.text, None
+
+
 def _agent_failure_classification_text(
     result: AgentResult,
     *,
     phase: str,
 ) -> str:
     """Choose the text that matches the failure being classified."""
-    if phase in {"command", "empty"}:
-        return result.raw_output or result.text
-    return result.text
+    return _agent_failure_classification(result, phase=phase)[0]
