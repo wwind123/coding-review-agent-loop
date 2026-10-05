@@ -3163,6 +3163,24 @@ as a reviewer-owned `step_back_entries` field on the planner record; a malformed
 entry suppresses the trigger and the stop with a log line rather than failing the
 run.
 
+#### Proactive generalization guidance and finding history
+
+The step-back trigger above is reactive. Independently of it, every planner
+revision prompt and every coder fix prompt (PR fix loop, same-PR follow-up, and
+CI repair; not the merge-conflict prompt) carries standing guidance: compare the
+newest finding with earlier rounds of this run, fix the whole class at its root
+with one parametrized test, state it as `Generalization: this generalizes the fix
+for [<item-id>]: <rule>`, and keep any broader refactor as a future follow-up.
+The prompt also lists a bounded history (#1273): earlier rounds' findings,
+resolved ones included, with their `path:line` references and open, deferred, or
+resolved status read from the live ledger, plus the agent's own previous fix
+summaries. Findings first raised in the current review round are not repeated.
+The history keeps at most the newest 6 rounds and 6000 characters (whole oldest
+rounds are dropped and the omitted count is reported). If it cannot be built the
+prompt says it is unavailable and the guidance stays. A response that declares a
+generalization is logged as `declared a generalization (proactive|step-back-directed)`;
+nothing is persisted and the step-back trigger is unchanged.
+
 #### PR step-back, reviewer sweep, and sibling escalation
 
 The same pattern appears in the PR fix loop: a reviewer raises one new sibling of

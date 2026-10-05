@@ -3581,6 +3581,81 @@ def _canonically_resolved_history_item_ids(
     return frozenset(resolved - set(active) - set(current_carried_ids))
 
 
+def canonical_history_item_outcomes(
+    records: Sequence[PostedRoundRecord],
+    *,
+    reconciliation_mode: str,
+    same_status: str,
+) -> dict[str, str]:
+    """Replay already-extracted records into per-item history outcomes (#1273).
+
+    Read-only sibling of ``_canonically_resolved_history_item_ids``: the same
+    group-by-(subject, round) replay through the live reconciler, but called
+    with ``retain_future=False`` (the compact-PR call shape).  Every item whose
+    reconciled status is ``future`` therefore lands in the SECOND returned
+    collection, which is where a deferral is read; the FIRST collection holds
+    only still-mandatory items and carries their updated state forward.
+
+    Returns ``item_id -> "active" | "deferred" | "resolved"``.  ``resolved`` is
+    any candidate the reconciler dropped (literal or derived clearance), so a
+    retained future item cleared by sub-item completion is not left deferred.
+    A later carry or reintroduction as a mandatory item resets the outcome to
+    ``active``; machine obligations never get an outcome.
+    """
+    groups: dict[tuple[str, int], list[PostedRoundRecord]] = {}
+    for record in records:
+        key = (record.metadata.subject, record.metadata.round_number)
+        groups.setdefault(key, []).append(record)
+    active: dict[str, UnresolvedReviewItem] = {}
+    outcomes: dict[str, str] = {}
+
+    def appear(item: UnresolvedReviewItem) -> None:
+        if _is_machine_obligation(item):
+            return
+        # A future item still carried in the stored ledger (full context mode, planner)
+        # stays a reconciliation candidate, so a later authoritative `resolved`
+        # clears it; compact mode never stores it, so absence keeps it deferred.
+        active[item.item_id] = item
+        outcomes[item.item_id] = "deferred" if item.status == "future" else "active"
+
+    for group in groups.values():
+        for record in group:
+            for item in record.metadata.prior_items:
+                appear(item)
+        dispositions_by_item = _aggregate_record_dispositions(
+            [record for record in group if record.metadata.role == "reviewer"]
+        )
+        candidates = [
+            item for item in active.values() if item.item_id in dispositions_by_item
+        ]
+        if candidates:
+            kept, future = _apply_unresolved_item_dispositions(
+                candidates,
+                dispositions_by_item,
+                same_status=same_status,
+                retain_future=False,
+                reconciliation_mode=reconciliation_mode,
+            )
+            for item in future:
+                active.pop(item.item_id, None)
+                outcomes[item.item_id] = "deferred"
+            for item in kept:
+                active[item.item_id] = item
+            returned = {item.item_id for item in (*kept, *future)}
+            for item in candidates:
+                if item.item_id in returned:
+                    continue
+                # The reconciler drops a non-machine item only when every
+                # obligation is cleared, including a clearance it derived from
+                # sub-item completion, so the drop itself is authoritative.
+                del active[item.item_id]
+                outcomes[item.item_id] = "resolved"
+        for record in group:
+            for item in record.metadata.new_items:
+                appear(item)
+    return outcomes
+
+
 def _live_round_resolved_item_ids(
     *,
     prior_items: Sequence[UnresolvedReviewItem],

@@ -88,6 +88,11 @@ from .split_materialization import (
     resolve_selected_stage_child,
 )
 from .logging import log
+from .finding_history import (
+    PHASE_PLAN as _HISTORY_PHASE_PLAN,
+    FindingHistoryLedger,
+    log_declared_generalization,
+)
 from .prompts import (
     CompactPlanTailContext,
     CompactPriorContext,
@@ -1598,6 +1603,15 @@ def _run_plan_first_loop(
         )
     except AgentLoopError:
         mode_history_records = ()
+    # Advisory per-run finding history (#1273), seeded once from the planning
+    # records already extracted above; an undecodable authoritative record set
+    # keeps its existing stop and never reaches this point with history work.
+    plan_finding_history = FindingHistoryLedger(
+        _HISTORY_PHASE_PLAN, log=lambda message: log(config, message)
+    )
+    plan_finding_history.seed_from_records(
+        mode_history_records, reconciliation_mode="aggregate", same_status="same-plan"
+    )
     prior_execution_mode = prior_plan_execution_mode(mode_history_records)
     execution_mode_history_present = bool(mode_history_records)
     if prior_execution_mode is not None and prior_execution_mode != config.plan_execution_mode:
@@ -1610,6 +1624,7 @@ def _run_plan_first_loop(
     for round_number in range(start_round_number, config.max_rounds + 1):
         current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
         prior_unresolved_items = current_resume.prior_items if current_resume is not None else tuple(unresolved_items)
+        plan_finding_history.note_carried_ledger(prior_unresolved_items)
         prior_dispositions: dict[str, list[ReviewItemDisposition]] = {
             item.item_id: [] for item in prior_unresolved_items
         }
@@ -2843,6 +2858,7 @@ def _run_plan_first_loop(
         unresolved_items = list(
             plan_ledger_view([*unresolved_items, *round_new_unresolved_items])
         )
+        plan_finding_history.observe_reconciled(unresolved_items)
         # Items minted and cleared inside one round never reappear as prior
         # items, so record them here too.
         plan_accounted_item_ids.update(item.item_id for item in unresolved_items)
@@ -4104,6 +4120,8 @@ def _run_plan_first_loop(
                     base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
                     plan_growth_notice=plan_growth_notice,
                     step_back_context=step_back_context,
+                    generalization_guidance=True,
+                    finding_history=plan_finding_history.view(round_number),
                     prior_execution_mode=prior_execution_mode,
                     execution_mode_history_present=execution_mode_history_present,
                 ),
@@ -4355,6 +4373,18 @@ def _run_plan_first_loop(
             else None
         )
         coder_session_id = plan_response.session_id
+        plan_finding_history.record_fix(
+            plan_response.marker_value,
+            published_round=round_number + 1,
+            agent=coder_name,
+        )
+        log_declared_generalization(
+            plan_response.marker_value,
+            log=lambda message: log(config, message),
+            round_number=round_number,
+            agent=coder_name,
+            step_back_directed=step_back_context is not None,
+        )
         try:
             plan_round_metadata = PostedRoundMetadata(
                     flow="plan",
