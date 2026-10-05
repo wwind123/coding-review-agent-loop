@@ -1475,12 +1475,13 @@ def test_a_carried_locations_known_rename_destination_keeps_an_unmappable_anchor
 
 
 def _publication(index, round_number, *, state="blocking", agent=PRIMARY, flow="plan",
-                 subject="plan", phase="publication"):
+                 subject="plan", phase="publication", prior=(), dispositions=()):
     return PostedRoundRecord(
         index=index,
         metadata=PostedRoundMetadata(
             flow=flow, role="reviewer", agent=agent, round_number=round_number,
             subject=subject, state=state, phase=phase, new_items=(),
+            prior_items=tuple(prior), dispositions=tuple(dispositions),
         ),
         body="",
     )
@@ -1634,3 +1635,40 @@ def test_pr_unresolved_post_entry_review_neither_escalates_nor_closes_the_episod
 
 def test_pr_approved_publication_closes_the_episode():
     assert _episode(_pr_publication(60, 4, HEAD_B, state="approved")).entry is None
+
+
+def test_pr_reconciliation_member_item_keeps_the_episode_open_until_resolved():
+    member = _pr_item("item-12", "spool branch src/spool.py:130", round_number=4)
+
+    def replay(*extra):
+        records = [
+            _pr_publication(60, 4, HEAD_B),
+            _pr_recon(61, 4, HEAD_B, [member]),
+            *extra,
+        ]
+        # current_round=5: round 4's sibling is stale, so escalation is suppressed
+        # and the open member is evaluated through _remaining_mandatory_items.
+        return sb.derive_pr_episode(
+            [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]), *records],
+            PR_REVIEWER, window=40, mapper=_identity_mapper,
+            current_round=5, current_head=HEAD_B,
+        )
+
+    kept = replay()
+    assert kept.entry is not None and not kept.siblings
+    still_open = replay(
+        _pr_publication(
+            70, 5, HEAD_B, prior=[member],
+            dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "blocking")],
+        ),
+        _pr_recon(71, 5, HEAD_B, []),
+    )
+    assert still_open.entry is not None and not still_open.siblings
+    closed = replay(
+        _pr_publication(
+            70, 5, HEAD_B, prior=[member],
+            dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "resolved")],
+        ),
+        _pr_recon(71, 5, HEAD_B, []),
+    )
+    assert closed.entry is None
