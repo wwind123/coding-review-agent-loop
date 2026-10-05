@@ -261,11 +261,17 @@ from .panel_evidence import (
     _plan_revision_descriptor,
 )
 from .review_step_back import (
+    BLOCKING_CLASSES,
+    DISPOSITION_DEFER_EPISODE,
+    DISPOSITION_DEFER_PENDING,
+    DISPOSITION_ESCALATED,
     PlanStepBackContext,
+    StallStepBackDisposition,
     derive_plan_step_back_state,
     entry_payload_for_plan,
     mandatory_plan_findings_since,
     plan_growth_crossing_round,
+    plan_stall_step_back_disposition,
     plan_step_back_candidate_rounds,
     render_step_back_human_decision,
     step_back_alternative_summary,
@@ -856,6 +862,28 @@ def _run_plan_first_loop(
             blocks=state.escalation_count,
             threshold=config.plan_step_back_escalation_rounds,
             alternative=step_back_alternative_summary(records, state.episode),
+        )
+
+    def _stall_step_back_disposition() -> StallStepBackDisposition:
+        """What the reached stall limit does about the plan step-back (#1275)."""
+        crossing = (
+            plan_growth_crossing_round(
+                plan_records,
+                config=config,
+                current_round=current_plan_sidecar.round_number,
+            )
+            if current_plan_sidecar is not None
+            else None
+        )
+        return plan_stall_step_back_disposition(
+            plan_step_back_state(
+                plan_records, panel_opening_index=plan_panel_evidence.opening_index
+            ),
+            round_number=round_number,
+            crossing_round=crossing,
+            growth_gate_enforced=plan_growth_gate_enforced(config),
+            step_back_rounds=config.plan_step_back_rounds,
+            escalation_rounds=config.plan_step_back_escalation_rounds,
         )
 
     if inherited_matrix_binding is not None:
@@ -1718,6 +1746,7 @@ def _run_plan_first_loop(
             else None
         )
         plan_scheduler_decision = None
+        stall_deferred_for_step_back = False
         step_back_candidate_review = False
         step_back_history_intact = False
         step_back_history_class = "unclassified"
@@ -1910,8 +1939,8 @@ def _run_plan_first_loop(
                 )
             ):
                 # Independent of --plan-primary-stall-rounds: only
-                # --plan-step-back-rounds 0 disables the step-back stop.  Whichever
-                # stop is reached first wins, so this runs before the stall stop.
+                # --plan-step-back-rounds 0 disables the step-back stop.  It runs
+                # before the stall stop, which a pending or active step-back defers.
                 if not step_back_history_intact:
                     log(
                         config,
@@ -1958,20 +1987,48 @@ def _run_plan_first_loop(
                         current_execution_mode=config.plan_execution_mode,
                     )
                     if plan_primary_streak.count >= config.plan_primary_stall_rounds:
-                        # Before the prelaunch checkpoint and every agent turn,
-                        # so the stop writes no record a resume could read as
-                        # a checkpoint, an approval, or a panel opening.
-                        stop_plan_pre_panel(
-                            plan_primary_stall_message(
-                                streak=plan_primary_streak.count,
-                                threshold=config.plan_primary_stall_rounds,
-                                plan_chars=len(current_plan),
-                                legacy_undigested=plan_primary_streak.edit_cannot_clear(
-                                    config.plan_primary_stall_rounds
+                        disposition = _stall_step_back_disposition()
+                        if disposition.kind == DISPOSITION_DEFER_PENDING:
+                            stall_deferred_for_step_back = True
+                            log(
+                                config,
+                                f"Planning round {round_number}: stall stop deferred: "
+                                f"pending plan step-back ({disposition.reason})",
+                            )
+                        elif disposition.kind == DISPOSITION_DEFER_EPISODE:
+                            log(
+                                config,
+                                f"Planning round {round_number}: stall stop deferred: "
+                                f"{disposition.reason}",
+                            )
+                        else:
+                            # Before the prelaunch checkpoint and every agent turn,
+                            # so the stop writes no record a resume could read as
+                            # a checkpoint, an approval, or a panel opening.
+                            escalation = (
+                                plan_step_back_escalation(
+                                    plan_records,
+                                    panel_opening_index=plan_panel_evidence.opening_index,
+                                    assessment=plan_growth_assessment,
+                                    measurements=plan_growth_measurements,
+                                )
+                                if disposition.kind == DISPOSITION_ESCALATED
+                                else None
+                            )
+                            stop_plan_pre_panel(
+                                escalation
+                                if escalation is not None
+                                else plan_primary_stall_message(
+                                    streak=plan_primary_streak.count,
+                                    threshold=config.plan_primary_stall_rounds,
+                                    plan_chars=len(current_plan),
+                                    legacy_undigested=plan_primary_streak.edit_cannot_clear(
+                                        config.plan_primary_stall_rounds
+                                    ),
+                                    step_back_status=disposition.reason,
                                 ),
-                            ),
-                            round_number=round_number,
-                        )
+                                round_number=round_number,
+                            )
             plan_classification = classify_plan_transition(
                 plan_previous_key,
                 current_plan_key,
@@ -2099,6 +2156,10 @@ def _run_plan_first_loop(
                 ),
                 scheduler_stall_reset=(
                     plan_reset_round and plan_scheduler_decision.phase == "primary"
+                ),
+                scheduler_step_back_deferral=(
+                    stall_deferred_for_step_back
+                    and plan_scheduler_decision.phase == "primary"
                 ),
                 scheduler_execution_mode=config.plan_execution_mode,
                 **_architecture_metadata_fields(config),
@@ -4045,8 +4106,18 @@ def _run_plan_first_loop(
                     current_round=current_plan_sidecar.round_number,
                 )
                 if crossing_round is not None:
-                    streak = step_back_state.streak_since(crossing_round)
-                    if streak >= config.plan_step_back_rounds:
+                    before = step_back_state.streak_before(crossing_round, round_number)
+                    streak = max(step_back_state.streak_since(crossing_round), before)
+                    # A step-back pending at this round (judged from earlier rounds)
+                    # is granted on any blocking primary review, repeat-only too.
+                    pending = (
+                        before >= config.plan_step_back_rounds
+                        and step_back_state.reviews[-1].classification in BLOCKING_CLASSES
+                    )
+                    if pending or (
+                        step_back_state.streak_since(crossing_round)
+                        >= config.plan_step_back_rounds
+                    ):
                         step_back_context = PlanStepBackContext(
                             measurements=plan_step_back_measurements(
                                 plan_growth_assessment, plan_growth_measurements

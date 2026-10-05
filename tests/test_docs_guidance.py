@@ -549,6 +549,9 @@ def test_operator_docs_document_the_staged_planning_flags_and_limits():
     assert "--plan-primary-stall-rounds" in architecture
     assert "scheduler_issue_digest" in architecture
     assert "scheduler_stall_reset" in architecture
+    assert "scheduler_step_back_deferral" in architecture
+    assert "whichever of that stop and the stall stop is reached first" not in architecture
+    assert "Whichever stop is reached first wins" not in readme
     assert "Comment-only narrowing never retires" in architecture
     assert "cannot retire them" in readme
     assert "a comment alone does not" in readme

@@ -14351,6 +14351,8 @@ def test_growth_gated_primary_approval_resets_the_stall_streak(tmp_path):
         max_rounds=8,
         plan_primary_stall_rounds=2,
         plan_growth_max_scope_items=1,
+        # An active step-back episode would defer the stall stop (#1275).
+        plan_step_back_rounds=0,
     )
     with patch.object(orchestrator_module, "log", wraps=orchestrator_module.log) as logged:
         with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
@@ -15449,6 +15451,13 @@ def test_stall_message_names_every_working_remedy():
         streak=8, threshold=8, plan_chars=1, legacy_undigested=True
     )
     assert "predate issue-text tracking" in legacy
+    assert "Plan step-back did not apply" not in message
+    suffixed = orchestrator_module.plan_primary_stall_message(
+        streak=8, threshold=8, plan_chars=1, step_back_status="plan-growth gate is off"
+    )
+    assert suffixed.endswith(" Plan step-back did not apply: plan-growth gate is off.")
+    for needle in ("--plan-reset-stall-streak", "--plan-review-force-full"):
+        assert needle in suffixed
 
 
 from coding_review_agent_loop.round_transport import decode_mapping  # noqa: E402
@@ -15500,6 +15509,40 @@ def test_issue_digest_and_reset_fields_are_strictly_validated(tmp_path):
     only_new = {"flow": "plan", "role": "summary", "agent": "Orchestrator",
                 "round_number": 1, "subject": "s", "scheduler_stall_reset": True}
     assert _decode_round_metadata_mapping(only_new).scheduler_metadata_status == "invalid"
+
+
+def test_step_back_deferral_marker_is_strictly_validated(tmp_path):
+    """`deferral-marker-roundtrip` at the codec (#1275)."""
+    from coding_review_agent_loop.round_state import (
+        _decode_round_metadata_mapping,
+        _encode_round_metadata,
+    )
+
+    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    base = _m1112_first_primary_payload(runner)
+
+    def decoded(**changes):
+        return _decode_round_metadata_mapping({**base, **changes})
+
+    assert decoded().scheduler_step_back_deferral is False
+    marked = decoded(scheduler_step_back_deferral=True)
+    assert marked.scheduler_metadata_status == "valid"
+    assert marked.scheduler_step_back_deferral is True
+    assert (
+        decode_mapping(_encode_round_metadata(marked))["scheduler_step_back_deferral"]
+        is True
+    )
+    assert "scheduler_step_back_deferral" not in decode_mapping(
+        _encode_round_metadata(decoded())
+    )
+    for bad in (False, "yes", 1, None):
+        assert decoded(scheduler_step_back_deferral=bad).scheduler_metadata_status == "invalid"
+    assert (
+        decoded(
+            scheduler_step_back_deferral=True, scheduler_phase="full-board"
+        ).scheduler_metadata_status
+        == "invalid"
+    )
 
 
 def test_all_reviewers_policy_writes_no_digest_or_reset_fields(tmp_path):
@@ -16120,14 +16163,267 @@ def test_m_equal_one_stops_as_soon_as_the_step_back_candidate_is_rejected(tmp_pa
     assert len(_m1251_prompts(runner, "claude")) == 5
 
 
-def test_the_stall_stop_wins_when_it_is_reached_first(tmp_path):
-    """Whichever stop is reached first wins: stall limit 5 beats M=5 here."""
-    _runner, error = _m1251_run(
-        tmp_path, last_round=5, max_rounds=8, plan_primary_stall_rounds=5,
+def test_an_active_step_back_episode_defers_the_stall_stop_until_the_escalation_budget(
+    tmp_path,
+):
+    """`live-episode-defers-stall`: stall limit 5 does not pre-empt M=5 (#1275)."""
+    runner, error = _m1251_run(
+        tmp_path, last_round=9, max_rounds=12, plan_primary_stall_rounds=5,
         plan_step_back_escalation_rounds=5,
     )
 
-    assert "blocked 5 consecutive primary-phase" in str(error)
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert "human decision required" in str(error)
+    assert "blocked 5 round(s)" in str(error)
+    assert "blocked 5 consecutive primary-phase" not in str(error)
+    assert len(_m1251_prompts(runner, "codex")) == 9
+
+
+# --- #1275: the primary stall stop defers to a pending or active step-back ---
+
+
+def _m1275_history(tmp_path):
+    """A crossed history that K=3 left without a step-back, cut before round 5's review.
+
+    Rounds 3 and 4 are new-finding blocks of the crossed plan (two, below K=3),
+    and the round-5 candidate is published but not yet reviewed.
+    """
+    runner, error = _m1251_run(
+        tmp_path, last_round=4, max_rounds=8, plan_step_back_rounds=3
+    )
+    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not any(
+        record.step_back_entries for record in _plan_round_records(runner)
+    )
+    return list(runner.issue_comments)
+
+
+def _m1275_scripts(first_round=5, last_round=9, *, codex_overrides=None):
+    """Chained outputs resuming at round ``first_round``'s primary review."""
+    _fresh, base0 = _m1103_fresh_base()
+    _c, _cl, base_round2 = _m1103_blocking_chain(1, 1, base=base0)
+    _justify, base_round3 = _m1251_justify_patch(base_round2, resolved_item="item-2")
+    codex, claude, _base = _m1103_blocking_chain(3, last_round, base=base_round3)
+    codex = list(codex)
+    for number, output in (codex_overrides or {}).items():
+        codex[number - 3] = output
+    return claude[first_round - 3:], codex[first_round - 3:]
+
+
+def _m1275_resume(tmp_path, history, *, claude=(), codex=(), **overrides):
+    values = {
+        "max_rounds": 12,
+        "plan_growth_max_chars": 4500,
+        "plan_growth_max_revisions": 3,
+        "plan_step_back_rounds": 2,
+        "plan_step_back_escalation_rounds": 2,
+    }
+    values.update(overrides)
+    rerun = _FakeRunner(
+        issue_comments=history, claude_outputs=list(claude), codex_outputs=list(codex)
+    )
+    config = _staged_plan_config(tmp_path, **values)
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(AgentLoopError) as excinfo:
+            run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+    return rerun, excinfo.value, messages
+
+
+def _m1275_deferral_markers(runner):
+    return [
+        record.round_number
+        for record in _plan_round_records(runner)
+        if record.scheduler_step_back_deferral
+    ]
+
+
+@pytest.mark.parametrize("stall_rounds", [4, 2])
+def test_stalled_step_back_eligible_history_gets_its_step_back_on_resume(
+    tmp_path, stall_rounds
+):
+    """`resume-pending-eligible`, `streak-exceeds-threshold`: at and above the limit."""
+    history = _m1275_history(tmp_path)
+    claude, codex = _m1275_scripts()
+    rerun, error, messages = _m1275_resume(
+        tmp_path, history, claude=claude, codex=codex,
+        plan_primary_stall_rounds=stall_rounds,
+    )
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert "human decision required" in str(error)
+    assert "blocked 2 round(s)" in str(error)
+    assert any("stall stop deferred: pending plan step-back" in m for m in messages)
+    assert any("crossed at round 3; 2 new-finding" in m for m in messages)
+    assert _m1275_deferral_markers(rerun) == [5]
+    prompts = _m1251_prompts(rerun, "claude")
+    # The step-back turn, then one ordinary revision before the M-th block.
+    assert [_STEP_BACK_MARKER in prompt for prompt in prompts] == [True, False]
+    assert _m1103_agent_calls(rerun) == ["codex", "claude", "codex", "claude", "codex"]
+    assert _m1251_coder_record(rerun, 6).step_back_entries == (
+        {"phase": "plan", "reviewer": "Codex", "trigger_round": 5},
+    )
+
+
+def test_a_repeat_only_block_in_the_deferred_round_still_gets_the_step_back(tmp_path):
+    """`deferred-round-repeat-only`."""
+    history = _m1275_history(tmp_path)
+    repeat = structured_plan_review(
+        state="blocking",
+        summary="Gap 4 still open.",
+        prior_plan_item_dispositions=[{"item_id": "item-4", "disposition": "blocking"}],
+    )
+    claude, codex = _m1275_scripts(codex_overrides={5: repeat})
+    # The repeat-only review raises no item-5, so the planner resolves item-4.
+    step_back_turn = claude[0].replace('"item-5"', '"item-4"')
+    rerun, _error, messages = _m1275_resume(
+        tmp_path, history, claude=[step_back_turn], codex=codex[:1],
+        plan_primary_stall_rounds=4,
+    )
+
+    assert any("stall stop deferred: pending plan step-back" in m for m in messages)
+    assert any("step-back revision" in m for m in messages)
+    assert _STEP_BACK_MARKER in _m1251_prompts(rerun, "claude")[0]
+    assert _m1251_coder_record(rerun, 6).step_back_entries == (
+        {"phase": "plan", "reviewer": "Codex", "trigger_round": 5},
+    )
+    assert _m1275_deferral_markers(rerun) == [5]
+
+
+def test_resume_with_a_rejected_episode_stops_with_the_human_decision(tmp_path):
+    """`resume-rejected-episode`: the stall limit is reached too."""
+    first, first_error = _m1251_run(
+        tmp_path, last_round=6, max_rounds=8, plan_step_back_escalation_rounds=5
+    )
+    assert not isinstance(first_error, orchestrator_module.PlanPrePanelSafetyError)
+    rerun, error, _messages = _m1275_resume(
+        tmp_path, list(first.issue_comments), plan_primary_stall_rounds=4,
+        max_rounds=8,
+    )
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert "human decision required" in str(error)
+    assert "consecutive primary-phase" not in str(error)
+    assert _m1103_agent_calls(rerun) == []
+
+
+def test_resume_without_a_crossing_keeps_the_stall_stop_and_names_the_reason(tmp_path):
+    """`resume-not-eligible`."""
+    history = _m1275_history(tmp_path)
+    rerun, error, _messages = _m1275_resume(
+        tmp_path, history, plan_primary_stall_rounds=4, plan_growth_max_revisions=99,
+    )
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert "blocked 4 consecutive primary-phase" in str(error)
+    assert (
+        "Plan step-back did not apply: the current candidate crosses no plan-growth "
+        "signal." in str(error)
+    )
+    assert _m1103_agent_calls(rerun) == []
+    assert _m1275_deferral_markers(rerun) == []
+
+
+def test_a_spent_deferral_is_not_granted_again(tmp_path):
+    """`spent-deferral-suppressed`: a marker at round 4 and no step-back entry."""
+    history = _m1275_history(tmp_path)
+    real_records = plan_first_loop_module._extract_round_metadata_records
+
+    def mark_round_four(comments, *, flow):
+        return tuple(
+            PostedRoundRecord(
+                index=record.index,
+                metadata=(
+                    replace(record.metadata, scheduler_step_back_deferral=True)
+                    if record.metadata.phase == "scheduler-prelaunch"
+                    and record.metadata.round_number == 4
+                    and record.metadata.scheduler_phase == "primary"
+                    else record.metadata
+                ),
+                body=record.body,
+            )
+            for record in real_records(comments, flow=flow)
+        )
+
+    with patch.object(
+        plan_first_loop_module, "_extract_round_metadata_records",
+        side_effect=mark_round_four,
+    ):
+        rerun, error, _messages = _m1275_resume(
+            tmp_path, history, plan_primary_stall_rounds=4, plan_step_back_rounds=2,
+        )
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert "blocked 4 consecutive primary-phase" in str(error)
+    assert "already deferred at round 4" in str(error)
+    assert _m1103_agent_calls(rerun) == []
+
+
+def test_a_crash_after_the_deferred_review_resumes_into_the_step_back(tmp_path):
+    """`crash-after-deferred-review`: no duplicate review, no ordinary revision."""
+    history = _m1275_history(tmp_path)
+    claude, codex = _m1275_scripts()
+    # The first resume dies at the step-back planner turn, after round 5's review.
+    crashed, _error, _messages = _m1275_resume(
+        tmp_path, history, claude=[], codex=codex[:1], plan_primary_stall_rounds=4,
+    )
+    assert _m1103_agent_calls(crashed) == ["codex", "claude"]
+    assert _m1275_deferral_markers(crashed) == [5]
+
+    resumed, error, _messages = _m1275_resume(
+        tmp_path, list(crashed.issue_comments), claude=claude[:2], codex=codex[1:],
+        plan_primary_stall_rounds=4,
+    )
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert _m1103_agent_calls(resumed)[0] == "claude"
+    assert _STEP_BACK_MARKER in _m1251_prompts(resumed, "claude")[0]
+    assert _m1251_coder_record(resumed, 6).step_back_entries
+
+
+@pytest.mark.parametrize(
+    ("overrides", "degrade", "reason"),
+    [
+        ({"plan_step_back_rounds": 0}, False, "step-back disabled"),
+        ({}, True, "planning step-back history degraded"),
+        ({"plan_growth_gate": "off"}, False, "plan-growth gate is off"),
+    ],
+)
+def test_a_reached_stall_names_why_the_step_back_did_not_apply(
+    tmp_path, overrides, degrade, reason
+):
+    """`disabled-or-degraded` through the stall branch's call site."""
+    history = _m1275_history(tmp_path)
+    real_records = plan_first_loop_module._extract_round_metadata_records
+
+    def malformed(comments, *, flow):
+        return tuple(
+            PostedRoundRecord(
+                index=record.index,
+                metadata=(
+                    replace(record.metadata, step_back_status="invalid")
+                    if degrade and record.metadata.role == "coder"
+                    else record.metadata
+                ),
+                body=record.body,
+            )
+            for record in real_records(comments, flow=flow)
+        )
+
+    with patch.object(
+        plan_first_loop_module, "_extract_round_metadata_records", side_effect=malformed
+    ):
+        rerun, error, _messages = _m1275_resume(
+            tmp_path, history, plan_primary_stall_rounds=4, **overrides
+        )
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert "blocked 4 consecutive primary-phase" in str(error)
+    assert f"Plan step-back did not apply: {reason}" in str(error)
+    assert _m1103_agent_calls(rerun) == []
+    assert _m1275_deferral_markers(rerun) == []
 
 
 def test_resume_after_the_step_back_turn_issues_no_second_step_back_and_keeps_the_count(

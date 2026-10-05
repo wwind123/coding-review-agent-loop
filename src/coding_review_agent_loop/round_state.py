@@ -214,6 +214,9 @@ class PostedRoundMetadata:
     # are omitted from the serialized record when unset.
     scheduler_issue_digest: str | None = None
     scheduler_stall_reset: bool = False
+    # Planning-only, primary-phase marker (#1275): this round's round-start stall
+    # stop was deferred for a pending plan step-back.  Omitted when False.
+    scheduler_step_back_deferral: bool = False
     # The ``--plan-execution-mode`` a planning round ran under (#1268).  Written
     # on plan-flow planner and reviewer records, and on planning scheduler
     # checkpoints as ``scheduler_execution_mode``; both are omitted when None
@@ -1737,7 +1740,12 @@ _SCHEDULER_METADATA_KEYS = frozenset(
 # Planning-only optional checkpoint keys (#1112).  Deliberately outside the
 # shared auxiliary set and the serializer's presence test.
 _PLAN_ONLY_SCHEDULER_KEYS = frozenset(
-    {"scheduler_issue_digest", "scheduler_stall_reset", "scheduler_execution_mode"}
+    {
+        "scheduler_issue_digest",
+        "scheduler_stall_reset",
+        "scheduler_step_back_deferral",
+        "scheduler_execution_mode",
+    }
 )
 
 
@@ -1918,6 +1926,11 @@ def _decode_plan_scheduler_fields(payload: Mapping[str, object]) -> dict[str, ob
             if payload["scheduler_stall_reset"] is not True or phase != "primary":
                 raise ValueError("invalid scheduler stall reset marker")
             stall_reset = True
+        step_back_deferral = False
+        if "scheduler_step_back_deferral" in payload:
+            if payload["scheduler_step_back_deferral"] is not True or phase != "primary":
+                raise ValueError("invalid scheduler step-back deferral marker")
+            step_back_deferral = True
     except (AgentLoopError, TypeError, ValueError, KeyError):
         return {"scheduler_metadata_status": "invalid"}
     return {
@@ -1926,6 +1939,7 @@ def _decode_plan_scheduler_fields(payload: Mapping[str, object]) -> dict[str, ob
             payload.get("scheduler_execution_mode")
         ),
         "scheduler_stall_reset": stall_reset,
+        "scheduler_step_back_deferral": step_back_deferral,
         "scheduler_contract": contract.as_dict(),
         "scheduler_obligation_digest": digest,
         "scheduler_phase": phase,
@@ -2353,6 +2367,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["scheduler_issue_digest"] = metadata.scheduler_issue_digest
     if metadata.scheduler_stall_reset:
         payload["scheduler_stall_reset"] = True
+    if metadata.scheduler_step_back_deferral:
+        payload["scheduler_step_back_deferral"] = True
     if metadata.scheduler_execution_mode is not None:
         payload["scheduler_execution_mode"] = metadata.scheduler_execution_mode
     if metadata.plan_execution_mode is not None:

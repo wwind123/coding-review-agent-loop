@@ -15,13 +15,21 @@ from coding_review_agent_loop.review_step_back import (
     CLASS_NEW_FINDING,
     CLASS_OTHER,
     CLASS_REPEAT_ONLY,
+    DISPOSITION_DEFER_EPISODE,
+    DISPOSITION_DEFER_PENDING,
+    DISPOSITION_ESCALATED,
+    DISPOSITION_NOT_APPLICABLE,
     PlanStepBackContext,
+    PrimaryReview,
+    StepBackEntry,
+    StepBackState,
     classify_review,
     derive_plan_step_back_state,
     effective_new_items,
     entry_payload_for_plan,
     mandatory_plan_findings_since,
     plan_growth_crossing_round,
+    plan_stall_step_back_disposition,
     plan_step_back_candidate_rounds,
     render_plan_step_back_guidance,
     render_step_back_human_decision,
@@ -67,7 +75,9 @@ def _review(index, round_number, *, state="blocking", items=(), agent=PRIMARY):
     )
 
 
-def _checkpoint(index, round_number, *, digest=None, reset=False, phase="primary"):
+def _checkpoint(
+    index, round_number, *, digest=None, reset=False, phase="primary", deferral=False
+):
     return PostedRoundRecord(
         index=index,
         metadata=PostedRoundMetadata(
@@ -81,6 +91,7 @@ def _checkpoint(index, round_number, *, digest=None, reset=False, phase="primary
             scheduler_phase=phase,
             scheduler_issue_digest=digest,
             scheduler_stall_reset=reset,
+            scheduler_step_back_deferral=deferral,
         ),
         body="",
     )
@@ -1672,3 +1683,146 @@ def test_pr_reconciliation_member_item_keeps_the_episode_open_until_resolved():
         _pr_recon(71, 5, HEAD_B, []),
     )
     assert closed.entry is None
+
+
+# --- stall-stop disposition (#1275) -----------------------------------------
+
+
+def _state(*, rounds=(3, 4), episode_round=None, escalation=0, deferrals=(), degraded=False):
+    reviews = tuple(PrimaryReview(n, n, CLASS_NEW_FINDING) for n in rounds)
+    episode = (
+        StepBackEntry("plan", PRIMARY, episode_round - 1, episode_round, 0)
+        if episode_round is not None
+        else None
+    )
+    return StepBackState(
+        degraded=degraded,
+        reviews=reviews,
+        episode=episode,
+        escalation_count=escalation,
+        deferral_rounds=tuple(deferrals),
+    )
+
+
+def _disposition(state, **overrides):
+    values = {
+        "round_number": 5,
+        "crossing_round": 3,
+        "growth_gate_enforced": True,
+        "step_back_rounds": 2,
+        "escalation_rounds": 3,
+    }
+    values.update(overrides)
+    return plan_stall_step_back_disposition(state, **values)
+
+
+@pytest.mark.parametrize(
+    ("state", "overrides", "kind", "needle"),
+    [
+        (_state(), {"step_back_rounds": 0}, DISPOSITION_NOT_APPLICABLE, "step-back disabled"),
+        (None, {}, DISPOSITION_NOT_APPLICABLE, "history degraded"),
+        (_state(degraded=True), {}, DISPOSITION_NOT_APPLICABLE, "history degraded"),
+        (_state(episode_round=5, escalation=3), {}, DISPOSITION_ESCALATED, "3/3"),
+        (_state(episode_round=5, escalation=1), {}, DISPOSITION_DEFER_EPISODE, "1/3"),
+        (_state(), {"growth_gate_enforced": False}, DISPOSITION_NOT_APPLICABLE, "gate is off"),
+        (_state(), {"crossing_round": None}, DISPOSITION_NOT_APPLICABLE, "crosses no plan-growth"),
+        (_state(deferrals=(4,)), {}, DISPOSITION_NOT_APPLICABLE, "already deferred at round 4"),
+        (_state(rounds=(4,)), {}, DISPOSITION_NOT_APPLICABLE, "only 1 new-finding"),
+        (_state(), {}, DISPOSITION_DEFER_PENDING, "2 new-finding"),
+        (_state(rounds=(3, 4, 5, 6, 7, 8)), {"round_number": 9}, DISPOSITION_DEFER_PENDING, "6 new-finding"),
+    ],
+)
+def test_stall_disposition_precedence(state, overrides, kind, needle):
+    result = _disposition(state, **overrides)
+    assert result.kind == kind
+    assert needle in result.reason
+
+
+def test_stall_disposition_reasons_are_distinct_and_deferrals_before_the_crossing_are_ignored():
+    reasons = {
+        _disposition(_state(), step_back_rounds=0).reason,
+        _disposition(None).reason,
+        _disposition(_state(), growth_gate_enforced=False).reason,
+        _disposition(_state(), crossing_round=None).reason,
+        _disposition(_state(deferrals=(4,))).reason,
+        _disposition(_state(rounds=(4,))).reason,
+    }
+    assert len(reasons) == 6 and all(reasons)
+    # A deferral before the crossing, or at the current round, is not a spent one.
+    assert _disposition(_state(deferrals=(2,))).kind == DISPOSITION_DEFER_PENDING
+    assert _disposition(_state(deferrals=(5,))).kind == DISPOSITION_DEFER_PENDING
+
+
+def test_streak_before_ignores_reviews_at_or_after_the_round():
+    state = _state(rounds=(3, 4, 5))
+    assert state.streak_since(3) == 3
+    assert state.streak_before(3, 5) == 2
+    assert state.streak_before(3, 4) == 1
+    assert state.streak_before(3, 3) == 0
+    assert state.streak_before(4, 6) == 2
+
+
+def test_deferral_rounds_follow_the_same_retirement_rules():
+    base = [_checkpoint(0, 3, digest=DIGEST), _review(1, 3, items=[_new(3)])]
+
+    def derive(records, **kwargs):
+        return derive_plan_step_back_state(records, primary=PRIMARY, **kwargs)
+
+    marked = [*base, _checkpoint(2, 4, digest=DIGEST, deferral=True)]
+    assert derive(marked).deferral_rounds == (4,)
+    # Operator reset retires rounds before the reset checkpoint's round.
+    reset = [*marked, _checkpoint(3, 5, digest=DIGEST, reset=True)]
+    assert derive(reset).deferral_rounds == ()
+    kept = [*marked, _checkpoint(3, 4, digest=DIGEST, reset=True)]
+    assert derive(kept).deferral_rounds == (4,)
+    # An issue edit retires the mismatching deferral and everything before it.
+    assert derive(marked, current_issue_digest="f" * 16).deferral_rounds == ()
+    assert derive(marked, current_issue_digest=DIGEST).deferral_rounds == (4,)
+    # A panel opening ends the primary phase.
+    assert derive(marked, panel_opening_index=2).deferral_rounds == ()
+    assert derive(marked, panel_opening_index=3).deferral_rounds == (4,)
+    # A phase advance (boundary) retires everything before it.
+    advance = PostedRoundRecord(
+        index=3,
+        metadata=PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", round_number=4,
+            subject="plan", phase="plan-phase-advance",
+        ),
+        body="",
+    )
+    assert derive([*marked, advance]).deferral_rounds == ()
+    # A non-primary phase checkpoint never counts.
+    other = [*base, _checkpoint(2, 4, digest=DIGEST, deferral=True, phase="secondary-audit")]
+    assert derive(other).deferral_rounds == ()
+
+
+def test_deferral_retired_by_an_intervening_unmarked_digest_boundary():
+    """A -> B -> A: a round-4 deferral under A is retired by the unmarked B checkpoint."""
+    other = "f" * 16
+    records = [
+        _checkpoint(0, 3, digest=DIGEST),
+        _review(1, 3, items=[_new(3)]),
+        _checkpoint(2, 4, digest=DIGEST, deferral=True),
+        _review(3, 4, items=[_new(4)]),
+        _checkpoint(4, 5, digest=other),
+        _review(5, 5, items=[_new(5)]),
+        _checkpoint(6, 6, digest=DIGEST),
+        _review(7, 6, items=[_new(6)]),
+        _checkpoint(8, 7, digest=DIGEST),
+        _review(9, 7, items=[_new(7)]),
+    ]
+    state = derive_plan_step_back_state(
+        records, primary=PRIMARY, current_issue_digest=DIGEST
+    )
+    assert state.deferral_rounds == ()
+    result = plan_stall_step_back_disposition(
+        state, round_number=8, crossing_round=6, growth_gate_enforced=True,
+        step_back_rounds=2, escalation_rounds=3,
+    )
+    assert result.kind == DISPOSITION_DEFER_PENDING
+    # Without the edit in between, the same deferral still counts.
+    kept = derive_plan_step_back_state(
+        [r for r in records if r.index not in (4, 5)],
+        primary=PRIMARY, current_issue_digest=DIGEST,
+    )
+    assert kept.deferral_rounds == (4,)
