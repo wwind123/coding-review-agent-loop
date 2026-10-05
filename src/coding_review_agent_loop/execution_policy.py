@@ -13,7 +13,7 @@ import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from .agents.registry import agent_display_name, get_backend
-from .config import AgentLoopConfig, reviewers
+from .config import AgentLoopConfig, phased_delivery_guard_active, reviewers
 from .decomposition import (
     _decode_json_payload,
     EXECUTION_DECISION_MARKER_RE,
@@ -2250,3 +2250,27 @@ def _resolved_stage_ids(
         stage_id = getattr(item.phase, "stage_id", None)
         resolved.append(stage_id or str(getattr(item.phase, "position", None) or index))
     return tuple(resolved)
+
+
+def staged_plan_mode_conflict_message(mode: str) -> str:
+    """Operator diagnostic for a staged plan under a guard-active mode (#1268)."""
+    if mode == "plan-only":
+        remedy = (
+            f"staged plan under plan-only: approval in this mode creates no tracked child "
+            "issues, so the phased-delivery guard cannot be satisfied. Rerun with "
+            "--plan-execution-mode decompose-only (creates tracked stage issues, implements "
+            "nothing, keeps review before implementation) or implement-by-phase; or rerun "
+            "with --plan-narrow-staged to have the planner narrow the plan to one "
+            "deliverable."
+        )
+    else:
+        remedy = (
+            f"staged plan under {mode}: this mode implements one PR and cannot deliver a "
+            "staged plan. Rerun with --plan-execution-mode implement-by-phase, "
+            "decompose-only, or auto; or rerun with --plan-narrow-staged to have the "
+            "planner narrow the plan to one deliverable."
+        )
+    return (
+        f"{remedy} No reviewer turn and no planner revision turn was invoked for this "
+        "candidate."
+    )

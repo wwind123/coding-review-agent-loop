@@ -1091,7 +1091,23 @@ def build_parser() -> argparse.ArgumentParser:
             "issue per phase; do not also pass --materialize-split-issues for the "
             "same run. auto cannot be combined with --materialize-split-issues "
             "or --split-stage because the topology is unknown before approval. "
+            "decompose-only, not plan-only, is the review-before-implementation mode "
+            "for work that may be staged: plan-only cannot satisfy the phased-delivery "
+            "guard for a staged plan and stops for a human decision. "
             "See docs/local_agent_loop.md#phased-decomposition-versus-split-materialization."
+        ),
+    )
+    issue.add_argument(
+        "--plan-narrow-staged",
+        dest="plan_narrow_staged",
+        action="store_true",
+        help=(
+            "With --plan-first and a mode that applies the phased-delivery guard "
+            "(plan-only or implement-one-shot): when the candidate plan is staged, make "
+            "the next planner revision narrow it to one deliverable instead of stopping "
+            "for a human decision. Independent remaining scope goes in the typed "
+            "deferred_work category, which is recorded only and never materialized. "
+            "Delivered once per invocation; a still-staged revision stops."
         ),
     )
     issue.add_argument(
@@ -2073,6 +2089,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError("--implement-after-approval requires --plan-first.")
             if args.plan_execution_mode and not args.plan_first:
                 raise AgentLoopError("--plan-execution-mode requires --plan-first.")
+            if getattr(args, "plan_narrow_staged", False) and not args.plan_first:
+                raise AgentLoopError("--plan-narrow-staged requires --plan-first.")
             if implementation_override_requested and not args.plan_first:
                 raise AgentLoopError("--implementation-coder options require --plan-first.")
             plan_execution_mode = args.plan_execution_mode

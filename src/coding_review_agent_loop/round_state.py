@@ -214,6 +214,12 @@ class PostedRoundMetadata:
     # are omitted from the serialized record when unset.
     scheduler_issue_digest: str | None = None
     scheduler_stall_reset: bool = False
+    # The ``--plan-execution-mode`` a planning round ran under (#1268).  Written
+    # on plan-flow planner and reviewer records, and on planning scheduler
+    # checkpoints as ``scheduler_execution_mode``; both are omitted when None
+    # so legacy records stay byte-stable, and an unknown value decodes to None.
+    plan_execution_mode: str | None = None
+    scheduler_execution_mode: str | None = None
     # This is an in-memory decode-quality signal, deliberately not serialized.
     # ``absent`` is the legacy-compatible state; ``invalid`` means scheduler
     # fields were present but could not be reconstructed safely.
@@ -1731,8 +1737,15 @@ _SCHEDULER_METADATA_KEYS = frozenset(
 # Planning-only optional checkpoint keys (#1112).  Deliberately outside the
 # shared auxiliary set and the serializer's presence test.
 _PLAN_ONLY_SCHEDULER_KEYS = frozenset(
-    {"scheduler_issue_digest", "scheduler_stall_reset"}
+    {"scheduler_issue_digest", "scheduler_stall_reset", "scheduler_execution_mode"}
 )
+
+
+def _decode_execution_mode(value: object) -> str | None:
+    """Tolerant decode: anything but a known execution mode is None (#1268)."""
+    from .config import PLAN_EXECUTION_MODES
+
+    return value if isinstance(value, str) and value in PLAN_EXECUTION_MODES else None
 
 _SCHEDULER_AUXILIARY_KEYS = frozenset(
     {
@@ -1909,6 +1922,9 @@ def _decode_plan_scheduler_fields(payload: Mapping[str, object]) -> dict[str, ob
         return {"scheduler_metadata_status": "invalid"}
     return {
         "scheduler_issue_digest": issue_digest,
+        "scheduler_execution_mode": _decode_execution_mode(
+            payload.get("scheduler_execution_mode")
+        ),
         "scheduler_stall_reset": stall_reset,
         "scheduler_contract": contract.as_dict(),
         "scheduler_obligation_digest": digest,
@@ -2337,6 +2353,10 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["scheduler_issue_digest"] = metadata.scheduler_issue_digest
     if metadata.scheduler_stall_reset:
         payload["scheduler_stall_reset"] = True
+    if metadata.scheduler_execution_mode is not None:
+        payload["scheduler_execution_mode"] = metadata.scheduler_execution_mode
+    if metadata.plan_execution_mode is not None:
+        payload["plan_execution_mode"] = metadata.plan_execution_mode
     if metadata.plan_supersession_digest is not None:
         payload["plan_supersession_digest"] = metadata.plan_supersession_digest
         payload["plan_supersession_superseded_hash"] = (
@@ -2808,6 +2828,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 payload, "reviewer_board_amendment_digest"
             ),
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
+            plan_execution_mode=_decode_execution_mode(payload.get("plan_execution_mode")),
             **_decode_step_back_fields(payload),
             **_decode_evidence_fields(payload),
             **_decode_matrix_evidence_full_round(payload),
@@ -2815,6 +2836,18 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
         )
     except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise AgentLoopError(f"Invalid AGENT_LOOP_META payload: {exc}") from exc
+
+
+def prior_plan_execution_mode(records: Sequence[PostedRoundRecord]) -> str | None:
+    """The mode on the newest plan-flow record that recorded one (#1268)."""
+    for record in reversed(tuple(records)):
+        metadata = record.metadata
+        if metadata.flow != "plan":
+            continue
+        mode = metadata.plan_execution_mode or metadata.scheduler_execution_mode
+        if mode is not None:
+            return mode
+    return None
 
 
 def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:

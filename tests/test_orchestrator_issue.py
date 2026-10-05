@@ -16407,3 +16407,398 @@ def test_obsolete_same_round_checkpoint_does_not_discard_a_fresh_review(tmp_path
     ]
     # The old-issue checkpoint plus the fresh one published on resume.
     assert len(checkpoints) == 2
+
+
+# --- Staged plan under a guard-active execution mode (#1268) -----------------
+
+
+def _m1268_staged_raw():
+    return _fresh_staged_plan_for_recovery()[0]
+
+
+def _m1268_base():
+    return AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(_m1268_staged_raw(), require_execution_strategy_contract=1),
+        round_number=1,
+    )
+
+
+def _m1268_narrowing_patch(base, *, round_number=1, dispositions=(), deferred=True):
+    """A semantic patch narrowing the staged candidate to one deliverable."""
+    one_shot = json.loads(structured_v1_plan_state().split("\n<!--")[0])[
+        "execution_recommendation"
+    ]
+    operations = [{"op": "replace", "field": "execution_recommendation", "value": one_shot}]
+    if deferred:
+        operations.append(
+            {
+                "op": "replace",
+                "field": "deferred_work",
+                "value": [
+                    {
+                        "title": "Stage B follow-up",
+                        "summary": "Independent remainder, filed manually.",
+                    }
+                ],
+            }
+        )
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Narrow to one deliverable.",
+        "prior_plan_item_dispositions": list(dispositions),
+        "base_round_number": round_number,
+        "base_state_identity": base.state_identity,
+        "operations": operations,
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _m1268_prompts(runner, agent):
+    return [cmd[-1] for cmd, _cwd in runner.commands if cmd[0] == agent]
+
+
+@pytest.mark.parametrize("policy", ["all-reviewers", "primary-then-panel"])
+def test_staged_plan_under_plan_only_stops_on_round_one(tmp_path, policy):
+    """`plan-only-staged-fresh`: no reviewer, revision, or checkpoint turn."""
+    runner = _FakeRunner(claude_outputs=[_m1268_staged_raw()])
+    config = (
+        _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=8)
+        if policy == "primary-then-panel"
+        else make_config(tmp_path, reviewer=("codex", "gemini"))
+    )
+
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    message = str(excinfo.value)
+    assert "staged plan under plan-only" in message
+    assert "decompose-only" in message
+    assert "--plan-narrow-staged" in message
+    assert _m1103_agent_calls(runner) == ["claude"]
+    assert not [r for r in _plan_round_records(runner) if r.role == "reviewer"]
+    assert not [r for r in _plan_round_records(runner) if r.phase == "scheduler-prelaunch"]
+
+
+def test_staged_plan_under_implement_one_shot_stops_with_the_phase_remedies(tmp_path):
+    """`one-shot-mode-staged`."""
+    runner = _FakeRunner(claude_outputs=[_m1268_staged_raw()])
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), plan_execution_mode="implement-one-shot"
+    )
+
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert "implement-by-phase" in str(excinfo.value)
+    assert "auto" in str(excinfo.value)
+    assert _m1103_agent_calls(runner) == ["claude"]
+
+
+@pytest.mark.parametrize("mode", ["decompose-only", "implement-by-phase", "auto"])
+@pytest.mark.parametrize("policy", ["all-reviewers", "primary-then-panel"])
+def test_staged_plan_under_phase_modes_is_not_stopped(tmp_path, mode, policy):
+    """`phase-modes-staged`: reviews proceed."""
+    runner = _FakeRunner(
+        claude_outputs=[_m1268_staged_raw()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    values = {"plan_execution_mode": mode}
+    config = (
+        _staged_plan_config(tmp_path, **values)
+        if policy == "primary-then-panel"
+        else make_config(tmp_path, reviewer=("codex", "gemini"), **values)
+    )
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except orchestrator_module.PlanPrePanelSafetyError:
+        pytest.fail("staged plans must not stop under a phase mode")
+    except Exception:  # noqa: BLE001 - decomposition itself is out of scope here
+        pass
+    assert "codex" in _m1103_agent_calls(runner)
+
+
+def test_one_shot_plan_under_plan_only_is_unaffected(tmp_path):
+    """`plan-only-one-shot`."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+
+def test_narrow_staged_flag_is_validated(tmp_path):
+    """`narrow-flag-validation`."""
+    with pytest.raises(AgentLoopError, match="--plan-narrow-staged"):
+        make_config(tmp_path, plan_narrow_staged=True, plan_execution_mode="decompose-only")
+    make_config(tmp_path, plan_narrow_staged=True, plan_execution_mode="plan-only")
+    make_config(tmp_path, plan_narrow_staged=True, plan_execution_mode="implement-one-shot")
+    assert main_exit_for(["issue", "56", "--repo", "OWNER/REPO", "--plan-narrow-staged"]) == 1
+
+
+def main_exit_for(argv):
+    from coding_review_agent_loop.cli import main
+
+    return main(argv)
+
+
+def test_narrow_staged_blocking_primary_reaches_a_directive_revision_then_stops(tmp_path):
+    """`narrow-staged-flag`: blocking primary; the still-staged revision stops."""
+    base = _m1268_base()
+    still_staged = _m1103_blocking_chain(1, 1, base=base)[1][0]
+    runner = _FakeRunner(
+        claude_outputs=[_m1268_staged_raw(), still_staged],
+        codex_outputs=[
+            structured_plan_review(
+                state="blocking", summary="Gap.", blocking_plan_issues=["Close the gap."]
+            )
+        ],
+    )
+    config = _staged_plan_config(
+        tmp_path, max_rounds=8, plan_primary_stall_rounds=1, plan_narrow_staged=True
+    )
+
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="staged plan under"):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert _m1103_agent_calls(runner) == ["claude", "codex", "claude"]
+    revision_prompt = _m1268_prompts(runner, "claude")[1]
+    assert "Operator directive (orchestrator, not a reviewer finding)" in revision_prompt
+    assert "deferred_work" in revision_prompt
+    # The directive is not a reviewer item.
+    assert "[item-2]" not in revision_prompt
+
+
+def test_narrow_staged_approving_primary_is_not_approved_or_advanced(tmp_path):
+    """`narrow-staged-flag`: an approving primary neither approves nor opens the panel."""
+    base = _m1268_base()
+    runner = _FakeRunner(
+        claude_outputs=[_m1268_staged_raw(), _m1268_narrowing_patch(base)],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_plan_review(state="approved"),
+        ],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=8, plan_narrow_staged=True)
+
+    result = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    assert result == 0
+    calls = _m1103_agent_calls(runner)
+    # Round 1: primary approval does not advance to the panel; the planner
+    # narrows; the narrowed plan then gets a normal primary-then-panel review.
+    assert calls[:3] == ["claude", "codex", "claude"]
+    assert "Operator directive (orchestrator" in _m1268_prompts(runner, "claude")[1]
+    assert "Operator directive (orchestrator" not in "".join(_m1268_prompts(runner, "codex"))
+    prelaunch = [r for r in _plan_round_records(runner) if r.phase == "scheduler-prelaunch"]
+    assert prelaunch[0].scheduler_phase == "primary"
+    assert not [r for r in _plan_round_records(runner) if r.role == "reviewer" and r.agent == "Gemini" and r.round_number == 1]
+
+
+def test_narrow_staged_flat_board_does_not_approve_a_staged_candidate(tmp_path):
+    """`narrow-staged-flag`: an approving flat board still reaches the revision."""
+    base = _m1268_base()
+    runner = _FakeRunner(
+        claude_outputs=[_m1268_staged_raw(), _m1268_narrowing_patch(base)],
+        codex_outputs=[structured_plan_review(state="approved")] * 2,
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")] * 2,
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), plan_narrow_staged=True)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    claude_prompts = _m1268_prompts(runner, "claude")
+    assert len(claude_prompts) == 2
+    assert "Operator directive (orchestrator" in claude_prompts[1]
+
+
+def test_narrowed_plan_with_typed_deferred_work_reaches_the_plan_only_stop(tmp_path, capsys):
+    """`narrowed-deferred-reviewable`: deferred titles are recorded-only."""
+    base = _m1268_base()
+    runner = _FakeRunner(
+        claude_outputs=[_m1268_staged_raw(), _m1268_narrowing_patch(base)],
+        codex_outputs=[structured_plan_review(state="approved")] * 2,
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")] * 2,
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), plan_narrow_staged=True)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    out = capsys.readouterr().out
+    assert "Deferred work recorded only" in out
+    assert "Stage B follow-up" in out
+    assert "--materialize-split-issues" not in out
+    # Reviewers see the guard's typed-deferred_work rule.
+    assert "typed `deferred_work`" in "".join(_m1268_prompts(runner, "codex"))
+
+
+def _m1268_strip_modes(comments):
+    """Rewrite posted history as if it predated execution-mode recording."""
+    from coding_review_agent_loop.round_transport import encode_mapping
+
+    pattern = re.compile(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->")
+    stripped = []
+    for comment in comments:
+        def rewrite(match):
+            payload = decode_mapping(match.group("payload"))
+            payload.pop("plan_execution_mode", None)
+            payload.pop("scheduler_execution_mode", None)
+            return f"<!-- AGENT_LOOP_META: {encode_mapping(payload)} -->"
+
+        stripped.append({**comment, "body": pattern.sub(rewrite, comment["body"])})
+    return stripped
+
+
+def _m1268_stalled_history(tmp_path, *, strip_modes):
+    runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    history = list(runner.issue_comments)
+    return (_m1268_strip_modes(history) if strip_modes else history), config
+
+
+def _m1268_resumed_runner(history):
+    resolved = [{"item_id": "item-2", "disposition": "resolved"}]
+    return _FakeRunner(
+        issue_comments=list(history),
+        codex_outputs=[
+            structured_plan_review(state="approved", prior_plan_item_dispositions=resolved)
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="approved", reviewer="Google Gemini", prior_plan_item_dispositions=resolved
+            )
+        ],
+    )
+
+
+def test_round_metadata_records_the_execution_mode(tmp_path):
+    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    records = _plan_round_records(runner)
+    assert {r.plan_execution_mode for r in records if r.role in {"coder", "reviewer"}} == {
+        "plan-only"
+    }
+    assert {r.scheduler_execution_mode for r in records if r.phase == "scheduler-prelaunch"} == {
+        "plan-only"
+    }
+
+
+def test_resume_under_a_changed_mode_retires_the_stall_streak(tmp_path):
+    """`resume-mode-changed`: no stall stop; prompts carry the change notice."""
+    history, config = _m1268_stalled_history(tmp_path, strip_modes=False)
+    proceeding = _m1268_resumed_runner(history)
+
+    try:
+        run_issue_loop(
+            proceeding,
+            issue_number=56,
+            config=replace(config, plan_execution_mode="decompose-only"),
+            plan_first=True,
+        )
+    except orchestrator_module.PlanPrePanelSafetyError:
+        pytest.fail("a mode change must retire the stall streak")
+    except AgentLoopError:
+        pass
+
+    codex_prompts = _m1268_prompts(proceeding, "codex")
+    assert codex_prompts
+    assert "changed the execution mode from plan-only to decompose-only" in codex_prompts[0]
+    assert "--plan-execution-mode decompose-only" in codex_prompts[0]
+
+
+def test_resume_without_a_mode_change_still_stalls(tmp_path):
+    history, config = _m1268_stalled_history(tmp_path, strip_modes=False)
+    rerun = _FakeRunner(issue_comments=list(history))
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    assert _m1103_agent_calls(rerun) == []
+
+
+def test_resume_over_legacy_unrecorded_history_names_the_reset_flag(tmp_path):
+    """`resume-legacy-stalled`: no silent retirement; the flag recovers."""
+    history, config = _m1268_stalled_history(tmp_path, strip_modes=True)
+    changed = replace(config, plan_execution_mode="decompose-only")
+
+    rerun = _FakeRunner(issue_comments=list(history))
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+        run_issue_loop(rerun, issue_number=56, config=changed, plan_first=True)
+    assert "--plan-reset-stall-streak" in str(excinfo.value)
+    assert _m1103_agent_calls(rerun) == []
+
+    proceeding = _m1268_resumed_runner(history)
+    try:
+        run_issue_loop(
+            proceeding,
+            issue_number=56,
+            config=replace(changed, plan_reset_stall_streak=True),
+            plan_first=True,
+        )
+    except orchestrator_module.PlanPrePanelSafetyError:
+        pytest.fail("the reset flag must retire the legacy streak")
+    except AgentLoopError:
+        pass
+    codex_prompts = _m1268_prompts(proceeding, "codex")
+    assert codex_prompts
+    assert "did not record their execution mode" in codex_prompts[0]
+
+
+def test_narrow_staged_with_a_carried_primary_approval_schedules_no_panel(tmp_path):
+    """`narrow-carried-primary-approval`: the extended seam skips the panel."""
+    first = _FakeRunner(
+        claude_outputs=[_m1268_staged_raw()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    # Record a primary approval of the staged candidate under decompose-only
+    # (where it is allowed), then resume the same candidate under plan-only.
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(
+            first,
+            issue_number=56,
+            config=_staged_plan_config(
+                tmp_path, max_rounds=1, plan_execution_mode="decompose-only"
+            ),
+            plan_first=True,
+        )
+    history = list(first.issue_comments)
+    base = _m1268_base()
+    resumed = _FakeRunner(
+        issue_comments=history,
+        claude_outputs=[_m1268_narrowing_patch(base)],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=8, plan_narrow_staged=True)
+    try:
+        run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
+    except orchestrator_module.PlanPrePanelSafetyError:
+        pytest.fail("the narrowing obligation must reach a planner revision")
+    calls = _m1103_agent_calls(resumed)
+    assert calls[0] == "claude"
+    assert "Operator directive (orchestrator" in _m1268_prompts(resumed, "claude")[0]
+    # No secondary review precedes the revision.
+    assert "gemini" not in calls[: calls.index("claude") + 1]
+
+
+def test_streak_ends_at_an_execution_mode_mismatch_and_missing_modes_count():
+    """`streak-mode-boundary`."""
+    records = []
+    for number, mode in ((1, "plan-only"), (2, "plan-only"), (3, "decompose-only"), (4, None)):
+        checkpoint = _m1103_checkpoint(len(records), number)
+        records.append(
+            PostedRoundRecord(
+                index=checkpoint.index,
+                metadata=replace(checkpoint.metadata, scheduler_execution_mode=mode),
+                body="",
+            )
+        )
+        records.append(_m1103_review(len(records), number, "blocking"))
+    detail = orchestrator_module.plan_primary_blocking_streak_detail
+    # Newest first: round 4 (no mode) counts, round 3 matches, round 2 ends it.
+    assert detail(records, primary="Codex", current_execution_mode="decompose-only").count == 2
+    assert detail(records, primary="Codex", current_execution_mode="plan-only").count == 1
+    # No current mode: nothing can mismatch.
+    assert detail(records, primary="Codex").count == 4

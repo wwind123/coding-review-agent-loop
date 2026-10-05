@@ -5359,3 +5359,80 @@ def test_sweep_output_over_twelve_instances_must_be_split_into_bounded_findings(
     )
     assert split.sub_item_degradations == ()
     assert len(split.blocking_items[0].sub_items) == 12
+
+
+# --- Execution-mode fact and guard semantics (#1268) -------------------------
+
+
+def _mode_fact_prompts(config, **kwargs):
+    issue_context = None
+    review_kwargs = dict(reviewer="codex", **kwargs)
+    return {
+        "issue-plan": build_issue_plan_prompt(56, config, **kwargs),
+        "review-full": build_plan_review_prompt(56, 2, "Plan.", config, **review_kwargs),
+        "review-compact": build_plan_review_prompt(
+            56, 2, "Plan.", config, compact_context=True,
+            compact_prior=CompactPriorContext(()),
+            compact_tail=CompactPlanTailContext(subject="s", action="Review."),
+            **review_kwargs,
+        ),
+        "revision-full": build_plan_revision_prompt(56, 2, "Plan.", "Review.", config, **kwargs),
+        "revision-compact": build_plan_revision_prompt(
+            56, 2, "Plan.", "Review.", config, compact_context=True,
+            compact_prior=CompactPriorContext(()),
+            compact_tail=CompactPlanTailContext(subject="s", action="Revise."),
+            **kwargs,
+        ),
+        "revision-semantic": build_plan_revision_prompt(
+            56, 2, "Plan.", "Review.", config, response_form="semantic-patch-v1",
+            base_round_number=1, base_state_identity="a" * 64, **kwargs,
+        ),
+    }, issue_context
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["plan-only", "decompose-only", "implement-one-shot", "implement-by-phase", "auto"],
+)
+def test_execution_mode_fact_appears_in_every_plan_prompt_branch(tmp_path, mode):
+    """`mode-fact-prompts`."""
+    config = make_config(tmp_path, plan_execution_mode=mode)
+    prompts, _ = _mode_fact_prompts(config)
+    for branch, prompt in prompts.items():
+        assert "Execution mode (authoritative runtime fact)" in prompt, branch
+        assert f"--plan-execution-mode {mode}" in prompt, branch
+        assert "changed the execution mode" not in prompt, branch
+        assert "did not record their execution mode" not in prompt, branch
+
+
+def test_execution_mode_change_notice_and_legacy_wording(tmp_path):
+    config = make_config(tmp_path, plan_execution_mode="decompose-only")
+    for branch, prompt in _mode_fact_prompts(
+        config, prior_execution_mode="plan-only", execution_mode_history_present=True
+    )[0].items():
+        assert "changed the execution mode from plan-only to decompose-only" in prompt, branch
+    for branch, prompt in _mode_fact_prompts(
+        config, prior_execution_mode="decompose-only", execution_mode_history_present=True
+    )[0].items():
+        assert "changed the execution mode" not in prompt, branch
+    for branch, prompt in _mode_fact_prompts(
+        config, execution_mode_history_present=True
+    )[0].items():
+        assert "did not record their execution mode" in prompt, branch
+        assert "changed the execution mode" not in prompt, branch
+
+
+def test_phased_guard_names_decompose_only_and_the_typed_deferred_work_rule(tmp_path):
+    guard = _phased_plan_guard(make_config(tmp_path, plan_execution_mode="plan-only"))
+    assert "--plan-execution-mode decompose-only" in guard
+    assert "implement-by-phase" in guard
+    assert "typed `deferred_work`" in guard
+    assert "depends on deferred work" in guard
+
+
+def test_phased_delivery_guard_predicate_agrees_with_the_prompt_guard(tmp_path):
+    from coding_review_agent_loop.config import PLAN_EXECUTION_MODES, phased_delivery_guard_active
+
+    for mode in sorted(PLAN_EXECUTION_MODES):
+        guard = _phased_plan_guard(make_config(tmp_path, plan_execution_mode=mode))
+        assert phased_delivery_guard_active(mode) == bool(guard), mode

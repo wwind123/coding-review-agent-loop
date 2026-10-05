@@ -138,7 +138,9 @@ from .followups import (
     _publish_plan_approved_followups,
     FollowupSourceContext,
 )
+from .config import phased_delivery_guard_active
 from .round_state import (
+    prior_plan_execution_mode,
     ApprovedPlanContext,
     PostedRoundMetadata,
     PostedRoundRecord,
@@ -286,6 +288,7 @@ from .execution_policy import (
     _plan_first_line,
     _current_execution_recommendation,
     _resolve_execution_policy,
+    staged_plan_mode_conflict_message,
     ChildExecutionRoute,
     resolve_child_execution_route,
     _fresh_phase_marker_payload,
@@ -714,6 +717,24 @@ def _dispatch_current_decomposition_phase(
         coder_session_id=coder_session_id,
         existing_handoff=handoff,
     )
+
+
+def _typed_deferred_work_titles(sidecar: object | None) -> tuple[str, ...]:
+    """Titles of the typed ``deferred_work`` in the canonical plan, best effort (#1268)."""
+    canonical = getattr(sidecar, "canonical_json", None)
+    if not isinstance(canonical, dict):
+        return ()
+    typed = canonical.get("typed_stages")
+    for container in (canonical, typed if isinstance(typed, dict) else {}):
+        items = container.get("deferred_work")
+        if isinstance(items, list):
+            titles = tuple(
+                str(item["title"]) for item in items
+                if isinstance(item, dict) and isinstance(item.get("title"), str)
+            )
+            if titles:
+                return titles
+    return ()
 
 
 def _run_plan_first_loop(
@@ -1404,6 +1425,7 @@ def _run_plan_first_loop(
             plan_round_metadata = PostedRoundMetadata(
                     flow="plan",
                     role="coder",
+                    plan_execution_mode=config.plan_execution_mode,
                     agent=coder_name,
                     round_number=1,
                     subject=_plan_subject(current_plan),
@@ -1569,6 +1591,22 @@ def _run_plan_first_loop(
             require_risk_test_matrix_contract=require_fresh_matrix_contract,
         )
 
+    narrow_directive_delivered = False
+    try:
+        mode_history_records = _extract_round_metadata_records(
+            issue_context.comments, flow="plan"
+        )
+    except AgentLoopError:
+        mode_history_records = ()
+    prior_execution_mode = prior_plan_execution_mode(mode_history_records)
+    execution_mode_history_present = bool(mode_history_records)
+    if prior_execution_mode is not None and prior_execution_mode != config.plan_execution_mode:
+        log(
+            config,
+            f"Planning: execution mode changed from {prior_execution_mode} to "
+            f"{config.plan_execution_mode} since the last recorded round",
+        )
+
     for round_number in range(start_round_number, config.max_rounds + 1):
         current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
         prior_unresolved_items = current_resume.prior_items if current_resume is not None else tuple(unresolved_items)
@@ -1730,12 +1768,37 @@ def _run_plan_first_loop(
             )
 
         round_reviewers = tuple(configured_reviewers)
+        # Staged candidate under a guard-active execution mode (#1268).  The
+        # phased-delivery guard can never be satisfied there, so stop for a
+        # human decision before any reviewer or revision turn (and before the
+        # growth seam and the scheduler block, so every review policy is
+        # covered) unless --plan-narrow-staged owns this round's revision.
+        staged_mode_revision = False
+        if phased_delivery_guard_active(config.plan_execution_mode):
+            try:
+                round_recommendation = _current_execution_recommendation(
+                    current_plan, issue_context.comments
+                )
+            except AgentLoopError:
+                round_recommendation = None
+            if round_recommendation is not None and round_recommendation.strategy == "staged":
+                if config.plan_narrow_staged and not narrow_directive_delivered:
+                    staged_mode_revision = True
+                else:
+                    stop_plan_pre_panel(
+                        staged_plan_mode_conflict_message(config.plan_execution_mode),
+                        round_number=round_number,
+                    )
         # Under primary-then-panel, a non-compliant candidate the primary has
         # already approved can never pass, so the panel is not scheduled on it:
         # this round invokes no reviewer and the gate below starts a planner
         # revision instead of a reviewer-only phase advance (#886).
         growth_skip_panel = False
-        if staged_planning and plan_growth_notice is not None and plan_primary_name is not None:
+        if (
+            staged_planning
+            and (plan_growth_notice is not None or staged_mode_revision)
+            and plan_primary_name is not None
+        ):
             plan_records = plan_history_records(refresh=True, round_number=round_number)
             growth_skip_panel = plan_primary_name in _carried_plan_approvals(
                 plan_records,
@@ -1753,8 +1816,13 @@ def _run_plan_first_loop(
             round_reviewers = ()
             log(
                 config,
-                f"Planning round {round_number}: the primary approved a candidate that fails "
-                "the plan-growth gate; no panel review is scheduled on it",
+                f"Planning round {round_number}: the primary approved a candidate that "
+                + (
+                    "must be narrowed (--plan-narrow-staged)"
+                    if staged_mode_revision and plan_growth_notice is None
+                    else "fails the plan-growth gate"
+                )
+                + "; no panel review is scheduled on it",
             )
         if staged_planning and not growth_skip_panel:
             assert plan_scheduler_contract is not None
@@ -1812,6 +1880,7 @@ def _run_plan_first_loop(
                 )
             if (
                 config.plan_step_back_rounds > 0
+                and not staged_mode_revision
                 and not plan_reset_round
                 and plan_primary_name is not None
                 and not plan_panel_evidence.opened
@@ -1845,6 +1914,7 @@ def _run_plan_first_loop(
                         stop_plan_pre_panel(step_back_stop, round_number=round_number)
             if (
                 config.plan_primary_stall_rounds > 0
+                and not staged_mode_revision
                 and not plan_reset_round
                 and plan_primary_name is not None
                 and not plan_panel_evidence.opened
@@ -1870,6 +1940,7 @@ def _run_plan_first_loop(
                         primary=plan_primary_name,
                         panel_opening_index=plan_panel_evidence.opening_index,
                         current_issue_digest=plan_issue_digest,
+                        current_execution_mode=config.plan_execution_mode,
                     )
                     if plan_primary_streak.count >= config.plan_primary_stall_rounds:
                         # Before the prelaunch checkpoint and every agent turn,
@@ -2014,6 +2085,7 @@ def _run_plan_first_loop(
                 scheduler_stall_reset=(
                     plan_reset_round and plan_scheduler_decision.phase == "primary"
                 ),
+                scheduler_execution_mode=config.plan_execution_mode,
                 **_architecture_metadata_fields(config),
             )
             post_issue_comment(
@@ -2199,6 +2271,8 @@ def _run_plan_first_loop(
                 plan_growth_notice=plan_growth_notice,
                 plan_growth_measurements=plan_growth_measurements,
                 step_back_review_notice=step_back_candidate_review,
+                prior_execution_mode=prior_execution_mode,
+                execution_mode_history_present=execution_mode_history_present,
             )
 
         plan_fatal_errors: list[tuple[str, AgentLoopError]] = []
@@ -2244,6 +2318,7 @@ def _run_plan_first_loop(
                     PostedRoundMetadata(
                         flow="plan", role="reviewer", agent=reviewer_name,
                         round_number=round_number, subject=_plan_subject(current_plan),
+                        plan_execution_mode=config.plan_execution_mode,
                         prior_items=prior_unresolved_items, dispositions=parsed.dispositions,
                         new_items=new_items, state=parsed.state,
                         # Staged planning only: a full-board planning run keeps
@@ -3043,6 +3118,27 @@ def _run_plan_first_loop(
                 )
             plan_phase_advance_pending = False
             growth_guard_revision = plan_growth_notice
+        # --plan-narrow-staged (#1268): an orchestrator-owned revision
+        # obligation, like the growth notice.  It blocks approval and any
+        # reviewer-only panel advance, and is delivered once per invocation.
+        narrow_revision: str | None = None
+        if staged_mode_revision:
+            narrow_revision = (
+                "Operator directive (orchestrator, not a reviewer finding): this "
+                f"invocation's execution mode is {config.plan_execution_mode} and cannot "
+                "deliver a staged plan. Revise to a one-shot plan whose single "
+                "deliverable is complete and useful on its own and fits one PR. Move "
+                "independent remaining scope into the typed `deferred_work` category; "
+                "that category is recorded only and is never materialized, so the "
+                "operator must file any follow-up issues for it manually."
+            )
+            if plan_phase_advance_pending:
+                log(
+                    config,
+                    f"Planning round {round_number}: skipping the reviewer-only plan phase "
+                    "advance; the staged candidate must be narrowed (--plan-narrow-staged)",
+                )
+            plan_phase_advance_pending = False
         # The outstanding phase, not the one that just ran: both the durable
         # phase-advance record and the round-budget diagnostic must name the
         # round that is still pending.
@@ -3135,6 +3231,14 @@ def _run_plan_first_loop(
                     f"the planning round budget ({config.max_rounds}) is exhausted. Raise "
                     "--max-rounds and rerun; re-planning continues the existing round "
                     "numbering."
+                )
+        elif narrow_revision is not None and growth_guard_revision is None:
+            if all_approved and not must_fix_items:
+                log(
+                    config,
+                    f"Planning round {round_number}: reviewers approved, but the staged plan "
+                    f"cannot be delivered under {config.plan_execution_mode}; starting a "
+                    "narrowing revision (--plan-narrow-staged)",
                 )
         elif growth_guard_revision is not None:
             log(
@@ -3440,6 +3544,12 @@ def _run_plan_first_loop(
                     f"Issue #{issue_number} plan approved by {format_agent_list(configured_reviewers)}."
                     + (f" {plan_amendment_note}" if plan_amendment_note else "")
                 )
+                deferred_titles = _typed_deferred_work_titles(current_plan_sidecar)
+                if deferred_titles:
+                    print(
+                        "Deferred work recorded only (not tracked or materialized; file "
+                        "follow-up issues manually): " + "; ".join(deferred_titles)
+                    )
                 return 0
 
             if mode in {"decompose-only", "implement-by-phase"}:
@@ -3774,6 +3884,7 @@ def _run_plan_first_loop(
             and not plan_phase_advance_pending
             and inherited_guard_revision is None
             and growth_guard_revision is None
+            and narrow_revision is None
             and not supersession_revision_pending
         ):
             if not step_back_history_intact:
@@ -3884,6 +3995,11 @@ def _run_plan_first_loop(
                 if combined_review
                 else growth_guard_revision
             )
+        if narrow_revision is not None:
+            combined_review = (
+                f"{combined_review}\n\n{narrow_revision}" if combined_review else narrow_revision
+            )
+            narrow_directive_delivered = True
         if supersession_revision_pending:
             # The signed authorization is the revision's instruction; the
             # planner must actually replace the plan, not return it (#985).
@@ -3988,6 +4104,8 @@ def _run_plan_first_loop(
                     base_state_identity=(semantic_base.state_identity if semantic_base is not None else None),
                     plan_growth_notice=plan_growth_notice,
                     step_back_context=step_back_context,
+                    prior_execution_mode=prior_execution_mode,
+                    execution_mode_history_present=execution_mode_history_present,
                 ),
                 session_id=coder_session_id,
                 marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
@@ -4241,6 +4359,7 @@ def _run_plan_first_loop(
             plan_round_metadata = PostedRoundMetadata(
                     flow="plan",
                     role="coder",
+                    plan_execution_mode=config.plan_execution_mode,
                     agent=coder_name,
                     round_number=round_number + 1,
                     subject=_plan_subject(current_plan),

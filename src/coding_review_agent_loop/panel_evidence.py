@@ -894,8 +894,14 @@ def plan_primary_blocking_streak_detail(
     primary: str,
     panel_opening_index: int | None = None,
     current_issue_digest: str | None = None,
+    current_execution_mode: str | None = None,
 ) -> PlanPrimaryStreak:
     """Consecutive completed blocking primary plan reviews (#1103).
+
+    A round whose checkpoint recorded a different execution mode than
+    ``current_execution_mode`` ends the streak before it counts, exactly like
+    an issue-digest mismatch: that review judged another execution contract
+    (#1268).  Rounds with no recorded mode count.
 
     Two further boundaries retire older rounds (#1112): a round whose
     checkpoint recorded a different issue digest than ``current_issue_digest``
@@ -989,6 +995,13 @@ def plan_primary_blocking_streak_detail(
             and recorded_digest != current_issue_digest
         ):
             break
+        recorded_mode = checkpoint.metadata.scheduler_execution_mode
+        if (
+            recorded_mode is not None
+            and current_execution_mode is not None
+            and recorded_mode != current_execution_mode
+        ):
+            break
         # An edit changes the current digest and ends the streak at the newest
         # digested round, so only the undigested *newest* counted rounds are
         # out of an edit's reach.
@@ -1029,7 +1042,9 @@ def plan_primary_stall_message(
         "--plan-review-force-full to authorize the complete plan board; or raise "
         "--plan-primary-stall-rounds (or pass 0 to disable this stop). Retiring the "
         "streak resumes with the primary review of the current candidate plan, which "
-        "the planner then revises against the narrowed issue." + legacy_note
+        "the planner then revises against the narrowed issue. If you changed "
+        "--plan-execution-mode since these rounds and they predate execution-mode "
+        "recording, rerun with --plan-reset-stall-streak to retire them." + legacy_note
     )
 
 

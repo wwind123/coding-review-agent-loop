@@ -1251,7 +1251,14 @@ convened automatically. Editing the issue title or body retires rounds reviewed
 against earlier text (a comment alone does not, and rounds recorded before
 issue-text tracking carry no digest, so an edit cannot retire them), and the one-shot
 `--plan-reset-stall-streak` durably retires the counted rounds; otherwise rerun
-with `--plan-review-force-full` or a higher threshold. `--plan-step-back-rounds K` (default 2, `0` disables) acts earlier on the "new edge
+with `--plan-review-force-full` or a higher threshold. A staged plan under `plan-only` or
+`implement-one-shot` can never satisfy the phased-delivery guard, so the run stops on the
+first such round for a human decision: use `--plan-execution-mode decompose-only` (the
+review-before-implementation mode for work that may be staged) or pass `--plan-narrow-staged`
+to have the planner narrow it to one deliverable once (independent remainder goes in the
+recorded-only typed `deferred_work`). Changing `--plan-execution-mode` on resume retires
+stall streaks recorded under the old mode; pre-change history needs
+`--plan-reset-stall-streak`. `--plan-step-back-rounds K` (default 2, `0` disables) acts earlier on the "new edge
 case every round" pattern: once the one-shot plan has crossed a plan-growth signal and
 the primary has blocked K consecutive rounds on new mandatory findings, the next planner
 turn must propose a materially simpler design (or a split, or under `implement-one-shot`

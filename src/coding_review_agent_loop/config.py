@@ -124,6 +124,17 @@ PLAN_EXECUTION_MODES: frozenset[str] = frozenset(
     {"plan-only", "decompose-only", "implement-one-shot", "implement-by-phase", "auto"}
 )
 
+
+
+def phased_delivery_guard_active(mode: str) -> bool:
+    """Whether the phased-delivery guard applies to ``mode`` (#1268).
+
+    Shared by the prompt guard, the deterministic staged-plan stop, and the
+    ``--plan-narrow-staged`` validation so they cannot drift.
+    """
+    return mode not in {"decompose-only", "implement-by-phase", "auto"}
+
+
 # Discuss-mode debater failure policy values (#475).
 DISCUSS_DEBATER_FAILURE_MODES: frozenset[str] = frozenset({"fail", "partial"})
 DISCUSS_RESULT_MODES: frozenset[str] = frozenset({"triage", "answer"})
@@ -221,6 +232,7 @@ class AgentLoopConfig:
     # primary-phase checkpoint is stamped as a durable streak boundary.  Never
     # inherited by child planning, isolated providers, or recovery commands.
     plan_reset_stall_streak: bool = False
+    plan_narrow_staged: bool = False
     # Plan-growth gate (#886): structural thresholds above which a one-shot
     # plan needs a reviewed justification or a staged restructure.
     plan_growth_gate: str = "enforce"
@@ -656,6 +668,12 @@ class AgentLoopConfig:
         if self.plan_reset_stall_streak and self.plan_review_policy != "primary-then-panel":
             raise AgentLoopError(
                 "--plan-reset-stall-streak requires --plan-review-policy primary-then-panel."
+            )
+        if self.plan_narrow_staged and not phased_delivery_guard_active(self.plan_execution_mode):
+            raise AgentLoopError(
+                "--plan-narrow-staged requires a --plan-execution-mode that applies the "
+                "phased-delivery guard (plan-only or implement-one-shot); "
+                f"'{self.plan_execution_mode}' already accepts staged plans."
             )
         stall_rounds = self.plan_primary_stall_rounds
         if (
@@ -2124,6 +2142,7 @@ def config_from_args(
             args, "pr_step_back_line_window", DEFAULT_PR_STEP_BACK_LINE_WINDOW
         ),
         plan_reset_stall_streak=bool(getattr(args, "plan_reset_stall_streak", False)),
+        plan_narrow_staged=bool(getattr(args, "plan_narrow_staged", False)),
         plan_growth_gate=getattr(args, "plan_growth_gate", None) or "enforce",
         plan_growth_max_chars=_arg_or_default(args, "plan_growth_max_chars", 120_000),
         plan_growth_max_revisions=_arg_or_default(args, "plan_growth_max_revisions", 6),
