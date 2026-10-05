@@ -415,3 +415,38 @@ def test_pr_round_reconciled_only_by_a_reconciliation_summary(phases, expected):
     ]
     resumed = _resume_pr_round(_comments(*records), head_sha="head", configured_reviewers=("codex",))
     assert resumed is not None and resumed.reconciled is expected
+
+
+def test_plan_execution_mode_fields_round_trip_and_are_omitted_when_absent():
+    from coding_review_agent_loop.round_state import prior_plan_execution_mode
+
+    base = dict(flow="plan", role="coder", agent="Claude", round_number=1, subject="s")
+    legacy = PostedRoundMetadata(**base)
+    assert "plan_execution_mode" not in decode_mapping(_encode_round_metadata(legacy))
+    assert _decode_round_metadata(_encode_round_metadata(legacy)).plan_execution_mode is None
+
+    recorded = PostedRoundMetadata(**base, plan_execution_mode="plan-only")
+    decoded = _decode_round_metadata(_encode_round_metadata(recorded))
+    assert decoded.plan_execution_mode == "plan-only"
+
+    payload = decode_mapping(_encode_round_metadata(recorded))
+    payload["plan_execution_mode"] = "not-a-mode"
+    assert _decode_round_metadata(encode_mapping(payload)).plan_execution_mode is None
+
+    from coding_review_agent_loop.round_state import PostedRoundRecord
+
+    records = [
+        PostedRoundRecord(index=0, metadata=recorded, body=""),
+        PostedRoundRecord(index=1, metadata=legacy, body=""),
+    ]
+    assert prior_plan_execution_mode(records) == "plan-only"
+    assert prior_plan_execution_mode([records[1]]) is None
+
+
+def test_planning_only_scheduler_mode_is_invalid_on_a_pr_flow_checkpoint():
+    assert "scheduler_execution_mode" not in decode_mapping(
+        _encode_round_metadata(_checkpoint())
+    )
+    payload = decode_mapping(_encode_round_metadata(_checkpoint()))
+    payload["scheduler_execution_mode"] = "plan-only"
+    assert _decode_round_metadata(encode_mapping(payload)).scheduler_metadata_status == "invalid"

@@ -1568,6 +1568,11 @@ agent-loop issue 56 --repo OWNER/REPO --plan-first --plan-execution-mode auto
 The modes are:
 
 - `plan-only`: post the approved plan summary and stop. This is the default.
+  It cannot satisfy the phased-delivery guard for a **staged** plan, because
+  approval creates no tracked child issues. For work that may be staged use
+  `decompose-only`, the review-before-implementation mode: it creates tracked
+  stage issues and implements nothing. See "Staged plans under plan-only and
+  implement-one-shot" below.
 - `decompose-only`: use typed `child_stages` directly when present; otherwise
   ask the coder to decompose the approved plan. Create one child issue per
   selected phase, post a parent summary, and stop. Typed stages are the
@@ -3320,6 +3325,40 @@ the decision rests on.
 
 ### Phased decomposition versus split materialization
 
+#### Staged plans under plan-only and implement-one-shot
+
+`plan-only` and `implement-one-shot` apply the phased-delivery guard: a plan that
+defers implementation to later PRs cannot be approved usefully, because neither
+mode creates tracked child issues. When the candidate plan carries a staged v1
+execution recommendation under either mode, the run therefore stops for a human
+decision at the start of the first such round, before any reviewer or planner
+revision turn, under every `--plan-review-policy`. The stop posts a plain
+diagnostic (no checkpoint, approval, or panel-opening record) naming the remedies:
+
+- rerun with `--plan-execution-mode decompose-only` (tracked stage issues, nothing
+  implemented, review still precedes implementation) or `implement-by-phase`
+  (`auto` also works under `implement-one-shot`'s diagnostic);
+- or rerun with `--plan-narrow-staged` (requires `--plan-first` and a guard-active
+  mode). The orchestrator then delivers a one-time narrowing directive to the
+  planner instead of stopping. It overrides approval and any reviewer-only panel
+  advance for that round, is not a reviewer finding, and is delivered once per
+  invocation; if the revision is still staged, the next round stops with the
+  diagnostic. Independent remaining scope goes in the typed `deferred_work`
+  category, which the guard accepts when the one-shot deliverable is complete
+  without it. `deferred_work` is **recorded only**: it is never materialized
+  (`--materialize-split-issues` does not file it), and the plan-only approval
+  output lists its titles so the operator can file follow-up issues manually.
+
+A plan with no v1 execution recommendation (a legacy plan) is never treated as
+staged. Every plan prompt (issue plan, review, and revision, including the compact
+and semantic-patch forms) states the current execution mode and what approval does
+as an authoritative runtime fact. Planning round records and scheduler checkpoints
+record the mode. Resuming under a different mode adds a "changed from X to Y" notice
+to the prompts and ends the primary stall streak at any checkpoint recorded under
+the other mode. Histories written before the mode was recorded carry none, so they
+are not retired automatically: rerun with `--plan-reset-stall-streak` after changing
+the mode.
+
 Decomposition modes and split materialization select one child-issue path.
 They share a parent-wide flat cap; decomposition modes reject the split flag
 before any write. Pick the row that matches your situation:
@@ -3330,7 +3369,8 @@ before any write. Pick the row that matches your situation:
 | Same plan, but implement the current phase now (rerun the parent to advance) | `--plan-execution-mode implement-by-phase` |
 | Approved plan you want implemented as a single PR, no phase breakdown | `--plan-execution-mode implement-one-shot` (or `--implement-after-approval`) |
 | Approved plan whose reviewed recommendation should choose the topology | `--plan-execution-mode auto` |
-| Plan review only, no implementation, no detailed child issues | `--plan-execution-mode plan-only` (the default) |
+| Review before implementation for work that may be staged | `--plan-execution-mode decompose-only` (not `plan-only`) |
+| Plan review only for a one-deliverable plan, no implementation, no detailed child issues | `--plan-execution-mode plan-only` (the default) |
 | Discuss `split` consensus, or plan-only deferred work with no detailed phase decomposition | `--materialize-split-issues` |
 
 **Do not combine `--materialize-split-issues` with `--plan-execution-mode

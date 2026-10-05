@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import re
 import shlex
@@ -20,7 +22,7 @@ from .architecture_context import (
     render_architecture_pair,
     render_architecture_snapshot,
 )
-from .config import AgentLoopConfig, reviewers
+from .config import AgentLoopConfig, phased_delivery_guard_active, reviewers
 from .decomposition import (
     INHERITED_SCENARIO_FIELDS,
     InheritedMatrixBinding,
@@ -2093,7 +2095,9 @@ def _compact_prior_ledger_block(compact_prior: CompactPriorContext | None) -> st
 
 
 def _phased_plan_guard(config: AgentLoopConfig) -> str:
-    if config.plan_execution_mode in {"decompose-only", "implement-by-phase", "auto"}:
+    # One shared predicate with the staged-plan stop and --plan-narrow-staged
+    # validation, so the prompt and the orchestrator cannot drift (#1268).
+    if not phased_delivery_guard_active(config.plan_execution_mode):
         return ""
     return (
         "Phased-delivery guard: if the plan defers any implementation to future PRs, "
@@ -2101,11 +2105,96 @@ def _phased_plan_guard(config: AgentLoopConfig) -> str:
         "\"phases X–Y deferred to future PRs\", or \"handled in a follow-up PR\" — "
         "return blocking and include a blocking issue instructing the coder to either "
         "(1) scope the plan down to a single deliverable that fits in one PR, or "
-        "(2) re-invoke with `--plan-execution-mode implement-by-phase` so phases are "
+        "(2) re-invoke with `--plan-execution-mode decompose-only` (tracked stage "
+        "issues are created, nothing is implemented, and review still precedes "
+        "implementation) or `--plan-execution-mode implement-by-phase` so phases are "
         "tracked as GitHub child issues created mechanically from structured JSON. "
         "A phased plan approved in this mode leaves later phases as untracked prose "
-        "with no mechanical follow-up.\n"
+        "with no mechanical follow-up. Do not block for independent scope the plan "
+        "records in the typed `deferred_work` category when the one-shot deliverable "
+        "is complete and useful without it: that category is recorded only and the "
+        "operator files any follow-up issues manually. Still block when the current "
+        "deliverable depends on deferred work (it is incomplete or unusable without a "
+        "future PR) or when deferral is stated only in prose such as step text or "
+        "plan actions.\n"
     )
+
+
+_EXECUTION_MODE_APPROVAL_EFFECTS = {
+    "plan-only": (
+        "approval stops after review: no child issues are created and nothing is "
+        "implemented"
+    ),
+    "decompose-only": (
+        "approval creates tracked child issues from the approved staged recommendation "
+        "and implements nothing"
+    ),
+    "implement-one-shot": "approval implements the plan as one pull request",
+    "implement-by-phase": (
+        "approval creates tracked child issues and dispatches the first phase"
+    ),
+    "auto": (
+        "approval resolves one-shot or by-phase delivery from the approved "
+        "recommendation"
+    ),
+}
+
+
+def _execution_mode_fact(
+    config: AgentLoopConfig,
+    prior_mode: str | None = None,
+    history_present: bool = False,
+) -> str:
+    """Authoritative runtime fact about the current execution mode (#1268)."""
+    mode = config.plan_execution_mode
+    lines = [
+        "Execution mode (authoritative runtime fact)",
+        f"This invocation runs with --plan-execution-mode {mode}: "
+        f"{_EXECUTION_MODE_APPROVAL_EFFECTS.get(mode, 'approval routes by this mode')}.",
+    ]
+    if mode in {"decompose-only", "implement-by-phase", "auto"}:
+        lines.append(
+            "A staged v1 recommendation is materialized as tracked child issues by "
+            "this invocation, so staged delivery is satisfied in this mode."
+        )
+    if prior_mode is not None and prior_mode != mode:
+        lines.append(
+            f"The operator changed the execution mode from {prior_mode} to {mode} "
+            "since earlier rounds. Re-evaluate carried findings that are premised on "
+            "the previous mode against the current mode, and resolve those that the "
+            "current mode satisfies."
+        )
+    elif prior_mode is None and history_present:
+        lines.append(
+            "Earlier rounds did not record their execution mode. Judge any carried "
+            "finding that depends on the execution mode only against the current mode "
+            "stated above."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _with_execution_mode_fact(builder):
+    """Prepend the execution-mode fact to a plan prompt builder's output."""
+    signature = inspect.signature(builder)
+
+    @functools.wraps(builder)
+    def wrapper(
+        *args,
+        prior_execution_mode: str | None = None,
+        execution_mode_history_present: bool = False,
+        **kwargs,
+    ) -> str:
+        prompt = builder(*args, **kwargs)
+        config = signature.bind(*args, **kwargs).arguments["config"]
+        return (
+            _execution_mode_fact(
+                config, prior_execution_mode, execution_mode_history_present
+            )
+            + "\n"
+            + prompt
+        )
+
+    return wrapper
 
 
 def _canonical_plan_ledger_rules() -> str:
@@ -2203,7 +2292,7 @@ constraints, retained-parent work, final integration, caveats, security
 boundaries, and meaningful test combinations. Reject missing, duplicated,
 unknown, uncovered, or split scope IDs and any mismatch between strategy and
 conditional delivery fields. This recommendation does not select the current
-execution mode or change issue count in Stage 1.
+execution mode (see the execution-mode runtime fact) or change issue count in Stage 1.
 
 For every child stage, review the planner's semantic execution disposition as
 part of the implementation contract. Approve `direct-implementation` only
@@ -2933,6 +3022,7 @@ def _plan_growth_review_guidance(
     return lever + "\n"
 
 
+@_with_execution_mode_fact
 def build_issue_plan_prompt(
     issue_number: int,
     config: AgentLoopConfig,
@@ -3042,6 +3132,7 @@ or, if clarifying:
 """
 
 
+@_with_execution_mode_fact
 def build_plan_review_prompt(
     issue_number: int,
     round_number: int,
@@ -3487,6 +3578,7 @@ invent or rewrite semantic operations.
 """
 
 
+@_with_execution_mode_fact
 def build_plan_revision_prompt(
     issue_number: int,
     round_number: int,

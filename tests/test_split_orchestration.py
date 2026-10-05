@@ -6,6 +6,7 @@ import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
+from coding_review_agent_loop.plan_review_scheduling import PlanPrePanelSafetyError
 from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
@@ -234,11 +235,20 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
     monkeypatch.setattr(orchestrator_module, "_implement_approved_issue", fake_implement)
 
     compatible = (
-        execution_mode == "plan-only"
+        execution_mode == "plan-only" and strategy == "one-shot"
         or strategy == "one-shot" and execution_mode in {"implement-one-shot", "auto"}
         or strategy == "staged" and execution_mode in {"decompose-only", "implement-by-phase", "auto"}
     )
-    if compatible:
+    if strategy == "staged" and execution_mode in {"plan-only", "implement-one-shot"}:
+        # A staged candidate under a guard-active mode stops for a human
+        # decision at round start, before any reviewer or downstream turn (#1268).
+        with pytest.raises(PlanPrePanelSafetyError, match="staged plan under"):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        assert events == []
+        assert runner.issues == []
+        assert not any("AGENT_PLAN_EXECUTION_DECISION" in comment for comment in runner.comments)
+        assert not any(cmd[:3] == ["gh", "issue", "create"] for cmd, _cwd in runner.commands)
+    elif compatible:
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
         expected = expected_events
         if execution_mode == "auto":

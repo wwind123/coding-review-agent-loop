@@ -636,6 +636,21 @@ the streak, because loop-posted comments share the operator's account and cannot
 be authenticated as operator intent; it is routed to the reset flag. `--plan-review-force-full` stays the only way to convene the panel
 without an exact-plan primary approval.
 
+**Staged-plan mode conflict** (#1268). `plan-only` and `implement-one-shot` apply
+the phased-delivery guard (`config.phased_delivery_guard_active`). At the start of
+every planning round, before the growth seam and the scheduler block (so every
+review policy is covered), a candidate whose v1 recommendation is `staged` stops
+for a human decision through `stop_plan_pre_panel`: no reviewer or revision turn,
+and no checkpoint, approval, or panel-opening record. `--plan-narrow-staged`
+replaces the stop with an orchestrator-owned revision obligation modeled on the
+growth guard: it blocks approval and reviewer-only advance, bypasses the
+pre-panel step-back and stall stops for that round, is delivered once per
+invocation, and is not a reviewer item. Planner and reviewer round records carry
+`plan_execution_mode` and planning checkpoints carry `scheduler_execution_mode`
+(both omitted when unset, unknown values decode to none); a checkpoint recorded
+under a different mode ends the primary stall streak like an issue-digest
+mismatch, and unrecorded legacy history needs `--plan-reset-stall-streak`.
+
 **Plan step-back episode** (#1251; `--plan-step-back-rounds` K, default 2, `0`
 disables; `--plan-step-back-escalation-rounds` M, default 2, minimum 1). The
 stall stop fires only after the time is spent, so a second, earlier mechanism

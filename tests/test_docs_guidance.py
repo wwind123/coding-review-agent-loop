@@ -888,3 +888,26 @@ def test_operator_docs_document_the_pr_step_back_mechanism():
     assert "without a pathspec" in text and "no pathspec" in architecture
     assert "`Generalization:`" in text and "`in_cluster`" in architecture
     assert "sweep" in text and "human-decision" in architecture
+
+
+def test_docs_name_decompose_only_as_review_before_implementation_mode():
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    assert "Staged plans under plan-only and implement-one-shot" in text
+    assert "`--plan-narrow-staged`" in text
+    assert "review-before-implementation mode" in text
+    assert "recorded only" in text
+    architecture = (LOCAL_AGENT_LOOP_DOC.parent.parent / "ARCHITECTURE.md").read_text(
+        encoding="utf-8"
+    )
+    assert "Staged-plan mode conflict" in architecture
+    from coding_review_agent_loop.cli import build_parser
+
+    issue_parser = next(
+        action.choices["issue"]
+        for action in build_parser()._actions
+        if getattr(action, "choices", None) and "issue" in action.choices
+    )
+    help_text = next(
+        a.help for a in issue_parser._actions if "--plan-execution-mode" in a.option_strings
+    )
+    assert "review-before-implementation" in help_text
