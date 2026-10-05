@@ -24,6 +24,7 @@
   "errors",
   "evidence_reconciliation",
   "expected_closure",
+  "finding_history",
   "followups",
   "gh_rest_shim",
   "github",
