@@ -16898,3 +16898,47 @@ def test_streak_ends_at_an_execution_mode_mismatch_and_missing_modes_count():
     assert detail(records, primary="Codex", current_execution_mode="plan-only").count == 1
     # No current mode: nothing can mismatch.
     assert detail(records, primary="Codex").count == 4
+
+
+def test_narrow_staged_flat_board_resume_over_complete_approvals_does_not_approve(
+    tmp_path, monkeypatch
+):
+    """`narrow-staged-flag`: all-reviewers history holding both approvals of the staged candidate."""
+    first = _FakeRunner(
+        claude_outputs=[_m1268_staged_raw()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+        issue_urls=_m1268_issue_urls(),
+    )
+    monkeypatch.setattr(
+        plan_first_loop_module,
+        "_decompose_approved_plan",
+        lambda *a, **k: (_ for _ in ()).throw(AgentLoopError("approval boundary stub")),
+    )
+    flat = make_config(tmp_path, reviewer=("codex", "gemini"), plan_execution_mode="decompose-only")
+    with pytest.raises(AgentLoopError, match="approval boundary stub"):
+        run_issue_loop(first, issue_number=56, config=flat, plan_first=True)
+    history = list(first.issue_comments)
+    approvals = [r for r in _plan_round_records(first) if r.role == "reviewer" and r.state == "approved"]
+    assert {r.agent for r in approvals} == {"Codex", "Gemini"}
+
+    base = _m1268_base()
+    resumed = _FakeRunner(
+        issue_comments=list(history),
+        claude_outputs=[_m1268_narrowing_patch(base, one_shot=False)],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), plan_narrow_staged=True)
+
+    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="staged plan under"):
+        run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
+
+    # The flat board re-reviews every round (nothing is carried); the approving
+    # board must still not approve the staged candidate: the directive reaches
+    # the planner revision, and the still-staged revision stops the next round.
+    calls = _m1103_agent_calls(resumed)
+    assert calls.count("claude") == 1
+    assert "Operator directive (orchestrator" in _m1268_prompts(resumed, "claude")[0]
+    assert calls[-1] == "claude"
+    assert not resumed.issues
