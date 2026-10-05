@@ -1931,6 +1931,146 @@ def test_managed_a_to_b_failure_shows_superseded_a_and_open_b_in_the_second_repa
     assert merges == [{"expected_head_sha": "abc123-coder-1-coder-2"}]
 
 
+
+def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualifies(
+    tmp_path, monkeypatch, capsys,
+):
+    """#1273 `ci-repair-dispatch` (managed): B stays open history until qualification.
+
+    A fails on abc123, B on abc123-coder-1; after B's repair a reviewer blocks a
+    new finding before re-qualification, so the third coder dispatch shows B as
+    an older OPEN entry (first observed in round 2) and A superseded.  Only the
+    next approval's exact-head qualification clears B, then the PR merges.
+    """
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, reviewer=("codex",), auto_merge=True,
+        max_rounds=6, quiet=False,
+    )
+    runner = _OrchestratorRoundCommentRunner(issue_events=[label_event()])
+    runner.pr_payload.update({
+        "headRefName": "agent-loop/managed-643", "headRefOid": "abc123",
+        "baseRefName": "main", "body": runner.rest_pr["body"],
+    })
+    root = publish_issue_created_authorization(
+        runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
+    )
+    runner.codex_outputs = [
+        structured_pr_review(state="approved", summary="Approved."),
+        structured_pr_review(
+            state="approved", summary="Approved after managed CI fix.",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ),
+        structured_pr_review(
+            state="blocking", summary="One more gap.",
+            blocking_items=["Gap in src/app.py:7"],
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ),
+        structured_pr_review(
+            state="approved", summary="Approved after the gap fix.",
+            prior_item_dispositions=[
+                {"item_id": "item-1", "disposition": "resolved"},
+                {"item_id": "item-2", "disposition": "resolved"},
+            ],
+        ),
+    ]
+    runner.claude_outputs = [
+        structured_coder_followup(
+            state="blocking", summary="Fixed managed CI.", addressed_items=["item-1"],
+        ),
+        structured_coder_followup(
+            state="blocking", summary="Fixed managed CI again.", addressed_items=["item-1"],
+        ),
+        structured_coder_followup(
+            state="blocking", summary="Closed the gap.",
+            addressed_items=["item-2"], remaining_items=["item-1"],
+        ),
+    ]
+    failed_check = PullRequestCheck(
+        name="final-ci/exact-head", kind="check_run", status="failure",
+        url="https://github.com/OWNER/REPO/actions/runs/555",
+    )
+    failed_check_b = PullRequestCheck(
+        name="final-ci/lint-b", kind="check_run", status="failure",
+        url="https://github.com/OWNER/REPO/actions/runs/777",
+    )
+    outcomes = iter([
+        managed_ci.ManagedCiOutcome(
+            status="failed", head_sha="abc123",
+            checks=PullRequestChecks(
+                state="failing", required_checks=("final-ci/exact-head",),
+                passing=(), pending=(), failing=(failed_check,), missing_required=(),
+                branch_protection_status="configured", check_query_status="ok",
+            ),
+        ),
+        managed_ci.ManagedCiOutcome(
+            status="failed", head_sha="abc123-coder-1",
+            checks=PullRequestChecks(
+                state="failing", required_checks=("final-ci/exact-head",),
+                passing=(), pending=(), failing=(failed_check_b,), missing_required=(),
+                branch_protection_status="configured", check_query_status="ok",
+            ),
+        ),
+        managed_ci.ManagedCiOutcome(
+            status="passed", head_sha="abc123-coder-1-coder-2-coder-3"
+        ),
+    ])
+    qualified_heads = []
+    merges = []
+    handoffs = []
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: root)
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci",
+        lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
+    )
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        orchestrator, "dispatch_final_qualification",
+        lambda *_a, **kwargs: qualified_heads.append(kwargs["expected_head_sha"]),
+    )
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes)
+    )
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **kwargs: merges.append(kwargs))
+    real_publish = orchestrator.publish_issue_created_continuity_authorization
+
+    def publish(*args, **kwargs):
+        continued = real_publish(*args, **kwargs)
+        handoffs.append((kwargs, continued))
+        return continued
+
+    monkeypatch.setattr(orchestrator, "publish_issue_created_continuity_authorization", publish)
+
+    assert orchestrator.run_pr_loop(
+        runner, pr_number=7, config=config, managed_ci_handoff=root,
+        managed_ci_issue_number=643,
+    ) == 0
+
+    prompts = [
+        "\n".join(cmd) for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"
+    ]
+    assert len(prompts) == 3
+    history = prompts[2].split("Earlier-round history for this run", 1)[1].split("\n\n", 1)[0]
+    round_one, rest = history.split("Round 2:", 1)
+    round_two = rest.split("Round 3:", 1)[0]
+    assert history.count("CI managed-exact-head-ci on") == 2
+    assert (
+        "CI managed-exact-head-ci on abc123 (superseded by the failure on abc123-coder)"
+        in round_one
+    )
+    assert "final-ci/exact-head (failure)" in round_one and "lint-b" not in round_one
+    # B: first observed in round 2, still the live failure, so an older OPEN entry
+    # even though the reviewer voted it resolved in round 3.
+    assert "CI managed-exact-head-ci on abc123-coder (open)" in round_two
+    assert "final-ci/lint-b (failure)" in round_two
+    # The round-3 reviewer finding is current-round: payload only.
+    assert "src/app.py:7" not in history and "src/app.py:7" in prompts[2]
+    # Approval-gated qualification: no qualification of the blocked head; only the
+    # next approval qualifies (and clears B on) the final head, which merges.
+    assert qualified_heads == ["abc123", "abc123-coder-1", "abc123-coder-1-coder-2-coder-3"]
+    assert merges == [{"expected_head_sha": "abc123-coder-1-coder-2-coder-3"}]
+
 def test_round_metadata_selection_requires_current_ordered_transition(tmp_path):
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.extend([

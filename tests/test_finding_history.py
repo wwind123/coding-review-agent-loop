@@ -712,6 +712,25 @@ def test_legacy_ci_snapshots_without_failed_head_seed_once_and_clear():
     assert "- old-check: failure" in body and "(resolved)" in body
 
 
+def test_legacy_ci_obligation_observed_open_then_cleared_by_the_machine_lifecycle():
+    """Legacy fallback key: an actually observed active obligation, then its clearance."""
+    legacy = UnresolvedReviewItem(
+        item_id="ci-item", reviewer="Orchestrator", source_round=1,
+        text="Legacy\n- old-check: failure", status="blocking", authority="machine",
+        obligation_kind="github-pr-checks", lifecycle="qualification_ready",
+    )
+    ledger, _ = _ledger()
+    ledger.observe_reconciled([legacy, _item("item-1", round_number=2)])
+    opened = ledger.view(5).body
+    assert "CI github-pr-checks" in opened and "(open)" in opened.split("Round 2:")[0]
+    assert "(resolved)" not in opened
+    cleared = _clear_machine_obligations([legacy], kind="github-pr-checks")
+    assert not any(item.obligation_kind for item in cleared)
+    ledger.observe_reconciled([*cleared, _item("item-1", round_number=2)])
+    body = ledger.view(5).body
+    assert body.count("CI github-pr-checks") == 1
+    assert "(resolved)" in body.split("Round 2:")[0]
+
 def test_future_item_kept_in_the_ledger_and_then_cleared_is_resolved_not_deferred():
     """Full context / planner: a retained future finding that the reconciler clears."""
     ledger, _ = _ledger()
@@ -787,3 +806,37 @@ def test_compact_resume_keeps_the_deferral_when_the_stored_ledger_omits_the_item
     ledger.note_carried_ledger([])
     ledger.observe_reconciled([_item("item-2", round_number=4)])
     assert "Codex finding item-1 (deferred)" in _view(ledger, 5)
+
+
+@pytest.mark.parametrize("mode", ["aggregate", "owner-scoped"])
+def test_replay_resolves_a_carried_future_item_cleared_by_subitem_completion(mode):
+    """Derived clearance: a note-less `blocking` entry closing every open sub-item."""
+    subs = (ReviewSubItem("item-1.s1", "x"), ReviewSubItem("item-1.s2", "y"))
+    item = _item("item-1", sub_items=subs)
+    carried = _item("item-1", "future", sub_items=subs)
+    seed = _record(0, "reviewer", 1, subject="h0", state="blocking", new_items=(item,))
+    stored = _record(1, "coder", 2, agent="Claude", subject="h1", prior_items=(carried,))
+    completes = _record(
+        2, "reviewer", 2, subject="h1", state="blocking",
+        dispositions=(
+            ReviewItemDisposition(
+                "item-1", "Codex", "blocking",
+                sub_item_dispositions=(("item-1.s1", "resolved"), ("item-1.s2", "resolved")),
+            ),
+        ),
+    )
+    after = _record(3, "coder", 3, agent="Claude", subject="h2", prior_items=())
+    records = [seed, stored, completes, after]
+    assert canonical_history_item_outcomes(
+        records, reconciliation_mode=mode, same_status="same-pr"
+    ) == {"item-1": "resolved"}
+    # The literal-only resolved whitelist is deliberately left unchanged.
+    assert "item-1" not in _canonically_resolved_history_item_ids(
+        records, reconciliation_mode=mode, same_status="same-pr"
+    )
+    # Seeded from these records, the stored ledger omitting item-1 keeps it resolved.
+    ledger, _ = _ledger()
+    ledger.seed_from_records(records, reconciliation_mode=mode, same_status="same-pr")
+    ledger.note_carried_ledger([])
+    ledger.observe_reconciled([_item("item-2", round_number=4)])
+    assert "Codex finding item-1 (resolved)" in _view(ledger, 5)

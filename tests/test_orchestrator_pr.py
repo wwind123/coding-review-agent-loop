@@ -18500,3 +18500,328 @@ def test_future_finding_cleared_in_the_first_resumed_round_is_resolved_not_defer
     assert "Codex finding item-2 (deferred) src/b.py:20" in history(prompts[1])
     assert "Codex finding item-2 (resolved) src/b.py:20" in history(prompts[2])
     assert "(deferred)" not in history(prompts[2])
+
+
+
+def test_future_finding_cleared_by_subitem_completion_is_resolved_live_and_after_resume(
+    tmp_path, monkeypatch
+):
+    """Derived clearance (every sub-item closed) of a retained future finding.
+
+    Full context keeps item-2 in the ledger as `future`.  The first resumed
+    review closes all its sub-items with a note-less `blocking` entry, which the
+    reconciler turns into a clearance, and raises item-4 so the coder is still
+    dispatched.  Both the live dispatch and the dispatch after a further resume
+    (whose stored ledger no longer holds item-2) must report it resolved.
+    """
+    gap_two = {"text": "Gap two in src/b.py:20", "sub_items": ["branch x", "branch y"]}
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", blocking_items=["Gap one in src/a.py:10", gap_two]
+            ),
+            structured_pr_review(
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "resolved"},
+                    {"item_id": "item-2", "disposition": "future", "note": "follow-up work"},
+                ],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"], remaining_items=["item-2"]),
+            structured_coder_followup(summary="Fixed CI.", remaining_items=["item-2", "item-3"]),
+        ],
+    )
+    counter = iter(range(1, 10))
+    original = orchestrator._run_validated_agent
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+
+    def boards(*_a, **_k):
+        head = runner.pr_payload["headRefOid"]
+        if head != "repaired-1":
+            return _watch_check_board("passing")
+        failed = PullRequestCheck(
+            name=f"check-{head}", kind="check_run", status="failure",
+            url=f"https://example.test/{head}",
+        )
+        return _watch_check_board("failing", failing=(failed,))
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    config = make_config(
+        tmp_path, watch_pending_ci=True, max_rounds=8, pr_review_context_mode="full"
+    )
+
+    def prompts():
+        return ["\n".join(cmd) for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"]
+
+    def history(prompt):
+        return prompt.split("Earlier-round history for this run", 1)[1].split("\n\n", 1)[0]
+
+    # First invocation stops when scripted reviewer output runs out.
+    with pytest.raises(Exception):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(prompts()) == 2
+    assert "Codex finding item-2 (deferred) src/b.py:20" in history(prompts()[1])
+
+    # Second invocation: the first resumed review closes every sub-item of item-2.
+    runner.codex_outputs.append(
+        structured_pr_review(
+            state="blocking",
+            blocking_items=["Gap three in src/c.py:30"],
+            prior_item_dispositions=[
+                {
+                    "item_id": "item-2",
+                    "disposition": "blocking",
+                    "sub_item_dispositions": {"item-2.s1": "resolved", "item-2.s2": "resolved"},
+                },
+                {"item_id": "item-3", "disposition": "resolved"},
+            ],
+        )
+    )
+    runner.claude_outputs.append(
+        structured_coder_followup(remaining_items=["item-3", "item-4"])
+    )
+    with pytest.raises(Exception):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(prompts()) == 3
+    assert "Codex finding item-2 (resolved) src/b.py:20" in history(prompts()[2])
+    assert "(deferred)" not in history(prompts()[2])
+
+    # Third invocation: history is seeded from records whose stored ledger no
+    # longer holds item-2, so the replay itself must report the clearance.
+    runner.codex_outputs.extend([
+        structured_pr_review(
+            state="blocking",
+            prior_item_dispositions=[
+                {"item_id": "item-3", "disposition": "resolved"},
+                {"item_id": "item-4", "disposition": "blocking", "note": "still open"},
+            ],
+        ),
+        structured_pr_review(
+            prior_item_dispositions=[
+                {"item_id": "item-3", "disposition": "resolved"},
+                {"item_id": "item-4", "disposition": "resolved"},
+            ]
+        ),
+    ])
+    runner.claude_outputs.append(
+        structured_coder_followup(remaining_items=["item-3", "item-4"])
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(prompts()) == 4
+    assert "Codex finding item-2 (resolved) src/b.py:20" in history(prompts()[3])
+    assert "(deferred)" not in history(prompts()[3])
+
+
+def test_compact_resume_cannot_reintroduce_a_deferred_finding_under_its_old_id(
+    tmp_path, monkeypatch
+):
+    """`deferred-status-sticky`, compact mode: why same-ID reintroduction is unreachable.
+
+    Compact reconciliation (`retain_future=False`) moves a deferred item out of
+    the ledger, so after a real resume the reviewer cannot disposition it again:
+    the authoritative validator treats its ID as an unknown prior item and it
+    never re-enters the ledger.  A concern raised again is a NEW finding ID, and
+    the deferred one stays deferred in the coder's history.  (Same-ID reintroduction is covered for
+    full context, where the item stays in the ledger as `future`.)
+    """
+    from coding_review_agent_loop.errors import AgentLoopError
+
+    runner = FakeRunner(
+        codex_outputs=[
+            "Two gaps."
+            + blocking_issues("Gap one in src/a.py:10", "Gap two in src/b.py:20")
+            + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Defer gap two."
+            + prior_item_dispositions(
+                "[item-1] resolved", "[item-2] future follow-up: separate follow-up work"
+            )
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=[
+            "Fixed one.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Fixed CI 1.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+    )
+    counter = iter(range(1, 10))
+    original = orchestrator._run_validated_agent
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+
+    def boards(*_a, **_k):
+        head = runner.pr_payload["headRefOid"]
+        if head != "repaired-1":
+            return _watch_check_board("passing")
+        failed = PullRequestCheck(
+            name=f"check-{head}", kind="check_run", status="failure",
+            url=f"https://example.test/{head}",
+        )
+        return _watch_check_board("failing", failing=(failed,))
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    config = make_config(
+        tmp_path, watch_pending_ci=True, max_rounds=8, pr_review_context_mode="compact"
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    def prompts():
+        return ["\n".join(cmd) for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"]
+
+    def history(prompt):
+        return prompt.split("Earlier-round history for this run", 1)[1].split("\n\n", 1)[0]
+
+    assert len(prompts()) == 2
+    assert "Codex finding item-2 (deferred) src/b.py:20" in history(prompts()[1])
+
+    # Resumed invocation: the reviewer tries to block item-2 under its old ID and
+    # also raises the concern again.  The old ID is not a carried prior item, so
+    # it never re-enters the ledger; the concern lives on only as new item-4.
+    runner.codex_outputs.extend([
+        structured_pr_review(
+            state="blocking",
+            blocking_items=["Gap two again in src/b.py:20"],
+            prior_item_dispositions=[
+                {"item_id": "item-2", "disposition": "blocking", "note": "src/b.py:20"},
+                {"item_id": "item-3", "disposition": "resolved"},
+            ],
+        ),
+        structured_pr_review(
+            prior_item_dispositions=[
+                {"item_id": "item-3", "disposition": "resolved"},
+                {"item_id": "item-4", "disposition": "resolved"},
+            ]
+        ),
+    ])
+    runner.claude_outputs.append(
+        structured_coder_followup(addressed_items=["item-4"], remaining_items=["item-3"])
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(prompts()) == 3
+    resumed_review = next(c for c in runner.comments if "Gap two again" in c)
+    assert "[item-2]" not in resumed_review
+    assert "Codex finding item-2 (deferred) src/b.py:20" in history(prompts()[2])
+    assert "item-4" not in history(prompts()[2])
+    assert "Gap two again in src/b.py:20" in prompts()[2]
+
+
+
+def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches(
+    tmp_path, monkeypatch
+):
+    """`ci-repair-dispatch` (ordinary CI) across four coder dispatches.
+
+    Head A (abc123) fails unit-a in round 1; head B (repaired-1) fails lint-b in
+    round 2 and, because the second coder turn pushes nothing, again in round 3
+    (a repeated snapshot of the same failure); round 4 sees pending checks on a
+    new head.  B must stay one instance first observed in round 2, rendered as an
+    older OPEN entry at dispatches 3 and 4 (machine qualification is approval
+    gated, so reviewer `resolved` votes never clear it), with A superseded.
+    """
+
+    def review(*dispositions, blocking=(), state="blocking"):
+        return structured_pr_review(
+            state=state,
+            blocking_items=list(blocking),
+            prior_item_dispositions=[
+                {"item_id": item, "disposition": verdict}
+                | ({"note": "still"} if verdict == "blocking" else {})
+                for item, verdict in dispositions
+            ],
+        )
+
+    runner = FakeRunner(
+        codex_outputs=[
+            review(blocking=["Bug one in src/app.py:3"]),
+            *[review(("item-1", "blocking"), ("item-2", "resolved"))] * 3,
+            review(("item-1", "resolved"), ("item-2", "resolved"), state="approved"),
+        ],
+        claude_outputs=[structured_coder_followup(remaining_items=["item-1", "item-2"])] * 4,
+    )
+    heads = iter(["repaired-1", "repaired-1", "repaired-3", "repaired-4"])
+    original = orchestrator._run_validated_agent
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = next(heads)
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+
+    def boards(*_a, **_k):
+        head = runner.pr_payload["headRefOid"]
+        failing = {"abc123": "unit-a", "repaired-1": "lint-b"}.get(head)
+        if head == "repaired-3":
+            return _watch_check_board(
+                "pending",
+                pending=(PullRequestCheck(name="lint-b", kind="check_run", status="pending"),),
+            )
+        if failing is None:
+            return _watch_check_board("passing")
+        return _watch_check_board("failing", failing=(PullRequestCheck(
+            name=failing, kind="check_run", status="failure",
+            url=f"https://example.test/{failing}",
+        ),))
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    assert run_pr_loop(
+        runner, pr_number=77, config=make_config(tmp_path, watch_pending_ci=True, max_rounds=8),
+    ) == 0
+    prompts = [
+        "\n".join(cmd) for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"
+    ]
+    assert len(prompts) == 4
+    # The lint-b failure on head B was really observed twice (rounds 2 and 3).
+    assert sum(
+        1 for c in runner.comments
+        if c.startswith("GitHub PR checks are failing") and "lint-b" in c
+    ) == 2
+
+    def history(prompt):
+        return prompt.split("Earlier-round history for this run", 1)[1].split("\n\n", 1)[0]
+
+    def rounds(text):
+        return {
+            block.split(":", 1)[0]: block for block in re.split(r"\n(?=Round \d+:)", text)
+        }
+
+    superseded = "item-2: CI github-pr-checks on abc123 (superseded by the failure on repaired-1)"
+    b_open = "item-2: CI github-pr-checks on repaired-1 (open)"
+    # Dispatch 2: B is the current round's failure, so only A is history.
+    assert superseded in history(prompts[1]) and "repaired-1 (open)" not in history(prompts[1])
+    for prompt in prompts[2:]:
+        text = history(prompt)
+        by_round = rounds(text)
+        assert superseded in by_round["Round 1"] and "unit-a (failure)" in by_round["Round 1"]
+        # One instance, first observed in round 2, despite the round-3 repeat.
+        assert b_open in by_round["Round 2"] and "lint-b (failure)" in by_round["Round 2"]
+        assert text.count("CI github-pr-checks on") == 2
+        assert "CI github-pr-checks" not in by_round.get("Round 3", "")
+        assert "repaired-3" not in text
+        assert "GitHub PR checks are failing" not in text

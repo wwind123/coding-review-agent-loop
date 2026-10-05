@@ -3596,9 +3596,11 @@ def canonical_history_item_outcomes(
     collection, which is where a deferral is read; the FIRST collection holds
     only still-mandatory items and carries their updated state forward.
 
-    Returns ``item_id -> "active" | "deferred" | "resolved"``.  A later carry or
-    reintroduction as a mandatory item resets the outcome to ``active``;
-    machine obligations never get an outcome.
+    Returns ``item_id -> "active" | "deferred" | "resolved"``.  ``resolved`` is
+    any candidate the reconciler dropped (literal or derived clearance), so a
+    retained future item cleared by sub-item completion is not left deferred.
+    A later carry or reintroduction as a mandatory item resets the outcome to
+    ``active``; machine obligations never get an outcome.
     """
     groups: dict[tuple[str, int], list[PostedRoundRecord]] = {}
     for record in records:
@@ -3643,12 +3645,11 @@ def canonical_history_item_outcomes(
             for item in candidates:
                 if item.item_id in returned:
                     continue
+                # The reconciler drops a non-machine item only when every
+                # obligation is cleared, including a clearance it derived from
+                # sub-item completion, so the drop itself is authoritative.
                 del active[item.item_id]
-                if all(
-                    disposition.disposition == "resolved"
-                    for disposition in dispositions_by_item[item.item_id]
-                ):
-                    outcomes[item.item_id] = "resolved"
+                outcomes[item.item_id] = "resolved"
         for record in group:
             for item in record.metadata.new_items:
                 appear(item)
