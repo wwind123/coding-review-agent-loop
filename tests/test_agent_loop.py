@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pytest
 
 import orchestrator_split_guard
+import coding_review_agent_loop.agent_failure as agent_failure
 import coding_review_agent_loop.cli as cli_module
 import coding_review_agent_loop.orchestrator as orchestrator_module
 import coding_review_agent_loop.prompts as prompts_module
@@ -7543,3 +7544,39 @@ def test_repair_backend_help_names_default_and_alternative(capsys):
     assert "default: antigravity" in help_text
     assert "agy CLI even when no role uses Antigravity" in help_text
     assert "--repair-backend codex|claude --repair-model MODEL" in help_text
+
+
+def test_at_capacity_message_is_transient_and_public_diagnostic() -> None:
+    msg = "Selected model is at capacity. Please try a different model."
+    assert agent_failure._failure_category(msg) == "transient"
+    assert agent_failure.PUBLIC_RESPONSE_TRANSIENT_DIAGNOSTIC_RE.search(msg)
+    assert agent_failure._is_transient_public_response(msg)
+    assert not agent_failure.PUBLIC_RESPONSE_TRANSIENT_DIAGNOSTIC_RE.search(
+        "The reviewer noted that the selected model is at capacity today."
+    )
+
+
+def test_provider_verdict_drives_failure_category_and_suggestion() -> None:
+    from coding_review_agent_loop.transient import classify_codex_failure
+
+    def cat(message):
+        raw = json.dumps({"type": "error", "message": message})
+        verdict = classify_codex_failure(raw)
+        return agent_failure._failure_category(verdict.text, provider_verdict=verdict)
+
+    assert cat("429 RESOURCE_EXHAUSTED") == "transient"
+    assert cat("429 insufficient_quota: please check your plan") == "non-retryable"
+    assert cat("Selected model is at capacity; auth proxy busy") == "transient"
+    assert "billing" in agent_failure._failure_suggestion(
+        "non-retryable", "x", "codex", classification_text="insufficient_quota"
+    )
+
+
+def test_codex_classification_ignores_tool_output() -> None:
+    tool = json.dumps({"type": "item.completed", "item": {"aggregated_output": "auth timeout"}})
+    result = AgentResult(text="", raw_output=tool, returncode=1, provider="codex")
+    text, verdict = agent_failure._agent_failure_classification(result, phase="command")
+    assert verdict is not None and "auth" not in text
+    assert agent_failure._failure_category(text, provider_verdict=verdict) == "deterministic"
+    legacy = AgentResult(text="", raw_output="invalid api key", returncode=1, provider="claude")
+    assert agent_failure._agent_failure_classification(legacy, phase="command") == ("invalid api key", None)

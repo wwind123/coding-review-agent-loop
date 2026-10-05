@@ -7,6 +7,7 @@ whether to retry an agent invocation without importing the full orchestrator.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Literal
@@ -20,7 +21,7 @@ TRANSIENT_AGENT_OUTPUT_RE = re.compile(
     r"Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|"
     r"\b429\b|rate.?limit(?:ed)?|"
     r"session.?limit.?exceeded|session_limit_exceeded|too many sessions|"
-    r"no capacity available|capacity.*(?:unavailable|exceeded)|"
+    r"no capacity available|capacity.*(?:unavailable|exceeded)|\bat capacity\b|"
     r"resource.?exhausted|overloaded|"
     r"\bquota\b",
     re.I,
@@ -41,6 +42,190 @@ def is_transient_agent_output(text: str) -> bool:
     return bool(TRANSIENT_AGENT_OUTPUT_RE.search(text)) and not bool(
         NON_RETRYABLE_AGENT_OUTPUT_RE.search(text)
     )
+
+
+# --- Codex provider error channel (#1269) -----------------------------------
+
+_CODEX_BUDGET = 12000
+_CODEX_EVENT_SHAPED_RE = re.compile(r'^\s*\{\s*"(?:type|id|item|thread_id)"\s*:')
+_CODEX_STDIN_BANNER = "Reading prompt from stdin..."
+_CODEX_NEUTRAL_TEXT = "codex exited without a provider error event"
+_CODEX_FIELDS = ("message", "code", "type", "status", "detail")
+_BILLING_GUARD_RE = re.compile(
+    r"billing|credit|insufficient_quota|check your plan|payment required|\b402\b", re.I
+)
+_AVAILABILITY_RE = re.compile(
+    r"at capacity|no capacity|capacity|overloaded|model_capacity_exhausted|"
+    r"Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|"
+    r"\bstatus:\s*5\d\d\b|\bHTTP\s*5\d\d\b|\b429\b|rate.?limit|quota|"
+    r"resource.?exhausted",
+    re.I,
+)
+_STRUCTURED_AUTH_RE = re.compile(
+    r"unauthorized|forbidden|invalid api key|\bauth(?:entication|orization)?\b|\b40[13]\b",
+    re.I,
+)
+
+
+@dataclass(frozen=True)
+class CodexStructuredError:
+    rendered: str
+    statuses: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class CodexErrorChannel:
+    structured_errors: tuple[CodexStructuredError, ...]
+    stderr_lines: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ProviderFailureVerdict:
+    category: Literal["transient", "non-retryable", "deterministic"]
+    billing: bool
+    text: str
+    source: Literal["structured", "stderr", "none"]
+
+
+def _status_value(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+    else:
+        return None
+    return number if 100 <= number <= 599 else None
+
+
+def _render_codex_error(error: object) -> CodexStructuredError | None:
+    if isinstance(error, str):
+        text = error.strip()
+        return CodexStructuredError(text) if text else None
+    if not isinstance(error, dict):
+        return None
+    parts: list[str] = []
+    statuses: list[int] = []
+
+    def collect(mapping: dict) -> None:
+        for field in _CODEX_FIELDS:
+            value = mapping.get(field)
+            if value is None or isinstance(value, (dict, list)):
+                continue
+            text = str(value).strip()
+            if text:
+                parts.append(f"{field}: {text}")
+            if field in ("status", "code"):
+                number = _status_value(value)
+                if number is not None:
+                    statuses.append(number)
+
+    collect(error)
+    nested = error.get("error")
+    if isinstance(nested, dict):
+        collect(nested)
+    elif isinstance(nested, str) and nested.strip():
+        parts.append(f"message: {nested.strip()}")
+    if not parts:
+        return None
+    return CodexStructuredError("; ".join(parts), tuple(dict.fromkeys(statuses)))
+
+
+def _bound(items: list, size) -> tuple:
+    kept: list = []
+    total = 0
+    for item in items:
+        total += size(item)
+        if total > _CODEX_BUDGET:
+            break
+        kept.append(item)
+    return tuple(kept)
+
+
+def extract_codex_error_channel(raw_output: str) -> CodexErrorChannel | None:
+    """Split a Codex ``--json`` capture into provider errors and stderr lines.
+
+    Returns None only when the capture is not event-shaped (plain CLI text), so
+    callers keep the legacy path. Item events and undecodable ``{`` lines are
+    never classified.
+    """
+    structured: list[CodexStructuredError] = []
+    stderr: list[str] = []
+    event_shaped = False
+    for line in (raw_output or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("{"):
+            try:
+                event = json.loads(stripped)
+            except ValueError:
+                event = None
+            if isinstance(event, dict) and isinstance(event.get("type"), str):
+                event_shaped = True
+                kind = event["type"]
+                rendered = None
+                if kind == "error":
+                    rendered = _render_codex_error(event)
+                elif kind == "turn.failed":
+                    rendered = _render_codex_error(event.get("error"))
+                if rendered is not None and rendered not in structured:
+                    structured.append(rendered)
+            elif _CODEX_EVENT_SHAPED_RE.match(stripped):
+                event_shaped = True
+            continue
+        if stripped == _CODEX_STDIN_BANNER:
+            continue
+        if stripped not in stderr:
+            stderr.append(stripped)
+    if not event_shaped:
+        return None
+    return CodexErrorChannel(
+        _bound(structured, lambda e: len(e.rendered)),
+        _bound(stderr, len),
+    )
+
+
+def _classify_structured_provider_error(err: CodexStructuredError) -> tuple[str, bool]:
+    text = err.rendered
+    if 402 in err.statuses or _BILLING_GUARD_RE.search(text):
+        return "non-retryable", True
+    if any(s >= 500 or s == 429 for s in err.statuses) or _AVAILABILITY_RE.search(text):
+        return "transient", False
+    if any(s in (401, 403) for s in err.statuses) or _STRUCTURED_AUTH_RE.search(text):
+        return "non-retryable", False
+    if TRANSIENT_AGENT_OUTPUT_RE.search(text):
+        return "transient", False
+    return "deterministic", False
+
+
+def classify_codex_failure(raw_output: str) -> ProviderFailureVerdict | None:
+    """Provider-channel verdict for a failed Codex invocation, or None (legacy path)."""
+    channel = extract_codex_error_channel(raw_output)
+    if channel is None:
+        return None
+    if channel.structured_errors:
+        results = [_classify_structured_provider_error(e) for e in channel.structured_errors]
+        text = "\n".join(e.rendered for e in channel.structured_errors)
+        bad = [r for r in results if r[0] == "non-retryable"]
+        if bad:
+            return ProviderFailureVerdict(
+                "non-retryable", any(r[1] for r in bad), text, "structured"
+            )
+        if any(r[0] == "transient" for r in results):
+            return ProviderFailureVerdict("transient", False, text, "structured")
+        return ProviderFailureVerdict("deterministic", False, text, "structured")
+    if channel.stderr_lines:
+        text = "\n".join(channel.stderr_lines)
+        if NON_RETRYABLE_AGENT_OUTPUT_RE.search(text):
+            category = "non-retryable"
+        elif TRANSIENT_AGENT_OUTPUT_RE.search(text):
+            category = "transient"
+        else:
+            category = "deterministic"
+        return ProviderFailureVerdict(category, False, text, "stderr")
+    return ProviderFailureVerdict("deterministic", False, _CODEX_NEUTRAL_TEXT, "none")
 
 
 @dataclass(frozen=True)

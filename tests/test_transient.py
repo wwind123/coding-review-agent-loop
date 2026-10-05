@@ -247,3 +247,122 @@ def test_sparse_newline_head_header_has_no_frame() -> None:
     capacity, quota = _classify(text)
     assert capacity.is_capacity and capacity.frame == ""
     assert quota is None
+
+
+# ---------------------------------------------------------------------------
+# Codex provider error channel (#1269)
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def _ev(**kw) -> str:
+    return _json.dumps(kw)
+
+
+_CAP = "Selected model is at capacity. Please try a different model."
+_TOOL = _ev(
+    type="item.completed",
+    item={"type": "command_execution", "aggregated_output": "loadHistoryList(owner = auth.captureOwner()) billing"},
+)
+
+
+def _stream(*lines: str) -> str:
+    return "\n".join(lines)
+
+
+def test_at_capacity_is_transient_text() -> None:
+    assert transient.TRANSIENT_AGENT_OUTPUT_RE.search(_CAP)
+
+
+def test_issue_capacity_pair_is_transient_despite_tool_output() -> None:
+    raw = _stream(
+        _ev(type="thread.started", thread_id="t"),
+        _TOOL,
+        _ev(type="error", message=_CAP),
+        _ev(type="turn.failed", error={"message": _CAP}),
+    )
+    verdict = transient.classify_codex_failure(raw)
+    assert verdict is not None
+    assert verdict.category == "transient" and verdict.source == "structured"
+    assert "auth" not in verdict.text and "billing" not in verdict.text
+
+
+@pytest.mark.parametrize("message", ["401 Unauthorized", "invalid api key"])
+def test_structured_auth_is_non_retryable(message) -> None:
+    verdict = transient.classify_codex_failure(_ev(type="error", message=message))
+    assert verdict.category == "non-retryable" and not verdict.billing
+
+
+def test_structured_auth_beats_stderr_capacity() -> None:
+    raw = _stream(_ev(type="error", message="401 Unauthorized"), "warning: model at capacity, retrying")
+    assert transient.classify_codex_failure(raw).category == "non-retryable"
+
+
+def test_structured_429_beats_stderr_billing() -> None:
+    raw = _stream(
+        _ev(type="error", message="429 Too Many Requests: rate limit reached"),
+        "billing notice",
+    )
+    verdict = transient.classify_codex_failure(raw)
+    assert verdict.category == "transient" and verdict.source == "structured"
+
+
+def test_insufficient_quota_is_billing_non_retryable() -> None:
+    raw = _ev(
+        type="turn.failed",
+        error={"message": "429 insufficient_quota: You exceeded your current quota, please check your plan."},
+    )
+    verdict = transient.classify_codex_failure(raw)
+    assert (verdict.category, verdict.billing) == ("non-retryable", True)
+
+
+def test_code_only_and_numeric_status() -> None:
+    q = transient.classify_codex_failure(
+        _ev(type="turn.failed", error={"code": "insufficient_quota", "message": "429 quota exceeded"})
+    )
+    assert (q.category, q.billing) == ("non-retryable", True)
+    cap = transient.classify_codex_failure(
+        _ev(type="turn.failed", error={"code": "model_capacity_exhausted", "message": "request failed"})
+    )
+    assert cap.category == "transient"
+    for status in (503, "503"):
+        v = transient.classify_codex_failure(
+            _ev(type="turn.failed", error={"message": "request failed", "status": status})
+        )
+        assert v.category == "transient"
+    v = transient.classify_codex_failure(_ev(type="turn.failed", error={"message": "request failed", "status": 401}))
+    assert v.category == "non-retryable"
+    v = transient.classify_codex_failure(
+        _ev(type="turn.failed", error={"status": 429, "code": "insufficient_quota"})
+    )
+    assert (v.category, v.billing) == ("non-retryable", True)
+
+
+def test_stderr_only_error_uses_legacy_order_and_ignores_items() -> None:
+    raw = _stream(
+        _ev(type="item.completed", item={"text": "capacity prose"}),
+        "ERROR: 401 Unauthorized",
+    )
+    verdict = transient.classify_codex_failure(raw)
+    assert verdict.source == "stderr" and verdict.text == "ERROR: 401 Unauthorized"
+    assert verdict.category == "non-retryable"
+
+
+_TRUNC = '{"type":"item.completed","item":{"aggregated_output":"auth.captureOwner() invalid api key timeout'
+
+
+def test_truncated_item_event_is_dropped() -> None:
+    verdict = transient.classify_codex_failure(_stream(_ev(type="thread.started", thread_id="t"), _TRUNC))
+    assert (verdict.source, verdict.category) == ("none", "deterministic")
+
+
+def test_malformed_only_capture_is_event_shaped_but_plain_text_is_not() -> None:
+    verdict = transient.classify_codex_failure(_TRUNC)
+    assert verdict is not None and verdict.source == "none" and verdict.category == "deterministic"
+    assert transient.extract_codex_error_channel("error: unexpected argument --foo") is None
+
+
+def test_no_error_events_is_deterministic() -> None:
+    verdict = transient.classify_codex_failure(_stream(_TOOL, _ev(type="turn.started")))
+    assert (verdict.source, verdict.category) == ("none", "deterministic")

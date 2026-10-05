@@ -103,6 +103,7 @@ from .agent_failure import (
     _format_invalid_agent_response_error,
     _operation_description_from_context,
     _failed_run_diagnostics,
+    _agent_failure_classification,
     _agent_failure_classification_text,
 )
 from .architecture_contract import (
@@ -1616,7 +1617,9 @@ def _run_validated_agent(
             break
         elif result.returncode != 0 and artifact_unavailable is None:
             last_error = f"agent command exited with {result.returncode}"
-            classification_text = _agent_failure_classification_text(result, phase="command")
+            classification_text, provider_verdict = _agent_failure_classification(
+                result, phase="command"
+            )
             if target_exec_retryable:
                 target_argv = (
                     result.command_result.args
@@ -1633,13 +1636,24 @@ def _run_validated_agent(
             if result.command_result is not None and result.command_result.capture_diagnostics:
                 classification_text += "\nsubprocess capture unavailable; retryable tooling failure"
             last_classification_text = classification_text
+            structured_verdict = (
+                provider_verdict
+                if provider_verdict is not None and provider_verdict.source == "structured"
+                else None
+            )
             should_retry = (
                 target_exec_retryable
                 or replacement_stability_failed
                 or bool(result.command_result and result.command_result.capture_diagnostics)
-                or _is_transient_agent_output(classification_text)
+                or (
+                    structured_verdict.category == "transient"
+                    if structured_verdict is not None
+                    else _is_transient_agent_output(classification_text)
+                )
             )
-            last_failure_category = _failure_category(classification_text)
+            last_failure_category = _failure_category(
+                classification_text, provider_verdict=structured_verdict
+            )
             if target_exec_retryable:
                 # The typed runner decision outranks textual classification:
                 # a preflighted CLI mid self-update is transient (#1226).
@@ -1656,12 +1670,23 @@ def _run_validated_agent(
                 last_failure_category = "transient"
         elif not text.strip():
             last_error = "agent response was empty"
-            classification_text = _agent_failure_classification_text(result, phase="empty")
-            last_classification_text = classification_text
-            should_retry = replacement_stability_failed or _is_transient_agent_output(
-                classification_text
+            classification_text, provider_verdict = _agent_failure_classification(
+                result, phase="empty"
             )
-            last_failure_category = _failure_category(classification_text)
+            last_classification_text = classification_text
+            structured_verdict = (
+                provider_verdict
+                if provider_verdict is not None and provider_verdict.source == "structured"
+                else None
+            )
+            should_retry = replacement_stability_failed or (
+                structured_verdict.category == "transient"
+                if structured_verdict is not None
+                else _is_transient_agent_output(classification_text)
+            )
+            last_failure_category = _failure_category(
+                classification_text, provider_verdict=structured_verdict
+            )
             capacity = classify_antigravity_capacity(
                 classification_text,
                 returncode=result.returncode,
