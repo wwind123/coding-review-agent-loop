@@ -779,8 +779,10 @@ def plan_step_back_anchor(
     )
 
 
+# A declaration is a whole line (optional whitespace or list/quote/emphasis
+# prefix), never a substring of prose such as "No revision reintroduces ...".
 _REVERSAL_RE = re.compile(
-    r"reintroduces\s+dissolved\s+item\s+[`\[]*([^\s`\]:]+)[`\]]*\s*:\s*(.*)",
+    r"^[\s>*_\-\u2022]*reintroduces\s+dissolved\s+item\s+[`\[]*([^\s`\]:]+)[`\]]*\s*:\s*(.*)",
     re.IGNORECASE,
 )
 
@@ -803,7 +805,7 @@ def declared_dissolution_reversals(
     found: dict[str, str] = {}
     for text in texts:
         for line in text.splitlines():
-            match = _REVERSAL_RE.search(line)
+            match = _REVERSAL_RE.match(line)
             if match and match.group(1) not in found:
                 found[match.group(1)] = _clip(match.group(2), ANCHOR_NOTE_LIMIT)
     return tuple(found.items())

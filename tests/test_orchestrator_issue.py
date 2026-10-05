@@ -17632,3 +17632,112 @@ def test_post_review_stop_lists_a_declared_reintroduction(tmp_path):
     message = str(error)
     assert "[item-4] at round 7 (needs a synchronous close)" in message
     assert "none declared" not in message
+
+
+def _m1278_declaring_transform(output):
+    """Make the planner's round-7 revision declare reversing item-4."""
+    if not output.lstrip().startswith("{"):
+        return output
+    payload, end = json.JSONDecoder().raw_decode(output.lstrip())
+    if payload.get("kind") != "plan_revision_patch" or not payload["summary"].startswith(
+        "Close gap 6"
+    ):
+        return output
+    payload["summary"] = (
+        f"{payload['summary']}\nreintroduces dissolved item item-4: needs a synchronous close"
+    )
+    return json.dumps(payload) + output.lstrip()[end:]
+
+
+def test_round_start_stop_after_a_post_review_stop_reports_the_declaration(tmp_path):
+    """`stop-prelaunch-with-reintroduction`: the resumed round-start stop site."""
+    first, error = _m1251_run(
+        tmp_path, last_round=7, max_rounds=12, plan_step_back_escalation_rounds=9,
+        claude_transform=_m1278_declaring_transform,
+    )
+    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    history = list(first.issue_comments)
+    before = len(_plan_round_records(first))
+
+    rerun, stop, _messages = _m1275_resume(
+        tmp_path, history, plan_step_back_escalation_rounds=2, max_rounds=12,
+    )
+
+    assert isinstance(stop, orchestrator_module.PlanPrePanelSafetyError)
+    message = str(stop)
+    assert "[item-4] at round 7 (needs a synchronous close)" in message
+    assert "No reviewer and no planner turn were invoked." in message
+    assert "This round's reviews were posted" not in message
+    # Zero agent launches and no new round record for the stopping round.
+    assert _m1103_agent_calls(rerun) == []
+    assert len(_plan_round_records(rerun)) == before
+
+
+def _m1278_episode_history(tmp_path):
+    first, error = _m1251_run(
+        tmp_path, last_round=7, max_rounds=12, plan_step_back_escalation_rounds=9,
+    )
+    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    return list(first.issue_comments)
+
+
+@pytest.mark.parametrize("review_parallel", [False, True])
+def test_reset_round_reviewers_and_planner_carry_no_anchor(tmp_path, review_parallel):
+    """`reset-round-reviewer`: the reset closes the episode before reviewers run."""
+    history = _m1278_episode_history(tmp_path)
+    claude, codex = _m1275_scripts(first_round=8, last_round=9)
+    plain, _e, _m = _m1275_resume(
+        tmp_path, history, claude=claude[:1], codex=codex[:1],
+        plan_step_back_escalation_rounds=9, review_parallel=review_parallel,
+    )
+    assert _STEP_BACK_ANCHOR_REVIEW in _m1251_prompts(plain, "codex")[0]
+    assert _STEP_BACK_ANCHOR_PLANNER in _m1251_prompts(plain, "claude")[0]
+
+    reset, _e, _m = _m1275_resume(
+        tmp_path, history, claude=claude[:1], codex=codex[:1],
+        plan_step_back_escalation_rounds=9, review_parallel=review_parallel,
+        plan_reset_stall_streak=True,
+    )
+    for agent in ("codex", "claude"):
+        for prompt in _m1251_prompts(reset, agent):
+            assert _STEP_BACK_ANCHOR_REVIEW not in prompt
+            assert _STEP_BACK_ANCHOR_PLANNER not in prompt
+
+
+def test_parallel_and_sequential_episode_reviewer_prompts_match(tmp_path):
+    """`parallel-reviewers`: both launch modes render the same pre-round anchor."""
+    history = _m1278_episode_history(tmp_path)
+    claude, codex = _m1275_scripts(first_round=8, last_round=9)
+    prompts = {}
+    for parallel in (False, True):
+        rerun, _e, _m = _m1275_resume(
+            tmp_path, history, claude=claude[:1], codex=codex[:1],
+            plan_step_back_escalation_rounds=9, review_parallel=parallel,
+        )
+        prompts[parallel] = _m1251_prompts(rerun, "codex")[0]
+    block = lambda text: text[text.index(_STEP_BACK_ANCHOR_REVIEW):]  # noqa: E731
+    assert block(prompts[False]).split("\n")[:12] == block(prompts[True]).split("\n")[:12]
+
+
+def test_resumed_episode_prompts_match_the_uninterrupted_run(tmp_path):
+    """`resume-replay`: resuming mid-episode rebuilds the uninterrupted anchor blocks."""
+    def block(prompt, marker, lines=9):
+        return prompt[prompt.index(marker):].split("\n")[:lines]
+
+    uninterrupted, _error = _m1251_run(
+        tmp_path, last_round=8, max_rounds=12, plan_step_back_escalation_rounds=9,
+    )
+    history = _m1278_episode_history(tmp_path)
+    claude, codex = _m1275_scripts(first_round=8, last_round=9)
+    resumed, _e, _m = _m1275_resume(
+        tmp_path, history, claude=claude[:1], codex=codex[:1],
+        plan_step_back_escalation_rounds=9,
+    )
+    # Round 8's review and the planner revision after it are the resumed run's
+    # first prompts; the uninterrupted run reaches them at the same positions.
+    assert block(_m1251_prompts(resumed, "codex")[0], _STEP_BACK_ANCHOR_REVIEW) == block(
+        _m1251_prompts(uninterrupted, "codex")[7], _STEP_BACK_ANCHOR_REVIEW
+    )
+    assert block(_m1251_prompts(resumed, "claude")[0], _STEP_BACK_ANCHOR_PLANNER) == block(
+        _m1251_prompts(uninterrupted, "claude")[8], _STEP_BACK_ANCHOR_PLANNER
+    )

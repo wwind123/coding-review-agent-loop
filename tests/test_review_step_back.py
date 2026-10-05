@@ -1974,3 +1974,28 @@ def test_guidance_asks_for_dissolved_prefix():
         )
     )
     assert "`dissolved:`" in text
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "No revision reintroduces dissolved item item-4: remains removed.",
+        'Example: "reintroduces dissolved item item-4: why".',
+        "We do not reintroduces dissolved item a: x",
+        "`reintroduces dissolved item a: quoted instruction`",
+    ],
+)
+def test_declaration_must_start_the_line(line):
+    assert declared_dissolution_reversals({"summary": line}) == ()
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "reintroduces dissolved item a: why",
+        "  - Reintroduces dissolved item `a`: why",
+        "> **reintroduces dissolved item [a]: why",
+    ],
+)
+def test_declaration_accepts_presentation_prefixes(line):
+    assert declared_dissolution_reversals({"summary": f"intro\n{line}"}) == (("a", "why"),)
