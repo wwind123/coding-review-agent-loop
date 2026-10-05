@@ -139,7 +139,8 @@ def validate(
             exact_string(record.get('repository'), 'repository', r'[^/\s]+/[^/\s]+')
             exact_int(record.get('pr'), 'pr', True)
             exact_string(record.get('expected_head_sha'), 'expected_head_sha', sha_re)
-            exact_string(record.get('base_ref'), 'base_ref', r'[^\s]+')
+            if not valid_branch(record.get('base_ref')):
+                fail('invalid base_ref')
             exact_string(record.get('workflow_revision'), 'workflow_revision', sha_re)
             if actor_id is not None or record.get('generation') is not None:
                 exact_string(record.get('generation'), 'generation', r'[A-Za-z0-9_-]+')

@@ -1271,7 +1271,7 @@ def test_dispatch_validator_fails_closed_without_a_usable_default_branch(payload
 
 
 # Valid git branch names outside [A-Za-z0-9._/-] must work (git check-ref-format).
-VALID_BRANCHES = ["release+stable", "ünï/ブランチ", "feat#1", "a=b,c", "x@y", "main-2", "v1.0/rc"]
+VALID_BRANCHES = ["release\u00a0stable", "release+stable", "ünï/ブランチ", "feat#1", "a=b,c", "x@y", "main-2", "v1.0/rc"]
 INVALID_BRANCHES = [
     None, 7, "", "@", "a b", "a\tb", "../x", "a..b", "/x", "x/", "a//b", "-x", "x.", ".x", "a/.b",
     "a.lock", "a.lock/b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "a@{b", "a\x7fb",
@@ -1295,3 +1295,9 @@ def test_invalid_branch_names_are_rejected_by_both_validators(branch):
         _validate(_record(), default_branch=branch)
     with pytest.raises(ValueError, match="default branch is unavailable"):
         _dispatch_validate(repo_payload={"full_name": "OWNER/REPO", "default_branch": branch}, ref="refs/heads/x")
+
+
+@pytest.mark.parametrize("base_ref", ["a b", "x\ty", "a..b", "/x", "", "a~b"])
+def test_intent_base_ref_must_be_a_valid_branch_name(base_ref):
+    with pytest.raises(ValueError, match="invalid base_ref"):
+        _validate(_record(base_ref=base_ref))
