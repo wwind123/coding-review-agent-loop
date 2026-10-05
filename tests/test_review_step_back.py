@@ -1826,3 +1826,151 @@ def test_deferral_retired_by_an_intervening_unmarked_digest_boundary():
         primary=PRIMARY, current_issue_digest=DIGEST,
     )
     assert kept.deferral_rounds == (4,)
+
+
+# --- episode anchor (#1278) ------------------------------------------------
+
+from coding_review_agent_loop.review_step_back import (  # noqa: E402
+    declared_dissolution_reversals,
+    plan_step_back_anchor,
+    reintroduced_dissolved_items,
+    render_plan_step_back_anchor_guidance,
+    render_plan_step_back_anchor_review_notice,
+)
+
+
+def _disp(item_id, note, disposition="resolved"):
+    return {"item_id": item_id, "disposition": disposition, "note": note}
+
+
+def _anchor_records(dispositions, *, summary="simpler design: drop caches", later=()):
+    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
+    raw = json.dumps({"summary": summary, "prior_plan_item_dispositions": dispositions})
+    records = [*_chain([1, 2]), _coder(10, 3, entries=[entry], raw=raw)]
+    index = 11
+    for round_number, payload in later:
+        records.append(_coder(index, round_number, raw=json.dumps(payload)))
+        index += 1
+    return records
+
+
+def _anchor_for(records):
+    state = _derive(records, primary=PRIMARY)
+    return state.episode, plan_step_back_anchor(records, state.episode)
+
+
+def test_anchor_prefers_dissolved_prefixed_notes():
+    records = _anchor_records(
+        [_disp("a", "dissolved: no cache"), _disp("b", "fixed in place"), _disp("c", "Dissolved - x")]
+    )
+    _episode, anchor = _anchor_for(records)
+    assert anchor.dissolved_ids == ("a", "c")
+    assert anchor.dissolved_notes["a"] == "no cache"
+    assert anchor.trade_offs == "simpler design: drop caches"
+
+
+def test_anchor_falls_back_to_every_resolved_entry_without_prefix():
+    records = _anchor_records(
+        [_disp("a", "gone"), _disp("b", "gone too"), _disp("c", "kept", "deferred"), _disp("a", "dup")]
+    )
+    _episode, anchor = _anchor_for(records)
+    assert anchor.dissolved_ids == ("a", "b")
+
+
+def test_anchor_is_empty_for_unreadable_candidate_payload():
+    entry = entry_payload_for_plan(reviewer=PRIMARY, trigger_round=2)
+    for raw in (None, "not json"):
+        records = [*_chain([1, 2]), _coder(10, 3, entries=[entry], raw=raw)]
+        _episode, anchor = _anchor_for(records)
+        assert anchor.dissolved_ids == () and anchor.trade_offs is None
+        assert "(not recorded)" in render_plan_step_back_anchor_guidance(anchor)
+        assert "(not recorded)" in render_plan_step_back_anchor_review_notice(anchor)
+
+
+def test_anchor_notes_are_clipped_and_ids_stay_complete():
+    dispositions = [_disp(f"i{n}", "dissolved: " + "x" * 500) for n in range(150)]
+    _episode, anchor = _anchor_for(_anchor_records(dispositions))
+    assert len(anchor.dissolved_ids) == 150
+    assert all(len(note) <= 240 for note in anchor.dissolved_notes.values())
+    text = render_plan_step_back_anchor_guidance(anchor)
+    assert "[i0] x" in text and "[i11] x" in text
+    assert "- [i12]\n" in text and "- [i99]\n" in text
+    assert "[i100]" not in text
+    assert "(50 more dissolved IDs not shown" in text
+
+
+def test_declaration_regex_forms_and_dedup():
+    payload = {
+        "summary": "Reintroduces dissolved item `a`: needs cancel safety\nother line",
+        "prior_plan_item_dispositions": [
+            _disp("x", "reintroduces dissolved item [b]: serialization"),
+            _disp("y", "reintroduces dissolved item a: second mention"),
+            _disp("z", "no declaration here"),
+        ],
+    }
+    assert declared_dissolution_reversals(payload) == (
+        ("a", "needs cancel safety"),
+        ("b", "serialization"),
+    )
+    assert declared_dissolution_reversals(None) == ()
+
+
+def test_reintroduced_items_report_beyond_cap_dedupe_and_ignore_candidate_round():
+    dispositions = [_disp(f"i{n}", "dissolved: n") for n in range(150)]
+    decl = lambda item, why: {"summary": f"reintroduces dissolved item {item}: {why}"}  # noqa: E731
+    records = _anchor_records(
+        dispositions,
+        later=[
+            (4, decl("i12", "need A")),
+            (4, decl("i12", "replayed newer")),
+            (5, decl("i140", "need B")),
+            (6, decl("unknown", "not dissolved")),
+        ],
+    )
+    episode, anchor = _anchor_for(records)
+    result = reintroduced_dissolved_items(records, episode, anchor)
+    assert result == (("i12", 4, "replayed newer"), ("i140", 5, "need B"))
+    # A declaration on the candidate round itself is ignored.
+    own = _anchor_records(
+        [_disp("a", "dissolved: n")],
+        summary="reintroduces dissolved item a: self",
+    )
+    episode, anchor = _anchor_for(own)
+    assert reintroduced_dissolved_items(own, episode, anchor) == ()
+
+
+def test_human_decision_defaults_are_legacy_and_anchor_variants_render():
+    base = dict(
+        phase="plan", measurements="M.", step_back_round=3, blocks=2, threshold=2,
+        alternative="alt",
+    )
+    legacy = render_step_back_human_decision(**base)
+    assert "No reviewer and no planner turn were invoked." in legacy
+    assert "Dissolved by the step-back" not in legacy
+    none_declared = render_step_back_human_decision(**base, dissolved=("a",), reintroduced=())
+    assert "Dissolved by the step-back: 1 item(s) [a]" in none_declared
+    assert "none declared (undeclared reintroductions are not detected)" in none_declared
+    assert "No reviewer and no planner turn were invoked." in none_declared
+    many = render_step_back_human_decision(
+        **base, dissolved=tuple(f"i{n}" for n in range(30)),
+        reintroduced=(("i29", 4, "need it"),),
+    )
+    assert "(+10 more)" in many and "[i29] at round 4 (need it)" in many
+    post = render_step_back_human_decision(
+        **base, dissolved=("a",), reintroduced=(), post_review=True
+    )
+    assert "This round's reviews were posted" in post
+    assert "No reviewer and no planner turn were invoked" not in post
+    unrecorded = render_step_back_human_decision(**base, dissolved=(), reintroduced=())
+    assert "Dissolved by the step-back: (not recorded)" in unrecorded
+    with pytest.raises(ValueError):
+        render_step_back_human_decision(**base, post_review=True)
+
+
+def test_guidance_asks_for_dissolved_prefix():
+    text = render_plan_step_back_guidance(
+        PlanStepBackContext(
+            measurements="M.", findings=(), execution_mode="auto", streak=2
+        )
+    )
+    assert "`dissolved:`" in text

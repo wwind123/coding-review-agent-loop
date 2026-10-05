@@ -69,7 +69,10 @@ from .finding_history import (
     render_generalization_guidance,
 )
 from .review_step_back import (
+    PlanStepBackAnchor,
     PlanStepBackContext,
+    render_plan_step_back_anchor_guidance,
+    render_plan_step_back_anchor_review_notice,
     render_plan_step_back_guidance,
     render_plan_step_back_review_notice,
 )
@@ -3023,6 +3026,16 @@ def _step_back_planner_block(context: PlanStepBackContext | None) -> str:
     return render_plan_step_back_guidance(context) + "\n" if context is not None else ""
 
 
+def _step_back_anchor_planner_block(anchor: PlanStepBackAnchor | None) -> str:
+    """Episode anchor for planner revisions; empty outside an episode (#1278)."""
+    return render_plan_step_back_anchor_guidance(anchor) + "\n" if anchor is not None else ""
+
+
+def _step_back_anchor_review_block(anchor: PlanStepBackAnchor | None) -> str:
+    """Episode anchor for primary plan reviewers; empty outside an episode (#1278)."""
+    return render_plan_step_back_anchor_review_notice(anchor) if anchor is not None else ""
+
+
 def _plan_growth_review_guidance(
     config: AgentLoopConfig,
     growth_notice: str | None = None,
@@ -3179,6 +3192,7 @@ def build_plan_review_prompt(
     plan_growth_notice: str | None = None,
     plan_growth_measurements: str | None = None,
     step_back_review_notice: bool = False,
+    step_back_anchor: PlanStepBackAnchor | None = None,
 ) -> str:
     config = _with_architecture_context(config, architecture_context)
     if compact_context:
@@ -3200,6 +3214,7 @@ def build_plan_review_prompt(
             plan_growth_notice=plan_growth_notice,
             plan_growth_measurements=plan_growth_measurements,
             step_back_review_notice=step_back_review_notice,
+            step_back_anchor=step_back_anchor,
         )
         return compact_prompt
     coder_name = agent_display_name(config.coder)
@@ -3240,7 +3255,7 @@ Plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_plan_step_back_review_notice() if step_back_review_notice else ''}
+{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_plan_step_back_review_notice() if step_back_review_notice else ''}{_step_back_anchor_review_block(step_back_anchor)}
 Review the plan for correctness, architecture fit, missing edge cases, test
 strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -3328,6 +3343,7 @@ def _build_compact_plan_review_prompt(
     plan_growth_notice: str | None = None,
     plan_growth_measurements: str | None = None,
     step_back_review_notice: bool = False,
+    step_back_anchor: PlanStepBackAnchor | None = None,
 ) -> str:
     coder_name = agent_display_name(config.coder)
     reviewer_name = agent_display_name(reviewer)
@@ -3391,7 +3407,7 @@ Current implementation plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{(plan_growth_measurements + chr(10)) if plan_growth_measurements else ""}{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{render_plan_step_back_review_notice() if step_back_review_notice else ""}{_agent_unavailable_guidance(reviewer_signature)}
+{(plan_growth_measurements + chr(10)) if plan_growth_measurements else ""}{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{render_plan_step_back_review_notice() if step_back_review_notice else ""}{_step_back_anchor_review_block(step_back_anchor)}{_agent_unavailable_guidance(reviewer_signature)}
 {_plan_review_scheduling_guidance(config, reviewer_group, compact=True)}Use approved only if there are no
 blocking plan issues, no Same-plan follow-ups, and no carried-forward plan
 items left active for this planning round. Do not place your signature before
@@ -3499,6 +3515,7 @@ def _build_semantic_plan_revision_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     plan_growth_notice: str | None = None,
     step_back_context: PlanStepBackContext | None = None,
+    step_back_anchor: PlanStepBackAnchor | None = None,
     generalization_guidance: bool = False,
     finding_history: FindingHistoryView | None = None,
 ) -> str:
@@ -3539,7 +3556,7 @@ Current canonical plan (read-only context):
 
 {previous_plan}
 
-{_proactive_generalization_block(_HISTORY_PHASE_PLAN, generalization_guidance, finding_history)}{_step_back_planner_block(step_back_context)}Blocking plan review payload:
+{_proactive_generalization_block(_HISTORY_PHASE_PLAN, generalization_guidance, finding_history)}{_step_back_planner_block(step_back_context)}{_step_back_anchor_planner_block(step_back_anchor)}Blocking plan review payload:
 
 {review}
 
@@ -3627,6 +3644,7 @@ def build_plan_revision_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     plan_growth_notice: str | None = None,
     step_back_context: PlanStepBackContext | None = None,
+    step_back_anchor: PlanStepBackAnchor | None = None,
     generalization_guidance: bool = False,
     finding_history: FindingHistoryView | None = None,
 ) -> str:
@@ -3649,6 +3667,7 @@ def build_plan_revision_prompt(
             inherited_matrix_binding=inherited_matrix_binding,
             plan_growth_notice=plan_growth_notice,
             step_back_context=step_back_context,
+            step_back_anchor=step_back_anchor,
             generalization_guidance=generalization_guidance,
             finding_history=finding_history,
         )
@@ -3669,6 +3688,7 @@ def build_plan_revision_prompt(
             inherited_matrix_binding=inherited_matrix_binding,
             plan_growth_notice=plan_growth_notice,
             step_back_context=step_back_context,
+            step_back_anchor=step_back_anchor,
             generalization_guidance=generalization_guidance,
             finding_history=finding_history,
         )
@@ -3706,7 +3726,7 @@ Previous plan:
 
 {previous_plan}
 
-{_proactive_generalization_block(_HISTORY_PHASE_PLAN, generalization_guidance, finding_history)}{_step_back_planner_block(step_back_context)}{reviewer_name} plan review:
+{_proactive_generalization_block(_HISTORY_PHASE_PLAN, generalization_guidance, finding_history)}{_step_back_planner_block(step_back_context)}{_step_back_anchor_planner_block(step_back_anchor)}{reviewer_name} plan review:
 
 {review}
 
@@ -3805,6 +3825,7 @@ def _build_compact_plan_revision_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     plan_growth_notice: str | None = None,
     step_back_context: PlanStepBackContext | None = None,
+    step_back_anchor: PlanStepBackAnchor | None = None,
     generalization_guidance: bool = False,
     finding_history: FindingHistoryView | None = None,
 ) -> str:
@@ -3868,7 +3889,7 @@ Previous implementation plan:
 
 {previous_plan}
 
-{render_finding_history_block(finding_history) + chr(10) if finding_history is not None else ""}{_step_back_planner_block(step_back_context)}Blocking plan review payload:
+{render_finding_history_block(finding_history) + chr(10) if finding_history is not None else ""}{_step_back_planner_block(step_back_context)}{_step_back_anchor_planner_block(step_back_anchor)}Blocking plan review payload:
 
 {review}
 

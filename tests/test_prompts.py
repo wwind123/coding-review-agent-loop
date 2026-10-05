@@ -5237,6 +5237,78 @@ def test_step_back_review_notice_appears_in_both_review_prompt_branches(tmp_path
         assert "Step-back notice" not in without
 
 
+# --- Plan step-back episode anchor (#1278) ----------------------------------
+
+from coding_review_agent_loop.review_step_back import PlanStepBackAnchor  # noqa: E402
+
+
+def _step_back_anchor():
+    return PlanStepBackAnchor(
+        candidate_round=3,
+        trade_offs="simpler design: no daemon thread; trade-off is slower saves.",
+        dissolved_ids=("item-7", "item-9"),
+        dissolved_notes={"item-7": "no cache", "item-9": "no daemon"},
+    )
+
+
+def _anchor_revision_prompts(config, anchor):
+    semantic = build_plan_revision_prompt(
+        1278, 4, "Authenticated prior plan.", "Blocking review.", config,
+        response_form="semantic-patch-v1", base_round_number=3,
+        base_state_identity="a" * 64, step_back_anchor=anchor,
+    )
+    compact = build_plan_revision_prompt(
+        1278, 4, "Previous plan", "Blocking review", config,
+        compact_context=True, step_back_anchor=anchor,
+    )
+    full = build_plan_revision_prompt(
+        1278, 4, "Previous plan", "Blocking review", config, step_back_anchor=anchor,
+    )
+    return {"semantic-patch": semantic, "compact": compact, "full": full}
+
+
+def test_step_back_anchor_appears_in_every_revision_prompt_branch(tmp_path):
+    config = make_config(tmp_path)
+    plain = _anchor_revision_prompts(config, None)
+    for branch, prompt in _anchor_revision_prompts(config, _step_back_anchor()).items():
+        assert "STEP-BACK ANCHOR" in prompt, branch
+        assert "[item-7] no cache" in prompt and "[item-9] no daemon" in prompt, branch
+        assert "slower saves" in prompt, branch
+        assert "within the simplified design" in prompt, branch
+        assert "reintroduces dissolved item <ID>:" in prompt, branch
+        assert "STEP-BACK ANCHOR" not in plain[branch], branch
+
+
+def test_step_back_anchor_none_leaves_revision_prompts_byte_identical(tmp_path):
+    config = make_config(tmp_path)
+    omitted = build_plan_revision_prompt(
+        1278, 4, "Previous plan", "Blocking review", config,
+    )
+    assert _anchor_revision_prompts(config, None)["full"] == omitted
+
+
+def test_step_back_anchor_appears_in_both_review_prompt_branches(tmp_path):
+    config = make_config(tmp_path, reviewer=("codex", "gemini"))
+    for compact in (False, True):
+        anchored = build_plan_review_prompt(
+            1278, 5, "Plan.", config, reviewer="codex", compact_context=compact,
+            step_back_anchor=_step_back_anchor(),
+        )
+        plain = build_plan_review_prompt(
+            1278, 5, "Plan.", config, reviewer="codex", compact_context=compact,
+        )
+        assert "Step-back anchor" in anchored
+        assert "[item-7] no cache" in anchored and "slower saves" in anchored
+        assert "requires reversing dissolved item <ID>" in anchored
+        assert "satisfiable within the simplified design" in anchored
+        assert "does not filter or downgrade findings" in anchored
+        assert "Step-back anchor" not in plain
+        assert plain == build_plan_review_prompt(
+            1278, 5, "Plan.", config, reviewer="codex", compact_context=compact,
+            step_back_anchor=None,
+        )
+
+
 # --- PR fix-loop step-back (#1251, stage 2) ---------------------------------
 
 

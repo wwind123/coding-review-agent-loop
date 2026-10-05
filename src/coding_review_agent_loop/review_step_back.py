@@ -57,6 +57,12 @@ _MANDATORY_STATUSES = {
 }
 
 ALTERNATIVE_EXCERPT_LIMIT = 2000
+# Episode anchor display bounds (#1278).  They cap rendering only; membership
+# always uses the complete dissolved-ID tuple.
+ANCHOR_NOTE_LIMIT = 240
+_ANCHOR_NOTED_IDS = 12
+_ANCHOR_SHOWN_IDS = 100
+_STOP_DISSOLVED_LIMIT = 20
 
 
 _USE_RECORD_ITEMS = object()
@@ -554,7 +560,8 @@ def render_plan_step_back_guidance(context: PlanStepBackContext) -> str:
         "`split` or `re-file caveat`) and state the trade-offs and which prior "
         "findings the alternative dissolves or defers. Prior items still need "
         "dispositions: mark an item the alternative dissolves as resolved with a "
-        "note. The approval-time growth gate is unchanged.\n"
+        "note that starts with `dissolved:`. The approval-time growth gate is "
+        "unchanged.\n"
     )
 
 
@@ -577,25 +584,71 @@ def render_step_back_human_decision(
     blocks: int,
     threshold: int,
     alternative: str | None,
+    dissolved: Sequence[str] = (),
+    reintroduced: Sequence[tuple[str, int, str]] | None = None,
+    post_review: bool = False,
 ) -> str:
-    """Human-decision-required diagnostic after a step-back that did not converge."""
+    """Human-decision-required diagnostic after a step-back that did not converge.
+
+    ``reintroduced`` is ``None`` for the legacy message.  When provided (the
+    episode anchor was derived), the message also reports the dissolved items and
+    the planner-declared reintroductions (#1278).
+    """
     excerpt = (alternative or "").strip()
     if len(excerpt) > ALTERNATIVE_EXCERPT_LIMIT:
         excerpt = excerpt[: ALTERNATIVE_EXCERPT_LIMIT - 1].rstrip() + "…"
     if phase != PHASE_PLAN:
         raise ValueError(f"unsupported step-back phase: {phase}")
+    if post_review and reintroduced is None:
+        raise ValueError("post_review requires the episode anchor report")
+    timing = "No reviewer and no planner turn were invoked. "
+    anchor_report = ""
+    if reintroduced is not None:
+        if post_review:
+            timing = (
+                "This round's reviews were posted; no further planner or reviewer "
+                "turn will be invoked. "
+            )
+        anchor_report = _render_anchor_report(dissolved, reintroduced) + " "
     return (
         "human decision required: the planner stepped back at round "
         f"{step_back_round} (a simplify-or-re-scope revision), and the primary plan "
         f"reviewer has since blocked {blocks} round(s), reaching "
         f"--plan-step-back-escalation-rounds {threshold} (the stall stop is deferred "
-        "while a step-back is pending or in progress). No reviewer and no planner turn were invoked. "
+        "while a step-back is pending or in progress). "
+        f"{timing}"
         f"{measurements} Latest alternative (excerpt of the step-back candidate "
-        f"summary): {excerpt or '(not recorded)'} Decide one of: continue patching "
+        f"summary): {excerpt or '(not recorded)'} {anchor_report}Decide one of: continue patching "
         "(rerun with --plan-step-back-rounds 0, or with --plan-reset-stall-streak, "
         "which also ends the episode); adopt the simpler alternative (narrow the "
         "issue text; an issue edit ends the episode); or split (rerun with "
         "--plan-execution-mode auto, or re-file the issue as staged work)."
+    )
+
+
+def _render_anchor_report(
+    dissolved: Sequence[str], reintroduced: Sequence[tuple[str, int, str]]
+) -> str:
+    if dissolved:
+        shown = ", ".join(dissolved[:_STOP_DISSOLVED_LIMIT])
+        extra = len(dissolved) - _STOP_DISSOLVED_LIMIT
+        tail = f", (+{extra} more)" if extra > 0 else ""
+        dissolved_text = f"{len(dissolved)} item(s) [{shown}{tail}]"
+    else:
+        dissolved_text = "(not recorded)"
+    if reintroduced:
+        entries = "; ".join(
+            f"[{item_id}] at round {round_number} ({reason or 'no reason given'})"
+            for item_id, round_number, reason in reintroduced
+        )
+        reintroduced_text = entries
+    else:
+        reintroduced_text = (
+            "none declared (undeclared reintroductions are not detected)"
+        )
+    return (
+        f"Dissolved by the step-back: {dissolved_text}. "
+        f"Reintroduced since the step-back (planner-declared): {reintroduced_text}."
     )
 
 
@@ -639,24 +692,203 @@ def mandatory_plan_findings_since(
     return tuple(lines[-limit:])
 
 
-def step_back_alternative_summary(
+def _step_back_candidate_payload(
     records: Sequence["PostedRoundRecord"], episode: StepBackEntry
-) -> str | None:
-    """The step-back candidate's structured ``summary``, or ``None`` if unreadable."""
+) -> Mapping[str, object] | None:
+    """The newest candidate-round coder record's structured payload, if readable."""
     for record in sorted(records, key=lambda item: item.index, reverse=True):
         metadata = record.metadata
         if metadata.role != "coder" or metadata.round_number != episode.candidate_round:
             continue
-        raw = metadata.raw_structured_coder_response
-        if not raw:
-            return None
-        try:
-            payload, _end = json.JSONDecoder().raw_decode(raw.lstrip())
-        except ValueError:
-            return None
-        summary = payload.get("summary") if isinstance(payload, dict) else None
-        return summary if isinstance(summary, str) else None
+        return _decode_payload(metadata.raw_structured_coder_response)
     return None
+
+
+def _decode_payload(raw: object) -> Mapping[str, object] | None:
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(raw.lstrip())
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def step_back_alternative_summary(
+    records: Sequence["PostedRoundRecord"], episode: StepBackEntry
+) -> str | None:
+    """The step-back candidate's structured ``summary``, or ``None`` if unreadable."""
+    payload = _step_back_candidate_payload(records, episode)
+    summary = payload.get("summary") if payload is not None else None
+    return summary if isinstance(summary, str) else None
+
+
+@dataclass(frozen=True)
+class PlanStepBackAnchor:
+    """The active episode's simplified design, derived from history only (#1278)."""
+
+    candidate_round: int
+    trade_offs: str | None
+    dissolved_ids: tuple[str, ...]
+    dissolved_notes: Mapping[str, str]
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text.strip()
+    if len(text) > limit:
+        return text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def plan_step_back_anchor(
+    records: Sequence["PostedRoundRecord"], episode: StepBackEntry
+) -> PlanStepBackAnchor:
+    """Derive the anchor from the step-back candidate record; never raises."""
+    payload = _step_back_candidate_payload(records, episode)
+    trade_offs: str | None = None
+    entries: list[tuple[str, str]] = []
+    if payload is not None:
+        summary = payload.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            trade_offs = _clip(summary, ALTERNATIVE_EXCERPT_LIMIT)
+        dispositions = payload.get("prior_plan_item_dispositions")
+        if isinstance(dispositions, list):
+            for entry in dispositions:
+                if not isinstance(entry, dict) or entry.get("disposition") != "resolved":
+                    continue
+                item_id = entry.get("item_id")
+                if not isinstance(item_id, str) or not item_id.strip():
+                    continue
+                note = entry.get("note")
+                entries.append((item_id.strip(), note if isinstance(note, str) else ""))
+    prefixed = [e for e in entries if e[1].strip().lower().startswith("dissolved")]
+    chosen = prefixed or entries
+    ids: list[str] = []
+    notes: dict[str, str] = {}
+    for item_id, note in chosen:
+        if item_id in notes:
+            continue
+        ids.append(item_id)
+        cleaned = re.sub(r"^\s*dissolved\s*:?\s*", "", note, flags=re.IGNORECASE)
+        notes[item_id] = _clip(cleaned, ANCHOR_NOTE_LIMIT)
+    return PlanStepBackAnchor(
+        candidate_round=episode.candidate_round,
+        trade_offs=trade_offs,
+        dissolved_ids=tuple(ids),
+        dissolved_notes=notes,
+    )
+
+
+_REVERSAL_RE = re.compile(
+    r"reintroduces\s+dissolved\s+item\s+[`\[]*([^\s`\]:]+)[`\]]*\s*:\s*(.*)",
+    re.IGNORECASE,
+)
+
+
+def declared_dissolution_reversals(
+    payload: Mapping[str, object] | None,
+) -> tuple[tuple[str, str], ...]:
+    """``(item_id, reason)`` pairs declared in a revision payload, deduplicated by ID."""
+    if payload is None:
+        return ()
+    texts: list[str] = []
+    summary = payload.get("summary")
+    if isinstance(summary, str):
+        texts.append(summary)
+    dispositions = payload.get("prior_plan_item_dispositions")
+    if isinstance(dispositions, list):
+        for entry in dispositions:
+            if isinstance(entry, dict) and isinstance(entry.get("note"), str):
+                texts.append(entry["note"])
+    found: dict[str, str] = {}
+    for text in texts:
+        for line in text.splitlines():
+            match = _REVERSAL_RE.search(line)
+            if match and match.group(1) not in found:
+                found[match.group(1)] = _clip(match.group(2), ANCHOR_NOTE_LIMIT)
+    return tuple(found.items())
+
+
+def reintroduced_dissolved_items(
+    records: Sequence["PostedRoundRecord"],
+    episode: StepBackEntry,
+    anchor: PlanStepBackAnchor,
+) -> tuple[tuple[str, int, str], ...]:
+    """Dissolved items later revisions declared reintroduced, as ``(id, round, reason)``."""
+    dissolved = frozenset(anchor.dissolved_ids)
+    newest: dict[int, "PostedRoundRecord"] = {}
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        if (
+            metadata.role == "coder"
+            and metadata.round_number > episode.candidate_round
+            and record.index > episode.record_index
+        ):
+            newest[metadata.round_number] = record
+    seen: set[str] = set()
+    result: list[tuple[str, int, str]] = []
+    for number in sorted(newest):
+        payload = _decode_payload(newest[number].metadata.raw_structured_coder_response)
+        for item_id, reason in declared_dissolution_reversals(payload):
+            if item_id in dissolved and item_id not in seen:
+                seen.add(item_id)
+                result.append((item_id, number, reason))
+    return tuple(result)
+
+
+def _render_anchor_items(anchor: PlanStepBackAnchor) -> str:
+    if not anchor.dissolved_ids:
+        return "Dissolved items: (not recorded)\n"
+    lines = ["Dissolved items:"]
+    shown = anchor.dissolved_ids[:_ANCHOR_SHOWN_IDS]
+    for index, item_id in enumerate(shown):
+        note = anchor.dissolved_notes.get(item_id, "")
+        if index < _ANCHOR_NOTED_IDS and note:
+            lines.append(f"- [{item_id}] {note}")
+        else:
+            lines.append(f"- [{item_id}]")
+    hidden = len(anchor.dissolved_ids) - len(shown)
+    if hidden > 0:
+        lines.append(
+            f"({hidden} more dissolved IDs not shown; a declaration naming any "
+            "dissolved ID is still recognized)"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _render_anchor_facts(anchor: PlanStepBackAnchor) -> str:
+    return (
+        f"Step-back round: {anchor.candidate_round}\n"
+        + _render_anchor_items(anchor)
+        + f"Trade-offs stated by the step-back: {anchor.trade_offs or '(not recorded)'}\n"
+    )
+
+
+def render_plan_step_back_anchor_guidance(anchor: PlanStepBackAnchor) -> str:
+    """The planner block for every revision while a step-back episode is active."""
+    return (
+        "STEP-BACK ANCHOR (orchestrator, not a reviewer finding): the plan is in a "
+        "step-back episode and the simplified design is the anchor.\n"
+        + _render_anchor_facts(anchor)
+        + "Address the blocking findings within the simplified design. Reintroducing "
+        "dissolved machinery requires a line `reintroduces dissolved item <ID>: <why "
+        "the simpler design cannot meet the requirement otherwise>` in the summary or "
+        "in the relevant disposition note. Reintroducing it without that declaration "
+        "contradicts the anchor.\n"
+    )
+
+
+def render_plan_step_back_anchor_review_notice(anchor: PlanStepBackAnchor) -> str:
+    """The reviewer block while a step-back episode is active (judgement, no filter)."""
+    return (
+        "Step-back anchor (orchestrator, not a reviewer finding): the plan is in a "
+        "step-back episode and the simplified design is the anchor.\n"
+        + _render_anchor_facts(anchor)
+        + "For each blocking finding, say in the finding text either `requires "
+        "reversing dissolved item <ID>` (with the requirement the simplification "
+        "cannot meet) or `satisfiable within the simplified design`. This is your "
+        "judgement; the orchestrator does not filter or downgrade findings on it.\n"
+    )
 
 
 # ---------------------------------------------------------------------------

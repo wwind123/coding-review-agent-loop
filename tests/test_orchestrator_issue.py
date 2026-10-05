@@ -17553,3 +17553,82 @@ def test_planner_resume_before_clearance_resolves_a_retained_future_finding(tmp_
     assert len(revisions) == 3
     assert "Codex finding item-2 (resolved) docs/b.md:20" in history(revisions[2])
     assert "(deferred)" not in history(revisions[2])
+
+
+# --- #1278: the step-back episode anchor -------------------------------------
+
+_STEP_BACK_ANCHOR_PLANNER = "STEP-BACK ANCHOR"
+_STEP_BACK_ANCHOR_REVIEW = "Step-back anchor (orchestrator"
+
+
+def test_episode_anchor_reaches_reviewer_and_planner_prompts_after_the_step_back(tmp_path):
+    runner, error = _m1251_run(
+        tmp_path, last_round=7, max_rounds=9, plan_step_back_escalation_rounds=5
+    )
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError) or error
+    planner = _m1251_prompts(runner, "claude")
+    codex = _m1251_prompts(runner, "codex")
+    # Planner: fresh, p1, justification, p3, step-back turn (no anchor), then anchored.
+    assert [_STEP_BACK_ANCHOR_PLANNER in prompt for prompt in planner] == [
+        False, False, False, False, False, True, True, True,
+    ]
+    assert all(_STEP_BACK_MARKER not in prompt for prompt in planner[5:])
+    assert "within the simplified design" in planner[5]
+    # Reviewer: the step-back candidate (round 5) and every later round are anchored.
+    anchored = [_STEP_BACK_ANCHOR_REVIEW in prompt for prompt in codex]
+    assert anchored[:4] == [False] * 4 and all(anchored[4:]) and len(anchored) > 5
+    assert _STEP_BACK_NOTICE in codex[4] and _STEP_BACK_NOTICE not in codex[5]
+    assert "does not filter or downgrade findings" in codex[4]
+    # No second step-back entry is recorded.
+    assert sum(1 for r in _plan_round_records(runner) if r.step_back_entries) == 1
+
+
+def test_prompts_carry_no_anchor_without_a_step_back_episode(tmp_path):
+    fresh, base = _m1103_fresh_base()
+    codex, claude, _base = _m1103_blocking_chain(1, 4, base=base)
+    runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
+    config = _staged_plan_config(tmp_path, max_rounds=4)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    for prompt in (*_m1251_prompts(runner, "claude"), *_m1251_prompts(runner, "codex")):
+        assert _STEP_BACK_ANCHOR_PLANNER not in prompt
+        assert _STEP_BACK_ANCHOR_REVIEW not in prompt
+
+
+def test_post_review_stop_reports_the_anchor_and_truthful_timing(tmp_path):
+    runner, error = _m1251_run(tmp_path, last_round=6, max_rounds=8)
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    message = str(error)
+    assert "Dissolved by the step-back:" in message
+    assert "none declared (undeclared reintroductions are not detected)" in message
+    assert "This round's reviews were posted; no further planner or reviewer turn" in message
+    assert "No reviewer and no planner turn were invoked" not in message
+    # The stop fires before any further agent launch.
+    assert len(_m1251_prompts(runner, "claude")) == 6
+    assert len(_m1251_prompts(runner, "codex")) == 6
+
+
+def test_post_review_stop_lists_a_declared_reintroduction(tmp_path):
+    def declare(output):
+        if not output.lstrip().startswith("{"):
+            return output
+        payload, end = json.JSONDecoder().raw_decode(output.lstrip())
+        if payload.get("kind") != "plan_revision_patch":
+            return output
+        marker = "reintroduces dissolved item item-4: needs a synchronous close"
+        if marker in payload.get("summary", "") or not payload["summary"].startswith("Close gap 6"):
+            return output
+        payload["summary"] = f"{payload['summary']}\n{marker}"
+        return json.dumps(payload) + output.lstrip()[end:]
+
+    runner, error = _m1251_run(
+        tmp_path, last_round=7, max_rounds=9, plan_step_back_escalation_rounds=3,
+        claude_transform=declare,
+    )
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    message = str(error)
+    assert "[item-4] at round 7 (needs a synchronous close)" in message
+    assert "none declared" not in message
