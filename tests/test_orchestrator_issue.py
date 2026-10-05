@@ -17632,6 +17632,10 @@ def test_post_review_stop_lists_a_declared_reintroduction(tmp_path):
     message = str(error)
     assert "[item-4] at round 7 (needs a synchronous close)" in message
     assert "none declared" not in message
+    records = _plan_round_records(runner)
+    assert any(r.phase == "scheduler-prelaunch" and r.round_number == 7 for r in records)
+    assert not any(r.round_number > 7 for r in records)
+    assert not any(r.role == "coder" and r.round_number >= 8 for r in records)
 
 
 def _m1278_declaring_transform(output):
@@ -17917,3 +17921,105 @@ def test_no_episode_run_logs_no_anchor_and_prompts_carry_no_anchor_text(tmp_path
     assert not any("step-back anchor" in str(c.args[-1]) for c in logged.call_args_list)
     for prompt in (*_m1251_prompts(runner, "claude"), *_m1251_prompts(runner, "codex")):
         assert "step-back anchor" not in prompt.lower()
+
+
+def test_stall_escalated_stop_reports_the_declared_reversal_before_launch(tmp_path):
+    """`stop-prelaunch-with-reintroduction`: the DISPOSITION_ESCALATED stall site.
+
+    The round-start step-back stop shares its guards and state with this site and
+    normally fires first, so the test suppresses that one derivation to reach the
+    stall path with the same escalated history.
+    """
+    first, error = _m1251_run(
+        tmp_path, last_round=7, max_rounds=12, plan_step_back_escalation_rounds=9,
+        claude_transform=_m1278_declaring_transform,
+    )
+    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    history = list(first.issue_comments)
+    before = len(_plan_round_records(first))
+
+    real_derive = plan_first_loop_module.derive_plan_step_back_state
+    calls = []
+
+    def derive(*args, **kwargs):
+        state = real_derive(*args, **kwargs)
+        calls.append(state.escalation_count)
+        # Call 1 is the reviewer-anchor snapshot, call 2 the round-start step-back
+        # stop: hide the escalation from the latter only.
+        return replace(state, escalation_count=0) if len(calls) == 2 else state
+
+    with patch.object(plan_first_loop_module, "derive_plan_step_back_state", derive):
+        rerun, stop, messages = _m1275_resume(
+            tmp_path, history, plan_step_back_escalation_rounds=2,
+            plan_primary_stall_rounds=2, max_rounds=12,
+        )
+
+    assert isinstance(stop, orchestrator_module.PlanPrePanelSafetyError)
+    message = str(stop)
+    assert "[item-4] at round 7 (needs a synchronous close)" in message
+    assert "No reviewer and no planner turn were invoked." in message
+    assert "This round's reviews were posted" not in message
+    assert _m1103_agent_calls(rerun) == []
+    assert len(_plan_round_records(rerun)) == before
+
+
+def _m1278_normalized(prompts):
+    return [
+        re.sub(r"rounds[02]", "roundsN", re.sub(r"/responses/\S+\.md", "/responses/X.md", p))
+        for p in prompts
+    ]
+
+
+def test_no_episode_prompts_match_a_run_with_step_back_disabled(tmp_path):
+    """`no-episode-prompts`: the anchor machinery leaves no-episode prompt text unchanged."""
+    runs = {}
+    for rounds in (2, 0):
+        fresh, base = _m1103_fresh_base()
+        codex, claude, _base = _m1103_blocking_chain(1, 4, base=base)
+        runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
+        workdir = tmp_path / f"rounds{rounds}"
+        workdir.mkdir()
+        config = _staged_plan_config(workdir, max_rounds=4, plan_step_back_rounds=rounds)
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        runs[rounds] = runner
+    for agent in ("codex", "claude"):
+        left = _m1278_normalized(_m1251_prompts(runs[2], agent))
+        right = _m1278_normalized(_m1251_prompts(runs[0], agent))
+        assert len(left) == len(right)
+        assert left == right
+
+
+def test_narrowing_revision_inside_an_active_episode_carries_directive_and_anchor(tmp_path):
+    """`narrow-revision-in-episode`: the independent planner-anchor path.
+
+    The first resumed round sees a staged recommendation, so ``--plan-narrow-staged``
+    owns that round's revision (the step-back gate is excluded); the anchor must
+    still follow the narrowing directive, and no new step-back entry is recorded.
+    """
+    from types import SimpleNamespace
+
+    history = _m1278_episode_history(tmp_path)
+    claude, codex = _m1275_scripts(first_round=8, last_round=9)
+    real = plan_first_loop_module._current_execution_recommendation
+    calls = []
+
+    def recommendation(*args, **kwargs):
+        calls.append(1)
+        return SimpleNamespace(strategy="staged") if len(calls) == 1 else real(*args, **kwargs)
+
+    with patch.object(
+        plan_first_loop_module, "_current_execution_recommendation", recommendation
+    ):
+        rerun, _error, messages = _m1275_resume(
+            tmp_path, history, claude=claude[:1], codex=codex[:1],
+            plan_step_back_escalation_rounds=9, plan_narrow_staged=True,
+            plan_execution_mode="implement-one-shot",
+        )
+
+    revision = _m1251_prompts(rerun, "claude")[0]
+    directive = "Operator directive (orchestrator, not a reviewer finding)"
+    assert directive in revision and _STEP_BACK_ANCHOR_PLANNER in revision
+    assert _STEP_BACK_MARKER not in revision
+    assert any("step-back anchor" in m for m in messages)
+    assert sum(1 for r in _plan_round_records(rerun) if r.step_back_entries) == 1
