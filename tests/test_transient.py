@@ -366,3 +366,14 @@ def test_malformed_only_capture_is_event_shaped_but_plain_text_is_not() -> None:
 def test_no_error_events_is_deterministic() -> None:
     verdict = transient.classify_codex_failure(_stream(_TOOL, _ev(type="turn.started")))
     assert (verdict.source, verdict.category) == ("none", "deterministic")
+
+
+def test_oversized_structured_errors_keep_authority() -> None:
+    big = _ev(type="turn.failed", error={"message": "x" * 30000, "status": 503})
+    v = transient.classify_codex_failure(_stream(big, "ERROR: 401 Unauthorized"))
+    assert (v.source, v.category) == ("structured", "transient")
+    assert len(v.text) < 13000
+    many = [_ev(type="error", message=f"warning {i}: something odd " + "y" * 900) for i in range(40)]
+    many.append(_ev(type="error", message="429 insufficient_quota: check your plan"))
+    v = transient.classify_codex_failure(_stream(*many))
+    assert (v.category, v.billing) == ("non-retryable", True)

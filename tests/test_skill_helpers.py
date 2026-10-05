@@ -7466,3 +7466,14 @@ class TestRunExternalCodexErrorChannel:
         assert self._run(monkeypatch, quota)[0] == 1
         trunc = '{"type":"item.completed","item":{"aggregated_output":"timeout invalid api key'
         assert self._run(monkeypatch, trunc)[0] == 1
+
+    def test_mixed_429_with_stderr_billing_retries(self, monkeypatch) -> None:
+        raw = json.dumps({"type": "error", "message": "429 Too Many Requests: rate limit reached"}) + "\nbilling notice"
+        assert self._run(monkeypatch, raw) == (2, 0)
+
+    def test_numeric_status_variants(self, monkeypatch) -> None:
+        def ev(**err):
+            return json.dumps({"type": "turn.failed", "error": err})
+        assert self._run(monkeypatch, ev(message="request failed", status="503")) == (2, 0)
+        assert self._run(monkeypatch, ev(message="request failed", status=401))[0] == 1
+        assert self._run(monkeypatch, ev(status=429, code="insufficient_quota"))[0] == 1

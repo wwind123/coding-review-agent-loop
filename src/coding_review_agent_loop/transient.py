@@ -132,15 +132,12 @@ def _render_codex_error(error: object) -> CodexStructuredError | None:
     return CodexStructuredError("; ".join(parts), tuple(dict.fromkeys(statuses)))
 
 
-def _bound(items: list, size) -> tuple:
-    kept: list = []
-    total = 0
-    for item in items:
-        total += size(item)
-        if total > _CODEX_BUDGET:
-            break
-        kept.append(item)
-    return tuple(kept)
+def _bounded_text(text: str) -> str:
+    """Head/tail bound for display text only; classification sees every error."""
+    if len(text) <= _CODEX_BUDGET:
+        return text
+    half = _CODEX_BUDGET // 2
+    return f"{text[:half]}\n...\n{text[-half:]}"
 
 
 def extract_codex_error_channel(raw_output: str) -> CodexErrorChannel | None:
@@ -181,10 +178,7 @@ def extract_codex_error_channel(raw_output: str) -> CodexErrorChannel | None:
             stderr.append(stripped)
     if not event_shaped:
         return None
-    return CodexErrorChannel(
-        _bound(structured, lambda e: len(e.rendered)),
-        _bound(stderr, len),
-    )
+    return CodexErrorChannel(tuple(structured), tuple(stderr))
 
 
 def _classify_structured_provider_error(err: CodexStructuredError) -> tuple[str, bool]:
@@ -207,7 +201,7 @@ def classify_codex_failure(raw_output: str) -> ProviderFailureVerdict | None:
         return None
     if channel.structured_errors:
         results = [_classify_structured_provider_error(e) for e in channel.structured_errors]
-        text = "\n".join(e.rendered for e in channel.structured_errors)
+        text = _bounded_text("\n".join(e.rendered for e in channel.structured_errors))
         bad = [r for r in results if r[0] == "non-retryable"]
         if bad:
             return ProviderFailureVerdict(
@@ -217,10 +211,11 @@ def classify_codex_failure(raw_output: str) -> ProviderFailureVerdict | None:
             return ProviderFailureVerdict("transient", False, text, "structured")
         return ProviderFailureVerdict("deterministic", False, text, "structured")
     if channel.stderr_lines:
-        text = "\n".join(channel.stderr_lines)
-        if NON_RETRYABLE_AGENT_OUTPUT_RE.search(text):
+        full = "\n".join(channel.stderr_lines)
+        text = _bounded_text(full)
+        if NON_RETRYABLE_AGENT_OUTPUT_RE.search(full):
             category = "non-retryable"
-        elif TRANSIENT_AGENT_OUTPUT_RE.search(text):
+        elif TRANSIENT_AGENT_OUTPUT_RE.search(full):
             category = "transient"
         else:
             category = "deterministic"
