@@ -22,7 +22,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-xdist>=3", "markdown-it-py>=3"]
+dev = ["pytest>=8", "pytest-xdist>=3", "markdown-it-py>=3", "pyyaml>=6"]
 
 [project.scripts]
 agent-loop = "coding_review_agent_loop.cli:main"

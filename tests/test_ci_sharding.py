@@ -13,16 +13,30 @@ from pathlib import Path
 
 import pytest
 
-import _ci_shard
-import ci_shard_verify
+import importlib.util
+
+import yaml
+
 from fixtures.managed_ci import publisher
 
 pytest_plugins = ["pytester"]
 
 TESTS_DIR = Path(__file__).parent
 ROOT = TESTS_DIR.parent
-WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
-VERIFIER = TESTS_DIR / "ci_shard_verify.py"
+CALLEE_DIR = ROOT / "ci" / "managed"
+# The plugin and verifier are owned by the reusable workflow (ci/managed), not
+# by this repository's tests.  The tests directory still holds transition shims
+# under the same module names, so the verifier is loaded by path.
+if str(CALLEE_DIR) not in sys.path:
+    sys.path.append(str(CALLEE_DIR))
+import ci_shard_plugin as _ci_shard  # noqa: E402
+
+VERIFIER = CALLEE_DIR / "ci_shard_verify.py"
+_spec = importlib.util.spec_from_file_location("callee_ci_shard_verify", VERIFIER)
+ci_shard_verify = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ci_shard_verify)
+ORDINARY_WORKFLOW = ROOT / ".github" / "workflows" / "managed-ci-ordinary.yml"
+MANAGED_WORKFLOW = ROOT / ".github" / "workflows" / "managed-ci.yml"
 HEAD = "b" * 40
 RUN_ID = "4242"
 
@@ -74,13 +88,20 @@ def test_real_collection_is_covered_exactly_once(request):
     if not full:
         pytest.skip("collection not recorded in this process")
     assert full
-    groups = _ci_shard.partition(full, _ci_shard._load_durations(), 3)
+    groups = _ci_shard.partition(full, _ci_shard._load_durations(TESTS_DIR / ".test_durations"), 3)
     _ci_shard.check_exactly_once(groups, full)
 
 
 # --------------------------------------------------------------------------
 # Plugin (pytester)
 # --------------------------------------------------------------------------
+
+# pytester points HOME at a temporary directory, which hides a user-site
+# install of pytest from child interpreters; hand them the directories this
+# process imported pytest and xdist from.
+_INSTALL_DIRS = os.pathsep.join(
+    sorted({str(Path(m.__file__).resolve().parent.parent) for m in (pytest, yaml)})
+)
 
 SUITE = """
 import time
@@ -94,7 +115,9 @@ def test_e(): pass
 
 @pytest.fixture
 def shard_env(monkeypatch):
-    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(TESTS_DIR), os.environ.get("PYTHONPATH", "")]))
+    monkeypatch.setenv(
+        "PYTHONPATH", os.pathsep.join([str(CALLEE_DIR), _INSTALL_DIRS, os.environ.get("PYTHONPATH", "")])
+    )
 
     def apply(**values):
         for key, value in values.items():
@@ -105,7 +128,7 @@ def shard_env(monkeypatch):
 
 def test_plugin_is_inert_without_shard_variables(pytester):
     pytester.makepyfile(test_suite=SUITE)
-    result = pytester.runpytest_inprocess("-p", "_ci_shard", "-q")
+    result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
     result.assert_outcomes(passed=5)
     assert not list(pytester.path.glob("**/*.json"))
 
@@ -124,7 +147,7 @@ def test_plugin_is_inert_without_shard_variables(pytester):
 def test_malformed_shard_configuration_fails_closed(pytester, shard_env, env):
     shard_env(**env)
     pytester.makepyfile(test_suite=SUITE)
-    result = pytester.runpytest_inprocess("-p", "_ci_shard", "-q")
+    result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
     assert result.ret != 0
     result.stderr.fnmatch_lines(["*CI_SHARD*"])
 
@@ -136,7 +159,7 @@ def test_shards_select_disjoint_cover_and_write_manifest(pytester, shard_env, tm
         manifest = tmp_path / f"m{index}" / "manifest.json"
         shard_env(CI_SHARD_INDEX=index, CI_SHARD_COUNT=3, CI_SHARD_MANIFEST=manifest,
                   GITHUB_RUN_ID=RUN_ID, GITHUB_RUN_ATTEMPT=2)
-        pytester.runpytest_inprocess("-p", "_ci_shard", "-q")
+        pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
         data = json.loads(manifest.read_text())
         assert data["schema_version"] == 1
         assert (data["shard_index"], data["shard_count"]) == (index, 3)
@@ -154,7 +177,7 @@ def test_xdist_manifest_is_written_once_and_matches_shard(pytester, shard_env, t
     pytester.makepyfile(test_suite=SUITE)
     manifest = tmp_path / "x" / "manifest.json"
     shard_env(CI_SHARD_INDEX=2, CI_SHARD_COUNT=2, CI_SHARD_MANIFEST=manifest)
-    result = pytester.runpytest_subprocess("-p", "_ci_shard", "-n", "2", "-q")
+    result = pytester.runpytest_subprocess("-p", "ci_shard_plugin", "-n", "2", "-q")
     assert result.ret == 0
     data = json.loads(manifest.read_text())
     assert data["shard_index"] == 2
@@ -180,7 +203,7 @@ def test_d(): pass
 """)
     plain = tmp_path / "plain.json"
     shard_env(CI_SHARD_STORE_DURATIONS=plain)
-    pytester.runpytest_inprocess("-p", "_ci_shard", "-q")
+    pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
     data = json.loads(plain.read_text())
     assert set(data) == {f"test_suite.py::test_{c}" for c in "abcd"}
     assert data["test_suite.py::test_a"] >= 0.15  # setup + call + teardown
@@ -188,7 +211,7 @@ def test_d(): pass
     pytest.importorskip("xdist")
     dist = tmp_path / "dist.json"
     shard_env(CI_SHARD_STORE_DURATIONS=dist)
-    result = pytester.runpytest_subprocess("-p", "_ci_shard", "-n", "2", "-q")
+    result = pytester.runpytest_subprocess("-p", "ci_shard_plugin", "-n", "2", "-q")
     assert result.ret == 0
     data = json.loads(dist.read_text())
     assert set(data) == {f"test_suite.py::test_{c}" for c in "abcd"}
@@ -216,7 +239,7 @@ def test_2(): pass
 def test_3(): pass
 \"\"\")
     # No opt-in: the scrubbed environment keeps the nested session inert.
-    result = pytester.runpytest_inprocess("-p", "_ci_shard", "-q")
+    result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
     result.assert_outcomes(passed=3)
     assert manifest.read_bytes() == before
     assert durations.read_bytes() == seeded
@@ -226,7 +249,7 @@ def test_3(): pass
     monkeypatch.setenv("CI_SHARD_COUNT", "2")
     monkeypatch.setenv("CI_SHARD_MANIFEST", str(private / "manifest.json"))
     monkeypatch.setenv("CI_SHARD_STORE_DURATIONS", str(private / "durations.json"))
-    pytester.runpytest_inprocess("-p", "_ci_shard", "-q")
+    pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
     assert (private / "manifest.json").exists()
     assert (private / "durations.json").exists()
     assert manifest.read_bytes() == before
@@ -256,7 +279,7 @@ def test_nested_sessions_cannot_clobber_outer_sharded_outputs(pytester, shard_en
         CI_SHARD_STORE_DURATIONS=outer_durations, OUTER_MANIFEST=outer_manifest, OUTER_DURATIONS=outer_durations,
         PRIVATE_DIR=private,
     )
-    args = ["-p", "_ci_shard", "-q"] + (["-n", workers] if workers else [])
+    args = ["-p", "ci_shard_plugin", "-q"] + (["-n", workers] if workers else [])
     result = pytester.runpytest_subprocess(*args)
     assert result.ret == 0, result.stdout.str()
     manifest = json.loads(outer_manifest.read_text())
@@ -417,40 +440,36 @@ def test_verifier_module_is_stdlib_only():
 # Connected workflow harness
 # --------------------------------------------------------------------------
 
-
-def _workflow_text():
-    return WORKFLOW.read_text(encoding="utf-8")
+WORKFLOW_SHA = "a" * 40
 
 
-def _job_block(text, job_id):
-    match = re.search(
-        rf"^  {re.escape(job_id)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text, re.S | re.M
-    )
-    assert match, job_id
-    return match.group(1)
+def _jobs(path):
+    return yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"]
 
 
-def _env_block(block):
-    match = re.search(r"^    env:\n((?:      .+\n)+)", block, re.M)
-    if not match:
-        return {}
-    return dict(re.findall(r"^      ([A-Z_]+): (.+)$", match.group(1), re.M))
+def _job_block(workflow, job_id):
+    path = ORDINARY_WORKFLOW if workflow == "ordinary" else MANAGED_WORKFLOW
+    return _jobs(path)[job_id]
 
 
-def _steps(block):
-    body = block.split("    steps:\n", 1)[1]
-    steps = []
-    for chunk in re.split(r"^      - ", body, flags=re.M)[1:]:
-        run = re.search(r"^\s*(?:- )?run: (.+)$", "      - " + chunk, re.M)
-        env_match = re.search(r"^        env:\n((?:          .+\n)+)", chunk, re.M)
-        env = dict(re.findall(r"^          ([A-Z_]+): (.+)$", env_match.group(1), re.M)) if env_match else {}
-        steps.append({"run": run.group(1) if run else None, "env": env,
-                      "text": chunk, "name": (re.match(r"name: (.+)", chunk) or [None, None])[1]})
-    return steps
+def _env_block(job):
+    return {k: str(v) for k, v in (job.get("env") or {}).items()}
 
 
-def _if_expression(block):
-    return re.search(r"^    if: (.+)$", block, re.M).group(1)
+def _steps(job):
+    return [
+        {
+            "run": step.get("run"),
+            "env": {k: str(v) for k, v in (step.get("env") or {}).items()},
+            "name": step.get("name"),
+            "if": step.get("if"),
+        }
+        for step in job["steps"]
+    ]
+
+
+def _if_expression(job):
+    return " ".join(str(job["if"]).split())
 
 
 def _eval_condition(expr, results):
@@ -470,7 +489,9 @@ def _expand(template, context):
     return re.sub(r"\$\{\{\s*([^}]+?)\s*\}\}", lambda m: str(context[m.group(1)]), template)
 
 
-def _run_aggregate(tmp_path, block, results, manifests, *, verifier="real", validate_ok=True):
+def _run_aggregate(
+    tmp_path, job, results, manifests, *, verifier="real", workflow_sha=WORKFLOW_SHA, shards=3
+):
     """Evaluate an aggregate the way Actions would, with per-step environments."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     log = tmp_path / "verifier.log"
@@ -484,23 +505,31 @@ def _run_aggregate(tmp_path, block, results, manifests, *, verifier="real", vali
         "github.sha": HEAD,
         "github.run_id": RUN_ID,
         "needs.validate-managed.outputs.target_sha": HEAD,
+        "inputs.shards": shards,
+        "inputs.python_version": "3.12",
+        "job.workflow_repository": "OWNER/REPO" if workflow_sha is not None else "",
+        "job.workflow_sha": workflow_sha or "",
     })
     outcome = {"ran": False, "gate": None, "verifier_calls": 0, "result": "skipped"}
-    if not _eval_condition(_if_expression(block), results):
+    if not _eval_condition(_if_expression(job), results):
         return outcome
     outcome["ran"] = True
-    job_env = {k: _expand(v, context) for k, v in _env_block(block).items()}
+    job_env = {k: _expand(v, context) for k, v in _env_block(job).items()}
     base_env = {"PATH": os.environ["PATH"]}
-    for step in _steps(block):
+    for step in _steps(job):
         run = step["run"]
         if run is None:
+            continue
+        if step["if"] == "inputs.shards > 1" and shards <= 1:
             continue
         env = {**base_env, **job_env, **{k: _expand(v, context) for k, v in step["env"].items()}}
         command = _expand(run, context)
         if "ci_shard_verify.py" in command:
-            command = command.replace("python tests/ci_shard_verify.py shard-manifests", f'"{spy}" "{directory}"')
-        done = subprocess.run(["bash", "-c", command], env=env, capture_output=True, text=True)
-        if "SHARD_RESULT\" = success" in run:
+            command = command.replace(
+                "python .managed-ci/ci/managed/ci_shard_verify.py shard-manifests", f'"{spy}" "{directory}"'
+            )
+        done = subprocess.run(["bash", "-eo", "pipefail", "-c", command], env=env, capture_output=True, text=True)
+        if 'SHARD_RESULT" = success' in run:
             outcome["gate"] = done.returncode
         if done.returncode != 0:
             outcome["result"] = "failure"
@@ -524,29 +553,30 @@ def _publisher_state(validation_result, aggregate_result):
 
 
 def test_workflow_conditions_are_the_expected_literals():
-    text = _workflow_text()
-    assert _if_expression(_job_block(text, "test")) == "always() && needs.test-shard.result != 'skipped'"
-    assert _if_expression(_job_block(text, "exact-head")) == (
+    assert _if_expression(_job_block("ordinary", "test")) == (
+        "always() && needs.test-shard.result != 'skipped'"
+    )
+    assert _if_expression(_job_block("managed", "exact-head")) == (
         "always() && needs.validate-managed.result == 'success'"
     )
 
 
 def test_ordinary_aggregate_all_success_runs_real_verifier(tmp_path):
-    block = _job_block(_workflow_text(), "test")
+    block = _job_block("ordinary", "test")
     out = _run_aggregate(tmp_path, block, {"test-shard": "success"}, _good())
     assert out == {"ran": True, "gate": 0, "verifier_calls": 1, "result": "success"}
 
 
 @pytest.mark.parametrize("result", ["failure", "cancelled"])
 def test_ordinary_aggregate_fails_at_gate_without_verifier(tmp_path, result):
-    block = _job_block(_workflow_text(), "test")
+    block = _job_block("ordinary", "test")
     for verifier in ("real", "stub"):
         out = _run_aggregate(tmp_path / verifier, block, {"test-shard": result}, _good(), verifier=verifier)
         assert out["result"] == "failure" and out["gate"] != 0 and out["verifier_calls"] == 0
 
 
 def test_ordinary_aggregate_is_skipped_when_routing_suppresses_shards(tmp_path):
-    block = _job_block(_workflow_text(), "test")
+    block = _job_block("ordinary", "test")
     out = _run_aggregate(tmp_path, block, {"test-shard": "skipped"}, _good(), verifier="stub")
     assert out["result"] == "skipped" and out["gate"] is None and out["verifier_calls"] == 0
 
@@ -556,7 +586,7 @@ def test_ordinary_aggregate_is_skipped_when_routing_suppresses_shards(tmp_path):
     ["missing", "substituted", "overlap"],
 )
 def test_ordinary_aggregate_defective_manifests_fail_via_verifier(tmp_path, defect):
-    block = _job_block(_workflow_text(), "test")
+    block = _job_block("ordinary", "test")
     manifests = {
         "missing": _good()[:2],
         "substituted": [_manifest(1, ["a"]), _manifest(2, ["b"]), _manifest(3, ["z"])],
@@ -567,7 +597,7 @@ def test_ordinary_aggregate_defective_manifests_fail_via_verifier(tmp_path, defe
 
 
 def test_managed_aggregate_success_publishes_success(tmp_path):
-    block = _job_block(_workflow_text(), "exact-head")
+    block = _job_block("managed", "exact-head")
     out = _run_aggregate(
         tmp_path, block, {"validate-managed": "success", "exact-head-shard": "success"}, _good()
     )
@@ -578,7 +608,7 @@ def test_managed_aggregate_success_publishes_success(tmp_path):
 @pytest.mark.parametrize("result", NON_SUCCESS)
 @pytest.mark.parametrize("verifier", ["real", "stub"])
 def test_managed_non_success_shard_never_publishes_success(tmp_path, result, verifier):
-    block = _job_block(_workflow_text(), "exact-head")
+    block = _job_block("managed", "exact-head")
     out = _run_aggregate(
         tmp_path, block, {"validate-managed": "success", "exact-head-shard": result}, _good(),
         verifier=verifier,
@@ -590,7 +620,7 @@ def test_managed_non_success_shard_never_publishes_success(tmp_path, result, ver
 
 @pytest.mark.parametrize("defect", ["missing", "substituted"])
 def test_managed_defective_manifests_publish_failure(tmp_path, defect):
-    block = _job_block(_workflow_text(), "exact-head")
+    block = _job_block("managed", "exact-head")
     manifests = (
         _good()[:2] if defect == "missing"
         else [_manifest(1, ["a"]), _manifest(2, ["b"]), _manifest(3, ["z"])]
@@ -603,7 +633,7 @@ def test_managed_defective_manifests_publish_failure(tmp_path, defect):
 
 
 def test_managed_validation_failure_skips_aggregate_and_writes_no_status(tmp_path):
-    block = _job_block(_workflow_text(), "exact-head")
+    block = _job_block("managed", "exact-head")
     out = _run_aggregate(
         tmp_path, block, {"validate-managed": "failure", "exact-head-shard": "skipped"}, _good()
     )
@@ -611,18 +641,36 @@ def test_managed_validation_failure_skips_aggregate_and_writes_no_status(tmp_pat
     assert _publisher_state("failure", out["result"]) is None
 
 
-@pytest.mark.parametrize("job,needs", [("test", "test-shard"), ("exact-head", "exact-head-shard")])
-def test_step_scoped_shard_result_is_detected_by_the_harness(tmp_path, job, needs):
+@pytest.mark.parametrize("workflow,job,needs", [("ordinary", "test", "test-shard"), ("managed", "exact-head", "exact-head-shard")])
+@pytest.mark.parametrize("workflow_sha", [None, "", "not-a-sha", "A" * 40])
+def test_aggregate_fails_closed_without_a_resolved_callee_revision(tmp_path, workflow, job, needs, workflow_sha):
+    """An empty or malformed job.workflow_sha never runs, skips or fakes the verifier."""
+    block = _job_block(workflow, job)
+    results = {needs: "success", "validate-managed": "success"}
+    out = _run_aggregate(tmp_path, block, results, _good(), workflow_sha=workflow_sha)
+    assert out["ran"] and out["gate"] == 0
+    assert out["result"] == "failure" and out["verifier_calls"] == 0
+
+
+@pytest.mark.parametrize("workflow,job,needs", [("ordinary", "test", "test-shard"), ("managed", "exact-head", "exact-head-shard")])
+def test_single_shard_aggregate_keeps_the_literal_gate_and_needs_no_manifests(tmp_path, workflow, job, needs):
+    block = _job_block(workflow, job)
+    ok = _run_aggregate(tmp_path / "ok", block, {needs: "success", "validate-managed": "success"}, [], shards=1)
+    assert ok["result"] == "success" and ok["verifier_calls"] == 0
+    bad = _run_aggregate(tmp_path / "bad", block, {needs: "failure", "validate-managed": "success"}, [], shards=1)
+    assert bad["result"] == "failure" and bad["gate"] != 0
+
+
+@pytest.mark.parametrize("workflow,job,needs", [("ordinary", "test", "test-shard"), ("managed", "exact-head", "exact-head-shard")])
+def test_step_scoped_shard_result_is_detected_by_the_harness(tmp_path, workflow, job, needs):
     """A SHARD_RESULT defined only in the gate step leaves the verifier empty."""
-    block = _job_block(_workflow_text(), job)
-    line = f"      SHARD_RESULT: ${{{{ needs.{needs}.result }}}}\n"
-    assert line in block
-    broken = block.replace("    env:\n" + line, "")
-    broken = broken.replace(
-        "        run: test \"$SHARD_RESULT\" = success",
-        "        env:\n          SHARD_RESULT: ${{ needs." + needs + ".result }}\n"
-        "        run: test \"$SHARD_RESULT\" = success",
-    )
+    import copy
+
+    block = _job_block(workflow, job)
+    assert block["env"]["SHARD_RESULT"] == "${{ needs." + needs + ".result }}"
+    broken = copy.deepcopy(block)
+    del broken["env"]["SHARD_RESULT"]
+    broken["steps"][0]["env"] = {"SHARD_RESULT": "${{ needs." + needs + ".result }}"}
     results = {needs: "success", "validate-managed": "success"}
     assert _run_aggregate(tmp_path / "ok", block, results, _good())["result"] == "success"
     out = _run_aggregate(tmp_path / "bad", broken, results, _good())
@@ -642,3 +690,124 @@ def test_committed_durations_cover_most_of_the_real_collection(request):
         pytest.skip("only meaningful when the whole suite is collected")
     known = sum(1 for i in full if i in durations)
     assert known / len(full) > 0.9, "refresh tests/.test_durations (see README)"
+
+
+# --------------------------------------------------------------------------
+# Stage-A transition compatibility: old workflow (shim only), new callee
+# (injection only), and both at once
+# --------------------------------------------------------------------------
+
+SHIM_CONFTEST = 'pytest_plugins = ["_ci_shard"]\n'
+PLUGIN_COUNT_CONFTEST = """
+import json
+import os
+import pytest
+
+pytest_plugins = ["_ci_shard"]
+
+
+def pytest_sessionfinish(session):
+    manager = session.config.pluginmanager
+    count = sum(1 for p in manager.get_plugins() if getattr(p, "__name__", "") == "ci_shard_plugin")
+    names = sorted(n for n, p in manager.list_name_plugin() if getattr(p, "__name__", "") == "ci_shard_plugin")
+    with open(os.environ["PLUGIN_COUNT_FILE"], "a") as handle:
+        handle.write(json.dumps({"count": count, "names": names}) + "\\n")
+"""
+
+
+@pytest.fixture
+def transition_env(monkeypatch):
+    # Both directories, like the repository (tests/) plus the injected callee.
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join([str(TESTS_DIR), str(CALLEE_DIR), _INSTALL_DIRS, os.environ.get("PYTHONPATH", "")]),
+    )
+    monkeypatch.setenv("GITHUB_RUN_ID", RUN_ID)
+
+
+@pytest.mark.parametrize("mode", ["old-workflow-shim-only", "new-callee-injection-only", "injection-and-shim"])
+def test_stage_a_head_writes_one_verifiable_manifest_per_leg_in_every_mode(
+    pytester, transition_env, monkeypatch, tmp_path, mode
+):
+    if mode == "new-callee-injection-only":
+        pytester.makeconftest("")
+        extra = ["-p", "ci_shard_plugin"]
+    elif mode == "old-workflow-shim-only":
+        pytester.makeconftest(PLUGIN_COUNT_CONFTEST)
+        extra = []
+    else:
+        pytester.makeconftest(PLUGIN_COUNT_CONFTEST)
+        extra = ["-p", "ci_shard_plugin"]
+    pytester.makepyfile(test_suite=SUITE)
+    counts = tmp_path / "count.jsonl"
+    monkeypatch.setenv("PLUGIN_COUNT_FILE", str(counts))
+    manifests = tmp_path / "manifests"
+    for index in (1, 2, 3):
+        monkeypatch.setenv("CI_SHARD_INDEX", str(index))
+        monkeypatch.setenv("CI_SHARD_COUNT", "3")
+        monkeypatch.setenv("CI_SHARD_MANIFEST", str(manifests / f"m{index}" / "manifest.json"))
+        result = pytester.runpytest_subprocess(*extra, "-q")
+        assert result.ret in (0, 5), result.stdout.str() + result.stderr.str()
+    written = sorted(manifests.glob("*/manifest.json"))
+    assert len(written) == 3
+    for path in written:
+        data = json.loads(path.read_text())
+        assert tuple(sorted(data)) == tuple(sorted(ci_shard_verify.MANIFEST_FIELDS))
+        assert data["schema_version"] == 1
+    # The unchanged schema is accepted by the verifier; the shim's CLI (the
+    # historical import path) agrees with the callee-owned one.
+    head = json.loads(written[0].read_text())["head_sha"]
+    for verifier in (VERIFIER, TESTS_DIR / "ci_shard_verify.py"):
+        done = subprocess.run(
+            [sys.executable, str(verifier), str(manifests), "--count", "3", "--head", head,
+             "--run-id", RUN_ID, "--result", "success"],
+            capture_output=True, text=True,
+        )
+        assert done.returncode == 0, done.stderr
+    if counts.exists():
+        for line in counts.read_text().splitlines():
+            recorded = json.loads(line)
+            assert recorded["count"] == 1 and recorded["names"] == ["ci_shard_plugin"], recorded
+
+
+def test_shim_defaults_to_the_committed_durations_but_explicit_file_wins(monkeypatch, tmp_path):
+    import _ci_shard as shim
+
+    assert shim._plugin is _ci_shard
+    assert _ci_shard.DEFAULT_DURATIONS == TESTS_DIR / ".test_durations"
+    explicit = tmp_path / "d.json"
+    explicit.write_text('{"x": 5.0}')
+    assert _ci_shard._load_durations(explicit) == {"x": 5.0}
+    assert _ci_shard._load_durations() == _ci_shard._load_durations(TESTS_DIR / ".test_durations")
+    config = _ci_shard.parse_env({"CI_SHARD_DURATIONS": str(explicit)})
+    assert config.durations == str(explicit)
+
+
+def test_shim_exports_no_pytest_hooks_or_fixtures():
+    import _ci_shard as shim
+
+    leaked = [
+        name for name, value in vars(shim).items()
+        if name.startswith("pytest_") and name != "pytest_configure"
+    ]
+    assert leaked == []
+    assert not hasattr(shim, "_scrub_ci_shard_environment")
+
+
+def test_callee_files_depend_only_on_the_standard_library_and_pytest():
+    """The injected plugin must not depend on this repository's tests helpers."""
+    import ast
+
+    for name, allowed in (
+        ("ci_shard_plugin.py", {"pytest"}),
+        ("ci_shard_verify.py", set()),
+        ("run_shard.py", set()),
+    ):
+        tree = ast.parse((CALLEE_DIR / name).read_text())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        assert imported <= set(sys.stdlib_module_names) | {"__future__"} | allowed, (name, imported)

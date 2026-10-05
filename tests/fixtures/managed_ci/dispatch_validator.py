@@ -1,9 +1,9 @@
 """Extraction-bounded copy of the workflow's v2 dispatch validator.
 
 Source repository: wwind123/coding-review-agent-loop
-Source commit: 1dde616f1f1b8274994548306f4ca255a9c98786
-Source block SHA-256: 4ec4a65cdd9026144a7e05972cb450d14258542ed14e9fec8ec5221ee92deaf8
-Source path: .github/workflows/ci.yml
+Source commit: b9be3320a11ae9bb610d027e07565e35ef82c0a2
+Source block SHA-256: c1abdfa09b3a598e4e819023f2acab3033b541076ff63888fa34b978698bda2c
+Source path: .github/workflows/managed-ci.yml
 Extraction boundary: ``validate_dispatch`` through its return value.
 The contract tests invoke this copy with offline API callbacks and compare its
 source block to the workflow so identity and input checks remain production-linked.
@@ -15,7 +15,7 @@ import re
 
 # BEGIN MANAGED_CI_V2_DISPATCH_VALIDATOR
 # Source repository: wwind123/coding-review-agent-loop
-# Source path: .github/workflows/ci.yml
+# Source path: .github/workflows/managed-ci.yml
 # Extraction boundary: validate_dispatch() through its return value.
 # A dispatch intent must be no more than 15 minutes old and may be at most 5
 # minutes ahead of the runner clock. The producer creates the record
@@ -35,8 +35,6 @@ def validate_dispatch(
         and re.fullmatch(r'[A-Za-z0-9_-]{32}', nonce or '')
     ):
         raise ValueError('managed dispatch inputs must be complete protocol-v2 values')
-    if ref != 'refs/heads/main':
-        raise ValueError('managed dispatch must execute the base workflow from main')
     if not re.fullmatch(r'[1-9][0-9]*', current_run_id or ''):
         raise ValueError('managed dispatch run ID is invalid')
     if not re.fullmatch(r'[1-9][0-9]*', current_run_attempt or ''):
@@ -70,15 +68,27 @@ def validate_dispatch(
         or live_repo.get('full_name', '').casefold() != repo.casefold()
     ):
         raise ValueError('managed dispatch repository identity could not be validated')
+    # The trusted workflow always executes from the live default branch.
+    default_branch = live_repo.get('default_branch')
+    if (
+        not isinstance(default_branch, str)
+        or not re.fullmatch(r'[A-Za-z0-9._/-]+', default_branch)
+        or '..' in default_branch
+        or default_branch.startswith('/')
+        or default_branch.endswith('/')
+    ):
+        raise ValueError('managed dispatch default branch is unavailable')
+    if ref != 'refs/heads/' + default_branch:
+        raise ValueError('managed dispatch must execute the base workflow from the default branch')
     pr = api_json('repos/' + repo + '/pulls/' + pr_number_text)
-    base_commit = api_json('repos/' + repo + '/commits/main')
+    base_commit = api_json('repos/' + repo + '/commits/' + default_branch)
     revision = base_commit.get('sha') if isinstance(base_commit, dict) else None
     if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40}', revision):
         raise ValueError('managed dispatch base workflow revision is unavailable')
     pages = api_pages('repos/' + repo + '/issues/' + pr_number_text + '/comments?per_page=100')
     record = validate(
         pr, pages, repo, pr_number_text, expected_head, nonce,
-        live_login, revision, live_id,
+        live_login, revision, live_id, default_branch=default_branch,
     )
     intent_age = current_time - record['created_at']
     if intent_age > MAX_INTENT_AGE_SECONDS:

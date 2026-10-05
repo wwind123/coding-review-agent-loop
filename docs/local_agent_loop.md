@@ -4149,7 +4149,36 @@ if a manifest is missing (for example expired artifacts) it asks for "Re-run
 all jobs". The partition uses `tests/.test_durations`; refresh it when balance
 drifts with
 `CI_SHARD_STORE_DURATIONS=tests/.test_durations python -m pytest -n auto`.
-Drift affects balance only, never coverage. The publisher writes `final-ci/exact-head` only for
+Drift affects balance only, never coverage.
+
+The validator, exact-head shards, aggregate and publisher live in the reusable
+workflow `.github/workflows/managed-ci.yml` (`on: workflow_call`), and the
+read-only ordinary suite in `.github/workflows/managed-ci-ordinary.yml`; this
+repository's `ci.yml` is a thin caller with two jobs. `ci` (push,
+`pull_request`, all-empty manual dispatch) calls the ordinary workflow with
+`contents: read` only, so fork runs request no write scope. `managed` (a
+dispatch with any non-empty managed input) calls the managed workflow with
+`actions`, `contents`, `issues` and `pull-requests` read plus `statuses: write`;
+each callee job declares its own narrower permissions and only the publisher
+holds `statuses: write`. The caller keeps `run-name`, the `workflow_dispatch`
+input declarations and the readiness markers, and forwards the four managed
+inputs; the callee requires each forwarded value to equal the dispatch event's
+own input, so a caller cannot validate one tuple and test another. Callee
+inputs are limited to project parameters (`test_command`, `install_command`,
+`python_version`, `shards`, `durations_file`); the trusted actor comes from the
+caller repository's `AGENT_LOOP_MANAGED_ACTOR` variable and the default branch
+from the live repository API, so no input can weaken a check. The dispatch must
+execute from `refs/heads/<default branch>` and the intent's `workflow_revision`
+is bound to that branch's head. Sharding is portable: the callee checks out
+`ci/managed` from `job.workflow_repository` at `job.workflow_sha` (an empty
+context fails closed), and every leg runs `ci/managed/run_shard.py`, which
+injects `ci_shard_plugin` with `-p`. With `shards: 1` the command runs unchanged
+and only the literal result gate applies. The reusable jobs surface as
+`ci / ...` and `managed / ...` checks, so a branch-protection rule that
+requires the old bare check names must be updated at rollout. Until the default
+branch itself runs the reusable workflow, `tests/_ci_shard.py` and
+`tests/ci_shard_verify.py` remain as transition shims for the installed
+workflow. The publisher writes `final-ci/exact-head` only for
 that validated SHA and correlates its terminal description and Actions URL to
 the managed nonce, run ID, and current attempt. It writes nothing when
 authorization fails before a target exists, and publishes failure when

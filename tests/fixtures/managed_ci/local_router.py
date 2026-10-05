@@ -1,8 +1,8 @@
 """Extraction-bounded copy of this repository's production v2 validator.
 
 Source repository: wwind123/coding-review-agent-loop
-Source commit: eaaeb666c6f9b1346643ad00b7d065df9ad95d75
-Source path: .github/workflows/ci.yml
+Source commit: b9be3320a11ae9bb610d027e07565e35ef82c0a2
+Source path: .github/workflows/managed-ci.yml
 Extraction boundary: the ``MANAGED_CI_V2_VALIDATOR`` block.
 The contract test compares this fixture to the workflow block after YAML
 indentation is removed.  The independent current and historical consumers
@@ -15,11 +15,12 @@ import re
 
 # BEGIN MANAGED_CI_V2_VALIDATOR
 # Source repository: wwind123/coding-review-agent-loop
-# Source path: .github/workflows/ci.yml
+# Source path: .github/workflows/managed-ci.yml
 # Extraction boundary: validate() through its closing assertion.
 # This block is copied verbatim into tests/fixtures/managed_ci/local_router.py.
 def validate(
-    pr, pages, repo, num, sha, nonce, actor, revision, actor_id=None
+    pr, pages, repo, num, sha, nonce, actor, revision, actor_id=None,
+    default_branch=None,
 ):
     def fail(reason):
         raise ValueError(reason)
@@ -32,6 +33,11 @@ def validate(
         if type(value) is not str or (pattern and not re.fullmatch(pattern, value)):
             fail('invalid ' + name)
 
+    # The live repository default branch, never a literal: a project's
+    # default branch is whatever the repository API reports (#1210).
+    exact_string(default_branch, 'default_branch', r'[A-Za-z0-9._/-]+')
+    if '..' in default_branch or default_branch.startswith('/') or default_branch.endswith('/'):
+        fail('invalid default_branch')
     if not isinstance(pr, dict):
         fail('live PR response is not an object')
     labels = {
@@ -40,8 +46,8 @@ def validate(
     }
     if pr.get('state') != 'open' or pr.get('draft') is not True:
         fail('live PR is not an open draft')
-    if pr.get('base', {}).get('ref') != 'main':
-        fail('live PR base is not main')
+    if pr.get('base', {}).get('ref') != default_branch:
+        fail('live PR base is not the default branch')
     if pr.get('head', {}).get('sha') != sha:
         fail('live PR head drifted')
     if (pr.get('head', {}).get('repo') or {}).get('full_name') != repo:
@@ -193,7 +199,7 @@ def validate(
                 'repository': repo,
                 'pr': int(num),
                 'expected_head_sha': sha,
-                'base_ref': 'main',
+                'base_ref': default_branch,
                 'workflow_revision': revision,
                 'nonce': nonce,
             }
