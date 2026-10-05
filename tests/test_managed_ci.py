@@ -1804,6 +1804,14 @@ def test_issue_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
     err = capsys.readouterr().err
     assert "Round 1: Claude repairing failed CI" in err
     assert "addressing reviewer feedback" not in err
+    # #1273: the managed exact-head repair dispatch carries the standing guidance
+    # and a history block (a round-1 failure is current-round, so none is listed yet).
+    repair_prompts = [
+        "\n".join(cmd) for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"
+    ]
+    assert len(repair_prompts) == 1
+    assert "Proactive generalization" in repair_prompts[0]
+    assert "no earlier-round findings or fixes" in repair_prompts[0]
 
 
 def test_round_metadata_selection_requires_current_ordered_transition(tmp_path):

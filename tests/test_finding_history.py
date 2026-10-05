@@ -604,3 +604,93 @@ def test_replay_carries_updated_subitem_state_into_a_later_group():
     assert canonical_history_item_outcomes(
         [seed, partial], reconciliation_mode="aggregate", same_status="same-pr"
     ) == {"item-1": "active"}
+
+
+def test_semantic_patch_planner_prompt_orders_history_before_step_back(tmp_path):
+    config = make_config(tmp_path)
+    view = _history_view()
+    step_back = PlanStepBackContext(
+        measurements="m", findings=("f",), execution_mode="implement-one-shot", streak=2
+    )
+    kwargs = dict(
+        response_form="semantic-patch-v1", base_round_number=1, base_state_identity="abc"
+    )
+    base = build_plan_revision_prompt(56, 3, "previous plan", "the review", config, **kwargs)
+    assert "Proactive generalization" not in base
+    prompt = build_plan_revision_prompt(
+        56, 3, "previous plan", "the review", config,
+        generalization_guidance=True, finding_history=view, step_back_context=step_back,
+        **kwargs,
+    )
+    assert prompt.count("Codex finding item-1 (resolved)") == 1
+    assert (
+        prompt.index("Proactive generalization")
+        < prompt.index("Codex finding item-1")
+        < prompt.index("STEP-BACK REVISION")
+        < prompt.index("the review")
+    )
+
+
+def test_full_and_compact_planner_prompts_order_guidance_before_step_back(tmp_path):
+    config = make_config(tmp_path)
+    view = _history_view()
+    step_back = PlanStepBackContext(
+        measurements="m", findings=("f",), execution_mode="implement-one-shot", streak=2
+    )
+    for extra in ({}, {"compact_context": True}):
+        prompt = build_plan_revision_prompt(
+            56, 3, "previous plan", "the review", config,
+            generalization_guidance=True, finding_history=view, step_back_context=step_back,
+            **extra,
+        )
+        assert prompt.index("Proactive generalization") < prompt.index("STEP-BACK REVISION")
+        assert prompt.index("Codex finding item-1") < prompt.index("STEP-BACK REVISION")
+
+
+def test_owner_scoped_replay_carries_the_earlier_subitem_closure_into_the_next_group(
+    monkeypatch,
+):
+    """Round 3 never repeats the round-2 closure of `a`, yet its candidate has `a` closed."""
+    from coding_review_agent_loop import round_state
+
+    item = _item(
+        "item-1",
+        resolution_owners=("Codex",),
+        sub_items=(ReviewSubItem("a", "x"), ReviewSubItem("b", "y")),
+    )
+    seed = _record(0, "reviewer", 1, subject="h0", state="blocking", new_items=(item,))
+    closes_a = _record(
+        1, "reviewer", 2, agent="Codex", subject="h1", state="blocking",
+        dispositions=(
+            ReviewItemDisposition(
+                "item-1", "Codex", "blocking", "b remains",
+                sub_item_dispositions=(("a", "resolved"), ("b", "unresolved")),
+            ),
+        ),
+    )
+    closes_b = _record(
+        2, "reviewer", 3, agent="Codex", subject="h2", state="blocking",
+        dispositions=(
+            ReviewItemDisposition(
+                "item-1", "Codex", "blocking", "closing b",
+                sub_item_dispositions=(("b", "resolved"),),
+            ),
+        ),
+    )
+    seen = []
+    real = round_state._apply_unresolved_item_dispositions
+
+    def spy(candidates, *args, **kwargs):
+        seen.append(
+            {c.item_id: {s.sub_item_id: s.status for s in c.sub_items} for c in candidates}
+        )
+        assert kwargs["reconciliation_mode"] == "owner-scoped"
+        assert kwargs["retain_future"] is False
+        return real(candidates, *args, **kwargs)
+
+    monkeypatch.setattr(round_state, "_apply_unresolved_item_dispositions", spy)
+    canonical_history_item_outcomes(
+        [seed, closes_a, closes_b], reconciliation_mode="owner-scoped", same_status="same-pr"
+    )
+    assert seen[0]["item-1"] == {"a": "open", "b": "open"}
+    assert seen[1]["item-1"] == {"a": "resolved", "b": "open"}

@@ -18133,3 +18133,116 @@ def test_deferred_finding_stays_deferred_across_ci_repair_dispatches_and_on_repl
     resumed.seed(records, outcomes=outcomes)
     resumed.observe_reconciled([])
     assert "Codex finding item-2 (deferred)" in resumed.view(99).body
+
+
+def test_deferred_finding_survives_a_real_resume_and_reintroduction_flips_it_open(
+    tmp_path, monkeypatch
+):
+    """`deferred-status-sticky`: stop after two dispatches, resume run_pr_loop, reintroduce."""
+    import dataclasses as dc
+
+    from coding_review_agent_loop.errors import AgentLoopError
+    from coding_review_agent_loop.github import get_pr_review_context
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata,
+        PostedRoundRecord,
+        _extract_round_metadata_records,
+        canonical_history_item_outcomes,
+    )
+
+    runner = FakeRunner(
+        codex_outputs=[
+            "Two gaps."
+            + blocking_issues("Gap one in src/a.py:10", "Gap two in src/b.py:20")
+            + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Defer gap two."
+            + prior_item_dispositions(
+                "[item-1] resolved", "[item-2] future follow-up: separate follow-up work"
+            )
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Still only CI."
+            + prior_item_dispositions("[item-3] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Done."
+            + prior_item_dispositions("[item-3] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=[
+            "Fixed one.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Fixed CI 1.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Fixed CI 2.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+    )
+    counter = iter(range(1, 10))
+    original = orchestrator._run_validated_agent
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+
+    def boards(*_a, **_k):
+        head = runner.pr_payload["headRefOid"]
+        if head in {"repaired-3", "abc123"}:
+            return _watch_check_board("passing")
+        failed = PullRequestCheck(
+            name=f"check-{head}", kind="check_run", status="failure",
+            url=f"https://example.test/{head}",
+        )
+        return _watch_check_board("failing", failing=(failed,))
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    first = make_config(
+        tmp_path, watch_pending_ci=True, max_rounds=3, pr_review_context_mode="compact"
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=first)
+    claude_after_first = [
+        cmd for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"
+    ]
+    assert len(claude_after_first) == 2
+
+    second = make_config(
+        tmp_path, watch_pending_ci=True, max_rounds=6, pr_review_context_mode="compact"
+    )
+    assert run_pr_loop(runner, pr_number=77, config=second) == 0
+    prompts = [
+        "\n".join(cmd) for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"
+    ]
+    assert len(prompts) == 3
+    # The third dispatch ran in a NEW invocation, seeded only from published records.
+    assert "Codex finding item-2 (deferred) src/b.py:20" in prompts[2]
+    assert "Codex finding item-1 (resolved) src/a.py:10" in prompts[2]
+
+    records = _extract_round_metadata_records(
+        get_pr_review_context(runner, config=second, pr_number=77).comments, flow="pr"
+    )
+    before = canonical_history_item_outcomes(
+        records, reconciliation_mode="aggregate", same_status="same-pr"
+    )
+    assert before["item-2"] == "deferred"
+    item2 = next(
+        item
+        for record in records
+        for item in record.metadata.new_items
+        if item.item_id == "item-2"
+    )
+    reintroduced = PostedRoundRecord(
+        index=max(record.index for record in records) + 1,
+        metadata=PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=99, subject="late",
+            prior_items=(dc.replace(item2, status="blocking", source_status="blocking"),),
+        ),
+        body="",
+    )
+    after = canonical_history_item_outcomes(
+        [*records, reintroduced], reconciliation_mode="aggregate", same_status="same-pr"
+    )
+    assert after["item-2"] == "active"
