@@ -19,8 +19,10 @@ a resumed run agree at exactly K and M.  A malformed entry marks the history
 
 from __future__ import annotations
 
+import dataclasses
 import json
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -486,3 +488,872 @@ def step_back_alternative_summary(
         summary = payload.get("summary") if isinstance(payload, dict) else None
         return summary if isinstance(summary, str) else None
     return None
+
+
+# ---------------------------------------------------------------------------
+# PR fix-loop step-back (#1251, stage 2)
+#
+# Finding locations are ``path:start[-end]`` references in finding text.  They
+# are bound to the head their review was taken on and compared across heads by
+# mapping a *anchor* through ``git diff`` hunks.  One membership predicate,
+# :func:`in_cluster`, governs clustering, escalation and clearance.
+# ---------------------------------------------------------------------------
+
+OUTCOME_SHIFTED = "SHIFTED"
+OUTCOME_REWRITTEN = "REWRITTEN"
+OUTCOME_UNMAPPABLE = "UNMAPPABLE"
+
+_LOCATION_RE = re.compile(
+    r"(?<![\w./:@-])"
+    r"((?:[\w.\-]+/)*[\w\-][\w.\-]*)"
+    r":(\d+)(?:\s*[-\u2013]\s*(\d+))?(?!\d)"
+)
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+@dataclass(frozen=True)
+class FindingLocation:
+    """One ``path:start-end`` reference projected from a finding.
+
+    ``item_id`` is always the parent finding's identity; ``sub_item_id`` is set
+    when the reference came from a sub-item statement.
+    """
+
+    path: str
+    start: int
+    end: int
+    item_id: str
+    sub_item_id: str | None = None
+
+
+def _looks_like_repo_path(path: str) -> bool:
+    """Any repository-relative path: extensionless files (``run``, ``Makefile``) are
+    valid.  Absolute paths are excluded here and URLs by the pattern's lookbehind."""
+    return bool(path) and not path.startswith("/")
+
+
+def _scan_locations(
+    text: str, *, item_id: str, sub_item_id: str | None
+) -> list[FindingLocation]:
+    found: list[FindingLocation] = []
+    for match in _LOCATION_RE.finditer(text or ""):
+        if not _looks_like_repo_path(match.group(1)):
+            continue
+        start = int(match.group(2))
+        end = int(match.group(3)) if match.group(3) else start
+        if start < 1:
+            continue
+        if end < start:
+            start, end = end, start
+        found.append(FindingLocation(match.group(1), start, end, item_id, sub_item_id))
+    return found
+
+
+def project_finding_locations(item: object) -> tuple[FindingLocation, ...]:
+    """Locations in a finding's text, ``fix_scope`` entries and open sub-items.
+
+    References without a line are ignored.  Sub-item locations keep the parent
+    item identity, so one finding can contribute several locations.
+    """
+    item_id = str(getattr(item, "item_id", ""))
+    locations = _scan_locations(
+        str(getattr(item, "text", "") or ""), item_id=item_id, sub_item_id=None
+    )
+    for entry in getattr(item, "fix_scope", None) or ():
+        locations.extend(_scan_locations(str(entry), item_id=item_id, sub_item_id=None))
+    for sub in getattr(item, "sub_items", None) or ():
+        if getattr(sub, "status", "open") == "resolved":
+            continue
+        locations.extend(
+            _scan_locations(
+                str(getattr(sub, "text", "") or ""),
+                item_id=item_id,
+                sub_item_id=str(getattr(sub, "sub_item_id", "")),
+            )
+        )
+    seen: set[tuple[str, int, int, str | None]] = set()
+    unique: list[FindingLocation] = []
+    for location in locations:
+        key = (location.path, location.start, location.end, location.sub_item_id)
+        if key not in seen:
+            seen.add(key)
+            unique.append(location)
+    return tuple(unique)
+
+
+@dataclass(frozen=True)
+class AnchorMapping:
+    """Where an anchor lives on another head, with an explicit outcome."""
+
+    outcome: str
+    original_path: str
+    path: str
+    start: int
+    end: int
+    reason: str = ""
+
+    @property
+    def mappable(self) -> bool:
+        return self.outcome != OUTCOME_UNMAPPABLE
+
+
+@dataclass(frozen=True)
+class Hunk:
+    old_start: int
+    old_count: int
+    new_start: int
+    new_count: int
+
+    @property
+    def old_end(self) -> int:
+        return self.old_start + self.old_count - 1
+
+
+def _name_status_records(text: str) -> list[tuple[str, list[str]]]:
+    """``(status, paths)`` records from ``--name-status``, NUL-delimited (``-z``) or
+    tab-delimited."""
+    records: list[tuple[str, list[str]]] = []
+    if "\0" in (text or ""):
+        tokens = [token for token in text.split("\0")]
+        index = 0
+        while index < len(tokens) and tokens[index]:
+            status = tokens[index]
+            width = 2 if status[:1] in {"R", "C"} else 1
+            records.append((status, tokens[index + 1 : index + 1 + width]))
+            index += 1 + width
+        return records
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0]:
+            records.append((parts[0], parts[1:]))
+    return records
+
+
+def parse_name_status(text: str) -> tuple[dict[str, str], frozenset[str]]:
+    """``(renames old->new, deleted paths)`` from ``git diff --name-status -M``."""
+    renames: dict[str, str] = {}
+    deleted: set[str] = set()
+    for status, paths in _name_status_records(text):
+        if status[:1] == "R" and len(paths) >= 2:
+            renames[paths[0]] = paths[1]
+        elif status[:1] == "D" and paths:
+            deleted.add(paths[0])
+    return renames, frozenset(deleted)
+
+
+def name_status_changed_paths(text: str) -> frozenset[str]:
+    """Every path a ``--name-status`` listing names as changed (old and new sides)."""
+    return frozenset(
+        path
+        for status, paths in _name_status_records(text)
+        if status[:1] != "C"
+        for path in paths
+    )
+
+
+def select_file_diff(text: str, old_path: str, new_path: str) -> str | None:
+    """The section of a multi-file diff for exactly ``old_path`` -> ``new_path``.
+
+    A pathspec naming both sides of a rename can also return other file
+    identities (a rename chain), so hunks are taken only from the matching
+    ``diff --git`` section.  Output with no section headers is one file's hunks;
+    ``None`` means sections exist but none belongs to this pair.
+    """
+    lines = (text or "").splitlines()
+    if not any(line.startswith("diff --git ") for line in lines):
+        return text or ""
+    header = f"diff --git a/{old_path} b/{new_path}"
+    selected: list[str] = []
+    matched = False
+    active = False
+    for line in lines:
+        if line.startswith("diff --git "):
+            active = line == header
+            matched = matched or active
+        if active:
+            selected.append(line)
+    return "\n".join(selected) if matched else None
+
+
+def parse_zero_context_hunks(text: str) -> tuple[Hunk, ...]:
+    """Hunks of a ``git diff -U0`` output, in order."""
+    hunks: list[Hunk] = []
+    for line in (text or "").splitlines():
+        match = _HUNK_RE.match(line)
+        if match is None:
+            continue
+        hunks.append(
+            Hunk(
+                int(match.group(1)),
+                1 if match.group(2) is None else int(match.group(2)),
+                int(match.group(3)),
+                1 if match.group(4) is None else int(match.group(4)),
+            )
+        )
+    return tuple(hunks)
+
+
+def _unmappable(path: str, start: int, end: int, reason: str, new_path: str | None = None):
+    return AnchorMapping(OUTCOME_UNMAPPABLE, path, new_path or path, start, end, reason)
+
+
+def map_anchor(
+    path: str,
+    start: int,
+    end: int,
+    window: int,
+    *,
+    name_status: str | None,
+    diff_text: str | None,
+) -> AnchorMapping:
+    """Map ``path:start-end`` across a diff, identity-preserving.
+
+    SHIFTED: the range lies in unchanged lines and moves by the cumulative hunk
+    offset.  REWRITTEN: changed hunks overlap it, their old side stays within
+    ``[start - window, end + window]`` and the new side is not empty; the range
+    maps to the replacement span.  UNMAPPABLE: the file was deleted with no
+    rename pair, the rewrite spills beyond the window, the new side is empty
+    (a deletion, which includes a move elsewhere), or the diff failed.  Ranges
+    are never widened to a whole hunk beyond the window.
+    """
+    if name_status is None:
+        return _unmappable(path, start, end, "the diff could not be read")
+    renames, deleted = parse_name_status(name_status)
+    new_path = renames.get(path, path)
+    if new_path == path and path in deleted:
+        return _unmappable(path, start, end, "the file was deleted with no rename pair")
+    if diff_text is None:
+        # Keep a known rename destination so the same-path fallback still works.
+        return _unmappable(path, start, end, "the diff could not be read", new_path)
+    section = select_file_diff(diff_text, path, new_path)
+    if section is None:
+        if {path, new_path} & name_status_changed_paths(name_status):
+            # The listing says the file changed but its diff section was not found
+            # (for example a quoted path): never read that as "unchanged".
+            return _unmappable(
+                path, start, end, "the changed file's diff section was not found", new_path
+            )
+        section = ""
+    hunks = parse_zero_context_hunks(section)
+    offset_before = 0
+    overlapping: list[Hunk] = []
+    for hunk in hunks:
+        if hunk.old_count == 0:
+            # Pure insertion after old line ``old_start``.
+            if hunk.old_start < start:
+                offset_before += hunk.new_count
+            elif hunk.old_start < end:
+                overlapping.append(hunk)
+            continue
+        if hunk.old_end < start:
+            offset_before += hunk.new_count - hunk.old_count
+        elif hunk.old_start <= end:
+            overlapping.append(hunk)
+    if not overlapping:
+        return AnchorMapping(
+            OUTCOME_SHIFTED, path, new_path, start + offset_before, end + offset_before
+        )
+    low = min(h.old_start for h in overlapping)
+    high = max(max(h.old_end, h.old_start) for h in overlapping)
+    if low < start - window or high > end + window:
+        return _unmappable(
+            path, start, end, "the anchor was rewritten together with unrelated code", new_path
+        )
+    if sum(h.new_count for h in overlapping) == 0:
+        return _unmappable(
+            path, start, end, "the anchored code was deleted or moved elsewhere", new_path
+        )
+    first, last = overlapping[0], overlapping[-1]
+    delta_inside = sum(h.new_count - h.old_count for h in overlapping)
+    new_first = first.new_start if first.new_count > 0 else first.new_start + 1
+    new_last = (
+        last.new_start + last.new_count - 1 if last.new_count > 0 else last.new_start
+    )
+    mapped_start = start + offset_before if start < first.old_start else new_first
+    last_old_end = max(last.old_end, last.old_start)
+    mapped_end = end + offset_before + delta_inside if end > last_old_end else new_last
+    mapped_start = max(1, mapped_start)
+    return AnchorMapping(
+        OUTCOME_REWRITTEN, path, new_path, mapped_start, max(mapped_start, mapped_end)
+    )
+
+
+def in_cluster(location: FindingLocation, mapping: AnchorMapping, window: int) -> bool:
+    """The single membership predicate for clustering, escalation and clearance.
+
+    A mappable anchor admits locations on the mapped path within the mapped span
+    +/- ``window``.  An UNMAPPABLE anchor admits any location on its original or
+    rename-destination path (the conservative, logged fallback).
+    """
+    if mapping.outcome == OUTCOME_UNMAPPABLE:
+        return location.path in {mapping.original_path, mapping.path}
+    return (
+        location.path == mapping.path
+        and location.end >= mapping.start - window
+        and location.start <= mapping.end + window
+    )
+
+
+@dataclass(frozen=True)
+class MappedLocation:
+    path: str
+    start: int
+    end: int
+    item_id: str
+
+
+@dataclass(frozen=True)
+class Cluster:
+    path: str
+    start: int
+    end: int
+    item_ids: tuple[str, ...]
+
+
+def find_cluster(
+    per_review: Sequence[Sequence[MappedLocation]], window: int
+) -> Cluster | None:
+    """One connected span on one path with a mapped finding from every review.
+
+    ``per_review`` holds the head-mapped locations of each of the K consecutive
+    reviews.  Each path's ranges are split into connected components (a gap of at
+    most ``window`` connects neighbours) and a component must contain a finding
+    from every review; a distant unrelated finding on the same path does not
+    prevent a cluster elsewhere on it.
+    """
+    if not per_review or any(not locations for locations in per_review):
+        return None
+    paths = set.intersection(*({loc.path for loc in locations} for locations in per_review))
+    for path in sorted(paths):
+        ranges = sorted(
+            (loc.start, loc.end, loc.item_id, number)
+            for number, locations in enumerate(per_review)
+            for loc in locations
+            if loc.path == path
+        )
+        components: list[list[tuple[int, int, str, int]]] = []
+        span_end = None
+        for entry in ranges:
+            if span_end is not None and entry[0] - span_end - 1 <= window:
+                components[-1].append(entry)
+                span_end = max(span_end, entry[1])
+            else:
+                components.append([entry])
+                span_end = entry[1]
+        for component in components:
+            if {entry[3] for entry in component} == set(range(len(per_review))):
+                ids = tuple(dict.fromkeys(entry[2] for entry in component))
+                return Cluster(path, component[0][0], max(e[1] for e in component), ids)
+    return None
+
+
+@dataclass(frozen=True)
+class PrReviewRecord:
+    round_number: int
+    index: int
+    head: str
+    classification: str
+    metadata: "PostedRoundMetadata"
+
+
+@dataclass(frozen=True)
+class PrStepBackEntry:
+    """A reviewer-owned PR step-back entry joined with its coder record."""
+
+    reviewer: str
+    trigger_round: int
+    trigger_head: str
+    path: str
+    start: int
+    end: int
+    coder_round: int
+    resulting_head: str
+    record_index: int
+
+
+def pr_reviews_for(
+    records: Sequence["PostedRoundRecord"], reviewer: str
+) -> tuple[PrReviewRecord, ...]:
+    """The reviewer's latest PR review record per round, in round order."""
+    latest: dict[int, "PostedRoundRecord"] = {}
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        if metadata.flow == "pr" and metadata.role == "reviewer" and metadata.agent == reviewer:
+            latest[metadata.round_number] = record
+    return tuple(
+        PrReviewRecord(
+            round_number=number,
+            index=record.index,
+            head=str(record.metadata.subject),
+            classification=classify_review(record.metadata, phase=PHASE_PR),
+            metadata=record.metadata,
+        )
+        for number, record in sorted(latest.items())
+    )
+
+
+def pr_step_back_history(
+    records: Sequence["PostedRoundRecord"], reviewer: str
+) -> tuple[tuple[PrStepBackEntry, ...], bool]:
+    """``(entries for the reviewer in record order, degraded)``."""
+    degraded = False
+    entries: list[PrStepBackEntry] = []
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        if metadata.flow != "pr" or metadata.role != "coder":
+            continue
+        if metadata.step_back_status == "invalid":
+            degraded = True
+            continue
+        for entry in metadata.step_back_entries:
+            if entry.get("phase") != PHASE_PR or entry.get("reviewer") != reviewer:
+                continue
+            anchor = entry["anchor"]
+            entries.append(
+                PrStepBackEntry(
+                    reviewer=reviewer,
+                    trigger_round=int(entry["trigger_round"]),
+                    trigger_head=str(entry["trigger_head"]),
+                    path=str(anchor["path"]),
+                    start=int(anchor["start"]),
+                    end=int(anchor["end"]),
+                    coder_round=metadata.round_number,
+                    resulting_head=str(metadata.subject),
+                    record_index=record.index,
+                )
+            )
+    return tuple(entries), degraded
+
+
+# ``mapper(from_head, to_head, path, start, end)`` maps a range between heads.
+AnchorMapper = Callable[[str, str, str, int, int], AnchorMapping]
+
+
+def map_between_heads(
+    mapper: AnchorMapper, from_head: str, to_head: str, path: str, start: int, end: int
+) -> AnchorMapping:
+    if from_head == to_head:
+        return AnchorMapping(OUTCOME_SHIFTED, path, path, start, end)
+    return mapper(from_head, to_head, path, start, end)
+
+
+def _mandatory_owned_new_items(metadata: "PostedRoundMetadata") -> list:
+    mandatory = _MANDATORY_STATUSES[PHASE_PR]
+    return [
+        item
+        for item in metadata.new_items
+        if item.status in mandatory and item.reviewer == metadata.agent
+    ]
+
+
+def _remaining_mandatory_items(metadata: "PostedRoundMetadata") -> list:
+    """The reviewer's mandatory items still open after this review's own record."""
+    mandatory = _MANDATORY_STATUSES[PHASE_PR]
+    closed = {
+        d.item_id
+        for d in metadata.dispositions
+        if d.disposition not in mandatory
+    }
+    dispositions = {d.item_id: d for d in metadata.dispositions}
+    remaining = []
+    for item in metadata.prior_items:
+        if item.reviewer != metadata.agent or getattr(item, "authority", None) is not None:
+            continue
+        disposition = dispositions.get(item.item_id)
+        # The review's own disposition decides the effective status, so a future
+        # item promoted to blocking/same-pr counts and a resolved one does not.
+        effective = disposition.disposition if disposition is not None else item.status
+        if effective not in mandatory:
+            continue
+        updated = _with_effective_sub_items(item, disposition)
+        if (
+            disposition is not None
+            and disposition.sub_item_dispositions
+            and updated.sub_items
+            and all(sub.status == "resolved" for sub in updated.sub_items)
+        ):
+            # A completing entry derives to resolved (the ledger's own semantics).
+            continue
+        if updated.status != effective:
+            updated = dataclasses.replace(updated, status=effective)
+        remaining.append(updated)
+    seen = {item.item_id for item in remaining}
+    remaining.extend(
+        item for item in _mandatory_owned_new_items(metadata) if item.item_id not in seen
+    )
+    return remaining
+
+
+def _with_effective_sub_items(item, disposition):
+    """The item with this review's own sub-item dispositions applied.
+
+    ``resolved`` closes a sub-item and ``unresolved`` reopens one, so location
+    projection sees the post-review state rather than the prior ledger's.
+    """
+    if disposition is None or not disposition.sub_item_dispositions or not item.sub_items:
+        return item
+    outcomes = dict(disposition.sub_item_dispositions)
+    updated = tuple(
+        dataclasses.replace(
+            sub,
+            status={"resolved": "resolved", "unresolved": "open"}.get(
+                outcomes.get(sub.sub_item_id, ""), sub.status
+            ),
+        )
+        for sub in item.sub_items
+    )
+    return dataclasses.replace(item, sub_items=updated)
+
+
+def _location_is_member(
+    location: FindingLocation,
+    source_head: str,
+    head: str,
+    mapping: AnchorMapping,
+    window: int,
+    mapper: AnchorMapper,
+) -> bool:
+    """Membership of a carried location, with anchor and location in ``head``'s coordinates.
+
+    The anchor ``mapping`` is already in ``head``'s coordinates; the location is
+    mapped forward from the head its review was taken on.  A location that cannot
+    be mapped falls back to same-path membership against the anchor's paths.
+    """
+    moved = map_between_heads(
+        mapper, source_head, head, location.path, location.start, location.end
+    )
+    if moved.mappable:
+        location = dataclasses.replace(
+            location, path=moved.path, start=moved.start, end=moved.end
+        )
+        return in_cluster(location, mapping, window)
+    # The path-wide fallback belongs to an UNMAPPABLE anchor only.  A mappable anchor
+    # requires the mapped window, so a location that cannot be placed (moved or
+    # deleted code, a failed diff) is not declared a member by path alone.
+    # Under that policy the location's known rename destination takes part too, so a
+    # chain of renames still meets the anchor's original or destination path.
+    return not mapping.mappable and bool(
+        {location.path, moved.path} & {mapping.original_path, mapping.path}
+    )
+
+
+@dataclass(frozen=True)
+class PrEpisodeResult:
+    """Outcome of replaying the history after a PR step-back turn."""
+
+    entry: PrStepBackEntry | None
+    siblings: tuple[FindingLocation, ...] = ()
+    sibling_round: int | None = None
+    mapping: AnchorMapping | None = None
+
+
+def derive_pr_episode(
+    records: Sequence["PostedRoundRecord"],
+    reviewer: str,
+    *,
+    window: int,
+    mapper: AnchorMapper,
+    current_round: int | None = None,
+    current_head: str | None = None,
+) -> PrEpisodeResult:
+    """Replay the reviewer's reviews after its newest step-back turn.
+
+    ``current_round`` is the round being dispatched: only a sibling introduced by
+    that round's review of ``current_head`` escalates.  A sibling from an earlier
+    round, or from a head the code has since moved past (an operator's pushed
+    redesign or documented limitation), already stopped the run once and must not
+    stop it again; it stays an open member item, which keeps the episode open until
+    it is resolved.
+
+    The episode stays active until the reviewer approves or no unresolved
+    mandatory item of theirs has a location that is a member of the cluster
+    (the same :func:`in_cluster` predicate escalation uses).  The first review
+    that introduces a new mandatory member while the episode is active is a
+    sibling and is returned for escalation.
+    """
+    entries, degraded = pr_step_back_history(records, reviewer)
+    if degraded or not entries:
+        return PrEpisodeResult(entry=None)
+    entry = entries[-1]
+    reviews = pr_reviews_for(records, reviewer)
+    heads = {review.round_number: review.head for review in reviews}
+    cache: dict[tuple[str, str, str, int, int], AnchorMapping] = {}
+
+    def mapping_to(head: str) -> AnchorMapping:
+        key = (entry.trigger_head, head, entry.path, entry.start, entry.end)
+        if key not in cache:
+            cache[key] = map_between_heads(
+                mapper, entry.trigger_head, head, entry.path, entry.start, entry.end
+            )
+        return cache[key]
+
+    last_mapping: AnchorMapping | None = None
+    for review in reviews:
+        if review.index <= entry.record_index:
+            continue
+        if review.classification == CLASS_APPROVED:
+            return PrEpisodeResult(entry=None)
+        mapping = mapping_to(review.head)
+        last_mapping = mapping
+        siblings = tuple(
+            location
+            for item in _mandatory_owned_new_items(review.metadata)
+            for location in project_finding_locations(item)
+            if in_cluster(location, mapping, window)
+        )
+        if (
+            siblings
+            and (current_round is None or review.round_number >= current_round)
+            and (current_head is None or review.head == current_head)
+        ):
+            return PrEpisodeResult(entry, siblings, review.round_number, mapping)
+        member_open = False
+        for item in _remaining_mandatory_items(review.metadata):
+            source_head = heads.get(item.source_round, review.head)
+            if any(
+                _location_is_member(
+                    location, source_head, review.head, mapping, window, mapper
+                )
+                for location in project_finding_locations(item)
+            ):
+                member_open = True
+                break
+        if not member_open:
+            return PrEpisodeResult(entry=None)
+    return PrEpisodeResult(entry=entry, mapping=last_mapping)
+
+
+@dataclass(frozen=True)
+class PrClusterTrigger:
+    """A tracked reviewer's K-round cluster that opens a PR step-back."""
+
+    reviewer: str
+    trigger_round: int
+    trigger_head: str
+    cluster: Cluster
+    findings: tuple[str, ...]
+
+
+def find_pr_cluster_trigger(
+    records: Sequence["PostedRoundRecord"],
+    reviewer: str,
+    *,
+    k: int,
+    window: int,
+    current_round: int,
+    mapper: AnchorMapper,
+    current_head: str | None = None,
+) -> PrClusterTrigger | None:
+    """The reviewer's cluster after K consecutive new-finding blocks, if any.
+
+    Only reviews recorded after the reviewer's newest step-back turn count, so a
+    closed episode re-arms from fresh blocks.  Locations that cannot be mapped to
+    the newest head never contribute.
+    """
+    if k <= 0:
+        return None
+    entries, degraded = pr_step_back_history(records, reviewer)
+    if degraded:
+        return None
+    floor = entries[-1].record_index if entries else -1
+    reviews = [
+        review for review in pr_reviews_for(records, reviewer) if review.index > floor
+    ]
+    if len(reviews) < k:
+        return None
+    tail = reviews[-k:]
+    if tail[-1].round_number != current_round:
+        return None
+    if any(review.classification != CLASS_NEW_FINDING for review in tail):
+        return None
+    if any(
+        later.round_number != earlier.round_number + 1
+        for earlier, later in zip(tail, tail[1:])
+    ):
+        return None
+    # Locations are mapped to the head being dispatched, which an operator may have
+    # pushed past the newest review; unmappable ones never contribute.
+    head = current_head or tail[-1].head
+    per_review: list[list[MappedLocation]] = []
+    for review in tail:
+        mapped: list[MappedLocation] = []
+        for item in _mandatory_owned_new_items(review.metadata):
+            for location in project_finding_locations(item):
+                mapping = map_between_heads(
+                    mapper, review.head, head, location.path, location.start, location.end
+                )
+                if mapping.mappable:
+                    mapped.append(
+                        MappedLocation(mapping.path, mapping.start, mapping.end, item.item_id)
+                    )
+        per_review.append(mapped)
+    cluster = find_cluster(per_review, window)
+    if cluster is None:
+        return None
+    first_lines: list[str] = []
+    wanted = set(cluster.item_ids)
+    for review in tail:
+        for item in _mandatory_owned_new_items(review.metadata):
+            if item.item_id in wanted:
+                line = next(
+                    (part.strip() for part in item.text.splitlines() if part.strip()), ""
+                )
+                first_lines.append(f"[{item.item_id}] (round {review.round_number}) {line[:240]}")
+    return PrClusterTrigger(reviewer, current_round, head, cluster, tuple(first_lines))
+
+
+def pr_step_back_entry_payload(trigger: PrClusterTrigger) -> Mapping[str, object]:
+    """The durable reviewer-owned PR entry the orchestrator records."""
+    return {
+        "phase": PHASE_PR,
+        "reviewer": trigger.reviewer,
+        "trigger_round": trigger.trigger_round,
+        "trigger_head": trigger.trigger_head,
+        "anchor": {
+            "path": trigger.cluster.path,
+            "start": trigger.cluster.start,
+            "end": trigger.cluster.end,
+        },
+    }
+
+
+def pr_sweep_entries(
+    records: Sequence["PostedRoundRecord"], *, round_number: int, head_sha: str | None
+) -> dict[str, PrStepBackEntry]:
+    """Reviewers owed a sweep on ``head_sha``: entries of the step-back coder record
+    whose resulting head is exactly this head and whose round is this round."""
+    if not head_sha:
+        return {}
+    bound: dict[str, PrStepBackEntry] = {}
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        if (
+            metadata.flow != "pr"
+            or metadata.role != "coder"
+            or metadata.step_back_status != "valid"
+            or metadata.round_number != round_number
+            or metadata.subject != head_sha
+        ):
+            continue
+        for entry in metadata.step_back_entries:
+            if entry.get("phase") != PHASE_PR:
+                continue
+            anchor = entry["anchor"]
+            reviewer = str(entry["reviewer"])
+            bound[reviewer] = PrStepBackEntry(
+                reviewer=reviewer,
+                trigger_round=int(entry["trigger_round"]),
+                trigger_head=str(entry["trigger_head"]),
+                path=str(anchor["path"]),
+                start=int(anchor["start"]),
+                end=int(anchor["end"]),
+                coder_round=metadata.round_number,
+                resulting_head=str(metadata.subject),
+                record_index=record.index,
+            )
+    return bound
+
+
+def step_back_generalization(
+    records: Sequence["PostedRoundRecord"], entry: PrStepBackEntry
+) -> str | None:
+    """The coder's structured ``summary`` on the step-back record, if readable."""
+    for record in records:
+        metadata = record.metadata
+        if record.index != entry.record_index or metadata.role != "coder":
+            continue
+        raw = metadata.raw_structured_coder_response
+        if not raw:
+            return None
+        try:
+            payload, _end = json.JSONDecoder().raw_decode(raw.lstrip())
+        except ValueError:
+            return None
+        summary = payload.get("summary") if isinstance(payload, dict) else None
+        return summary if isinstance(summary, str) else None
+    return None
+
+
+def render_pr_step_back_coder_guidance(triggers: Sequence[PrClusterTrigger]) -> str:
+    """The generalize-the-class coder instruction for one or more clusters."""
+    blocks = []
+    for trigger in triggers:
+        cluster = trigger.cluster
+        findings = "\n".join(f"  - {line}" for line in trigger.findings) or "  - (none recorded)"
+        blocks.append(
+            f"- {trigger.reviewer}: `{cluster.path}` lines {cluster.start}-{cluster.end} "
+            f"(head `{trigger.trigger_head}`). Recent findings:\n{findings}"
+        )
+    return (
+        "STEP-BACK TURN (orchestrator, not a reviewer finding): a reviewer has blocked "
+        "several consecutive rounds, each with a new finding in the same part of the code. "
+        "Do not patch only the newest finding. Name the common root of these findings, fix "
+        "the whole class with one rule, and add a parametrized test that covers every branch "
+        "of that rule. This replaces any instruction to keep the change small and "
+        "localized. Begin the `summary` of your structured response with `Generalization:` "
+        "followed by the rule you applied.\n"
+        "Clusters:\n" + "\n".join(blocks) + "\n"
+    )
+
+
+def render_pr_sweep_guidance(entry: PrStepBackEntry) -> str:
+    """The reviewer sweep instruction, bound to the step-back head only."""
+    return (
+        "Sweep (orchestrator, not a reviewer finding; this round only): the coder just "
+        f"generalized a class of findings you raised in `{entry.path}` (lines "
+        f"{entry.start}-{entry.end} at head `{entry.trigger_head}`, which may have "
+        "shifted). Enumerate ALL remaining instances of that pattern in the code under "
+        "review, not just the first, giving a `path:line` reference for each. Shape the "
+        "output by count: no remaining instance means no finding for the pattern; one "
+        "instance is one plain finding; 2-12 instances are one finding whose `sub_items` "
+        "list each instance with its `path:line`; more than 12 are several findings, "
+        "each a plain finding or holding at most 12 `sub_items`, so the sweep stays "
+        "exhaustive. This guidance does not change any other review rule.\n"
+    )
+
+
+def render_pr_step_back_human_decision(
+    *,
+    reviewer: str,
+    entry: PrStepBackEntry,
+    mapping: AnchorMapping | None,
+    siblings: Sequence[FindingLocation],
+    window: int,
+    generalization: str | None,
+    sibling_round: int | None,
+) -> str:
+    """Human-decision diagnostic after a step-back that still produced a sibling."""
+    excerpt = (generalization or "").strip()
+    if len(excerpt) > ALTERNATIVE_EXCERPT_LIMIT:
+        excerpt = excerpt[: ALTERNATIVE_EXCERPT_LIMIT - 1].rstrip() + "…"
+    if mapping is None:
+        mapped = "(not mapped)"
+    elif mapping.mappable:
+        mapped = (
+            f"{mapping.outcome} to `{mapping.path}` lines {mapping.start}-{mapping.end} "
+            f"(+/- {window})"
+        )
+    else:
+        mapped = (
+            f"{mapping.outcome} ({mapping.reason}); falling back to any finding on "
+            f"`{mapping.original_path}` or `{mapping.path}`"
+        )
+    sibling_text = "; ".join(
+        dict.fromkeys(
+            f"[{loc.item_id}{'/' + loc.sub_item_id if loc.sub_item_id else ''}] "
+            f"`{loc.path}:{loc.start}-{loc.end}`"
+            for loc in siblings
+        )
+    )
+    return (
+        "human decision required: the coder generalized a class of findings at round "
+        f"{entry.coder_round} (a step-back turn after {reviewer} blocked consecutive rounds "
+        f"on `{entry.path}` lines {entry.start}-{entry.end}), and {reviewer} still raised a "
+        f"new sibling finding in round {sibling_round}: {sibling_text}. Cluster mapping: "
+        f"{mapped}. No further coder turn was invoked. Coder generalization (excerpt): "
+        f"{excerpt or '(not recorded)'} Decide one of: continue (rerun with "
+        "--pr-step-back-rounds 0, which also disables step-back detection), accept a stated "
+        "limitation (document it, resolve or defer the sibling, push the commit and rerun), or "
+        "redesign the affected code (push the redesign and rerun). After a push, a rerun does "
+        "not stop again on this round's sibling; only a new sibling in a later review does."
+    )

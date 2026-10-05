@@ -656,3 +656,812 @@ def test_an_episode_published_after_the_edit_is_not_closed_by_it():
     ]
     state = derive_plan_step_back_state(records, primary=PRIMARY, current_issue_digest=NEW_DIGEST)
     assert state.episode is not None and state.escalation_count == 1
+
+
+# ---------------------------------------------------------------------------
+# PR fix-loop step-back (#1251, stage 2)
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.protocol import ReviewItemDisposition, ReviewSubItem
+from coding_review_agent_loop import review_step_back as sb
+
+HEAD_A = "a" * 40
+HEAD_B = "b" * 40
+HEAD_C = "c" * 40
+PR_REVIEWER = "OpenAI Codex"
+
+
+def _pr_item(item_id, text, *, status="blocking", round_number=1, sub_items=(), fix_scope=None):
+    return UnresolvedReviewItem(
+        item_id=item_id,
+        reviewer=PR_REVIEWER,
+        source_round=round_number,
+        text=text,
+        status=status,
+        sub_items=tuple(sub_items),
+        fix_scope=fix_scope,
+    )
+
+
+def _pr_review(index, round_number, head, *, state="blocking", new=(), prior=(), dispositions=()):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="pr",
+            role="reviewer",
+            agent=PR_REVIEWER,
+            round_number=round_number,
+            subject=head,
+            state=state,
+            new_items=tuple(new),
+            prior_items=tuple(prior),
+            dispositions=tuple(dispositions),
+        ),
+        body="",
+    )
+
+
+def _pr_coder(index, round_number, head, *, entries=(), raw=None):
+    return PostedRoundRecord(
+        index=index,
+        metadata=PostedRoundMetadata(
+            flow="pr",
+            role="coder",
+            agent="Claude",
+            round_number=round_number,
+            subject=head,
+            step_back_entries=tuple(entries),
+            raw_structured_coder_response=raw,
+        ),
+        body="",
+    )
+
+
+def _pr_entry(*, trigger_round=3, head=HEAD_A, path="src/spool.py", start=100, end=105):
+    return {
+        "phase": "pr",
+        "reviewer": PR_REVIEWER,
+        "trigger_round": trigger_round,
+        "trigger_head": head,
+        "anchor": {"path": path, "start": start, "end": end},
+    }
+
+
+def _identity_mapper(from_head, to_head, path, start, end):
+    return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+
+def test_project_finding_locations_reads_parent_fix_scope_and_sub_items():
+    item = _pr_item(
+        "item-7",
+        "Undecodable file classified absent at `src/spool.py:124-131` and see also "
+        "https://example.com/x.py:9 and src/readme.md without a line",
+        fix_scope=("src/other.py:40",),
+        sub_items=(
+            ReviewSubItem("sub-1", "invalid identity at tests/test_spool.py:12-13"),
+            ReviewSubItem("sub-2", "already fixed at src/gone.py:5", status="resolved"),
+        ),
+    )
+    locations = sb.project_finding_locations(item)
+    assert [(loc.path, loc.start, loc.end, loc.item_id, loc.sub_item_id) for loc in locations] == [
+        ("src/spool.py", 124, 131, "item-7", None),
+        ("src/other.py", 40, 40, "item-7", None),
+        ("tests/test_spool.py", 12, 13, "item-7", "sub-1"),
+    ]
+
+
+def test_map_anchor_insertion_above_is_shifted():
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 40,
+        name_status="M\tsrc/a.py\n",
+        diff_text="@@ -10,0 +11,100 @@\n+x\n",
+    )
+    assert (mapping.outcome, mapping.start, mapping.end) == (sb.OUTCOME_SHIFTED, 200, 205)
+
+
+def test_map_anchor_in_window_rewrite_is_rewritten_without_widening_to_the_hunk():
+    # Old lines 98-110 replaced by 20 lines; anchor 100-105 lies inside the hunk.
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 40,
+        name_status="M\tsrc/a.py\n",
+        diff_text="@@ -98,13 +98,20 @@\n",
+    )
+    assert mapping.outcome == sb.OUTCOME_REWRITTEN
+    assert (mapping.start, mapping.end) == (98, 117)
+
+
+def test_map_anchor_rewrite_spilling_into_unrelated_code_is_unmappable():
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 10,
+        name_status="M\tsrc/a.py\n",
+        diff_text="@@ -60,80 +60,90 @@\n",
+    )
+    assert mapping.outcome == sb.OUTCOME_UNMAPPABLE
+    assert "unrelated" in mapping.reason
+
+
+def test_map_anchor_pure_deletion_or_move_is_unmappable():
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 40,
+        name_status="M\tsrc/a.py\n",
+        diff_text="@@ -99,8 +98,0 @@\n",
+    )
+    assert mapping.outcome == sb.OUTCOME_UNMAPPABLE
+    deleted = sb.map_anchor(
+        "src/a.py", 100, 105, 40, name_status="D\tsrc/a.py\n", diff_text=""
+    )
+    assert deleted.outcome == sb.OUTCOME_UNMAPPABLE and "deleted" in deleted.reason
+    assert sb.map_anchor(
+        "src/a.py", 1, 2, 40, name_status=None, diff_text=None
+    ).outcome == sb.OUTCOME_UNMAPPABLE
+
+
+def test_map_anchor_pairs_a_rename_to_a_different_directory():
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 40,
+        name_status="R095\tsrc/a.py\tlib/core/a.py\n",
+        diff_text="@@ -1,0 +2,3 @@\n",
+    )
+    assert (mapping.outcome, mapping.path, mapping.start, mapping.end) == (
+        sb.OUTCOME_SHIFTED, "lib/core/a.py", 103, 108,
+    )
+    assert mapping.original_path == "src/a.py"
+
+
+def test_in_cluster_uses_the_window_and_the_unmappable_fallback():
+    mapped = sb.AnchorMapping(sb.OUTCOME_SHIFTED, "src/a.py", "src/a.py", 100, 105)
+    near = sb.FindingLocation("src/a.py", 135, 135, "item-9")
+    far = sb.FindingLocation("src/a.py", 146, 146, "item-9")
+    other = sb.FindingLocation("src/b.py", 100, 100, "item-9")
+    assert sb.in_cluster(near, mapped, 40)
+    assert not sb.in_cluster(far, mapped, 40)
+    assert not sb.in_cluster(other, mapped, 40)
+    lost = sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, "src/a.py", "lib/a.py", 100, 105, "moved")
+    assert sb.in_cluster(far, lost, 40)
+    assert sb.in_cluster(sb.FindingLocation("lib/a.py", 900, 900, "x"), lost, 40)
+    assert not sb.in_cluster(other, lost, 40)
+
+
+def _loc(path, start, end, item="item-1"):
+    return sb.MappedLocation(path, start, end, item)
+
+
+def test_find_cluster_adjacent_overlapping_unrelated_and_missing():
+    adjacent = [[_loc("a.py", 124, 131)], [_loc("a.py", 133, 136)], [_loc("a.py", 150, 160)]]
+    cluster = sb.find_cluster(adjacent, 40)
+    assert (cluster.path, cluster.start, cluster.end) == ("a.py", 124, 160)
+    assert sb.find_cluster([[_loc("a.py", 1, 5)], [_loc("a.py", 3, 9)]], 0).end == 9
+    assert sb.find_cluster([[_loc("a.py", 1, 5)], [_loc("b.py", 1, 5)]], 40) is None
+    assert sb.find_cluster([[_loc("a.py", 1, 5)], [_loc("a.py", 500, 505)]], 40) is None
+    assert sb.find_cluster([[_loc("a.py", 1, 5)], []], 40) is None
+
+
+def _trigger_records(texts, *, heads=None):
+    heads = heads or [HEAD_A] * len(texts)
+    return [
+        _pr_review(
+            10 + n, n + 1, heads[n], new=[_pr_item(f"item-{n + 1}", text, round_number=n + 1)]
+        )
+        for n, text in enumerate(texts)
+    ]
+
+
+def test_cluster_trigger_needs_k_consecutive_clustered_new_findings():
+    records = _trigger_records(
+        ["gap src/spool.py:124-131", "gap src/spool.py:131-136", "gap src/spool.py:140"]
+    )
+    trigger = sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=_identity_mapper
+    )
+    assert trigger is not None
+    assert (trigger.cluster.path, trigger.cluster.start, trigger.cluster.end) == (
+        "src/spool.py", 124, 140,
+    )
+    assert trigger.trigger_head == HEAD_A and trigger.trigger_round == 3
+    assert sb.pr_step_back_entry_payload(trigger)["anchor"] == {
+        "path": "src/spool.py", "start": 124, "end": 140,
+    }
+    assert sb.find_pr_cluster_trigger(
+        records[1:], PR_REVIEWER, k=3, window=40, current_round=3, mapper=_identity_mapper
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "texts",
+    [
+        ["src/a.py:10", "src/b.py:10", "src/a.py:12"],  # unrelated files
+        ["src/a.py:10", "src/a.py:900", "src/a.py:12"],  # beyond the window
+        ["src/a.py:10", "no reference here", "src/a.py:12"],  # no line reference
+    ],
+)
+def test_cluster_trigger_ignores_unrelated_unparseable_and_distant_findings(texts):
+    assert sb.find_pr_cluster_trigger(
+        _trigger_records(texts), PR_REVIEWER, k=3, window=40, current_round=3,
+        mapper=_identity_mapper,
+    ) is None
+
+
+def test_cluster_trigger_ignores_repeat_only_and_unmappable_locations():
+    records = _trigger_records(["src/a.py:10", "src/a.py:11", "src/a.py:12"])
+    repeat = _pr_review(
+        40, 3, HEAD_A,
+        prior=[_pr_item("item-2", "src/a.py:11")],
+        dispositions=[ReviewItemDisposition("item-2", PR_REVIEWER, "blocking")],
+    )
+    assert sb.find_pr_cluster_trigger(
+        [*records[:2], repeat], PR_REVIEWER, k=3, window=40, current_round=3,
+        mapper=_identity_mapper,
+    ) is None
+
+    def lost(from_head, to_head, path, start, end):
+        return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "moved")
+
+    mixed = _trigger_records(["src/a.py:10", "src/a.py:11", "src/a.py:12"], heads=[HEAD_B, HEAD_B, HEAD_A])
+    assert sb.find_pr_cluster_trigger(
+        mixed, PR_REVIEWER, k=3, window=40, current_round=3, mapper=lost
+    ) is None
+
+
+def test_cluster_trigger_maps_older_locations_to_the_newest_head():
+    def shift(from_head, to_head, path, start, end):
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start + 100, end + 100)
+
+    records = _trigger_records(
+        ["src/a.py:10", "src/a.py:110", "src/a.py:111"], heads=[HEAD_B, HEAD_A, HEAD_A]
+    )
+    trigger = sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=0, current_round=3, mapper=shift
+    )
+    assert trigger is not None and (trigger.cluster.start, trigger.cluster.end) == (110, 111)
+
+
+def test_cluster_trigger_rearms_only_from_reviews_after_a_step_back():
+    records = [
+        *_trigger_records(["src/a.py:10", "src/a.py:11", "src/a.py:12"]),
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]),
+        _pr_review(60, 4, HEAD_B, new=[_pr_item("item-9", "src/a.py:13", round_number=4)]),
+    ]
+    assert sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=4, mapper=_identity_mapper
+    ) is None
+
+
+def test_malformed_pr_step_back_entries_suppress_trigger_and_episode():
+    bad = PostedRoundRecord(
+        index=45,
+        metadata=PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=4, subject=HEAD_B,
+            step_back_status="invalid",
+        ),
+        body="",
+    )
+    records = [*_trigger_records(["src/a.py:10", "src/a.py:11", "src/a.py:12"]), bad]
+    assert sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=_identity_mapper
+    ) is None
+    assert sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=_identity_mapper).entry is None
+
+
+def _episode(*extra, window=40):
+    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]), *extra]
+    return sb.derive_pr_episode(records, PR_REVIEWER, window=window, mapper=_identity_mapper)
+
+
+def test_sweep_sibling_in_the_cluster_escalates_even_when_located_only_in_a_sub_item():
+    sibling = _pr_item(
+        "item-12",
+        "Another spool branch is misclassified",
+        round_number=4,
+        sub_items=(
+            ReviewSubItem("sub-1", "branch at src/spool.py:130 treats it as absent"),
+            ReviewSubItem("sub-2", "elsewhere at src/other.py:5"),
+        ),
+    )
+    result = _episode(_pr_review(60, 4, HEAD_B, new=[sibling]))
+    assert result.entry is not None and result.sibling_round == 4
+    assert [(loc.item_id, loc.sub_item_id) for loc in result.siblings] == [("item-12", "sub-1")]
+
+
+def test_carried_item_does_not_escalate_but_keeps_the_episode_open():
+    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
+    result = _episode(
+        _pr_review(
+            60, 4, HEAD_B, prior=[carried],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        )
+    )
+    assert result.entry is not None and not result.siblings
+
+
+def test_findings_outside_the_cluster_neither_escalate_nor_close_the_episode():
+    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
+    unrelated = _pr_item("item-12", "unrelated src/other.py:5", round_number=4)
+    result = _episode(
+        _pr_review(
+            60, 4, HEAD_B, new=[unrelated], prior=[carried],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        )
+    )
+    assert result.entry is not None and not result.siblings
+
+
+def test_clearance_and_escalation_share_the_window_membership_rule():
+    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
+    keep_open = _pr_review(
+        60, 4, HEAD_B, prior=[carried],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+    )
+    sibling = _pr_review(
+        70, 5, HEAD_B,
+        new=[_pr_item("item-13", "src/spool.py:135", round_number=5)],
+        prior=[carried],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+    )
+    live = _episode(keep_open, sibling)
+    assert live.entry is not None and live.sibling_round == 5
+    # A resume replays the same records and reaches the same decision.
+    assert _episode(keep_open, sibling).sibling_round == 5
+    # Once the carried in-window item is resolved the episode closes, so a later
+    # sibling is an ordinary finding that can re-arm the trigger.
+    resolved = _pr_review(
+        61, 4, HEAD_B, prior=[carried],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "resolved")],
+    )
+    later = _pr_review(
+        71, 5, HEAD_B, new=[_pr_item("item-13", "src/spool.py:135", round_number=5)]
+    )
+    assert _episode(resolved, later).entry is None
+
+
+def test_approval_closes_the_pr_episode():
+    assert _episode(_pr_review(60, 4, HEAD_B, state="approved")).entry is None
+
+
+def test_unmappable_anchor_escalates_on_any_same_path_finding():
+    def lost(from_head, to_head, path, start, end):
+        return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "moved")
+
+    records = [
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]),
+        _pr_review(60, 4, HEAD_B, new=[_pr_item("item-12", "src/spool.py:900", round_number=4)]),
+    ]
+    result = sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=lost)
+    assert result.siblings and not result.mapping.mappable
+    message = sb.render_pr_step_back_human_decision(
+        reviewer=PR_REVIEWER, entry=result.entry, mapping=result.mapping,
+        siblings=result.siblings, window=40, generalization=None, sibling_round=4,
+    )
+    assert "UNMAPPABLE" in message and "--pr-step-back-rounds 0" in message
+
+
+def test_sweep_entries_bind_to_the_resulting_head_and_round_only():
+    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()])]
+    assert set(sb.pr_sweep_entries(records, round_number=4, head_sha=HEAD_B)) == {PR_REVIEWER}
+    assert sb.pr_sweep_entries(records, round_number=4, head_sha=HEAD_C) == {}
+    assert sb.pr_sweep_entries(records, round_number=5, head_sha=HEAD_B) == {}
+    assert sb.pr_sweep_entries(records, round_number=4, head_sha=None) == {}
+
+
+def test_generalization_is_reconstructed_from_the_stored_structured_response():
+    raw = json.dumps({"kind": "coder_followup", "summary": "Generalization: any malformed record"})
+    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=raw)]
+    entry = sb.pr_step_back_history(records, PR_REVIEWER)[0][0]
+    assert sb.step_back_generalization(records, entry) == "Generalization: any malformed record"
+    assert sb.step_back_generalization([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()])], entry) is None
+
+
+def test_pr_step_back_entry_round_trips_through_round_metadata():
+    metadata = _pr_coder(1, 4, HEAD_B, entries=[_pr_entry()]).metadata
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.step_back_status == "valid"
+    assert decoded.step_back_entries[0]["anchor"] == {"path": "src/spool.py", "start": 100, "end": 105}
+
+
+# --- review round 1 fixes (#1265) -------------------------------------------
+
+
+def test_clearance_applies_the_reviews_own_sub_item_dispositions():
+    sub_items = (
+        ReviewSubItem("sub-1", "in cluster at src/spool.py:130"),
+        ReviewSubItem("sub-2", "distant at src/spool.py:900"),
+    )
+    parent = _pr_item("item-3", "conjunctive gap", round_number=3, sub_items=sub_items)
+
+    def episode(outcomes):
+        review = _pr_review(
+            60, 4, HEAD_B, prior=[parent],
+            dispositions=[
+                ReviewItemDisposition("item-3", PR_REVIEWER, "blocking", sub_item_dispositions=outcomes)
+            ],
+        )
+        return _episode(review)
+
+    # Resolving the in-cluster sub-item while the distant one stays open clears the episode.
+    assert episode((("sub-1", "resolved"), ("sub-2", "unresolved"))).entry is None
+    # Reopening an in-cluster sub-item (previously resolved) keeps it open.
+    closed_first = _pr_item(
+        "item-3", "conjunctive gap", round_number=3,
+        sub_items=(
+            ReviewSubItem("sub-1", "in cluster at src/spool.py:130", status="resolved"),
+            ReviewSubItem("sub-2", "distant at src/spool.py:900"),
+        ),
+    )
+    review = _pr_review(
+        60, 4, HEAD_B, prior=[closed_first],
+        dispositions=[
+            ReviewItemDisposition(
+                "item-3", PR_REVIEWER, "blocking",
+                sub_item_dispositions=(("sub-1", "unresolved"), ("sub-2", "resolved")),
+            )
+        ],
+    )
+    assert _episode(review).entry is not None
+
+
+def _shifting_mapper(from_head, to_head, path, start, end):
+    # The coder inserted 100 lines between the anchor (100-105) and later code.
+    if (from_head, to_head) == (HEAD_A, HEAD_B) and start >= 110:
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start + 100, end + 100)
+    if (from_head, to_head) == (HEAD_B, HEAD_A) and start >= 210:
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start - 100, end - 100)
+    return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+
+def test_clearance_maps_carried_locations_into_the_current_heads_coordinates():
+    carried = _pr_item("item-3", "old gap src/spool.py:130", round_number=3)
+    records = [
+        _pr_review(40, 3, HEAD_A, new=[carried]),
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A)]),
+        _pr_review(
+            60, 4, HEAD_B, prior=[carried],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        ),
+    ]
+    # Line 130 moved to 230, outside 100-105 +/- 40: no member remains.
+    result = sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=_shifting_mapper)
+    assert result.entry is None
+    # Without the shift the carried item is still a member (control).
+    kept = sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=_identity_mapper)
+    assert kept.entry is not None
+
+
+def test_a_formerly_distant_carried_item_that_moves_into_the_window_keeps_the_episode_open():
+    carried = _pr_item("item-3", "old gap src/spool.py:300", round_number=3)
+
+    def pulled_in(from_head, to_head, path, start, end):
+        if (from_head, to_head) == (HEAD_A, HEAD_B) and start >= 290:
+            return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start - 190, end - 190)
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    records = [
+        _pr_review(40, 3, HEAD_A, new=[carried]),
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A)]),
+        _pr_review(
+            60, 4, HEAD_B, prior=[carried],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        ),
+    ]
+    assert sb.derive_pr_episode(records, PR_REVIEWER, window=40, mapper=pulled_in).entry is not None
+
+
+def test_find_cluster_ignores_a_distant_finding_on_the_same_path():
+    cluster = sb.find_cluster(
+        [[_loc("a.py", 100, 100), _loc("a.py", 900, 900)], [_loc("a.py", 110, 110)], [_loc("a.py", 120, 120)]],
+        40,
+    )
+    assert (cluster.path, cluster.start, cluster.end) == ("a.py", 100, 120)
+    # A component missing one review's finding is not a cluster.
+    assert sb.find_cluster(
+        [[_loc("a.py", 100, 100)], [_loc("a.py", 110, 110)], [_loc("a.py", 900, 900)]], 40
+    ) is None
+
+
+def test_map_anchor_uses_only_the_matching_file_section_of_a_rename_chain():
+    name_status = "R100\ta.py\tb.py\nR100\tb.py\tc.py\n"
+    diff = (
+        "diff --git a/b.py b/c.py\nsimilarity index 90%\n@@ -1,0 +2,50 @@\n"
+        "diff --git a/a.py b/b.py\nsimilarity index 100%\n"
+    )
+    mapping = sb.map_anchor("a.py", 100, 105, 40, name_status=name_status, diff_text=diff)
+    assert (mapping.outcome, mapping.path, mapping.start, mapping.end) == (
+        sb.OUTCOME_SHIFTED, "b.py", 100, 105,
+    )
+    other = sb.map_anchor("b.py", 100, 105, 40, name_status=name_status, diff_text=diff)
+    assert (other.path, other.start) == ("c.py", 150)
+
+
+def test_a_failed_hunk_read_keeps_the_known_rename_destination():
+    mapping = sb.map_anchor(
+        "src/a.py", 100, 105, 40, name_status="R100\tsrc/a.py\tlib/a.py\n", diff_text=None
+    )
+    assert mapping.outcome == sb.OUTCOME_UNMAPPABLE and mapping.path == "lib/a.py"
+    assert sb.in_cluster(sb.FindingLocation("lib/a.py", 7, 7, "x"), mapping, 40)
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("see Dockerfile:20", ("Dockerfile", 20, 20)),
+        ("see Makefile:30-35", ("Makefile", 30, 35)),
+        ("see scripts/run:40", ("scripts/run", 40, 40)),
+        ("see src/a.py:7", ("src/a.py", 7, 7)),
+        ("see run:40", ("run", 40, 40)),
+        ("see configure:20-22", ("configure", 20, 22)),
+    ],
+)
+def test_extensionless_repository_files_project_from_parent_and_sub_items(text, expected):
+    parent = sb.project_finding_locations(_pr_item("item-1", text))
+    assert [(l.path, l.start, l.end) for l in parent] == [expected]
+    sub = sb.project_finding_locations(
+        _pr_item("item-1", "plain", sub_items=(ReviewSubItem("sub-1", text), ReviewSubItem("sub-2", "x")))
+    )
+    assert [(l.path, l.start, l.end, l.sub_item_id) for l in sub] == [(*expected, "sub-1")]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["https://example.com/x.py:9", "http://host/run:40", "/etc/passwd:3"],
+)
+def test_urls_absolute_paths_and_plain_words_do_not_project(text):
+    assert sb.project_finding_locations(_pr_item("item-1", text)) == ()
+
+
+# --- review round 2 fixes (#1265) -------------------------------------------
+
+
+def test_a_parent_whose_sub_items_are_all_completed_no_longer_keeps_the_episode_open():
+    parent = _pr_item(
+        "item-3", "spool gap at src/spool.py:130", round_number=3,
+        sub_items=(ReviewSubItem("sub-1", "a"), ReviewSubItem("sub-2", "b")),
+    )
+    completing = _pr_review(
+        60, 4, HEAD_B, prior=[parent],
+        dispositions=[
+            ReviewItemDisposition(
+                "item-3", PR_REVIEWER, "blocking",
+                sub_item_dispositions=(("sub-1", "resolved"), ("sub-2", "resolved")),
+            )
+        ],
+    )
+    later = _pr_review(
+        70, 5, HEAD_B, new=[_pr_item("item-9", "sibling src/spool.py:135", round_number=5)]
+    )
+    # The completing entry derives to resolved: the episode closed, so the later
+    # in-window finding is an ordinary finding rather than a sibling.
+    assert _episode(completing, later).entry is None
+
+
+def test_a_future_item_promoted_by_the_sweep_keeps_the_episode_open_and_a_sibling_escalates():
+    future = _pr_item("item-3", "retained gap src/spool.py:130", status="future", round_number=3)
+    promoted = _pr_review(
+        60, 4, HEAD_B, prior=[future],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+    )
+    sibling = _pr_review(
+        70, 5, HEAD_B, new=[_pr_item("item-9", "sibling src/spool.py:135", round_number=5)],
+        prior=[future],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+    )
+    assert _episode(promoted).entry is not None
+    assert _episode(promoted, sibling).sibling_round == 5
+    # A still-future item stays out of clearance.
+    still_future = _pr_review(
+        60, 4, HEAD_B, prior=[future],
+        dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "future")],
+    )
+    assert _episode(still_future).entry is None
+
+
+def test_nul_delimited_name_status_and_non_ascii_paths_map_through_the_runner(tmp_path):
+    from coding_review_agent_loop.pr_loop_support import _git_anchor_mapper as _git_anchor_mapper_
+    from coding_review_agent_loop.runner import CommandResult
+
+    config = make_config(tmp_path)
+    commands = []
+
+    class Runner:
+        def run(self, args, *, cwd, check=True, **_kw):
+            args = list(args)
+            commands.append(args)
+            if "--name-status" in args:
+                out = "M\0src/café.py\0R100\0src/old é.py\0lib/new é.py\0"
+                return CommandResult(args, cwd, out, "", 0)
+            diff = (
+                "diff --git a/src/café.py b/src/café.py\n@@ -10,0 +11,100 @@\n"
+                "diff --git a/src/old é.py b/lib/new é.py\n@@ -1,0 +2,3 @@\n"
+            )
+            return CommandResult(args, cwd, diff, "", 0)
+
+    mapper = _git_anchor_mapper_(Runner(), config, checkout=tmp_path, window=40)
+    moved = mapper(HEAD_A, HEAD_B, "src/café.py", 100, 105)
+    assert (moved.outcome, moved.start, moved.end) == (sb.OUTCOME_SHIFTED, 200, 205)
+    renamed = mapper(HEAD_A, HEAD_B, "src/old é.py", 100, 105)
+    assert (renamed.path, renamed.start) == ("lib/new é.py", 103)
+    assert all("core.quotePath=false" in c for c in commands)
+    assert all("-z" in c for c in commands if "--name-status" in c)
+
+
+def test_a_changed_file_whose_diff_section_is_missing_is_unmappable_not_unchanged():
+    mapping = sb.map_anchor(
+        "src/café.py", 100, 105, 40,
+        name_status="M\tsrc/café.py\n",
+        diff_text='diff --git "a/src/caf\\303\\251.py" "b/src/caf\\303\\251.py"\n@@ -10,0 +11,100 @@\n',
+    )
+    assert mapping.outcome == sb.OUTCOME_UNMAPPABLE
+    # An unchanged file (not in the listing) with unrelated sections stays SHIFTED.
+    other = sb.map_anchor(
+        "src/a.py", 100, 105, 40,
+        name_status="M\tsrc/b.py\n",
+        diff_text="diff --git a/src/b.py b/src/b.py\n@@ -1,0 +2,3 @@\n",
+    )
+    assert (other.outcome, other.start) == (sb.OUTCOME_SHIFTED, 100)
+
+
+def test_a_sibling_from_an_earlier_round_does_not_escalate_again_but_keeps_the_episode_open():
+    sibling = _pr_item("item-12", "another branch src/spool.py:134", round_number=4)
+    stale = _pr_review(60, 4, HEAD_B, new=[sibling])
+    later = _pr_review(
+        70, 5, HEAD_C,
+        new=[_pr_item("item-13", "unrelated src/other.py:5", round_number=5)],
+        prior=[sibling],
+        dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "blocking")],
+    )
+    records = [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]), stale, later]
+    # Dispatching round 5: the round-4 sibling already stopped the run once.
+    result = sb.derive_pr_episode(
+        records, PR_REVIEWER, window=40, mapper=_identity_mapper, current_round=5
+    )
+    assert result.entry is not None and not result.siblings
+    # Dispatching round 4 itself still escalates, as does an unscoped replay.
+    assert sb.derive_pr_episode(
+        records, PR_REVIEWER, window=40, mapper=_identity_mapper, current_round=4
+    ).sibling_round == 4
+    assert sb.derive_pr_episode(
+        records, PR_REVIEWER, window=40, mapper=_identity_mapper
+    ).sibling_round == 4
+    # A new sibling introduced by the dispatched round's own review escalates.
+    newer = _pr_review(
+        70, 5, HEAD_C, new=[_pr_item("item-13", "another src/spool.py:136", round_number=5)],
+        prior=[sibling],
+        dispositions=[ReviewItemDisposition("item-12", PR_REVIEWER, "blocking")],
+    )
+    assert sb.derive_pr_episode(
+        [records[0], stale, newer], PR_REVIEWER, window=40, mapper=_identity_mapper, current_round=5
+    ).sibling_round == 5
+
+
+def test_a_sibling_reviewed_on_a_head_the_code_has_moved_past_does_not_escalate_again():
+    sibling = _pr_item("item-12", "another branch src/spool.py:134", round_number=4)
+    records = [
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()]),
+        _pr_review(60, 4, HEAD_B, new=[sibling]),
+    ]
+    same = sb.derive_pr_episode(
+        records, PR_REVIEWER, window=40, mapper=_identity_mapper,
+        current_round=4, current_head=HEAD_B,
+    )
+    assert same.sibling_round == 4  # an unchanged rerun stops again
+    pushed = sb.derive_pr_episode(
+        records, PR_REVIEWER, window=40, mapper=_identity_mapper,
+        current_round=4, current_head=HEAD_C,
+    )
+    assert pushed.entry is not None and not pushed.siblings
+
+
+# --- review round 6 fixes (#1265) -------------------------------------------
+
+
+def test_trigger_locations_are_mapped_to_the_dispatch_head_not_the_newest_reviews_head():
+    records = _trigger_records(["src/a.py:124", "src/a.py:130", "src/a.py:136"], heads=[HEAD_A] * 3)
+
+    def deleted_since(from_head, to_head, path, start, end):
+        if to_head == HEAD_B:
+            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "deleted")
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    # Reviewed on HEAD_A, dispatched on HEAD_B where the code is gone: no trigger.
+    assert sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=deleted_since,
+        current_head=HEAD_B,
+    ) is None
+    assert sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=deleted_since,
+    ) is not None  # without the dispatch head the stale review head was used
+
+    def shifted(from_head, to_head, path, start, end):
+        if to_head == HEAD_B:
+            return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start + 100, end + 100)
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    trigger = sb.find_pr_cluster_trigger(
+        records, PR_REVIEWER, k=3, window=40, current_round=3, mapper=shifted,
+        current_head=HEAD_B,
+    )
+    assert trigger.trigger_head == HEAD_B
+    assert (trigger.cluster.start, trigger.cluster.end) == (224, 236)
+
+
+def test_a_moved_distant_carried_item_does_not_keep_a_mappable_anchors_episode_open():
+    near = _pr_item("item-3", "gap src/spool.py:130", round_number=3)
+    far = _pr_item("item-6", "elsewhere src/spool.py:900", round_number=3)
+
+    def mapper(from_head, to_head, path, start, end):
+        if start >= 900:  # that code moved away: it cannot be placed on the new head
+            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, path, start, end, "moved")
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    sweep = _pr_review(
+        60, 4, HEAD_B, prior=[near, far],
+        dispositions=[
+            ReviewItemDisposition("item-3", PR_REVIEWER, "resolved"),
+            ReviewItemDisposition("item-6", PR_REVIEWER, "blocking"),
+        ],
+    )
+    later = _pr_review(
+        70, 5, HEAD_B, new=[_pr_item("item-9", "ordinary src/spool.py:135", round_number=5)],
+        prior=[far], dispositions=[ReviewItemDisposition("item-6", PR_REVIEWER, "blocking")],
+    )
+    # Round 3's review (on HEAD_A) is the carried items' source head.
+    source = _pr_review(40, 3, HEAD_A, new=[near, far])
+    records = [source, _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A)]), sweep, later]
+    # The only in-window item was resolved, so the episode closed at the sweep; the
+    # later in-window finding is ordinary.  Replaying the same records (a resume) agrees.
+    for _ in range(2):
+        result = sb.derive_pr_episode(
+            records, PR_REVIEWER, window=40, mapper=mapper, current_round=5, current_head=HEAD_B
+        )
+        assert result.entry is None and not result.siblings
+    # An unmappable ANCHOR still uses the same-path fallback for a carried item.
+    lost = lambda *a: sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, a[2], a[2], a[3], a[4], "moved")
+    kept = sb.derive_pr_episode(
+        records[:3], PR_REVIEWER, window=40, mapper=lost, current_round=4, current_head=HEAD_B
+    )
+    assert kept.entry is not None
+
+
+# --- review round 7 fix (#1265) ---------------------------------------------
+
+
+def test_a_carried_locations_known_rename_destination_keeps_an_unmappable_anchors_episode_open():
+    near = _pr_item("item-3", "gap src/a.py:130", round_number=3)
+    far = _pr_item("item-6", "elsewhere src/b.py:900", round_number=4)
+
+    def mapper(from_head, to_head, path, start, end):
+        if (from_head, to_head) == (HEAD_A, HEAD_B) and path == "src/a.py":
+            return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, "src/b.py", start, end)
+        if (from_head, to_head) == (HEAD_A, HEAD_C) and path == "src/a.py":
+            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, "src/c.py", start, end, "rewritten")
+        if (from_head, to_head) == (HEAD_B, HEAD_C) and path == "src/b.py":
+            return sb.AnchorMapping(sb.OUTCOME_UNMAPPABLE, path, "src/c.py", start, end, "moved")
+        return sb.AnchorMapping(sb.OUTCOME_SHIFTED, path, path, start, end)
+
+    records = [
+        _pr_review(40, 3, HEAD_A, new=[near]),
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry(head=HEAD_A, path="src/a.py")]),
+        _pr_review(
+            60, 4, HEAD_B, new=[far], prior=[near],
+            dispositions=[ReviewItemDisposition("item-3", PR_REVIEWER, "blocking")],
+        ),
+        # The near item is resolved; the distant one is carried onto a head where both
+        # files were renamed to src/c.py and the anchored code was rewritten.
+        _pr_review(
+            70, 5, HEAD_C, prior=[near, far],
+            dispositions=[
+                ReviewItemDisposition("item-3", PR_REVIEWER, "resolved"),
+                ReviewItemDisposition("item-6", PR_REVIEWER, "blocking"),
+            ],
+        ),
+        _pr_review(
+            80, 6, HEAD_C, new=[_pr_item("item-9", "sibling src/c.py:50", round_number=6)],
+            prior=[far], dispositions=[ReviewItemDisposition("item-6", PR_REVIEWER, "blocking")],
+        ),
+    ]
+    for _ in range(2):  # live, then a replay as a resume would see it
+        result = sb.derive_pr_episode(
+            records, PR_REVIEWER, window=40, mapper=mapper, current_round=6, current_head=HEAD_C
+        )
+        assert result.entry is not None and result.sibling_round == 6
+    # Before the sibling arrives the episode is still open (the rename destination counts).
+    assert sb.derive_pr_episode(
+        records[:4], PR_REVIEWER, window=40, mapper=mapper, current_round=5, current_head=HEAD_C
+    ).entry is not None

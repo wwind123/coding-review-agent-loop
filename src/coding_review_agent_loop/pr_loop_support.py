@@ -84,6 +84,7 @@ from .protocol import (
     parse_historical_structured_issue_implementation,
 )
 from .runner import Runner
+from . import review_step_back as _step_back
 from .usage import RunUsageContext
 from .workdirs import active_workdir
 from .workdir_guard import (
@@ -117,6 +118,7 @@ from .round_state import (
     PostedRoundRecord,
     _attach_round_metadata,
     _extract_round_metadata_records,
+    _is_followup_dispatch_head,
     _prior_item_ledger_signature,
     _resume_plan_round,
     scope_approved_plan_matrix,
@@ -3083,3 +3085,261 @@ def _recover_managed_ci_approved_plan(
     if parent_candidate.is_available:
         return parent_candidate
     return candidate
+
+
+# ---------------------------------------------------------------------------
+# PR fix-loop step-back (#1251, stage 2): runner-facing glue around the pure
+# helpers in ``review_step_back``.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PrStepBackDecision:
+    """Clusters that open a step-back turn at this coder dispatch."""
+
+    triggers: tuple[_step_back.PrClusterTrigger, ...] = ()
+
+    def coder_guidance(self) -> str:
+        if not self.triggers:
+            return ""
+        return _step_back.render_pr_step_back_coder_guidance(self.triggers)
+
+    def entry_payloads(self) -> tuple[Mapping[str, object], ...]:
+        return tuple(_step_back.pr_step_back_entry_payload(t) for t in self.triggers)
+
+
+def _pr_step_back_tracked_reviewers(
+    config: AgentLoopConfig, configured_reviewers: Sequence[AgentName]
+) -> tuple[str, ...]:
+    """The reviewers tracked independently, in configured-reviewer order."""
+    if config.pr_review_policy == "primary-then-panel" and config.primary_reviewer is not None:
+        return (agent_display_name(config.primary_reviewer),)
+    return tuple(agent_display_name(reviewer) for reviewer in configured_reviewers)
+
+
+def _git_anchor_mapper(
+    runner: Runner, config: AgentLoopConfig, *, checkout: Path, window: int
+) -> _step_back.AnchorMapper:
+    """Map anchors between heads through ``git diff`` hunks.
+
+    Rename pairs come from ``--name-status -M`` with no pathspec so both sides
+    are visible; hunks then come from ``-U0`` restricted to the old and new
+    paths.  A failed diff is UNMAPPABLE, never an error.
+    """
+    name_status_cache: dict[tuple[str, str], str | None] = {}
+    results: dict[tuple[str, str, str, int, int], _step_back.AnchorMapping] = {}
+
+    def run_git(args: Sequence[str]) -> str | None:
+        try:
+            result = runner.run(["git", *args], cwd=checkout, check=False)
+        except (OSError, AttributeError, TypeError, AgentLoopError):
+            return None
+        return result.stdout if result.returncode == 0 else None
+
+    def mapper(
+        from_head: str, to_head: str, path: str, start: int, end: int
+    ) -> _step_back.AnchorMapping:
+        key = (from_head, to_head, path, start, end)
+        if key in results:
+            return results[key]
+        pair = (from_head, to_head)
+        if pair not in name_status_cache:
+            name_status_cache[pair] = run_git(
+                ["-c", "core.quotePath=false", "diff", "--name-status", "-z", "-M", from_head, to_head]
+            )
+        name_status = name_status_cache[pair]
+        diff_text: str | None = None
+        if name_status is not None:
+            renames, _deleted = _step_back.parse_name_status(name_status)
+            new_path = renames.get(path, path)
+            pathspec = list(dict.fromkeys((path, new_path)))
+            diff_text = run_git(
+                ["-c", "core.quotePath=false", "diff", "-M", "-U0", from_head, to_head, "--", *pathspec]
+            )
+        mapping = _step_back.map_anchor(
+            path, start, end, window, name_status=name_status, diff_text=diff_text
+        )
+        if not mapping.mappable:
+            log(
+                config,
+                f"PR step-back: anchor {path}:{start}-{end} is UNMAPPABLE between "
+                f"{from_head[:12]} and {to_head[:12]} ({mapping.reason}); membership falls "
+                "back to any finding on the same path",
+            )
+        results[key] = mapping
+        return mapping
+
+    return mapper
+
+
+def _pr_step_back_records_may_matter(
+    records: Sequence[PostedRoundRecord], tracked: Sequence[str], *, k: int, round_number: int
+) -> bool:
+    """Cheap pre-check on the round-start snapshot: could this dispatch step back?
+
+    The snapshot lacks at most the current round's review, so a trigger needs the
+    previous K-1 reviews to already be consecutive new findings, and an episode
+    needs a recorded entry.  Anything else skips the fresh read entirely.
+    """
+    for reviewer in tracked:
+        entries, degraded = _step_back.pr_step_back_history(records, reviewer)
+        if degraded or entries:
+            return True
+        if k <= 1:
+            return True
+        # The snapshot may or may not already hold the current round's review (a
+        # resume restores it), so the preceding K-1 reviews are taken before it.
+        recent = [
+            review
+            for review in _step_back.pr_reviews_for(records, reviewer)
+            if review.round_number < round_number
+        ][-(k - 1):]
+        if (
+            len(recent) == k - 1
+            and recent[-1].round_number == round_number - 1
+            and all(r.classification == _step_back.CLASS_NEW_FINDING for r in recent)
+        ):
+            return True
+    return False
+
+
+def _pr_step_back_decision(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    round_number: int,
+    snapshot_comments: Sequence[object],
+    tracked: Sequence[str],
+    head_sha: str | None,
+) -> PrStepBackDecision:
+    """Escalate on a clustered sibling, else name the clusters that trigger now.
+
+    Evaluated at the coder dispatch from freshly read history so a live run and
+    a resumed run agree.  Raises ``AgentLoopError`` (a human-decision stop) before
+    any coder invocation when a reviewer's step-back still produced a sibling.
+    """
+    k = config.pr_step_back_rounds
+    window = config.pr_step_back_line_window
+    if k <= 0 or not tracked or not head_sha:
+        return PrStepBackDecision()
+    try:
+        snapshot = _extract_round_metadata_records(snapshot_comments, flow="pr")
+    except AgentLoopError:
+        log(config, "PR step-back suppressed: round history could not be decoded")
+        return PrStepBackDecision()
+    if not _pr_step_back_records_may_matter(snapshot, tracked, k=k, round_number=round_number):
+        return PrStepBackDecision()
+    try:
+        fresh = _extract_round_metadata_records(
+            get_pr_review_context(runner, config=config, pr_number=pr_number).comments,
+            flow="pr",
+        )
+    except AgentLoopError as exc:
+        log(config, f"PR step-back suppressed: fresh round history is unavailable ({exc})")
+        return PrStepBackDecision()
+    mapper = _git_anchor_mapper(runner, config, checkout=active_workdir(config), window=window)
+    triggers: list[_step_back.PrClusterTrigger] = []
+    for reviewer in tracked:
+        _entries, degraded = _step_back.pr_step_back_history(fresh, reviewer)
+        if degraded:
+            log(config, f"PR step-back suppressed for {reviewer}: malformed step-back history")
+            continue
+        episode = _step_back.derive_pr_episode(
+            fresh, reviewer, window=window, mapper=mapper,
+            current_round=round_number, current_head=head_sha,
+        )
+        if episode.siblings and episode.entry is not None:
+            mapping = episode.mapping
+            if mapping is not None and not mapping.mappable:
+                log(
+                    config,
+                    f"PR step-back: escalating {reviewer} on the unmappable-anchor same-path "
+                    "fallback",
+                )
+            raise AgentLoopError(
+                f"PR #{pr_number}: "
+                + _step_back.render_pr_step_back_human_decision(
+                    reviewer=reviewer,
+                    entry=episode.entry,
+                    mapping=mapping,
+                    siblings=episode.siblings,
+                    window=window,
+                    generalization=_step_back.step_back_generalization(fresh, episode.entry),
+                    sibling_round=episode.sibling_round,
+                )
+            )
+        if episode.entry is not None:
+            continue
+        trigger = _step_back.find_pr_cluster_trigger(
+            fresh, reviewer, k=k, window=window, current_round=round_number, mapper=mapper,
+            current_head=head_sha,
+        )
+        if trigger is not None and not _is_followup_dispatch_head(trigger.trigger_head):
+            log(
+                config,
+                f"PR step-back suppressed for {reviewer}: head {trigger.trigger_head!r} is not "
+                "a Git commit SHA, so it cannot be recorded",
+            )
+        elif trigger is not None:
+            triggers.append(trigger)
+            log(
+                config,
+                f"Round {round_number}: {reviewer} blocked {k} consecutive rounds with new "
+                f"findings clustered in {trigger.cluster.path}:{trigger.cluster.start}-"
+                f"{trigger.cluster.end}; the coder follow-up is a step-back turn",
+            )
+    return PrStepBackDecision(tuple(triggers))
+
+
+def _pr_step_back_sweep_contexts(
+    config: AgentLoopConfig,
+    comments: Sequence[object],
+    *,
+    round_number: int,
+    head_sha: str | None,
+    carried: Mapping[str, "_step_back.PrStepBackEntry"] | None = None,
+) -> dict[str, str]:
+    """Sweep prompt text per entry reviewer, for the step-back head's review only."""
+    if config.pr_step_back_rounds <= 0 or not head_sha or round_number < 2:
+        return {}
+    try:
+        records = _extract_round_metadata_records(comments, flow="pr")
+    except AgentLoopError:
+        records = ()
+    bound = _step_back.pr_sweep_entries(records, round_number=round_number, head_sha=head_sha)
+    for reviewer, entry in (carried or {}).items():
+        if entry.coder_round == round_number and entry.resulting_head == head_sha:
+            bound.setdefault(reviewer, entry)
+    return {
+        reviewer: _step_back.render_pr_sweep_guidance(entry) for reviewer, entry in bound.items()
+    }
+
+
+def _pr_step_back_carried_entries(
+    entries: Sequence[Mapping[str, object]], *, coder_round: int, head_sha: str | None
+) -> dict[str, "_step_back.PrStepBackEntry"]:
+    """The entries just recorded, kept in memory for the very next review.
+
+    The next round's comment snapshot is read before the coder record is posted,
+    so a live run carries the entries across the iteration; a resumed run
+    rebuilds the same bindings from the durable record.
+    """
+    if not head_sha:
+        return {}
+    carried: dict[str, _step_back.PrStepBackEntry] = {}
+    for entry in entries:
+        anchor = entry["anchor"]
+        reviewer = str(entry["reviewer"])
+        carried[reviewer] = _step_back.PrStepBackEntry(
+            reviewer=reviewer,
+            trigger_round=int(entry["trigger_round"]),
+            trigger_head=str(entry["trigger_head"]),
+            path=str(anchor["path"]),
+            start=int(anchor["start"]),
+            end=int(anchor["end"]),
+            coder_round=coder_round,
+            resulting_head=str(head_sha),
+            record_index=-1,
+        )
+    return carried

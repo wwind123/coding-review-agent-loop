@@ -870,3 +870,21 @@ def test_operator_docs_document_the_plan_step_back_mechanism():
     assert "re-filed as staged work" in text
     assert "`review_step_back.py`" in architecture
     assert "step_back_entries" in architecture and "step_back_entries" in text
+
+
+def test_operator_docs_document_the_pr_step_back_mechanism():
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "docs" / "local_agent_loop.md").read_text()
+    readme = (root / "README.md").read_text()
+    architecture = (root / "ARCHITECTURE.md").read_text()
+
+    for flag in ("--pr-step-back-rounds", "--pr-step-back-line-window"):
+        assert flag in text and flag in readme and flag in architecture
+    assert "#### PR step-back, reviewer sweep, and sibling escalation" in text
+    for outcome in ("SHIFTED", "REWRITTEN", "UNMAPPABLE"):
+        assert outcome in text and outcome in architecture
+    assert "without a pathspec" in text and "no pathspec" in architecture
+    assert "`Generalization:`" in text and "`in_cluster`" in architecture
+    assert "sweep" in text and "human-decision" in architecture

@@ -17357,3 +17357,528 @@ def test_ordinary_recovery_same_head_accepted_ready_reaches_post_write_verificat
     assert len(ready) == 1
     assert validations == [True, None]  # the existing post-write verification ran
     assert len(_merge_commands(runner)) == 1  # and only then was the exact head merged
+
+
+# --- PR fix-loop step-back (#1251, stage 2) ---------------------------------
+
+SB_HEAD = "a" * 40
+
+
+class _StepBackRunner(FakeRunner):
+    """FakeRunner with Git-SHA-shaped heads and scripted ``git diff`` output."""
+
+    def __init__(self, *, name_status="M\tsrc/spool.py\n", hunks="", shift_head=None, **kwargs):
+        kwargs.setdefault("pr_payload", {"headRefOid": SB_HEAD})
+        kwargs.setdefault("git_head", SB_HEAD)
+        super().__init__(**kwargs)
+        self.scripted_name_status = name_status
+        self.scripted_hunks = hunks
+        # The scripted hunks describe the step-back coder's push only; diffs between
+        # earlier heads stay empty so older locations are not shifted by them.
+        self.shift_head = shift_head or f"{3:040x}"
+
+    def _maybe_advance_pr_head_for_coder_followup(self, cmd) -> None:
+        if '"kind": "coder_followup"' not in "\n".join(cmd):
+            return
+        self._coder_followup_counter += 1
+        new_head = f"{self._coder_followup_counter:040x}"
+        self.pr_payload["headRefOid"] = new_head
+        self._move_head(new_head, cwd=self._last_agent_cwd)
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        cmd = [str(arg) for arg in args]
+        if cmd[:1] == ["git"] and "diff" in cmd and "--name-status" in cmd and "-M" in cmd:
+            cmd, cwd_path = self._record_command(cmd, cwd)
+            return CommandResult(cmd, cwd_path, self.scripted_name_status, "", 0)
+        if cmd[:1] == ["git"] and "diff" in cmd and "-U0" in cmd:
+            cmd, cwd_path = self._record_command(cmd, cwd)
+            touches = self.shift_head in cmd
+            return CommandResult(cmd, cwd_path, self.scripted_hunks if touches else "", "", 0)
+        return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
+
+
+def _sb_review(
+    blocking_items=None, *, resolved=(), carried=(), state=None, summary="review",
+    signature="OpenAI Codex",
+):
+    state = state or ("blocking" if blocking_items or carried else "approved")
+    dispositions = [{"item_id": item, "disposition": "resolved"} for item in resolved]
+    dispositions += [{"item_id": item, "disposition": "blocking", "note": "still open"} for item in carried]
+    return (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "pr_review",
+                "state": state,
+                "summary": summary,
+                "blocking_items": blocking_items or [],
+                "same_pr_followups": [],
+                "future_followups": [],
+                "prior_item_dispositions": dispositions,
+            }
+        )
+        + f"\n<!-- AGENT_STATE: {state} -->\n-- {signature}"
+    )
+
+
+def _sb_config(tmp_path, **overrides):
+    overrides.setdefault("max_rounds", 8)
+    return make_config(tmp_path, reviewer=("codex",), **overrides)
+
+
+def _sb_coder_prompts(runner):
+    return [
+        "\n".join(command) for command, _cwd in runner.commands
+        if command and command[0] == "claude"
+    ]
+
+
+def _sb_codex_prompts(runner):
+    return [
+        "\n".join(command) for command, _cwd in runner.commands
+        if command and command[0] == "codex"
+    ]
+
+
+def _three_clustered_blocks():
+    return [
+        _sb_review(["gap one at src/spool.py:124-131"]),
+        _sb_review(["gap two at src/spool.py:131-136"], resolved=["item-1"]),
+        _sb_review(["gap three at src/spool.py:140"], resolved=["item-2"]),
+    ]
+
+
+def _step_back_coders(count=3):
+    return [
+        structured_coder_followup(addressed_items=[f"item-{n}"]) for n in range(1, count)
+    ] + [
+        structured_coder_followup(
+            addressed_items=["item-3"],
+            summary="Generalization: any spool record that fails a validation step is malformed.",
+        )
+    ]
+
+
+def test_clustered_new_finding_blocks_trigger_a_step_back_turn_and_a_bound_sweep(tmp_path):
+    """`pr-clustered-k-blocks`."""
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    coder_prompts = _sb_coder_prompts(runner)
+    assert len(coder_prompts) == 3
+    assert all("STEP-BACK TURN" not in prompt for prompt in coder_prompts[:2])
+    assert "STEP-BACK TURN" in coder_prompts[2]
+    assert "src/spool.py` lines 124-140" in coder_prompts[2]
+    assert "small, localized cleanup" not in coder_prompts[2]
+    review_prompts = _sb_codex_prompts(runner)
+    assert len(review_prompts) == 4
+    assert all("Enumerate ALL remaining instances" not in p for p in review_prompts[:3])
+    assert "Enumerate ALL remaining instances" in review_prompts[3]
+
+
+def test_step_back_entry_is_recorded_on_the_coder_record_and_not_repeated(tmp_path):
+    from coding_review_agent_loop.github import get_pr_review_context
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+    config = _sb_config(tmp_path)
+    run_pr_loop(runner, pr_number=77, config=config)
+    comments = get_pr_review_context(runner, config=config, pr_number=77).comments
+    records = _extract_round_metadata_records(comments, flow="pr")
+    stepped = [r for r in records if r.metadata.role == "coder" and r.metadata.step_back_entries]
+    assert len(stepped) == 1
+    (entry,) = stepped[0].metadata.step_back_entries
+    assert entry["reviewer"] == "Codex" and entry["trigger_round"] == 3
+    assert entry["trigger_head"] == f"{2:040x}"
+    assert entry["anchor"] == {"path": "src/spool.py", "start": 124, "end": 140}
+    assert stepped[0].metadata.round_number == 4
+    assert stepped[0].metadata.subject == f"{3:040x}"
+
+
+def test_unrelated_blocks_do_not_trigger_a_step_back(tmp_path):
+    """`pr-no-trigger`."""
+    runner = _StepBackRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=[f"item-{n}"]) for n in (1, 2, 3)],
+        codex_outputs=[
+            _sb_review(["gap at src/a.py:10"]),
+            _sb_review(["gap at src/b.py:10"], resolved=["item-1"]),
+            _sb_review(["gap at src/c.py:10"], resolved=["item-2"]),
+            _sb_review(resolved=["item-3"]),
+        ],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    assert all("STEP-BACK TURN" not in prompt for prompt in _sb_coder_prompts(runner))
+    assert all("Enumerate ALL remaining" not in p for p in _sb_codex_prompts(runner))
+
+
+def test_disabling_the_pr_step_back_restores_the_ordinary_prompt(tmp_path):
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+    config = _sb_config(tmp_path, pr_step_back_rounds=0)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert all("STEP-BACK TURN" not in prompt for prompt in _sb_coder_prompts(runner))
+    assert all("Enumerate ALL remaining" not in p for p in _sb_codex_prompts(runner))
+
+
+def _run_to_sibling(tmp_path, sibling, **runner_kwargs):
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review([sibling], resolved=["item-3"])],
+        **runner_kwargs,
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
+    return runner, str(excinfo.value)
+
+
+def test_a_sibling_in_the_sweep_review_stops_for_a_human_decision_before_another_coder_turn(tmp_path):
+    """`pr-sibling-escalation`."""
+    runner, message = _run_to_sibling(tmp_path, "another branch at src/spool.py:134")
+    assert "human decision required" in message
+    assert "Generalization: any spool record that fails a validation step is malformed." in message
+    assert "--pr-step-back-rounds 0" in message and "accept a stated limitation" in message
+    assert len(_sb_coder_prompts(runner)) == 3  # no coder turn after the sweep
+    assert len(_sb_codex_prompts(runner)) == 4
+
+
+def test_a_sweep_sibling_located_only_in_a_sub_item_escalates(tmp_path):
+    """`pr-sweep-sub-item-location`."""
+    sibling = {
+        "text": "More spool validation branches are misclassified",
+        "sub_items": ["branch at src/spool.py:130 treats it as absent", "branch at src/other.py:9"],
+    }
+    runner, message = _run_to_sibling(tmp_path, sibling)
+    assert "human decision required" in message and "src/spool.py:130-130" in message
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_a_sweep_finding_outside_the_cluster_does_not_escalate(tmp_path):
+    runner = _StepBackRunner(
+        claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-4"])],
+        codex_outputs=[
+            *_three_clustered_blocks(),
+            _sb_review(["unrelated at src/other.py:5"], resolved=["item-3"]),
+            _sb_review(resolved=["item-4"]),
+        ],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    # The fourth coder turn is an ordinary follow-up, not a second step-back.
+    assert "STEP-BACK TURN" not in _sb_coder_prompts(runner)[3]
+
+
+def test_a_carried_item_does_not_escalate_and_no_second_step_back_is_issued(tmp_path):
+    runner = _StepBackRunner(
+        claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-3"])],
+        codex_outputs=[
+            *_three_clustered_blocks(),
+            _sb_review(carried=["item-3"]),
+            _sb_review(resolved=["item-3"]),
+        ],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    prompts = _sb_coder_prompts(runner)
+    assert len(prompts) == 4 and "STEP-BACK TURN" not in prompts[3]
+
+
+def test_a_step_back_that_shifts_lines_by_one_hundred_still_escalates_a_true_sibling(tmp_path):
+    """`pr-head-coordinate-mapping` through the orchestrator."""
+    hunks = "@@ -10,0 +11,100 @@\n"
+    _runner, message = _run_to_sibling(
+        tmp_path, "another branch at src/spool.py:230", hunks=hunks
+    )
+    assert "human decision required" in message and "SHIFTED" in message
+    assert "src/spool.py` lines 224-240" in message
+
+
+def test_unrelated_code_shifted_into_the_old_coordinates_does_not_escalate(tmp_path):
+    hunks = "@@ -10,0 +11,100 @@\n"
+    runner = _StepBackRunner(
+        claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-4"])],
+        codex_outputs=[
+            *_three_clustered_blocks(),
+            _sb_review(["code now at src/spool.py:130"], resolved=["item-3"]),
+            _sb_review(resolved=["item-4"]),
+        ],
+        hunks=hunks,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+
+
+def test_an_unmappable_anchor_falls_back_to_any_finding_on_the_path(tmp_path):
+    hunks = "@@ -124,17 +123,0 @@\n"
+    _runner, message = _run_to_sibling(
+        tmp_path, "another branch at src/spool.py:900", hunks=hunks
+    )
+    assert "UNMAPPABLE" in message and "human decision required" in message
+
+
+def test_resume_after_the_step_back_record_rebuilds_the_sweep_without_a_second_step_back(tmp_path):
+    """`pr-resume-mid-step-back`."""
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=_three_clustered_blocks(),
+    )
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        # The step-back coder record is published, then the sweep review cannot run.
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
+    assert len(_sb_coder_prompts(runner)) == 3
+    runner.codex_outputs.append(_sb_review(resolved=["item-3"]))
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    assert len(_sb_coder_prompts(runner)) == 3  # still one step-back turn, nothing re-dispatched
+    assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[3]
+
+
+def _gemini_review(*args, **kwargs):
+    return _sb_review(*args, signature="Google Gemini", **kwargs)
+
+
+def _two_reviewer_board(*, gemini_paths):
+    """Codex and Gemini each block three rounds; item IDs interleave per round.
+
+    Every reviewer dispositions every prior item, as the aggregate ledger requires.
+    """
+    codex, gemini = [], []
+    for n, line in enumerate((124, 131, 140)):
+        prior = [f"item-{2 * n - 1}", f"item-{2 * n}"] if n else []
+        codex.append(_sb_review([f"codex gap at src/spool.py:{line}"], resolved=prior))
+        gemini.append(
+            _gemini_review([f"gemini gap at {gemini_paths[n]}:{10 + n}"], resolved=prior)
+        )
+    coders = [
+        structured_coder_followup(addressed_items=[f"item-{2 * n + 1}", f"item-{2 * n + 2}"])
+        for n in range(3)
+    ]
+    return codex, gemini, coders
+
+
+def _two_reviewer_config(tmp_path):
+    return make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=8)
+
+
+def _sb_gemini_prompts(runner):
+    return [
+        "\n".join(command) for command, _cwd in runner.commands
+        if command and command[0] == "gemini"
+    ]
+
+
+def test_one_trigger_on_a_multi_reviewer_board_leaves_the_other_reviewer_ordinary(tmp_path):
+    codex, gemini, coders = _two_reviewer_board(
+        gemini_paths=("src/a.py", "src/b.py", "src/c.py")
+    )
+    runner = _StepBackRunner(
+        claude_outputs=coders,
+        codex_outputs=[*codex, _sb_review(resolved=["item-5", "item-6"])],
+        gemini_outputs=[*gemini, _gemini_review(resolved=["item-5", "item-6"])],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_two_reviewer_config(tmp_path)) == 0
+    assert "STEP-BACK TURN" in _sb_coder_prompts(runner)[2]
+    assert "src/a.py" not in _sb_coder_prompts(runner)[2].split("Clusters:")[1].split("Recent")[0]
+    assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[3]
+    assert "Enumerate ALL remaining instances" not in _sb_gemini_prompts(runner)[3]
+
+
+def _simultaneous_runner(gemini_outputs_tail):
+    codex, gemini, coders = _two_reviewer_board(
+        gemini_paths=("src/other.py", "src/other.py", "src/other.py")
+    )
+    return _StepBackRunner(
+        claude_outputs=coders,
+        codex_outputs=[*codex, _sb_review(resolved=["item-5", "item-6"])],
+        gemini_outputs=[*gemini, *gemini_outputs_tail],
+    )
+
+
+def test_simultaneous_clusters_share_one_coder_turn_with_one_bound_sweep_each(tmp_path):
+    """`pr-simultaneous-clusters`."""
+    from coding_review_agent_loop.github import get_pr_review_context
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    runner = _simultaneous_runner([_gemini_review(resolved=["item-5", "item-6"])])
+    config = _two_reviewer_config(tmp_path)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    step_back_prompts = [p for p in _sb_coder_prompts(runner) if "STEP-BACK TURN" in p]
+    assert len(step_back_prompts) == 1
+    clusters = step_back_prompts[0].split("Clusters:")[1]
+    assert clusters.index("Codex") < clusters.index("Gemini")  # configured-reviewer order
+    assert "src/spool.py" in clusters and "src/other.py" in clusters
+    assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[3]
+    assert "Enumerate ALL remaining instances" in _sb_gemini_prompts(runner)[3]
+    records = _extract_round_metadata_records(
+        get_pr_review_context(runner, config=config, pr_number=77).comments, flow="pr"
+    )
+    entries = [
+        entry for r in records if r.metadata.role == "coder" for entry in r.metadata.step_back_entries
+    ]
+    assert [entry["reviewer"] for entry in entries] == ["Codex", "Gemini"]
+
+
+def test_resume_after_one_sweep_review_is_published_requests_only_the_missing_sweep(tmp_path):
+    runner = _simultaneous_runner([])  # Gemini's sweep review cannot run the first time
+    config = _two_reviewer_config(tmp_path)
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    codex_before = len(_sb_codex_prompts(runner))
+    runner.gemini_outputs.append(_gemini_review(resolved=["item-5", "item-6"]))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(_sb_codex_prompts(runner)) == codex_before  # the published sweep is not re-requested
+    assert "Enumerate ALL remaining instances" in _sb_gemini_prompts(runner)[-1]
+    assert len([p for p in _sb_coder_prompts(runner) if "STEP-BACK TURN" in p]) == 1
+
+
+def test_a_carried_in_window_item_keeps_the_episode_open_and_a_later_sibling_escalates(tmp_path):
+    """`pr-clearance-window-membership`: live; the unit tests replay the same records."""
+    runner = _StepBackRunner(
+        claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-3"])],
+        codex_outputs=[
+            *_three_clustered_blocks(),
+            _sb_review(carried=["item-3"]),
+            _sb_review(["late sibling at src/spool.py:135"], carried=["item-3"]),
+        ],
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
+    assert "human decision required" in str(excinfo.value)
+    assert len(_sb_coder_prompts(runner)) == 4  # no fifth coder turn
+
+
+# --- review round 1 fixes (#1265) -------------------------------------------
+
+
+def test_a_sweep_sibling_arriving_exactly_at_the_round_limit_still_stops_for_a_human_decision(tmp_path):
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(["sibling at src/spool.py:134"], resolved=["item-3"])],
+    )
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path, max_rounds=4))
+    message = str(excinfo.value)
+    assert "human decision required" in message and "Reached max rounds" not in message
+    assert "Generalization:" in message
+    assert len(_sb_coder_prompts(runner)) == 3
+
+
+def test_primary_then_panel_step_back_sweeps_only_the_primary_before_any_secondary(tmp_path):
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+        gemini_outputs=[_gemini_review()],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=8,
+        pr_review_policy="primary-then-panel", primary_reviewer="codex",
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    commands = [c[0] for c, _cwd in runner.commands if c and c[0] in {"codex", "gemini"}]
+    first_gemini = commands.index("gemini")
+    assert commands[:first_gemini] == ["codex"] * 4  # no secondary before exact-head primary approval
+    assert len([p for p in _sb_coder_prompts(runner) if "STEP-BACK TURN" in p]) == 1
+    assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[3]
+    assert all("Enumerate ALL remaining instances" not in p for p in _sb_gemini_prompts(runner))
+
+
+def test_resume_after_a_carried_in_window_sweep_review_keeps_the_episode_and_stops_on_a_sibling(tmp_path):
+    runner = _StepBackRunner(
+        claude_outputs=[*_step_back_coders(), structured_coder_followup(addressed_items=["item-3"])],
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(carried=["item-3"])],
+    )
+    config = _sb_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        # Round 4's sweep review (carrying the in-window item) and the ordinary fourth
+        # coder turn are published; the run is interrupted before round 5's review.
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_sb_coder_prompts(runner)) == 4
+    runner.codex_outputs.append(_sb_review(["late sibling at src/spool.py:135"], carried=["item-3"]))
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(excinfo.value)
+    assert "human decision required" in message
+    assert "Generalization: any spool record that fails a validation step is malformed." in message
+    assert len(_sb_coder_prompts(runner)) == 4  # no coder turn after the sibling
+
+
+def test_resume_after_the_kth_review_is_published_still_issues_the_step_back_turn(tmp_path):
+    """Interrupted between the K-th clustered review and its coder dispatch."""
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders()[:2],  # the third (step-back) coder turn cannot run
+        codex_outputs=_three_clustered_blocks(),
+    )
+    config = _sb_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    runner.claude_outputs.append(_step_back_coders()[2])
+    runner.codex_outputs.append(_sb_review(resolved=["item-3"]))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    prompts = _sb_coder_prompts(runner)
+    assert "STEP-BACK TURN" in prompts[-1]  # the resumed dispatch, not an ordinary follow-up
+    assert len([p for p in prompts[:2] if "STEP-BACK TURN" in p]) == 0
+    assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[-1]
+
+
+def test_a_rerun_after_a_sibling_stop_does_not_repeat_the_stop_for_the_old_sibling(tmp_path):
+    """The operator pushes a redesign or a documented limitation; the next review
+    blocks on something outside the cluster. The stale sibling must not stop the run."""
+    runner, message = _run_to_sibling(tmp_path, "another branch at src/spool.py:134")
+    assert "human decision required" in message
+    assert len(_sb_coder_prompts(runner)) == 3
+    runner._move_head(f"{9:040x}", cwd=None)  # the operator's push
+    runner.pr_payload["headRefOid"] = f"{9:040x}"
+    # The pushed head is recovered as an unrecorded advance: the coder checks the
+    # stopped round's item, then the reviewer blocks on something outside the cluster.
+    runner.claude_outputs.extend(
+        [
+            structured_coder_followup(addressed_items=["item-4"]),
+            structured_coder_followup(addressed_items=["item-5"]),
+        ]
+    )
+    runner.codex_outputs.extend(
+        [
+            _sb_review(["unrelated at src/other.py:5"], resolved=["item-4"]),
+            _sb_review(resolved=["item-5"]),
+        ]
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    assert len(_sb_coder_prompts(runner)) == 5  # three before the stop, two after the push
+    assert all("STEP-BACK TURN" not in p for p in _sb_coder_prompts(runner)[3:])
+
+
+def _external_push_after_the_kth_review(tmp_path, hunks):
+    """Interrupt between the K-th clustered review and its coder dispatch, then push."""
+    pushed = f"{9:040x}"
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders()[:2],
+        codex_outputs=_three_clustered_blocks(),
+        hunks=hunks,
+        shift_head=pushed,
+    )
+    config = _sb_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    runner._move_head(pushed, cwd=None)  # an operator's refactor lands first
+    runner.pr_payload["headRefOid"] = pushed
+    runner.claude_outputs.append(structured_coder_followup(addressed_items=["item-3"]))
+    runner.codex_outputs.append(_sb_review(resolved=["item-3"]))
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    return runner
+
+
+def test_an_external_push_that_deletes_the_cluster_suppresses_the_stale_step_back(tmp_path):
+    runner = _external_push_after_the_kth_review(tmp_path, "@@ -100,60 +99,0 @@\n")
+    prompts = _sb_coder_prompts(runner)
+    # The first (interrupted) dispatch was a step-back on the then-current head; the
+    # resumed one, on the pushed head, is ordinary because the code is now unmappable.
+    assert "STEP-BACK TURN" in prompts[2]
+    assert "STEP-BACK TURN" not in prompts[-1]
+    assert all("Enumerate ALL remaining" not in p for p in _sb_codex_prompts(runner)[3:])
+
+
+def test_an_external_push_that_shifts_the_cluster_maps_the_step_back_to_the_pushed_head(tmp_path):
+    runner = _external_push_after_the_kth_review(tmp_path, "@@ -10,0 +11,100 @@\n")
+    assert "src/spool.py` lines 224-240" in _sb_coder_prompts(runner)[-1]

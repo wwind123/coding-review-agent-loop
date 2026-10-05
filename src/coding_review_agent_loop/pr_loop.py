@@ -352,6 +352,10 @@ from .child_plan_binding import (
 )
 from .pr_loop_support import (
     ExactHeadCiProof,
+    _pr_step_back_carried_entries,
+    _pr_step_back_decision,
+    _pr_step_back_sweep_contexts,
+    _pr_step_back_tracked_reviewers,
     _merge_with_exact_head_proof,
     _read_assigned_workdir_head,
     MAX_UNCHANGED_HEAD_CODER_TURNS,
@@ -2228,6 +2232,8 @@ def run_pr_loop(
                 "gate; no freeze was published and the new head needs review",
             )
 
+        # Step-back entries recorded by the previous iteration's coder turn (#1251).
+        pending_step_back_sweeps: dict = {}
         for round_number in round_sequence:
             evidence_pass = pending_evidence_pass
             pending_evidence_pass = None
@@ -2674,6 +2680,16 @@ def run_pr_loop(
             ) + _evidence_review_context(
                 prior_unresolved_items, response_head=evidence_response_head
             )
+            # Step-back sweeps (#1251) bind to the step-back coder record's
+            # resulting head and this round only; rebuilt from durable records.
+            pr_step_back_sweeps = _pr_step_back_sweep_contexts(
+                config,
+                pr_comments,
+                round_number=round_number,
+                head_sha=pr_metadata.head_sha,
+                carried=pending_step_back_sweeps,
+            )
+            pending_step_back_sweeps = {}
             # Persist the same digest identities surfaced in reviewer prompts.
             # An edited signed comment must not inherit the old approval.
             surfaced_reviewer_requirement_ids = _reviewer_requirement_identity_ids(
@@ -3857,6 +3873,9 @@ def run_pr_loop(
                                 superseded_prepanel_review_context=_superseded_prepanel_review(
                                     superseded_prepanel_reviews.get(agent_display_name(reviewer))
                                 ),
+                                sweep_context=pr_step_back_sweeps.get(
+                                    agent_display_name(reviewer), ""
+                                ),
                             )
                             for reviewer in launchable_pr_reviewers
                         }
@@ -4218,6 +4237,7 @@ def run_pr_loop(
                                 superseded_prepanel_review_context=_superseded_prepanel_review(
                                     superseded_prepanel_reviews.get(reviewer_name)
                                 ),
+                                sweep_context=pr_step_back_sweeps.get(reviewer_name, ""),
                             ),
                             session_id=(
                                 None
@@ -6778,6 +6798,18 @@ def run_pr_loop(
                             + approved_pr_reopen_hint(pr_number)
                         )
                         return 0
+            # A clustered sibling after a step-back stops for a human decision
+            # here, before the round-limit exit and any coder invocation; K clustered blocks otherwise
+            # turn this follow-up into one generalize-the-class step-back turn.
+            step_back_decision = _pr_step_back_decision(
+                runner,
+                config,
+                pr_number=pr_number,
+                round_number=round_number,
+                snapshot_comments=pr_comments,
+                tracked=_pr_step_back_tracked_reviewers(config, configured_reviewers),
+                head_sha=pr_metadata.head_sha,
+            )
             if round_number == allowed_rounds:
                 raise AgentLoopError(
                     _round_limit_diagnostic(
@@ -6918,6 +6950,12 @@ def run_pr_loop(
                     "commit's intent.\n\n"
                     + summary_context
                 )
+            step_back_guidance = (
+                step_back_decision.coder_guidance() if not has_merge_conflict_item else ""
+            )
+            step_back_entries = (
+                step_back_decision.entry_payloads() if step_back_guidance else ()
+            )
             if has_merge_conflict_item:
                 other_items = [
                     item for item in unresolved_items if item.item_id != MERGE_CONFLICT_ITEM_ID
@@ -6978,6 +7016,7 @@ def run_pr_loop(
                     human_requirements_context=coder_human_requirements_context,
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
+                    step_back_context=step_back_guidance,
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             else:
@@ -6997,6 +7036,7 @@ def run_pr_loop(
                     human_requirements_context=coder_human_requirements_context,
                     approved_plan_context=approved_plan_context,
                     parent_issue_context=parent_issue_context,
+                    step_back_context=step_back_guidance,
                 )
                 _log_coder_followup_dispatch(config, round_number, coder_name, coder_followup_items)
             repair_unresolved_item_ids = tuple(
@@ -7370,6 +7410,7 @@ def run_pr_loop(
                 scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
                 qualification_checkpoint=qualification_checkpoint,
                 followup_dispatch_head=followup_dispatch_head,
+                step_back_entries=step_back_entries,
                 **_test_observation_degradation_fields(coder_response.marker_value),
                 **_architecture_metadata_fields(
                     config, result=coder_response.marker_value
@@ -7415,6 +7456,11 @@ def run_pr_loop(
                         issue_created_handoff=managed_ci_handoff,
                         override_nonce=managed_ci_handoff.override_nonce,
                     )
+            pending_step_back_sweeps = _pr_step_back_carried_entries(
+                step_back_entries,
+                coder_round=coder_record_round,
+                head_sha=updated_pr_context.metadata.head_sha,
+            )
             previous_head = pr_metadata.head_sha
             unchanged_head_coder_turns = unchanged_head_tracker.observe(
                 previous_head, updated_pr_context.metadata.head_sha

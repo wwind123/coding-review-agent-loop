@@ -101,7 +101,7 @@ Source paths below are relative to
 | Validated agent turn | `validated_agent.py` | Run telemetry and usage contexts, structured repair, completion recovery, and the validated agent turn shared by every role. |
 | Response validation | `response_validation.py` | Coder and plan response validators, human-requirement checks, and post-PR test/observation validation. |
 | Panel evidence | `panel_evidence.py` | PR/plan panel evidence, board-amendment notes, plan primary streak, and plan-growth gates. |
-| Review step-back | `review_step_back.py` | Pure, history-derived step-back bookkeeping (#1251): classifies each primary review from its historical record as `new-finding`, `repeat-only`, or `approved`; derives the trigger streak and the active episode separately; and renders the step-back planner guidance, the step-back reviewer notice, and the human-decision stop message. It performs no I/O. |
+| Review step-back | `review_step_back.py` | Pure, history-derived step-back bookkeeping (#1251): classifies each primary review from its historical record as `new-finding`, `repeat-only`, or `approved`; derives the trigger streak and the active episode separately; and renders the step-back planner guidance, the step-back reviewer notice, and the human-decision stop message. For the PR fix loop (#1251) it also projects finding locations, maps anchors across heads from supplied diff text (`SHIFTED`/`REWRITTEN`/`UNMAPPABLE`), clusters findings, applies the shared `in_cluster` membership rule, and renders the coder step-back, reviewer sweep, and sibling-escalation text; the git reads happen in `pr_loop_support.py`. It performs no I/O. |
 | Review rounds | `review_rounds.py` | Review outcome classification, round-ledger helpers, parallel reviewer-turn launch, spool replay, and partial-round refusal. |
 | Discuss loop | `discuss_loop.py` | The discuss mode entry point and its consensus and split-proposal analyzers. |
 | Execution policy | `execution_policy.py` | Execution-policy resolution, child routing and provenance, staged reporting, typed plan-stage extraction, and fresh-topology preflights. |
@@ -799,6 +799,55 @@ resume. A pure helper classifies each item as `new`, `converging`, `stalled`,
 (default 3, 0 disables) sets the stall window, and the max-rounds diagnostics
 add a per-item progress block. The signal is advisory: it never changes
 `--max-rounds`, `allowed_rounds` or a checkpoint bound.
+
+**PR step-back, reviewer sweep, and sibling escalation** (#1251;
+`--pr-step-back-rounds` K, default 3, `0` disables; `--pr-step-back-line-window`,
+default 40). The PR fix loop reuses the plan-phase classification
+(`classify_review(..., phase="pr")`: `blocking` and `same-pr` items the reviewer
+owns are mandatory, future follow-ups never count). Each reviewer is tracked
+independently, or only the primary under `primary-then-panel`. Findings carry
+`path:start[-end]` references; `project_finding_locations` reads them from the
+parent text, the `fix_scope` entries, and every open sub-item statement (the
+sub-items are stored apart from the parent) while keeping the parent identity,
+and every location is bound to the head its review was taken on. Locations are
+compared across heads by `map_anchor`, which pairs renames with
+`git diff --name-status -M` and no pathspec, then reads `git diff -U0` hunks for
+the old and new paths through the runner. It returns exactly one of three
+outcomes: `SHIFTED` (the range lies in unchanged lines and moves by the
+cumulative hunk offset), `REWRITTEN` (changed hunks overlap it, their old side
+stays within the anchor +/- the window, and the replacement span is the new
+position; ranges are never widened to a whole hunk), or `UNMAPPABLE` (a deleted
+file with no rename pair, a rewrite that spills beyond the window, a pure
+deletion or move, or a failed diff). At the coder dispatch, after the round's
+review is read back from fresh history, a tracked reviewer with K consecutive
+`new-finding` reviews (and no active episode) forms a cluster when one path has a
+mapped finding in every one of those K reviews and the mapped ranges connect with
+gaps no larger than the window; unrelated paths, repeat-only reviews, findings
+without a line reference, and `UNMAPPABLE` locations never contribute. All
+reviewers that trigger at the same dispatch share one step-back coder turn
+(`step_back_context` replaces the same-PR small-cleanup framing and asks for a
+single rule, a parametrized test, and a summary beginning `Generalization:`;
+the existing `coder_followup` JSON carries it, no new section), and the
+orchestrator records one reviewer-owned `step_back_entries` entry per reviewer
+(`phase: "pr"`, `trigger_round`, `trigger_head`, `anchor`) on the coder record. The
+sweep binds to that record's entry reviewers and its resulting head only: the
+review of that head receives `sweep_context` (full and compact prompts), asking
+for every remaining instance, in the existing sub-item shape (none, one plain
+finding, one finding with 2-12 sub-items, or several findings of at most 12). A
+live run carries the entries across the iteration; a resumed run rebuilds them
+from the durable record and never re-requests a published sweep review. One
+predicate, `in_cluster`, decides membership for clustering, escalation, and
+clearance: for a mappable anchor, the mapped path within the mapped span +/- the
+window; for an `UNMAPPABLE` anchor, the logged conservative fallback of any
+finding on the original or rename-destination path. If the sweep review, or any
+later review in the active episode, introduces a new mandatory finding that is a
+member (located in the parent text or only in a sub-item), the loop raises a
+human-decision error before any further coder invocation, naming the cluster, the
+mapping outcome, the siblings, and the coder's `Generalization:` excerpt rebuilt
+from the stored structured response. A carried item is not a sibling; it keeps the
+episode open while it is a member. The episode closes on the reviewer's approval
+or when no unresolved mandatory item of theirs is a member. A malformed entry
+suppresses the trigger and the stop with a log line.
 
 ### CI and Merge
 
