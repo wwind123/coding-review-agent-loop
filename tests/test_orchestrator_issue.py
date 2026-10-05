@@ -15906,7 +15906,10 @@ def _m1251_steps_patch(base, *, resolved_item, summary):
     return text, next_base
 
 
-def _m1251_run(tmp_path, *, last_round, max_rounds, codex_overrides=None, **overrides):
+def _m1251_run(
+    tmp_path, *, last_round, max_rounds, codex_overrides=None, claude_transform=None,
+    **overrides,
+):
     """Run a live script to `last_round`'s review; return (runner, error).
 
     Round `n`'s primary review blocks on a new finding `item-n`.  The planner's
@@ -15924,8 +15927,11 @@ def _m1251_run(tmp_path, *, last_round, max_rounds, codex_overrides=None, **over
     codex_all = [*codex1, *codex2, *codex_rest]
     for number, output in (codex_overrides or {}).items():
         codex_all[number - 1] = output
+    claude_all = [fresh, *claude1, justify, *claude_rest]
+    if claude_transform is not None:
+        claude_all = [claude_transform(output) for output in claude_all]
     runner = _FakeRunner(
-        claude_outputs=[fresh, *claude1, justify, *claude_rest],
+        claude_outputs=claude_all,
         codex_outputs=codex_all,
     )
     values = {
@@ -17016,9 +17022,14 @@ def test_planner_history_failure_is_advisory_and_keeps_the_guidance(tmp_path, mo
     assert "projection exploded" not in str(error)
 
 
-def _m1273_run_all_reviewers(tmp_path, *, declare, rounds=3):
+def _m1273_run_all_reviewers(tmp_path, *, declare, rounds=3, locations=False):
     fresh, base0 = _m1103_fresh_base()
     codex, claude, _base = _m1103_blocking_chain(1, rounds, base=base0)
+    if locations:
+        codex = [
+            output.replace(f"Close gap {n}.", f"Close gap {n} in src/spool.py:{10 + n}.")
+            for n, output in enumerate(codex, start=1)
+        ]
     if declare:
         claude = [
             output.replace(
@@ -17064,3 +17075,81 @@ def test_planner_declared_generalization_is_logged_with_a_tag_and_silent_otherwi
     assert "declared a generalization (proactive): Generalization: this generalizes" in err
     _m1273_run_all_reviewers(tmp_path / "quiet", declare=False)
     assert "declared a generalization" not in capsys.readouterr().err
+
+
+_DECLARATION = "Generalization: this generalizes the fix for [item-1]: every gap"
+
+
+def test_planner_disposition_note_declaration_is_logged(tmp_path, capsys):
+    """`generalization-logged`: a declaration in a disposition note, not the summary."""
+    fresh, base0 = _m1103_fresh_base()
+    codex, claude, _base = _m1103_blocking_chain(1, 3, base=base0)
+    marker = '"item_id": "item-2", "disposition": "resolved"'
+    assert any(marker in output for output in claude)
+    claude = [
+        output.replace(marker, marker + f', "note": "{_DECLARATION}"') for output in claude
+    ]
+    runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
+    config = make_config(tmp_path, reviewer=("codex",), max_rounds=3, quiet=False)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    err = capsys.readouterr().err
+    assert err.count("declared a generalization") == 1
+    assert "declared a generalization (proactive): Generalization: this generalizes" in err
+
+
+def test_real_planner_step_back_turn_logs_a_step_back_directed_generalization(
+    tmp_path, capsys
+):
+    runner, _error = _m1251_run(
+        tmp_path, last_round=4, max_rounds=5, plan_step_back_escalation_rounds=5,
+        quiet=False,
+        claude_transform=lambda output: output.replace(
+            '"summary": "Close gap 4."', f'"summary": "{_DECLARATION}"'
+        ),
+    )
+    assert any(_STEP_BACK_MARKER in prompt for prompt in _m1251_prompts(runner, "claude"))
+    err = capsys.readouterr().err
+    assert err.count("declared a generalization") == 1
+    assert "declared a generalization (step-back-directed)" in err
+
+
+def test_all_reviewers_planner_history_cutoff_with_locations(tmp_path):
+    runner = _m1273_run_all_reviewers(tmp_path, declare=False, rounds=4, locations=True)
+    revisions = [
+        prompt for prompt in _m1251_prompts(runner, "claude")
+        if "Proactive generalization" in prompt
+    ]
+    # Prompt for review round 2: round-1 finding resolved with its location, the
+    # fix published under round 2 (the first revision) is shown, and the round-2
+    # sibling appears only in the review payload.
+    second = revisions[1]
+    history = second.split("Earlier-round history for this run", 1)[1].split("\n\n", 1)[0]
+    assert "Codex finding item-1 (resolved) src/spool.py:11" in history
+    assert "fix by " in history and "Close gap 1." in history
+    assert "item-2" not in history and "src/spool.py:12" not in history
+    assert "src/spool.py:12" in second
+
+
+def _non_agent_command_count(runner):
+    return sum(
+        1 for cmd, _cwd in runner.commands if cmd and cmd[0] not in {"codex", "claude", "gemini"}
+    )
+
+
+def test_history_adds_no_github_reads_under_either_planning_policy(tmp_path, monkeypatch):
+    from coding_review_agent_loop.finding_history import FindingHistoryLedger
+
+    def counts():
+        compat = _m1273_run_all_reviewers(tmp_path / "c", declare=False, rounds=3)
+        staged, _error = _m1251_run(
+            tmp_path / "s", last_round=3, max_rounds=3, plan_step_back_rounds=0,
+            plan_step_back_escalation_rounds=1,
+        )
+        return _non_agent_command_count(compat), _non_agent_command_count(staged)
+
+    with_history = counts()
+    monkeypatch.setattr(FindingHistoryLedger, "observe_reconciled", lambda *a, **k: None)
+    monkeypatch.setattr(FindingHistoryLedger, "record_fix", lambda *a, **k: None)
+    monkeypatch.setattr(FindingHistoryLedger, "seed_from_records", lambda *a, **k: None)
+    assert counts() == with_history

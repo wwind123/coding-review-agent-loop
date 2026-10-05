@@ -18039,6 +18039,97 @@ def test_ci_repair_dispatch_shows_the_earlier_ci_failure_by_check_name(
     assert len(prompts) == 2
     assert all("Proactive generalization" in prompt for prompt in prompts)
     second = prompts[1]
-    history = second.split("Earlier-round history for this run", 1)[1]
-    assert "CI github-pr-checks on" in history
-    assert "unit-a" in history
+    history = second.split("Earlier-round history for this run", 1)[1].split("\n\n", 1)[0]
+    assert history.count("CI github-pr-checks on") == 1
+    assert "(resolved)" in history or "(superseded" in history
+    assert "- unit-a" in history or "unit-a" in history
+    assert "Failing checks: unit-a" in history
+    assert "GitHub PR checks are failing" not in history
+    assert "Reviewed head" not in history
+
+
+def test_deferred_finding_stays_deferred_across_ci_repair_dispatches_and_on_replay(
+    tmp_path, monkeypatch
+):
+    """`deferred-status-sticky`: approval defers item-2, CI forces two later dispatches."""
+    from coding_review_agent_loop.finding_history import FindingHistoryLedger
+    from coding_review_agent_loop.github import get_pr_review_context
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
+        canonical_history_item_outcomes,
+    )
+
+    runner = FakeRunner(
+        codex_outputs=[
+            "Two gaps."
+            + blocking_issues("Gap one in src/a.py:10", "Gap two in src/b.py:20")
+            + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Defer gap two."
+            + prior_item_dispositions(
+                "[item-1] resolved", "[item-2] future follow-up: separate follow-up work"
+            )
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Still only CI."
+            + prior_item_dispositions("[item-3] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Done."
+            + prior_item_dispositions("[item-3] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=[
+            "Fixed one.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Fixed CI 1.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Fixed CI 2.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+    )
+    counter = iter(range(1, 10))
+    original = orchestrator._run_validated_agent
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+
+    def boards(*_a, **_k):
+        head = runner.pr_payload["headRefOid"]
+        if head == "repaired-3":
+            return _watch_check_board("passing")
+        if head == "abc123":
+            return _watch_check_board("passing")
+        failed = PullRequestCheck(
+            name=f"check-{head}", kind="check_run", status="failure",
+            url=f"https://example.test/{head}",
+        )
+        return _watch_check_board("failing", failing=(failed,))
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    config = make_config(
+        tmp_path, watch_pending_ci=True, max_rounds=6, pr_review_context_mode="compact"
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    prompts = [
+        "\n".join(cmd) for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"
+    ]
+    assert len(prompts) == 3
+    for prompt in prompts[1:]:
+        assert "Codex finding item-2 (deferred) src/b.py:20" in prompt
+    assert "Codex finding item-1 (resolved) src/a.py:10" in prompts[1]
+    records = _extract_round_metadata_records(
+        get_pr_review_context(runner, config=config, pr_number=77).comments, flow="pr"
+    )
+    outcomes = canonical_history_item_outcomes(
+        records, reconciliation_mode="aggregate", same_status="same-pr"
+    )
+    assert outcomes.get("item-2") == "deferred"
+    assert outcomes.get("item-1") == "resolved"
+    resumed = FindingHistoryLedger("pr")
+    resumed.seed(records, outcomes=outcomes)
+    resumed.observe_reconciled([])
+    assert "Codex finding item-2 (deferred)" in resumed.view(99).body

@@ -123,7 +123,7 @@ def _ci_detail_lines(text: str) -> tuple[str, ...]:
     details: list[str] = []
     for line in str(text or "").splitlines():
         stripped = line.strip()
-        if not stripped.startswith("- "):
+        if not stripped.startswith("- ") or stripped.lower().startswith("- reviewed head"):
             continue
         details.append(_neutral(stripped, _CI_DETAIL_LIMIT))
         if len(details) >= FINDING_HISTORY_CI_DETAIL_LINES:

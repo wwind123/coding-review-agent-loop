@@ -31,6 +31,10 @@ from coding_review_agent_loop.round_state import (
     _canonically_resolved_history_item_ids,
     canonical_history_item_outcomes,
 )
+from coding_review_agent_loop.unresolved_items import (
+    _clear_machine_obligations,
+    _upsert_machine_obligation,
+)
 
 
 def _item(item_id, status="blocking", *, reviewer="Codex", round_number=1, text=None, **kw):
@@ -525,4 +529,78 @@ def test_owner_scoped_replay_pending_second_owner_is_not_deferred_or_cleared():
     )
     assert canonical_history_item_outcomes(
         [seed, only_one], reconciliation_mode="owner-scoped", same_status="same-pr"
+    ) == {"item-1": "active"}
+
+
+@pytest.mark.parametrize("kind", ["github-pr-checks", "managed-exact-head-ci"])
+def test_real_singleton_upsert_yields_distinct_instances_for_both_ci_kinds(kind):
+    """A-to-B via the real `_upsert_machine_obligation`, repeat, then clearance."""
+    a, b = "a" * 40, "b" * 40
+
+    def text(head, check):
+        return f"Failing checks\nReviewed head: {head}\n- {check}: failure\nadvisory"
+
+    ledger, _ = _ledger()
+    items = _upsert_machine_obligation(
+        [], item_number=1, kind=kind, source_round=2, text=text(a, "check-x"), failed_head_sha=a
+    )
+    ledger.observe_reconciled(items)
+    ledger.observe_reconciled(items)  # repeated snapshot of A
+    items = _upsert_machine_obligation(
+        items, item_number=1, kind=kind, source_round=4, text=text(b, "check-y"), failed_head_sha=b
+    )
+    ledger.observe_reconciled(items)
+    body = ledger.view(9).body
+    assert body.count(f"CI {kind} on") == 2
+    assert f"CI {kind} on {a[:12]} (superseded by the failure on {b[:12]})" in body
+    assert f"CI {kind} on {b[:12]} (open)" in body
+    assert "- check-x: failure" in body and "- check-y: failure" in body
+    # First-observed rounds: A is round 2, B is round 4.
+    a_at = body.index(f"CI {kind} on {a[:12]}")
+    b_at = body.index(f"CI {kind} on {b[:12]} (open)")
+    assert body.index("Round 2:") < a_at < body.index("Round 4:") < b_at
+    ledger.observe_reconciled(_clear_machine_obligations(items, kind=kind))
+    assert f"CI {kind} on {b[:12]} (resolved)" in ledger.view(9).body
+
+
+def test_owner_scoped_replay_keeps_owner_state_without_a_repeated_vote():
+    shared = _item("item-1", resolution_owners=("Codex", "Claude"))
+    seed = _record(0, "reviewer", 1, subject="h0", state="blocking", new_items=(shared,))
+    codex = _record(
+        1, "reviewer", 2, agent="Codex", subject="h1", state="blocking",
+        dispositions=(ReviewItemDisposition("item-1", "Codex", "resolved"),),
+    )
+    claude_blocks = _record(
+        2, "reviewer", 2, agent="Claude", subject="h1", state="blocking",
+        dispositions=(ReviewItemDisposition("item-1", "Claude", "blocking", "no"),),
+    )
+    claude_later = _record(
+        3, "reviewer", 3, agent="Claude", subject="h2", state="blocking",
+        dispositions=(ReviewItemDisposition("item-1", "Claude", "resolved"),),
+    )
+    # Codex's earlier resolution was carried in the item's owner state: Claude's
+    # later resolution alone must now clear it.
+    assert canonical_history_item_outcomes(
+        [seed, codex, claude_blocks, claude_later],
+        reconciliation_mode="owner-scoped", same_status="same-pr",
+    ) == {"item-1": "resolved"}
+
+
+def test_replay_carries_updated_subitem_state_into_a_later_group():
+    item = _item(
+        "item-1",
+        sub_items=(ReviewSubItem("a", "x"), ReviewSubItem("b", "y")),
+    )
+    seed = _record(0, "reviewer", 1, subject="h0", state="blocking", new_items=(item,))
+    partial = _record(
+        1, "reviewer", 2, subject="h1", state="blocking",
+        dispositions=(
+            ReviewItemDisposition(
+                "item-1", "Codex", "blocking", "b remains",
+                sub_item_dispositions=(("a", "resolved"), ("b", "unresolved")),
+            ),
+        ),
+    )
+    assert canonical_history_item_outcomes(
+        [seed, partial], reconciliation_mode="aggregate", same_status="same-pr"
     ) == {"item-1": "active"}
