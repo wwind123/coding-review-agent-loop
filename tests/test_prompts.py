@@ -5285,6 +5285,18 @@ def test_step_back_anchor_none_leaves_revision_prompts_byte_identical(tmp_path):
         1278, 4, "Previous plan", "Blocking review", config,
     )
     assert _anchor_revision_prompts(config, None)["full"] == omitted
+    plain = {
+        "semantic-patch": build_plan_revision_prompt(
+            1278, 4, "Authenticated prior plan.", "Blocking review.", config,
+            response_form="semantic-patch-v1", base_round_number=3,
+            base_state_identity="a" * 64,
+        ),
+        "compact": build_plan_revision_prompt(
+            1278, 4, "Previous plan", "Blocking review", config, compact_context=True,
+        ),
+        "full": omitted,
+    }
+    assert _anchor_revision_prompts(config, None) == plain
 
 
 def test_step_back_anchor_appears_in_both_review_prompt_branches(tmp_path):

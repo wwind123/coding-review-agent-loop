@@ -17741,3 +17741,179 @@ def test_resumed_episode_prompts_match_the_uninterrupted_run(tmp_path):
     assert block(_m1251_prompts(resumed, "claude")[0], _STEP_BACK_ANCHOR_PLANNER) == block(
         _m1251_prompts(uninterrupted, "claude")[8], _STEP_BACK_ANCHOR_PLANNER
     )
+
+
+# --- #1278: closure, suppression and resume coverage -------------------------
+
+
+def _m1278_block(prompt, start, end):
+    """The anchor block verbatim, from its opening marker through its closing sentence."""
+    begin = prompt.index(start)
+    return prompt[begin : prompt.index(end, begin) + len(end)]
+
+
+_M1278_REVIEW_END = "does not filter or downgrade findings on it."
+_M1278_PLANNER_END = "contradicts the anchor."
+
+
+def test_degraded_history_with_an_existing_episode_suppresses_every_anchor(tmp_path):
+    """`degraded-history-suppression`: an established episode, then a malformed entry."""
+    history = _m1278_episode_history(tmp_path)
+    claude, codex = _m1275_scripts(first_round=8, last_round=9)
+    real_records = plan_first_loop_module._extract_round_metadata_records
+
+    def degrade(comments, *, flow):
+        return tuple(
+            PostedRoundRecord(
+                index=record.index,
+                metadata=(
+                    replace(
+                        record.metadata, step_back_status="invalid", step_back_entries=()
+                    )
+                    if record.metadata.role == "coder"
+                    else record.metadata
+                ),
+                body=record.body,
+            )
+            for record in real_records(comments, flow=flow)
+        )
+
+    with patch.object(
+        plan_first_loop_module, "_extract_round_metadata_records", side_effect=degrade
+    ):
+        rerun, error, messages = _m1275_resume(
+            tmp_path, history, claude=claude[:1], codex=codex[:1],
+            plan_step_back_escalation_rounds=2,
+        )
+
+    for agent in ("codex", "claude"):
+        for prompt in _m1251_prompts(rerun, agent):
+            assert _STEP_BACK_ANCHOR_REVIEW not in prompt
+            assert _STEP_BACK_ANCHOR_PLANNER not in prompt
+            assert _STEP_BACK_MARKER not in prompt
+    assert any("step-back suppressed" in m for m in messages)
+    assert not any("step-back anchor" in m for m in messages)
+    # No anchor-bearing stop and no new step-back entry.
+    assert "human decision required" not in str(error)
+    # Only the pre-existing entry from the history; the rerun records none.
+    assert sum(1 for r in _plan_round_records(rerun) if r.step_back_entries) == 1
+
+
+def test_resume_after_review_publication_rebuilds_the_planner_anchor(tmp_path):
+    """`resume-replay`: interrupted after round 8's review posted, before the planner turn."""
+    uninterrupted, _error = _m1251_run(
+        tmp_path, last_round=8, max_rounds=12, plan_step_back_escalation_rounds=9,
+    )
+    # Round 9's candidate is the first coder record after round 8's review.
+    history = []
+    for comment in uninterrupted.issue_comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if match is not None:
+            metadata = _decode_round_metadata(match.group("payload"))
+            if metadata.flow == "plan" and metadata.role == "coder" and metadata.round_number >= 9:
+                break
+        history.append(comment)
+    claude, codex = _m1275_scripts(first_round=8, last_round=9)
+    resumed, _e, _m = _m1275_resume(
+        tmp_path, history, claude=claude[:1], codex=[],
+        plan_step_back_escalation_rounds=9,
+    )
+
+    # The reviewers' round-8 posts are replayed, so only the planner turn launches.
+    assert _m1103_agent_calls(resumed)[0] == "claude"
+    planner_resumed = _m1251_prompts(resumed, "claude")[0]
+    planner_uninterrupted = _m1251_prompts(uninterrupted, "claude")[8]
+    assert _m1278_block(
+        planner_resumed, _STEP_BACK_ANCHOR_PLANNER, _M1278_PLANNER_END
+    ) == _m1278_block(planner_uninterrupted, _STEP_BACK_ANCHOR_PLANNER, _M1278_PLANNER_END)
+
+
+def test_complete_anchor_blocks_match_between_sequential_and_parallel(tmp_path):
+    """`parallel-reviewers`: full blocks, from the same pre-round snapshot."""
+    history = _m1278_episode_history(tmp_path)
+    claude, codex = _m1275_scripts(first_round=8, last_round=9)
+    blocks = {}
+    for parallel in (False, True):
+        rerun, _e, _m = _m1275_resume(
+            tmp_path, history, claude=claude[:1], codex=codex[:1],
+            plan_step_back_escalation_rounds=9, review_parallel=parallel,
+        )
+        blocks[parallel] = _m1278_block(
+            _m1251_prompts(rerun, "codex")[0], _STEP_BACK_ANCHOR_REVIEW, _M1278_REVIEW_END
+        )
+    assert blocks[False] == blocks[True]
+    # The pre-round snapshot excludes round 8's own posts: nothing from round 8
+    # (item-8) appears as a dissolved item.
+    assert "[item-8]" not in blocks[True]
+
+
+def test_post_review_stop_keeps_its_checkpoint_and_writes_nothing_later(tmp_path):
+    """`stop-post-review-with-reintroduction`: checkpoint present, nothing after it."""
+    runner, error = _m1251_run(tmp_path, last_round=6, max_rounds=8)
+
+    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    records = _plan_round_records(runner)
+    assert any(
+        r.phase == "scheduler-prelaunch" and r.round_number == 6 for r in records
+    )
+    assert not any(r.round_number > 6 for r in records)
+    assert not any(r.role == "coder" and r.round_number >= 7 for r in records)
+
+
+def test_approved_candidate_panel_prompts_carry_no_anchor(tmp_path):
+    """`episode-closed`: after the primary approves, the panel phase has no anchor."""
+    fresh, base0 = _m1103_fresh_base()
+    codex1, claude1, base_round2 = _m1103_blocking_chain(1, 1, base=base0)
+    codex2, _claude2, _base = _m1103_blocking_chain(2, 2, base=base_round2)
+    justify, base_round3 = _m1251_justify_patch(base_round2, resolved_item="item-2")
+    codex_rest, claude_rest, _base = _m1103_blocking_chain(3, 4, base=base_round3)
+    approve = structured_plan_review(
+        state="approved",
+        prior_plan_item_dispositions=[{"item_id": "item-4", "disposition": "resolved"}],
+    )
+    panel = structured_plan_review(state="approved", reviewer="Google Gemini")
+    runner = _FakeRunner(
+        claude_outputs=[fresh, *claude1, justify, *claude_rest],
+        codex_outputs=[*codex1, *codex2, *codex_rest, approve],
+        gemini_outputs=[panel],
+    )
+    config = _staged_plan_config(
+        tmp_path, max_rounds=8, plan_growth_max_chars=4500, plan_growth_max_revisions=3,
+        plan_step_back_escalation_rounds=1,
+    )
+    run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    gemini = _m1251_prompts(runner, "gemini")
+    assert len(gemini) == 1 and _STEP_BACK_ANCHOR_REVIEW not in gemini[0]
+    # The primary's own review of the candidate did carry the anchor.
+    assert _STEP_BACK_ANCHOR_REVIEW in _m1251_prompts(runner, "codex")[4]
+
+
+@pytest.mark.parametrize("drop_round5_checkpoint", [True, False])
+def test_issue_edit_drops_the_anchor_from_the_first_later_prompts(
+    tmp_path, drop_round5_checkpoint
+):
+    """`episode-closed`: the edit closes the old episode before any later prompt."""
+    rerun, _message = _m1251_edit_resume(
+        tmp_path, drop_round5_checkpoint=drop_round5_checkpoint
+    )
+
+    # The first review and the first revision after the edit still precede the
+    # new episode's step-back turn.
+    assert _STEP_BACK_ANCHOR_REVIEW not in _m1251_prompts(rerun, "codex")[0]
+    assert _STEP_BACK_ANCHOR_PLANNER not in _m1251_prompts(rerun, "claude")[0]
+
+
+def test_no_episode_run_logs_no_anchor_and_prompts_carry_no_anchor_text(tmp_path):
+    fresh, base = _m1103_fresh_base()
+    codex, claude, _base = _m1103_blocking_chain(1, 4, base=base)
+    runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
+    config = _staged_plan_config(tmp_path, max_rounds=4)
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not any("step-back anchor" in str(c.args[-1]) for c in logged.call_args_list)
+    for prompt in (*_m1251_prompts(runner, "claude"), *_m1251_prompts(runner, "codex")):
+        assert "step-back anchor" not in prompt.lower()
