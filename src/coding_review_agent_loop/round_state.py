@@ -3610,12 +3610,11 @@ def canonical_history_item_outcomes(
     def appear(item: UnresolvedReviewItem) -> None:
         if _is_machine_obligation(item):
             return
-        if item.status == "future":
-            active.pop(item.item_id, None)
-            outcomes[item.item_id] = "deferred"
-            return
+        # A future item still carried in the stored ledger (full context mode, planner)
+        # stays a reconciliation candidate, so a later authoritative `resolved`
+        # clears it; compact mode never stores it, so absence keeps it deferred.
         active[item.item_id] = item
-        outcomes[item.item_id] = "active"
+        outcomes[item.item_id] = "deferred" if item.status == "future" else "active"
 
     for group in groups.values():
         for record in group:

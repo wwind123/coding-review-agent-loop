@@ -333,6 +333,7 @@ class FindingHistoryLedger:
     _live_open: dict[tuple, int] = field(default_factory=dict)
     _live_machine: dict[str, str | None] = field(default_factory=dict)
     _deferred: set[tuple] = field(default_factory=set)
+    _ledger_future: set[tuple] = field(default_factory=set)
     unavailable_reason: str | None = None
 
     def _note(self, message: str) -> None:
@@ -360,10 +361,13 @@ class FindingHistoryLedger:
         try:
             live_open: dict[tuple, int] = {}
             live_machine: dict[str, str | None] = {}
+            seen_keys: set[tuple] = set()
+            ledger_future: set[tuple] = set()
             for item in (*unresolved_items, *future_items):
                 finding = self.add_finding(item)
                 if finding is None:
                     continue
+                seen_keys.add(finding.key)
                 status = getattr(item, "status", None)
                 if finding.kind == "machine":
                     if getattr(item, "lifecycle", None) != "cleared" and status != "future":
@@ -379,6 +383,16 @@ class FindingHistoryLedger:
                     self._deferred.discard(finding.key)
                 elif status == "future":
                     self._deferred.add(finding.key)
+                    if any(item is carried for carried in unresolved_items):
+                        ledger_future.add(finding.key)
+            # A future item that stays in the canonical ledger (full context mode,
+            # planner) and then leaves it was cleared by the reconciler: explicit
+            # clearance overrides the deferral.  An item that left the ledger by
+            # moving to the separate future collection (compact PR mode) is not
+            # in `_ledger_future`, so mere absence keeps it deferred.
+            for key in self._ledger_future - seen_keys:
+                self._deferred.discard(key)
+            self._ledger_future = ledger_future
             self._live_open = live_open
             self._live_machine = live_machine
         except Exception as exc:  # advisory: never stop the run

@@ -18248,3 +18248,174 @@ def test_deferred_finding_survives_a_real_resume_and_reintroduction_flips_it_ope
         [*records, reintroduced], reconciliation_mode="aggregate", same_status="same-pr"
     )
     assert after["item-2"] == "active"
+
+
+def test_future_finding_cleared_in_full_context_mode_is_resolved_live_and_on_resume(
+    tmp_path, monkeypatch
+):
+    """Retained future item resolved by the reconciler while CI forces other dispatches."""
+    import dataclasses as dc  # noqa: F401
+
+    from coding_review_agent_loop.errors import AgentLoopError
+    from coding_review_agent_loop.github import get_pr_review_context
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
+        canonical_history_item_outcomes,
+    )
+
+    runner = FakeRunner(
+        codex_outputs=[
+            "Two gaps."
+            + blocking_issues("Gap one in src/a.py:10", "Gap two in src/b.py:20")
+            + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Defer gap two."
+            + prior_item_dispositions(
+                "[item-1] resolved", "[item-2] future follow-up: separate follow-up work"
+            )
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Gap two was fixed after all."
+            + prior_item_dispositions(
+                "[item-2] resolved", "[item-3] resolved"
+            )
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Done."
+            + prior_item_dispositions("[item-3] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=[
+            "Fixed one.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Fixed CI 1.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Fixed CI 2.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+    )
+    counter = iter(range(1, 10))
+    original = orchestrator._run_validated_agent
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+
+    def boards(*_a, **_k):
+        head = runner.pr_payload["headRefOid"]
+        if head in {"repaired-3", "abc123"}:
+            return _watch_check_board("passing")
+        failed = PullRequestCheck(
+            name=f"check-{head}", kind="check_run", status="failure",
+            url=f"https://example.test/{head}",
+        )
+        return _watch_check_board("failing", failing=(failed,))
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    config = make_config(
+        tmp_path, watch_pending_ci=True, max_rounds=6, pr_review_context_mode="full"
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    prompts = [
+        "\n".join(cmd) for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"
+    ]
+    assert len(prompts) == 3
+
+    def history(prompt):
+        return prompt.split("Earlier-round history for this run", 1)[1].split("\n\n", 1)[0]
+
+    assert "Codex finding item-2 (deferred) src/b.py:20" in history(prompts[1])
+    assert "Codex finding item-2 (resolved) src/b.py:20" in history(prompts[2])
+    assert "(deferred)" not in history(prompts[2])
+    records = _extract_round_metadata_records(
+        get_pr_review_context(runner, config=config, pr_number=77).comments, flow="pr"
+    )
+    outcomes = canonical_history_item_outcomes(
+        records, reconciliation_mode="aggregate", same_status="same-pr"
+    )
+    assert outcomes["item-2"] == "resolved"
+
+
+def test_future_finding_reintroduced_as_blocking_in_full_context_mode_is_open_live(
+    tmp_path, monkeypatch
+):
+    """Retained future item resolved by the reconciler while CI forces other dispatches."""
+    import dataclasses as dc  # noqa: F401
+
+    from coding_review_agent_loop.errors import AgentLoopError
+    from coding_review_agent_loop.github import get_pr_review_context
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
+        canonical_history_item_outcomes,
+    )
+
+    runner = FakeRunner(
+        codex_outputs=[
+            "Two gaps."
+            + blocking_issues("Gap one in src/a.py:10", "Gap two in src/b.py:20")
+            + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Defer gap two."
+            + prior_item_dispositions(
+                "[item-1] resolved", "[item-2] future follow-up: separate follow-up work"
+            )
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Gap two matters now."
+            + prior_item_dispositions(
+                "[item-2] still blocking: src/b.py:20 must be fixed in this PR after all",
+                "[item-3] resolved",
+            )
+            + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex",
+            "Done."
+            + prior_item_dispositions("[item-2] resolved", "[item-3] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=[
+            "Fixed one.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Fixed CI 1.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+            "Fixed CI 2.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        ],
+    )
+    counter = iter(range(1, 10))
+    original = orchestrator._run_validated_agent
+
+    def run(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if kwargs.get("role") == "coder":
+            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+        return response
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+
+    def boards(*_a, **_k):
+        head = runner.pr_payload["headRefOid"]
+        if head in {"repaired-3", "abc123"}:
+            return _watch_check_board("passing")
+        failed = PullRequestCheck(
+            name=f"check-{head}", kind="check_run", status="failure",
+            url=f"https://example.test/{head}",
+        )
+        return _watch_check_board("failing", failing=(failed,))
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
+    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+        status="passed", pr_checks=_watch_check_board("passing"),
+        head_sha=runner.pr_payload["headRefOid"], attempts_used=1
+    ))
+    config = make_config(
+        tmp_path, watch_pending_ci=True, max_rounds=6, pr_review_context_mode="full"
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    prompts = [
+        "\n".join(cmd) for cmd, _cwd in runner.commands if cmd and cmd[0] == "claude"
+    ]
+    assert len(prompts) == 3
+
+    def history(prompt):
+        return prompt.split("Earlier-round history for this run", 1)[1].split("\n\n", 1)[0]
+
+    assert "Codex finding item-2 (deferred) src/b.py:20" in history(prompts[1])
+    # Authoritative reintroduction: a reviewer blocks the carried future item again.
+    assert "Codex finding item-2 (open) src/b.py:20" in history(prompts[2])
+    assert "(deferred)" not in history(prompts[2])

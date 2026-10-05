@@ -710,3 +710,45 @@ def test_legacy_ci_snapshots_without_failed_head_seed_once_and_clear():
     body = ledger.view(5).body
     assert body.count("CI github-pr-checks") == 1
     assert "- old-check: failure" in body and "(resolved)" in body
+
+
+def test_future_item_kept_in_the_ledger_and_then_cleared_is_resolved_not_deferred():
+    """Full context / planner: a retained future finding that the reconciler clears."""
+    ledger, _ = _ledger()
+    future = _item("item-1", "future")
+    ledger.observe_reconciled([future])
+    assert "Codex finding item-1 (deferred)" in _view(ledger, 5)
+    ledger.observe_reconciled([future])  # still carried: stays deferred
+    assert "Codex finding item-1 (deferred)" in _view(ledger, 5)
+    ledger.observe_reconciled([])  # reconciler cleared it
+    assert "Codex finding item-1 (resolved)" in _view(ledger, 5)
+
+
+def test_compact_mode_future_item_stays_deferred_across_absent_snapshots():
+    ledger, _ = _ledger()
+    ledger.observe_reconciled([], [_item("item-1", "future")])
+    ledger.observe_reconciled([])
+    ledger.observe_reconciled([])
+    assert "Codex finding item-1 (deferred)" in _view(ledger, 5)
+
+
+def test_replay_lets_a_resolved_disposition_clear_a_carried_future_item():
+    item = _item("item-1")
+    seed = _record(0, "reviewer", 1, subject="h0", state="blocking", new_items=(item,))
+    carried = _record(
+        1, "coder", 2, agent="Claude", subject="h1",
+        prior_items=(UnresolvedReviewItem(
+            item_id="item-1", reviewer="Codex", source_round=1, text=item.text, status="future"
+        ),),
+    )
+    still = canonical_history_item_outcomes(
+        [seed, carried], reconciliation_mode="aggregate", same_status="same-pr"
+    )
+    assert still == {"item-1": "deferred"}
+    clears = _record(
+        2, "reviewer", 2, subject="h1", state="blocking",
+        dispositions=(ReviewItemDisposition("item-1", "Codex", "resolved"),),
+    )
+    assert canonical_history_item_outcomes(
+        [seed, carried, clears], reconciliation_mode="aggregate", same_status="same-pr"
+    ) == {"item-1": "resolved"}
