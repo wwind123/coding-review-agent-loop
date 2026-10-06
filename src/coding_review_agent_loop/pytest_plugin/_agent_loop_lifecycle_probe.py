@@ -126,30 +126,41 @@ def _veto() -> None:
         _emit("test-code-touched")
 
 
+def _spellings(path: str):
+    """Absolute lexical and filesystem-resolved spellings, taken at observation time.
+
+    ``abspath`` removes ``..`` lexically while ``realpath`` follows symlinks
+    first, so they can name different files; both are kept (pattern matching
+    needs the spelling the user wrote, explicit targets need the real file).
+    """
+    lexical = os.path.abspath(path)
+    resolved = os.path.realpath(path)
+    return (lexical,) if lexical == resolved else (lexical, resolved)
+
+
 def _see(path) -> None:
     if isinstance(path, bytes):
         path = os.fsdecode(path)
     if not isinstance(path, str) or not path:
         return
+    try:
+        spellings = _spellings(path)
+    except Exception:
+        _veto()  # an unresolvable observation cannot be proven harmless
+        return
     if _S.phase == 1:
-        # Snapshot the observation-time location: a relative spelling would
-        # later resolve against a different working directory.
-        try:
-            path = os.path.abspath(path)
-        except Exception:
+        # Every path is retained, whatever its extension, in both spellings:
+        # an explicit target can only be recognised once the resolved arguments
+        # are known.  Overflow is a veto, never a silent drop.
+        for spelling in spellings:
+            if spelling not in _S.retained:
+                if len(_S.retained) >= _MAX_RETAINED:
+                    _veto()
+                    return
+                _S.retained.add(spelling)
+        if any(_matches_patterns(spelling) for spelling in spellings):
             _veto()
-            return
-        # Every path is retained, whatever its extension: an explicit target
-        # (for example ``cases.spec``) can only be recognised once the resolved
-        # arguments are known.  Overflow is a veto, never a silent drop.
-        if path not in _S.retained:
-            if len(_S.retained) >= _MAX_RETAINED:
-                _veto()
-                return
-            _S.retained.add(path)
-        if _matches_patterns(path):
-            _veto()
-    elif _matches_patterns(path) or _is_protected(path):
+    elif any(_matches_patterns(spelling) or _is_protected(spelling) for spelling in spellings):
         _veto()
 
 
