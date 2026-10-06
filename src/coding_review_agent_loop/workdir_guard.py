@@ -1558,25 +1558,64 @@ def partition_reported_tests_by_workdir(
     return ReportedTestsPartition(in_checkout=tuple(kept), out_of_checkout=tuple(context))
 
 
+_PACKAGE_MANAGER_HEADS = frozenset({"npm", "pnpm", "yarn"})
+_ENV_ASSIGNMENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _argv_tokens(argv: Sequence[str] | str) -> tuple[str, ...]:
+    if isinstance(argv, str):
+        try:
+            return tuple(shlex.split(argv))
+        except ValueError:
+            return (argv,)
+    return tuple(str(item) for item in argv)
+
+
+def is_package_manager_command(argv: Sequence[str] | str) -> bool:
+    """Whether ``argv`` (after an optional ``env NAME=VALUE`` prefix) is npm/pnpm/yarn."""
+    tokens = _argv_tokens(argv)
+    index = 0
+    if tokens and Path(tokens[0]).name == "env":
+        index = 1
+        while index < len(tokens) and (
+            tokens[index] == "--" or _ENV_ASSIGNMENT_TOKEN_RE.match(tokens[index])
+        ):
+            index += 1
+    return index < len(tokens) and Path(tokens[index]).name in _PACKAGE_MANAGER_HEADS
+
+
 def command_is_admissible_evidence(
     argv: Sequence[str] | str,
     *,
     assigned_workdir: Path,
+    executed_argv: Sequence[str] | None = None,
 ) -> bool:
     """Return whether a recorded test command may back an evidence selector.
 
     A command that targets a location outside the assigned checkout is
     context, not evidence, even when the managed broker ran it from inside the
     checkout (#991).  Anything the guard cannot validate is inadmissible too.
+
+    A package-manager command (``npm run <script>``) hides its operands in
+    package.json, so it is admissible only with the ``executed_argv`` the
+    runner froze at resolution time (#1294); that argv is validated as well.
     """
+    if is_package_manager_command(argv) and not executed_argv:
+        return False
     violations = _command_path_violations(argv, assigned_workdir=assigned_workdir)
-    return violations is not None and not violations
+    if violations is None or violations:
+        return False
+    if executed_argv:
+        executed = _command_path_violations(executed_argv, assigned_workdir=assigned_workdir)
+        return executed is not None and not executed
+    return True
 
 
 def command_targets_outside_workdir(
     argv: Sequence[str] | str,
     *,
     assigned_workdir: Path,
+    executed_argv: Sequence[str] | None = None,
 ) -> bool:
     """Return whether a validatable command tests *only* outside the checkout.
 
@@ -1585,9 +1624,12 @@ def command_targets_outside_workdir(
     as context, and an unvalidatable failure must stay authoritative.  A mixed
     run that also names an in-checkout test target, or whose only outside
     path is an option value such as a config or ignore path, is not context
-    either: its failure may be a real in-checkout failure.
+    either: its failure may be a real in-checkout failure.  When
+    ``executed_argv`` is supplied it is the argv judged (#1294).
     """
-    log = _command_path_violations(argv, assigned_workdir=assigned_workdir)
+    log = _command_path_violations(
+        executed_argv if executed_argv else argv, assigned_workdir=assigned_workdir
+    )
     return isinstance(log, _PathLog) and _tests_only_outside(log)
 
 

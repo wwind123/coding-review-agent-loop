@@ -224,23 +224,39 @@ def _admissible_evidence_observations(
     so an unvalidatable failure still degrades the rows it would affect.
     """
 
-    def keep(command: str | tuple[str, ...]) -> bool:
+    def keep(command: str | tuple[str, ...], executed: tuple[str, ...]) -> bool:
         if selectable:
-            return command_is_admissible_evidence(command, assigned_workdir=assigned_workdir)
-        return not command_targets_outside_workdir(command, assigned_workdir=assigned_workdir)
+            return command_is_admissible_evidence(
+                command, assigned_workdir=assigned_workdir, executed_argv=executed or None
+            )
+        return not command_targets_outside_workdir(
+            command, assigned_workdir=assigned_workdir, executed_argv=executed or None
+        )
 
     def argv(observation: object) -> object:
         if isinstance(observation, Mapping):
             return observation.get("argv", observation.get("command", ()))
         return getattr(observation, "command", ())
 
+    def executed_argv(observation: object) -> tuple[str, ...]:
+        # The exact spawned target the runner froze (#1294); live-only.
+        raw = (
+            observation.get("executed_command")
+            if isinstance(observation, Mapping)
+            else getattr(observation, "executed_command", ())
+        )
+        if isinstance(raw, Sequence) and not isinstance(raw, str):
+            return tuple(str(item) for item in raw)
+        return ()
+
     kept: list[object] = []
     for observation in observations:
         command = argv(observation)
+        executed = executed_argv(observation)
         if isinstance(command, str):
-            admissible = keep(command)
+            admissible = keep(command, executed)
         elif isinstance(command, Sequence):
-            admissible = keep(tuple(str(item) for item in command))
+            admissible = keep(tuple(str(item) for item in command), executed)
         else:
             admissible = not selectable
         if admissible:

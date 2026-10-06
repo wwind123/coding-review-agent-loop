@@ -1501,7 +1501,13 @@ flags (including `--shard`), `--config`/`--tsconfig`/global-setup options, custo
 non-empty `NODE_OPTIONS` or `PW_TEST_REPORTER` stay unrecognized; probed as
 `playwright --version`; `npx [--no-install|--no] playwright test ...` is recognized only
 when `<cwd>/node_modules/.bin/playwright` exists and is then probed and launched as
-that local binary, never letting npx resolve or download a package); other
+that local binary, never letting npx resolve or download a package;
+`npm run <script> [-- args]`, `pnpm run <script>` and `yarn run <script>`/`yarn <script>`
+are recognized when `<cwd>/package.json` statically resolves the script to one
+recognized command with no `pre`/`post` script, and then the resolved command is
+probed and launched, never the package manager). A standalone Node test script is
+citable only as `node --test <file>` and counts as one runner test that passes
+only on exit 0; other
 commands remain
 unknown rather than being judged from text or exit codes. The runtime result
 keeps independent `wrapper_bootstrap`, `inner_exec`, and `suite_start` states,

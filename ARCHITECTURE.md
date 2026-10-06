@@ -364,7 +364,27 @@ npx is never executed by the recognizer or probe. Any other npx option
 (`-y`/`--yes`, `-p`/`--package`, `-c`, `--`, a version-pinned `playwright@x`),
 the existing unsafe `playwright test` forms, and a non-empty `NODE_OPTIONS` or
 `PW_TEST_REPORTER` (ambient or via an `env` prefix) leave the launcher
-unrecognized, so the observation stays `suite_start=unknown`. Repair
+unrecognized, so the observation stays `suite_start=unknown`.
+
+Package-script resolution (#1294) extends the same contract to
+`npm run|run-script <name> [-- args]`, `pnpm run <name>` and
+`yarn run <name>`/`yarn <name>`. `<cwd>/package.json` (never an ancestor) is read
+statically, once per request, and package.json logic is never executed. The
+script is adopted only when its body is a single simple command the recognizer
+already accepts; compound or shell-syntax bodies, a missing script, an existing
+`pre<name>`/`post<name>`, manager options, pnpm/yarn trailing arguments, nested
+package-manager or `env` bodies, an `node_modules/.bin` shadow of a bare head,
+and an unrecognized body are discarded and the request runs exactly as before
+with `suite_start=unknown`. The resolved argv is frozen once and is the only
+input to worker policy, the probe, the launch, worker-report classification and
+checkout-evidence admissibility; an adopted resolution never spawns the package
+manager, and `ForegroundTestResult.args` and the broker/row `executed_argv` hold
+the exact spawned target after launcher rebinding (excluding containment
+wrappers). The recorded command and the input manifest keep the original
+package-manager spelling. A package-manager observation without a live executed
+command is never admissible evidence. Plain `node <file>` is not recognized; the
+launch-integrity rejection instead names the exact `node --test <file>` spelling
+when redaction left the file token untouched. Repair
 does not generate matrix identities, canonical rows, receipt IDs, mappings,
 statuses, or evidence envelopes. Derived evidence and diagnostics are the
 durable replay artifact; live execution selectors are not. Historical accepted

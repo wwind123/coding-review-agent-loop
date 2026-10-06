@@ -3202,6 +3202,69 @@ def _observation_projection_field(observation: object, name: str) -> object:
     return None
 
 
+_NODE_HINT_FILE_RE = re.compile(r"[A-Za-z0-9 ._/@+,=-]+")
+_NODE_HINT_EXTENSIONS = (".js", ".mjs", ".cjs", ".ts")
+
+
+def _node_test_hint(observation: object) -> str:
+    """Name the verifiable ``node --test <file>`` spelling, or nothing (#1294).
+
+    Derived only from the redacted projection, and only when the projection
+    signals that redaction left every token byte-for-byte intact, so an
+    altered, truncated or private path is never turned into a rerun command.
+    """
+    from .local_test_evidence import MAX_SAFE_COMMAND_BYTES, _UNPARSABLE_PREFIX
+    from .test_runtime import _is_node_test_runner
+
+    if _observation_projection_field(observation, "command_verbatim") is not True:
+        return ""
+    caveats = _observation_projection_field(observation, "caveats")
+    if isinstance(caveats, (list, tuple)) and any(
+        isinstance(item, str) and item.startswith(_UNPARSABLE_PREFIX) for item in caveats
+    ):
+        return ""
+    command = _observation_projection_field(observation, "command")
+    if isinstance(command, str):
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return ""
+    elif isinstance(command, (list, tuple)):
+        tokens = [str(item) for item in command]
+    else:
+        return ""
+    if len(tokens) < 2 or tokens[0] not in {"node", "nodejs"}:
+        return ""
+    flags, file = tokens[1:-1], tokens[-1]
+    if "--test" in flags or not _is_node_test_runner(["--test", *flags, file]):
+        return ""
+    parts = file.split("/")
+    if (
+        not _NODE_HINT_FILE_RE.fullmatch(file)
+        or file.startswith(("/", "-"))
+        or ".." in parts
+        or not file.endswith(_NODE_HINT_EXTENSIONS)
+        or any(part == "" for part in parts)
+    ):
+        return ""
+    base = parts[-1].lower()
+    if not (
+        parts[0] in {"test", "tests", "e2e"}
+        or any(word in base for word in ("test", "spec", "e2e"))
+    ):
+        return ""
+    rerun = shlex.join(["node", "--test", *flags, file])
+    sentence = (
+        "To make it citable, re-run it through run-tests as: "
+        f"{rerun} (a standalone script counts as one runner test that passes only if it exits 0)."
+    )
+    # Emit only a sentence the final sanitizer leaves untouched, so an altered
+    # or truncated rerun command can never reach the coder.
+    if _safe_label(sentence, MAX_SAFE_COMMAND_BYTES * 2) != sentence:
+        return ""
+    return " " + sentence
+
+
 def _observation_command_label(observation: object) -> str:
     """Redacted, bounded command text; never reads raw argv attributes."""
     from .local_test_evidence import _UNPARSABLE_PREFIX, MAX_SAFE_COMMAND_BYTES, redact_test_command
@@ -4650,7 +4713,8 @@ def _parse_semantic_risk_coverage_claims(
                         f"{'; '.join(_launch_integrity_failure_reasons(observation))}; "
                         f"command: {_observation_command_label(observation)}; "
                         f"observed at {_observation_timestamp_label(observation)}. "
-                        "Cite a different observation whose launch was fully verified.",
+                        "Cite a different observation whose launch was fully verified."
+                        + _node_test_hint(observation),
                         reason="launch-integrity",
                     )
         # Then the first degradable defect wins, in a fixed order, so every

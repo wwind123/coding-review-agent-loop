@@ -38,6 +38,7 @@ from .test_runtime import (
     WRAPPER_BOOTSTRAP_STATES,
     acquire_command_lane,
     probe_inner_launcher,
+    resolve_adopted_package_script,
 )
 from .test_workers import (
     CAVEAT_DESCENDANTS,
@@ -338,6 +339,9 @@ def _cancelled_result(cmd, cwd, timeout_seconds, wrapper_bootstrap, health_prove
     )
 
 
+_UNRESOLVED_PACKAGE_SCRIPT: Any = object()
+
+
 def run_foreground_test(
     args: Sequence[str],
     *,
@@ -388,8 +392,19 @@ def _run_foreground_test_body(
     host_wait_heartbeat: Callable[[], None] | None = None,
     host_wait_notify: Callable[[str], None] | None = None,
     host_launch_guard: Callable[[], Any] | None = None,
+    package_script: Any = _UNRESOLVED_PACKAGE_SCRIPT,
 ) -> ForegroundTestResult:
     """Run a command in the foreground, teeing output and bounding its process group.
+
+    ``package_script`` (issue #1294) is the one-per-request static resolution of
+    an ``npm|pnpm|yarn run`` argv, adopted only when its resolved body is a
+    recognized launcher; ``None`` means discarded/not a package script, and the
+    default resolves here for direct callers.  An adopted resolution is the only
+    input to worker policy, the probe and the launch: the package manager is
+    never spawned and ``ForegroundTestResult.args`` is the exact spawned target
+    (after launcher rebinding, excluding containment wrappers).  For every other
+    run ``args`` stays the post-worker-policy argv in the caller's spelling,
+    which can differ from the spawned process by launcher rebinding.
 
     ``worker_budget`` enables the test-worker budget.  It is never read from
     ``env``: ``None`` means no injection, no plugin report and no worker-budget
@@ -409,6 +424,20 @@ def _run_foreground_test_body(
         )
     if not cmd:
         raise AgentLoopError("Test command is empty.")
+    if package_script is _UNRESOLVED_PACKAGE_SCRIPT:
+        package_script = resolve_adopted_package_script(
+            requested_cmd,
+            cwd=cwd,
+            environment=(
+                dict(env) if env is not None and environment_is_complete
+                else ({**os.environ, **env} if env is not None else None)
+            ),
+        )
+    # Frozen once: the resolved body (or the original argv) is what worker
+    # policy, the probe, the launch and worker-report classification all use.
+    policy_input = list(package_script.executed_argv) if package_script is not None else list(requested_cmd)
+    cmd = list(policy_input)
+    adopted_spawn: list[str] | None = None
 
     def notify(text: str) -> None:
         if output_callback is not None:
@@ -586,7 +615,7 @@ def _run_foreground_test_body(
                 decision.cleanup()
                 try:
                     decision = apply_worker_budget(
-                        requested_cmd,
+                        policy_input,
                         base_environment,
                         cwd,
                         worker_budget,
@@ -642,6 +671,7 @@ def _run_foreground_test_body(
             environment=spawn_environment,
             environment_is_complete=spawn_environment is not None,
             cancel=host_wait_cancel,
+            package_script=package_script,
         )
         if host_wait_cancel is not None and host_wait_cancel.is_set():
             if handle is not None:
@@ -671,6 +701,10 @@ def _run_foreground_test_body(
             if inner_probe.state == "verified" and inner_probe.launch_argv
             else cmd
         )
+        if package_script is not None:
+            # An adopted resolution never spawns the package manager.
+            assert launch_cmd, "adopted package script has no launch argv"
+            adopted_spawn = list(launch_cmd)
         pass_fds: tuple[int, ...] = ()
         if parent_cgroup_path is not None:
             ready_read, ready_write = os.pipe()
@@ -1046,7 +1080,7 @@ def _run_foreground_test_body(
                 decision.report_path,
                 command_class=decision.command_class,
                 mode=decision.mode,
-                argv=requested_cmd,
+                argv=policy_input,
             )
     finally:
         lane_lock.close()
@@ -1090,7 +1124,7 @@ def _run_foreground_test_body(
     for notice in worker_notices:
         notify(notice)
     return ForegroundTestResult(
-        cmd, cwd, outcome, final_returncode,
+        adopted_spawn if adopted_spawn is not None else cmd, cwd, outcome, final_returncode,
         elapsed, timeout_seconds, "\n".join(tail), evidence, False,
         wrapper_bootstrap, inner_exec, suite_start,
         "\n".join(handle.diagnostics) if handle is not None else "",

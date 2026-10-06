@@ -2477,6 +2477,195 @@ def _npx_local_playwright_target(tokens: tuple[str, ...], *, cwd: Path) -> tuple
     return (str(local), *tokens[index + 1:])
 
 
+class _NotPackageScript:
+    """Sentinel: the argv is not a package-manager script invocation."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "NOT_PACKAGE_SCRIPT"
+
+
+NOT_PACKAGE_SCRIPT = _NotPackageScript()
+
+_PACKAGE_MANAGERS = frozenset({"npm", "pnpm", "yarn"})
+# ``yarn <name>`` is a script only when ``<name>`` is not a yarn command.
+_YARN_BUILTIN_COMMANDS = frozenset({
+    "add", "audit", "autoclean", "bin", "cache", "check", "config", "create", "dedupe",
+    "dlx", "exec", "explain", "generate-lock-entry", "global", "help", "import", "info",
+    "init", "install", "licenses", "link", "list", "login", "logout", "node", "npm", "outdated",
+    "owner", "pack", "patch", "plugin", "policies", "prune", "publish", "rebuild", "remove",
+    "run", "set", "search", "tag", "team", "unlink", "unplug", "up", "upgrade",
+    "upgrade-interactive", "version", "versions", "why", "workspace", "workspaces",
+    "constraints", "bin", "start", "test", "stop", "restart",
+})
+_PACKAGE_JSON_MAX_BYTES = 1024 * 1024
+_PACKAGE_BODY_FORBIDDEN_CHARS = frozenset(";&|<>$`\\()*?[]{}!#~%\r\n")
+_PACKAGE_BODY_FORBIDDEN_HEADS = frozenset({"env", "npm", "pnpm", "yarn", "cross-env"})
+_ASSIGNMENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_PATH_SHADOWED_HEADS = frozenset({"node", "nodejs", "pytest", "py.test"})
+
+
+@dataclass(frozen=True)
+class PackageScriptResolution:
+    """A statically resolved ``npm|pnpm|yarn run <script>`` invocation.
+
+    ``requested_argv`` is the caller's spelling, frozen verbatim; it stays the
+    reported command and the probe ``candidate``.  ``executed_argv`` is the
+    resolved single command (env prefix + script body + appended args) that is
+    the only thing worker policy, the probe, the launch and evidence
+    admissibility ever see.  Nothing from package.json is executed to build it.
+    """
+
+    requested_argv: tuple[str, ...]
+    manager: str
+    script_name: str
+    body: str
+    appended_args: tuple[str, ...]
+    env_prefix_tokens: tuple[str, ...]
+    executed_argv: tuple[str, ...]
+
+
+def _package_script_request(
+    target: tuple[str, ...],
+) -> tuple[str, str, tuple[str, ...]] | None:
+    """Parse ``(manager, script_name, appended_args)`` from a manager argv."""
+    manager = Path(target[0]).name
+    rest = target[1:]
+    appended: tuple[str, ...] = ()
+    if manager == "npm":
+        if len(rest) < 2 or rest[0] not in {"run", "run-script"}:
+            return None
+        name, extra = rest[1], rest[2:]
+        if extra:
+            if extra[0] != "--":
+                return None
+            appended = tuple(extra[1:])
+    elif manager == "pnpm":
+        if len(rest) != 2 or rest[0] != "run":
+            return None
+        name = rest[1]
+    else:
+        if len(rest) == 2 and rest[0] == "run":
+            name = rest[1]
+        elif len(rest) == 1 and rest[0] not in _YARN_BUILTIN_COMMANDS:
+            name = rest[0]
+        else:
+            return None
+    if not name or name.startswith("-"):
+        return None
+    return manager, name, appended
+
+
+def _read_package_scripts(cwd: Path) -> Mapping[str, object] | None:
+    path = cwd / "package.json"
+    try:
+        if not path.is_file() or path.stat().st_size > _PACKAGE_JSON_MAX_BYTES:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    scripts = data.get("scripts") if isinstance(data, dict) else None
+    return scripts if isinstance(scripts, dict) else None
+
+
+def _node_modules_bin_shadowed(head: str, cwd: Path) -> bool:
+    return any((directory / "node_modules" / ".bin" / head).exists() for directory in (cwd, *cwd.parents))
+
+
+def resolve_package_script(
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None
+) -> "PackageScriptResolution | None | _NotPackageScript":
+    """Statically resolve a package-manager script invocation (issue #1294).
+
+    Returns ``NOT_PACKAGE_SCRIPT`` for any other argv and ``None`` for a
+    package-manager form that cannot be resolved safely.  Reads only
+    ``<cwd>/package.json``; never runs the manager or any script.
+    """
+    requested = tuple(str(item) for item in argv)
+    values: Mapping[str, str] = environment if environment is not None else os.environ
+    if not requested:
+        return NOT_PACKAGE_SCRIPT
+    split = _split_env_prefix(requested, environment=values)
+    if split is None:
+        return NOT_PACKAGE_SCRIPT
+    _assignments, target, _env_path = split
+    if not target or Path(target[0]).name not in _PACKAGE_MANAGERS:
+        return NOT_PACKAGE_SCRIPT
+    env_prefix = requested[: len(requested) - len(target)]
+    parsed = _package_script_request(target)
+    if parsed is None:
+        return None
+    manager, name, appended = parsed
+    scripts = _read_package_scripts(cwd)
+    if scripts is None:
+        return None
+    body = scripts.get(name)
+    if not isinstance(body, str) or f"pre{name}" in scripts or f"post{name}" in scripts:
+        return None
+    if any(char in _PACKAGE_BODY_FORBIDDEN_CHARS for char in body):
+        return None
+    try:
+        tokens = shlex.split(body, posix=True)
+    except ValueError:
+        return None
+    if not tokens or _ASSIGNMENT_TOKEN_RE.match(tokens[0]):
+        return None
+    head = Path(tokens[0]).name
+    if head in _PACKAGE_BODY_FORBIDDEN_HEADS:
+        return None
+    if head == "npx":
+        # Never leave npx to resolve or download anything: the offline-safe
+        # spellings become the local binary, anything else stays and is
+        # discarded by the adoption gate.
+        rewritten = _npx_local_playwright_target(tuple(tokens), cwd=cwd)
+        if rewritten is not None:
+            tokens = list(rewritten)
+    elif tokens[0] == "playwright":
+        local = cwd / "node_modules" / ".bin" / "playwright"
+        if not local.is_file():
+            return None
+        tokens[0] = str(local)
+    elif tokens[0] in _PATH_SHADOWED_HEADS or tokens[0].startswith("python"):
+        if "/" not in tokens[0] and _node_modules_bin_shadowed(tokens[0], cwd):
+            return None
+    return PackageScriptResolution(
+        requested_argv=requested,
+        manager=manager,
+        script_name=name,
+        body=body,
+        appended_args=appended,
+        env_prefix_tokens=env_prefix,
+        executed_argv=(*env_prefix, *tokens, *appended),
+    )
+
+
+def adopt_package_script(
+    resolution: "PackageScriptResolution | None | _NotPackageScript",
+    *,
+    cwd: Path,
+    environment: Mapping[str, str] | None = None,
+) -> PackageScriptResolution | None:
+    """Return ``resolution`` only if its resolved argv is a recognized launcher."""
+    if not isinstance(resolution, PackageScriptResolution):
+        return None
+    values: Mapping[str, str] = environment if environment is not None else os.environ
+    if _recognized_inner_probe_with_environment(
+        resolution.executed_argv, cwd=cwd, environment=values
+    ) is None:
+        return None
+    return resolution
+
+
+def resolve_adopted_package_script(
+    argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None
+) -> PackageScriptResolution | None:
+    """Resolve once and keep the result only when it is statically recognized."""
+    return adopt_package_script(
+        resolve_package_script(argv, cwd=cwd, environment=environment),
+        cwd=cwd,
+        environment=environment,
+    )
+
+
 def _recognized_inner_probe_with_environment(
     argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None
 ) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, str], tuple[str, ...], tuple[str, ...]] | None:
@@ -2512,6 +2701,11 @@ def _recognized_inner_probe_with_environment(
 
 def recognized_inner_probe(argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None) -> tuple[str, ...] | None:
     """Return the only inner launcher forms eligible for a safe bootstrap probe."""
+    resolution = resolve_package_script(argv, cwd=cwd, environment=environment)
+    if resolution is None:
+        return None
+    if isinstance(resolution, PackageScriptResolution):
+        argv = resolution.executed_argv
     recognized = _recognized_inner_probe_with_environment(argv, cwd=cwd, environment=environment)
     return recognized[0] if recognized is not None else None
 
@@ -2712,8 +2906,15 @@ def probe_inner_launcher(
     argv: Sequence[str], *, cwd: Path, environment: Mapping[str, str] | None = None,
     environment_is_complete: bool = False,
     cancel: "threading.Event | None" = None,
+    package_script: "PackageScriptResolution | None" = None,
 ) -> LauncherProbeResult:
     """Run only a recognized, identity-cached five-second bootstrap probe.
+
+    ``package_script`` (issue #1294) marks ``argv`` as the post-policy resolved
+    body of an adopted package script: the probe is bound to that exact argv,
+    the identity covers the script, the result's ``candidate`` is the frozen
+    requested spelling, and a verified result always carries a full
+    ``launch_argv`` so the package manager is never spawned.
 
     ``cancel`` (issue #1108) aborts the probe: the owner kills its probe group
     and nothing is published to the cache, so a cancelled probe is never
@@ -2725,9 +2926,10 @@ def probe_inner_launcher(
         else ({**os.environ, **environment} if environment is not None else dict(os.environ))
     )
     original = tuple(str(item) for item in argv)
+    reported = package_script.requested_argv if package_script is not None else original
     recognized = _recognized_inner_probe_with_environment(original, cwd=cwd, environment=values)
     if recognized is None:
-        return LauncherProbeResult(original, "unknown", "unrecognized inner launcher")
+        return LauncherProbeResult(reported, "unknown", "unrecognized inner launcher")
     probe, target, env_assignments, launch_argv, env_prefix = recognized
     if env_assignments:
         values = {**values, **env_assignments}
@@ -2738,8 +2940,17 @@ def probe_inner_launcher(
         identity["env_prefix_sha256"] = hashlib.sha256(
             json.dumps([launch_argv[0], *env_prefix[1:]]).encode("utf-8")
         ).hexdigest()
+    if package_script is not None:
+        identity["package_script_sha256"] = hashlib.sha256(
+            json.dumps([
+                package_script.manager,
+                package_script.script_name,
+                package_script.body,
+                list(package_script.appended_args),
+            ]).encode("utf-8")
+        ).hexdigest()
     identity_key = _identity_key(identity)
-    rebound = launch_argv if launch_argv != original else ()
+    rebound = launch_argv if package_script is not None or launch_argv != original else ()
 
     def bind(result: LauncherProbeResult) -> LauncherProbeResult:
         # The cache holds only launcher authentication keyed by identity,
@@ -2748,7 +2959,7 @@ def probe_inner_launcher(
         # earlier command's argv.
         return replace(
             result,
-            candidate=original,
+            candidate=reported,
             launch_argv=rebound if result.state == "verified" else (),
         )
 
@@ -2770,7 +2981,7 @@ def probe_inner_launcher(
                 seen = _INNER_PREFLIGHT_CANDIDATES.setdefault(invocation, set())
                 if identity_key not in seen and len(seen) >= MAX_INNER_PROBE_CANDIDATES:
                     return LauncherProbeResult(
-                        original,
+                        reported,
                         "unknown",
                         f"inner probe candidate limit reached ({MAX_INNER_PROBE_CANDIDATES})",
                         identity_key,
@@ -2787,7 +2998,7 @@ def probe_inner_launcher(
         while True:
             remaining = flight_deadline - time.monotonic()
             if cancel is not None and cancel.is_set():
-                return LauncherProbeResult(original, "unknown", "inner probe cancelled", identity_key)
+                return LauncherProbeResult(reported, "unknown", "inner probe cancelled", identity_key)
             if remaining <= 0:
                 break
             slice_seconds = remaining if cancel is None else min(PROBE_CANCEL_POLL_SECONDS, remaining)
@@ -2798,7 +3009,7 @@ def probe_inner_launcher(
                     return bind(cached)
                 break
         return LauncherProbeResult(
-            original,
+            reported,
             "unknown",
             "inner probe result was not published by its owner",
             identity_key,
@@ -2819,19 +3030,19 @@ def probe_inner_launcher(
             )
         except ProbeCancelled:
             # Never published: the next request probes afresh.
-            return LauncherProbeResult(original, "unknown", "inner probe cancelled", identity_key)
+            return LauncherProbeResult(reported, "unknown", "inner probe cancelled", identity_key)
         except subprocess.TimeoutExpired:
-            result = LauncherProbeResult(original, "failed", "inner bootstrap probe timed out after 5s", identity_key)
+            result = LauncherProbeResult(reported, "failed", "inner bootstrap probe timed out after 5s", identity_key)
         except _ProbeContainmentUnavailable as exc:
-            result = LauncherProbeResult(original, "unknown", str(exc), identity_key)
+            result = LauncherProbeResult(reported, "unknown", str(exc), identity_key)
         except OSError as exc:
-            result = LauncherProbeResult(original, "failed", f"inner launcher did not start: {type(exc).__name__}", identity_key)
+            result = LauncherProbeResult(reported, "failed", f"inner launcher did not start: {type(exc).__name__}", identity_key)
         else:
             output = _collapsed_diagnostic((completed.stdout or "") + " " + (completed.stderr or ""))
             if completed.returncode == 0:
-                result = LauncherProbeResult(original, "verified", output, identity_key)
+                result = LauncherProbeResult(reported, "verified", output, identity_key)
             else:
-                result = LauncherProbeResult(original, "failed", output or f"bootstrap exited {completed.returncode}", identity_key)
+                result = LauncherProbeResult(reported, "failed", output or f"bootstrap exited {completed.returncode}", identity_key)
         return bind(result)
     finally:
         if cache_key is not None:

@@ -2617,3 +2617,265 @@ def test_gate_path_persists_triple(tmp_path):
     row = runtime.load_runtime_memory(memory)[-1]
     assert (row["wrapper_bootstrap"], row["inner_exec"], row["suite_start"]) == ("unknown", "started", "verified")
     assert row["launch_integrity"] == "verified"
+
+
+# --- package-script resolution (issue #1294) ---------------------------------
+
+
+def _write_package(root, scripts):
+    (root / "package.json").write_text(json.dumps({"scripts": scripts}), encoding="utf-8")
+
+
+def _verified_probe(monkeypatch, calls=None):
+    def fake_run(a, **kwargs):
+        if calls is not None:
+            calls.append(a)
+        return type("Completed", (), {"returncode": 0, "stdout": "1.0", "stderr": ""})()
+
+    monkeypatch.setattr(runtime, "_run_bounded_probe", fake_run)
+
+
+def _fake_npm(root, name="npm"):
+    sentinel = root / f"{name}-ran"
+    bindir = root / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    fake = bindir / name
+    fake.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    return bindir, sentinel
+
+
+def test_npm_run_playwright_script_is_verified_and_launches_local_binary(tmp_path, monkeypatch, no_ambient_invocation):
+    launcher = _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"test:x": "npx playwright test --project=a"})
+    calls = []
+    _verified_probe(monkeypatch, calls)
+    argv = ["npm", "run", "test:x"]
+    resolution = runtime.resolve_adopted_package_script(argv, cwd=tmp_path)
+    assert resolution is not None
+    result = runtime.probe_inner_launcher(
+        resolution.executed_argv, cwd=tmp_path, package_script=resolution
+    )
+    assert result.state == "verified"
+    assert result.candidate == tuple(argv)
+    assert result.launch_argv == (str(launcher), "test", "--project=a")
+    assert tuple(calls[0]) == (str(launcher), "--version")
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path) == (str(launcher), "--version")
+
+
+def test_npm_run_extra_args_are_appended_and_still_allow_listed(tmp_path, monkeypatch, no_ambient_invocation):
+    launcher = _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"test:x": "npx playwright test --project=a"})
+    _verified_probe(monkeypatch)
+    ok = runtime.resolve_adopted_package_script(["npm", "run", "test:x", "--", "--grep=foo"], cwd=tmp_path)
+    assert ok is not None
+    result = runtime.probe_inner_launcher(ok.executed_argv, cwd=tmp_path, package_script=ok)
+    assert result.launch_argv == (str(launcher), "test", "--project=a", "--grep=foo")
+    assert runtime.resolve_adopted_package_script(["npm", "run", "test:x", "--", "--list"], cwd=tmp_path) is None
+    assert runtime.recognized_inner_probe(["npm", "run", "test:x", "--", "--list"], cwd=tmp_path) is None
+    # npm args without ``--`` are never accepted.
+    assert runtime.resolve_package_script(["npm", "run", "test:x", "--grep=foo"], cwd=tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "scripts,argv",
+    [
+        ({"t": "npx playwright test && echo hi"}, ["npm", "run", "t"]),
+        ({"t": "npx playwright test | tee x"}, ["npm", "run", "t"]),
+        ({"t": "npx playwright test; true"}, ["npm", "run", "t"]),
+        ({"t": "FOO=1 npx playwright test"}, ["npm", "run", "t"]),
+        ({"t": "npm run other"}, ["npm", "run", "t"]),
+        ({"t": "jest"}, ["npm", "run", "t"]),
+        ({"t": "npx playwright test", "pret": "echo"}, ["npm", "run", "t"]),
+        ({"t": "npx playwright test", "postt": "echo"}, ["npm", "run", "t"]),
+        ({"other": "npx playwright test"}, ["npm", "run", "t"]),
+        ({"t": "npx playwright test"}, ["npm", "run", "--if-present", "t"]),
+        ({"t": "npx playwright test"}, ["npm", "-w", "x", "run", "t"]),
+        ({"t": "npx playwright test"}, ["pnpm", "run", "t", "--grep=x"]),
+        ({"t": "npx playwright test"}, ["yarn", "install"]),
+        ({"t": "npx playwright test"}, ["yarn", "run", "t", "--grep=x"]),
+    ],
+)
+def test_package_script_fail_closed_never_probes(tmp_path, monkeypatch, no_ambient_invocation, scripts, argv):
+    _fake_playwright(tmp_path)
+    _write_package(tmp_path, scripts)
+    calls = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *a, **k: calls.append(a))
+    assert runtime.resolve_adopted_package_script(argv, cwd=tmp_path) is None
+    assert runtime.recognized_inner_probe(argv, cwd=tmp_path) is None
+    assert calls == []
+
+
+def test_package_script_missing_or_invalid_package_json_is_unknown(tmp_path, no_ambient_invocation):
+    _fake_playwright(tmp_path)
+    argv = ["npm", "run", "t"]
+    assert runtime.resolve_package_script(argv, cwd=tmp_path) is None
+    (tmp_path / "package.json").write_text("{not json", encoding="utf-8")
+    assert runtime.resolve_package_script(argv, cwd=tmp_path) is None
+    (tmp_path / "package.json").write_text('{"scripts": []}', encoding="utf-8")
+    assert runtime.resolve_package_script(argv, cwd=tmp_path) is None
+    assert runtime.resolve_package_script(["pytest"], cwd=tmp_path) is runtime.NOT_PACKAGE_SCRIPT
+
+
+@pytest.mark.parametrize("name", ["NODE_OPTIONS", "PW_TEST_REPORTER"])
+def test_package_script_code_loading_environment_is_discarded(tmp_path, monkeypatch, no_ambient_invocation, name):
+    _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"t": "npx playwright test"})
+    monkeypatch.setenv(name, "--require x")
+    assert runtime.resolve_adopted_package_script(["npm", "run", "t"], cwd=tmp_path) is None
+
+
+def test_package_script_bin_shadowing_fails_closed(tmp_path, monkeypatch, no_ambient_invocation):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    _write_package(sub, {"t": "node --test t.js"})
+    assert runtime.resolve_package_script(["npm", "run", "t"], cwd=sub) is not None
+    shadow = tmp_path / "node_modules" / ".bin" / "node"
+    shadow.parent.mkdir(parents=True)
+    shadow.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert runtime.resolve_package_script(["npm", "run", "t"], cwd=sub) is None
+    # A bare ``playwright`` with no local binary cannot be reproduced either.
+    _write_package(sub, {"t": "playwright test"})
+    assert runtime.resolve_package_script(["npm", "run", "t"], cwd=sub) is None
+
+
+def test_pnpm_and_yarn_forms_are_recognized(tmp_path, monkeypatch, no_ambient_invocation):
+    _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"test:x": "npx playwright test --project=a"})
+    _verified_probe(monkeypatch)
+    for argv in (["pnpm", "run", "test:x"], ["yarn", "run", "test:x"], ["yarn", "test:x"]):
+        resolution = runtime.resolve_adopted_package_script(argv, cwd=tmp_path)
+        assert resolution is not None, argv
+        assert runtime.recognized_inner_probe(argv, cwd=tmp_path) is not None
+
+
+def test_package_script_probe_identity_and_candidate_spelling(tmp_path, monkeypatch, no_ambient_invocation):
+    _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"a": "npx playwright test --project=a", "b": "npx playwright test --project=b"})
+    _verified_probe(monkeypatch)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "pkg-identity-1294")
+    results = []
+    spellings = [
+        ["npm", "run", "a"], ["npm", "run-script", "a"], ["npm", "run", "a", "--"],
+        ["yarn", "run", "a"], ["yarn", "a"], ["npm", "run", "b"],
+    ]
+    for argv in spellings * 2:  # the second pass is served from the cache
+        resolution = runtime.resolve_adopted_package_script(argv, cwd=tmp_path)
+        assert resolution is not None
+        result = runtime.probe_inner_launcher(
+            resolution.executed_argv, cwd=tmp_path, package_script=resolution
+        )
+        assert result.candidate == tuple(argv)
+        assert result.launch_argv
+        results.append((argv, result))
+    by_name = {tuple(a): r for a, r in results}
+    assert by_name[("npm", "run", "a")].identity != by_name[("npm", "run", "b")].identity
+    assert by_name[("npm", "run", "a")].launch_argv[-1] == "--project=a"
+    assert by_name[("npm", "run", "b")].launch_argv[-1] == "--project=b"
+
+
+def test_foreground_adopted_script_without_rewrite_never_spawns_npm(tmp_path, monkeypatch, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    bindir, sentinel = _fake_npm(tmp_path)
+    node = bindir / "node"
+    node.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    node.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    _write_package(tmp_path, {"t": "node --test t.js"})
+    result = runner_module.run_foreground_test(
+        ["npm", "run", "t"], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+    assert result.suite_start == "verified"
+    assert not sentinel.exists()
+    assert result.args[1:] == ["--test", "t.js"]
+
+
+def test_foreground_adopted_playwright_script_records_spawned_local_binary(tmp_path, monkeypatch, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    launcher = _fake_playwright(tmp_path)
+    bindir, sentinel = _fake_npm(tmp_path)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    _write_package(tmp_path, {"t": "npx playwright test --project=a"})
+    result = runner_module.run_foreground_test(
+        ["npm", "run", "t", "--", "--grep=foo"], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+    assert result.suite_start == "verified"
+    assert runtime.launch_integrity_state(result, wrapper_boundary=False) == "verified"
+    assert not sentinel.exists()
+    assert list(result.args) == [str(launcher), "test", "--project=a", "--grep=foo"]
+
+
+@pytest.mark.parametrize("script,extra", [("jest", []), ("npx playwright test", ["--", "--list"])])
+def test_foreground_discarded_script_runs_npm_as_today(tmp_path, monkeypatch, no_ambient_invocation, script, extra):
+    from coding_review_agent_loop import runner as runner_module
+
+    _fake_playwright(tmp_path)
+    bindir, sentinel = _fake_npm(tmp_path)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    _write_package(tmp_path, {"t": script})
+    result = runner_module.run_foreground_test(
+        ["npm", "run", "t", *extra], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+    assert sentinel.exists()
+    assert result.suite_start == "unknown"
+    assert list(result.args) == ["npm", "run", "t", *extra]
+
+
+def test_foreground_adopted_script_with_unknown_probe_spawns_body_never_npm(tmp_path, monkeypatch, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    launcher = _fake_playwright(tmp_path)
+    bindir, sentinel = _fake_npm(tmp_path)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    _write_package(tmp_path, {"t": "npx playwright test"})
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "pkg-unknown-1294")
+    monkeypatch.setattr(runtime, "MAX_INNER_PROBE_CANDIDATES", 0)
+    result = runner_module.run_foreground_test(
+        ["npm", "run", "t"], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+    assert result.suite_start == "unknown"
+    assert not sentinel.exists()
+    assert list(result.args) == [str(launcher), "test"]
+
+
+def test_package_json_is_read_once_and_frozen_before_launch(tmp_path, monkeypatch, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    launcher = _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"t": "npx playwright test --project=a"})
+    resolution = runtime.resolve_adopted_package_script(["npm", "run", "t"], cwd=tmp_path)
+    _write_package(tmp_path, {"t": "npx playwright test --project=b"})
+    reads = []
+    original = runtime._read_package_scripts
+    monkeypatch.setattr(runtime, "_read_package_scripts", lambda cwd: reads.append(cwd) or original(cwd))
+    result = runner_module.run_foreground_test(
+        ["npm", "run", "t"], cwd=tmp_path, timeout_seconds=60, echo_output=False,
+        package_script=resolution,
+    )
+    assert reads == []
+    assert list(result.args) == [str(launcher), "test", "--project=a"]
+
+
+def test_cli_run_tests_records_npm_run_as_verified_evidence(tmp_path, monkeypatch, no_ambient_invocation):
+    launcher = _fake_playwright(tmp_path)
+    bindir, sentinel = _fake_npm(tmp_path)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    _write_package(tmp_path, {"test:x": "npx playwright test --project=a"})
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    monkeypatch.chdir(tmp_path)
+    code = main(["run-tests", "--timeout-seconds", "60", "--memory-dir", str(memory), "--", "npm", "run", "test:x"])
+    assert code == 0
+    assert not sentinel.exists()
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["launch_integrity"] == "verified"
+    assert runtime.runtime_row_is_evidence(row)
+    assert row["normalized_command"].startswith("npm run test:x")
+    assert row["executed_argv"] == [str(launcher), "test", "--project=a"]
+    # The input manifest stays on the original argv and tracks package.json.
+    assert row["input_manifest"] == runtime.build_input_manifest(["npm", "run", "test:x"], tmp_path)
+    _write_package(tmp_path, {"test:x": "npx playwright test --project=b"})
+    assert row["input_manifest"] != runtime.build_input_manifest(["npm", "run", "test:x"], tmp_path)
+

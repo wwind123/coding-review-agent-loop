@@ -1850,8 +1850,15 @@ def _run_tests_command(args: argparse.Namespace) -> int:
 
         from .worker_telemetry import ReservationTelemetry, attribution_from_environment, telemetry_log_path
 
+        from .test_runtime import resolve_adopted_package_script
+
+        # One static package.json read per request; the runner never rereads it.
+        package_script = resolve_adopted_package_script(
+            raw_inner, cwd=Path.cwd(), environment=fallback_environment
+        )
         result = run_foreground_test(
             raw_inner,
+            package_script=package_script,
             reservation_telemetry=ReservationTelemetry(
                 telemetry_log_path(), attribution_from_environment()
             ),

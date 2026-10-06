@@ -346,6 +346,13 @@ class LocalTestObservation:
     wrapper_bootstrap: str = "unknown"
     inner_exec: str = "not-attempted"
     suite_start: str = "not-started"
+    # Live-only exact spawned target of an adopted package-script run (issue
+    # #1294), after worker policy and launcher rebinding.  Never projected;
+    # restored rows carry none, so a package-manager row fails closed.
+    executed_command: tuple[str, ...] = field(default=(), repr=False, compare=False)
+    # ``True`` only while every projected command token equals the raw token
+    # byte for byte; ``None`` is a fresh live row that was never redacted.
+    command_verbatim: bool | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if self.outcome not in OUTCOMES:
@@ -388,7 +395,12 @@ class LocalTestObservation:
                         outcome = "incomplete"
                 elif not _is_downgraded(caveats):
                     argv = list(tokens)
+        verbatim = (
+            _tokens_verbatim(source.command, tokens, command_caveats)
+            and self.command_verbatim is not False
+        )
         projection = {
+            "command_verbatim": verbatim,
             "command": _bounded(command, MAX_SAFE_COMMAND_BYTES),
             "receipt_id": _safe_text(self.receipt_id or "", MAX_SAFE_IDENTIFIER_BYTES),
             "turn_id": _safe_text(self.turn_id or "", MAX_SAFE_IDENTIFIER_BYTES),
@@ -451,7 +463,7 @@ def mark_out_of_checkout_context(
     marked: list[LocalTestObservation] = []
     for row in observations:
         if not row.is_out_of_checkout_context and command_targets_outside_workdir(
-            row.command, assigned_workdir=assigned_workdir
+            row.executed_command or row.command, assigned_workdir=assigned_workdir
         ):
             row = replace(row, caveats=(OUT_OF_CHECKOUT_CONTEXT_CAVEAT, *row.caveats))
         marked.append(row)
@@ -655,6 +667,8 @@ def observation_from_mapping(
         wrapper_bootstrap=str(value.get("wrapper_bootstrap", "unknown")),
         inner_exec=str(value.get("inner_exec", "not-attempted")),
         suite_start=str(value.get("suite_start", "not-started")),
+        # A restored row cannot prove its tokens were never altered.
+        command_verbatim=value.get("command_verbatim") is True,
     )
 
 
@@ -1102,6 +1116,16 @@ def _redact_command_tokens(
     )
 
 
+def _tokens_verbatim(
+    raw: Sequence[str] | str, tokens: Sequence[str], caveats: Sequence[str]
+) -> bool:
+    """Whether redaction left every projected token identical to its raw token."""
+    return (
+        _TRUNCATED_CAVEAT not in caveats
+        and _coerce_command(raw) == tuple(tokens)
+    )
+
+
 def redact_test_command(
     argv: Sequence[str] | str, *, cwd: Path | None = None, identifiers: Sequence[str] = ()
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
@@ -1120,6 +1144,10 @@ def redact_observation(observation: LocalTestObservation) -> LocalTestObservatio
     )
     return replace(
         observation,
+        command_verbatim=(
+            _tokens_verbatim(observation.command, tokens, command_caveats)
+            and observation.command_verbatim is not False
+        ),
         normalized_command=command,
         # Take the redacted argv directly: the bounded display may end inside
         # a quoted token and must never be re-parsed (#1139).
@@ -2649,8 +2677,15 @@ class TestBrokerServer:
                     self._telemetry_attribution
                     or {"attribution_source": "none", "lane": "broker"},
                 )
+                from .test_runtime import resolve_adopted_package_script
+
+                # One static package.json read per request (issue #1294).
+                package_script = resolve_adopted_package_script(
+                    argv, cwd=cwd, environment=environment
+                )
                 result = run_foreground_test(
                     argv,
+                    package_script=package_script,
                     reservation_telemetry=telemetry,
                     worker_budget=self.effective_worker_budget(environment),
                     worker_lock_root=self._worker_lock_root,
@@ -2745,6 +2780,9 @@ class TestBrokerServer:
                 wrapper_bootstrap=str(getattr(result, "wrapper_bootstrap", "unknown")),
                 inner_exec=str(getattr(result, "inner_exec", "not-attempted")),
                 suite_start=suite_start,
+                executed_command=tuple(
+                    str(item) for item in (getattr(result, "args", ()) or ())
+                ),
             )
             with self._journal_lock:
                 if self._stop_event.is_set() and "unattributed: broker shutdown" not in observation.attribution.caveats:
