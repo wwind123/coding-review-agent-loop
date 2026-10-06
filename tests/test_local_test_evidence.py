@@ -4287,3 +4287,37 @@ def test_unchanged_head_sentence_names_unsuperseded_receipts_only():
     )
     assert unsuperseded_receipts_sentence(only_launch) == ""
     assert unsuperseded_receipts_sentence(None) == ""
+
+
+def test_broker_classifies_a_pytest_less_native_interpreter_without_mocking_the_bootstrap(
+    monkeypatch, tmp_path
+):
+    _no_snapshot(monkeypatch, tmp_path)
+    venv = tmp_path / "venv"
+    done = subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv)], capture_output=True, timeout=120,
+    )
+    python = venv / "bin" / "python"
+    if done.returncode != 0 or subprocess.run(
+        [str(python), "-c", "import pytest"], capture_output=True
+    ).returncode == 0:
+        pytest.skip("cannot build a pytest-less venv")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "test_x.py").write_text("def test_a():\n    assert True\n")
+    server = BrokerServer(root=project, turn_id="turn-no-pytest").start()
+    try:
+        request = _signed_broker_request(
+            server, project, "4" * 32, argv=[str(python), "-m", "pytest", "test_x.py"],
+        )
+        request["timeout_seconds"] = 60
+        response = _raw_broker_request(server, request)
+        assert (response["outcome"], response["suite_start"], response["returncode"]) == (
+            "launch-failed", "not-started", 1,
+        )
+        assert response["diagnostic"].startswith(PRE_COLLECTION_LAUNCH_FAILURE_PREFIX)
+        row = server.journal[-1]
+        assert row.is_non_evidence_launch_failure and row.provenance == "parent-observed"
+        assert reconcile_test_observations(server.journal).authoritative_failures == ()
+    finally:
+        server.stop()

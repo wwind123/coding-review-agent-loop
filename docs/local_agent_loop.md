@@ -1337,6 +1337,12 @@ parent-observed provenance:
 - **Independent importability check.** For a `-m pytest` run that exits 1 with
   `No module named pytest`, the parent separately confirms with a short
   `find_spec` run on the same validated interpreter that pytest is absent.
+  The launcher bootstrap probe that runs before the target reaches the same
+  verdict: a failed bootstrap whose diagnostic ends `No module named pytest` is
+  classified only when the parent's own check confirms pytest is absent from the
+  validated interpreter. Console scripts must match the generated template
+  exactly, an `env` shebang must name the system `env` binary, and
+  pathname-style `python_files` patterns are matched like pytest does.
 - **Vetoes.** A whole-stream output scan (any collection or result marker, or
   more than 60 lines) and a claimed worker-plugin session can only prevent
   classification; the absence of a marker is never proof.

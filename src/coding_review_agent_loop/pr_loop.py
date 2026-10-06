@@ -431,6 +431,20 @@ from .pr_loop_support import (
 )
 
 
+def unchanged_head_stop_message(
+    *, pr, coder_name, previous_head, turns, round_number, evidence, route
+) -> str:
+    """The unchanged-head stop text; receipts (issue #1182) go before the route."""
+    return (
+        f"PR #{pr}: {coder_name} left head {previous_head} unchanged in "
+        f"{turns} consecutive follow-up rounds, so another "
+        "review of the same diff cannot change the verdict. Stopping before round "
+        f"{round_number + 1}; human review required."
+        f"{unsuperseded_receipts_sentence(evidence)}"
+        f"{route}"
+    )
+
+
 @claimed_run("pr", "pr_number")
 def run_pr_loop(
     runner: Runner,
@@ -7732,12 +7746,19 @@ def run_pr_loop(
                     else ""
                 )
                 raise AgentLoopError(
-                    f"PR #{pr_number}: {coder_name} left head {previous_head} unchanged in "
-                    f"{unchanged_head_coder_turns} consecutive follow-up rounds, so another "
-                    "review of the same diff cannot change the verdict. Stopping before round "
-                    f"{round_number + 1}; human review required."
-                    f"{unsuperseded_receipts_sentence(latest_coder_metadata.local_test_evidence if latest_coder_metadata is not None else None)}"
-                    f"{route}"
+                    unchanged_head_stop_message(
+                        pr=pr_number,
+                        coder_name=coder_name,
+                        previous_head=previous_head,
+                        turns=unchanged_head_coder_turns,
+                        round_number=round_number,
+                        evidence=(
+                            latest_coder_metadata.local_test_evidence
+                            if latest_coder_metadata is not None
+                            else None
+                        ),
+                        route=route,
+                    )
                 )
             log(
                 config,

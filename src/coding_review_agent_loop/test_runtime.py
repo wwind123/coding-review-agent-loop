@@ -3353,3 +3353,28 @@ def classify_pre_collection_launch_failure(
 
 
 PROBE_MODULE_NAME = "_agent_loop_lifecycle_probe"
+
+
+def classify_missing_pytest_bootstrap(
+    diagnostic: str,
+    independent_import_check: str | None,
+    *,
+    launch_eligibility: object | None,
+) -> str | None:
+    """Classify a failed inner bootstrap probe as a missing pytest (issue #1182).
+
+    The launcher bootstrap probe already runs ``<python> -m pytest`` before the
+    target and stops the run when pytest cannot be imported, so route (c) must
+    also hold there.  It requires the same positive provenance: a parent-
+    validated ``-m pytest`` launch eligibility, the probe's own
+    ``No module named pytest`` diagnostic and the independent importability
+    check reporting ``pytest-absent``.  Anything else is not classified.
+    """
+    if (
+        launch_eligibility is not None
+        and getattr(launch_eligibility, "shape", None) == "module"
+        and independent_import_check == "pytest-absent"
+        and re.search(r"No module named '?pytest'?\s*$", diagnostic.strip())
+    ):
+        return PRE_COLLECTION_NO_PYTEST_REASON
+    return None

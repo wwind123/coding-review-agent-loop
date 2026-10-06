@@ -3465,18 +3465,7 @@ def _lp_no_pytest_python(tmp_path):
     return str(python)
 
 
-def _lp_force_unknown_inner_probe(monkeypatch):
-    """Let the target run: the inner launcher probe already stops a pytest-less launcher."""
-    import coding_review_agent_loop.runner as runner_module
-
-    monkeypatch.setattr(
-        runner_module, "probe_inner_launcher",
-        lambda argv, **kwargs: runtime.LauncherProbeResult(tuple(argv), "unknown", "forced"),
-    )
-
-
-def test_interpreter_without_pytest_is_classified_only_after_the_independent_check(tmp_path, monkeypatch):
-    _lp_force_unknown_inner_probe(monkeypatch)
+def test_interpreter_without_pytest_is_classified_only_after_the_independent_check(tmp_path):
     python = _lp_no_pytest_python(tmp_path)
     project = _lp_write(tmp_path / "project", _LP_PASSING)
     result = run_foreground_test(
@@ -3535,8 +3524,7 @@ def test_no_pytest_route_needs_eligibility_report_and_check():
     assert classify(scan=plain) is None
 
 
-def test_python_named_shell_wrapper_is_never_classified_as_missing_pytest(tmp_path, monkeypatch):
-    _lp_force_unknown_inner_probe(monkeypatch)
+def test_python_named_shell_wrapper_is_never_classified_as_missing_pytest(tmp_path):
     python = _lp_no_pytest_python(tmp_path)
     real = os.path.realpath(sys.executable)
     wrapper = _lp_script(
@@ -3618,3 +3606,255 @@ def test_cli_broker_path_records_nothing_for_a_classified_frame(tmp_path, monkey
     monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker("ordinary"))
     assert main(command) == 1
     assert "result" in calls
+
+
+# --- review round 1 regressions (issue #1182) --------------------------------
+
+_LP_FIRE_MODULE = (
+    "import importlib.util\n"
+    "def load(path):\n"
+    "    spec = importlib.util.spec_from_file_location('hidden', path)\n"
+    "    module = importlib.util.module_from_spec(spec)\n"
+    "    spec.loader.exec_module(module)\n"
+    "    return module\n"
+)
+
+
+def test_console_script_with_an_expression_in_a_standard_line_gets_no_injection(tmp_path):
+    real = os.path.realpath(sys.executable)
+    _lp_write(tmp_path, {"test_x.py": _LP_FIRE})
+    template = (
+        f"#!{real}\nimport re\nimport sys\nfrom pytest import console_main\n"
+        "if __name__ == '__main__':\n    {argv0}\n    sys.exit(console_main())\n"
+    )
+    standard = "sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])"
+    smuggled = "sys.argv[0] = re.sub(__import__('test_x').fire() or '', '', sys.argv[0])"
+    good = _lp_script(tmp_path / "good" / "pytest", template.format(argv0=standard))
+    bad = _lp_script(tmp_path / "bad" / "pytest", template.format(argv0=smuggled))
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    assert lp.prepare_lifecycle_probe([str(good), "x.py"], env, tmp_path) is not None
+    assert lp.prepare_lifecycle_probe([str(bad), "x.py", "--bogus-flag"], env, tmp_path) is None
+    result = run_foreground_test(
+        [str(bad), "--bogus-flag", "-p", "no:cacheprovider", "test_x.py"], cwd=tmp_path,
+        timeout_seconds=120, echo_output=False, classify_pre_collection=True,
+        env={"PYTHONPATH": str(tmp_path)},
+    )
+    assert result.pre_collection_launch_failure is None
+
+
+def test_env_shebang_trampoline_gets_no_injection_and_keeps_the_exit_status(tmp_path):
+    real = os.path.realpath(sys.executable)
+    _lp_write(tmp_path, _LP_PASSING)
+    trampoline = _lp_script(tmp_path / "bin" / "env", f'#!/bin/sh\nshift\nexec {real} -I "$@"\n')
+    script = _lp_script(
+        tmp_path / "scripts" / "pytest",
+        f"#!{trampoline} python3\nimport sys\nfrom pytest import console_main\n"
+        "if __name__ == '__main__':\n    sys.exit(console_main())\n",
+    )
+    argv = [str(script), "-q", "-p", "no:cacheprovider", "test_x.py"]
+    assert lp.prepare_lifecycle_probe(argv, dict(os.environ), tmp_path) is None
+    plain = run_foreground_test(
+        argv, cwd=tmp_path, timeout_seconds=120, echo_output=False,
+    )
+    classified = run_foreground_test(
+        argv, cwd=tmp_path, timeout_seconds=120, echo_output=False, classify_pre_collection=True,
+    )
+    assert classified.returncode == plain.returncode
+    assert classified.pre_collection_launch_failure is None
+
+
+@pytest.mark.parametrize("variant", ["pathname_pattern", "pyc_load", "retained_set_overflow", "ini_addopts_target"])
+def test_further_pre_parse_test_code_variants_are_not_classified(tmp_path, variant):
+    files = {"pytest.ini": "[pytest]\n", "loader.py": _LP_FIRE_MODULE}
+    extra = ["-p", "no:terminal", "-s"]
+    if variant == "pathname_pattern":
+        files.update({
+            "pytest.ini": "[pytest]\npython_files = check/*.py\n",
+            "check/cases.py": _LP_FIRE,
+            "userplug.py": "import loader\nFIRE = loader.load('check/cases.py')\n",
+            "conftest.py": "import userplug\nuserplug.FIRE.fire()\n",
+        })
+        extra += ["-p", "userplug", "check"]
+    elif variant == "pyc_load":
+        files.update({
+            "test_x.py": _LP_FIRE,
+            "conftest.py": (
+                "import importlib.machinery, importlib.util, py_compile\n"
+                "py_compile.compile('test_x.py', cfile='compiled.pyc', doraise=True)\n"
+                "import sys\nsys.modules.pop('test_x', None)\n"
+                "loader = importlib.machinery.SourcelessFileLoader('hidden_pyc', 'compiled.pyc')\n"
+                "spec = importlib.util.spec_from_loader('hidden_pyc', loader)\n"
+                "module = importlib.util.module_from_spec(spec)\nloader.exec_module(module)\nmodule.fire()\n"
+            ),
+        })
+        # The compiled file shares the source's name only through its code object.
+        files["conftest.py"] = files["conftest.py"].replace("'compiled.pyc'", "'test_x.pyc'")
+    elif variant == "retained_set_overflow":
+        for index in range(4100):
+            files[f"filler/f{index}.py"] = ""
+        files["userplug.py"] = (
+            "import glob\nfor path in glob.glob('filler/*.py'):\n    open(path).close()\n"
+        )
+        extra = ["-p", "userplug"]
+    else:
+        files.update({
+            "pytest.ini": "[pytest]\naddopts = -p no:terminal -s cases.py\n",
+            "cases.py": _LP_FIRE,
+            "conftest.py": "import loader\nloader.load('cases.py').fire()\n",
+        })
+        extra = []
+    _lp_write(tmp_path, files)
+    env = {"PYTHONPATH": str(tmp_path)}
+    quiet = variant == "retained_set_overflow"
+    if variant == "retained_set_overflow":
+        extra += ["--bogus-flag"]
+    result = _lp_run(tmp_path, extra, env=env, quiet=quiet)
+    assert result.returncode == 4 if variant != "retained_set_overflow" else result.returncode != 0
+    assert result.pre_collection_launch_failure is None
+    rc, _output, report = _lp_direct(tmp_path, extra, env=env)
+    assert "test-code-touched" in [record["kind"] for record in report.records]
+
+
+@pytest.mark.parametrize("target", ["-cases.py", "-cases.py::test_x"])
+def test_bare_dash_targets_after_the_delimiter_are_not_classified(tmp_path, target):
+    _lp_write(tmp_path, {
+        "-cases.py": _LP_FIRE,
+        "loader.py": _LP_FIRE_MODULE,
+        "conftest.py": "import loader\nloader.load('./-cases.py').fire()\n",
+    })
+    env = {"PYTHONPATH": str(tmp_path)}
+    result = _lp_run(tmp_path, ["-p", "no:terminal", "-s", "--", target], env=env, quiet=False)
+    assert result.returncode == 4 and result.pre_collection_launch_failure is None
+
+
+def test_bare_dash_target_runs_exactly_as_it_does_without_the_probe(tmp_path):
+    _lp_write(tmp_path, {"-cases.py": "def test_b():\n    assert True\n"})
+    plain = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--", "-cases.py"],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    rc, _output, report = _lp_direct(tmp_path, ["--", "-cases.py"])
+    assert rc == plain.returncode
+    assert [record["kind"] for record in report.records][-1] == "final"
+
+
+_LP_SHORT_SITE = _LP_SITE.replace(
+    "            raise OSError('injected')\n",
+    "            return _real(fd, data[:5])\n",
+)
+
+
+def test_short_probe_writes_and_an_unopenable_report_fail_closed(tmp_path):
+    _lp_write(tmp_path, {**_LP_PASSING, "hook/sitecustomize.py": _LP_SHORT_SITE})
+    env = {"PYTHONPATH": str(tmp_path / "hook"), "LP_FAIL_ON": "1"}
+    result = _lp_run(tmp_path, ["--bogus-flag", "test_x.py"], env=env)
+    assert result.returncode == 4 and result.pre_collection_launch_failure is None
+    argv = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--bogus-flag", "test_x.py"]
+    setup = lp.prepare_lifecycle_probe(argv, dict(os.environ), tmp_path)
+    try:
+        setup.report_path.unlink()  # the probe cannot open a report that is gone
+        done = subprocess.run(list(setup.argv), cwd=tmp_path, env=setup.env, capture_output=True, text=True)
+        assert done.returncode == 4
+        assert lp.read_probe_report(setup.report_path, setup.nonce) is None
+    finally:
+        setup.cleanup()
+
+
+_LP_NOT_INJECTED = (
+    "import os, sys\n\n"
+    "def test_not_injected():\n"
+    "    assert '_agent_loop_lifecycle_probe' not in sys.modules\n"
+    "    assert 'AGENT_LOOP_LIFECYCLE_PROBE_SPEC' not in os.environ\n"
+)
+
+
+def test_excluded_launchers_and_setup_failures_run_the_original_command_through_the_runner(
+    tmp_path, monkeypatch
+):
+    real = os.path.realpath(sys.executable)
+    wrapper = _lp_script(tmp_path / "bin" / "python3", f'#!/bin/sh\nexec {real} "$@"\n')
+    _lp_write(tmp_path, {"test_x.py": _LP_NOT_INJECTED})
+    base = ["-m", "pytest", "-q", "-p", "no:cacheprovider", "test_x.py"]
+    cases = [
+        ("wrapper", [str(wrapper), *base]),
+        ("setup-failure", [sys.executable, *base]),
+        ("preflight-failure", [sys.executable, *base]),
+    ]
+    for label, argv in cases:
+        with monkeypatch.context() as patched:
+            if label == "setup-failure":
+                def failing(*_a, **_k):
+                    raise OSError("no space")
+                patched.setattr(lp.tempfile, "mkdtemp", failing)
+            elif label == "preflight-failure":
+                patched.setattr(lp, "_PREFLIGHT_CODE", "import sys; sys.exit(3)")
+            passing = run_foreground_test(
+                argv, cwd=tmp_path, timeout_seconds=120, echo_output=False, classify_pre_collection=True,
+            )
+            usage = run_foreground_test(
+                [*argv, "--bogus-flag"], cwd=tmp_path, timeout_seconds=120, echo_output=False,
+                classify_pre_collection=True,
+            )
+        assert (passing.returncode, passing.pre_collection_launch_failure) == (0, None), label
+        assert (usage.returncode, usage.pre_collection_launch_failure) == (4, None), label
+
+
+def test_missing_pytest_is_non_evidence_through_the_unmocked_cli_fallback(tmp_path, monkeypatch):
+    python = _lp_no_pytest_python(tmp_path)
+    project = _lp_write(tmp_path / "project", _LP_PASSING)
+    cli_module, calls = _lp_cli_fixtures(project, monkeypatch)
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: None)
+    code = main([
+        "run-tests", "--timeout-seconds", "60", "--memory-dir", str(tmp_path / "memory"), "--",
+        python, "-m", "pytest", "test_x.py",
+    ])
+    assert code == 1
+    assert calls == []
+
+
+def test_unchanged_head_stop_message_keeps_route_suffix_and_is_byte_identical_without_receipts():
+    from coding_review_agent_loop.local_test_evidence import (
+        EnvironmentIdentityRegistry, EvidenceScope, LocalTestObservation, TreeAttribution,
+        bounded_evidence_for_round, reconcile_test_observations,
+    )
+    from coding_review_agent_loop.pr_loop import unchanged_head_stop_message
+
+    registry = EnvironmentIdentityRegistry()
+    failure = LocalTestObservation(
+        command=("python3", "-m", "pytest", "tests/x.py"), outcome="failed", provenance="parent-observed",
+        scope=EvidenceScope("unknown", ()), receipt_id="r", turn_id="t", cwd="/checkout", returncode=4,
+        attribution=TreeAttribution(state="current-head", head="h", stable=True),
+        environment_identity=registry.capture({"PATH": "/usr/bin"}),
+    )
+    evidence = bounded_evidence_for_round(reconcile_test_observations([failure], registry=registry))
+    route = " If the blocking finding requires re-planning the child plan, post the record."
+    arguments = dict(pr=7, coder_name="claude", previous_head="abc", turns=2, round_number=2, route=route)
+    legacy = (
+        "PR #7: claude left head abc unchanged in 2 consecutive follow-up rounds, so another "
+        "review of the same diff cannot change the verdict. Stopping before round 3; "
+        "human review required." + route
+    )
+    assert unchanged_head_stop_message(evidence=None, **arguments) == legacy
+    with_receipts = unchanged_head_stop_message(evidence=evidence, **arguments)
+    assert with_receipts.startswith(legacy.removesuffix(route))
+    assert with_receipts.endswith(route) and "unsuperseded failure receipts" in with_receipts
+
+
+def test_configured_gate_usage_error_is_a_failed_test_result_not_a_launcher_failure(tmp_path):
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop import checks
+    from coding_review_agent_loop.runner import Runner
+
+    _lp_write(tmp_path, _LP_PASSING)
+    result = Runner().run_test_command(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_x.py", "--bogus-flag"],
+        cwd=tmp_path, timeout_seconds=120,
+    )
+    assert result.pre_collection_launch_failure is None
+    assert (result.outcome, result.returncode) == ("failed", 4)
+    config = SimpleNamespace(coder_test_command_timeout_seconds=120)
+    with pytest.raises(AgentLoopError) as raised:
+        checks._raise_for_gate_result(result, config)
+    assert "failed with exit 4" in str(raised.value)
+    assert "could not start" not in str(raised.value)

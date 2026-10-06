@@ -86,16 +86,34 @@ class ProbeSetup:
 # Launcher validation and injection
 # ---------------------------------------------------------------------------
 
-_CONSOLE_ARGV0_LINES = (
-    re.compile(r"sys\.argv\[0\] = re\.sub\(.*, sys\.argv\[0\]\)"),
-    re.compile(r"sys\.argv\[0\] = sys\.argv\[0\]\.removesuffix\(['\"]\.exe['\"]\)"),
-)
-_CONSOLE_FIXED_LINES = frozenset({
-    "import re", "import sys", "from pytest import console_main", "from pytest import main",
-    "if __name__ == '__main__':", 'if __name__ == "__main__":',
-    "sys.exit(console_main())", "sys.exit(main())",
-    "# -*- coding: utf-8 -*-",
-})
+_CONSOLE_ARGV0_RE_SUB = "sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])"
+_CONSOLE_ARGV0_SUFFIX = "sys.argv[0] = sys.argv[0].removesuffix('.exe')"
+_CODING_LINE = "# -*- coding: utf-8 -*-"
+_ENV_LAUNCHERS = frozenset({"/usr/bin/env", "/bin/env"})
+
+
+def _console_script_bodies() -> frozenset[tuple[str, ...]]:
+    """Every normalized body (after the shebang) of a generated pytest console script.
+
+    The match is against whole bodies built from literal lines, never per-line
+    patterns, so an expression smuggled into an otherwise standard line cannot
+    pass (issue #1182).
+    """
+    bodies: set[tuple[str, ...]] = set()
+    for entry in ("console_main", "main"):
+        for guard in (True, False):
+            for argv0 in (_CONSOLE_ARGV0_RE_SUB, _CONSOLE_ARGV0_SUFFIX):
+                imports = ["import re", "import sys"] if argv0 == _CONSOLE_ARGV0_RE_SUB else ["import sys"]
+                core = [*imports, f"from pytest import {entry}"]
+                if guard:
+                    core.append("if __name__ == '__main__':")
+                core.extend([argv0, f"sys.exit({entry}())"])
+                for coding in (False, True):
+                    bodies.add(tuple(([_CODING_LINE] if coding else []) + core))
+    return frozenset(bodies)
+
+
+_CONSOLE_BODIES = _console_script_bodies()
 
 
 def _resolve_executable(token: str, env: Mapping[str, str], cwd: Path) -> str | None:
@@ -123,20 +141,18 @@ def _console_script_interpreter(
     lines = text.splitlines()
     if not lines or not lines[0].startswith("#!"):
         return None
-    body = [line.strip() for line in lines[1:] if line.strip()]
-    for line in body:
-        if line in _CONSOLE_FIXED_LINES or any(p.fullmatch(line) for p in _CONSOLE_ARGV0_LINES):
-            continue
-        return None
-    if not any(line.startswith("from pytest import") for line in body) or not any(
-        line.startswith("sys.exit(") for line in body
-    ):
+    body = tuple(line.strip().replace('"__main__"', "'__main__'") for line in lines[1:] if line.strip())
+    if body not in _CONSOLE_BODIES:
         return None
     parts = lines[0][2:].strip().split()
     if not parts:
         return None
     if os.path.basename(parts[0]) == "env":
-        # Any env option (including -S) means no injection.
+        # Only the system env launcher, and only as a native executable; any
+        # other ``env`` (a trampoline that could add -I) means no injection.
+        # Any env option (including -S) also means no injection.
+        if parts[0] not in _ENV_LAUNCHERS or _interpreter_is_script(parts[0]):
+            return None
         if len(parts) != 2 or parts[1].startswith("-") or "=" in parts[1]:
             return None
         name = parts[1]
@@ -149,6 +165,14 @@ def _console_script_interpreter(
     if resolved is None:
         return None
     return (parts[0], *flags), resolved
+
+
+def _interpreter_is_script(path: str) -> bool:
+    try:
+        with open(os.path.realpath(path), "rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return True
 
 
 def _interpreter_identity(path: str) -> tuple[str, IdentityTuple] | None:

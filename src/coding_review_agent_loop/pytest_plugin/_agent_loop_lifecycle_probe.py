@@ -84,9 +84,27 @@ def _source_of(path: str) -> str:
     return path[:-1]
 
 
+def _pattern_matches(pattern: str, source: str) -> bool:
+    """Match like pytest's ``fnmatch_ex``: pathname patterns see the whole path."""
+    seps = [os.sep] + ([os.altsep] if os.altsep else [])
+    if not any(sep in pattern for sep in seps):
+        return fnmatch.fnmatch(os.path.basename(source), pattern)
+    if not os.path.isabs(pattern):
+        pattern = "*" + os.sep + pattern
+    candidates = {os.path.abspath(source)}
+    try:
+        candidates.add(os.path.realpath(source))
+    except Exception:
+        pass
+    return any(fnmatch.fnmatch(candidate, pattern) for candidate in candidates)
+
+
 def _matches_patterns(path: str) -> bool:
-    name = os.path.basename(_source_of(path))
-    return any(fnmatch.fnmatch(name, pattern) for pattern in _S.patterns)
+    source = _source_of(path)
+    try:
+        return any(_pattern_matches(pattern, source) for pattern in _S.patterns)
+    except Exception:
+        return True
 
 
 def _is_protected(path: str) -> bool:

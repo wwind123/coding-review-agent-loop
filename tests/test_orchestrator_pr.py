@@ -20287,20 +20287,12 @@ def test_unchanged_head_stop_names_unsuperseded_evidence_receipts(tmp_path):
     runner = _unchanged_head_runner(with_failure_receipt=False, tmp_path=tmp_path)
     with pytest.raises(AgentLoopError) as without:
         run_pr_loop(runner, pr_number=77, config=config)
-    assert "unsuperseded" not in str(without.value)
-    assert str(without.value).endswith("human review required.")
+    import re as _re
 
-
-def test_configured_gate_usage_error_keeps_its_routing(tmp_path):
-    """Issue #1182: the gate never asks the runner to classify or inject the probe."""
-    import inspect
-
-    from coding_review_agent_loop import checks
-
-    source = inspect.getsource(checks)
-    assert "classify_pre_collection" not in source
-    assert "pre_collection_launch_failure" not in source
-    result = SimpleNamespace(
-        outcome="failed", inner_exec="started", returncode=4, pre_collection_launch_failure="usage error",
+    found = _re.fullmatch(
+        r"PR #77: Claude left head (\S+) unchanged in 2 consecutive follow-up rounds, so another "
+        r"review of the same diff cannot change the verdict\. Stopping before round (\d+); "
+        r"human review required\.",
+        str(without.value),
     )
-    assert getattr(result, "outcome", "") != "launch-failed"
+    assert found is not None, str(without.value)

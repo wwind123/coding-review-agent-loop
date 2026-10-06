@@ -712,9 +712,23 @@ def _run_foreground_test_body(
             )
         inner_probe_state = inner_probe.state
         if inner_probe.state == "failed":
+            missing_pytest = None
+            if probe_setup is not None:
+                missing_pytest = _classify_missing_pytest_bootstrap(
+                    cmd, probe_setup, inner_probe.diagnostic, cwd,
+                )
             if handle is not None:
                 handle.close()
             lane_lock.close()
+            if missing_pytest is not None:
+                # The target never ran, but the parent proved pytest is absent
+                # from a validated interpreter: non-evidence, failing exit code.
+                return ForegroundTestResult(
+                    cmd, cwd, "failed", 1, time.monotonic() - started,
+                    timeout_seconds, inner_probe.diagnostic, None, False,
+                    wrapper_bootstrap, "started", "not-started", inner_probe.diagnostic,
+                    health_provenance, pre_collection_launch_failure=missing_pytest,
+                )
             return ForegroundTestResult(
                 cmd, cwd, "launch-failed", None, time.monotonic() - started,
                 timeout_seconds, inner_probe.diagnostic, None, False,
@@ -1205,6 +1219,22 @@ def _run_foreground_test_body(
             else None
         ),
     )
+
+
+def _classify_missing_pytest_bootstrap(requested, probe_setup, diagnostic, cwd) -> str | None:
+    """Classify a failed launcher bootstrap as a missing pytest; errors mean no."""
+    try:
+        from .lifecycle_probe import run_independent_import_check
+        from .test_runtime import classify_missing_pytest_bootstrap
+
+        check = run_independent_import_check(
+            probe_setup.eligibility, requested, probe_setup.env, cwd,
+        )
+        return classify_missing_pytest_bootstrap(
+            diagnostic, check, launch_eligibility=probe_setup.eligibility,
+        )
+    except Exception:
+        return None
 
 
 def _classify_pre_collection_run(
