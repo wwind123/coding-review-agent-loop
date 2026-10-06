@@ -419,17 +419,20 @@ def final_risk_coverage_assessment(
     approved_plan_context: ApprovedPlanContext | None,
     workdir: Path,
     initial_head_sha: str | None,
-    reauthenticate_head: Callable[[], str | None],
+    derived: DerivedRiskEvidenceResult | None = None,
 ) -> CoverageAssessment | None:
-    """Assess the final post-correction claims at the head derivation bound to."""
+    """Assess the final post-correction claims at the head derivation bound to.
+
+    The head is carried explicitly from derivation (``bound_head_sha``), never
+    re-read from the remote, so a later push cannot silently rebind the map.
+    """
     if not coverage_map_applies(approved_plan_context):
         return None
-    head = initial_head_sha
-    if any(
-        diagnostic.code == "head-changed-during-correction"
-        for diagnostic in parsed.risk_test_matrix_diagnostics
-    ):
-        head = reauthenticate_head()
+    head = (
+        derived.bound_head_sha
+        if derived is not None and derived.bound_head_sha is not None
+        else initial_head_sha
+    )
     return assess_risk_coverage_map(
         parsed,
         approved_plan_context=approved_plan_context,
@@ -628,6 +631,8 @@ def _derive_authenticated_risk_evidence_for_coder(
                         risk_test_matrix_evidence=corrected_result.evidence,
                         risk_test_matrix_diagnostics=corrected_result.diagnostics,
                     )
+                if corrected_result is not None:
+                    corrected_result = dataclasses_replace(corrected_result, bound_head_sha=head_sha)
                 return corrected_parsed, corrected_result
             if corrected_head is not None:
                 raced_parsed, raced_result = _derive_authenticated_risk_evidence_for_coder(
@@ -675,6 +680,8 @@ def _derive_authenticated_risk_evidence_for_coder(
                         risk_test_matrix_evidence=raced_result.evidence,
                         risk_test_matrix_diagnostics=raced_result.diagnostics,
                     )
+                if raced_result is not None:
+                    raced_result = dataclasses_replace(raced_result, bound_head_sha=corrected_head)
                 return raced_parsed, raced_result
             correction_error = "semantic correction was discarded because the authenticated PR head changed"
         diagnostic = PostAuthClaimDiagnostic(
@@ -686,6 +693,7 @@ def _derive_authenticated_risk_evidence_for_coder(
             result,
             diagnostics=tuple((*result.diagnostics, diagnostic)),
         )
+    result = dataclasses_replace(result, bound_head_sha=head_sha)
     return dataclasses_replace(
         parsed,
         risk_test_matrix_evidence=result.evidence,

@@ -19856,11 +19856,30 @@ def _init_followup_checkout(workdir):
     return git("rev-parse", "HEAD")
 
 
-@pytest.mark.parametrize("with_matrix", [True, False])
+@pytest.mark.parametrize("mode", ["claim", "gap-only", "none", "not-applicable"])
 def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
-    tmp_path, monkeypatch, with_matrix
+    tmp_path, monkeypatch, mode
 ):
-    plan_context = _followup_matrix_context() if with_matrix else None
+    with_matrix = mode in {"claim", "gap-only"}
+    if with_matrix:
+        plan_context = _followup_matrix_context()
+    elif mode == "not-applicable":
+        na_matrix = parse_risk_test_matrix({
+            "applicability": "not-applicable", "rows": [], "important_exclusions": [],
+            "not_applicable_rationale": "Formatting-only change without any stateful path.",
+        })
+        na_identity = risk_test_matrix_identity(na_matrix)
+        plan_context = orchestrator.make_approved_plan_context(
+            "Approved plan.\n\n" + render_risk_test_matrix_section(na_matrix),
+            source_locator="test na plan",
+            risk_test_matrix_contract_version=1,
+            risk_test_matrix_payload=na_matrix.to_payload(),
+            risk_test_matrix_changes_payload=(),
+            risk_test_matrix_identity=na_identity,
+            risk_test_matrix_boundary_digest=na_identity,
+        )
+    else:
+        plan_context = None
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
     head = _init_followup_checkout(config.claude_dir)
     current = _followup_observation(
@@ -19883,6 +19902,15 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
         "caveats": [],
         "test_level": "workflow",
     }]
+    if mode == "not-applicable":
+        payload.pop("risk_test_matrix_claims")
+    if mode == "gap-only":
+        payload.pop("risk_test_matrix_claims")
+        payload["risk_test_matrix_coverage_gaps"] = [{
+            "row_id": "followup-derived-evidence",
+            "reason": "cannot be driven through the real follow-up caller here",
+            "proposed_correction": "downgrade the row to a unit test",
+        }]
     text = json.dumps(payload) + raw[end:]
     parsed = validate_structured_coder_followup(
         text,

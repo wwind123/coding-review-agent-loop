@@ -1206,6 +1206,24 @@ def validate_repair_preservation(
             for entry in source_observations:
                 if isinstance(entry, dict):
                     require(entry in target_observations, "test_observations")
+        # ``test_level`` is preserve-only (#1290): every target claim that
+        # carries one must match a source claim for the same row, so repair
+        # cannot mint a level on an added row, a duplicate, or a response whose
+        # source had no claims at all.
+        raw_source_claims = source.get("risk_test_matrix_claims")
+        raw_target_claims = target.get("risk_test_matrix_claims")
+        for target_claim in raw_target_claims if isinstance(raw_target_claims, list) else ():
+            if not isinstance(target_claim, dict) or "test_level" not in target_claim:
+                continue
+            require(
+                any(
+                    isinstance(source_claim, dict)
+                    and source_claim.get("row_id") == target_claim.get("row_id")
+                    and source_claim.get("test_level") == target_claim["test_level"]
+                    for source_claim in (raw_source_claims if isinstance(raw_source_claims, list) else ())
+                ),
+                "risk_test_matrix_claims.test_level",
+            )
         if "risk_test_matrix_claims" in source:
             source_claims = source.get("risk_test_matrix_claims")
             target_claims = target.get("risk_test_matrix_claims")

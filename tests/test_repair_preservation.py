@@ -2370,3 +2370,33 @@ def test_repair_cannot_invent_level_or_gaps():
     empty_gaps = deepcopy(source)
     empty_gaps["risk_test_matrix_coverage_gaps"] = []
     check(source, empty_gaps)
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+@pytest.mark.parametrize("source_claims", [None, [], "other-row"])
+def test_repair_cannot_mint_test_level_on_added_or_unsourced_rows(kind, source_claims):
+    def claim(row_id, **extra):
+        return {
+            "row_id": row_id, "execution_refs": ["turn:valid"],
+            "test_identifiers": ["tests/t.py::t"], "test_locations": ["tests/t.py"],
+            "workflow_path_claim": "path", "outcome_assertions": ["ok"],
+            "forbidden_effect_assertions": ["none"], **extra,
+        }
+
+    source = {"kind": kind}
+    if source_claims == []:
+        source["risk_test_matrix_claims"] = []
+    elif source_claims == "other-row":
+        source["risk_test_matrix_claims"] = [claim("row-1")]
+    target = deepcopy(source)
+    target["risk_test_matrix_claims"] = [
+        *source.get("risk_test_matrix_claims", []), claim("row-2", test_level="workflow"),
+    ]
+    with pytest.raises(AgentLoopError, match="test_level"):
+        check(source, target)
+    # A duplicate candidate for a sourced row cannot carry an unsourced level either.
+    if source_claims == "other-row":
+        duplicate = deepcopy(source)
+        duplicate["risk_test_matrix_claims"].append(claim("row-1", test_level="unit"))
+        with pytest.raises(AgentLoopError, match="test_level"):
+            check(source, duplicate)

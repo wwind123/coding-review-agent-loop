@@ -112,7 +112,7 @@ def gap(row_id: str) -> dict:
 class CoverageHarness:
     """A scripted implementation turn over a real temp git checkout."""
 
-    def __init__(self, tmp_path, monkeypatch, *, applicable: bool = True, pr_body: str = "Fixes #56", pr_overrides=None, **config_overrides):
+    def __init__(self, tmp_path, monkeypatch, *, applicable: bool = True, pr_body: str = "Fixes #56", pr_overrides=None, plan_context_mode: str = "default", real_agent: bool = False, claude_outputs=None, **config_overrides):
         self.tmp_path = tmp_path
         self.monkeypatch = monkeypatch
         self.config = make_config(tmp_path, coder="claude", **config_overrides)
@@ -123,13 +123,22 @@ class CoverageHarness:
         self._git("add", "-A")
         self.head = self._commit("initial")
         self.runner = FakeRunner(
-            pr_payload={"body": pr_body, "headRefOid": self.head, **(pr_overrides or {})}
+            pr_payload={"body": pr_body, "headRefOid": self.head, **(pr_overrides or {})},
+            claude_outputs=claude_outputs,
         )
+        self.real_agent = real_agent
         self.approved_plan, self.plan_context = matrix_context(applicable=applicable)
+        if plan_context_mode == "none":
+            self.plan_context = None
+        elif plan_context_mode == "unavailable":
+            self.plan_context = make_approved_plan_context(
+                self.approved_plan, source_locator="unavailable matrix test plan"
+            )
         self.calls: list[dict] = []
         self.script: list = []
         self.run_pr_calls: list[dict] = []
         self.agent_result_calls: list = []
+        self.correction_handler = None
         self._install()
 
     # -- git helpers ------------------------------------------------------
@@ -168,7 +177,8 @@ class CoverageHarness:
             step = self.script.pop(0)
             return step(self) if callable(step) else step
 
-        m.setattr(orchestrator_module, "_run_validated_agent", scripted)
+        if not self.real_agent:
+            m.setattr(orchestrator_module, "_run_validated_agent", scripted)
         m.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
         m.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
         m.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
@@ -193,6 +203,8 @@ class CoverageHarness:
             if k.get("label") != "semantic-evidence-correction":
                 return _REAL_RUN_AGENT_RESULT(*a, **k)
             self.agent_result_calls.append((a, k))
+            if self.correction_handler is not None:
+                return SimpleNamespace(text=self.correction_handler(self))
             return SimpleNamespace(text="not a structured response")
 
         m.setattr(orchestrator_module, "run_agent_result", no_agent_result)

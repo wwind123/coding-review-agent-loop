@@ -861,9 +861,15 @@ def _implement_approved_issue(
         approved_plan_context=approved_plan_context,
         workdir=active_workdir(implementation_config),
         initial_head_sha=initial_pr_context.metadata.head_sha,
-        reauthenticate_head=lambda: get_pr_review_context(
-            runner, config=implementation_config, pr_number=pr_number
-        ).metadata.head_sha,
+        derived=_initial_derived_risk_evidence,
+    )
+    # Evidence was derived for this exact head (the raced head when semantic
+    # correction observed a push), so the round record binds to it too.
+    bound_round_head = (
+        _initial_derived_risk_evidence.bound_head_sha
+        if _initial_derived_risk_evidence is not None
+        and _initial_derived_risk_evidence.bound_head_sha is not None
+        else initial_pr_context.metadata.head_sha
     )
     initial_local_test_evidence = runner.render_local_test_evidence(
         current_head=initial_pr_context.metadata.head_sha,
@@ -888,7 +894,7 @@ def _implement_approved_issue(
             role="coder",
             agent=coder_name,
             round_number=1,
-            subject=str(initial_pr_context.metadata.head_sha or "unknown"),
+            subject=str(bound_round_head or "unknown"),
             prior_items=(),
             raw_structured_coder_response=coder_output,
             local_test_evidence=initial_local_test_evidence,

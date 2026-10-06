@@ -2320,6 +2320,8 @@ class DerivedRiskEvidenceResult:
 
     evidence: RiskTestMatrixEvidence
     diagnostics: tuple[PostAuthClaimDiagnostic, ...] = ()
+    # The exact PR head SHA this derivation bound to (#1290); in-memory only.
+    bound_head_sha: str | None = None
 
     @property
     def risk_test_matrix_evidence(self) -> RiskTestMatrixEvidence:

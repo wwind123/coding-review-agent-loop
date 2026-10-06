@@ -7474,15 +7474,19 @@ def run_pr_loop(
                     and updated_pr_context.metadata.head_sha == followup_dispatch_head
                     else None
                 )
+                followup_bound_head = (
+                    _followup_derived_risk_evidence.bound_head_sha
+                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                    and _followup_derived_risk_evidence is not None
+                    else None
+                )
                 followup_coverage_assessment = (
                     final_risk_coverage_assessment(
                         coder_response.marker_value,
                         approved_plan_context=approved_plan_context,
                         workdir=active_workdir(config),
                         initial_head_sha=updated_pr_context.metadata.head_sha,
-                        reauthenticate_head=lambda: get_pr_review_context(
-                            runner, config=config, pr_number=pr_number
-                        ).metadata.head_sha,
+                        derived=_followup_derived_risk_evidence,
                     )
                     if isinstance(coder_response.marker_value, StructuredCoderFollowup)
                     else None
@@ -7531,7 +7535,11 @@ def run_pr_loop(
                     role="coder",
                     agent=coder_name,
                     round_number=coder_record_round,
-                    subject=str(updated_pr_context.metadata.head_sha or "unknown"),
+                    subject=str(
+                        followup_bound_head
+                        or updated_pr_context.metadata.head_sha
+                        or "unknown"
+                    ),
                     prior_items=tuple(unresolved_items),
                     raw_structured_coder_response=raw_structured_coder_response,
                     local_test_evidence=local_test_evidence,

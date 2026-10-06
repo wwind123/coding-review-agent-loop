@@ -1459,43 +1459,6 @@ supply the reviewer's decision, and repair preservation rejects any
 still goes to repair, and near-miss aliases still normalize or degrade as
 before (#1185).
 
-Broader handoff atomicity for other envelope failures after a PR is pushed is
-owned by #827 and #828.
-
-Fix a GitHub issue:
-
-```bash
-agent-loop issue 56 --repo OWNER/REPO
-```
-
-Issue mode includes the issue title, body, and comments in the coder prompt and
-issue-origin review prompts. Comments are ordered oldest to newest so later
-discussion can refine or supersede the original body.
-
-The issue implementation coder uses the structured `issue_implementation`
-contract. It reports a non-blank summary, a positive `pr_number` or `null`, an
-exact signed-human-requirement disposition ledger, and optional `tests_run`
-command strings. The orchestrator validates supplied commands inside the
-assigned checkout. A null-PR result is posted as a readable issue-level
-terminal comment and stops before PR operations. If a signed requirement is
-blocked after a PR was opened, the coder must retain the real PR number or URL
-in the summary or disposition evidence while setting `pr_number` to `null`;
-the conflict is posted once without retrying or entering handoff, review, or
-merge gates. Accepted created-PR results are rendered for GitHub and retain the
-raw structured payload in round metadata so resume can restore the typed result.
-
-Run issue mode as plan-first discussion before implementation:
-
-```bash
-agent-loop issue 56 --repo OWNER/REPO --plan-first
-```
-
-With `--plan-first`, the coder writes an implementation plan without editing
-code, pushing a branch, or opening a PR. Reviewers critique that plan on the
-issue using `AGENT_PLAN_STATE` markers until every reviewer approves in the
-same planning round. Plan reviews use explicit sections:
-
-```md
 #### Risk-matrix coverage map (#1290)
 
 For an applicable matrix the approved-plan implementation prompt renders every
@@ -1554,6 +1517,43 @@ context. Coder follow-up round comments carry the same section computed at the
 follow-up head, with no coverage re-ask on follow-ups. The section is display
 only: persisted round metadata and canonical evidence schemas do not change.
 
+Broader handoff atomicity for other envelope failures after a PR is pushed is
+owned by #827 and #828.
+
+Fix a GitHub issue:
+
+```bash
+agent-loop issue 56 --repo OWNER/REPO
+```
+
+Issue mode includes the issue title, body, and comments in the coder prompt and
+issue-origin review prompts. Comments are ordered oldest to newest so later
+discussion can refine or supersede the original body.
+
+The issue implementation coder uses the structured `issue_implementation`
+contract. It reports a non-blank summary, a positive `pr_number` or `null`, an
+exact signed-human-requirement disposition ledger, and optional `tests_run`
+command strings. The orchestrator validates supplied commands inside the
+assigned checkout. A null-PR result is posted as a readable issue-level
+terminal comment and stops before PR operations. If a signed requirement is
+blocked after a PR was opened, the coder must retain the real PR number or URL
+in the summary or disposition evidence while setting `pr_number` to `null`;
+the conflict is posted once without retrying or entering handoff, review, or
+merge gates. Accepted created-PR results are rendered for GitHub and retain the
+raw structured payload in round metadata so resume can restore the typed result.
+
+Run issue mode as plan-first discussion before implementation:
+
+```bash
+agent-loop issue 56 --repo OWNER/REPO --plan-first
+```
+
+With `--plan-first`, the coder writes an implementation plan without editing
+code, pushing a branch, or opening a PR. Reviewers critique that plan on the
+issue using `AGENT_PLAN_STATE` markers until every reviewer approves in the
+same planning round. Plan reviews use explicit sections:
+
+```md
 ### Blocking plan issues
 ### Same-plan follow-ups
 ### Future follow-ups

@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from .protocol_markers import sanitize_untrusted_prose
+
 LEVEL_RANK = {"unit": 1, "integration": 2, "workflow": 3}
 
 CODE_MISSING_ROW = "missing-row"
@@ -70,10 +72,18 @@ def coverage_map_applies(plan_context: object) -> bool:
 
 
 def _bounded(text: object) -> str:
-    flat = " ".join(str(text).split())
-    if len(flat) <= _DETAIL_MAX_CHARS:
-        return flat
-    return flat[: _DETAIL_MAX_CHARS - 1] + "…"
+    """Flatten, neutralize reserved syntax, and clip decoded display text.
+
+    JSON-decoded coder prose can restore marker syntax a raw-text guard never
+    saw, so it is sanitized both before and after clipping (#1290).
+    """
+    flat = " ".join(sanitize_untrusted_prose(str(text)).split())
+    if len(flat) > _DETAIL_MAX_CHARS:
+        flat = flat[: _DETAIL_MAX_CHARS - 1] + "…"
+    safe = " ".join(sanitize_untrusted_prose(flat).split())
+    # No HTML-comment syntax at all: state footers and other comment-shaped
+    # records are never display text.
+    return safe.replace("<", "&lt;").replace(">", "&gt;")
 
 
 def normalize_test_path(reference: str, *, identifier: bool) -> str | None:
@@ -357,29 +367,29 @@ def render_coverage_map(
             declared = entry.declared_level or "undeclared"
             refs = ", ".join(f"`{ref}`" for ref in entry.test_references) or "(none cited)"
             lines.append(
-                f"- `{entry.row_id}`: tests {refs}; declared level {declared} vs required {required}"
+                f"- `{_bounded(entry.row_id)}`: tests {refs}; declared level {declared} vs required {required}"
             )
         elif entry.kind == "gap":
             lines.append(
-                f"- `{entry.row_id}`: declared gap (required {required}) - reason: "
+                f"- `{_bounded(entry.row_id)}`: declared gap (required {required}) - reason: "
                 f"{entry.gap_reason}; proposed correction: {entry.gap_correction}"
             )
         elif entry.kind == "ambiguous":
-            lines.append(f"- `{entry.row_id}`: claimed and declared as a gap (required {required})")
+            lines.append(f"- `{_bounded(entry.row_id)}`: claimed and declared as a gap (required {required})")
         else:
-            lines.append(f"- `{entry.row_id}`: no test claim and no declared gap (required {required})")
+            lines.append(f"- `{_bounded(entry.row_id)}`: no test claim and no declared gap (required {required})")
     suffix = " after one coverage re-ask" if reask_used else ""
     if assessment.status == "unverified":
         status = "unverified: authenticated PR tree unavailable" + suffix
     elif assessment.status == "complete":
         status = (
-            f"complete at {assessment.revision} "
+            f"complete at {_bounded(assessment.revision)} "
             f"(deterministic completeness check passed){suffix}"
         )
     else:
         status = (
-            f"incomplete at {assessment.revision}{suffix}: "
-            + "; ".join(f"{item.row_id}: {item.code}" for item in assessment.deficiencies)
+            f"incomplete at {_bounded(assessment.revision)}{suffix}: "
+            + "; ".join(f"{_bounded(item.row_id)}: {item.code}" for item in assessment.deficiencies)
         )
     lines.append(f"- **Status:** {status}")
     if discard_note:
