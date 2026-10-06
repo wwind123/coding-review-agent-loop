@@ -3023,3 +3023,598 @@ def test_non_package_npx_run_keeps_npx_spelling_in_result_and_cli_row(tmp_path, 
     assert main(["run-tests", "--timeout-seconds", "60", "--memory-dir", str(memory), "--", *requested]) == 0
     assert launched.exists() and not npx_ran.exists()
     assert runtime.load_runtime_memory(memory)[-1]["executed_argv"] == requested
+
+
+# --- pre-collection launch failures (issue #1182) ----------------------------
+
+from coding_review_agent_loop import lifecycle_probe as lp  # noqa: E402
+from coding_review_agent_loop.test_workers import WorkerBudget  # noqa: E402
+
+_LP_USAGE_REASON = runtime.PRE_COLLECTION_USAGE_REASON
+
+
+def _lp_write(root, files):
+    for name, text in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    return root
+
+
+_LP_PASSING = {"test_x.py": "def test_a():\n    assert True\n"}
+
+
+def _lp_run(root, extra, *, env=None, budget=None, python=None, quiet=True):
+    # ``-q`` belongs to the terminal plugin, so suppression variants omit it.
+    quiet = ["-q"] if quiet else []
+    argv = [python or sys.executable, "-m", "pytest", *quiet, "-p", "no:cacheprovider", *extra]
+    return run_foreground_test(
+        argv, cwd=root, timeout_seconds=120, echo_output=False, classify_pre_collection=True,
+        env=({**os.environ, **env} if env else None), worker_budget=budget,
+    )
+
+
+def _lp_direct(root, extra, *, env=None, argv=None):
+    """Inject the probe by hand and run for real; return (rc, output, report)."""
+    quiet = [] if "no:terminal" in extra else ["-q"]
+    argv = argv or [sys.executable, "-m", "pytest", *quiet, "-p", "no:cacheprovider", *extra]
+    base = {**os.environ, **(env or {})}
+    setup = lp.prepare_lifecycle_probe(argv, base, root)
+    assert setup is not None
+    try:
+        done = subprocess.run(
+            list(setup.argv), cwd=root, env=setup.env, text=True, capture_output=True, timeout=120,
+        )
+        return done.returncode, done.stdout + done.stderr, lp.read_probe_report(setup.report_path, setup.nonce)
+    finally:
+        setup.cleanup()
+
+
+def _lp_qualifying():
+    scan = lp.PreCollectionScan()
+    scan.feed("ERROR: usage: pytest [options]\n")
+    scan.feed("pytest: error: unrecognized arguments: -n 0\n")
+    records = tuple(
+        {"kind": kind, "nonce": "n", "pid": 1, **fields}
+        for kind, fields in (
+            ("loaded", {}),
+            ("args-seen", {
+                "doctest_requested": False, "early_plugin": False,
+                "probe_blocked_later": False, "explicit_targets_unprovable": False,
+            }),
+            ("final", {"invalid": False, "write_failures": 0, "vetoed": False, "parsed": False}),
+        )
+    )
+    eligibility = lp.LaunchEligibility("module", (sys.executable,), sys.executable, (1, 2, 3, 4))
+    return scan, lp.ProbeReport(records), eligibility
+
+
+def _lp_classify(**overrides):
+    scan, probe, eligibility = _lp_qualifying()
+    arguments = {
+        "argv": [sys.executable, "-m", "pytest", "x.py"], "returncode": 4, "scan": scan, "probe": probe,
+        "independent_import_check": "unavailable", "launch_eligibility": eligibility,
+        "worker_sessions_observed": False,
+    }
+    arguments.update(overrides)
+    return runtime.classify_pre_collection_launch_failure(
+        arguments.pop("argv"), arguments.pop("returncode"), arguments.pop("scan"), arguments.pop("probe"),
+        arguments.pop("independent_import_check"), **arguments,
+    )
+
+
+@pytest.mark.parametrize("extra", [["--bogus-flag"], ["-p", "no:xdist", "-n", "0"]])
+def test_usage_error_is_classified_as_pre_collection_launch_failure(tmp_path, extra):
+    _lp_write(tmp_path, {**_LP_PASSING, "helper.py": "VALUE = 1\n", "conftest.py": "import helper\n"})
+    result = _lp_run(tmp_path, ["test_x.py", *extra])
+    assert (result.outcome, result.returncode) == ("failed", 4)
+    assert result.pre_collection_launch_failure == _LP_USAGE_REASON
+    rc, _output, report = _lp_direct(tmp_path, ["test_x.py", *extra])
+    assert rc == 4
+    assert [record["kind"] for record in report.records] == ["loaded", "args-seen", "final"]
+
+
+def test_standard_console_script_usage_error_is_classified(tmp_path):
+    script = tmp_path / "bin" / "pytest"
+    script.parent.mkdir()
+    script.write_text(
+        f"#!{os.path.realpath(sys.executable)}\nimport sys\nfrom pytest import console_main\n"
+        "if __name__ == '__main__':\n    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n"
+        "    sys.exit(console_main())\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    _lp_write(tmp_path, _LP_PASSING)
+    result = run_foreground_test(
+        [str(script), "--bogus-flag", "-p", "no:cacheprovider", "test_x.py"], cwd=tmp_path,
+        timeout_seconds=120, echo_output=False, classify_pre_collection=True,
+    )
+    assert result.returncode == 4
+    assert result.pre_collection_launch_failure == _LP_USAGE_REASON
+
+
+def test_ordinary_failure_and_pass_are_not_classified(tmp_path):
+    _lp_write(tmp_path, {"test_x.py": "def test_a():\n    assert False\n"})
+    failed = _lp_run(tmp_path, ["test_x.py"])
+    assert (failed.outcome, failed.pre_collection_launch_failure) == ("failed", None)
+    _lp_write(tmp_path, _LP_PASSING)
+    passed = _lp_run(tmp_path, ["test_x.py"])
+    assert (passed.outcome, passed.pre_collection_launch_failure) == ("passed", None)
+
+
+def test_classification_is_off_unless_requested(tmp_path):
+    _lp_write(tmp_path, _LP_PASSING)
+    result = run_foreground_test(
+        [sys.executable, "-m", "pytest", "test_x.py", "--bogus-flag"], cwd=tmp_path,
+        timeout_seconds=120, echo_output=False,
+    )
+    assert result.returncode == 4 and result.pre_collection_launch_failure is None
+
+
+def test_pytest_exit_forgery_is_not_classified(tmp_path):
+    _lp_write(tmp_path, {"test_x.py": (
+        "import pytest\n\n"
+        "def test_a():\n    pytest.exit('usage: x\\nerror: unrecognized arguments: x', returncode=4)\n"
+    )})
+    result = _lp_run(tmp_path, ["test_x.py"])
+    assert result.returncode == 4
+    assert result.pre_collection_launch_failure is None
+
+
+def test_plugin_session_and_missing_scan_veto_classification():
+    assert _lp_classify() == _LP_USAGE_REASON
+    assert _lp_classify(worker_sessions_observed=True) is None
+    assert _lp_classify(scan=None) is None
+    assert _lp_classify(launch_eligibility=None) is None
+    assert _lp_classify(probe=None) is None
+    assert _lp_classify(argv=["python", "-c", "pass"]) is None
+    scan, _probe, _eligibility = _lp_qualifying()
+    scan.feed("collected 1 item\n")
+    assert _lp_classify(scan=scan) is None
+
+
+def test_markers_evicted_from_the_tail_still_veto(tmp_path):
+    _lp_write(tmp_path, {
+        "test_x.py": "def test_a():\n    assert False\n",
+        "conftest.py": (
+            "def pytest_sessionfinish(session):\n"
+            "    for index in range(100):\n        print('filler', index)\n"
+            "    print('No module named pytest')\n"
+        ),
+    })
+    for budget in (None, WorkerBudget(2, "operator", "off")):
+        result = _lp_run(tmp_path, ["test_x.py"], budget=budget)
+        assert result.returncode == 1 and "No module named pytest" in result.output_tail
+        assert "collected" not in result.output_tail
+        assert result.pre_collection_launch_failure is None
+
+
+_LP_SUPPRESS = ("-p", "no:terminal", "-s")
+
+
+@pytest.mark.parametrize("where", ["argv", "ini", "env"])
+@pytest.mark.parametrize("mode", [None, "off"])
+@pytest.mark.parametrize("code", [1, 4])
+def test_marker_suppressed_real_execution_is_not_classified(tmp_path, where, mode, code):
+    text = "usage: x\\nerror: unrecognized arguments: x" if code == 4 else "No module named pytest"
+    files = {"test_x.py": (
+        "import os, sys\n\n"
+        f"def test_a():\n    print('{text}'); sys.stdout.flush()\n    os._exit({code})\n"
+    )}
+    extra, env = [], None
+    if where == "argv":
+        extra = list(_LP_SUPPRESS)
+    elif where == "ini":
+        files["pytest.ini"] = "[pytest]\naddopts = -p no:terminal -s\n"
+    else:
+        env = {"PYTEST_ADDOPTS": "-p no:terminal -s"}
+    _lp_write(tmp_path, files)
+    budget = WorkerBudget(2, "operator", "off") if mode == "off" else None
+    result = _lp_run(tmp_path, [*extra, "test_x.py"], env=env, budget=budget, quiet=False)
+    assert result.returncode == code
+    assert result.pre_collection_launch_failure is None
+
+
+_LP_FIRE = (
+    "def fire():\n    print('usage: x')\n    print('error: unrecognized arguments: x')\n    raise SystemExit(4)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "files, extra",
+    [
+        ({"test_x.py": _LP_FIRE, "conftest.py": (
+            "import importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('hidden', 'test_x.py')\n"
+            "module = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.fire()\n"
+        )}, []),
+        ({"test_x.py": _LP_FIRE, "conftest.py": (
+            "namespace = {}\nexec(compile(open('test_x.py').read(), 'anything', 'exec'), namespace)\n"
+            "namespace['fire']()\n"
+        )}, []),
+        ({"cases.py": _LP_FIRE, "conftest.py": (
+            "import importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('hidden', 'cases.py')\n"
+            "module = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.fire()\n"
+        )}, ["cases.py"]),
+        ({"cases.py": _LP_FIRE, "conftest.py": (
+            "import importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('hidden', 'cases.py')\n"
+            "module = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.fire()\n"
+        )}, ["cases.py::test_x"]),
+        ({"-cases.py": _LP_FIRE, "conftest.py": (
+            "import importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('hidden', './-cases.py')\n"
+            "module = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.fire()\n"
+        )}, ["--", "-cases.py"]),
+        ({"cases.py": _LP_FIRE, "pytest.ini": "[pytest]\ntestpaths = cases.py\n", "conftest.py": (
+            "import importlib.util\n"
+            "spec = importlib.util.spec_from_file_location('hidden', 'cases.py')\n"
+            "module = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.fire()\n"
+        )}, []),
+        ({"check_x.py": _LP_FIRE, "pytest.ini": "[pytest]\npython_files = check_*.py\n",
+          "userplug.py": (
+              "import importlib.util\n"
+              "spec = importlib.util.spec_from_file_location('hidden', 'check_x.py')\n"
+              "FIRE = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(FIRE)\n"
+          ), "conftest.py": "import userplug\nuserplug.FIRE.fire()\n"}, ["-p", "userplug"]),
+    ],
+    ids=["exec_module", "read_then_exec", "explicit_target", "node_id", "dash_after_delimiter",
+         "testpaths", "two_phase_custom_patterns"],
+)
+def test_test_code_executed_before_option_parsing_is_not_classified(tmp_path, files, extra):
+    _lp_write(tmp_path, files)
+    env = {"PYTHONPATH": str(tmp_path)}
+    result = _lp_run(tmp_path, ["-p", "no:terminal", "-s", *extra], env=env, quiet=False)
+    assert result.returncode == 4
+    assert result.pre_collection_launch_failure is None
+    rc, _output, report = _lp_direct(tmp_path, ["-p", "no:terminal", "-s", *extra], env=env)
+    assert rc == 4
+    kinds = [record["kind"] for record in report.records]
+    assert "test-code-touched" in kinds
+
+
+def test_early_plugin_and_unprovable_targets_are_not_classified(tmp_path):
+    _lp_write(tmp_path, {**_LP_PASSING, "early.py": "", "args.txt": "test_x.py\n"})
+    env = {"PYTHONPATH": str(tmp_path)}
+    early = _lp_run(tmp_path, ["--bogus-flag", "test_x.py"], env={**env, "PYTEST_ADDOPTS": "-p early"})
+    assert early.returncode == 4 and early.pre_collection_launch_failure is None
+    argsfile = _lp_run(tmp_path, ["--bogus-flag", "@args.txt"])
+    assert argsfile.pre_collection_launch_failure is None
+    pyargs = _lp_run(tmp_path, ["--bogus-flag", "--pyargs", "test_x"], env=env)
+    assert pyargs.pre_collection_launch_failure is None
+
+
+def test_explicit_non_pattern_targets_are_collected_normally_with_the_probe(tmp_path):
+    _lp_write(tmp_path, {"cases.py": "def test_a():\n    assert True\n", "-cases.py": "def test_b():\n    assert True\n"})
+    for extra in (["cases.py"], ["--", "./-cases.py"]):
+        rc, _output, report = _lp_direct(tmp_path, extra)
+        assert rc == 0
+        assert [record["kind"] for record in report.records] == ["loaded", "args-seen", "parsed", "final"]
+
+
+@pytest.mark.parametrize("where", ["argv", "ini", "env"])
+def test_a_blocked_probe_fails_closed(tmp_path, where):
+    files = dict(_LP_PASSING)
+    extra, env = ["--bogus-flag", "test_x.py"], None
+    if where == "argv":
+        extra = ["-p", f"no:{lp.PROBE_MODULE}", *extra]
+    elif where == "ini":
+        files["pytest.ini"] = f"[pytest]\naddopts = -p no:{lp.PROBE_MODULE}\n"
+    else:
+        env = {"PYTEST_ADDOPTS": f"-p no:{lp.PROBE_MODULE}"}
+    _lp_write(tmp_path, files)
+    result = _lp_run(tmp_path, extra, env=env)
+    assert result.returncode == 4 and result.pre_collection_launch_failure is None
+
+
+def test_probe_report_parsing_fails_closed(tmp_path):
+    path = tmp_path / "report.jsonl"
+    assert lp.read_probe_report(path, "n") is None
+    path.write_text("")
+    assert lp.read_probe_report(path, "n") == lp.ProbeReport(())
+    path.write_text('{"kind":"loaded","nonce":"other","pid":1}\n')
+    assert lp.read_probe_report(path, "n") is None
+    path.write_text('{"kind":"loaded","nonce":"n","pid":1}\n{"kind":"x"')
+    assert lp.read_probe_report(path, "n") is None
+    path.write_text('{"kind":"loaded","nonce":"n","pid":1}\n{"kind":"final","nonce":"n","pid":2}\n')
+    assert lp.read_probe_report(path, "n") is None
+    _scan, probe, eligibility = _lp_qualifying()
+    missing_final = lp.ProbeReport(probe.records[:2])
+    assert _lp_classify(probe=missing_final) is None
+    for field, value in (("invalid", True), ("write_failures", 1), ("vetoed", True), ("parsed", True)):
+        records = list(probe.records)
+        records[-1] = {**records[-1], field: value}
+        assert _lp_classify(probe=lp.ProbeReport(tuple(records))) is None
+
+
+_LP_SITE = (
+    "import os\n_real = os.write\n_state = {'n': 0}\n"
+    "def _write(fd, data):\n"
+    "    if fd > 2 and b'\"kind\"' in data:\n"
+    "        _state['n'] += 1\n"
+    "        if _state['n'] == int(os.environ.get('LP_FAIL_ON', '0')):\n"
+    "            raise OSError('injected')\n"
+    "    return _real(fd, data)\n"
+    "os.write = _write\n"
+)
+
+
+@pytest.mark.parametrize("fail_on, files, extra", [
+    (1, dict(_LP_PASSING), ["--bogus-flag", "test_x.py"]),
+    (3, {"test_x.py": _LP_FIRE, "conftest.py": (
+        "import importlib.util\n"
+        "spec = importlib.util.spec_from_file_location('hidden', 'test_x.py')\n"
+        "module = importlib.util.module_from_spec(spec)\nspec.loader.exec_module(module)\nmodule.fire()\n"
+    )}, ["-p", "no:terminal", "-s"]),
+])
+def test_probe_write_failures_never_alter_the_target_and_fail_closed(tmp_path, fail_on, files, extra):
+    _lp_write(tmp_path, {**files, "hook/sitecustomize.py": _LP_SITE})
+    env = {"PYTHONPATH": str(tmp_path / "hook"), "LP_FAIL_ON": str(fail_on)}
+    result = _lp_run(tmp_path, extra, env=env)
+    assert result.returncode == 4
+    assert result.pre_collection_launch_failure is None
+
+
+def test_probe_never_changes_normal_runs_and_writes_bounded_records(tmp_path):
+    _lp_write(tmp_path, {
+        "mod.py": "def double(x):\n    '''\n    >>> double(2)\n    4\n    '''\n    return 2 * x\n",
+        "doc.txt": ">>> 1 + 1\n2\n",
+        **_LP_PASSING,
+    })
+    for extra in (["--doctest-modules", "mod.py"], ["--doctest-glob=*.txt", "doc.txt"], ["test_x.py"]):
+        rc, _output, report = _lp_direct(tmp_path, extra)
+        assert rc == 0
+        assert len(report.records) <= 5
+        assert {record["pid"] for record in report.records} == {report.records[0]["pid"]}
+
+
+def _lp_script(path, text, mode=0o755):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
+def test_launchers_outside_the_allowlist_get_no_probe_and_are_never_classified(tmp_path, monkeypatch):
+    _lp_write(tmp_path, _LP_PASSING)
+    real = os.path.realpath(sys.executable)
+    base = dict(os.environ)
+    bin_dir = tmp_path / "bin"
+    wrapper = _lp_script(bin_dir / "python3", f'#!/bin/sh\nexec {real} "$@"\n')
+    trampoline = _lp_script(bin_dir / "pytest", f'#!/bin/sh\nexec {real} -I -m pytest "$@"\n')
+    shell_python_script = _lp_script(
+        tmp_path / "wrapped" / "pytest",
+        f"#!{wrapper}\nimport sys\nfrom pytest import console_main\nif __name__ == '__main__':\n"
+        "    sys.exit(console_main())\n",
+    )
+    env_form = _lp_script(
+        tmp_path / "envform" / "pytest",
+        "#!/usr/bin/env python3\nimport sys\nfrom pytest import console_main\nif __name__ == '__main__':\n"
+        "    sys.exit(console_main())\n",
+    )
+    nontemplate = _lp_script(
+        tmp_path / "other" / "pytest", f"#!{real}\nimport os\nos.system('echo hi')\nimport pytest\n",
+    )
+    cases = [
+        ([sys.executable, "-I", "-m", "pytest"], base),
+        ([sys.executable, "-E", "-m", "pytest"], base),
+        ([str(wrapper), "-m", "pytest"], base),
+        ([str(trampoline)], base),
+        ([str(shell_python_script)], base),
+        (["pytest"], {**base, "PATH": f"{bin_dir}:{base['PATH']}"}),
+        ([str(env_form)], {**base, "PATH": f"{bin_dir}:{base['PATH']}"}),
+        ([str(nontemplate)], base),
+    ]
+    for argv, env in cases:
+        assert lp.prepare_lifecycle_probe([*argv, "test_x.py", "--bogus-flag"], env, tmp_path) is None, argv
+    for argv in ([sys.executable, "-I", "-m", "pytest"], [str(trampoline)]):
+        for tail, code in ((["test_x.py", "-p", "no:cacheprovider"], 0), (["test_x.py", "--bogus-flag"], 4)):
+            result = run_foreground_test(
+                [*argv, *tail], cwd=tmp_path, timeout_seconds=120, echo_output=False,
+                classify_pre_collection=True,
+            )
+            # ``-I`` also hides user site-packages, so only the classification is stable.
+            assert result.pre_collection_launch_failure is None
+            assert result.returncode in {code, 1, None}
+    # A forced preflight failure on a native interpreter means no injection.
+    monkeypatch.setattr(lp, "_PREFLIGHT_CODE", "import sys; sys.exit(3)")
+    assert lp.prepare_lifecycle_probe([sys.executable, "-m", "pytest", "test_x.py"], base, tmp_path) is None
+
+
+def test_parent_setup_failures_launch_the_original_command(tmp_path, monkeypatch):
+    _lp_write(tmp_path, _LP_PASSING)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(lp.tempfile, "tempdir", str(scratch))
+    argv = [sys.executable, "-m", "pytest", "test_x.py", "--bogus-flag"]
+
+    def failing_mkdtemp(*_args, **_kwargs):
+        raise OSError("no space")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(lp.tempfile, "mkdtemp", failing_mkdtemp)
+        assert lp.prepare_lifecycle_probe(argv, dict(os.environ), tmp_path) is None
+    real_open = os.open
+
+    def failing_open(path, flags, *args, **kwargs):
+        if flags & os.O_EXCL:
+            raise OSError("exists")
+        return real_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(lp.os, "open", failing_open)
+        assert lp.prepare_lifecycle_probe(argv, dict(os.environ), tmp_path) is None
+    assert list(scratch.iterdir()) == []
+    with monkeypatch.context() as patched:
+        patched.setattr(lp, "prepare_lifecycle_probe", lambda *a, **k: None)
+        result = _lp_run(tmp_path, ["test_x.py", "--bogus-flag"])
+        assert result.returncode == 4 and result.pre_collection_launch_failure is None
+
+
+def _lp_no_pytest_python(tmp_path):
+    venv = tmp_path / "venv"
+    done = subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv)], capture_output=True, timeout=120,
+    )
+    if done.returncode != 0:
+        pytest.skip("cannot create a venv without pytest")
+    python = venv / "bin" / "python"
+    if subprocess.run([str(python), "-c", "import pytest"], capture_output=True).returncode == 0:
+        pytest.skip("venv unexpectedly provides pytest")
+    return str(python)
+
+
+def _lp_force_unknown_inner_probe(monkeypatch):
+    """Let the target run: the inner launcher probe already stops a pytest-less launcher."""
+    import coding_review_agent_loop.runner as runner_module
+
+    monkeypatch.setattr(
+        runner_module, "probe_inner_launcher",
+        lambda argv, **kwargs: runtime.LauncherProbeResult(tuple(argv), "unknown", "forced"),
+    )
+
+
+def test_interpreter_without_pytest_is_classified_only_after_the_independent_check(tmp_path, monkeypatch):
+    _lp_force_unknown_inner_probe(monkeypatch)
+    python = _lp_no_pytest_python(tmp_path)
+    project = _lp_write(tmp_path / "project", _LP_PASSING)
+    result = run_foreground_test(
+        [python, "-m", "pytest", "test_x.py"], cwd=project, timeout_seconds=120, echo_output=False,
+        classify_pre_collection=True,
+    )
+    assert result.returncode == 1
+    assert result.pre_collection_launch_failure == runtime.PRE_COLLECTION_NO_PYTEST_REASON
+    setup = lp.prepare_lifecycle_probe([python, "-m", "pytest", "test_x.py"], dict(os.environ), project)
+    try:
+        assert lp.run_independent_import_check(
+            setup.eligibility, setup.argv, dict(os.environ), project,
+        ) == "pytest-absent"
+        stale = lp.LaunchEligibility(
+            "module", setup.eligibility.invocation, setup.eligibility.interpreter_path, (0, 0, 0, 0),
+        )
+        assert lp.run_independent_import_check(stale, setup.argv, dict(os.environ), project) == "unavailable"
+        assert lp.run_independent_import_check(None, setup.argv, dict(os.environ), project) == "unavailable"
+        console = lp.LaunchEligibility(
+            "console-script", setup.eligibility.invocation, setup.eligibility.interpreter_path,
+            setup.eligibility.identity,
+        )
+        assert lp.run_independent_import_check(console, setup.argv, dict(os.environ), project) == "unavailable"
+    finally:
+        setup.cleanup()
+
+
+def test_no_pytest_route_needs_eligibility_report_and_check():
+    scan = lp.PreCollectionScan()
+    scan.feed("/x/python: No module named pytest\n")
+    eligibility = lp.LaunchEligibility("module", (sys.executable,), sys.executable, (1, 2, 3, 4))
+    argv = [sys.executable, "-m", "pytest", "x.py"]
+    empty = lp.ProbeReport(())
+
+    def classify(**overrides):
+        arguments = {
+            "returncode": 1, "scan": scan, "probe": empty, "independent_import_check": "pytest-absent",
+            "launch_eligibility": eligibility, "worker_sessions_observed": False,
+        }
+        arguments.update(overrides)
+        return runtime.classify_pre_collection_launch_failure(
+            argv, arguments.pop("returncode"), arguments.pop("scan"), arguments.pop("probe"),
+            arguments.pop("independent_import_check"), **arguments,
+        )
+
+    assert classify() == runtime.PRE_COLLECTION_NO_PYTEST_REASON
+    assert classify(launch_eligibility=None) is None
+    assert classify(independent_import_check="unavailable") is None
+    assert classify(probe=None) is None
+    assert classify(probe=lp.ProbeReport(({"kind": "loaded"},))) is None
+    assert classify(returncode=0) is None
+    console = lp.LaunchEligibility("console-script", (sys.executable,), sys.executable, (1, 2, 3, 4))
+    assert classify(launch_eligibility=console) is None
+    plain = lp.PreCollectionScan()
+    plain.feed("something else\n")
+    assert classify(scan=plain) is None
+
+
+def test_python_named_shell_wrapper_is_never_classified_as_missing_pytest(tmp_path, monkeypatch):
+    _lp_force_unknown_inner_probe(monkeypatch)
+    python = _lp_no_pytest_python(tmp_path)
+    real = os.path.realpath(sys.executable)
+    wrapper = _lp_script(
+        tmp_path / "bin" / "python3",
+        f'#!/bin/sh\nif [ "$1" = "-m" ]; then exec {real} "$@"; else exec {python} "$@"; fi\n',
+    )
+    project = _lp_write(tmp_path / "project", {"test_x.py": (
+        "import os, sys\n\ndef test_a():\n    print('No module named pytest'); sys.stdout.flush()\n    os._exit(1)\n"
+    )})
+    argv = [str(wrapper), "-m", "pytest", "-p", "no:cacheprovider", "-p", "no:terminal", "-s", "test_x.py"]
+    assert lp.prepare_lifecycle_probe(argv, dict(os.environ), project) is None
+    result = run_foreground_test(
+        argv, cwd=project, timeout_seconds=120, echo_output=False, classify_pre_collection=True,
+    )
+    assert (result.outcome, result.returncode) == ("failed", 1)
+    assert result.pre_collection_launch_failure is None
+    scan = lp.PreCollectionScan()
+    scan.feed("No module named pytest\n")
+    assert runtime.classify_pre_collection_launch_failure(
+        argv, 1, scan, lp.ProbeReport(()), "pytest-absent", launch_eligibility=None,
+        worker_sessions_observed=False,
+    ) is None
+
+
+def _lp_cli_fixtures(tmp_path, monkeypatch):
+    import coding_review_agent_loop.cli as cli_module
+
+    calls = []
+    monkeypatch.setattr(cli_module, "record_launcher_health", lambda *a, **k: calls.append("health"))
+    monkeypatch.setattr(cli_module, "_record_run_tests_result", lambda *a, **k: calls.append("result"))
+    monkeypatch.chdir(tmp_path)
+    return cli_module, calls
+
+
+def test_cli_fallback_path_records_nothing_for_a_classified_run(tmp_path, monkeypatch):
+    _lp_write(tmp_path, {**_LP_PASSING, "test_bad.py": "def test_b():\n    assert False\n"})
+    cli_module, calls = _lp_cli_fixtures(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: None)
+    base = ["run-tests", "--timeout-seconds", "60", "--memory-dir", str(tmp_path / "memory"), "--"]
+    pytest_argv = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    assert main([*base, *pytest_argv, "test_x.py", "--bogus-flag"]) == 4
+    assert calls == []
+    assert main([*base, *pytest_argv, "test_bad.py"]) == 1
+    assert "result" in calls
+
+
+def test_cli_broker_path_records_nothing_for_a_classified_frame(tmp_path, monkeypatch):
+    from coding_review_agent_loop.local_test_evidence import (
+        PRE_COLLECTION_LAUNCH_FAILURE_PREFIX, BrokerRunResult,
+    )
+
+    cli_module, calls = _lp_cli_fixtures(tmp_path, monkeypatch)
+    frames = {
+        "classified": BrokerRunResult(
+            receipt_id="r1", execution_ref="e1", outcome="launch-failed", returncode=4, elapsed_seconds=1.0,
+            wrapper_bootstrap="verified", inner_exec="started", suite_start="not-started",
+            diagnostic=f"{PRE_COLLECTION_LAUNCH_FAILURE_PREFIX}: usage",
+        ),
+        "ordinary": BrokerRunResult(
+            receipt_id="r2", execution_ref="e2", outcome="failed", returncode=1, elapsed_seconds=1.0,
+            wrapper_bootstrap="verified", inner_exec="started", suite_start="unknown",
+        ),
+    }
+
+    class FakeBroker:
+        def __init__(self, key):
+            self.key = key
+
+        def run(self, *args, **kwargs):
+            return frames[self.key]
+
+    command = [
+        "run-tests", "--timeout-seconds", "5", "--memory-dir", str(tmp_path / "memory"), "--",
+        sys.executable, "-m", "pytest",
+    ]
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker("classified"))
+    assert main(command) == 4
+    assert calls == []
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker("ordinary"))
+    assert main(command) == 1
+    assert "result" in calls

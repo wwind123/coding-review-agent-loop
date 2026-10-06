@@ -191,6 +191,7 @@ from .ci_health import (
     CiInfrastructureStall,
     is_wholly_infrastructure_blocked,
 )
+from .local_test_evidence import unsuperseded_receipts_sentence
 from .comment_rendering import (
     add_coder_followup_head_unchanged_notice,
     normalize_freeform_signature,
@@ -7734,7 +7735,9 @@ def run_pr_loop(
                     f"PR #{pr_number}: {coder_name} left head {previous_head} unchanged in "
                     f"{unchanged_head_coder_turns} consecutive follow-up rounds, so another "
                     "review of the same diff cannot change the verdict. Stopping before round "
-                    f"{round_number + 1}; human review required.{route}"
+                    f"{round_number + 1}; human review required."
+                    f"{unsuperseded_receipts_sentence(latest_coder_metadata.local_test_evidence if latest_coder_metadata is not None else None)}"
+                    f"{route}"
                 )
             log(
                 config,

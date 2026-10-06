@@ -1712,6 +1712,26 @@ def _record_run_tests_result(
     )
 
 
+def _broker_frame_is_pre_collection(result: object) -> bool:
+    """Whether a broker frame reports a parent-classified pre-collection launch failure."""
+    from .local_test_evidence import PRE_COLLECTION_LAUNCH_FAILURE_PREFIX
+
+    return (
+        getattr(result, "outcome", "") == "launch-failed"
+        and getattr(result, "inner_exec", "") != "failed"
+        and str(getattr(result, "diagnostic", "")).startswith(PRE_COLLECTION_LAUNCH_FAILURE_PREFIX)
+    )
+
+
+def _announce_pre_collection(reason: str) -> None:
+    print(
+        f"agent-loop: pre-collection launch failure ({reason}); no test ran, so this run is "
+        "not evidence. Fix the interpreter or flags and rerun.",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 _NO_RECORD_OUTCOMES = frozenset(
     {"overlap-rejected", "worker-budget-busy", "worker-budget-refused", "cancelled"}
 )
@@ -1783,6 +1803,11 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                     flush=True,
                 )
+                if _broker_frame_is_pre_collection(broker_result):
+                    # Issue #1182: no test ran; neither timing nor launcher
+                    # health describes the suite or the launcher.
+                    _announce_pre_collection(broker_result.diagnostic)
+                    return int(broker_result.returncode if broker_result.returncode is not None else 1)
                 if broker_result.outcome in _NO_RECORD_OUTCOMES:
                     # Coordination and pre-execution refusals are not evidence
                     # about the executable. They must not affect timing or health.
@@ -1872,7 +1897,11 @@ def _run_tests_command(args: argparse.Namespace) -> int:
             wrapper_bootstrap="verified",
             worker_budget=worker_budget,
             worker_budget_resizer=(None if worker_resolution.inherited else resize),
+            classify_pre_collection=True,
         )
+        if result.pre_collection_launch_failure and result.outcome == "failed":
+            _announce_pre_collection(result.pre_collection_launch_failure)
+            return int(result.returncode if result.returncode is not None else 1)
         if result.overlap_rejected or result.outcome in _NO_RECORD_OUTCOMES:
             # Overlap, worker-budget-busy and direct refusals are coordination
             # or configuration, not launcher health or suite timing evidence.

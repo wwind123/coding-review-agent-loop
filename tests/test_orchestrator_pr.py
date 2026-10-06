@@ -20229,3 +20229,78 @@ def test_loop_failing_pull_request_check_creates_checks_blocking_item(tmp_path, 
 
     assert any(c.startswith("GitHub PR checks are failing for PR #77.") for c in runner.comments)
     assert [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+
+
+def _unchanged_head_runner(*, with_failure_receipt, tmp_path):
+    from coding_review_agent_loop.local_test_evidence import (
+        EnvironmentIdentityRegistry,
+        EvidenceScope,
+        LocalTestObservation,
+        TreeAttribution,
+    )
+
+    blocking = structured_pr_review(
+        state="blocking", summary="Needs work.", blocking_items=["Fix it."]
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            blocking,
+            structured_pr_review(
+                state="blocking", summary="Still needs work.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "blocking", "note": "Fix it."}
+                ],
+            ),
+            structured_pr_review(state="approved"),
+        ],
+        claude_outputs=[
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+        ],
+        advance_pr_head_on_coder_followup=False,
+    )
+    if with_failure_receipt:
+        registry = EnvironmentIdentityRegistry()
+        runner._environment_registry = registry
+        runner._local_test_observations.append(LocalTestObservation(
+            command=("python3", "-m", "pytest", "tests/test_x.py", "-q", "-n", "0"),
+            outcome="failed", provenance="parent-observed", scope=EvidenceScope("unknown", ()),
+            receipt_id="receipt-open", turn_id="turn-opaque", cwd=str(tmp_path),
+            normalized_command="python3 -m pytest tests/test_x.py -q -n 0", returncode=4,
+            attribution=TreeAttribution(state="current-head", head="abc123", stable=True),
+            environment_identity=registry.capture({"PATH": "/usr/bin"}),
+        ))
+    return runner
+
+
+def test_unchanged_head_stop_names_unsuperseded_evidence_receipts(tmp_path):
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
+    runner = _unchanged_head_runner(with_failure_receipt=True, tmp_path=tmp_path)
+    with pytest.raises(AgentLoopError) as with_receipts:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(with_receipts.value)
+    assert "unchanged in 2 consecutive follow-up rounds" in message
+    assert "human review required." in message
+    assert "unsuperseded failure receipts" in message and "-n 0" in message
+    assert "evidence bookkeeping" in message
+
+    runner = _unchanged_head_runner(with_failure_receipt=False, tmp_path=tmp_path)
+    with pytest.raises(AgentLoopError) as without:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "unsuperseded" not in str(without.value)
+    assert str(without.value).endswith("human review required.")
+
+
+def test_configured_gate_usage_error_keeps_its_routing(tmp_path):
+    """Issue #1182: the gate never asks the runner to classify or inject the probe."""
+    import inspect
+
+    from coding_review_agent_loop import checks
+
+    source = inspect.getsource(checks)
+    assert "classify_pre_collection" not in source
+    assert "pre_collection_launch_failure" not in source
+    result = SimpleNamespace(
+        outcome="failed", inner_exec="started", returncode=4, pre_collection_launch_failure="usage error",
+    )
+    assert getattr(result, "outcome", "") != "launch-failed"

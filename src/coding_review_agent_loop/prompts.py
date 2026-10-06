@@ -475,6 +475,21 @@ def _scratch_file_guidance() -> str:
     )
 
 
+PRE_COLLECTION_REVIEWER_GUIDANCE = (
+    "A local test receipt labelled `pre-collection launch failure (not evidence)` records a "
+    "run that exited before any test could run (for example a pytest argument error or an "
+    "interpreter without pytest). It says nothing about the change, so it needs no "
+    "supersession and must not be held open as an unresolved failure. Every other failed "
+    "receipt keeps the existing rule: only a later parent-observed pass of the same command "
+    "supersedes it."
+)
+PRE_COLLECTION_CODER_GUIDANCE = (
+    "If `agent-loop run-tests` reports a pre-collection launch failure (no test ran, so the run "
+    "is not evidence), fix the interpreter or flags and rerun; do not argue the receipt. A "
+    "genuine test failure is still cleared only by a passing rerun of the same command."
+)
+
+
 def _coder_test_reporting_guidance(*, structured: bool = False) -> str:
     if structured:
         reporting = (
@@ -496,7 +511,8 @@ def _coder_test_reporting_guidance(*, structured: bool = False) -> str:
         "foreground and wait for them to finish before ending this turn. Do not "
         "launch them in the background and end the turn saying you will wait for "
         "them; a turn that ends without a real terminal marker because required "
-        "work is still running in the background cannot be validated.\n"
+        "work is still running in the background cannot be validated. "
+        f"{PRE_COLLECTION_CODER_GUIDANCE}\n"
     )
 
 
@@ -4428,6 +4444,7 @@ state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.
 Do not defer your review to wait for CI checks to finish. Review the PR now.
 Failing GitHub checks may justify a blocking review and a `blocking_items` entry.
+{PRE_COLLECTION_REVIEWER_GUIDANCE}
 Pending or unavailable GitHub checks are an external wait state: mention them
 only in `summary`, never in `blocking_items`, and never as the sole reason to
 return `state: "blocking"` — only failing checks or real code-level findings
@@ -5052,6 +5069,7 @@ state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.
 Do not defer your review to wait for CI checks to finish. Review the PR now.
 Failing GitHub checks may justify a blocking review and a `blocking_items` entry.
+{PRE_COLLECTION_REVIEWER_GUIDANCE}
 Pending or unavailable GitHub checks are an external wait state: mention them
 only in `summary`, never in `blocking_items`, and never as the sole reason to
 return `state: "blocking"` — only failing checks or real code-level findings

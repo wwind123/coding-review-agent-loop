@@ -1314,6 +1314,49 @@ self-reported/capture-limited; direct shell execution cannot claim complete
 capture. Base reproduction requires a clean, stable checkout at the base
 commit and never performs a dangerous checkout mutation or live-service test.
 
+#### Pre-collection launch failures
+
+A direct-pytest run that exits before any test could run (a pytest argument
+error such as `unrecognized arguments: -n 0`, or an interpreter without pytest)
+says nothing about the change, so a failed receipt for it must not need a
+passing rerun of the identical command. The broker and the `run-tests` fallback
+therefore classify such a run deterministically, and only from positive
+parent-observed provenance:
+
+- **Lifecycle probe.** For a validated launcher (a native Python interpreter
+  with `-m pytest`, or a standard generated `pytest` console script whose
+  interpreter is native, non-script and not `-I`/`-E`, and that passes a
+  preflight import of the probe through the same invocation) the parent injects
+  the stdlib-only `_agent_loop_lifecycle_probe` plugin ahead of every other
+  plugin and records its private report. The report must show that pytest
+  never finished option parsing, that no file matching the resolved
+  `python_files` patterns or an explicitly selected path was opened, compiled,
+  executed or imported before that point, and a clean closing `final` record.
+  Shell shims, trampolines, script interpreters, non-template scripts, `@file`
+  and `--pyargs` invocations are not injected or not classified.
+- **Independent importability check.** For a `-m pytest` run that exits 1 with
+  `No module named pytest`, the parent separately confirms with a short
+  `find_spec` run on the same validated interpreter that pytest is absent.
+- **Vetoes.** A whole-stream output scan (any collection or result marker, or
+  more than 60 lines) and a claimed worker-plugin session can only prevent
+  classification; the absence of a marker is never proof.
+
+Anything missing, blocked, corrupt or unreadable fails closed and the run stays
+an ordinary authoritative failure. A classified run is recorded as a visible
+`launch-failed` row whose first caveat is `pre-collection launch failure; not
+evidence`: it is never an authoritative failure, never needs supersession, is
+evicted first from the private journal, keeps that status through persistence
+and restore, and is labelled `pre-collection launch failure (not evidence)` in
+PR comments. It writes no timing or launcher-health memory and the command
+keeps its failing exit code. The caveat grants nothing on any other outcome.
+The supersession rule above is unchanged for every real failure: only a
+parent-observed pass of the same command, scope, tree and environment clears
+it. The configured test gate keeps its existing routing. Receipts persisted
+before this behaviour carry no probe provenance and are not reclassified. When
+the loop stops because the head stayed unchanged while unsuperseded failure
+receipts remain, the stop message names them so it is not read as the coder
+failing to act.
+
 Durable metadata contains only bounded, sanitized projections: at most 32
 detailed observations and 16 KiB, with unresolved failures retained longest.
 Paths, credentials, DSNs, environment-assignment values, unknown positional

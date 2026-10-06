@@ -68,6 +68,12 @@ MAX_SAFE_IDENTIFIER_BYTES = 256
 MAX_SAFE_IDENTIFIERS = 8
 MAX_SAFE_CAVEAT_BYTES = 256
 MAX_PRIVATE_OBSERVATIONS = 64
+# Issue #1182: a direct-pytest run the parent positively observed exiting
+# before any test could run is recorded as a ``launch-failed`` row carrying
+# this caveat first.  It is visible but is not evidence: never an
+# authoritative failure and never in need of supersession.  The caveat grants
+# nothing on any other outcome.
+PRE_COLLECTION_LAUNCH_FAILURE_PREFIX = "pre-collection launch failure; not evidence"
 MAX_PRIVATE_DIAGNOSTIC_BYTES = 8 * 1024
 MAX_PRIVATE_TOTAL_BYTES = 128 * 1024
 MAX_ROUND_OBSERVATIONS = 32
@@ -373,6 +379,10 @@ class LocalTestObservation:
         return self.outcome in {"failed", "timed_out", "interrupted", "incomplete", "launch-failed"}
 
     @property
+    def is_non_evidence_launch_failure(self) -> bool:
+        return is_non_evidence_launch_failure(self)
+
+    @property
     def is_out_of_checkout_context(self) -> bool:
         return OUT_OF_CHECKOUT_CONTEXT_CAVEAT in self.caveats
 
@@ -559,12 +569,28 @@ def _is_downgraded(caveats: Iterable[str]) -> bool:
     )
 
 
+def is_non_evidence_launch_failure(row: object) -> bool:
+    """Whether a row (observation, projection or mapping) is a non-evidence launch failure."""
+    if isinstance(row, Mapping):
+        outcome, caveats = row.get("outcome"), row.get("caveats")
+    else:
+        outcome, caveats = getattr(row, "outcome", None), getattr(row, "caveats", None)
+    if outcome != "launch-failed" or not isinstance(caveats, (list, tuple)):
+        return False
+    return any(
+        isinstance(item, str) and item.startswith(PRE_COLLECTION_LAUNCH_FAILURE_PREFIX)
+        for item in caveats
+    )
+
+
 def _prioritized_caveats(caveats: Iterable[str]) -> list[str]:
     unique = list(dict.fromkeys(caveats))
     has_omitted = _ARGV_OMITTED_CAVEAT in unique
     first_unparsable = next((c for c in unique if c.startswith(_UNPARSABLE_PREFIX)), None)
 
     def rank(item: str) -> int:
+        if item.startswith(PRE_COLLECTION_LAUNCH_FAILURE_PREFIX):
+            return 0
         if item == OUT_OF_CHECKOUT_CONTEXT_CAVEAT:
             return 1
         if item == _CAPTURE_LIMITED_CAVEAT:
@@ -886,6 +912,7 @@ def reconcile_test_observations(
             not failure.is_failure
             or failure.superseded_by
             or failure.is_out_of_checkout_context
+            or failure.is_non_evidence_launch_failure
         ):
             continue
         for later in rows[failure_index + 1 :]:
@@ -932,6 +959,7 @@ def reconcile_test_observations(
         and row.provenance == "parent-observed"
         and not row.superseded_by
         and not row.is_out_of_checkout_context
+        and not row.is_non_evidence_launch_failure
     )
     legacy_limited = bool(legacy_rows)
     if legacy_limited:
@@ -1179,7 +1207,7 @@ def bounded_evidence_for_round(evidence: LocalTestEvidence | Mapping[str, object
     # Retain unresolved failures before any class of pass, then prefer newer
     # rows within a class. Restore chronological order for rendering.
     def retention_priority(row: Mapping[str, object]) -> int:
-        if row.get("superseded_by"):
+        if row.get("superseded_by") or is_non_evidence_launch_failure(row):
             return 0
         caveats = row.get("caveats")
         if isinstance(caveats, list) and OUT_OF_CHECKOUT_CONTEXT_CAVEAT in caveats:
@@ -2585,6 +2613,15 @@ class TestBrokerServer:
                     (
                         index
                         for index, row in enumerate(candidate_rows)
+                        if row.is_non_evidence_launch_failure
+                    ),
+                    None,
+                )
+            if discard is None:
+                discard = next(
+                    (
+                        index
+                        for index, row in enumerate(candidate_rows)
                         if not row.is_failure
                     ),
                     0,
@@ -2713,6 +2750,7 @@ class TestBrokerServer:
                     process_finished=finished,
                     wrapper_bootstrap="verified",
                     health_provenance="broker-parent",
+                    classify_pre_collection=True,
                 )
             if str(getattr(result, "outcome", "")) == "cancelled":
                 # Nothing launched: no post-run snapshot, attribution or evidence.
@@ -2760,12 +2798,29 @@ class TestBrokerServer:
                 + "; executed argv: "
                 + " ".join(str(item) for item in getattr(result, "args", argv))[:512],
             )
-        if suite_start != "not-started" and str(getattr(result, "outcome", "")) not in {
+        pre_collection = getattr(result, "pre_collection_launch_failure", None)
+        result_outcome = str(result.outcome)
+        result_diagnostic = getattr(result, "diagnostic", "")
+        if isinstance(pre_collection, str) and pre_collection and result_outcome == "failed":
+            # Issue #1182: parent-observed non-evidence launch failure.  The
+            # row stays visible with the caveat first; the frame reports it
+            # as ``launch-failed``/``not-started`` so no timing or health is
+            # recorded for it.
+            caveat = _safe_text(
+                f"{PRE_COLLECTION_LAUNCH_FAILURE_PREFIX}: {pre_collection}", MAX_SAFE_CAVEAT_BYTES,
+            )
+            journal_caveats = (caveat, *journal_caveats)
+            result_outcome = "launch-failed"
+            suite_start = "not-started"
+            result_diagnostic = caveat
+        else:
+            pre_collection = None
+        if (suite_start != "not-started" or pre_collection) and str(getattr(result, "outcome", "")) not in {
             "overlap-rejected", "worker-budget-busy", "worker-budget-refused", "cancelled",
         }:
             observation = LocalTestObservation(
                 command=argv,
-                outcome=str(result.outcome),
+                outcome=result_outcome,
                 provenance="parent-observed",
                 scope=EvidenceScope("unknown", ()),
                 receipt_id=receipt_id,
@@ -2801,14 +2856,14 @@ class TestBrokerServer:
             "type": "result",
             "receipt_id": receipt_id,
             "execution_ref": execution_ref,
-            "outcome": str(result.outcome),
+            "outcome": result_outcome,
             "returncode": result.returncode,
             "elapsed_seconds": float(result.elapsed_seconds),
             "output_tail": _safe_text(getattr(result, "output_tail", ""), 8 * 1024),
             "wrapper_bootstrap": str(getattr(result, "wrapper_bootstrap", "unknown")),
             "inner_exec": str(getattr(result, "inner_exec", "not-attempted")),
             "suite_start": suite_start,
-            "diagnostic": _safe_text(getattr(result, "diagnostic", ""), MAX_SAFE_CAVEAT_BYTES),
+            "diagnostic": _safe_text(result_diagnostic, MAX_SAFE_CAVEAT_BYTES),
             "executed_argv": _bounded_argv(getattr(result, "args", argv) or argv),
             "workers_cohort": getattr(result, "workers_cohort", None),
             "worker_enforcement": worker_enforcement,
@@ -2950,3 +3005,36 @@ EnvironmentRegistry = EnvironmentIdentityRegistry
 reconcile = reconcile_test_observations
 parse_legacy_test_commands = parse_legacy_tests_run
 safe_public_observation = LocalTestObservation.public_projection
+
+
+def unsuperseded_receipts_sentence(value: object) -> str:
+    """One bounded sentence naming unsuperseded authoritative failure receipts.
+
+    Used by the unchanged-head stop (issue #1182) so a loop that stops while
+    the only open item is evidence bookkeeping is not read as the coder
+    failing to act.  Empty when there are no such receipts.
+    """
+    evidence = decode_bounded_evidence(value) if value else None
+    if evidence is None:
+        return ""
+    failing = [
+        row for row in evidence.observations
+        if row.is_failure
+        and row.provenance == "parent-observed"
+        and not row.superseded_by
+        and not row.is_out_of_checkout_context
+        and not row.is_non_evidence_launch_failure
+    ]
+    if not failing:
+        return ""
+    named = []
+    for row in failing[:3]:
+        command, _ids, _caveats = redact_test_command(row.command)
+        named.append(f"`{_bounded(command, 120)}` ({row.outcome})")
+    more = f" and {len(failing) - 3} more" if len(failing) > 3 else ""
+    return (
+        " The latest local test evidence still holds unsuperseded failure receipts: "
+        + ", ".join(named) + more
+        + ". This stop may be evidence bookkeeping rather than a missing code change; an operator "
+        "can verify the command and decide whether the receipts are still meaningful."
+    )

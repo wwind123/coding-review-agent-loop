@@ -124,7 +124,7 @@ Source paths below are relative to
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
 | CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
 | Optional workflow branches | `decomposition.py`, `child_topology.py`, `split_materialization.py`, `followups.py`, `semantic_dedupe.py`, `evidence_reconciliation.py` | Materialize typed child work, reconcile follow-ups, and support discussion evidence. |
-| Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `tool_provenance.py`, `logging.py`, `worker_telemetry.py` | Record invocation-local test selectors and authoritative observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success; `tool_provenance.py` validates the Git executable's location and reads the tool checkout only through `run_hardened_git` to record the running commit; runtime rows persist the launch triple (`wrapper_bootstrap`, `inner_exec`, `suite_start`) as diagnostics beside `launch_integrity`; `worker_telemetry.py` appends a disposable host-scoped worker-reservation log whose broker-lane attribution comes from the runner while standalone `run-tests` attribution is self-reported. |
+| Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `tool_provenance.py`, `logging.py`, `worker_telemetry.py` | Record invocation-local test selectors and authoritative observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success; `tool_provenance.py` validates the Git executable's location and reads the tool checkout only through `run_hardened_git` to record the running commit; runtime rows persist the launch triple (`wrapper_bootstrap`, `inner_exec`, `suite_start`) as diagnostics beside `launch_integrity`; `worker_telemetry.py` appends a disposable host-scoped worker-reservation log whose broker-lane attribution comes from the runner while standalone `run-tests` attribution is self-reported. `lifecycle_probe.py` and the `_agent_loop_lifecycle_probe` pytest plugin (beside the worker-cap plugin) give a direct-pytest run positive parent-observed lifecycle provenance, and with the parent importability check let `test_runtime.py` classify a run that exited before any test could run as a persisted non-evidence `launch-failed` row (pre-collection caveat first) that every authoritative-failure consumer excludes. |
 
 `orchestrator.py` is a thin re-export facade over the lifecycle modules listed
 above, which were extracted from it by pure moves (#1181). Each extracted module
@@ -1442,6 +1442,20 @@ judgement, so refuse-mode enforcement is not weakened. A broker request's
 pending admission is cancelled when the broker stops, synchronised with target
 launch so no target starts after the owning turn ends. See
 [Parallel test-worker budget](docs/local_agent_loop.md#parallel-test-worker-budget).
+
+The same test-execution boundary distinguishes positive lifecycle provenance
+from vetoes when deciding that a direct-pytest run exited before any test could
+run. Provenance is parent-owned: a launch eligibility the parent validated for a
+native, non-script, non-isolated interpreter that passed a probe-import
+preflight, the `_agent_loop_lifecycle_probe` plugin's strictly parsed report
+(injected ahead of later plugins; option parsing never finished and no test-code
+file was touched first; a clean `final` record), or an independent parent
+importability check when pytest itself is absent. The whole-stream output scan
+and the worker-session report are vetoes only, and a missing, blocked or
+unreadable signal always fails closed. The probe is a cooperative observation
+channel, not a sandbox. A classified run is a persisted non-evidence
+`launch-failed` row; see
+[Pre-collection launch failures](docs/local_agent_loop.md#pre-collection-launch-failures).
 
 **Antigravity quota-group fallback (#1236).** `agents/antigravity.py` derives a
 quota group per chain entry (an explicit override or the model-name family) and

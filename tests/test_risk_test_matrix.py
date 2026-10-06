@@ -3317,3 +3317,49 @@ def test_default_claim_schema_text_and_example_are_unchanged_by_coverage_keys() 
     assert "preserve-only" in preserved
     assert preserved.endswith("never add, change, or drop it.")
     assert preserved.startswith(default.rstrip()[:200])
+
+
+def _derive_with(observations):
+    matrix = parse_risk_test_matrix(_matrix())
+    claim = SemanticRiskCoverageClaims((SemanticRiskCoverageClaim(
+        row_id="row-ordinary",
+        execution_refs=("invocation:observation-1",),
+        test_identifiers=("test_ordinary",),
+        test_locations=("tests/test_protocol.py::test_ordinary",),
+        workflow_path_claim="The workflow path ran.",
+        outcome_assertions=("The selected test passed.",),
+        forbidden_effect_assertions=("No stale head was merged.",),
+    ),))
+    return derive_risk_test_matrix_evidence(
+        matrix=matrix,
+        claims=claim,
+        observations=observations,
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+
+def test_non_evidence_launch_failure_does_not_block_matrix_evidence() -> None:
+    """Issue #1182: a pre-collection launch failure is not an unsuperseded failure."""
+    from dataclasses import replace  # noqa: F401 - SimpleNamespace copies below
+
+    passing = _derived_observation(execution_ref="invocation:observation-1", receipt_id="receipt-pass")
+    launch = _derived_observation(
+        execution_ref="invocation:observation-2", receipt_id="receipt-launch", outcome="launch-failed",
+    )
+    launch.caveats = ("pre-collection launch failure; not evidence: usage error",)
+    result = _derive_with((passing, launch))
+    assert not any(d.code == "unsuperseded-journal-failure" for d in result.diagnostics)
+    assert result.evidence.rows[0].status == "verified"
+
+    forged = _derived_observation(
+        execution_ref="invocation:observation-2", receipt_id="receipt-forged", outcome="failed",
+    )
+    forged.caveats = ("pre-collection launch failure; not evidence: usage error",)
+    forged_result = _derive_with((passing, forged))
+    assert any(d.code == "unsuperseded-journal-failure" for d in forged_result.diagnostics)
+    assert forged_result.evidence.rows[0].status == "incomplete"
