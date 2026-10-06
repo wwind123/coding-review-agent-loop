@@ -4105,6 +4105,18 @@ def _admit_recovery_records(
     )
 
 
+def _is_budget_candidate(metadata: PostedRoundMetadata) -> bool:
+    """Whether the operator override may take a round budget from this record.
+
+    One predicate shared by budget selection and REST coverage, so the records
+    that can supply a budget are exactly the records whose authorship must be
+    proven: any record bearing a qualification checkpoint, or a recovery record.
+    """
+    return metadata.qualification_checkpoint is not None or (
+        metadata.phase in RECOVERY_RECORD_PHASES and metadata.recovery_round_budget is not None
+    )
+
+
 def unauthenticated_recovery_record_indexes(
     comments: Sequence[object],
     head_sha: str | None = None,
@@ -4125,7 +4137,7 @@ def unauthenticated_recovery_record_indexes(
         phase = record.metadata.phase
         if phase in RECOVERY_RECORD_PHASES:
             needed.add(record.index)
-        elif phase == "qualification-checkpoint" and review_unrecorded_head:
+        elif review_unrecorded_head and _is_budget_candidate(record.metadata):
             needed.add(record.index)
     if head_sha and records and not any(r.metadata.subject == head_sha for r in records):
         prior = [r for r in records if r.metadata.phase != CODER_DISPATCH_PHASE]
@@ -4343,6 +4355,8 @@ def _operator_head_review_resume(
         # already, and a qualification checkpoint (or any other record) only
         # counts when the authenticated actor authored it.  Only recovery
         # phases may carry a recovery budget.
+        if not _is_budget_candidate(metadata):
+            continue
         if not _recovery_record_admitted(record, comments, trusted_actor):
             continue
         if _recovery_record_problems(metadata):

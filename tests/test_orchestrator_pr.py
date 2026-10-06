@@ -19706,7 +19706,10 @@ def test_incomplete_rest_page_that_omits_a_recovery_record_stops_before_any_agen
 
 @pytest.mark.parametrize(
     "case",
-    ["legacy-anchor", "operator-budget-checkpoint", "dispatch-and-rejection"],
+    [
+        "legacy-anchor", "operator-budget-checkpoint", "operator-budget-coder-record",
+        "dispatch-and-rejection",
+    ],
 )
 def test_rest_page_omitting_any_record_recovery_depends_on_stops_before_any_agent_call(tmp_path, case):
     """Generalizes the omitted-handoff rule to checkpoint anchors and budget sources."""
@@ -19714,7 +19717,7 @@ def test_rest_page_omitting_any_record_recovery_depends_on_stops_before_any_agen
     flag = False
     if case == "legacy-anchor":
         records, omit = [*_history_1292(), _checkpoint_1292()], 2
-    elif case == "operator-budget-checkpoint":
+    elif case in {"operator-budget-checkpoint", "operator-budget-coder-record"}:
         used = dataclasses.replace(
             _checkpoint_1292(),
             qualification_checkpoint=QualificationCheckpoint(
@@ -19723,6 +19726,12 @@ def test_rest_page_omitting_any_record_recovery_depends_on_stops_before_any_agen
                 allowed_rounds=5, watch_failure_extension_used=True, watch_head_extension_used=False,
             ),
         )
+        if case == "operator-budget-coder-record":
+            # An authoritative coder record that carries the used-extension checkpoint.
+            used = dataclasses.replace(
+                _meta_1292("coder", subject=_A_1292, round_number=2, items=(_item_1292(),)),
+                qualification_checkpoint=used.qualification_checkpoint,
+            )
         records, omit, flag = [*_history_1292(), used, prelaunch], 2, True
     else:
         records = [
