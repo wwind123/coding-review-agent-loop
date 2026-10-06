@@ -2823,6 +2823,35 @@ def test_foreground_discarded_script_runs_npm_as_today(tmp_path, monkeypatch, no
     assert list(result.args) == ["npm", "run", "t", *extra]
 
 
+def test_deeply_nested_package_json_is_unresolved_and_npm_runs_as_today(tmp_path, monkeypatch, no_ambient_invocation):
+    """A package.json the decoder cannot recurse through is unresolved, not a crash (#1294)."""
+    from coding_review_agent_loop import runner as runner_module
+
+    _fake_playwright(tmp_path)
+    bindir, sentinel = _fake_npm(tmp_path)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    depth = 100_000
+    (tmp_path / "package.json").write_text(
+        '{"scripts": {"t": "npx playwright test"}, "meta": ' + "[" * depth + "]" * depth + "}",
+        encoding="utf-8",
+    )
+    assert (tmp_path / "package.json").stat().st_size < runtime._PACKAGE_JSON_MAX_BYTES
+    with pytest.raises(RecursionError):
+        json.loads((tmp_path / "package.json").read_text(encoding="utf-8"))
+
+    assert runtime.resolve_package_script(["npm", "run", "t"], cwd=tmp_path) is None
+    assert runtime.resolve_adopted_package_script(["npm", "run", "t"], cwd=tmp_path) is None
+    probes = []
+    monkeypatch.setattr(runtime, "_run_bounded_probe", lambda *a, **k: probes.append(a))
+    result = runner_module.run_foreground_test(
+        ["npm", "run", "t"], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+    assert probes == []
+    assert sentinel.exists()
+    assert result.suite_start == "unknown"
+    assert list(result.args) == ["npm", "run", "t"]
+
+
 def test_foreground_adopted_script_with_unknown_probe_spawns_body_never_npm(tmp_path, monkeypatch, no_ambient_invocation):
     from coding_review_agent_loop import runner as runner_module
 

@@ -2601,7 +2601,10 @@ def _read_package_scripts(cwd: Path) -> Mapping[str, object] | None:
         if not path.is_file() or path.stat().st_size > _PACKAGE_JSON_MAX_BYTES:
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # Deeply nested JSON well under the size cap raises RecursionError in
+        # the decoder; like any other undecodable file it leaves the script
+        # unresolved rather than aborting the run.
         return None
     scripts = data.get("scripts") if isinstance(data, dict) else None
     return scripts if isinstance(scripts, dict) else None
