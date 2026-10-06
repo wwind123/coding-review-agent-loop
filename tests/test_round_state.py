@@ -1,5 +1,6 @@
 """Round metadata compatibility for the reviewer-board amendment digest (#943)."""
 
+import dataclasses
 import json
 from types import SimpleNamespace
 
@@ -454,7 +455,7 @@ def test_planning_only_scheduler_mode_is_invalid_on_a_pr_flow_checkpoint():
 
 # --- Coder-recovery and head-review-recovery records (#1292) -----------------
 
-from coding_review_agent_loop.protocol import UnresolvedReviewItem  # noqa: E402
+from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem  # noqa: E402
 from coding_review_agent_loop.round_state import (  # noqa: E402
     CODER_DISPATCH_PHASE,
     CODER_FOLLOWUP_REJECTED_PHASE,
@@ -984,3 +985,29 @@ def test_partial_head_review_recovery_ignores_records_published_before_its_hando
     assert [r.metadata.agent for r in resumed.completed_reviews] == ["Gemini"]
     assert resumed.coder_output is None and resumed.coder_metadata is None
     assert resumed.reconciled is False
+
+
+def test_prior_head_reconstruction_stops_at_the_head_review_handoff_boundary():
+    """Cleared items stay cleared and pre-handoff coder context is absent after a head advance."""
+    items = (_item(),)
+
+    def verdict(disposition):
+        return dataclasses.replace(
+            _reviewer(subject=_NEW, round_number=3, items=items),
+            dispositions=(
+                ReviewItemDisposition(item_id="item-1", reviewer="Codex", disposition=disposition),
+            ),
+        )
+
+    history = [
+        _coder(subject=_NEW, round_number=3, items=items),
+        verdict("blocking"),  # published before the handoff
+        _handoff(subject=_NEW, round_number=3, items=items),
+        verdict("resolved"),  # the completed fresh recovery review
+    ]
+    # The fresh review cleared item-1; a manual push to C must not revive it.
+    assert _resume(history, _NEWER) is None
+    # With the fresh review still blocking, the ledger carries over but the
+    # pre-handoff coder response is never restored.
+    resumed = _resume([*history[:3], verdict("blocking")], _NEWER)
+    assert resumed is not None and resumed.coder_output is None

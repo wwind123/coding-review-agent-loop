@@ -19799,3 +19799,34 @@ def test_restart_after_partial_head_review_does_not_replay_pre_handoff_reviews(t
     # Codex's pre-handoff verdict was not replayed: it was invoked afresh.
     assert "codex" in _agent_sequence(runner)
     assert len(_records_1292(runner, "head-review-recovery")) == 1
+
+
+def test_manual_push_after_completed_head_review_recovery_does_not_revive_pre_handoff_verdicts(tmp_path):
+    """Generalizes the item-6 boundary to prior-head reconstruction (item-7)."""
+    def reviewer(agent, state, disposition):
+        return dataclasses.replace(
+            _meta_1292("reviewer", subject=_B_1292, round_number=2, items=(_item_1292(),)),
+            agent=agent, state=state,
+            dispositions=(
+                ReviewItemDisposition(item_id="item-1", reviewer=agent, disposition=disposition),
+            ),
+        )
+
+    records = [
+        *_history_1292(),
+        _meta_1292("coder", subject=_B_1292, round_number=2, items=(_item_1292(),)),
+        reviewer("Codex", "blocking", "blocking"),  # published before the handoff
+        _handoff_1292(round_number=2),
+        reviewer("Codex", "approved", "resolved"),  # the completed fresh recovery review
+    ]
+    runner = _stranded_runner_1292(
+        records, _C_1292,
+        codex_outputs=[structured_pr_review(state="approved", summary="Nothing carried.")],
+    )
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    # item-1 was cleared by the fresh review: nothing is carried to C or sent to a coder.
+    assert "claude" not in _agent_order_1292(runner)
+    assert _agent_order_1292(runner)[:1] == ["codex"]

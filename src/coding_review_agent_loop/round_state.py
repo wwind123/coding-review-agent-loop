@@ -3601,6 +3601,23 @@ def _select_current_round_records(
         if record.metadata.round_number == anchor_metadata.round_number
         and _prior_item_ledger_signature(record.metadata.prior_items) == prior_items_signature
     )
+    # A head-review recovery handoff for this round is a boundary: records the
+    # same head, round and ledger published before it are never part of the
+    # recovered round (it carries only the ledger, budget and handoff).  Uses only
+    # fields that always decode, so it applies to every caller, live or retired.
+    boundary = next(
+        (
+            record
+            for record in reversed(subject_records)
+            if record.metadata.phase == HEAD_REVIEW_RECOVERY_PHASE
+            and record.metadata.round_number == anchor_metadata.round_number
+        ),
+        None,
+    )
+    if boundary is not None:
+        current_round_records = tuple(
+            record for record in current_round_records if record.index >= boundary.index
+        )
     latest_coder_record = next(
         (
             record
