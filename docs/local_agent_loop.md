@@ -4148,7 +4148,7 @@ aggregate (skipped when routing suppresses CI, as before). After
 if a manifest is missing (for example expired artifacts) it asks for "Re-run
 all jobs". The partition uses `tests/.test_durations`; refresh it when balance
 drifts with
-`CI_SHARD_STORE_DURATIONS=tests/.test_durations python -m pytest -n auto`.
+`PYTHONPATH=ci/managed${PYTHONPATH:+:$PYTHONPATH} CI_SHARD_STORE_DURATIONS=tests/.test_durations python -m pytest -p ci_shard_plugin -n auto` (the plugin is not loaded automatically).
 Drift affects balance only, never coverage.
 
 The validator, exact-head shards, aggregate and publisher live in the reusable

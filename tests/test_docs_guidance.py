@@ -956,3 +956,16 @@ def test_adoption_snippet_carries_the_caller_routing_and_permissions():
         assert condition(snippet, job) == condition(workflow, job)
     assert "      statuses: write" in snippet and "AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1" in snippet
     assert snippet.index("  ci:") < snippet.index("      contents: read") < snippet.index("  managed:")
+
+
+def test_duration_refresh_command_loads_the_callee_owned_shard_plugin():
+    # The conftest shim is gone, so a refresh only records durations when the
+    # plugin is put on PYTHONPATH and loaded explicitly.
+    for path in (README, LOCAL_AGENT_LOOP_DOC):
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        assert "CI_SHARD_STORE_DURATIONS=tests/.test_durations" in text, path
+        command = text[text.index("PYTHONPATH=ci/managed") :]
+        command = command[: command.index("-n auto") + len("-n auto")]
+        assert "CI_SHARD_STORE_DURATIONS=tests/.test_durations" in command, path
+        assert "${PYTHONPATH:+:$PYTHONPATH}" in command, path
+        assert "-p ci_shard_plugin" in command, path

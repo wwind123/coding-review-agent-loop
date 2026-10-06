@@ -168,7 +168,7 @@ revision. Managed CI can also target allow-listed integration branches via the
 see [trusted integration bases](docs/local_agent_loop.md#trusted-integration-bases-agent_loop_trusted_bases)
 for the adoption snippet, trust model and limitation. Shard balance comes from `tests/.test_durations`,
 refreshed with
-`CI_SHARD_STORE_DURATIONS=tests/.test_durations python -m pytest -n auto`. The always-evaluated publisher writes
+`PYTHONPATH=ci/managed${PYTHONPATH:+:$PYTHONPATH} CI_SHARD_STORE_DURATIONS=tests/.test_durations python -m pytest -p ci_shard_plugin -n auto` (the plugin is not loaded automatically). The always-evaluated publisher writes
 `final-ci/exact-head` only for that validated target, with the nonce, run ID,
 attempt, and Actions URL correlated in the status. Authorization failures
 before target validation write no status; checkout or test failures publish a
