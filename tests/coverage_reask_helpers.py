@@ -209,7 +209,7 @@ class CoverageHarness:
 
         m.setattr(orchestrator_module, "run_agent_result", no_agent_result)
 
-    def response(self, text: str, *, session_id: str = "coder-session"):
+    def response(self, text: str, *, session_id: str = "coder-session", turn_id: str = "coder-turn", observations=()):
         parsed = validate_structured_issue_implementation(
             text, delivered_risk_test_matrix_row_ids=ROWS
         )
@@ -218,8 +218,8 @@ class CoverageHarness:
             text=text,
             session_id=session_id,
             marker_value=parsed,
-            acquisition_test_turn_id="coder-turn",
-            acquisition_test_observations=(),
+            acquisition_test_turn_id=turn_id,
+            acquisition_test_observations=tuple(observations),
         )
 
     # -- run --------------------------------------------------------------

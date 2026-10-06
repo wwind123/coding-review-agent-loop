@@ -18718,3 +18718,161 @@ def test_workflow_final_assessment_follows_actual_semantic_correction(tmp_path, 
         assert f"complete at {h.head}" in comment
     else:
         assert f"incomplete at {h.head}" in comment and expected in comment
+
+
+# --- #1290 round 2: remaining approved workflow transitions --------------------
+
+import coding_review_agent_loop.validated_agent as validated_agent_module
+
+def test_workflow_envelope_normalization_reaches_the_single_coverage_reask(tmp_path, monkeypatch):
+    from coverage_reask_helpers import CoverageHarness
+
+    incomplete, ok = _real_agent_texts()
+    # Reversed footer/signature order is a recoverable envelope defect that the
+    # deterministic normalizer fixes without any repair model.
+    payload, end = json.JSONDecoder().raw_decode(incomplete)
+    reversed_envelope = json.dumps(payload) + "\n-- Anthropic Claude\n<!-- AGENT_STATE: blocking -->"
+    h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, claude_outputs=[reversed_envelope, ok, ok])
+    repair_calls = []
+    monkeypatch.setattr(
+        orchestrator_module, "attempt_repair",
+        lambda raw, *a, **k: repair_calls.append(1) or incomplete,
+    )
+    normalized = []
+    real_normalize = validated_agent_module.attempt_envelope_normalization
+    monkeypatch.setattr(
+        validated_agent_module, "attempt_envelope_normalization",
+        lambda raw, **k: normalized.append(1) or real_normalize(raw, **k),
+    )
+    assert h.run() == 0
+    assert normalized, "the recoverable envelope defect must go through normalization"
+    commands = _claude_commands(h)
+    assert len(commands) == 2
+    assert "row-man: missing-row" in commands[-1][-1]
+    assert repair_calls == []
+    comment = h.coder_comment()
+    assert f"complete at {h.head}" in comment and "after one coverage re-ask" in comment
+    assert h.run_pr_calls
+
+
+def test_workflow_corroborated_near_miss_on_still_incomplete_reask_is_canonicalized(tmp_path, monkeypatch):
+    from coverage_reask_helpers import CoverageHarness
+
+    incomplete, _ok = _real_agent_texts()
+    near_miss = _deg_with(incomplete, _DEG_CORROBORATED)
+    h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, claude_outputs=[incomplete, near_miss, near_miss])
+    assert h.run() == 0
+    assert len(_claude_commands(h)) == 2  # exactly one coverage re-ask
+    comment = h.coder_comment()
+    assert f"incomplete at {h.head} after one coverage re-ask" in comment
+    assert "row-man: missing-row" in comment
+    metadata = _metadata_from_public_comment(comment)
+    # Accepted-text canonicalization retained the degradation record.
+    assert [r.outcome for r in metadata.architecture_impact_degradations] == ["normalized-to-changed"]
+    assert h.run_pr_calls
+
+
+def test_workflow_initial_signed_requirement_conflict_never_reaches_the_gate(tmp_path, monkeypatch):
+    from coverage_reask_helpers import CoverageHarness, claim, response_text
+    from coding_review_agent_loop.architecture_contract import _TerminalIssueImplementationConflict
+    from coding_review_agent_loop.protocol import HumanRequirementDisposition
+
+    h = CoverageHarness(tmp_path, monkeypatch)
+    first = h.response(response_text(claims=[claim("row-wf")]))
+    blocked = replace(
+        first.marker_value,
+        human_requirement_dispositions=(HumanRequirementDisposition("hr-1", "blocked", "cannot comply"),),
+    )
+    h.script = [replace(first, marker_value=_TerminalIssueImplementationConflict(blocked))]
+    with pytest.raises(AgentLoopError, match="signed human requirement is blocked"):
+        h.run()
+    assert len(h.calls) == 1 and h.run_pr_calls == []
+    assert not any("AGENT_ISSUE_PR_HANDOFF" in body for body in h.all_comments())
+
+
+@pytest.mark.parametrize("outcome", ["null-pr", "different-pr", "failure", "adopted"])
+def test_workflow_post_auth_derivation_receives_the_right_acquisition(tmp_path, monkeypatch, outcome):
+    import coding_review_agent_loop.issue_implementation as issue_module
+    from coverage_reask_helpers import CoverageHarness, claim, complete_claims, response_text
+
+    h = CoverageHarness(tmp_path, monkeypatch)
+    seen = []
+    real = issue_module._derive_authenticated_risk_evidence_for_coder
+
+    def spy(parsed, **kwargs):
+        seen.append((kwargs.get("invocation_id"), tuple(kwargs.get("_closed_execution_catalog") or ()), kwargs["head_sha"]))
+        return real(parsed, **{**kwargs, "_closed_execution_catalog": (), "_journal_observations": ()})
+
+    monkeypatch.setattr(issue_module, "_derive_authenticated_risk_evidence_for_coder", spy)
+    first_catalog = ("first-catalog-marker",)
+    reask_catalog = ("reask-catalog-marker",)
+    first = h.response(
+        response_text(claims=[claim("row-wf"), claim("row-unit", level="unit")]),
+        turn_id="first-turn", observations=first_catalog,
+    )
+
+    def reask(harness):
+        harness.commit_file("tests/test_pushed.py", push=True)
+        if outcome == "failure":
+            raise AgentLoopError("failed after pushing")
+        if outcome == "null-pr":
+            return harness.response(response_text(pr_number=None), turn_id="reask-turn", observations=reask_catalog)
+        pr_number = 99 if outcome == "different-pr" else 77
+        return harness.response(
+            response_text(claims=complete_claims(), pr_number=pr_number),
+            turn_id="reask-turn", observations=reask_catalog,
+        )
+
+    h.script = [first, reask]
+    assert h.run() == 0
+    refreshed = h.runner.pr_payload["headRefOid"]
+    expected_turn, expected_catalog = (
+        ("reask-turn", reask_catalog) if outcome == "adopted" else ("first-turn", first_catalog)
+    )
+    assert seen == [(expected_turn, expected_catalog, refreshed)]
+    handoffs = [body for body in h.all_comments() if "AGENT_ISSUE_PR_HANDOFF" in body]
+    assert handoffs and all(refreshed in body and h.head not in body for body in handoffs)
+
+
+def test_workflow_unavailable_matrix_skips_assessment_and_reask(tmp_path, monkeypatch):
+    import coding_review_agent_loop.issue_implementation as issue_module
+    from coding_review_agent_loop.round_state import make_approved_plan_context
+    from coverage_reask_helpers import CoverageHarness, response_text
+
+    h = CoverageHarness(tmp_path, monkeypatch)
+    h.approved_plan = "Approved implementation plan without a usable matrix section."
+    h.plan_context = replace(
+        make_approved_plan_context(h.approved_plan, source_locator="unavailable matrix plan"),
+        risk_test_matrix_availability="unavailable",
+        risk_test_matrix_diagnostic="matrix payload could not be authenticated",
+    )
+    assert not h.plan_context.matrix_available
+    assessments = []
+    import coding_review_agent_loop.response_validation as validation_module
+
+    monkeypatch.setattr(issue_module, "assess_risk_coverage_map", lambda *a, **k: assessments.append(1))
+    monkeypatch.setattr(validation_module, "check_coverage_map", lambda *a, **k: assessments.append(1))
+    h.script = [h.response(response_text())]
+    assert h.run() == 0
+    assert assessments == [] and len(h.calls) == 1
+    assert "Risk-matrix coverage map" not in h.coder_comment()
+    for text in ("coverage obligations", "test_level", "risk_test_matrix_coverage_gaps"):
+        assert text not in h.calls[0]["prompt"]
+
+
+def test_workflow_correction_repairs_a_deficient_reask_without_a_second_reask(tmp_path, monkeypatch):
+    from coverage_reask_helpers import CoverageHarness, claim, complete_claims, response_text
+
+    h = CoverageHarness(tmp_path, monkeypatch)
+    deficient = [claim("row-wf", level=None), claim("row-unit", level="unit"), claim("row-man", level=None)]
+    h.script = [
+        h.response(response_text(claims=deficient)),
+        h.response(response_text(claims=deficient)),
+    ]
+    h.correction_handler = lambda harness: response_text(claims=complete_claims())
+    assert h.run() == 0
+    assert len(h.calls) == 2 and "row-wf: missing-level" in h.calls[1]["prompt"]
+    comment = h.coder_comment()
+    # The deficiency that survived the re-ask disappears once correction supplies the level.
+    assert f"complete at {h.head}" in comment and "after one coverage re-ask" in comment
+    assert "missing-level" not in comment.split("### Risk-matrix coverage map")[1]
