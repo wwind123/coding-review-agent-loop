@@ -11,7 +11,6 @@ later run finds the PR already MERGED.
 from __future__ import annotations
 
 import json
-import re
 from typing import Literal
 
 from .config import AgentLoopConfig
@@ -55,27 +54,39 @@ class _RecordedBaseUnavailable(Exception):
 def _authorized_base(runner: Runner, config: AgentLoopConfig, pr_number: int) -> str | None:
     """Recover the base the managed workflow was authorized for from durable evidence.
 
-    The trusted actor's signed handoff records on the PR carry the authorized
-    ``base_ref``.  Only comments by the live, advertised trusted actor (login
-    and immutable ID) count.  Returns ``None`` when the PR carries no such
-    record (never managed) and raises when evidence is unreadable, forged or
-    contradictory, so recovery fails closed instead of trusting a later
-    ``--base`` or the PR's current base.
+    Evidence is the managed workflow's own signed handoff record: a comment
+    whose whole body is the canonical record envelope (the same matcher the
+    hosted validator uses), authored by the live trusted actor (login and
+    immutable ID), that passes the canonical schema validation and names this
+    repository and PR.  Prose that merely mentions or quotes a record, and
+    records by other authors, are not evidence.  Returns ``None`` when the PR
+    carries no authenticated record (never managed); raises when evidence is
+    unreadable, malformed or contradictory, so recovery fails closed instead of
+    trusting a later ``--base`` or the PR's current base.
     """
     from .github import read_rest_issue_comments
-    from .managed_ci import INTENT_MARKER, _advertised_managed_actor, _api_json
-    from .errors import AgentLoopError as _Err
+    from .managed_ci import (
+        IntentBinding,
+        _advertised_managed_actor,
+        _api_json,
+        match_intent_envelope,
+        validate_intent_record,
+    )
 
     try:
         comments = read_rest_issue_comments(
             runner, config=config, issue_number=pr_number,
             purpose="authenticating the recorded integration base",
         )
-    except _Err as exc:
+    except AgentLoopError as exc:
         raise _RecordedBaseUnavailable(str(exc)) from exc
-    pattern = re.compile(rf"<!-- {INTENT_MARKER} (?P<payload>\{{.*?\}}) -->", re.DOTALL)
-    candidates = [c for c in comments if isinstance(c.body, str) and INTENT_MARKER in c.body]
-    if not candidates:
+    # Whole-body envelope only: embedded examples and discussion never match.
+    envelopes = []
+    for comment in comments:
+        match = match_intent_envelope(comment.body, visible_capable=True, host_footer_capable=True)
+        if match is not None:
+            envelopes.append((comment, match))
+    if not envelopes:
         return None
     actor = _advertised_managed_actor(runner, config)
     live = _api_json(runner, config, f"users/{actor}", quiet=True) if actor else {}
@@ -83,28 +94,28 @@ def _authorized_base(runner: Runner, config: AgentLoopConfig, pr_number: int) ->
     if not actor or actor_id is None:
         raise _RecordedBaseUnavailable("the trusted actor identity could not be established")
     bases: set[str] = set()
-    for comment in candidates:
+    for comment, match in envelopes:
         if (comment.author or "").casefold() != actor.casefold() or comment.author_id != actor_id:
-            continue
-        match = pattern.search(comment.body or "")
-        if match is None:
             continue
         try:
             record = json.loads(match.group("payload"))
         except json.JSONDecodeError:
             raise _RecordedBaseUnavailable("a trusted handoff record is malformed") from None
-        if (
-            not isinstance(record, dict)
-            or record.get("pr") != pr_number
-            or str(record.get("repository", "")).casefold() != config.repo.casefold()
-        ):
-            continue
-        if not isinstance(record.get("base_ref"), str) or not record["base_ref"]:
-            raise _RecordedBaseUnavailable("a trusted handoff record has no base")
+        if not isinstance(record, dict) or record.get("version") != 2:
+            raise _RecordedBaseUnavailable("a trusted handoff record is malformed or has the wrong version")
+        binding = IntentBinding(
+            repository=config.repo, pr=pr_number,
+            expected_head_sha=record.get("expected_head_sha"), base_ref=record.get("base_ref"),
+            workflow_revision=record.get("workflow_revision"), nonce=record.get("nonce"),
+            require_generation=False,
+        )
+        reason = validate_intent_record(record, match, binding=binding)
+        if reason is not None:
+            raise _RecordedBaseUnavailable(f"a trusted handoff record is invalid ({reason})")
         bases.add(record["base_ref"])
     if not bases:
-        # Only untrusted authors claimed a record: evidence exists but is unauthenticated.
-        raise _RecordedBaseUnavailable("no handoff record by the trusted actor could be authenticated")
+        # Only other authors posted envelopes: no authenticated authorization exists.
+        return None
     if len(bases) != 1:
         raise _RecordedBaseUnavailable("trusted handoff records disagree on the base")
     return next(iter(bases))
