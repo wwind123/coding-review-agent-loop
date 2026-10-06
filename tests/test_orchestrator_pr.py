@@ -19757,3 +19757,45 @@ def test_rest_page_omitting_any_record_recovery_depends_on_stops_before_any_agen
         run_pr_loop(runner, pr_number=77, config=config)
     assert _agent_order_1292(runner) == []
     assert _records_1292(runner, "head-review-recovery") == []
+
+
+def test_restart_after_partial_head_review_does_not_replay_pre_handoff_reviews(tmp_path):
+    """Row operator-record-interrupted (iii): only post-handoff publications count."""
+    stale_codex = dataclasses.replace(
+        _meta_1292("reviewer", subject=_B_1292, round_number=2, items=(_item_1292(),)),
+        agent="Codex", state="blocking",
+        canonical_reviewer_response=structured_pr_review(
+            state="blocking", summary="Old verdict.", blocking_items=["Old blocker."],
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "blocking",
+                                      "note": "Old note on the stale head."}],
+        ),
+    )
+    gemini = dataclasses.replace(
+        _meta_1292("reviewer", subject=_B_1292, round_number=2, items=(_item_1292(),)),
+        agent="Gemini", state="approved",
+        canonical_reviewer_response=structured_pr_review(
+            state="approved", summary="Resolved.", reviewer="Google Gemini",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ),
+    )
+    records = [
+        *_history_1292(), stale_codex,
+        _meta_1292("summary", "reconciliation", subject=_B_1292, round_number=2, items=(_item_1292(),)),
+        _handoff_1292(round_number=2), gemini,
+    ]
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved", summary="Resolved now.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+        pr_payload={"headRefOid": _B_1292, "comments": _seed_1292(*records)},
+        authenticated_actor=_ACTOR_1292,
+        advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), coder="claude")
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    # Codex's pre-handoff verdict was not replayed: it was invoked afresh.
+    assert "codex" in _agent_sequence(runner)
+    assert len(_records_1292(runner, "head-review-recovery")) == 1

@@ -964,3 +964,23 @@ def test_item_numbers_stay_global_after_a_successful_recovery_push(stage):
         history.append(_reviewer(subject=_NEWER, round_number=2, items=(_item(1),)))
     resumed = _resume(history, _NEWER)
     assert resumed is not None and resumed.next_unresolved_item_number == 8
+
+
+def test_partial_head_review_recovery_ignores_records_published_before_its_handoff():
+    """Pre-handoff reviewer/coder records sharing head, round and ledger are not replayed."""
+    items = (_item(),)
+    history = [
+        _coder(subject=_NEW, round_number=3, items=items),
+        _reviewer(subject=_NEW, round_number=3, items=items, agent="Codex"),
+        _summary("reconciliation", _NEW, 3, items),
+        _handoff(subject=_NEW, round_number=3, items=items),
+        _reviewer(subject=_NEW, round_number=3, items=items, agent="Gemini"),
+    ]
+    resumed = _resume_pr_round(
+        _history(*history), head_sha=_NEW, configured_reviewers=("codex", "gemini"),
+        trusted_actor=_ACTOR,
+    )
+    assert resumed is not None
+    assert [r.metadata.agent for r in resumed.completed_reviews] == ["Gemini"]
+    assert resumed.coder_output is None and resumed.coder_metadata is None
+    assert resumed.reconciled is False

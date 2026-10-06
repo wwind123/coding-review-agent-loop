@@ -5202,6 +5202,13 @@ def _resume_pr_round_from_records(
     )
     # A head-review handoff supersedes every earlier checkpoint on this head.
     superseded_below = review_handoff.index if review_handoff is not None else -1
+    if review_handoff is not None:
+        # Head-review recovery carries only the ledger, budget and handoff: records
+        # published before the handoff (reviewers, coder, reconciliation) that share
+        # its head, round and ledger are never replayed as part of the new round.
+        current_round_records = tuple(
+            record for record in current_round_records if record.index >= superseded_below
+        )
     checkpoint_record = _latest_qualification_checkpoint_record(
         records, head_sha=head_sha, min_index=superseded_below
     )
