@@ -4486,15 +4486,25 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
     with pytest.raises(AgentLoopError) as raised:
         orchestrator.run_pr_loop(runner, pr_number=77, config=config)
     message = str(raised.value)
+    from coding_review_agent_loop.pr_loop import _child_resume_hint
+
+    hint = _child_resume_hint(56, orchestrator.EXECUTION_DISPOSITION_PLANNING)
     route = (
         " If the blocking finding requires re-planning the child plan, post the signed "
-        "child-plan supersession record on child issue #56 and rerun `"
+        f"child-plan supersession record on child issue #56 and rerun `{hint}`."
     )
-    assert route in message
-    base, _, tail = message.partition(route)
-    assert base.endswith("human review required.") != with_receipt
+    legacy = (
+        "PR #77: Claude left head abc123 unchanged in 2 consecutive follow-up rounds, so another "
+        "review of the same diff cannot change the verdict. Stopping before round 3; "
+        "human review required."
+    )
     if with_receipt:
-        assert "unsuperseded failure receipts" in base and "-n 0" in base
+        sentence = (
+            " The latest local test evidence still holds unsuperseded failure receipts: "
+            "`python3 -m pytest tests/test_x.py -q -n 0` (failed). This stop may be evidence "
+            "bookkeeping rather than a missing code change; an operator can verify the command "
+            "and decide whether the receipts are still meaningful."
+        )
+        assert message == legacy + sentence + route
     else:
-        assert "unsuperseded" not in message
-    assert tail.endswith("`.")
+        assert message == legacy + route

@@ -3383,14 +3383,38 @@ _LP_TEMPLATE_BODY = (
 )
 
 
-def _lp_status_equal_without_probe(argv, tmp_path, *, env=None):
-    """Run with and without classification: same status, never classified."""
-    kwargs = dict(cwd=tmp_path, timeout_seconds=120, echo_output=False, env=env)
-    plain = run_foreground_test(argv, **kwargs)
-    classified = run_foreground_test(argv, classify_pre_collection=True, **kwargs)
-    assert classified.returncode == plain.returncode, argv
-    assert classified.pre_collection_launch_failure is None, argv
-    return classified
+_LP_DUMP_TEST = (
+    "import json, os, sys\n\n"
+    "def test_dump():\n"
+    "    assert '_agent_loop_lifecycle_probe' not in sys.modules\n"
+    "    assert not any('lifecycle_probe' in arg for arg in sys.argv)\n"
+    "    environment = {k: v for k, v in os.environ.items() if k not in {'LP_DUMP', 'PYTEST_CURRENT_TEST'}}\n"
+    "    with open(os.environ['LP_DUMP'], 'w') as handle:\n"
+    "        json.dump({'argv': sys.argv[1:], 'env': environment}, handle, sort_keys=True)\n"
+)
+
+
+def _lp_run_control(argv, tmp_path, tag, *, env, classify):
+    dump = tmp_path / f"dump-{tag}.json"
+    if dump.exists():
+        dump.unlink()
+    result = run_foreground_test(
+        argv, cwd=tmp_path, timeout_seconds=120, echo_output=False, classify_pre_collection=classify,
+        env={**env, "LP_DUMP": str(dump)},
+    )
+    return result, (json.loads(dump.read_text()) if dump.exists() else None)
+
+
+def _lp_assert_control(argv, tmp_path, *, env, expected, label):
+    """Compare a classified run with an unclassified one: status, argv and environment."""
+    plain, plain_dump = _lp_run_control(argv, tmp_path, "plain", env=env, classify=False)
+    classified, classified_dump = _lp_run_control(argv, tmp_path, "classified", env=env, classify=True)
+    assert classified.returncode == plain.returncode, label
+    assert classified.pre_collection_launch_failure is None, label
+    assert classified_dump == plain_dump, label
+    if expected is not None:
+        assert classified.returncode == expected, label
+        assert classified_dump is not None, label  # the target really ran, unprobed
 
 
 def test_launchers_outside_the_allowlist_get_no_probe_and_are_never_classified(tmp_path, monkeypatch):
@@ -3424,15 +3448,24 @@ def test_launchers_outside_the_allowlist_get_no_probe_and_are_never_classified(t
         ("env-shebang-via-wrapper-path", [str(env_form)], path_env),
         ("non-template", [str(nontemplate)], base),
     ]
-    _lp_write(tmp_path, {"test_x.py": _LP_NOT_INJECTED})
+    _lp_write(tmp_path, {"test_x.py": _LP_DUMP_TEST})
+    isolated = {"dash-I", "isolating-wrapper", "trampoline", "shebang-isolating-wrapper", "shebang-dash-I"}
+    # ``-I`` also hides user site-packages; where pytest lives there, an isolated
+    # launcher cannot start it and only the equality checks apply (CI venvs run strictly).
+    isolated_ok = subprocess.run(
+        [sys.executable, "-I", "-c", "import pytest"], capture_output=True
+    ).returncode == 0
     for label, launcher, env in cases:
         argv = [*launcher, "-q", "-p", "no:cacheprovider", "test_x.py"]
         assert lp.prepare_lifecycle_probe([*argv, "--bogus-flag"], env, tmp_path) is None, label
-        for tail in ([], ["--bogus-flag"]):
-            result = _lp_status_equal_without_probe([*argv, *tail], tmp_path, env=env)
-            if label.startswith("shebang-wrapper") or label in {"shell-python-wrapper", "env-shebang-via-wrapper-path"}:
-                # These interpreters work, so the target ran and saw no probe.
-                assert result.returncode == (4 if tail else 0), label
+        strict = label not in isolated or isolated_ok
+        _lp_assert_control(argv, tmp_path, env=env, expected=0 if strict else None, label=label)
+        usage = [*argv, "--bogus-flag"]
+        plain, _ = _lp_run_control(usage, tmp_path, "plain", env=env, classify=False)
+        classified, _ = _lp_run_control(usage, tmp_path, "classified", env=env, classify=True)
+        assert classified.returncode == plain.returncode and classified.pre_collection_launch_failure is None, label
+        if strict:
+            assert classified.returncode == 4, label
     # A forced preflight failure on a native interpreter means no injection.
     monkeypatch.setattr(lp, "_PREFLIGHT_CODE", "import sys; sys.exit(3)")
     assert lp.prepare_lifecycle_probe([sys.executable, "-m", "pytest", "test_x.py"], base, tmp_path) is None
@@ -3681,7 +3714,10 @@ def test_env_shebang_trampoline_gets_no_injection_and_keeps_the_exit_status(tmp_
 
 @pytest.mark.parametrize(
     "variant",
-    ["pathname_pattern", "pyc_load", "retained_set_overflow", "ini_addopts_target", "non_py_explicit_target"],
+    [
+        "pathname_pattern", "pyc_load", "retained_set_overflow", "ini_addopts_target",
+        "non_py_explicit_target", "chdir_explicit_target", "chdir_pathname_pattern",
+    ],
 )
 def test_further_pre_parse_test_code_variants_are_not_classified(tmp_path, variant):
     files = {"pytest.ini": "[pytest]\n", "loader.py": _LP_FIRE_MODULE}
@@ -3715,6 +3751,29 @@ def test_further_pre_parse_test_code_variants_are_not_classified(tmp_path, varia
             "import glob\nfor path in glob.glob('filler/*.py'):\n    open(path).close()\n"
         )
         extra = ["-p", "userplug"]
+    elif variant == "chdir_explicit_target":
+        files.update({
+            "cases.spec": _LP_FIRE,
+            "sub/keep": "",
+            "userplug.py": (
+                "import os\nNS = {}\nexec(compile(open('cases.spec').read(), 'cases.spec', 'exec'), NS)\n"
+                "FIRE = NS['fire']\nos.chdir('sub')\n"
+            ),
+            "conftest.py": "import userplug\nuserplug.FIRE()\n",
+        })
+        extra += ["-p", "userplug", str(tmp_path / "cases.spec")]
+    elif variant == "chdir_pathname_pattern":
+        files.update({
+            "pytest.ini": "[pytest]\npython_files = check/*.py\n",
+            "check/cases.py": _LP_FIRE,
+            "sub/keep": "",
+            "userplug.py": (
+                "import os\nNS = {}\nexec(compile(open('check/cases.py').read(), 'check/cases.py', 'exec'), NS)\n"
+                "FIRE = NS['fire']\nos.chdir('sub')\n"
+            ),
+            "conftest.py": "import userplug\nuserplug.FIRE()\n",
+        })
+        extra += ["-p", "userplug", str(tmp_path / "check")]
     elif variant == "non_py_explicit_target":
         files.update({
             "cases.spec": _LP_FIRE,
@@ -3805,7 +3864,7 @@ def test_excluded_launchers_and_setup_failures_run_the_original_command_through_
     scratch.mkdir()
     monkeypatch.setattr(lp.tempfile, "tempdir", str(scratch))
     wrapper = _lp_script(tmp_path / "bin" / "python3", f'#!/bin/sh\nexec {real} "$@"\n')
-    _lp_write(tmp_path, {"test_x.py": _LP_NOT_INJECTED})
+    _lp_write(tmp_path, {"test_x.py": _LP_DUMP_TEST})
     base = ["-m", "pytest", "-q", "-p", "no:cacheprovider", "test_x.py"]
     cases = [
         ("wrapper", [str(wrapper), *base]),
@@ -3830,16 +3889,14 @@ def test_excluded_launchers_and_setup_failures_run_the_original_command_through_
                     return real_open(path, flags, *args, **kwargs)
 
                 patched.setattr(lp.os, "open", failing_open)
-            passing = run_foreground_test(
-                argv, cwd=tmp_path, timeout_seconds=120, echo_output=False, classify_pre_collection=True,
-            )
-            usage = run_foreground_test(
-                [*argv, "--bogus-flag"], cwd=tmp_path, timeout_seconds=120, echo_output=False,
-                classify_pre_collection=True,
-            )
+            passing, passing_dump = _lp_run_control(argv, tmp_path, "classified", env={}, classify=True)
+            usage, _ = _lp_run_control([*argv, "--bogus-flag"], tmp_path, "usage", env={}, classify=True)
+        # The same command with classification off (nothing patched) is the baseline.
+        baseline, baseline_dump = _lp_run_control(argv, tmp_path, "plain", env={}, classify=False)
         assert (passing.returncode, passing.pre_collection_launch_failure) == (0, None), label
         assert (usage.returncode, usage.pre_collection_launch_failure) == (4, None), label
-    assert list(scratch.iterdir()) == []  # no partial probe allocation is left behind
+        assert baseline.returncode == 0 and passing_dump == baseline_dump and passing_dump is not None, label
+    assert not list(scratch.rglob("agent-loop-lifecycle-probe-*"))  # no partial probe allocation is left behind
 
 
 def test_missing_pytest_is_non_evidence_through_the_unmocked_cli_fallback(tmp_path, monkeypatch):

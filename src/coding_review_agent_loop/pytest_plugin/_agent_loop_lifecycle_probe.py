@@ -132,6 +132,13 @@ def _see(path) -> None:
     if not isinstance(path, str) or not path:
         return
     if _S.phase == 1:
+        # Snapshot the observation-time location: a relative spelling would
+        # later resolve against a different working directory.
+        try:
+            path = os.path.abspath(path)
+        except Exception:
+            _veto()
+            return
         # Every path is retained, whatever its extension: an explicit target
         # (for example ``cases.spec``) can only be recognised once the resolved
         # arguments are known.  Overflow is a veto, never a silent drop.
