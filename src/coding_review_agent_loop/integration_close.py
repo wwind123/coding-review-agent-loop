@@ -291,8 +291,8 @@ def reconcile_merged_integration_child(
         return True
     if outcome == "unresolved":
         raise AgentLoopError(
-            f"Issue #{issue_number}: canonical PR #{authenticated.pr_number} is MERGED but the "
-            "integration-base merge or the child closure could not be authenticated; the stage "
+            f"Issue #{issue_number}: canonical PR #{authenticated.pr_number} is MERGED, not OPEN, "
+            "and the integration-base merge or the child closure could not be authenticated; the stage "
             "is not complete. Close the issue manually once the merge is verified."
         )
     return False
