@@ -20,7 +20,10 @@ from .ci_health import (
     PullRequestCheck,
     PullRequestChecks,
     StalledCheck,
+    EXCLUSION_NOTE_SUFFIX,
+    V2_RUN_NAME_PREFIX,
     _extract_run_id,
+    decode_concatenated_json_objects,
     classify_ci_infrastructure_stall,
     is_wholly_infrastructure_blocked,
 )
@@ -1593,6 +1596,19 @@ def _listing_is_complete(payload: object, list_key: str, parsed_count: int) -> b
     return total == len(raw) == parsed_count
 
 
+def _check_suite_id(raw_check: dict) -> int | None:
+    suite = raw_check.get("check_suite")
+    suite_id = suite.get("id") if isinstance(suite, dict) else None
+    if isinstance(suite_id, bool) or not isinstance(suite_id, int):
+        return None
+    return suite_id
+
+
+def _check_app_slug(raw_check: dict) -> str | None:
+    app = raw_check.get("app")
+    return _optional_str(app.get("slug")) if isinstance(app, dict) else None
+
+
 def _parse_check_runs_payload(payload: object) -> tuple[list[PullRequestCheck], list[str]]:
     """Parse the `commits/{sha}/check-runs` response into `PullRequestCheck`s.
 
@@ -1624,6 +1640,8 @@ def _parse_check_runs_payload(payload: object) -> tuple[list[PullRequestCheck], 
                 started_at=_optional_str(raw_check.get("started_at")),
                 completed_at=_optional_str(raw_check.get("completed_at")),
                 creator_login=_author_login(raw_check.get("app")),
+                check_suite_id=_check_suite_id(raw_check),
+                app_slug=_check_app_slug(raw_check),
                 description=(
                     _optional_str(raw_check["output"].get("summary"))
                     if isinstance(raw_check.get("output"), dict)
@@ -1717,6 +1735,177 @@ def _fetch_branch_protection_required_checks(
         (),
         "GitHub branch protection could not be inspected due to an unexpected API failure."
         + _failure_detail(result),
+    )
+
+
+_ACTIONS_APP_SLUG = "github-actions"
+
+
+def _fetch_head_dispatch_runs(
+    runner: Runner, *, config: AgentLoopConfig, head_sha: str
+) -> tuple[dict[int, tuple[int, bool]], list[str]]:
+    """Map check_suite id -> (run id, is_managed) for workflow_dispatch runs on the head.
+
+    Any problem returns an empty mapping plus a note, so nothing is excluded.
+    """
+    result = run_gh_read(
+        runner,
+        [
+            config.gh_cmd,
+            "api",
+            f"repos/{config.repo}/actions/runs?event=workflow_dispatch&head_sha={head_sha}&per_page=100",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    prefix = "workflow_dispatch run lookup failed, so no check was excluded: "
+    if result.returncode != 0:
+        return {}, [prefix + "query failed" + _failure_detail(result)]
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}, [prefix + "response was not valid JSON"]
+    runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
+    total = payload.get("total_count") if isinstance(payload, dict) else None
+    if not isinstance(runs, list):
+        return {}, [prefix + "response had no workflow_runs list"]
+    if isinstance(total, bool) or not isinstance(total, int) or total != len(runs):
+        return {}, [prefix + "listing was truncated or inconsistent"]
+    mapping: dict[int, tuple[int, bool]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        run_id = run.get("id")
+        suite_id = run.get("check_suite_id")
+        repo = run.get("repository")
+        full_name = repo.get("full_name") if isinstance(repo, dict) else None
+        names = [n for n in (run.get("name"), run.get("display_title")) if isinstance(n, str)]
+        if (
+            run.get("event") != "workflow_dispatch"
+            or run.get("head_sha") != head_sha
+            or not isinstance(full_name, str)
+            or full_name.lower() != config.repo.lower()
+            or isinstance(run_id, bool)
+            or not isinstance(run_id, int)
+            or isinstance(suite_id, bool)
+            or not isinstance(suite_id, int)
+            or not names
+        ):
+            continue
+        if suite_id in mapping:
+            return {}, [prefix + f"check suite {suite_id} was claimed by more than one run"]
+        mapping[suite_id] = (run_id, any(n.startswith(V2_RUN_NAME_PREFIX) for n in names))
+    return mapping, []
+
+
+def _classify_dispatch_observation(
+    check: PullRequestCheck, dispatch_map: dict[int, tuple[int, bool]]
+) -> Literal["excluded", "conflict", "counted"]:
+    """The single exclusion decision: only an Actions check run whose own suite
+    is a non-managed dispatch run on the head, with no conflicting URL run id."""
+    if (
+        check.kind != "check_run"
+        or check.app_slug != _ACTIONS_APP_SLUG
+        or check.check_suite_id is None
+    ):
+        return "counted"
+    entry = dispatch_map.get(check.check_suite_id)
+    if entry is None or entry[1]:
+        return "counted"
+    if check.run_id is not None and check.run_id != str(entry[0]):
+        return "conflict"
+    return "excluded"
+
+
+def _fetch_check_run_history(
+    runner: Runner, *, config: AgentLoopConfig, head_sha: str
+) -> list[PullRequestCheck] | None:
+    """Every check-run observation (filter=all), or None when unusable."""
+    result = run_gh_read(
+        runner,
+        [
+            config.gh_cmd,
+            "api",
+            "--paginate",
+            f"repos/{config.repo}/commits/{head_sha}/check-runs?filter=all&per_page=100",
+        ],
+        cwd=active_workdir(config),
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    pages = decode_concatenated_json_objects(result.stdout or "")
+    if pages is None:
+        return None
+    totals: set[int] = set()
+    raw_runs: list[object] = []
+    for page in pages:
+        total = page.get("total_count")
+        page_runs = page.get("check_runs")
+        if isinstance(total, bool) or not isinstance(total, int) or not isinstance(page_runs, list):
+            return None
+        totals.add(total)
+        raw_runs.extend(page_runs)
+    if len(totals) != 1:
+        return None
+    aggregate = {"total_count": totals.pop(), "check_runs": raw_runs}
+    parsed, _errors = _parse_check_runs_payload(aggregate)
+    if not _listing_is_complete(aggregate, "check_runs", len(parsed)):
+        return None
+    for raw in raw_runs:
+        raw_id = raw.get("id") if isinstance(raw, dict) else None
+        if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+            return None
+    ids = [check.check_id for check in parsed]
+    if any(i is None for i in ids) or len(set(ids)) != len(ids):
+        return None
+    return parsed
+
+
+def _rebuild_counted_check_runs(
+    history: list[PullRequestCheck], dispatch_map: dict[int, tuple[int, bool]]
+) -> tuple[list[PullRequestCheck], list[PullRequestCheck], list[PullRequestCheck]]:
+    """Classify first, then collapse only fully identified same-suite reruns.
+
+    Returns (counted check runs newest-first, excluded, conflicts).
+    """
+    excluded: list[PullRequestCheck] = []
+    conflicts: list[PullRequestCheck] = []
+    counted: list[PullRequestCheck] = []
+    grouped: dict[tuple[str, int, str], PullRequestCheck] = {}
+    for check in history:
+        verdict = _classify_dispatch_observation(check, dispatch_map)
+        if verdict == "excluded":
+            excluded.append(check)
+            continue
+        if verdict == "conflict":
+            conflicts.append(check)
+            counted.append(check)
+        elif check.app_slug is None or check.check_suite_id is None:
+            counted.append(check)
+        else:
+            key = (check.app_slug, check.check_suite_id, check.name)
+            held = grouped.get(key)
+            if held is None or (check.check_id or 0) > (held.check_id or 0):
+                grouped[key] = check
+    counted.extend(grouped.values())
+    counted.sort(key=lambda c: c.check_id or 0, reverse=True)
+    return counted, excluded, conflicts
+
+
+def _conflict_note(check: PullRequestCheck) -> str:
+    return (
+        f"{check.name} ({check.status.lower()}, check run {check.check_id}) names workflow run "
+        f"{check.run_id} but its check suite {check.check_suite_id} belongs to a different "
+        "dispatch run: kept counted"
+    )
+
+
+def _exclusion_note(check: PullRequestCheck, dispatch_map, head_sha: str) -> str:
+    run_id, _managed = dispatch_map[check.check_suite_id]  # type: ignore[index]
+    return (
+        f"{check.name} ({check.status.lower()}) from ad hoc workflow_dispatch run {run_id} "
+        f"(check suite {check.check_suite_id}) on {head_sha}{EXCLUSION_NOTE_SUFFIX}"
     )
 
 
@@ -1825,6 +2014,66 @@ def get_pr_checks(
     else:
         check_query_status = "unavailable"
 
+    excluded_checks: list[PullRequestCheck] = []
+    exclusion_notes: list[str] = []
+    non_authoritative = False
+    head_sha = metadata.head_sha
+    if check_runs_ok and any(
+        c.kind == "check_run" and c.app_slug == _ACTIONS_APP_SLUG and c.check_suite_id is not None
+        for c in checks
+    ):
+        dispatch_map, lookup_notes = _fetch_head_dispatch_runs(
+            runner, config=config, head_sha=head_sha
+        )
+        exclusion_notes.extend(lookup_notes)
+        default_runs = [c for c in checks if c.kind == "check_run"]
+        verdicts = [_classify_dispatch_observation(c, dispatch_map) for c in default_runs]
+        for c, verdict in zip(default_runs, verdicts):
+            if verdict == "conflict":
+                exclusion_notes.append(_conflict_note(c))
+        if "excluded" in verdicts:
+            history = _fetch_check_run_history(runner, config=config, head_sha=head_sha)
+            rebuilt = None
+            if history is not None:
+                rebuilt = _rebuild_counted_check_runs(history, dispatch_map)
+                counted_ids = {c.check_id for c in rebuilt[0]}
+                for c, verdict in zip(default_runs, verdicts):
+                    if verdict != "excluded" and (
+                        isinstance(c.check_id, bool)
+                        or not isinstance(c.check_id, int)
+                        or c.check_id not in counted_ids
+                    ):
+                        rebuilt = None
+                        break
+            if rebuilt is None:
+                non_authoritative = True
+                note = (
+                    "complete check-run history was unavailable or inconsistent while an "
+                    "ad hoc workflow_dispatch exclusion candidate exists, so nothing was "
+                    "excluded and the check board is non-authoritative"
+                )
+                exclusion_notes.append(note)
+                check_errors.append(note)
+                if check_query_status == "ok":
+                    check_query_status = "partial"
+            else:
+                counted_runs, history_excluded, conflicts = rebuilt
+                seen_ids = {c.check_id for c in history_excluded}
+                excluded_checks = history_excluded + [
+                    c
+                    for c, v in zip(default_runs, verdicts)
+                    if v == "excluded" and c.check_id not in seen_ids
+                ]
+                checks = counted_runs + [c for c in checks if c.kind != "check_run"]
+                for c in excluded_checks:
+                    exclusion_notes.append(_exclusion_note(c, dispatch_map, head_sha))
+                for c in conflicts:
+                    note = _conflict_note(c)
+                    if note not in exclusion_notes:
+                        exclusion_notes.append(note)
+    if excluded_checks or non_authoritative:
+        log(config, "PR checks gate: " + "; ".join(exclusion_notes))
+
     deduped_checks = _dedupe_checks(checks)
     passing = tuple(check for check in deduped_checks if _classify_check_status(check.status) == "passing")
     pending = tuple(check for check in deduped_checks if _classify_check_status(check.status) == "pending")
@@ -1853,6 +2102,9 @@ def get_pr_checks(
     else:
         state = "no_checks"
 
+    if non_authoritative and state != "failing":
+        state = "unavailable"
+
     if state == "unavailable" and not branch_protection_note and check_errors:
         branch_protection_note = "; ".join(check_errors)
 
@@ -1869,7 +2121,9 @@ def get_pr_checks(
         check_query_errors=tuple(check_errors),
         infrastructure_stalls=infrastructure_stalls,
         shadowed=_shadowed_checks(checks),
-        listing_complete=check_runs_complete and statuses_complete,
+        listing_complete=check_runs_complete and statuses_complete and not non_authoritative,
+        excluded=tuple(excluded_checks),
+        exclusion_notes=tuple(exclusion_notes),
     )
 
 

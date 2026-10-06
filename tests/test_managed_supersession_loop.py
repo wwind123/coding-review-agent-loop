@@ -406,3 +406,113 @@ def test_timeout_pending_or_missing_retains_obligation_without_persisting_change
         item.text == PERSISTED_TEXT and item.lifecycle == "qualification_ready"
         for item in _checks_items(runner)
     )
+
+
+# ---- #1293: workflow_dispatch exclusion keeps the supersession guards strict ----
+
+from test_ci_health import (  # noqa: E402
+    SUITE_DISPATCH,
+    _cr,
+    _dispatch,
+    _history,
+    _listing,
+)
+from test_managed_supersession import _decide  # noqa: E402
+
+
+def _scoped_board(tmp_path, default_runs, history_runs, *, protection=None, **kwargs):
+    stub = _StubGhRunner(
+        check_runs_payload=_listing(*default_runs),
+        status_payload={
+            "state": "success",
+            "total_count": 1,
+            "statuses": [{"context": FINAL_CONTEXT, "state": "success"}],
+        },
+        branch_protection_payload=protection or {"contexts": []},
+        dispatch_payload=_dispatch(),
+        history_stdout=_history(*history_runs),
+        **kwargs,
+    )
+    return get_pr_checks(stub, config=make_config(tmp_path), metadata=_metadata(), now=NOW)
+
+
+def test_independent_suite_failure_is_shadowed_and_unqualified(tmp_path):
+    dispatch_x = _cr(9, "x", "success", suite=SUITE_DISPATCH, run=7000)
+    newer = _cr(8, "x", "success", run=5000)
+    independent = _cr(3, "x", "failure", suite=555, run=5001)
+    board = _scoped_board(tmp_path, [dispatch_x, newer], [dispatch_x, newer, independent])
+    assert [c.check_id for c in board.shadowed] == [3]
+    assert _decide(board)[0] == "unqualified"
+
+
+def test_identity_less_failure_is_shadowed_and_unqualified(tmp_path):
+    dispatch_x = _cr(9, "x", "success", suite=SUITE_DISPATCH, run=7000)
+    newer = _cr(8, "x", "success", suite=None, app=None)
+    older = _cr(3, "x", "failure", suite=None, app=None)
+    board = _scoped_board(tmp_path, [dispatch_x, newer], [dispatch_x, newer, older])
+    assert [c.check_id for c in board.shadowed] == [3]
+    assert _decide(board)[0] == "unqualified"
+
+
+def test_required_check_with_non_success_shadowed_observation_is_unqualified(tmp_path):
+    dispatch_x = _cr(9, "x", "success", suite=SUITE_DISPATCH, run=7000)
+    newer = _cr(8, "x", "success", run=5000)
+    independent = _cr(3, "x", "failure", suite=555, run=5001)
+    board = _scoped_board(
+        tmp_path, [dispatch_x, newer], [dispatch_x, newer, independent], protection={"contexts": ["x"]}
+    )
+    assert _decide(board)[0] == "unqualified"
+
+
+def test_unavailable_history_is_unqualified(tmp_path):
+    dispatch_x = _cr(9, "x", "success", suite=SUITE_DISPATCH, run=7000)
+    y = _cr(4, "y", "success", run=5000)
+    board = _scoped_board(tmp_path, [dispatch_x, y], [], history_returncode=1)
+    assert board.state == "unavailable"
+    assert _decide(board)[0] == "unqualified"
+
+
+def _identity_less_boards(tmp_path):
+    dispatch_x = _cr(9, "x", "success", suite=SUITE_DISPATCH, run=7000)
+    newer = _cr(8, "x", "success", suite=None, app=None)
+    older = _cr(3, "x", "failure", suite=None, app=None)
+    return _scoped_board(tmp_path, [dispatch_x, newer], [dispatch_x, newer, older])
+
+
+def _independent_boards(tmp_path, conclusion="failure", protection=None):
+    dispatch_x = _cr(9, "x", "success", suite=SUITE_DISPATCH, run=7000)
+    newer = _cr(8, "x", "success", run=5000)
+    independent = _cr(3, "x", conclusion, suite=555, run=5001)
+    return _scoped_board(
+        tmp_path, [dispatch_x, newer], [dispatch_x, newer, independent], protection=protection
+    )
+
+
+@pytest.mark.parametrize("auto_merge", [True, False], ids=["auto-merge", "manual"])
+@pytest.mark.parametrize(
+    "make_board, match",
+    [
+        (lambda tp: _independent_boards(tp), r"cannot finalize.*`x`"),
+        (_identity_less_boards, r"cannot finalize.*`x`"),
+        # A skipped (non-success, non-failure) shadowed observation of a required
+        # check reaches the required-check guard, not the shadowed-failure guard.
+        (lambda tp: _independent_boards(tp, "skipped", {"contexts": ["x"]}), r"cannot finalize.*`x`"),
+    ],
+    ids=["independent-suite", "identity-less", "required-skipped"],
+)
+def test_scoped_board_shadowed_observation_refuses_through_loop(
+    tmp_path, monkeypatch, make_board, match, auto_merge
+):
+    board = make_board(tmp_path)
+    assert board.shadowed and board.excluded
+    effects = _install(monkeypatch, _passed(board))
+    runner = _runner(_items())
+
+    with pytest.raises(AgentLoopError, match=match):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=auto_merge))
+
+    assert not (effects.merges or effects.prepares or effects.publishes)
+    persisted = _checks_items(runner)
+    assert persisted and all(
+        item.text == PERSISTED_TEXT and item.lifecycle == "qualification_ready" for item in persisted
+    )

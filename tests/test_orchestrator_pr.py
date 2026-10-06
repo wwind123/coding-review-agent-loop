@@ -20111,3 +20111,121 @@ def test_run_pr_loop_followup_semantic_correction_keeps_original_gaps_and_fixes_
     assert "original gap reason" in section and "CHANGED BY CORRECTION" not in section
     review_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
     assert "original gap reason" in review_prompts[-1] and "CHANGED BY CORRECTION" not in review_prompts[-1]
+
+
+def test_gate_details_separate_excluded_dispatch_from_failing_pr_checks(tmp_path):
+    from coding_review_agent_loop.checks import _pr_check_details
+    from coding_review_agent_loop.github import get_pr_checks
+    from test_ci_health import (
+        SUITE_DISPATCH, _StubGhRunner, _cr, _dispatch, _history, _listing, _metadata,
+    )
+
+    neg = _cr(2, "validate", "failure", suite=SUITE_DISPATCH, run=7000)
+    ok = _cr(1, "ci", "success", run=5000)
+    board = get_pr_checks(
+        _StubGhRunner(
+            check_runs_payload=_listing(neg, ok),
+            dispatch_payload=_dispatch(),
+            history_stdout=_history(neg, ok),
+        ),
+        config=make_config(tmp_path),
+        metadata=_metadata(),
+    )
+    assert board.state == "passing"
+    details = _pr_check_details(board)
+    assert any(d.startswith("Excluded ad hoc workflow_dispatch checks") for d in details)
+    assert not any(d.startswith("Failing checks") for d in details)
+
+    failing = get_pr_checks(
+        _StubGhRunner(check_runs_payload=_listing(_cr(1, "ci", "failure", run=5000))),
+        config=make_config(tmp_path),
+        metadata=_metadata(),
+    )
+    assert failing.state == "failing"
+    assert any(d.startswith("Failing checks") for d in _pr_check_details(failing))
+
+
+def _scoped_boards_for_loop(tmp_path):
+    from coding_review_agent_loop.github import get_pr_checks
+    from test_ci_health import (
+        SUITE_DISPATCH, _StubGhRunner, _cr, _dispatch, _history, _listing, _metadata,
+    )
+
+    config = make_config(tmp_path)
+    neg = _cr(2, "validate", "failure", suite=SUITE_DISPATCH, run=7000)
+    ok = _cr(1, "ci", "success", run=5000)
+    bad = _cr(1, "ci", "failure", run=5000)
+    excluded_only = get_pr_checks(
+        _StubGhRunner(
+            check_runs_payload=_listing(neg, ok),
+            dispatch_payload=_dispatch(),
+            history_stdout=_history(neg, ok),
+        ),
+        config=config,
+        metadata=_metadata(),
+    )
+    failing_pr = get_pr_checks(
+        _StubGhRunner(check_runs_payload=_listing(bad)), config=config, metadata=_metadata()
+    )
+    return excluded_only, failing_pr
+
+
+def test_loop_excluded_failing_dispatch_creates_no_checks_blocking_item(tmp_path, monkeypatch):
+    excluded_only, _failing = _scoped_boards_for_loop(tmp_path)
+    assert excluded_only.state == "passing" and excluded_only.excluded
+    runner = FakeRunner(
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        claude_outputs=[],
+    )
+    monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: excluded_only)
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *a, **k: CiWatchOutcome(
+            status="passed", pr_checks=excluded_only, head_sha="abc123", attempts_used=1
+        ),
+    )
+
+    assert run_pr_loop(
+        runner, pr_number=77, config=make_config(tmp_path, watch_pending_ci=True)
+    ) == 0
+
+    assert not any(c.startswith("GitHub PR checks are") for c in runner.comments)
+    assert not [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+
+
+def test_loop_failing_pull_request_check_creates_checks_blocking_item(tmp_path, monkeypatch):
+    excluded_only, failing_pr = _scoped_boards_for_loop(tmp_path)
+    assert failing_pr.state == "failing" and not failing_pr.excluded
+    runner = FakeRunner(
+        codex_outputs=[
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+            "Fixed."
+            + prior_item_dispositions("[item-1] resolved")
+            + "\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        claude_outputs=["Fixed CI.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
+    )
+    _advance_head_after_coder(monkeypatch, runner)
+    monkeypatch.setattr(
+        orchestrator,
+        "get_pr_checks",
+        lambda *a, **k: failing_pr
+        if runner.pr_payload["headRefOid"] == "abc123"
+        else excluded_only,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "watch_pr_checks",
+        lambda *a, **k: CiWatchOutcome(
+            status="passed", pr_checks=excluded_only,
+            head_sha=runner.pr_payload["headRefOid"], attempts_used=1,
+        ),
+    )
+
+    assert run_pr_loop(
+        runner, pr_number=77, config=make_config(tmp_path, max_rounds=2, watch_pending_ci=True)
+    ) == 0
+
+    assert any(c.startswith("GitHub PR checks are failing for PR #77.") for c in runner.comments)
+    assert [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]

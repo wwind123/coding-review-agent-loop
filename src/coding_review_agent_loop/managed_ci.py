@@ -22,6 +22,8 @@ from .ci_health import (
     CiInfrastructureStall,
     PullRequestCheck,
     PullRequestChecks,
+    V2_RUN_NAME_PREFIX,
+    decode_concatenated_json_objects,
     is_wholly_infrastructure_blocked,
 )
 from .config import AgentLoopConfig
@@ -8579,7 +8581,7 @@ def _refresh_v2_attached_run(
 
 
 def _v2_run_name(contract: ManagedCiContract) -> str:
-    return f"managed-ci-v2 nonce={contract.nonce}"
+    return f"{V2_RUN_NAME_PREFIX}{contract.nonce}"
 
 
 def _is_v2_intent_run(
@@ -8907,21 +8909,8 @@ def _v2_failed_jobs(runner: Runner, *, config: AgentLoopConfig, run_id: int | No
     raw = result.stdout or ""
     # Without --slurp, gh 2.45 concatenates object pages. Decode every object
     # instead of accepting only the first page (or treating the stream as bad).
-    decoder = json.JSONDecoder()
-    pages: list[dict[str, object]] = []
-    offset = 0
-    try:
-        while offset < len(raw):
-            while offset < len(raw) and raw[offset].isspace():
-                offset += 1
-            if offset == len(raw):
-                break
-            page, end = decoder.raw_decode(raw, offset)
-            if not isinstance(page, dict):
-                raise ValueError("jobs page is not an object")
-            pages.append(page)
-            offset = end
-    except (json.JSONDecodeError, ValueError):
+    pages = decode_concatenated_json_objects(raw)
+    if pages is None:
         return (f"Managed CI run {run_id} failed; job details were unavailable.",)
     jobs: list[object] = []
     for payload in pages:

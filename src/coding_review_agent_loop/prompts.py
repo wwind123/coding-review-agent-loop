@@ -30,6 +30,7 @@ from .decomposition import (
     approved_plan_hash,
 )
 from .errors import AgentLoopError
+from .ci_health import partition_exclusion_notes
 from .github import HumanReviewRequirement, IssueContext, PullRequestChecks, PullRequestMetadata
 from .issue_pr_provenance import IssuePrProvenanceScope, format_issue_pr_provenance
 from .memory import AgentMemoryContext, format_agent_memory_context
@@ -1740,6 +1741,15 @@ def format_pr_checks(checks: PullRequestChecks) -> str:
         lines.append(f"- Required checks not yet reporting: {', '.join(checks.missing_required)}")
     if checks.branch_protection_note:
         lines.append(f"- Branch protection: {checks.branch_protection_note}")
+    exclusions, diagnostics = partition_exclusion_notes(checks)
+    if exclusions:
+        lines.append(
+            "- Excluded ad hoc workflow_dispatch checks (operator diagnostics, not PR checks):"
+        )
+        lines.extend(f"  - {note}" for note in exclusions)
+    if diagnostics:
+        lines.append("- Check-scoping diagnostics:")
+        lines.extend(f"  - {note}" for note in diagnostics)
     if checks.infrastructure_stalls:
         lines.append("- External CI infrastructure stalls:")
         for stall in checks.infrastructure_stalls:

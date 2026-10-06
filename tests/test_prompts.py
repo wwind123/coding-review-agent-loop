@@ -5719,3 +5719,53 @@ def test_rendered_recommendation_matches_recorded_package_script_rows_1294(tmp_p
     )
     edited = render()
     assert f"Recommended whole-command timeout: {expected}s" not in edited
+
+
+def test_format_pr_checks_lists_excluded_dispatch_checks_separately():
+    excluded = PullRequestCheck(name="validate", kind="check_run", status="failure")
+    checks = PullRequestChecks(
+        state="passing",
+        required_checks=(),
+        passing=(),
+        pending=(),
+        failing=(),
+        missing_required=(),
+        branch_protection_status="not_found",
+        excluded=(excluded,),
+        exclusion_notes=("validate (failure) from ad hoc workflow_dispatch run 7000 (check suite 9) on abc123: not a PR check",),
+    )
+
+    rendered = format_pr_checks(checks)
+
+    assert "Excluded ad hoc workflow_dispatch checks" in rendered
+    assert "run 7000" in rendered
+    assert "Failing checks" not in rendered
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "workflow_dispatch run lookup failed, so no check was excluded: query failed",
+        "complete check-run history was unavailable, so the check board is non-authoritative",
+    ],
+)
+def test_diagnostic_notes_render_without_excluded_checks(note):
+    from coding_review_agent_loop.checks import _pr_check_details
+
+    checks = PullRequestChecks(
+        state="unavailable",
+        required_checks=(),
+        passing=(),
+        pending=(),
+        failing=(),
+        missing_required=(),
+        branch_protection_status="not_found",
+        branch_protection_note="Required status checks are not configured on the PR base branch.",
+        exclusion_notes=(note,),
+    )
+
+    rendered = format_pr_checks(checks)
+
+    assert "Check-scoping diagnostics" in rendered and note in rendered
+    assert "Excluded ad hoc workflow_dispatch checks" not in rendered
+    assert note in _pr_check_details(checks)

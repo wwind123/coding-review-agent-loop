@@ -5244,6 +5244,17 @@ Two independent, complementary mechanisms bound this instead:
 
 Reviewers see the same classification (an "External CI infrastructure stalls" section in the PR checks context) and are instructed not to record a classified stall as a blocking code item; any other failing or never-reporting check remains ordinary review work.
 
+### PR-checks gate scope: ad hoc workflow_dispatch runs
+
+The PR-checks gate counts the current-head board **minus** check runs from ad hoc `workflow_dispatch` runs, so a deliberately failing operator dispatch (for example a plan-required negative hosted test) does not become an unclearable PR-checks blocking item.
+
+- **Predicate.** A check run is excluded only when it was created by the GitHub Actions app, its own `check_suite.id` belongs to a same-repository `workflow_dispatch` run on the PR head whose name does not start with `managed-ci-v2 nonce=`, and any URL-derived run id agrees. Everything else counts: `pull_request`/`push` runs, non-Actions apps, the managed qualification run, unjoined or conflicting checks, and every commit status context including `final-ci/exact-head`.
+- **Rebuild.** When an exclusion candidate exists, the board is rebuilt from the complete paginated `filter=all` history so an excluded newer dispatch cannot hide an older counted failure. Only fully identified same-suite reruns are collapsed; conflicting or identity-less observations stay independent and reach `shadowed`, so managed qualification stays strict. A required check reported only by an excluded run is still missing (pending).
+- **Fail closed.** If the dispatch lookup fails nothing is excluded (a note is recorded). If a candidate exists but the history is unavailable or inconsistent, nothing is excluded and the board is non-authoritative: partial query, `unavailable` unless a check is positively failing, so it can neither pass the gate nor qualify managed success.
+- **Reporting.** `PullRequestChecks.excluded` and `exclusion_notes` name each run id and head SHA; reviewer/coder context and gate details show an "Excluded ad hoc workflow_dispatch checks" section, and the run log records the exclusion.
+- **Cost.** One extra read per live fetch whenever Actions check runs are present; the history read only when a candidate exists.
+- **Caveat.** Merge-time protection handling is unchanged: under an unreadable (403) classic protection the merge state may be UNSTABLE while a failing dispatch run exists, and the loop stops fail-closed.
+
 ### Merge conflicts
 
 GitHub's own mergeability computation, not just the current-head CI check, is

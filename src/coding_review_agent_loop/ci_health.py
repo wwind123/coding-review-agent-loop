@@ -8,6 +8,7 @@ over already-fetched data, so it only depends on stdlib.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -28,6 +29,11 @@ class PullRequestCheck:
     creator_login: str | None = None
     creator_id: int | None = None
     description: str | None = None
+    # The check run's own check_suite id and app slug, as reported by the API.
+    # They are the only join keys for ad hoc workflow_dispatch exclusion; the
+    # URL-derived ``run_id`` is display/consistency only.
+    check_suite_id: int | None = None
+    app_slug: str | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +88,11 @@ class PullRequestChecks:
     # True only when get_pr_checks saw every counted check-run and status entry
     # and parsed each into a check. Fails closed for every other constructor.
     listing_complete: bool = False
+    # Check runs removed from the counted board because they belong to an ad
+    # hoc (non-managed) workflow_dispatch run, plus one audit note per
+    # exclusion, conflict, lookup problem or fail-closed fallback.
+    excluded: tuple[PullRequestCheck, ...] = field(default=())
+    exclusion_notes: tuple[str, ...] = field(default=())
 
 
 @dataclass(frozen=True)
@@ -91,6 +102,51 @@ class CiInfrastructureStall:
     @property
     def is_stalled(self) -> bool:
         return bool(self.checks)
+
+
+# Run name prefix of the managed qualification dispatch; shared with
+# managed_ci._v2_run_name so the PR-checks gate always counts that run.
+V2_RUN_NAME_PREFIX = "managed-ci-v2 nonce="
+
+
+# Every exclusion note ends with this suffix; other exclusion_notes entries
+# (conflicts, dispatch-lookup problems, non-authoritative fallback) are diagnostics.
+EXCLUSION_NOTE_SUFFIX = ": not a PR check"
+
+
+def partition_exclusion_notes(checks: "PullRequestChecks") -> tuple[list[str], list[str]]:
+    """Split ``exclusion_notes`` into (exclusion lines, diagnostic lines)."""
+    exclusions: list[str] = []
+    diagnostics: list[str] = []
+    for note in checks.exclusion_notes:
+        (exclusions if note.endswith(EXCLUSION_NOTE_SUFFIX) else diagnostics).append(note)
+    if checks.excluded and not exclusions:
+        exclusions = [f"{c.name} ({c.status.lower()})" for c in checks.excluded]
+    return exclusions, diagnostics
+
+
+def decode_concatenated_json_objects(raw: str) -> list[dict] | None:
+    """Decode back-to-back JSON object pages (``gh api --paginate`` output).
+
+    Returns None on any decode error, non-object page or empty stream.
+    """
+    decoder = json.JSONDecoder()
+    pages: list[dict] = []
+    offset = 0
+    try:
+        while offset < len(raw):
+            while offset < len(raw) and raw[offset].isspace():
+                offset += 1
+            if offset == len(raw):
+                break
+            page, end = decoder.raw_decode(raw, offset)
+            if not isinstance(page, dict):
+                return None
+            pages.append(page)
+            offset = end
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return pages or None
 
 
 _RUN_ID_RE = re.compile(r"/actions/runs/(\d+)")
