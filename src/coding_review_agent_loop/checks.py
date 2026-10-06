@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .checkout_verification import gate_window
-from .ci_health import CiInfrastructureStall
+from .ci_health import CiInfrastructureStall, partition_exclusion_notes
 from .config import AgentLoopConfig
 from .github import PullRequestChecks
 from .logging import log
@@ -226,13 +226,6 @@ def _pending_ci_stop_guidance(state: str) -> str:
     )
 
 
-def _excluded_dispatch_text(pr_checks: PullRequestChecks) -> str:
-    return (
-        "Excluded ad hoc workflow_dispatch checks (operator diagnostics, not PR checks): "
-        + "; ".join(pr_checks.exclusion_notes or tuple(c.name for c in pr_checks.excluded))
-    )
-
-
 def _pr_check_details(pr_checks: PullRequestChecks) -> list[str]:
     details: list[str] = []
     if pr_checks.required_checks:
@@ -257,8 +250,13 @@ def _pr_check_details(pr_checks: PullRequestChecks) -> list[str]:
         )
     if pr_checks.branch_protection_note:
         details.append(pr_checks.branch_protection_note)
-    if pr_checks.excluded:
-        details.append(_excluded_dispatch_text(pr_checks))
+    exclusions, diagnostics = partition_exclusion_notes(pr_checks)
+    if exclusions:
+        details.append(
+            "Excluded ad hoc workflow_dispatch checks (operator diagnostics, not PR checks): "
+            + "; ".join(exclusions)
+        )
+    details.extend(diagnostics)
     if pr_checks.infrastructure_stalls:
         # Not code defects, and not necessarily the sole reason the state is
         # failing/pending: annotate them so a coder round does not chase a

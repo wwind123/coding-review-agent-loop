@@ -937,3 +937,39 @@ def test_read_cost_calls(tmp_path):
     )
     assert sum("/actions/runs?" in c[2] for c in runner.calls) == 1
     assert any(c[:3] == ["gh", "api", "--paginate"] for c in runner.calls)
+
+
+def test_default_listing_conflict_is_noted_without_a_rebuild(tmp_path):
+    conflicting = _cr(1, "x", "failure", suite=SUITE_DISPATCH, run=7001)
+    checks, runner = _fetch(
+        tmp_path, check_runs_payload=_listing(conflicting), dispatch_payload=_dispatch()
+    )
+    assert checks.state == "failing"
+    assert not checks.excluded
+    assert sum("different dispatch run" in n for n in checks.exclusion_notes) == 1
+    assert not any(c[:3] == ["gh", "api", "--paginate"] for c in runner.calls)
+
+
+def test_default_listing_conflict_is_noted_once_when_history_repeats_it(tmp_path):
+    legit = _cr(5, "x", "success", suite=SUITE_DISPATCH, run=7000)
+    conflicting = _cr(1, "x", "failure", suite=SUITE_DISPATCH, run=7001)
+    checks, _ = _fetch(
+        tmp_path,
+        check_runs_payload=_listing(legit, conflicting),
+        dispatch_payload=_dispatch(),
+        history_stdout=_history(legit, conflicting),
+    )
+    assert sum("different dispatch run" in n for n in checks.exclusion_notes) == 1
+
+
+def test_default_listing_conflict_is_noted_when_history_falls_back(tmp_path):
+    legit = _cr(5, "x", "success", suite=SUITE_DISPATCH, run=7000)
+    conflicting = _cr(1, "x", "failure", suite=SUITE_DISPATCH, run=7001)
+    checks, _ = _fetch(
+        tmp_path,
+        check_runs_payload=_listing(legit, conflicting),
+        dispatch_payload=_dispatch(),
+        history_returncode=1,
+    )
+    assert any("different dispatch run" in n for n in checks.exclusion_notes)
+    assert any("non-authoritative" in n for n in checks.exclusion_notes)

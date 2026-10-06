@@ -20,6 +20,7 @@ from .ci_health import (
     PullRequestCheck,
     PullRequestChecks,
     StalledCheck,
+    EXCLUSION_NOTE_SUFFIX,
     V2_RUN_NAME_PREFIX,
     _extract_run_id,
     decode_concatenated_json_objects,
@@ -1892,11 +1893,19 @@ def _rebuild_counted_check_runs(
     return counted, excluded, conflicts
 
 
+def _conflict_note(check: PullRequestCheck) -> str:
+    return (
+        f"{check.name} ({check.status.lower()}, check run {check.check_id}) names workflow run "
+        f"{check.run_id} but its check suite {check.check_suite_id} belongs to a different "
+        "dispatch run: kept counted"
+    )
+
+
 def _exclusion_note(check: PullRequestCheck, dispatch_map, head_sha: str) -> str:
     run_id, _managed = dispatch_map[check.check_suite_id]  # type: ignore[index]
     return (
         f"{check.name} ({check.status.lower()}) from ad hoc workflow_dispatch run {run_id} "
-        f"(check suite {check.check_suite_id}) on {head_sha}: not a PR check"
+        f"(check suite {check.check_suite_id}) on {head_sha}{EXCLUSION_NOTE_SUFFIX}"
     )
 
 
@@ -2019,6 +2028,9 @@ def get_pr_checks(
         exclusion_notes.extend(lookup_notes)
         default_runs = [c for c in checks if c.kind == "check_run"]
         verdicts = [_classify_dispatch_observation(c, dispatch_map) for c in default_runs]
+        for c, verdict in zip(default_runs, verdicts):
+            if verdict == "conflict":
+                exclusion_notes.append(_conflict_note(c))
         if "excluded" in verdicts:
             history = _fetch_check_run_history(runner, config=config, head_sha=head_sha)
             rebuilt = None
@@ -2056,10 +2068,9 @@ def get_pr_checks(
                 for c in excluded_checks:
                     exclusion_notes.append(_exclusion_note(c, dispatch_map, head_sha))
                 for c in conflicts:
-                    exclusion_notes.append(
-                        f"{c.name} ({c.status.lower()}) names workflow run {c.run_id} but its check "
-                        f"suite {c.check_suite_id} belongs to a different dispatch run: kept counted"
-                    )
+                    note = _conflict_note(c)
+                    if note not in exclusion_notes:
+                        exclusion_notes.append(note)
     if excluded_checks or non_authoritative:
         log(config, "PR checks gate: " + "; ".join(exclusion_notes))
 

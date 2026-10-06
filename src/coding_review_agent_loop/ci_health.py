@@ -109,6 +109,22 @@ class CiInfrastructureStall:
 V2_RUN_NAME_PREFIX = "managed-ci-v2 nonce="
 
 
+# Every exclusion note ends with this suffix; other exclusion_notes entries
+# (conflicts, dispatch-lookup problems, non-authoritative fallback) are diagnostics.
+EXCLUSION_NOTE_SUFFIX = ": not a PR check"
+
+
+def partition_exclusion_notes(checks: "PullRequestChecks") -> tuple[list[str], list[str]]:
+    """Split ``exclusion_notes`` into (exclusion lines, diagnostic lines)."""
+    exclusions: list[str] = []
+    diagnostics: list[str] = []
+    for note in checks.exclusion_notes:
+        (exclusions if note.endswith(EXCLUSION_NOTE_SUFFIX) else diagnostics).append(note)
+    if checks.excluded and not exclusions:
+        exclusions = [f"{c.name} ({c.status.lower()})" for c in checks.excluded]
+    return exclusions, diagnostics
+
+
 def decode_concatenated_json_objects(raw: str) -> list[dict] | None:
     """Decode back-to-back JSON object pages (``gh api --paginate`` output).
 

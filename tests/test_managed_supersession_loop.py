@@ -470,3 +470,49 @@ def test_unavailable_history_is_unqualified(tmp_path):
     board = _scoped_board(tmp_path, [dispatch_x, y], [], history_returncode=1)
     assert board.state == "unavailable"
     assert _decide(board)[0] == "unqualified"
+
+
+def _identity_less_boards(tmp_path):
+    dispatch_x = _cr(9, "x", "success", suite=SUITE_DISPATCH, run=7000)
+    newer = _cr(8, "x", "success", suite=None, app=None)
+    older = _cr(3, "x", "failure", suite=None, app=None)
+    return _scoped_board(tmp_path, [dispatch_x, newer], [dispatch_x, newer, older])
+
+
+def _independent_boards(tmp_path, conclusion="failure", protection=None):
+    dispatch_x = _cr(9, "x", "success", suite=SUITE_DISPATCH, run=7000)
+    newer = _cr(8, "x", "success", run=5000)
+    independent = _cr(3, "x", conclusion, suite=555, run=5001)
+    return _scoped_board(
+        tmp_path, [dispatch_x, newer], [dispatch_x, newer, independent], protection=protection
+    )
+
+
+@pytest.mark.parametrize("auto_merge", [True, False], ids=["auto-merge", "manual"])
+@pytest.mark.parametrize(
+    "make_board, match",
+    [
+        (lambda tp: _independent_boards(tp), r"cannot finalize.*`x`"),
+        (_identity_less_boards, r"cannot finalize.*`x`"),
+        # A skipped (non-success, non-failure) shadowed observation of a required
+        # check reaches the required-check guard, not the shadowed-failure guard.
+        (lambda tp: _independent_boards(tp, "skipped", {"contexts": ["x"]}), r"cannot finalize.*`x`"),
+    ],
+    ids=["independent-suite", "identity-less", "required-skipped"],
+)
+def test_scoped_board_shadowed_observation_refuses_through_loop(
+    tmp_path, monkeypatch, make_board, match, auto_merge
+):
+    board = make_board(tmp_path)
+    assert board.shadowed and board.excluded
+    effects = _install(monkeypatch, _passed(board))
+    runner = _runner(_items())
+
+    with pytest.raises(AgentLoopError, match=match):
+        run_pr_loop(runner, pr_number=77, config=_config(tmp_path, auto_merge=auto_merge))
+
+    assert not (effects.merges or effects.prepares or effects.publishes)
+    persisted = _checks_items(runner)
+    assert persisted and all(
+        item.text == PERSISTED_TEXT and item.lifecycle == "qualification_ready" for item in persisted
+    )
