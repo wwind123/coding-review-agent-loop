@@ -8,7 +8,11 @@ import html
 import json
 import re
 import shlex
-from .risk_coverage_map import CoverageAssessment, render_coverage_map
+from .risk_coverage_map import (
+    CoverageAssessment,
+    neutralize_coverage_map_heading,
+    render_coverage_map,
+)
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -1688,7 +1692,7 @@ def _render_public_coder_followup_comment(
         )
     sections.append(f"<!-- AGENT_STATE: {parsed_followup.state} -->")
     sections.append(f"-- {_comment_signature(agent, config, model_used)}")
-    return "\n\n".join(section for section in sections if section)
+    return _join_sections_protecting_coverage_map(sections, coverage_map)
 
 
 def _render_coder_sub_item_progress(
@@ -1901,7 +1905,7 @@ def _render_public_issue_implementation_comment(
             f"-- {_comment_signature(agent, config, model_used)}",
         ]
     )
-    return "\n\n".join(section for section in sections if section)
+    return _join_sections_protecting_coverage_map(sections, coverage_map)
 
 
 def _extract_plan_human_requirements_block(text: str) -> str:
@@ -2321,6 +2325,21 @@ def normalize_freeform_signature(
         lines[tail - 1] = canonical
         return "\n".join(lines)
     return f"{text.rstrip(chr(10))}\n{canonical}"
+
+
+def _join_sections_protecting_coverage_map(sections: Sequence[str], coverage_map: str) -> str:
+    """Join comment sections so only the orchestrator's own map keeps its heading.
+
+    Coder-authored sections (summary, notes, dispositions) are rendered
+    verbatim, so any occurrence of the coverage-map heading in them is
+    neutralized; extraction of the reviewer-facing map from a round comment can
+    then never return coder prose (#1290).
+    """
+    return "\n\n".join(
+        section if (coverage_map and section is coverage_map) else neutralize_coverage_map_heading(section)
+        for section in sections
+        if section
+    )
 
 
 def render_public_agent_comment(

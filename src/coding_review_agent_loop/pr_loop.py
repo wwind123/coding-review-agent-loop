@@ -299,7 +299,7 @@ from .validated_agent import (
     _log_repair_attempts,
     _run_validated_agent,
 )
-from .risk_coverage_map import extract_coverage_map_section
+from .risk_coverage_map import extract_coverage_map_section, render_coverage_map
 from .response_validation import (
     _current_test_turn_observations,
     _derive_authenticated_risk_evidence_for_coder,
@@ -7509,7 +7509,11 @@ def run_pr_loop(
                     public_comment = add_coder_followup_head_unchanged_notice(
                         public_comment, head_unchanged_sha
                     )
-                latest_coder_coverage_map = extract_coverage_map_section(public_comment)
+                # Carry the orchestrator's own rendering, never text re-parsed from a
+                # comment that also holds coder prose (#1290).
+                latest_coder_coverage_map = (
+                    render_coverage_map(followup_coverage_assessment) or None
+                )
 
                 qualification_checkpoint = _machine_obligation_checkpoint(
                     unresolved_items,

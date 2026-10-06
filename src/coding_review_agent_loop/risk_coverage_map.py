@@ -18,6 +18,7 @@ never persisted as authority.
 from __future__ import annotations
 
 import posixpath
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,7 +84,9 @@ def _bounded(text: object) -> str:
     safe = " ".join(sanitize_untrusted_prose(flat).split())
     # No HTML-comment syntax at all: state footers and other comment-shaped
     # records are never display text.
-    return safe.replace("<", "&lt;").replace(">", "&gt;")
+    return _COVERAGE_HEADING_RE.sub(
+        "risk-matrix coverage-map (quoted)", safe.replace("<", "&lt;").replace(">", "&gt;")
+    )
 
 
 def normalize_test_path(reference: str, *, identifier: bool) -> str | None:
@@ -398,6 +401,15 @@ def render_coverage_map(
 
 
 COVERAGE_MAP_HEADING = "### Risk-matrix coverage map"
+
+
+_COVERAGE_HEADING_RE = re.compile(r"risk-matrix\s+coverage\s+map", re.IGNORECASE)
+
+
+def neutralize_coverage_map_heading(text: str) -> str:
+    """Rewrite the coverage-map heading phrase in untrusted text so it can never be
+    mistaken for the orchestrator-authored section."""
+    return _COVERAGE_HEADING_RE.sub("risk-matrix coverage-map (quoted)", text)
 
 
 def extract_coverage_map_section(body: str | None) -> str | None:
