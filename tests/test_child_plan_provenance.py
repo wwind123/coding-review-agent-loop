@@ -1688,7 +1688,7 @@ def test_m931_omission_checks_are_unchanged():
 
 # --- #931: planning-time enforcement through a bounded replan ---------------
 
-from agent_loop_helpers import structured_plan_review  # noqa: E402
+from agent_loop_helpers import structured_plan_review, structured_pr_review, structured_coder_followup  # noqa: E402
 from coding_review_agent_loop.errors import AgentInvocationError  # noqa: E402
 from coding_review_agent_loop.plan_assembly import AuthenticatedPlanState  # noqa: E402
 from coding_review_agent_loop.protocol import validate_structured_plan_state  # noqa: E402
@@ -4430,3 +4430,81 @@ def test_m1278_supersession_revision_after_an_approval_closed_episode_has_no_anc
     assert not any("step-back anchor" in str(c.args[-1]) for c in logged.call_args_list)
     posted = _extract_round_metadata_records(world.all_comments(), flow="plan")
     assert sum(1 for r in posted if r.metadata.step_back_entries) == 1
+
+
+@pytest.mark.parametrize("with_receipt", [False, True])
+def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_receipts(
+    tmp_path, monkeypatch, with_receipt
+):
+    """Issue #1182: the receipt sentence sits before the child-plan route suffix."""
+    from coding_review_agent_loop.local_test_evidence import (
+        EnvironmentIdentityRegistry, EvidenceScope, LocalTestObservation, TreeAttribution,
+    )
+
+    parent_plan = fresh_staged_plan(first_disposition="requires-child-planning")
+    child_plan = "Reviewed child plan.\n\n## Scope\n- Implement the selected child design."
+    child, parent = fresh_child_contexts(
+        parent_plan, handoff_execution_disposition="requires-child-planning", child_plan=child_plan,
+    )
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    blocking = structured_pr_review(
+        state="blocking", summary="Re-plan the issue first.", blocking_items=["Re-plan first."]
+    )
+    runner = FakeRunner(
+        pr_payload={"number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77"},
+        codex_outputs=[
+            blocking,
+            structured_pr_review(
+                state="blocking", summary="Still needs a re-plan.",
+                prior_item_dispositions=[
+                    {"item_id": "item-1", "disposition": "blocking", "note": "Re-plan first."}
+                ],
+            ),
+            structured_pr_review(state="approved"),
+        ],
+        claude_outputs=[
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+            structured_coder_followup(remaining_items=["item-1"], addressed_items=[]),
+        ],
+        advance_pr_head_on_coder_followup=False,
+    )
+    if with_receipt:
+        registry = EnvironmentIdentityRegistry()
+        runner._environment_registry = registry
+        runner._local_test_observations.append(LocalTestObservation(
+            command=("python3", "-m", "pytest", "tests/test_x.py", "-q", "-n", "0"),
+            outcome="failed", provenance="parent-observed", scope=EvidenceScope("unknown", ()),
+            receipt_id="receipt-open", turn_id="turn-opaque", cwd=str(tmp_path),
+            normalized_command="python3 -m pytest tests/test_x.py -q -n 0", returncode=4,
+            attribution=TreeAttribution(state="current-head", head="abc123", stable=True),
+            environment_identity=registry.capture({"PATH": "/usr/bin"}),
+        ))
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
+    with pytest.raises(AgentLoopError) as raised:
+        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+    message = str(raised.value)
+    from coding_review_agent_loop.pr_loop import _child_resume_hint
+
+    hint = _child_resume_hint(56, orchestrator.EXECUTION_DISPOSITION_PLANNING)
+    route = (
+        " If the blocking finding requires re-planning the child plan, post the signed "
+        f"child-plan supersession record on child issue #56 and rerun `{hint}`."
+    )
+    legacy = (
+        "PR #77: Claude left head abc123 unchanged in 2 consecutive follow-up rounds, so another "
+        "review of the same diff cannot change the verdict. Stopping before round 3; "
+        "human review required."
+    )
+    if with_receipt:
+        sentence = (
+            " The latest local test evidence still holds unsuperseded failure receipts: "
+            "`python3 -m pytest tests/test_x.py -q -n 0` (failed). This stop may be evidence "
+            "bookkeeping rather than a missing code change; an operator can verify the command "
+            "and decide whether the receipts are still meaningful."
+        )
+        assert message == legacy + sentence + route
+    else:
+        assert message == legacy + route

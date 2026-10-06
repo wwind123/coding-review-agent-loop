@@ -2328,6 +2328,12 @@ class DerivedRiskEvidenceResult:
         return self.evidence
 
 
+def _is_non_evidence_launch_failure(observation: object) -> bool:
+    from .local_test_evidence import is_non_evidence_launch_failure
+
+    return is_non_evidence_launch_failure(observation)
+
+
 def _observation_value(observation: object, name: str, default: object = None) -> object:
     if isinstance(observation, Mapping):
         return observation.get(name, default)
@@ -2573,6 +2579,7 @@ def derive_risk_test_matrix_evidence(
             "failed", "timed_out", "interrupted", "incomplete", "launch-failed"
         }
         and not _observation_value(observation, "superseded_by")
+        and not _is_non_evidence_launch_failure(observation)
     ]
     if isinstance(claims, SemanticRiskCoverageClaims):
         owner_by_row = {row.row_id: row.execution_owner for row in parsed_matrix.rows}

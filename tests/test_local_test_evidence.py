@@ -4068,3 +4068,282 @@ def test_broker_to_cli_refuses_unspawnable_or_oversized_serialization_before_the
     assert row["lane"] == "broker"
     assert row["executed_argv"] == ["npm", "run", "big"]
     assert "broker unavailable" not in log
+
+
+# --- pre-collection launch failures (issue #1182) ----------------------------
+
+from coding_review_agent_loop.local_test_evidence import (  # noqa: E402
+    PRE_COLLECTION_LAUNCH_FAILURE_PREFIX,
+    is_non_evidence_launch_failure,
+)
+
+_PRE_CAVEAT = f"{PRE_COLLECTION_LAUNCH_FAILURE_PREFIX}: pytest rejected its arguments"
+
+
+def _non_evidence(registry, *, receipt="launch-1", outcome="launch-failed", extra=()):
+    row = _observation(
+        outcome="failed", timestamp="2026-10-06T10:00:00+00:00", receipt_id=receipt, registry=registry,
+    )
+    from dataclasses import replace as _replace
+
+    return _replace(
+        row, outcome=outcome, returncode=4, suite_start="not-started", inner_exec="started",
+        caveats=(*extra, _PRE_CAVEAT),
+    )
+
+
+def test_non_evidence_launch_failure_is_not_an_authoritative_failure():
+    registry = EnvironmentIdentityRegistry()
+    row = _non_evidence(registry)
+    assert row.is_non_evidence_launch_failure and is_non_evidence_launch_failure(row.to_dict())
+    evidence = reconcile_test_observations([row], registry=registry)
+    assert evidence.authoritative_failures == ()
+    assert evidence.observations[0].outcome == "launch-failed"
+    assert evidence.capture_incomplete is False
+
+
+def test_caveat_on_any_other_outcome_grants_nothing():
+    registry = EnvironmentIdentityRegistry()
+    for outcome in ("failed", "timed_out", "interrupted", "incomplete"):
+        row = _non_evidence(registry, receipt=f"r-{outcome}", outcome=outcome)
+        assert not row.is_non_evidence_launch_failure
+        evidence = reconcile_test_observations([row], registry=registry)
+        assert evidence.authoritative_failures == (f"r-{outcome}",)
+    plain = _non_evidence(registry, outcome="launch-failed")
+    from dataclasses import replace as _replace
+
+    assert not _replace(plain, caveats=("something else",)).is_non_evidence_launch_failure
+
+
+def test_projection_and_restore_keep_the_non_evidence_status():
+    registry = EnvironmentIdentityRegistry()
+    noisy = tuple(f"noise caveat {index}" for index in range(6))
+    row = _non_evidence(registry, extra=noisy)
+    projected = row.public_projection()
+    assert projected["caveats"][0].startswith(PRE_COLLECTION_LAUNCH_FAILURE_PREFIX)
+    assert is_non_evidence_launch_failure(projected)
+    encoded = bounded_evidence_for_round(reconcile_test_observations([row], registry=registry))
+    restored = decode_bounded_evidence(encoded)
+    assert restored is not None
+    assert restored.observations[0].is_non_evidence_launch_failure
+    assert reconcile_test_observations(restored.observations).authoritative_failures == ()
+    assert json.loads(encoded)["observations"][0]["caveats"][0].startswith(PRE_COLLECTION_LAUNCH_FAILURE_PREFIX)
+
+
+def test_post_collection_rc4_failure_is_not_superseded_by_an_alternate_command():
+    registry = EnvironmentIdentityRegistry()
+    failure = _observation(
+        outcome="failed", timestamp="2026-10-06T10:00:00+00:00", receipt_id="real-rc4", registry=registry,
+    )
+    from dataclasses import replace as _replace
+
+    failure = _replace(
+        failure, returncode=4, suite_start="verified",
+        normalized_command="python3 -m pytest tests/x.py -q -n 0",
+    )
+    alternate = _replace(
+        _observation(
+            outcome="passed", timestamp="2026-10-06T10:05:00+00:00", receipt_id="alt-pass", registry=registry,
+        ),
+        normalized_command=".venv/bin/python -m pytest tests/x.py -q",
+    )
+    evidence = reconcile_test_observations([failure, alternate], registry=registry)
+    assert evidence.authoritative_failures == ("real-rc4",)
+    assert evidence.observations[0].superseded_by is None
+
+
+def _stub_result(**fields):
+    base = {
+        "outcome": "failed", "returncode": 4, "elapsed_seconds": 0.01, "output_tail": "usage: x",
+        "suite_start": "verified", "inner_exec": "started", "wrapper_bootstrap": "verified",
+        "diagnostic": "", "args": (sys.executable, "-m", "pytest"),
+    }
+    base.update(fields)
+    return SimpleNamespace(**base)
+
+
+def _no_snapshot(monkeypatch, tmp_path):
+    snapshot = evidence_module.TrackedTreeSnapshot(
+        root=str(tmp_path), head=None, digest=None, tracked_digest=None,
+        status_clean=None, complete=False, stable=None,
+    )
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", lambda *_a, **_k: snapshot)
+
+
+def test_broker_records_a_classified_run_as_a_non_evidence_row(monkeypatch, tmp_path):
+    _no_snapshot(monkeypatch, tmp_path)
+    reasons = iter(["usage error", None])
+
+    def execute(argv, cwd, timeout, environment, stream):
+        return _stub_result(pre_collection_launch_failure=next(reasons))
+
+    server = BrokerServer(root=tmp_path, turn_id="turn-classified", execute=execute).start()
+    try:
+        classified = _raw_broker_request(server, _signed_broker_request(server, tmp_path, "1" * 32))
+        ordinary = _raw_broker_request(server, _signed_broker_request(server, tmp_path, "2" * 32))
+        assert classified["outcome"] == "launch-failed" and classified["suite_start"] == "not-started"
+        assert classified["returncode"] == 4
+        assert classified["diagnostic"].startswith(PRE_COLLECTION_LAUNCH_FAILURE_PREFIX)
+        assert ordinary["outcome"] == "failed"
+        journal = {row.receipt_id: row for row in server.journal}
+        row = journal[classified["receipt_id"]]
+        assert row.outcome == "launch-failed" and row.suite_start == "not-started"
+        assert row.caveats[0].startswith(PRE_COLLECTION_LAUNCH_FAILURE_PREFIX)
+        evidence = reconcile_test_observations(server.journal)
+        assert classified["receipt_id"] not in evidence.authoritative_failures
+        assert ordinary["receipt_id"] in evidence.authoritative_failures
+    finally:
+        server.stop()
+
+
+def test_broker_with_a_real_subprocess_classifies_a_usage_error(monkeypatch, tmp_path):
+    _no_snapshot(monkeypatch, tmp_path)
+    (tmp_path / "test_x.py").write_text("def test_a():\n    assert True\n")
+    server = BrokerServer(root=tmp_path, turn_id="turn-real-usage").start()
+    try:
+        request = _signed_broker_request(
+            server, tmp_path, "3" * 32,
+            argv=[sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "test_x.py", "--bogus-flag"],
+        )
+        request["timeout_seconds"] = 60
+        response = _raw_broker_request(server, request)
+        assert response["type"] == "result"
+        assert (response["outcome"], response["suite_start"], response["returncode"]) == (
+            "launch-failed", "not-started", 4,
+        )
+        row = server.journal[-1]
+        assert row.provenance == "parent-observed" and row.is_non_evidence_launch_failure
+        assert reconcile_test_observations(server.journal).authoritative_failures == ()
+    finally:
+        server.stop()
+
+
+def test_saturated_journal_evicts_non_evidence_rows_first(monkeypatch, tmp_path):
+    registry = EnvironmentIdentityRegistry()
+    server = BrokerServer(root=tmp_path, turn_id="turn-evict", execute=lambda *_a, **_k: None)
+    monkeypatch.setattr(evidence_module, "MAX_PRIVATE_OBSERVATIONS", 4)
+    failure = _observation(
+        outcome="failed", timestamp="2026-10-06T10:00:00+00:00", receipt_id="unresolved", registry=registry,
+    )
+    passing = _observation(
+        outcome="passed", timestamp="2026-10-06T10:01:00+00:00", receipt_id="pass-1", registry=registry,
+    )
+    with server._journal_lock:
+        server._append_journal_locked(failure)
+        server._append_journal_locked(passing)
+        server._append_journal_locked(_non_evidence(registry, receipt="launch-old-1"))
+        server._append_journal_locked(_non_evidence(registry, receipt="launch-old-2"))
+        server._append_journal_locked(_non_evidence(registry, receipt="launch-new"))
+        newest = server._append_journal_locked(passing.__class__(**{
+            **{name: getattr(passing, name) for name in passing.__dataclass_fields__ if name not in {"execution_ref"}},
+            "receipt_id": "pass-newest",
+        }))
+    receipts = [row.receipt_id for row in server.journal]
+    assert "unresolved" in receipts and "pass-1" in receipts
+    assert "launch-old-1" not in receipts and "launch-old-2" not in receipts
+    assert newest is not None and receipts[-1] == "pass-newest"
+    assert server.journal[-1].execution_ref == newest.execution_ref
+
+
+def test_comment_labels_a_non_evidence_launch_failure_and_keeps_real_failures_uncited(tmp_path):
+    from dataclasses import replace as _replace
+
+    from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+    from coding_review_agent_loop.runner import Runner
+
+    registry = EnvironmentIdentityRegistry()
+    command = (sys.executable, "-m", "pytest", "tests/x.py")
+    launch = _replace(_non_evidence(registry, receipt="launch-receipt"), command=command)
+    real = _replace(
+        _observation(
+            outcome="failed", timestamp="2026-10-06T10:01:00+00:00", receipt_id="real-receipt",
+            registry=registry,
+        ),
+        command=command,
+    )
+    runner = Runner()
+    runner._environment_registry = registry
+    runner._local_test_observations.extend([launch, real])
+    rendered = runner.render_local_test_evidence(cwd=tmp_path)
+    public = _render_test_observation_citations((), local_test_evidence=rendered)
+    assert "pre-collection launch failure (not evidence) `launch-failed`" in public
+    assert "uncited authoritative `failed`" in public
+    assert public.count("uncited authoritative") == 1
+
+
+def test_unchanged_head_sentence_names_unsuperseded_receipts_only():
+    from coding_review_agent_loop.local_test_evidence import unsuperseded_receipts_sentence
+
+    registry = EnvironmentIdentityRegistry()
+    failure = _observation(
+        outcome="failed", timestamp="2026-10-06T10:00:00+00:00", receipt_id="open", registry=registry,
+    )
+    with_failure = bounded_evidence_for_round(reconcile_test_observations([failure], registry=registry))
+    sentence = unsuperseded_receipts_sentence(with_failure)
+    assert "unsuperseded failure receipts" in sentence and "evidence bookkeeping" in sentence
+    assert len(sentence) < 700
+    only_launch = bounded_evidence_for_round(
+        reconcile_test_observations([_non_evidence(registry)], registry=registry)
+    )
+    assert unsuperseded_receipts_sentence(only_launch) == ""
+    assert unsuperseded_receipts_sentence(None) == ""
+
+
+def test_broker_classifies_a_pytest_less_native_interpreter_without_mocking_the_bootstrap(
+    monkeypatch, tmp_path
+):
+    _no_snapshot(monkeypatch, tmp_path)
+    venv = tmp_path / "venv"
+    done = subprocess.run(
+        [sys.executable, "-m", "venv", "--without-pip", str(venv)], capture_output=True, timeout=120,
+    )
+    python = venv / "bin" / "python"
+    if done.returncode != 0 or subprocess.run(
+        [str(python), "-c", "import pytest"], capture_output=True
+    ).returncode == 0:
+        pytest.skip("cannot build a pytest-less venv")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "test_x.py").write_text("def test_a():\n    assert True\n")
+    server = BrokerServer(root=project, turn_id="turn-no-pytest").start()
+    try:
+        request = _signed_broker_request(
+            server, project, "4" * 32, argv=[str(python), "-m", "pytest", "test_x.py"],
+        )
+        request["timeout_seconds"] = 60
+        response = _raw_broker_request(server, request)
+        assert (response["outcome"], response["suite_start"], response["returncode"]) == (
+            "launch-failed", "not-started", 1,
+        )
+        assert response["diagnostic"].startswith(PRE_COLLECTION_LAUNCH_FAILURE_PREFIX)
+        row = server.journal[-1]
+        assert row.is_non_evidence_launch_failure and row.provenance == "parent-observed"
+        assert reconcile_test_observations(server.journal).authoritative_failures == ()
+    finally:
+        server.stop()
+
+
+def test_citing_a_non_evidence_receipt_keeps_the_non_evidence_label(tmp_path):
+    import shlex
+    from dataclasses import replace as _replace
+
+    from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+    from coding_review_agent_loop.runner import Runner
+
+    registry = EnvironmentIdentityRegistry()
+    command = (sys.executable, "-m", "pytest", "tests/x.py")
+    launch = _replace(_non_evidence(registry, receipt="launch-receipt"), command=command)
+    runner = Runner()
+    runner._environment_registry = registry
+    runner._local_test_observations.append(launch)
+    rendered = runner.render_local_test_evidence(cwd=tmp_path)
+    citation = SimpleNamespace(
+        receipt_id="launch-receipt", command=shlex.join(command), claim="passed",
+    )
+    public = _render_test_observation_citations(
+        [citation], local_test_evidence=rendered, current_test_turn_id="turn-opaque",
+    )
+    (line,) = [item for item in public.splitlines() if "launch-receipt" in item]
+    assert "pre-collection launch failure (not evidence)" in line
+    assert "verified against the parent journal" not in line
+    assert "uncited authoritative" not in public

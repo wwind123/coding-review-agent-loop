@@ -3259,3 +3259,122 @@ def render_runtime_context(
 parse_test_invocation = parse_managed_test_invocation
 record_observation = record_test_observation
 recommend_test_timeout = recommend_timeout
+
+
+# ---------------------------------------------------------------------------
+# Pre-collection launch-failure classification (issue #1182)
+# ---------------------------------------------------------------------------
+
+PRE_COLLECTION_USAGE_REASON = (
+    "pytest rejected its arguments before collecting any test (usage error)"
+)
+PRE_COLLECTION_NO_PYTEST_REASON = "the interpreter has no pytest module"
+
+
+def _probe_args_clean(records: Sequence[Mapping[str, object]]) -> bool:
+    """Whether a probe report positively shows a pre-parse, pre-test-code exit."""
+    kinds = [record.get("kind") for record in records]
+    if not kinds or kinds[0] != "loaded" or kinds.count("loaded") != 1:
+        return False
+    if kinds.count("args-seen") != 1 or kinds.count("final") != 1 or kinds[-1] != "final":
+        return False
+    if set(kinds) - {"loaded", "args-seen", "final"}:
+        return False
+    seen = next(record for record in records if record.get("kind") == "args-seen")
+    for flag in ("doctest_requested", "early_plugin", "probe_blocked_later", "explicit_targets_unprovable"):
+        if seen.get(flag) is not False:
+            return False
+    final = records[-1]
+    return (
+        final.get("invalid") is False
+        and final.get("write_failures") == 0
+        and final.get("vetoed") is False
+        and final.get("parsed") is False
+    )
+
+
+def classify_pre_collection_launch_failure(
+    argv: Sequence[str],
+    returncode: int | None,
+    scan: object | None,
+    probe: object | None,
+    independent_import_check: str | None,
+    *,
+    launch_eligibility: object | None,
+    worker_sessions_observed: bool,
+) -> str | None:
+    """Return a reason when a direct-pytest run provably ran no test, else ``None``.
+
+    The decision rests on positive, parent-observed provenance: a validated
+    ``launch_eligibility`` for every route, plus the lifecycle probe report
+    (usage errors) or an independent importability check (no pytest).  The
+    whole-stream ``scan`` and the worker-session report are vetoes only; the
+    absence of a marker is never proof.  Anything missing fails closed.
+    """
+    from .lifecycle_probe import PROBE_DISABLE_TOKENS, SCAN_MAX_LINES
+    from .test_workers import classify_command
+
+    if returncode is None or scan is None or launch_eligibility is None or worker_sessions_observed:
+        return None
+    tokens = [str(item) for item in argv]
+    shape = classify_command(tokens)
+    if shape.command_class != "direct-pytest" or shape.pytest_args_start is None:
+        return None
+    if getattr(scan, "collection_marker_seen", True) or getattr(scan, "lines", SCAN_MAX_LINES + 1) > SCAN_MAX_LINES:
+        return None
+    records = getattr(probe, "records", None) if probe is not None else None
+    if records is None:
+        return None
+    # Route (a): usage error, proven by the probe.
+    if returncode == 4:
+        for index, token in enumerate(tokens):
+            if token in {f"-pno:{PROBE_MODULE_NAME}", f"-p=no:{PROBE_MODULE_NAME}"} or (
+                token == "-p" and index + 1 < len(tokens) and tokens[index + 1] in PROBE_DISABLE_TOKENS
+            ):
+                return None
+        if (
+            getattr(scan, "usage_error", False)
+            and getattr(scan, "usage_line", False)
+            and _probe_args_clean(records)
+        ):
+            return PRE_COLLECTION_USAGE_REASON
+        return None
+    # Route (c): no pytest.  Only a validated `-m pytest` launch with an empty
+    # report and an independent importability check qualifies.
+    if (
+        returncode == 1
+        and getattr(launch_eligibility, "shape", None) == "module"
+        and len(records) == 0
+        and getattr(scan, "no_module_pytest", False)
+        and independent_import_check == "pytest-absent"
+    ):
+        return PRE_COLLECTION_NO_PYTEST_REASON
+    return None
+
+
+PROBE_MODULE_NAME = "_agent_loop_lifecycle_probe"
+
+
+def classify_missing_pytest_bootstrap(
+    diagnostic: str,
+    independent_import_check: str | None,
+    *,
+    launch_eligibility: object | None,
+) -> str | None:
+    """Classify a failed inner bootstrap probe as a missing pytest (issue #1182).
+
+    The launcher bootstrap probe already runs ``<python> -m pytest`` before the
+    target and stops the run when pytest cannot be imported, so route (c) must
+    also hold there.  It requires the same positive provenance: a parent-
+    validated ``-m pytest`` launch eligibility, the probe's own
+    ``No module named pytest`` diagnostic and the independent importability
+    check reporting ``pytest-absent``.  Anything else is not classified.
+    """
+    if (
+        launch_eligibility is not None
+        and getattr(launch_eligibility, "shape", None) == "module"
+        and independent_import_check == "pytest-absent"
+        and re.search(r"No module named '?pytest'?\s*$", diagnostic.strip())
+    ):
+        return PRE_COLLECTION_NO_PYTEST_REASON
+    return None

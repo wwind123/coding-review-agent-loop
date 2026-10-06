@@ -235,6 +235,11 @@ class ForegroundTestResult:
     worker_caveats: tuple[str, ...] = ()
     worker_notices: tuple[str, ...] = ()
     descendants_terminated: int = 0
+    # Issue #1182: a non-empty reason means the parent positively observed
+    # that pytest exited before any test could run (see lifecycle_probe).
+    # Only set when the caller asked for classification; the outcome and
+    # returncode keep their ordinary values.
+    pre_collection_launch_failure: str | None = None
 
     def __post_init__(self) -> None:
         if self.wrapper_bootstrap not in WRAPPER_BOOTSTRAP_STATES:
@@ -309,6 +314,7 @@ class _HeldTestLocks:
         self._lane = lane
         self._worker_lock = worker_lock
         self._decision = decision
+        self.extra_cleanups: list[Callable[[], None]] = []
 
     def record_process_group(self, pgid: int) -> None:
         if self._worker_lock is not None:
@@ -327,8 +333,13 @@ class _HeldTestLocks:
             try:
                 self._lane.close()
             finally:
-                if self._decision is not None:
-                    self._decision.cleanup()
+                try:
+                    if self._decision is not None:
+                        self._decision.cleanup()
+                finally:
+                    for cleanup in self.extra_cleanups:
+                        cleanup()
+                    self.extra_cleanups.clear()
 
 
 def _cancelled_result(cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance):
@@ -394,6 +405,7 @@ def _run_foreground_test_body(
     host_wait_notify: Callable[[str], None] | None = None,
     host_launch_guard: Callable[[], Any] | None = None,
     package_script: Any = _UNRESOLVED_PACKAGE_SCRIPT,
+    classify_pre_collection: bool = False,
 ) -> ForegroundTestResult:
     """Run a command in the foreground, teeing output and bounding its process group.
 
@@ -406,6 +418,12 @@ def _run_foreground_test_body(
     (after launcher rebinding, excluding containment wrappers).  For every other
     run ``args`` stays the post-worker-policy argv in the caller's spelling,
     which can differ from the spawned process by launcher rebinding.
+
+    ``classify_pre_collection`` (issue #1182) injects the lifecycle probe into a
+    validated direct-pytest launcher and sets
+    ``ForegroundTestResult.pre_collection_launch_failure`` when the run provably
+    exited before any test could run.  Callers that do not consume the field
+    (the configured gate) leave it off and see no argv or environment change.
 
     ``worker_budget`` enables the test-worker budget.  It is never read from
     ``env``: ``None`` means no injection, no plugin report and no worker-budget
@@ -662,12 +680,22 @@ def _run_foreground_test_body(
     proc: subprocess.Popen[bytes] | None = None
     inner_probe_state = "unknown"
     held_fds: tuple[int, int, int, int] | None = None
+    probe_setup = None
+    launch_source = cmd
     try:
+        if classify_pre_collection and package_script is None:
+            from .lifecycle_probe import prepare_lifecycle_probe
+
+            probe_setup = prepare_lifecycle_probe(cmd, spawn_environment, cwd)
+            if probe_setup is not None:
+                lane_lock.extra_cleanups.append(probe_setup.cleanup)
+                launch_source = list(probe_setup.argv)
+                spawn_environment = probe_setup.env
         # Probe before allocating containment leases or broker handshake pipes.
         # The probe receives exactly the environment that the real target will
         # receive, including the ambient environment for partial overlays.
         inner_probe = probe_inner_launcher(
-            cmd,
+            launch_source,
             cwd=cwd,
             environment=spawn_environment,
             environment_is_complete=spawn_environment is not None,
@@ -684,9 +712,23 @@ def _run_foreground_test_body(
             )
         inner_probe_state = inner_probe.state
         if inner_probe.state == "failed":
+            missing_pytest = None
+            if probe_setup is not None:
+                missing_pytest = _classify_missing_pytest_bootstrap(
+                    cmd, probe_setup, inner_probe.diagnostic, cwd,
+                )
             if handle is not None:
                 handle.close()
             lane_lock.close()
+            if missing_pytest is not None:
+                # The target never ran, but the parent proved pytest is absent
+                # from a validated interpreter: non-evidence, failing exit code.
+                return ForegroundTestResult(
+                    cmd, cwd, "failed", 1, time.monotonic() - started,
+                    timeout_seconds, inner_probe.diagnostic, None, False,
+                    wrapper_bootstrap, "started", "not-started", inner_probe.diagnostic,
+                    health_provenance, pre_collection_launch_failure=missing_pytest,
+                )
             return ForegroundTestResult(
                 cmd, cwd, "launch-failed", None, time.monotonic() - started,
                 timeout_seconds, inner_probe.diagnostic, None, False,
@@ -700,8 +742,11 @@ def _run_foreground_test_body(
         launch_cmd = (
             list(inner_probe.launch_argv)
             if inner_probe.state == "verified" and inner_probe.launch_argv
-            else cmd
+            else launch_source
         )
+        if probe_setup is not None and list(launch_cmd) != list(launch_source):
+            # Launcher rebinding changed the argv the probe was validated for.
+            probe_setup = None
         if package_script is not None:
             # An adopted resolution never spawns the package manager.
             assert launch_cmd, "adopted package script has no launch argv"
@@ -911,6 +956,11 @@ def _run_foreground_test_body(
 
     tail: deque[str] = deque(maxlen=80)
     pending = ""
+    pre_collection_scan = None
+    if classify_pre_collection:
+        from .lifecycle_probe import PreCollectionScan
+
+        pre_collection_scan = PreCollectionScan()
 
     def consume(data: bytes, *, final: bool = False) -> None:
         nonlocal pending
@@ -925,12 +975,16 @@ def _run_foreground_test_body(
                 print(line, end="", flush=True)
             if output_callback is not None:
                 output_callback(line)
+            if pre_collection_scan is not None:
+                pre_collection_scan.feed(line)
             tail.extend(line.splitlines())
         if final and pending:
             if echo_output:
                 print(pending, end="", flush=True)
             if output_callback is not None:
                 output_callback(pending)
+            if pre_collection_scan is not None:
+                pre_collection_scan.feed(pending)
             tail.extend(pending.splitlines())
             pending = ""
 
@@ -1097,6 +1151,18 @@ def _run_foreground_test_body(
                 mode=decision.mode,
                 argv=policy_input,
             )
+        pre_collection_reason = None
+        if (
+            probe_setup is not None
+            and not timed_out
+            and not interrupted
+            and not target_exec_error
+            and returncode is not None
+        ):
+            pre_collection_reason = _classify_pre_collection_run(
+                requested=cmd, probe_setup=probe_setup, returncode=returncode,
+                scan=pre_collection_scan, analysis=analysis, cwd=cwd,
+            )
     finally:
         lane_lock.close()
         tel.released()
@@ -1112,6 +1178,7 @@ def _run_foreground_test_body(
     workers_cohort = None
     worker_enforcement = None
     worker_notices: tuple[str, ...] = ()
+    analysis_direct_refusal = bool(analysis is not None and analysis.direct_refusal)
     if analysis is not None:
         workers_cohort = analysis.workers_cohort
         worker_enforcement = analysis.enforcement
@@ -1146,7 +1213,58 @@ def _run_foreground_test_body(
         health_provenance,
         workers_cohort, worker_enforcement, worker_caveats, worker_notices,
         descendants_terminated,
+        pre_collection_launch_failure=(
+            pre_collection_reason
+            if outcome == "failed" and not analysis_direct_refusal
+            else None
+        ),
     )
+
+
+def _classify_missing_pytest_bootstrap(requested, probe_setup, diagnostic, cwd) -> str | None:
+    """Classify a failed launcher bootstrap as a missing pytest; errors mean no."""
+    try:
+        from .lifecycle_probe import run_independent_import_check
+        from .test_runtime import classify_missing_pytest_bootstrap
+
+        check = run_independent_import_check(
+            probe_setup.eligibility, requested, probe_setup.env, cwd,
+        )
+        return classify_missing_pytest_bootstrap(
+            diagnostic, check, launch_eligibility=probe_setup.eligibility,
+        )
+    except Exception:
+        return None
+
+
+def _classify_pre_collection_run(
+    *, requested, probe_setup, returncode, scan, analysis, cwd,
+) -> str | None:
+    """Classify one finished injected run; any error means not classified."""
+    try:
+        from .lifecycle_probe import read_probe_report, run_independent_import_check
+        from .test_runtime import classify_pre_collection_launch_failure
+
+        report = read_probe_report(probe_setup.report_path, probe_setup.nonce)
+        sessions = bool(analysis is not None and analysis.sessions)
+        check = "unavailable"
+        if (
+            returncode == 1
+            and scan is not None
+            and scan.no_module_pytest
+            and report is not None
+            and not report.records
+        ):
+            check = run_independent_import_check(
+                probe_setup.eligibility, requested, probe_setup.env, cwd,
+            )
+        return classify_pre_collection_launch_failure(
+            requested, returncode, scan, report, check,
+            launch_eligibility=probe_setup.eligibility,
+            worker_sessions_observed=sessions,
+        )
+    except Exception:
+        return None
 
 
 def _terminate_process_group(proc: subprocess.Popen) -> None:

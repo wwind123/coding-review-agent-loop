@@ -5769,3 +5769,23 @@ def test_diagnostic_notes_render_without_excluded_checks(note):
     assert "Check-scoping diagnostics" in rendered and note in rendered
     assert "Excluded ad hoc workflow_dispatch checks" not in rendered
     assert note in _pr_check_details(checks)
+
+
+def test_prompts_describe_pre_collection_launch_failures_as_non_evidence(tmp_path):
+    """Issue #1182: reviewer and coder guidance for non-evidence launch failures."""
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    marker = "pre-collection launch failure (not evidence)"
+    for compact in (False, True):
+        review = build_review_prompt(
+            77, 1, config, reviewer="codex", compact_context=compact,
+        )
+        assert marker in review
+        assert "needs no supersession" in review
+        assert "only a later parent-observed pass of the same command supersedes it" in review
+    for coder_prompt in (
+        build_issue_implementation_prompt(56, "1. Fix it.", config),
+        prompts_module.build_followup_prompt(77, 1, "Fix it.", config),
+    ):
+        assert "pre-collection launch failure" in coder_prompt
+        assert "fix the interpreter or flags and rerun" in coder_prompt
+        assert "cleared only by a passing rerun of the same command" in coder_prompt
