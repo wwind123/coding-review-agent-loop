@@ -3929,3 +3929,76 @@ def test_in_process_broker_resolves_package_json_once_and_freezes_the_argv(tmp_p
     (observation,) = server.journal
     assert observation.command == ("npm", "run", "test:x")
     assert list(observation.executed_command) == response["executed_argv"]
+
+
+# --- non-package executed-argv contract regressions (issue #1294) -------------
+
+
+def _recording_playwright_and_npx(tmp_path):
+    """A local playwright that records its launch and an npx that must never run."""
+    local = tmp_path / "node_modules" / ".bin" / "playwright"
+    local.parent.mkdir(parents=True)
+    launched = tmp_path / "playwright-ran"
+    local.write_text(f"#!/bin/sh\ntouch {launched}\nexit 0\n", encoding="utf-8")
+    local.chmod(0o755)
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    npx_ran = tmp_path / "npx-ran"
+    fake = bindir / "npx"
+    fake.write_text(f"#!/bin/sh\ntouch {npx_ran}\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    return local, launched, npx_ran, {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+
+
+def test_broker_non_package_npx_keeps_npx_spelling_while_launching_the_local_binary(tmp_path):
+    _git_checkout(tmp_path)
+    local, launched, npx_ran, env = _recording_playwright_and_npx(tmp_path)
+    requested = ["npx", "playwright", "test", "--project=a"]
+    runner, result, row, log = _brokered_run_tests(tmp_path, requested, extra_env=env)
+    assert result.returncode == 0, log
+    # The local binary ran, never npx, yet every record keeps the caller's spelling.
+    assert launched.exists() and not npx_ran.exists()
+    assert row["lane"] == "broker"
+    assert row["executed_argv"] == requested
+    (observation,) = runner.local_test_observations()
+    assert observation.command == tuple(requested)
+    assert list(observation.executed_command) == requested
+
+
+def test_in_process_broker_response_executed_argv_for_non_package_npx(tmp_path, monkeypatch):
+    _git_checkout(tmp_path)
+    monkeypatch.delenv("AGENT_LOOP_INVOCATION_ID", raising=False)
+    local, launched, npx_ran, env = _recording_playwright_and_npx(tmp_path)
+    requested = ["npx", "playwright", "test", "--project=a"]
+    server = BrokerServer(root=tmp_path, turn_id="turn-npx").start()
+    try:
+        request = _signed_broker_request(server, tmp_path, "d" * 32, argv=requested)
+        request["environment"] = {"PATH": env["PATH"]}
+        response = _raw_broker_request(server, request)
+    finally:
+        server.stop()
+    assert response.get("outcome") == "passed", response
+    assert launched.exists() and not npx_ran.exists()
+    assert response["executed_argv"] == requested
+
+
+@pytest.mark.skipif(not _HAS_XDIST, reason="pytest-xdist is not installed")
+def test_broker_clamped_direct_pytest_records_the_exact_post_policy_argv(tmp_path):
+    _git_checkout(tmp_path)
+    (tmp_path / "test_cases.py").write_text("def test_a():\n    pass\n\ndef test_b():\n    pass\n", encoding="utf-8")
+    requested = [
+        sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
+        "-p", "no:_agent_loop_worker_cap", "test_cases.py",
+    ]
+    runner, result, row, log = _brokered_run_tests(tmp_path, requested)
+    assert result.returncode == 0, log
+    # The disabling token is stripped and the worker-cap plugin is injected,
+    # exactly as before the package-script change.
+    expected = [
+        sys.executable, "-m", "pytest", "-p", "_agent_loop_worker_cap",
+        "-p", "no:cacheprovider", "-q", "test_cases.py",
+    ]
+    assert row["executed_argv"] == expected
+    (observation,) = runner.local_test_observations()
+    assert observation.command == tuple(requested)
+    assert list(observation.executed_command) == expected

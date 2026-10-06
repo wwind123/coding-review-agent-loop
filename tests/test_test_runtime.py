@@ -2966,3 +2966,31 @@ def test_cli_run_tests_resolves_package_json_exactly_once(tmp_path, monkeypatch,
     assert len(reads) == 1
     row = runtime.load_runtime_memory(memory)[-1]
     assert row["executed_argv"] == [str(launcher), "test", "--project=a"]
+
+
+def test_non_package_npx_run_keeps_npx_spelling_in_result_and_cli_row(tmp_path, monkeypatch, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    launcher = tmp_path / "node_modules" / ".bin" / "playwright"
+    launcher.parent.mkdir(parents=True)
+    launched = tmp_path / "playwright-ran"
+    launcher.write_text(f"#!/bin/sh\ntouch {launched}\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    npx_ran = tmp_path / "npx-ran"
+    fake = bindir / "npx"
+    fake.write_text(f"#!/bin/sh\ntouch {npx_ran}\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    requested = ["npx", "playwright", "test", "--project=a"]
+    result = runner_module.run_foreground_test(requested, cwd=tmp_path, timeout_seconds=60, echo_output=False)
+    assert launched.exists() and not npx_ran.exists()
+    assert list(result.args) == requested
+    launched.unlink()
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert main(["run-tests", "--timeout-seconds", "60", "--memory-dir", str(memory), "--", *requested]) == 0
+    assert launched.exists() and not npx_ran.exists()
+    assert runtime.load_runtime_memory(memory)[-1]["executed_argv"] == requested
