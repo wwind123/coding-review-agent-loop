@@ -2506,18 +2506,39 @@ EXECUTED_ARGV_MAX_TOTAL_BYTES = 32 * 1024
 EXECUTED_ARGV_MAX_ITEM_BYTES = 8 * 1024
 
 
+# The response frame is capped at 128 KiB once JSON-escaped (a control character
+# becomes six bytes), so the serialized executed argv gets a bounded share and
+# leaves room for the other response fields.
+EXECUTED_ARGV_MAX_SERIALIZED_BYTES = 48 * 1024
+
+
 def argv_is_transportable(argv: Sequence[str]) -> bool:
-    """Whether ``argv`` survives the bounded broker argv transport losslessly."""
+    """Whether ``argv`` can be spawned and survives the broker transport losslessly.
+
+    Every token must be spawnable (no NUL, strictly UTF-8 encodable, so no lone
+    surrogate) and the argv must fit the item, per-item byte, raw total byte and
+    JSON-serialized bounds the broker response applies.
+    """
     items = [str(item) for item in argv]
     if not items or len(items) > EXECUTED_ARGV_MAX_ITEMS:
         return False
     total = 0
     for item in items:
-        size = len(item.encode("utf-8", errors="replace"))
+        if "\x00" in item:
+            return False
+        try:
+            size = len(item.encode("utf-8"))
+        except UnicodeEncodeError:
+            return False
         if size > EXECUTED_ARGV_MAX_ITEM_BYTES:
             return False
         total += size
-    return total <= EXECUTED_ARGV_MAX_TOTAL_BYTES
+    if total > EXECUTED_ARGV_MAX_TOTAL_BYTES:
+        return False
+    serialized = json.dumps(items, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return len(serialized) <= EXECUTED_ARGV_MAX_SERIALIZED_BYTES
+
+
 _PACKAGE_BODY_FORBIDDEN_CHARS = frozenset(";&|<>$`\\()*?[]{}!#~%\r\n")
 _PACKAGE_BODY_FORBIDDEN_HEADS = frozenset({"env", "npm", "pnpm", "yarn", "cross-env"})
 _ASSIGNMENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")

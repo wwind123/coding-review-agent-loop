@@ -4039,3 +4039,32 @@ def test_broker_to_cli_executed_argv_is_complete_or_the_script_is_not_adopted(tm
         assert npm_ran.exists()
         assert row["executed_argv"] == ["npm", "run", "big"]
         assert list(observation.executed_command) == ["npm", "run", "big"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "node --test 'tests/test_\x00.js'",
+        "node --test 'tests/test_\ud800.js'",
+        "node --test " + " ".join("'--test-name-pattern=" + "\x01" * 8000 + "'" for _ in range(4)),
+    ],
+    ids=["nul", "lone-surrogate", "json-expansion"],
+)
+def test_broker_to_cli_refuses_unspawnable_or_oversized_serialization_before_the_target_runs(tmp_path, body):
+    _git_checkout(tmp_path)
+    npm_ran, env = _fake_node_and_npm(tmp_path)
+    node_ran = tmp_path / "node-ran"
+    fake_node = tmp_path / "fakebin" / "node"
+    fake_node.write_text(
+        f'#!/bin/sh\n[ "$1" = "--version" ] || touch {node_ran}\nexit 0\n', encoding="utf-8"
+    )
+    fake_node.chmod(0o755)
+    _package_json(tmp_path, {"big": body})
+    runner, result, row, log = _brokered_run_tests(tmp_path, ["npm", "run", "big"], extra_env=env)
+    assert result.returncode == 0, log
+    # Never adopted: npm ran once, the resolved target never ran, no broker error
+    # forced a second local run, and the row records the npm argv.
+    assert npm_ran.exists() and not node_ran.exists()
+    assert row["lane"] == "broker"
+    assert row["executed_argv"] == ["npm", "run", "big"]
+    assert "broker unavailable" not in log

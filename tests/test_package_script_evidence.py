@@ -251,3 +251,43 @@ def test_runner_refuses_before_spawn_when_worker_policy_grows_the_argv_past_the_
     )
     assert result.outcome == "launch-failed"
     assert not marker.exists()
+
+
+# --- unspawnable / JSON-expanding resolved tokens (issue #1294) ----------------
+
+_PATTERN = "--test-name-pattern=" + "\x01" * 8000
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "node --test 'tests/test_\x00.js'",                          # NUL cannot be exec'd
+        "node --test 'tests/test_\ud800.js'",                        # lone surrogate cannot be encoded
+        "node --test " + " ".join(f"'{_PATTERN}'" for _ in range(4)),  # raw size fits; JSON escapes do not
+    ],
+    ids=["nul", "lone-surrogate", "json-expansion"],
+)
+def test_adoption_discards_tokens_that_cannot_be_spawned_or_serialized(tmp_path, monkeypatch, body):
+    from coding_review_agent_loop import runner as runner_module
+
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    npm_ran = tmp_path / "npm-ran"
+    node_ran = tmp_path / "node-ran"
+    for name, script in (
+        ("node", f'[ "$1" = "--version" ] || touch {node_ran}; exit 0'),
+        ("npm", f"touch {npm_ran}; exit 0"),
+    ):
+        fake = bindir / name
+        fake.write_text(f"#!/bin/sh\n{script}\n", encoding="utf-8")
+        fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    _package(tmp_path, {"t": body})
+    assert runtime.resolve_adopted_package_script(["npm", "run", "t"], cwd=tmp_path) is None
+    # No resolved-target probe, launch or uncaught exception: npm runs as today.
+    result = runner_module.run_foreground_test(
+        ["npm", "run", "t"], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+    assert npm_ran.exists() and not node_ran.exists()
+    assert result.suite_start == "unknown"
+    assert list(result.args) == ["npm", "run", "t"]
