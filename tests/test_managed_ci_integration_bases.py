@@ -31,11 +31,20 @@ from agent_loop_helpers import make_config
 WORKFLOW = f"{TRUSTED_BASES_MARKER}: enabled\nAGENT_LOOP_MANAGED_CI_V2: enabled\n"
 
 
+def intent_comment(base, *, login="agent-loop", user_id=1, pr=7):
+    record = {"version": 2, "repository": "OWNER/REPO", "pr": pr, "base_ref": base}
+    return {
+        "id": 900, "created_at": "2026-01-01T00:00:00Z", "user": {"login": login, "id": user_id},
+        "body": "<!-- AGENT_MANAGED_CI_INTENT_V2 " + json.dumps(record) + " -->",
+    }
+
+
 class ScriptRunner(Runner):
     """Answers ``gh api <endpoint>`` calls from a dict; records every command."""
 
     def __init__(self, *, default="main", variable="refactor/*", variable_error=None,
-                 workflow=WORKFLOW, pr=None, issue_state="open", close_rc=0, merged=True):
+                 workflow=WORKFLOW, pr=None, issue_state="open", close_rc=0, merged=True,
+                 authorized="refactor/1181", comments=None):
         super().__init__(dry_run=False)
         self.commands: list[list[str]] = []
         self.default = default
@@ -44,6 +53,10 @@ class ScriptRunner(Runner):
         self.workflow = workflow
         self.issue_state = issue_state
         self.close_rc = close_rc
+        # Durable evidence: the trusted actor's signed handoff record naming the authorized base.
+        self.comments = comments if comments is not None else (
+            [intent_comment(authorized)] if authorized else []
+        )
         self.pr = pr if pr is not None else {
             "number": 7, "merged": merged, "merged_at": "2026-01-01T00:00:00Z" if merged else None,
             "base": {"ref": "refactor/1181", "repo": {"full_name": "OWNER/REPO"}},
@@ -71,6 +84,12 @@ class ScriptRunner(Runner):
             return ok(json.dumps({"value": self.variable}))
         if "/contents/.github/workflows/" in endpoint:
             return ok(self.workflow) if self.workflow is not None else CommandResult(cmd, Path(cwd), "", "gh: Not Found (HTTP 404)", 1)
+        if endpoint.startswith("repos/OWNER/REPO/issues/7/comments?"):
+            return ok(json.dumps(self.comments if "page=1" in endpoint else []))
+        if endpoint.endswith("/actions/variables/AGENT_LOOP_MANAGED_ACTOR"):
+            return ok(json.dumps({"value": "agent-loop"}))
+        if endpoint == "users/agent-loop":
+            return ok(json.dumps({"login": "agent-loop", "id": 1}))
         if endpoint == "repos/OWNER/REPO/pulls/7":
             return ok(json.dumps(self.pr))
         if endpoint == "repos/OWNER/REPO/issues/42":
@@ -265,7 +284,7 @@ def test_close_is_a_noop_when_already_closed_and_never_for_default_or_unmerged(t
     closed = ScriptRunner(issue_state="closed")
     assert close_child_after_integration_merge(closed, config=cfg, issue_context=ctx, pr_number=7) == "already-closed"
     assert not closed.commands_matching("gh", "issue", "close")
-    default_merge = ScriptRunner(pr={
+    default_merge = ScriptRunner(authorized="main", pr={
         "merged": True, "merged_at": "t", "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}}, "body": "Closes #42",
     })
     assert close_child_after_integration_merge(default_merge, config=cfg, issue_context=ctx, pr_number=7) == "default-branch"
@@ -478,7 +497,12 @@ def test_run_issue_loop_reconciles_before_canonical_pr_resolution():
     import coding_review_agent_loop.issue_loop as issue_loop
 
     source = inspect.getsource(issue_loop.run_issue_loop)
-    assert source.index("reconcile_merged_integration_child(") < source.index("resolved_pr = resolve_canonical_pr_for_issue(")
+    reconcile = source.index("reconcile_merged_integration_child(")
+    # Before every route, including the staged direct-child dispatch, so the
+    # approved-implementation resume path (which rejects MERGED) is never reached first.
+    assert reconcile < source.index("_resolve_fresh_child_provenance(")
+    assert reconcile < source.index("_dispatch_decomposition_child(")
+    assert reconcile < source.index("resolve_canonical_pr_for_issue(")
 
 
 def test_parent_completion_is_not_recorded_when_post_merge_evidence_is_unreadable(tmp_path, monkeypatch):
@@ -567,3 +591,50 @@ def test_manual_qualification_refuses_a_retarget_after_the_initial_check(tmp_pat
         )
     assert not runner.commands_matching("gh", "pr", "ready")
     assert not [c for c in runner.commands if any(QUALIFICATION_MARKER_TEXT in part for part in c)]
+
+
+# --- authorized base recovered from authenticated durable evidence (round-2 item 4) --------
+
+
+def _merged(base, body="Closes #42"):
+    return {"merged": True, "merged_at": "t", "body": body, "base": {"ref": base, "repo": {"full_name": "OWNER/REPO"}}}
+
+
+@pytest.mark.parametrize(
+    ("label", "runner_kwargs", "expected"),
+    [
+        # No --base on the rerun: the merge target must still equal the authorized base.
+        ("different-trusted-target", dict(pr=_merged("refactor/other"), authorized="refactor/1181"), "unresolved"),
+        ("default-target-vs-integration-record", dict(pr=_merged("main"), authorized="refactor/1181"), "unresolved"),
+        ("integration-merge-vs-default-record", dict(pr=_merged("refactor/1181"), authorized="main"), "unresolved"),
+        ("no-durable-evidence", dict(pr=_merged("refactor/1181"), authorized=None), "unresolved"),
+        ("forged-by-other-author", dict(pr=_merged("refactor/1181"), authorized=None,
+                                        comments=[intent_comment("refactor/1181", login="mallory", user_id=9)]), "unresolved"),
+        ("right-login-wrong-id", dict(pr=_merged("refactor/1181"), authorized=None,
+                                      comments=[intent_comment("refactor/1181", user_id=99)]), "unresolved"),
+        ("contradictory-records", dict(pr=_merged("refactor/1181"), authorized=None,
+                                       comments=[intent_comment("refactor/1181"), intent_comment("refactor/other")]), "unresolved"),
+        ("authorized-and-merged-agree", dict(pr=_merged("refactor/1181"), authorized="refactor/1181"), "closed"),
+        ("unmanaged-default-merge", dict(pr=_merged("main"), authorized=None), "default-branch"),
+    ],
+)
+def test_recovery_authenticates_the_originally_authorized_base_without_an_explicit_base(
+    tmp_path, label, runner_kwargs, expected
+):
+    runner = ScriptRunner(**runner_kwargs)
+    # A parent/child rerun carries no explicit --base (provenance is the repository default).
+    config = _config(tmp_path, base="main", base_provenance="repository-default")
+    outcome = close_child_after_integration_merge(
+        runner, config=config, issue_context=_issue_context(), pr_number=7
+    )
+    assert outcome == expected, label
+    assert bool(runner.commands_matching("gh", "issue", "close")) == (expected == "closed")
+
+
+def test_a_later_explicit_base_cannot_stand_in_for_the_authorization(tmp_path):
+    runner = ScriptRunner(pr=_merged("refactor/other"), authorized="refactor/1181")
+    config = _config(tmp_path, base="refactor/other", base_provenance="explicit")
+    assert close_child_after_integration_merge(
+        runner, config=config, issue_context=_issue_context(), pr_number=7
+    ) == "unresolved"
+    assert not runner.commands_matching("gh", "issue", "close")

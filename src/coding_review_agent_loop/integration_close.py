@@ -11,6 +11,7 @@ later run finds the PR already MERGED.
 from __future__ import annotations
 
 import json
+import re
 from typing import Literal
 
 from .config import AgentLoopConfig
@@ -47,9 +48,66 @@ def _api(runner: Runner, config: AgentLoopConfig, endpoint: str) -> dict[str, ob
     return payload if isinstance(payload, dict) else None
 
 
-def _recorded_base(config: AgentLoopConfig) -> str | None:
-    """The base the operator explicitly recorded for this run, if any."""
-    return config.base if config.base and config.base_provenance == "explicit" else None
+class _RecordedBaseUnavailable(Exception):
+    """Authenticated durable base evidence could not be read or is ambiguous."""
+
+
+def _authorized_base(runner: Runner, config: AgentLoopConfig, pr_number: int) -> str | None:
+    """Recover the base the managed workflow was authorized for from durable evidence.
+
+    The trusted actor's signed handoff records on the PR carry the authorized
+    ``base_ref``.  Only comments by the live, advertised trusted actor (login
+    and immutable ID) count.  Returns ``None`` when the PR carries no such
+    record (never managed) and raises when evidence is unreadable, forged or
+    contradictory, so recovery fails closed instead of trusting a later
+    ``--base`` or the PR's current base.
+    """
+    from .github import read_rest_issue_comments
+    from .managed_ci import INTENT_MARKER, _advertised_managed_actor, _api_json
+    from .errors import AgentLoopError as _Err
+
+    try:
+        comments = read_rest_issue_comments(
+            runner, config=config, issue_number=pr_number,
+            purpose="authenticating the recorded integration base",
+        )
+    except _Err as exc:
+        raise _RecordedBaseUnavailable(str(exc)) from exc
+    pattern = re.compile(rf"<!-- {INTENT_MARKER} (?P<payload>\{{.*?\}}) -->", re.DOTALL)
+    candidates = [c for c in comments if isinstance(c.body, str) and INTENT_MARKER in c.body]
+    if not candidates:
+        return None
+    actor = _advertised_managed_actor(runner, config)
+    live = _api_json(runner, config, f"users/{actor}", quiet=True) if actor else {}
+    actor_id = live.get("id") if isinstance(live.get("id"), int) else None
+    if not actor or actor_id is None:
+        raise _RecordedBaseUnavailable("the trusted actor identity could not be established")
+    bases: set[str] = set()
+    for comment in candidates:
+        if (comment.author or "").casefold() != actor.casefold() or comment.author_id != actor_id:
+            continue
+        match = pattern.search(comment.body or "")
+        if match is None:
+            continue
+        try:
+            record = json.loads(match.group("payload"))
+        except json.JSONDecodeError:
+            raise _RecordedBaseUnavailable("a trusted handoff record is malformed") from None
+        if (
+            not isinstance(record, dict)
+            or record.get("pr") != pr_number
+            or str(record.get("repository", "")).casefold() != config.repo.casefold()
+        ):
+            continue
+        if not isinstance(record.get("base_ref"), str) or not record["base_ref"]:
+            raise _RecordedBaseUnavailable("a trusted handoff record has no base")
+        bases.add(record["base_ref"])
+    if not bases:
+        # Only untrusted authors claimed a record: evidence exists but is unauthenticated.
+        raise _RecordedBaseUnavailable("no handoff record by the trusted actor could be authenticated")
+    if len(bases) != 1:
+        raise _RecordedBaseUnavailable("trusted handoff records disagree on the base")
+    return next(iter(bases))
 
 
 def close_child_after_integration_merge(
@@ -92,11 +150,26 @@ def close_child_after_integration_merge(
     default_branch = repo.get("default_branch") if repo else None
     if not isinstance(default_branch, str) or not default_branch:
         return "unresolved"
+    try:
+        authorized = _authorized_base(runner, config, pr_number)
+    except _RecordedBaseUnavailable as exc:
+        log(config, f"Issue #{issue_context.number}: recorded base not authenticated ({exc})")
+        return "unresolved"
+    # Every explicit statement of the recorded base must agree with the
+    # authenticated evidence and the actual merge target, before any mutation.
+    claimed = {b for b in (expected_base, config.base if config.base_provenance == "explicit" else None) if b}
+    if authorized is not None and claimed - {authorized}:
+        return "unresolved"
+    if authorized is None and not (claimed <= {base_ref}):
+        return "unresolved"
+    if authorized is not None and authorized != base_ref:
+        log(config, f"Issue #{issue_context.number}: PR #{pr_number} merged into {base_ref}, not the authorized base {authorized}")
+        return "unresolved"
     if base_ref == default_branch:
         return "default-branch"
-    recorded = expected_base or _recorded_base(config)
-    if recorded is not None and base_ref != recorded:
-        log(config, f"Issue #{issue_context.number}: PR #{pr_number} merged into {base_ref}, not the recorded base {recorded}")
+    if authorized is None:
+        # A non-default merge with no authenticated authorization is never closed.
+        log(config, f"Issue #{issue_context.number}: no authenticated authorization for base {base_ref}")
         return "unresolved"
     from .managed_ci import trusted_base_problem
 
@@ -179,9 +252,14 @@ def reconcile_merged_integration_child(
         return False
     from .issue_pr_handoff import authenticate_canonical_issue_pr
 
-    authenticated = authenticate_canonical_issue_pr(
-        runner, config=config, issue_number=issue_number, issue_context=issue_context
-    )
+    try:
+        authenticated = authenticate_canonical_issue_pr(
+            runner, config=config, issue_number=issue_number, issue_context=issue_context
+        )
+    except AgentLoopError:
+        # Not an authenticated MERGED handoff: the ordinary resume path owns
+        # (and reports) every other canonical-handoff problem unchanged.
+        return False
     if authenticated is None or authenticated.state != "MERGED":
         return False
     outcome = close_child_after_integration_merge(
