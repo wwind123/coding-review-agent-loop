@@ -4002,3 +4002,40 @@ def test_broker_clamped_direct_pytest_records_the_exact_post_policy_argv(tmp_pat
     (observation,) = runner.local_test_observations()
     assert observation.command == tuple(requested)
     assert list(observation.executed_command) == expected
+
+
+def _fake_node_and_npm(tmp_path):
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    npm_ran = tmp_path / "npm-ran"
+    for name, body in (("node", "exit 0"), ("npm", f"touch {npm_ran}; exit 0")):
+        fake = bindir / name
+        fake.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        fake.chmod(0o755)
+    return npm_ran, {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+
+
+@pytest.mark.parametrize(
+    "tokens_over",
+    [0, 1],
+    ids=["at-the-item-limit", "one-item-over-the-limit"],
+)
+def test_broker_to_cli_executed_argv_is_complete_or_the_script_is_not_adopted(tmp_path, tokens_over):
+    _git_checkout(tmp_path)
+    npm_ran, env = _fake_node_and_npm(tmp_path)
+    files = [f"t{index}.js" for index in range(254 + tokens_over)]
+    body_tokens = ["node", "--test", *files]
+    _package_json(tmp_path, {"big": " ".join(body_tokens)})
+    runner, result, row, log = _brokered_run_tests(tmp_path, ["npm", "run", "big"], extra_env=env)
+    assert result.returncode == 0, log
+    (observation,) = runner.local_test_observations()
+    if tokens_over == 0:
+        # Fits the bounded transport: the full launched argv is recorded.
+        assert not npm_ran.exists()
+        assert row["executed_argv"] == body_tokens
+        assert list(observation.executed_command) == body_tokens
+    else:
+        # Not representable: never adopted, so npm runs and nothing is truncated.
+        assert npm_ran.exists()
+        assert row["executed_argv"] == ["npm", "run", "big"]
+        assert list(observation.executed_command) == ["npm", "run", "big"]

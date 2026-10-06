@@ -199,3 +199,55 @@ def test_recommendation_cohorts_follow_the_resolved_package_script(tmp_path):
     assert _expected_worker_cohorts(config, ["npm", "run", "test:py"]) == ["3", "serial"]
     # A discarded body falls back to today's cohorts for the original command.
     assert _expected_worker_cohorts(config, ["npm", "run", "test:j"]) == ["unknown"]
+
+
+# --- executed-argv transport bounds (issue #1294) ------------------------------
+
+_FILES = [f"t{index}.js" for index in range(400)]
+
+
+def _node_script(count=0, *, wide=None):
+    parts = ["node", "--test", *_FILES[:count]]
+    if wide is not None:
+        parts += ["w" * wide[1]] * wide[0]
+    return " ".join(parts)
+
+
+@pytest.mark.parametrize(
+    "body_kwargs,fits",
+    [
+        ({"count": 254}, True),            # exactly the 256-item limit
+        ({"count": 255}, False),           # one item over
+        ({"wide": (1, 8 * 1024)}, True),   # exactly the per-item byte limit
+        ({"wide": (1, 8 * 1024 + 1)}, False),
+        ({"wide": (4, 8 * 1024 - 100)}, True),   # 4 * 8092 + small < 32 KiB
+        ({"wide": (5, 8 * 1024 - 100)}, False),  # total bytes over 32 KiB
+    ],
+)
+def test_adoption_refuses_resolved_argv_that_exceeds_the_transport_bounds(tmp_path, body_kwargs, fits):
+    from coding_review_agent_loop.test_runtime import argv_is_transportable
+
+    _package(tmp_path, {"big": _node_script(**body_kwargs)})
+    adopted = runtime.resolve_adopted_package_script(["npm", "run", "big"], cwd=tmp_path)
+    assert (adopted is not None) is fits
+    if adopted is not None:
+        assert argv_is_transportable(adopted.executed_argv)
+
+
+def test_runner_refuses_before_spawn_when_worker_policy_grows_the_argv_past_the_bounds(tmp_path, monkeypatch):
+    from coding_review_agent_loop import runner as runner_module
+
+    bindir = _fake_pytest(tmp_path)
+    marker = tmp_path / "spawned"
+    (bindir / "pytest").write_text(f"#!/bin/sh\n[ \"$1\" = \"--version\" ] || touch {marker}\nexit 0\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    # 255 resolved tokens fit, but clamp-mode policy injects ``-p <plugin>``.
+    _package(tmp_path, {"t": "pytest " + " ".join(_FILES[:254])})
+    resolution = runtime.resolve_adopted_package_script(["npm", "run", "t"], cwd=tmp_path)
+    assert resolution is not None and len(resolution.executed_argv) == 255
+    result = runner_module.run_foreground_test(
+        ["npm", "run", "t"], cwd=tmp_path, timeout_seconds=60, echo_output=False,
+        worker_budget=_budget("clamp"), worker_lock_root=tmp_path / "locks",
+    )
+    assert result.outcome == "launch-failed"
+    assert not marker.exists()

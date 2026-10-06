@@ -2498,6 +2498,26 @@ _YARN_BUILTIN_COMMANDS = frozenset({
     "constraints", "bin", "start", "test", "stop", "restart",
 })
 _PACKAGE_JSON_MAX_BYTES = 1024 * 1024
+# Bounds of the broker request and response argv.  The executed argv of an
+# adopted package script travels back through the response, so a resolved argv
+# that does not fit must never be adopted: it would be silently truncated.
+EXECUTED_ARGV_MAX_ITEMS = 256
+EXECUTED_ARGV_MAX_TOTAL_BYTES = 32 * 1024
+EXECUTED_ARGV_MAX_ITEM_BYTES = 8 * 1024
+
+
+def argv_is_transportable(argv: Sequence[str]) -> bool:
+    """Whether ``argv`` survives the bounded broker argv transport losslessly."""
+    items = [str(item) for item in argv]
+    if not items or len(items) > EXECUTED_ARGV_MAX_ITEMS:
+        return False
+    total = 0
+    for item in items:
+        size = len(item.encode("utf-8", errors="replace"))
+        if size > EXECUTED_ARGV_MAX_ITEM_BYTES:
+            return False
+        total += size
+    return total <= EXECUTED_ARGV_MAX_TOTAL_BYTES
 _PACKAGE_BODY_FORBIDDEN_CHARS = frozenset(";&|<>$`\\()*?[]{}!#~%\r\n")
 _PACKAGE_BODY_FORBIDDEN_HEADS = frozenset({"env", "npm", "pnpm", "yarn", "cross-env"})
 _ASSIGNMENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
@@ -2647,6 +2667,8 @@ def adopt_package_script(
 ) -> PackageScriptResolution | None:
     """Return ``resolution`` only if its resolved argv is a recognized launcher."""
     if not isinstance(resolution, PackageScriptResolution):
+        return None
+    if not argv_is_transportable(resolution.executed_argv):
         return None
     values: Mapping[str, str] = environment if environment is not None else os.environ
     if _recognized_inner_probe_with_environment(

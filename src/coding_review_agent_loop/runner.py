@@ -37,6 +37,7 @@ from .test_runtime import (
     SUITE_START_STATES,
     WRAPPER_BOOTSTRAP_STATES,
     acquire_command_lane,
+    argv_is_transportable,
     probe_inner_launcher,
     resolve_adopted_package_script,
 )
@@ -704,6 +705,20 @@ def _run_foreground_test_body(
         if package_script is not None:
             # An adopted resolution never spawns the package manager.
             assert launch_cmd, "adopted package script has no launch argv"
+            if not argv_is_transportable(launch_cmd):
+                # Worker policy or launcher rebinding grew the argv past what the
+                # bounded executed-argv transport can carry losslessly: refuse
+                # before spawning rather than record a truncated executed argv.
+                reason = "resolved package-script argv exceeds the executed-argv transport bounds"
+                if handle is not None:
+                    handle.close()
+                lane_lock.close()
+                return ForegroundTestResult(
+                    cmd, cwd, "launch-failed", None, time.monotonic() - started,
+                    timeout_seconds, reason, None, False,
+                    wrapper_bootstrap, "failed", "not-started", reason,
+                    health_provenance,
+                )
             adopted_spawn = list(launch_cmd)
         pass_fds: tuple[int, ...] = ()
         if parent_cgroup_path is not None:
