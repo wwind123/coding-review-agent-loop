@@ -19702,3 +19702,49 @@ def test_incomplete_rest_page_that_omits_a_recovery_record_stops_before_any_agen
         run_pr_loop(runner, pr_number=77, config=config)
     assert _agent_order_1292(runner) == []  # no coder, no reviewer, no ordinary fallback
     assert _records_1292(runner, "head-review-recovery") == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["legacy-anchor", "operator-budget-checkpoint", "dispatch-and-rejection"],
+)
+def test_rest_page_omitting_any_record_recovery_depends_on_stops_before_any_agent_call(tmp_path, case):
+    """Generalizes the omitted-handoff rule to checkpoint anchors and budget sources."""
+    prelaunch = _meta_1292("summary", "scheduler-prelaunch", round_number=2, items=(_item_1292(),))
+    flag = False
+    if case == "legacy-anchor":
+        records, omit = [*_history_1292(), _checkpoint_1292()], 2
+    elif case == "operator-budget-checkpoint":
+        used = dataclasses.replace(
+            _checkpoint_1292(),
+            qualification_checkpoint=QualificationCheckpoint(
+                obligation_kind="managed-exact-head-ci", obligation_identity="ci",
+                lifecycle="repair_required", failed_head_sha=_A_1292, candidate_head_sha=None,
+                allowed_rounds=5, watch_failure_extension_used=True, watch_head_extension_used=False,
+            ),
+        )
+        records, omit, flag = [*_history_1292(), used, prelaunch], 2, True
+    else:
+        records = [
+            *_history_1292(), _dispatch_1292(),
+            _rejection_1292(attempt=2, subject=_B_1292, reason="again",
+                            carried_rejection_reasons=("first",)),
+        ]
+        omit = 3
+    runner = _stranded_runner_1292(records, _B_1292)
+    original = runner.run
+
+    def omitting_run(cmd, *args, **kwargs):
+        result = original(cmd, *args, **kwargs)
+        if cmd[:2] == ["gh", "api"] and "/comments?per_page=" in cmd[2] and "&since=" not in cmd[2]:
+            page = json.loads(result.stdout)
+            del page[omit]  # a successful page that lacks the needed record
+            return CommandResult(cmd, result.cwd, json.dumps(page), "", 0)
+        return result
+
+    runner.run = omitting_run
+    config = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=flag)
+    with pytest.raises(AgentLoopError, match="cannot be authenticated"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _agent_order_1292(runner) == []
+    assert _records_1292(runner, "head-review-recovery") == []

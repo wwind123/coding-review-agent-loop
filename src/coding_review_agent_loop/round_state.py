@@ -4105,18 +4105,37 @@ def _admit_recovery_records(
     )
 
 
-def unauthenticated_recovery_record_indexes(comments: Sequence[object]) -> tuple[int, ...]:
-    """Indexes of recovery-phase records whose comment carries no author identity.
+def unauthenticated_recovery_record_indexes(
+    comments: Sequence[object],
+    head_sha: str | None = None,
+    review_unrecorded_head: bool = False,
+) -> tuple[int, ...]:
+    """Indexes of records recovery depends on whose comment has no author identity.
 
-    After the REST identity merge every comment that was matched has a numeric
-    author ID.  A recovery record left without one was not covered by the REST
-    read (a page omitted it), so it can be neither admitted nor ruled out.
+    After the REST identity merge every matched comment has a numeric author ID.
+    A needed record left without one was not covered by the REST read (a page
+    omitted it), so it can be neither admitted nor ruled out as another
+    author's.  Needed records are: every recovery-phase record; the legacy
+    qualification-checkpoint anchor of a head that has no records of its own;
+    and, under ``--review-unrecorded-head``, every checkpoint (a budget source).
     """
+    records = _extract_round_metadata_records(comments, flow="pr")
+    needed: set[int] = set()
+    for record in records:
+        phase = record.metadata.phase
+        if phase in RECOVERY_RECORD_PHASES:
+            needed.add(record.index)
+        elif phase == "qualification-checkpoint" and review_unrecorded_head:
+            needed.add(record.index)
+    if head_sha and records and not any(r.metadata.subject == head_sha for r in records):
+        prior = [r for r in records if r.metadata.phase != CODER_DISPATCH_PHASE]
+        if prior and prior[-1].metadata.phase == "qualification-checkpoint":
+            needed.add(prior[-1].index)
     return tuple(
-        record.index
-        for record in _extract_round_metadata_records(comments, flow="pr")
-        if record.metadata.phase in RECOVERY_RECORD_PHASES
-        and getattr(comments[record.index], "author_id", None) is None
+        sorted(
+            index for index in needed
+            if getattr(comments[index], "author_id", None) is None
+        )
     )
 
 

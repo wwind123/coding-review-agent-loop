@@ -2175,7 +2175,9 @@ def _resume_pr_round_admitted(
         comments = merge_pr_comment_transport_identity(
             runner, config=config, pr_number=pr_number, comments=tuple(comments)  # type: ignore[arg-type]
         )
-        missing = unauthenticated_recovery_record_indexes(comments)
+        missing = unauthenticated_recovery_record_indexes(
+            comments, head_sha, config.review_unrecorded_head
+        )
         if missing:
             raise AgentLoopError(
                 "PR recovery records cannot be authenticated: the REST comment read did not "
