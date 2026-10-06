@@ -6811,3 +6811,44 @@ def test_plain_node_hint_requires_a_verbatim_projection_signal():
     assert "node --test tests/test_x.js" in _node_test_hint(
         {"command": "node tests/test_x.js", "command_verbatim": True}
     )
+
+
+def _reask_text(command):
+    from coding_review_agent_loop.architecture_contract import _evidence_rejection_reask_prompt
+
+    message = _node_hint_rejection(command)
+    return message, _evidence_rejection_reask_prompt("PROMPT", message)
+
+
+def test_plain_node_hint_is_omitted_for_a_filename_the_reask_rendering_would_alter():
+    # Consecutive spaces would collapse in the re-ask prompt into a different file.
+    message, rendered = _reask_text(("node", "tests/my  test.js"))
+    assert "node --test" not in message and "node --test" not in rendered
+    message, rendered = _reask_text(("node", "tests/my test.js"))
+    assert "node --test 'tests/my test.js'" in rendered
+
+
+@pytest.mark.parametrize("length", [100, 300, 400, 440, 460, 480, 500])
+def test_plain_node_hint_never_reaches_the_coder_truncated_or_altered(length):
+    name = "tests/" + "a" * length + "_test.js"
+    message, rendered = _reask_text(("node", name))
+    if "node --test" in rendered:
+        # Shown only when the complete, unaltered rerun command fits the re-ask cap.
+        assert f"node --test {name}" in rendered
+        assert "..." not in rendered.split("test evidence")[1]
+    else:
+        assert "node --test" not in message
+
+
+def test_plain_node_hint_is_omitted_when_the_whole_message_would_exceed_the_reask_cap():
+    from coding_review_agent_loop.protocol import EVIDENCE_REASK_MAX_CHARS
+
+    # A verbatim, relative, test-like path long enough that the message plus the
+    # hint cannot fit the cap: no hint and no truncated rerun command.
+    for length in range(380, 520, 4):
+        name = "tests/" + "a" * length + "_test.js"
+        message, rendered = _reask_text(("node", name))
+        if f"node --test {name}" not in message:
+            assert "node --test" not in rendered
+            return
+    pytest.fail("no length reached the cap; widen the range")

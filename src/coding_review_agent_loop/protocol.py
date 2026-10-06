@@ -3206,7 +3206,23 @@ _NODE_HINT_FILE_RE = re.compile(r"[A-Za-z0-9 ._/@+,=-]+")
 _NODE_HINT_EXTENSIONS = (".js", ".mjs", ".cjs", ".ts")
 
 
-def _node_test_hint(observation: object) -> str:
+EVIDENCE_REASK_MAX_CHARS = 1500
+
+
+def render_evidence_rejection_detail(detail: str) -> str:
+    """The exact text the evidence re-ask prompt quotes for a rejection detail.
+
+    Single definition shared with the re-ask renderer, so anything validated
+    against it reaches the coder unaltered: markers neutralized, whitespace runs
+    collapsed, and the whole detail capped.
+    """
+    quoted = " ".join(sanitize_historical_text(detail).replace("<", "(").replace(">", ")").split())
+    if len(quoted) > EVIDENCE_REASK_MAX_CHARS:
+        quoted = quoted[: EVIDENCE_REASK_MAX_CHARS - 3] + "..."
+    return quoted
+
+
+def _node_test_hint(observation: object, message: str = "") -> str:
     """Name the verifiable ``node --test <file>`` spelling, or nothing (#1294).
 
     Derived only from the redacted projection, and only when the projection
@@ -3258,9 +3274,14 @@ def _node_test_hint(observation: object) -> str:
         "To make it citable, re-run it through run-tests as: "
         f"{rerun} (a standalone script counts as one runner test that passes only if it exits 0)."
     )
-    # Emit only a sentence the final sanitizer leaves untouched, so an altered
-    # or truncated rerun command can never reach the coder.
+    # Emit only a sentence that reaches the coder unaltered: it must survive the
+    # label sanitizer AND the re-ask rendering (whitespace collapsing and the
+    # whole-message cap) after the message that precedes it, so an altered,
+    # collapsed or truncated rerun command is never shown.
     if _safe_label(sentence, MAX_SAFE_COMMAND_BYTES * 2) != sentence:
+        return ""
+    rendered = render_evidence_rejection_detail(message + " " + sentence)
+    if not rendered.endswith(sentence):
         return ""
     return " " + sentence
 
@@ -4707,14 +4728,17 @@ def _parse_semantic_risk_coverage_claims(
                         reason="non-passing-selector",
                     )
                 if not _known_launch_integrity_passes(observation):
-                    raise NonRepairableEvidenceRejection(  # shape-check: fatal:authority-decision
+                    launch_integrity_message = (
                         f"{refs_context} selector `{ref}` has known non-authoritative "
                         "launch-integrity state and cannot be selected before authentication: "
                         f"{'; '.join(_launch_integrity_failure_reasons(observation))}; "
                         f"command: {_observation_command_label(observation)}; "
                         f"observed at {_observation_timestamp_label(observation)}. "
                         "Cite a different observation whose launch was fully verified."
-                        + _node_test_hint(observation),
+                    )
+                    raise NonRepairableEvidenceRejection(  # shape-check: fatal:authority-decision
+                        launch_integrity_message
+                        + _node_test_hint(observation, launch_integrity_message),
                         reason="launch-integrity",
                     )
         # Then the first degradable defect wins, in a fixed order, so every
