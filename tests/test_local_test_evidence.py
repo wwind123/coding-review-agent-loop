@@ -2,6 +2,7 @@ import json
 import os
 import hashlib
 import hmac
+import shutil
 import socket
 import sys
 import subprocess
@@ -3760,3 +3761,171 @@ def test_handshake_failure_without_a_stop_is_still_an_error(tmp_path, monkeypatc
         assert reader.final["type"] == "error"  # not a shutdown: a real launch failure
     finally:
         server.stop()
+
+
+# --- brokered package-script runs (issue #1294) -------------------------------
+
+
+def _package_json(root, scripts):
+    (root / "package.json").write_text(json.dumps({"scripts": scripts}), encoding="utf-8")
+
+
+def _brokered_run_tests(tmp_path, argv, *, workers=2, mode="clamp", extra_env=None):
+    """Run ``agent-loop run-tests -- <argv>`` inside a real broker-owning runner."""
+    runner = _runner_with_budget(tmp_path, workers, mode)
+    memory = tmp_path / ".memory"
+    script = (
+        "import sys; from coding_review_agent_loop.cli import main; "
+        f"raise SystemExit(main(['run-tests','--timeout-seconds','60','--memory-dir',{str(memory)!r},'--',"
+        + ",".join(repr(item) for item in argv) + "]))"
+    )
+    result = runner.run_with_log(
+        [sys.executable, "-c", script], cwd=tmp_path, log_path=tmp_path / "coder.log",
+        label="coder", progress_interval_seconds=1, env={**_src_env(), **(extra_env or {})},
+    )
+    from coding_review_agent_loop import test_runtime as runtime
+
+    rows = runtime.load_runtime_memory(memory)
+    return runner, result, (rows[-1] if rows else None), (tmp_path / "coder.log").read_text()
+
+
+def _fake_playwright_and_npm(tmp_path):
+    local = tmp_path / "node_modules" / ".bin" / "playwright"
+    local.parent.mkdir(parents=True)
+    local.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    local.chmod(0o755)
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    sentinel = tmp_path / "npm-ran"
+    fake = bindir / "npm"
+    fake.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+    return local, sentinel, {"PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"}
+
+
+def test_broker_adopted_playwright_script_agrees_across_result_row_and_observation(tmp_path):
+    from coding_review_agent_loop.local_test_evidence import observation_from_mapping
+    from coding_review_agent_loop.response_validation import _admissible_evidence_observations
+
+    _git_checkout(tmp_path)
+    local, sentinel, env = _fake_playwright_and_npm(tmp_path)
+    _package_json(tmp_path, {"test:x": "npx playwright test --project=a"})
+    runner, result, row, log = _brokered_run_tests(
+        tmp_path, ["npm", "run", "test:x"], extra_env=env
+    )
+    assert result.returncode == 0, log
+    assert not sentinel.exists()
+    expected = [str(local), "test", "--project=a"]
+    assert row["lane"] == "broker"
+    assert row["launch_integrity"] == "verified"
+    assert row["executed_argv"] == expected
+    assert row["normalized_command"].startswith("npm run test:x")
+    (observation,) = runner.local_test_observations()
+    assert observation.command == ("npm", "run", "test:x")
+    assert list(observation.executed_command) == expected
+    assert "executed_command" not in observation.public_projection()
+    # Catalog path: the live row is selectable, its restored mapping is not.
+    assert _admissible_evidence_observations(
+        [observation], assigned_workdir=tmp_path, selectable=True
+    ) == (observation,)
+    restored = observation_from_mapping(observation.public_projection())
+    assert _admissible_evidence_observations(
+        [restored], assigned_workdir=tmp_path, selectable=True
+    ) == ()
+
+
+@pytest.mark.skipif(not _HAS_XDIST, reason="pytest-xdist is not installed")
+@pytest.mark.parametrize("serial", [False, True])
+def test_broker_adopted_pytest_script_gets_direct_pytest_worker_policy(tmp_path, serial):
+    from coding_review_agent_loop import test_runtime as runtime
+    from coding_review_agent_loop.test_workers import row_workers_label
+
+    _git_checkout(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n', encoding="utf-8"
+    )
+    (tmp_path / "test_cases.py").write_text("def test_a():\n    pass\n\ndef test_b():\n    pass\n", encoding="utf-8")
+    body = f"{sys.executable} -m pytest -p no:cacheprovider -q -p no:_agent_loop_worker_cap"
+    body += " -n 0 test_cases.py" if serial else " test_cases.py"
+    _package_json(tmp_path, {"test:py": body})
+    runner, result, row, log = _brokered_run_tests(tmp_path, ["npm", "run", "test:py"])
+    assert result.returncode == 0, log
+    assert row["lane"] == "broker"
+    assert row["normalized_command"].startswith("npm run test:py")
+    assert row["executed_argv"][0] == sys.executable
+    assert "npm" not in row["executed_argv"]
+    assert "no:_agent_loop_worker_cap" not in row["executed_argv"]
+    assert row_workers_label(row) == ("serial" if serial else "2")
+    (observation,) = runner.local_test_observations()
+    assert list(observation.executed_command) == row["executed_argv"]
+
+
+def test_broker_adopted_script_operands_outside_checkout_are_context_or_unselectable(tmp_path):
+    from coding_review_agent_loop.local_test_evidence import (
+        OUT_OF_CHECKOUT_CONTEXT_CAVEAT,
+        mark_out_of_checkout_context,
+    )
+    from coding_review_agent_loop.response_validation import _admissible_evidence_observations
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _git_checkout(checkout)
+    (outside / "test_o.py").write_text("def test_o():\n    pass\n", encoding="utf-8")
+    (checkout / "test_i.py").write_text("def test_i():\n    pass\n", encoding="utf-8")
+    base = f"{sys.executable} -m pytest -p no:cacheprovider -q"
+    _package_json(checkout, {
+        "outside": f"{base} {outside / 'test_o.py'}",
+        "mixed": f"{base} {outside / 'test_o.py'} test_i.py",
+        "inside": f"{base} test_i.py",
+    })
+    labels = {}
+    for name in ("outside", "mixed", "inside"):
+        runner, _result, _row, _log = _brokered_run_tests(
+            checkout, ["npm", "run", name], workers=2, mode="off"
+        )
+        (observation,) = runner.local_test_observations()
+        (marked,) = mark_out_of_checkout_context([observation], assigned_workdir=checkout)
+        selectable = _admissible_evidence_observations(
+            [marked], assigned_workdir=checkout, selectable=True
+        )
+        labels[name] = (OUT_OF_CHECKOUT_CONTEXT_CAVEAT in marked.caveats, bool(selectable))
+        shutil.rmtree(checkout / ".memory", ignore_errors=True)
+    assert labels == {"outside": (True, False), "mixed": (False, False), "inside": (False, True)}
+
+
+def test_in_process_broker_resolves_package_json_once_and_freezes_the_argv(tmp_path, monkeypatch):
+    from coding_review_agent_loop import test_runtime as runtime
+
+    _git_checkout(tmp_path)
+    monkeypatch.delenv("AGENT_LOOP_INVOCATION_ID", raising=False)
+    local, sentinel, env = _fake_playwright_and_npm(tmp_path)
+    monkeypatch.setenv("PATH", env["PATH"])
+    _package_json(tmp_path, {"test:x": "npx playwright test --project=a"})
+    reads = []
+    original = runtime._read_package_scripts
+
+    def mutate_after_read(cwd):
+        scripts = original(cwd)
+        reads.append(cwd)
+        _package_json(tmp_path, {"test:x": "npx playwright test --project=b"})
+        return scripts
+
+    monkeypatch.setattr(runtime, "_read_package_scripts", mutate_after_read)
+    server = BrokerServer(root=tmp_path, turn_id="turn-frozen").start()
+    try:
+        request = _signed_broker_request(
+            server, tmp_path, "c" * 32, argv=["npm", "run", "test:x"]
+        )
+        request["environment"] = {"PATH": env["PATH"]}
+        response = _raw_broker_request(server, request)
+    finally:
+        server.stop()
+    assert response.get("outcome") == "passed", response
+    assert len(reads) == 1
+    assert not sentinel.exists()
+    assert response["executed_argv"] == [str(local), "test", "--project=a"]
+    (observation,) = server.journal
+    assert observation.command == ("npm", "run", "test:x")
+    assert list(observation.executed_command) == response["executed_argv"]

@@ -2879,3 +2879,90 @@ def test_cli_run_tests_records_npm_run_as_verified_evidence(tmp_path, monkeypatc
     _write_package(tmp_path, {"test:x": "npx playwright test --project=b"})
     assert row["input_manifest"] != runtime.build_input_manifest(["npm", "run", "test:x"], tmp_path)
 
+
+
+@pytest.mark.parametrize("alias", ["pypy3", "py", "python3.99", "custom-runner"])
+def test_any_bare_head_shadowed_by_local_bin_fails_closed(tmp_path, no_ambient_invocation, alias):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    _write_package(sub, {"t": f"{alias} -m pytest tests/"})
+    assert isinstance(runtime.resolve_package_script(["npm", "run", "t"], cwd=sub), runtime.PackageScriptResolution)
+    shadow = tmp_path / "node_modules" / ".bin" / alias
+    shadow.parent.mkdir(parents=True)
+    shadow.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert runtime.resolve_package_script(["npm", "run", "t"], cwd=sub) is None
+    assert runtime.recognized_inner_probe(["npm", "run", "t"], cwd=sub) is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["npm", "run", "t"], ["pnpm", "run", "t"], ["yarn", "run", "t"], ["yarn", "t"]],
+)
+@pytest.mark.parametrize("body", ["playwright test --project=a", "npx playwright test --project=a"])
+def test_foreground_every_manager_launches_the_local_playwright_never_the_manager(
+    tmp_path, monkeypatch, no_ambient_invocation, argv, body
+):
+    from coding_review_agent_loop import runner as runner_module
+
+    launcher = _fake_playwright(tmp_path)
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    sentinels = []
+    for manager in ("npm", "pnpm", "yarn"):
+        fake = bindir / manager
+        sentinel = tmp_path / f"{manager}-ran"
+        sentinels.append(sentinel)
+        fake.write_text(f"#!/bin/sh\ntouch {sentinel}\nexit 0\n", encoding="utf-8")
+        fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    _write_package(tmp_path, {"t": body})
+    result = runner_module.run_foreground_test(argv, cwd=tmp_path, timeout_seconds=60, echo_output=False)
+    assert result.suite_start == "verified"
+    assert runtime.launch_integrity_state(result, wrapper_boundary=False) == "verified"
+    assert list(result.args) == [str(launcher), "test", "--project=a"]
+    assert not any(sentinel.exists() for sentinel in sentinels)
+
+
+@requires_system_env
+def test_package_script_env_prefix_keeps_distinct_identity_and_binding(tmp_path, monkeypatch, no_ambient_invocation):
+    launcher = _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"t": "npx playwright test"})
+    _verified_probe(monkeypatch)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "pkg-env-1294")
+    results = {}
+    for round_name in ("fresh", "cached"):
+        for value in ("1", "2"):
+            argv = ["env", f"A={value}", "npm", "run", "t"]
+            resolution = runtime.resolve_adopted_package_script(argv, cwd=tmp_path)
+            assert resolution is not None
+            result = runtime.probe_inner_launcher(
+                resolution.executed_argv, cwd=tmp_path, package_script=resolution
+            )
+            assert result.state == "verified"
+            assert result.candidate == tuple(argv)
+            assert result.launch_argv[1:] == (f"A={value}", str(launcher), "test")
+            results[(round_name, value)] = result
+    assert results[("fresh", "1")].identity != results[("fresh", "2")].identity
+    assert results[("cached", "1")].identity == results[("fresh", "1")].identity
+
+
+def test_cli_run_tests_resolves_package_json_exactly_once(tmp_path, monkeypatch, no_ambient_invocation):
+    launcher = _fake_playwright(tmp_path)
+    _write_package(tmp_path, {"test:x": "npx playwright test --project=a"})
+    reads = []
+    original = runtime._read_package_scripts
+
+    def mutate_after_read(cwd):
+        scripts = original(cwd)
+        reads.append(cwd)
+        _write_package(tmp_path, {"test:x": "npx playwright test --project=b"})
+        return scripts
+
+    monkeypatch.setattr(runtime, "_read_package_scripts", mutate_after_read)
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    monkeypatch.chdir(tmp_path)
+    assert main(["run-tests", "--timeout-seconds", "60", "--memory-dir", str(memory), "--", "npm", "run", "test:x"]) == 0
+    assert len(reads) == 1
+    row = runtime.load_runtime_memory(memory)[-1]
+    assert row["executed_argv"] == [str(launcher), "test", "--project=a"]

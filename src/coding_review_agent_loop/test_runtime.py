@@ -2501,7 +2501,6 @@ _PACKAGE_JSON_MAX_BYTES = 1024 * 1024
 _PACKAGE_BODY_FORBIDDEN_CHARS = frozenset(";&|<>$`\\()*?[]{}!#~%\r\n")
 _PACKAGE_BODY_FORBIDDEN_HEADS = frozenset({"env", "npm", "pnpm", "yarn", "cross-env"})
 _ASSIGNMENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
-_PATH_SHADOWED_HEADS = frozenset({"node", "nodejs", "pytest", "py.test"})
 
 
 @dataclass(frozen=True)
@@ -2624,9 +2623,11 @@ def resolve_package_script(
         if not local.is_file():
             return None
         tokens[0] = str(local)
-    elif tokens[0] in _PATH_SHADOWED_HEADS or tokens[0].startswith("python"):
-        if "/" not in tokens[0] and _node_modules_bin_shadowed(tokens[0], cwd):
-            return None
+    elif "/" not in tokens[0] and _node_modules_bin_shadowed(tokens[0], cwd):
+        # npm prepends every node_modules/.bin up the tree to PATH, so any bare
+        # executable (including interpreter aliases such as pypy3 or py) may be
+        # shadowed by a binary the PATH lookup cannot reproduce.
+        return None
     return PackageScriptResolution(
         requested_argv=requested,
         manager=manager,
