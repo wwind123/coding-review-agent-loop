@@ -5926,10 +5926,11 @@ def test_publish_manual_rejects_adopted_pr_whose_draft_is_not_exactly_false(
             payload["draft"] = draft_value
         return payload
 
-    # PR reads: 0 stale-label cleanup, 1 initial guard, 2 pre-record re-read.
+    # PR reads: 0 stale-label cleanup, 1 initial guard, 2 recorded-base guard,
+    # 3 pre-record re-read.
     runner = PublicationRunner(
         rest_pr={"draft": False},
-        pr_overrides={1 if stage == "initial-guard" else 2: with_draft},
+        pr_overrides={1 if stage == "initial-guard" else 3: with_draft},
     )
 
     with pytest.raises(AgentLoopError, match="changed before manual qualification publication"):
@@ -5996,12 +5997,12 @@ def test_publish_manual_readiness_failure_releases_owned_label(tmp_path):
 
 
 def test_publish_manual_post_ready_verification_failure_releases_owned_label(tmp_path):
-    # PR read 2 follows `gh pr ready`; a drifted head there fails verification.
+    # PR read 3 follows `gh pr ready`; a drifted head there fails verification.
     def drifted(payload):
         payload["head"] = dict(payload["head"], sha="other")
         return payload
 
-    runner = PublicationRunner(pr_overrides={2: drifted})
+    runner = PublicationRunner(pr_overrides={3: drifted})
 
     with pytest.raises(AgentLoopError, match="changed while being made ready"):
         _publish(runner, tmp_path)

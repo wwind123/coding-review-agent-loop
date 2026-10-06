@@ -44,6 +44,7 @@ from .github import (
     WrittenProtocolComment,
 )
 from .logging import log
+from .managed_ci_bases import base_is_trusted
 from . import github_retry
 from .github_retry import (
     DEFAULT_POLICY,
@@ -94,6 +95,11 @@ VISIBLE_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1"
 # comment body (#1043).
 HOST_FOOTER_INTENT_MARKER = "AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1"
 UNPROTECTED_OVERRIDE_TRAILER = "AGENT_MANAGED_CI_UNPROTECTED_OVERRIDE_V1"
+# Default-branch workflows advertise trusted integration-base support with this
+# literal; the allow-list itself is the AGENT_LOOP_TRUSTED_BASES repository
+# variable, which a PR cannot change (#1285).
+TRUSTED_BASES_MARKER = "AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1"
+TRUSTED_BASES_VARIABLE = "AGENT_LOOP_TRUSTED_BASES"
 ISSUE_AUTHORIZATION_MARKER = "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1"
 _TERMINAL_CI_STATUSES = frozenset({
     "success", "failure", "error", "cancelled", "timed_out",
@@ -265,6 +271,9 @@ class ManagedCiContract:
     workflow_file: str = WORKFLOW_FILE
     protocol_version: int = 1
     base_ref: str | None = None
+    # The managed workflow is always read, revision-bound and dispatched on the
+    # default branch; ``base_ref`` is the PR's real (possibly integration) base.
+    dispatch_ref: str | None = None
     trusted_actor_login: str | None = None
     trusted_actor_id: int | None = None
     workflow_revision: str | None = None
@@ -802,7 +811,7 @@ def activate_managed_ci(
     if not config.effective_managed_ci or config.dry_run:
         return None
 
-    workflow_ref = metadata.base_branch or config.base
+    workflow_ref = _workflow_source_ref(runner, config, metadata.base_branch or config.base)
     workflow_endpoint = f"repos/{config.repo}/contents/.github/workflows/{WORKFLOW_FILE}"
     if workflow_ref:
         workflow_endpoint += f"?ref={workflow_ref}"
@@ -1039,12 +1048,19 @@ def _http_status(result: object) -> int | None:
 def _read_managed_actor_variable(
     runner: Runner, gh_cmd: str, repo: str, cwd: Path
 ) -> ManagedActorVariable:
-    """Classify the ``AGENT_LOOP_MANAGED_ACTOR`` read for every identity check.
+    """Classify the ``AGENT_LOOP_MANAGED_ACTOR`` read for every identity check."""
+    return _read_actions_variable(runner, gh_cmd, repo, cwd, "AGENT_LOOP_MANAGED_ACTOR")
+
+
+def _read_actions_variable(
+    runner: Runner, gh_cmd: str, repo: str, cwd: Path, name: str
+) -> ManagedActorVariable:
+    """Classify one repository Actions variable read.
 
     A strict HTTP 403 is checked before the legacy 404 text match, so a
     refused read whose body happens to mention 404 is never "absent".
     """
-    endpoint = f"repos/{repo}/actions/variables/AGENT_LOOP_MANAGED_ACTOR"
+    endpoint = f"repos/{repo}/actions/variables/{name}"
     result = runner.run([gh_cmd, "api", endpoint], cwd=cwd, check=False)
     if result.returncode == 0:
         try:
@@ -1374,7 +1390,9 @@ def evaluate_managed_ci_readiness(
     if not resolved_base:
         return ManagedCiReadiness("indeterminate", visibility, None, None, False, False,
             ProtectionAssessment("indeterminate", "none", "base branch unavailable"), ("base branch is unavailable",), ())
-    workflow, workflow_result = _probe_raw_workflow(runner, context, resolved_base)
+    default_branch = repo.get("default_branch") if isinstance(repo.get("default_branch"), str) else None
+    workflow_ref = default_branch or resolved_base
+    workflow, workflow_result = _probe_raw_workflow(runner, context, workflow_ref)
     if workflow is None:
         if _is_http_error(workflow_result, 404):
             return ManagedCiReadiness(
@@ -1388,6 +1406,18 @@ def evaluate_managed_ci_readiness(
             "indeterminate", visibility, None, None, False, False,
             ProtectionAssessment("indeterminate", "none", "base workflow could not be read"),
             ("a required read-only GitHub probe failed",), (), resolved_base,
+        )
+    base_problem = trusted_base_problem(
+        runner, gh_cmd=context.gh_cmd, repo=context.repo, cwd=context.cwd, base=resolved_base,
+        default_branch=default_branch, workflow_text=workflow,
+    )
+    if base_problem is not None:
+        return ManagedCiReadiness(
+            "invalid", visibility, None, None, False, False,
+            ProtectionAssessment("indeterminate", "none", "base is not a trusted managed-CI target"),
+            (base_problem,),
+            (f"add the base to the {TRUSTED_BASES_VARIABLE} repository variable, or use the default branch",),
+            resolved_base,
         )
     who, _ = _probe_json(runner, context, "user")
     variable = _read_managed_actor_variable(runner, context.gh_cmd, context.repo, context.cwd)
@@ -1488,7 +1518,9 @@ def preflight_managed_ci_creation(
     if not config.effective_managed_ci or config.dry_run or not config.managed_ci_trusted_actor or not config.base:
         return None
     source_context = ManagedCiProbeContext(config.repo, config.gh_cmd, active_workdir(config))
-    source_workflow, _ = _probe_raw_workflow(runner, source_context, config.base)
+    source_workflow, _ = _probe_raw_workflow(
+        runner, source_context, _workflow_source_ref(runner, config, config.base)
+    )
     if source_workflow is None or V2_MARKER not in source_workflow:
         if config.managed_ci:
             raise AgentLoopError(
@@ -5496,11 +5528,12 @@ def _activate_v2_managed_ci(
     base_ref = metadata.base_branch or config.base
     if not base_ref:
         return None
+    dispatch_ref = _workflow_source_ref(runner, config, base_ref)
     base_workflow = runner.run(
         [
             config.gh_cmd,
             "api",
-            f"repos/{config.repo}/contents/.github/workflows/{WORKFLOW_FILE}?ref={base_ref}",
+            f"repos/{config.repo}/contents/.github/workflows/{WORKFLOW_FILE}?ref={dispatch_ref}",
             "-H",
             "Accept: application/vnd.github.raw+json",
         ],
@@ -5512,6 +5545,12 @@ def _activate_v2_managed_ci(
     workflow_text = base_workflow.stdout or ""
     if any(marker not in workflow_text for marker in V2_FEATURE_MARKERS):
         raise AgentLoopError("The base branch does not contain the complete managed-CI v2 workflow.")
+    base_problem = trusted_base_problem(
+        runner, gh_cmd=config.gh_cmd, repo=config.repo, cwd=github_api_cwd(), base=base_ref,
+        default_branch=dispatch_ref, workflow_text=workflow_text,
+    )
+    if base_problem is not None:
+        raise AgentLoopError(f"Managed CI cannot target this PR's base: {base_problem}.")
     ordinary_recovery_capable = (
         RECOVERY_MARKER in workflow_text and "pull_request" in workflow_text and "unlabeled" in workflow_text
     )
@@ -6135,7 +6174,7 @@ def _activate_v2_managed_ci(
                     return _ordinary_fallback_contract(runner, config=config, pr_number=pr_number, context=context, recovery=recovery)
             else:
                 audit_id = None
-        workflow_revision = _api_json(runner, config, f"repos/{config.repo}/commits/{base_ref}", quiet=True)
+        workflow_revision = _api_json(runner, config, f"repos/{config.repo}/commits/{dispatch_ref}", quiet=True)
         revision = workflow_revision.get("sha") if isinstance(workflow_revision.get("sha"), str) else None
         # Every v2 activation is generation-scoped.  ``auto_merge`` is an implicit
         # managed-CI request, so it must mint the same producer field as explicit
@@ -6150,6 +6189,7 @@ def _activate_v2_managed_ci(
         return ManagedCiContract(
             protocol_version=2,
             base_ref=base_ref,
+            dispatch_ref=dispatch_ref,
             trusted_actor_login=actor_login,
             trusted_actor_id=actor_id,
             workflow_revision=revision,
@@ -6592,8 +6632,9 @@ def _activate_v2_existing_pr_adoption(
     base_ref = metadata.base_branch or config.base
     if not base_ref:
         return None
+    dispatch_ref = _workflow_source_ref(runner, config, base_ref)
     workflow = runner.run(
-        [config.gh_cmd, "api", f"repos/{config.repo}/contents/.github/workflows/{WORKFLOW_FILE}?ref={base_ref}",
+        [config.gh_cmd, "api", f"repos/{config.repo}/contents/.github/workflows/{WORKFLOW_FILE}?ref={dispatch_ref}",
          "-H", "Accept: application/vnd.github.raw+json"],
         cwd=active_workdir(config), check=False,
     )
@@ -6603,6 +6644,11 @@ def _activate_v2_existing_pr_adoption(
     # Incomplete optional adoption advertisement is unsupported rather than a
     # reason to break the existing issue-created v2 route.
     if any(marker not in source for marker in (*V2_FEATURE_MARKERS, *V2_ADOPTION_FEATURE_MARKERS)):
+        return None
+    if trusted_base_problem(
+        runner, gh_cmd=config.gh_cmd, repo=config.repo, cwd=github_api_cwd(), base=base_ref,
+        default_branch=dispatch_ref, workflow_text=source,
+    ) is not None:
         return None
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
     head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
@@ -6671,10 +6717,10 @@ def _activate_v2_existing_pr_adoption(
                 + provisional.release_diagnostic
             )
         return None
-    revision = _api_json(runner, config, f"repos/{config.repo}/commits/{base_ref}", quiet=True).get("sha")
+    revision = _api_json(runner, config, f"repos/{config.repo}/commits/{dispatch_ref}", quiet=True).get("sha")
     log(config, f"PR #{pr_number}: activated authenticated managed exact-head CI v2 adoption")
     return ManagedCiContract(
-        protocol_version=2, base_ref=base_ref, trusted_actor_login=actor_login,
+        protocol_version=2, base_ref=base_ref, dispatch_ref=dispatch_ref, trusted_actor_login=actor_login,
         trusted_actor_id=actor_id, workflow_revision=revision if isinstance(revision, str) else None,
         adopted_existing_pr=True, guard_head_sha=live_sha, active_label_event_id=existing[0],
         invocation_applied_label=applied,
@@ -6991,6 +7037,11 @@ def _publish_manual_v2_qualification(
         or (contract.adopted_existing_pr and guard.get("draft") is not False)
     ):
         raise AgentLoopError(not_published)
+    require_recorded_base(
+        runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
+        repository=contract.repository or config.repo, head_sha=expected_head_sha,
+        action="manual qualification",
+    )
     _verify_manual_qualification_label_provenance(
         runner, config=config, pr_number=pr_number, contract=contract,
     )
@@ -7021,6 +7072,11 @@ def _publish_manual_v2_qualification(
         runner, config=config, pr_number=pr_number, contract=contract,
     )
 
+    require_recorded_base(
+        runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
+        repository=contract.repository or config.repo, head_sha=expected_head_sha,
+        action="manual qualification record",
+    )
     run_text = str(contract.attached_run_id) if contract.attached_run_id is not None else "unknown"
     attempt_text = str(contract.run_attempt) if contract.run_attempt is not None else "unknown"
     reviewer_text = ",".join(reviewers) or "unknown"
@@ -7113,6 +7169,177 @@ def release_retained_managed_label(
         "ordinary CI resumes and the run continues as ready/unlabeled",
     )
     return True
+
+
+def _workflow_source_ref(runner: Runner, config: AgentLoopConfig, fallback: str | None) -> str | None:
+    """The branch the trusted managed workflow is read from and dispatched on.
+
+    Always the live default branch, never the PR's integration base, so a
+    branch cannot supply the workflow that qualifies it (#1285).  When the
+    default branch cannot be read the caller's own ref is used, which keeps
+    default-branch behavior unchanged; the hosted validator and the
+    trusted-base checks remain the authority for anything else.
+    """
+    return _read_repo_default_branch(runner, config.gh_cmd, config.repo, github_api_cwd()) or fallback
+
+
+def _contract_dispatch_ref(runner: Runner, config: AgentLoopConfig, contract: ManagedCiContract) -> str:
+    """Resolve the dispatch ref, failing closed for a legacy non-default contract."""
+    if contract.dispatch_ref:
+        return contract.dispatch_ref
+    default_branch = _read_repo_default_branch(runner, config.gh_cmd, config.repo, github_api_cwd())
+    base = contract.base_ref
+    if default_branch is None or base is None or base != default_branch:
+        raise AgentLoopError(
+            "The managed-CI contract carries no default-branch dispatch ref and its base "
+            f"{base!r} is not the default branch; the workflow is never dispatched from a "
+            "non-default ref. Rerun agent-loop on the PR so a fresh contract is authorized."
+        )
+    contract.dispatch_ref = default_branch
+    return default_branch
+
+
+def _read_repo_default_branch(runner: Runner, gh_cmd: str, repo: str, cwd: Path) -> str | None:
+    """The live default branch, or ``None`` when it cannot be established."""
+    result = runner.run([gh_cmd, "api", f"repos/{repo}"], cwd=cwd, check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    value = payload.get("default_branch") if isinstance(payload, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def trusted_base_problem(
+    runner: Runner,
+    *,
+    gh_cmd: str,
+    repo: str,
+    cwd: Path,
+    base: str | None,
+    default_branch: str | None,
+    workflow_text: str | None = None,
+    require_marker: bool = True,
+) -> str | None:
+    """Why ``base`` cannot be a managed-CI target, or ``None`` when it can.
+
+    The default branch is always allowed.  Any other base needs the default
+    branch workflow to advertise trusted-base support and the repository
+    variable to allow-list it; an unreadable variable never grants trust.
+    """
+    if not base or not default_branch or base == default_branch:
+        return None
+    if require_marker and (workflow_text is None or TRUSTED_BASES_MARKER not in workflow_text):
+        return (
+            f"base {base!r} is not the default branch {default_branch!r} and the default-branch "
+            f"workflow does not advertise {TRUSTED_BASES_MARKER}; managed CI into an integration "
+            f"branch needs the reusable managed-CI workflow with {TRUSTED_BASES_VARIABLE} support"
+        )
+    variable = _read_actions_variable(runner, gh_cmd, repo, cwd, TRUSTED_BASES_VARIABLE)
+    if variable.status in {"unreadable", "error"}:
+        return (
+            f"base {base!r} cannot be verified: the {TRUSTED_BASES_VARIABLE} repository variable "
+            f"could not be read ({variable.detail}); trust is never assumed on a read failure"
+        )
+    value = variable.value if variable.status == "readable" and variable.value else ""
+    if not base_is_trusted(base, default_branch, value):
+        listed = f"currently {value!r}" if value.strip() else "currently unset"
+        return (
+            f"base {base!r} is not the default branch {default_branch!r} and is not trusted by "
+            f"the {TRUSTED_BASES_VARIABLE} repository variable ({listed}; an unset or invalid "
+            "variable trusts the default branch only)"
+        )
+    return None
+
+
+def enforce_trusted_base_at_startup(runner: Runner, config: AgentLoopConfig) -> None:
+    """Refuse an untrusted integration ``--base`` before any agent work (#1285).
+
+    Default-branch runs and runs without managed CI are never affected.
+    """
+    if not config.effective_managed_ci or config.dry_run or not config.base:
+        return
+    cwd = github_api_cwd()
+    default_branch = _read_repo_default_branch(runner, config.gh_cmd, config.repo, cwd)
+    if default_branch is None or default_branch == config.base:
+        return
+    workflow, _ = _probe_raw_workflow(
+        runner, ManagedCiProbeContext(config.repo, config.gh_cmd, cwd), default_branch
+    )
+    problem = trusted_base_problem(
+        runner, gh_cmd=config.gh_cmd, repo=config.repo, cwd=cwd, base=config.base,
+        default_branch=default_branch, workflow_text=workflow,
+    )
+    if problem:
+        raise AgentLoopError(
+            f"Managed CI refuses --base {config.base!r}: {problem}. No review cycle was spent. "
+            f"Ask the repository owner to add the base to the {TRUSTED_BASES_VARIABLE} repository "
+            "variable (exact names or `prefix/*`), or use the default branch."
+        )
+
+
+def require_recorded_base(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    base_ref: str | None,
+    repository: str | None,
+    head_sha: str | None,
+    action: str,
+) -> None:
+    """Re-read the live PR tuple and refuse when the recorded base drifted.
+
+    Qualification is bound to the repository, base and head it was granted
+    for.  On a retarget, a revoked allow-list entry or a moved head the
+    qualified label is released and the caller must re-qualify.  GitHub's
+    merge API guards only the head SHA, so a retarget between this read and
+    the merge call is narrowed but cannot be excluded atomically.
+    """
+    if not base_ref:
+        return
+    pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True)
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    base_repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    problem: str | None = None
+    if not pr:
+        problem = "the live pull request could not be read"
+    elif base.get("ref") != base_ref:
+        problem = f"the live base {base.get('ref')!r} differs from the qualified base {base_ref!r}"
+    elif (
+        isinstance(base_repo.get("full_name"), str)
+        and base_repo["full_name"].casefold() != (repository or config.repo).casefold()
+    ):
+        problem = "the live base repository differs from the qualified repository"
+    elif head_sha is not None and head.get("sha") != head_sha:
+        problem = "the live head differs from the qualified head"
+    else:
+        default_branch = _read_repo_default_branch(
+            runner, config.gh_cmd, config.repo, github_api_cwd()
+        )
+        if default_branch is None:
+            problem = "the repository default branch could not be read"
+        else:
+            problem = trusted_base_problem(
+                runner, gh_cmd=config.gh_cmd, repo=config.repo, cwd=github_api_cwd(),
+                base=base_ref, default_branch=default_branch, require_marker=False,
+            )
+    if problem is None:
+        return
+    released = _label_remove(
+        runner, config=config, pr_number=pr_number, label_name=QUALIFIED_LABEL
+    ).result
+    suffix = (
+        "" if released.returncode == 0
+        else f" The `{QUALIFIED_LABEL}` label could not be released.{failure_suffix(released)}"
+    )
+    raise AgentLoopError(
+        f"PR #{pr_number} {action} refused: {problem}. Qualification is invalidated; "
+        f"re-qualify the exact head before merging.{suffix}"
+    )
 
 
 def _api_json(runner: Runner, config: AgentLoopConfig, endpoint: str, *, quiet: bool = False) -> dict[str, object]:
@@ -7282,8 +7509,9 @@ def _dispatch_v2_qualification(
     """
     if not contract.base_ref or not contract.trusted_actor_login or contract.trusted_actor_id is None:
         raise AgentLoopError("Managed-CI v2 contract is missing authenticated dispatch provenance.")
+    dispatch_ref = _contract_dispatch_ref(runner, config, contract)
     current_base = _api_json(
-        runner, config, f"repos/{config.repo}/commits/{contract.base_ref}", quiet=True
+        runner, config, f"repos/{config.repo}/commits/{dispatch_ref}", quiet=True
     ).get("sha")
     if (
         contract.workflow_revision
@@ -7374,7 +7602,7 @@ def _dispatch_v2_qualification(
                 "POST",
                 f"repos/{config.repo}/actions/workflows/{contract.workflow_file}/dispatches",
                 "-f",
-                f"ref={contract.base_ref}",
+                f"ref={_contract_dispatch_ref(runner, config, contract)}",
                 "-f",
                 "inputs[protocol_version]=2",
                 "-f",
@@ -8346,7 +8574,8 @@ def _is_v2_intent_run(
     path = run.get("path")
     if isinstance(path, str) and f".github/workflows/{WORKFLOW_FILE}" not in path:
         return False
-    if isinstance(run.get("head_branch"), str) and contract.base_ref and run["head_branch"] != contract.base_ref:
+    run_ref = contract.dispatch_ref or contract.base_ref
+    if isinstance(run.get("head_branch"), str) and run_ref and run["head_branch"] != run_ref:
         return False
     if isinstance(run.get("head_sha"), str) and contract.workflow_revision and run["head_sha"] != contract.workflow_revision:
         return False
@@ -8699,6 +8928,11 @@ def prepare_v2_merge(
     """Publish continuity before readying the PR, then re-check its exact head."""
     if contract.protocol_version != 2:
         return
+    require_recorded_base(
+        runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
+        repository=contract.repository or config.repo, head_sha=expected_head_sha,
+        action="readiness for merge",
+    )
     labelled = _label_add(
         runner, config=config, pr_number=pr_number, label_name=QUALIFIED_LABEL
     ).result
@@ -8708,6 +8942,11 @@ def prepare_v2_merge(
         )
     pr = _api_json(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     if pr.get("draft") is True:
+        require_recorded_base(
+            runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
+            repository=contract.repository or config.repo, head_sha=expected_head_sha,
+            action="ready-for-review transition",
+        )
         ready = reconciled_pr_ready(
             runner, config=config, pr_number=pr_number, expected_head_sha=expected_head_sha,
         )

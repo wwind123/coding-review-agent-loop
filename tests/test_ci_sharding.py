@@ -25,8 +25,7 @@ TESTS_DIR = Path(__file__).parent
 ROOT = TESTS_DIR.parent
 CALLEE_DIR = ROOT / "ci" / "managed"
 # The plugin and verifier are owned by the reusable workflow (ci/managed), not
-# by this repository's tests.  The tests directory still holds transition shims
-# under the same module names, so the verifier is loaded by path.
+# by this repository's tests; the verifier is loaded by path.
 if str(CALLEE_DIR) not in sys.path:
     sys.path.append(str(CALLEE_DIR))
 import ci_shard_plugin as _ci_shard  # noqa: E402
@@ -84,7 +83,9 @@ def test_exactly_once_guard_rejects_overlap_and_gaps():
 
 
 def test_real_collection_is_covered_exactly_once(request):
-    full = request.config.stash[_ci_shard._FULL_KEY]
+    # The plugin is injected by the reusable workflow (``-p ci_shard_plugin``);
+    # an ordinary local run never loads it, so there is no recorded collection.
+    full = request.config.stash.get(_ci_shard._FULL_KEY, None)
     if not full:
         pytest.skip("collection not recorded in this process")
     assert full
@@ -685,113 +686,11 @@ def test_unsharded_workflow_command_is_still_detected_as_parallel():
 
 def test_committed_durations_cover_most_of_the_real_collection(request):
     durations = json.loads((TESTS_DIR / ".test_durations").read_text())
-    full = request.config.stash[_ci_shard._FULL_KEY]
+    full = request.config.stash.get(_ci_shard._FULL_KEY, None) or []
     if len(full) < 1000:
         pytest.skip("only meaningful when the whole suite is collected")
     known = sum(1 for i in full if i in durations)
     assert known / len(full) > 0.9, "refresh tests/.test_durations (see README)"
-
-
-# --------------------------------------------------------------------------
-# Stage-A transition compatibility: old workflow (shim only), new callee
-# (injection only), and both at once
-# --------------------------------------------------------------------------
-
-SHIM_CONFTEST = 'pytest_plugins = ["_ci_shard"]\n'
-PLUGIN_COUNT_CONFTEST = """
-import json
-import os
-import pytest
-
-pytest_plugins = ["_ci_shard"]
-
-
-def pytest_sessionfinish(session):
-    manager = session.config.pluginmanager
-    count = sum(1 for p in manager.get_plugins() if getattr(p, "__name__", "") == "ci_shard_plugin")
-    names = sorted(n for n, p in manager.list_name_plugin() if getattr(p, "__name__", "") == "ci_shard_plugin")
-    with open(os.environ["PLUGIN_COUNT_FILE"], "a") as handle:
-        handle.write(json.dumps({"count": count, "names": names}) + "\\n")
-"""
-
-
-@pytest.fixture
-def transition_env(monkeypatch):
-    # Both directories, like the repository (tests/) plus the injected callee.
-    monkeypatch.setenv(
-        "PYTHONPATH",
-        os.pathsep.join([str(TESTS_DIR), str(CALLEE_DIR), _INSTALL_DIRS, os.environ.get("PYTHONPATH", "")]),
-    )
-    monkeypatch.setenv("GITHUB_RUN_ID", RUN_ID)
-
-
-@pytest.mark.parametrize("mode", ["old-workflow-shim-only", "new-callee-injection-only", "injection-and-shim"])
-def test_stage_a_head_writes_one_verifiable_manifest_per_leg_in_every_mode(
-    pytester, transition_env, monkeypatch, tmp_path, mode
-):
-    if mode == "new-callee-injection-only":
-        pytester.makeconftest("")
-        extra = ["-p", "ci_shard_plugin"]
-    elif mode == "old-workflow-shim-only":
-        pytester.makeconftest(PLUGIN_COUNT_CONFTEST)
-        extra = []
-    else:
-        pytester.makeconftest(PLUGIN_COUNT_CONFTEST)
-        extra = ["-p", "ci_shard_plugin"]
-    pytester.makepyfile(test_suite=SUITE)
-    counts = tmp_path / "count.jsonl"
-    monkeypatch.setenv("PLUGIN_COUNT_FILE", str(counts))
-    manifests = tmp_path / "manifests"
-    for index in (1, 2, 3):
-        monkeypatch.setenv("CI_SHARD_INDEX", str(index))
-        monkeypatch.setenv("CI_SHARD_COUNT", "3")
-        monkeypatch.setenv("CI_SHARD_MANIFEST", str(manifests / f"m{index}" / "manifest.json"))
-        result = pytester.runpytest_subprocess(*extra, "-q")
-        assert result.ret in (0, 5), result.stdout.str() + result.stderr.str()
-    written = sorted(manifests.glob("*/manifest.json"))
-    assert len(written) == 3
-    for path in written:
-        data = json.loads(path.read_text())
-        assert tuple(sorted(data)) == tuple(sorted(ci_shard_verify.MANIFEST_FIELDS))
-        assert data["schema_version"] == 1
-    # The unchanged schema is accepted by the verifier; the shim's CLI (the
-    # historical import path) agrees with the callee-owned one.
-    head = json.loads(written[0].read_text())["head_sha"]
-    for verifier in (VERIFIER, TESTS_DIR / "ci_shard_verify.py"):
-        done = subprocess.run(
-            [sys.executable, str(verifier), str(manifests), "--count", "3", "--head", head,
-             "--run-id", RUN_ID, "--result", "success"],
-            capture_output=True, text=True,
-        )
-        assert done.returncode == 0, done.stderr
-    if counts.exists():
-        for line in counts.read_text().splitlines():
-            recorded = json.loads(line)
-            assert recorded["count"] == 1 and recorded["names"] == ["ci_shard_plugin"], recorded
-
-
-def test_shim_defaults_to_the_committed_durations_but_explicit_file_wins(monkeypatch, tmp_path):
-    import _ci_shard as shim
-
-    assert shim._plugin is _ci_shard
-    assert _ci_shard.DEFAULT_DURATIONS == TESTS_DIR / ".test_durations"
-    explicit = tmp_path / "d.json"
-    explicit.write_text('{"x": 5.0}')
-    assert _ci_shard._load_durations(explicit) == {"x": 5.0}
-    assert _ci_shard._load_durations() == _ci_shard._load_durations(TESTS_DIR / ".test_durations")
-    config = _ci_shard.parse_env({"CI_SHARD_DURATIONS": str(explicit)})
-    assert config.durations == str(explicit)
-
-
-def test_shim_exports_no_pytest_hooks_or_fixtures():
-    import _ci_shard as shim
-
-    leaked = [
-        name for name, value in vars(shim).items()
-        if name.startswith("pytest_") and name != "pytest_configure"
-    ]
-    assert leaked == []
-    assert not hasattr(shim, "_scrub_ci_shard_environment")
 
 
 def test_callee_files_depend_only_on_the_standard_library_and_pytest():

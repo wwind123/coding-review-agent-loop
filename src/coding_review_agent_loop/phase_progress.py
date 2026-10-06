@@ -40,6 +40,7 @@ from .github import (
     resolve_authenticated_github_actor,
     strip_bot_login_suffix,
 )
+from .integration_close import close_child_after_integration_merge
 from .issue_pr_handoff import authenticate_canonical_issue_pr
 from .protocol import ExecutionAllocation
 from .protocol_markers import TrustedBody
@@ -303,6 +304,16 @@ def _resolve_agent_phase(
             just_merged, child_issue_number=child_issue_number, pr_number=pr_number
         ):
             return STATUS_COMPLETE, child_state, pr_number, pr_state
+        if (
+            pr_state == "MERGED"
+            and pr_number is not None
+            and close_child_after_integration_merge(
+                runner, config=config, issue_context=child_context, pr_number=pr_number
+            ) in {"closed", "already-closed"}
+        ):
+            # An authenticated MERGED non-default-base PR whose child was left
+            # open by an interrupted completion: closure retried, no merge replay.
+            return STATUS_COMPLETE, "CLOSED", pr_number, pr_state
         raise AgentLoopError(
             f"Issue #{parent_issue} phase {phase_index} (`{stage_id}`) child issue "
             f"#{child_issue_number} is OPEN but its canonical implementation PR "

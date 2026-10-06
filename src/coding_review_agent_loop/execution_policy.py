@@ -52,6 +52,7 @@ from .decomposition import (
 from .protocol import EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING
 from .child_topology import NeedsHumanDecision, parent_child_search_queries
 from .errors import AgentLoopError
+from .integration_close import require_child_closed_or_report
 from .github import (
     _REST_ISSUE_COMMENT_PAGE_SIZE,
     strip_bot_login_suffix,
@@ -1087,6 +1088,11 @@ def _record_staged_parent_completion_after_merge(
     rerun that records it, never raised.
     """
     if issue_context is None or config.dry_run:
+        return
+    # GitHub closes a child only for a default-branch merge (#1285).
+    if not require_child_closed_or_report(
+        runner, config=config, issue_context=issue_context, pr_number=pr_number
+    ):
         return
     parent_issue: int | None = None
     try:

@@ -13047,6 +13047,7 @@ class _M1047LivePrRunner(_FakeRunner):
             "draft": draft,
             "labels": [{"name": name} for name in labels],
             "head": {"sha": self.pr_payload.get("headRefOid")},
+            "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}},
         }
         self.events = [{
             "id": 101, "event": "labeled", "label": {"name": "agent-loop-managed"},

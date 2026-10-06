@@ -2,7 +2,7 @@
 
 Source repository: wwind123/coding-review-agent-loop
 Source commit: b9be3320a11ae9bb610d027e07565e35ef82c0a2
-Source block SHA-256: c2d8ae24ef07872a6a8fe1ddc54bb76157710788fcffb154e2f80136fbec693b
+Source block SHA-256: 8dfe7a469409adc30826a683a927ec266eb7f91f2a4901ddb925f4da37cf4b49
 Source path: .github/workflows/managed-ci.yml
 Extraction boundary: ``validate_dispatch`` through its return value.
 The contract tests invoke this copy with offline API callbacks and compare its
@@ -27,6 +27,7 @@ def validate_dispatch(
     *, protocol, pr_number_text, expected_head, nonce, repo, ref,
     configured_actor, initiating_actor, rerun_actor, current_run_id,
     current_run_attempt, current_time, api_json, api_pages, validate,
+    trusted_bases='',
 ):
     if not (
         protocol == '2'
@@ -94,6 +95,7 @@ def validate_dispatch(
     record = validate(
         pr, pages, repo, pr_number_text, expected_head, nonce,
         live_login, revision, live_id, default_branch=default_branch,
+        trusted_bases=trusted_bases,
     )
     intent_age = current_time - record['created_at']
     if intent_age > MAX_INTENT_AGE_SECONDS:

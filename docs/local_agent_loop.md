@@ -4175,15 +4175,107 @@ context fails closed), and every leg runs `ci/managed/run_shard.py`, which
 injects `ci_shard_plugin` with `-p`. With `shards: 1` the command runs unchanged
 and only the literal result gate applies. The reusable jobs surface as
 `ci / ...` and `managed / ...` checks, so a branch-protection rule that
-requires the old bare check names must be updated at rollout. Until the default
-branch itself runs the reusable workflow, `tests/_ci_shard.py` and
-`tests/ci_shard_verify.py` remain as transition shims for the installed
-workflow. The publisher writes `final-ci/exact-head` only for
+requires the old bare check names must be updated at rollout. The default
+branch now is the reusable workflow's caller, so the stage-A transition shims
+(`tests/_ci_shard.py`, `tests/ci_shard_verify.py`) are gone: the plugin is only
+ever injected by `ci/managed/run_shard.py`. The publisher writes `final-ci/exact-head` only for
 that validated SHA and correlates its terminal description and Actions URL to
 the managed nonce, run ID, and current attempt. It writes nothing when
 authorization fails before a target exists, and publishes failure when
 checkout or tests fail. Pushes to `main` and ordinary manual dispatch remain
 full-suite paths.
+
+#### Trusted integration bases (`AGENT_LOOP_TRUSTED_BASES`)
+
+Risky multi-PR work can run on an integration branch with the full managed-CI
+guarantees (CI only after every reviewer approved, exact-head testing, the
+trusted `final-ci/exact-head` gate for auto-merge), not only PRs into the
+default branch. The repository owner declares the allowed integration bases in
+the `AGENT_LOOP_TRUSTED_BASES` Actions variable: whitespace- or
+comma-separated entries, each an exact branch name (`refactor/1181`) or a
+`prefix/*` pattern (`refactor/*`, which matches `refactor/1181` and
+`refactor/a/b` but not `refactor` or `refactorx/1`). Anything else (`*`, `**`,
+embedded wildcards, invalid ref names) makes the whole variable invalid. An
+unset or invalid variable trusts the default branch only, which is the behavior
+without the variable.
+
+```bash
+gh variable set AGENT_LOOP_TRUSTED_BASES --repo OWNER/REPO --body 'refactor/*'
+```
+
+Trust model:
+
+- The workflow always executes from the default branch, and the intent's
+  `workflow_revision` stays bound to the default-branch head. The tool reads
+  `ci.yml`, the workflow revision and the dispatch ref from the default branch
+  whatever `--base` is; the signed intent records the PR's real base in
+  `base_ref`.
+- The validator accepts a dispatch only when the live PR base equals the
+  intent's `base_ref` and that base is the default branch or matches
+  `AGENT_LOOP_TRUSTED_BASES`. The variable is read by the called workflow from
+  repository settings, never from a workflow input, so a PR cannot edit it or
+  the reusable workflow to qualify itself.
+- `--base` that is neither the default branch nor trusted is refused at startup
+  (and by `agent-loop managed-ci preflight --base X`) with a message naming
+  `AGENT_LOOP_TRUSTED_BASES`, before any agent or review cycle. An unreadable
+  variable, or a default-branch workflow without the
+  `AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1` marker, also refuses a non-default
+  base; neither affects default-branch runs.
+- Auto-merge and manual qualification re-read the live repository, base and
+  head and re-check trust before readying the PR, before publishing a manual
+  qualification record and before merging. A retarget, revoked allow-list entry
+  or moved head refuses, releases the qualified label and requires
+  re-qualification. Residual race: GitHub's merge API guards only the head SHA,
+  so a retarget between the final check and the merge call is narrowed but not
+  excluded atomically.
+- GitHub closes a closing-referenced issue only on a default-branch merge, so
+  after a confirmed merge into a trusted non-default base agent-loop closes the
+  child issue with a comment naming the PR and base. If the merge succeeded but
+  the close was interrupted, a later run (or the staged parent's
+  `phase_progress`) authenticates the MERGED PR and retries the closure without
+  replaying the merge, and reports unresolved closure instead of claiming the
+  stage complete.
+
+Known limitation: the workflow comes from the default branch, so CI-level
+changes that exist only on the integration branch (new jobs or steps in
+`ci.yml`) do not apply to its PRs until they land on the default branch. Test
+code and test infrastructure at the PR head do apply, because the workflow
+checks out and runs the exact head. Ordinary `pull_request` CI for an
+integration-base PR is not suppressed and is never the trusted gate.
+
+Adopting the reusable workflow in another project: call both entry points from
+a thin `ci.yml`, pinned to a commit SHA (put the tag in a comment, tags are
+mutable), keep the caller permissions below, set `AGENT_LOOP_MANAGED_ACTOR`
+and, for integration branches, `AGENT_LOOP_TRUSTED_BASES`:
+
+```yaml
+jobs:
+  ci:
+    permissions:
+      contents: read
+    uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci-ordinary.yml@<sha> # v1
+    with:
+      test_command: python -m pytest -n auto
+  managed:
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: write
+    uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci.yml@<sha> # v1
+    with:
+      protocol_version: ${{ inputs.protocol_version }}
+      pr_number: ${{ inputs.pr_number }}
+      expected_head_sha: ${{ inputs.expected_head_sha }}
+      managed_nonce: ${{ inputs.managed_nonce }}
+      test_command: python -m pytest -n auto
+```
+
+The caller also keeps the `workflow_dispatch` input declarations, `run-name`
+and the literal readiness markers, including
+`AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1`. The callee takes no trusted-bases or
+actor input.
 
 For this sole-maintainer repository, install and qualify the workflow before
 using managed CI: set `AGENT_LOOP_MANAGED_ACTOR` to `wwind123`, authenticate

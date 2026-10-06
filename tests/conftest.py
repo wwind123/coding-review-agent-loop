@@ -140,9 +140,6 @@ def _isolate_store_locks(tmp_path_factory):
     run_worktrees._set_store_lock_root_for_tests(None)
 
 
-pytest_plugins = ["_ci_shard"]
-
-
 class _InertRoundPublication:
     """Stands in for a freeze/resume hook when a fake runner models no actor surface."""
 

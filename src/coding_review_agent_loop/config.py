@@ -819,6 +819,22 @@ def resolve_base_branch(
     pr_metadata: PullRequestMetadata | None = None,
     cwd: Path | None = None,
 ) -> AgentLoopConfig:
+    resolved = _resolve_base_branch(config, runner, pr_metadata=pr_metadata, cwd=cwd)
+    # Startup gate (#1285): a non-default managed-CI base must be allow-listed
+    # by AGENT_LOOP_TRUSTED_BASES before any agent work or workdir setup.
+    from .managed_ci import enforce_trusted_base_at_startup
+
+    enforce_trusted_base_at_startup(runner, resolved)
+    return resolved
+
+
+def _resolve_base_branch(
+    config: AgentLoopConfig,
+    runner: Runner,
+    *,
+    pr_metadata: PullRequestMetadata | None = None,
+    cwd: Path | None = None,
+) -> AgentLoopConfig:
     explicit_base = (config.base or "").strip()
     live_pr_base = (pr_metadata.base_branch or "").strip() if pr_metadata is not None else ""
 
