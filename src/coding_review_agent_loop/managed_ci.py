@@ -7171,20 +7171,20 @@ def release_retained_managed_label(
     return True
 
 
-def _workflow_source_ref(runner: Runner, config: AgentLoopConfig, fallback: str | None) -> str | None:
+def _workflow_source_ref(runner: Runner, config: AgentLoopConfig, requested_base: str | None) -> str:
     """The branch the trusted managed workflow is read from and dispatched on.
 
     Always the live default branch, never the PR's integration base, so a
-    branch cannot supply the workflow that qualifies it (#1285).  When the
-    default branch cannot be read the caller's own ref is used, which keeps
-    default-branch behavior unchanged; the hosted validator and the
-    trusted-base checks remain the authority for anything else.
+    branch cannot supply the workflow that qualifies it (#1285).  Fail-closed:
+    when the default branch cannot be read this raises ``AgentLoopError`` and
+    never substitutes ``requested_base`` (or any other branch), which is only
+    named in the error message.
     """
     default_branch = _read_repo_default_branch(runner, config.gh_cmd, config.repo, github_api_cwd())
     if default_branch is None:
         raise AgentLoopError(
             f"The default branch of {config.repo} could not be read, so the trusted managed-CI "
-            f"workflow source cannot be established (base {fallback!r} is never used as a "
+            f"workflow source cannot be established (base {requested_base!r} is never used as a "
             "substitute). Retry once repository metadata is readable."
         )
     return default_branch
