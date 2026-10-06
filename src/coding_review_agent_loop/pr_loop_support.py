@@ -55,6 +55,7 @@ from .github import (
     parse_linked_issue_numbers,
     get_pr_review_context,
     merge_pr,
+    merge_pr_comment_transport_identity,
     post_pr_comment,
     resolve_authenticated_github_actor,
 )
@@ -125,6 +126,15 @@ from .round_state import (
     scope_approved_plan_matrix,
     recover_approved_plan_context,
     _resume_pr_round,
+    CODER_DISPATCH_PHASE,
+    CODER_FOLLOWUP_REJECTED_PHASE,
+    HEAD_REVIEW_RECOVERY_PHASE,
+    RecoveryRoundBudget,
+    ResumedReviewRound,
+    _recovery_record_problems,
+    pr_resume_needs_author_admission,
+    unauthenticated_recovery_record_indexes,
+    sanitize_recovery_reason,
 )
 from .protocol_markers import (
     TrustedBody,
@@ -2142,6 +2152,257 @@ def _persist_qualification_checkpoint(
     )
 
 
+def _resume_pr_round_admitted(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    comments: Sequence[object],
+    head_sha: str | None,
+    configured_reviewers: Sequence[AgentName],
+    reconciliation_mode: str = "aggregate",
+) -> ResumedReviewRound | None:
+    """Resume a PR round, admitting recovery records only from the authenticated actor.
+
+    REST identities and the actor are fetched only when a recovery record, a
+    head advance, or ``--review-unrecorded-head`` makes admission necessary; an
+    incomplete read stops here, before any agent call.
+    """
+    trusted_actor: tuple[str, int] | None = None
+    if not config.dry_run and pr_resume_needs_author_admission(
+        comments, head_sha, config.review_unrecorded_head
+    ):
+        comments = merge_pr_comment_transport_identity(
+            runner, config=config, pr_number=pr_number, comments=tuple(comments)  # type: ignore[arg-type]
+        )
+        missing = unauthenticated_recovery_record_indexes(
+            comments, head_sha, config.review_unrecorded_head
+        )
+        if missing:
+            raise AgentLoopError(
+                "PR recovery records cannot be authenticated: the REST comment read did not "
+                f"cover recovery record(s) at comment index {', '.join(map(str, missing))}; "
+                "rerun once the complete comment history is readable."
+            )
+        trusted_actor = resolve_authenticated_github_actor(runner, config=config)
+    return _resume_pr_round(
+        comments,
+        head_sha=head_sha,
+        configured_reviewers=configured_reviewers,
+        reconciliation_mode=reconciliation_mode,
+        trusted_actor=trusted_actor,
+        review_unrecorded_head=config.review_unrecorded_head,
+    )
+
+
+def _cached_trusted_actor(runner: Runner) -> tuple[str, int] | None:
+    cached = getattr(runner, "_agent_loop_authenticated_actor", None)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        return cached
+    return None
+
+
+def _post_recovery_record(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    message: str,
+    metadata: PostedRoundMetadata,
+) -> None:
+    # Writer-side assertion: a record this process posts must pass its own
+    # per-phase structural validation, or recovery would refuse it later.
+    problems = _recovery_record_problems(metadata)
+    if problems:
+        raise AgentLoopError(
+            f"Refusing to post a malformed {metadata.phase} record: {', '.join(problems)}."
+        )
+    post_pr_comment(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        body=_attach_round_metadata(message, metadata),
+    )
+
+
+def _persist_coder_dispatch(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    dispatch_round: int,
+    dispatch_head: str | None,
+    ledger: Sequence[UnresolvedReviewItem],
+    budget: RecoveryRoundBudget,
+    attempt: int,
+    carried_reasons: Sequence[str] = (),
+) -> None:
+    """Record the slot, ledger, budget and attempt before a coder is dispatched."""
+    if not dispatch_head or dispatch_head == "unknown":
+        raise AgentLoopError(
+            f"PR #{pr_number}: the PR head is unknown, so the coder dispatch cannot be recorded; "
+            "no coder was dispatched."
+        )
+    _post_recovery_record(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        message=(
+            f"PR #{pr_number} coder dispatch record: round {dispatch_round}, attempt {attempt}, "
+            f"head `{dispatch_head}`. Written before the coder is invoked so an interrupted "
+            "or rejected turn can be resumed."
+        ),
+        metadata=PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=dispatch_round + 1,
+            subject=dispatch_head,
+            prior_items=tuple(ledger),
+            state="blocking",
+            phase=CODER_DISPATCH_PHASE,
+            dispatch_round=dispatch_round,
+            dispatch_head=dispatch_head,
+            dispatch_attempt=attempt,
+            recovery_dispatch=attempt > 1,
+            carried_rejection_reasons=tuple(carried_reasons),
+            recovery_round_budget=budget,
+            **_architecture_metadata_fields(config),
+        ),
+    )
+
+
+def _persist_rejected_coder_followup(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    dispatch_round: int,
+    dispatch_head: str,
+    observed_head: str,
+    ledger: Sequence[UnresolvedReviewItem],
+    budget: RecoveryRoundBudget,
+    attempt: int,
+    reason: object,
+    carried_reasons: Sequence[str] = (),
+) -> None:
+    """Record that a coder follow-up was rejected, keyed to the head observed afterwards."""
+    bounded = sanitize_recovery_reason(reason)
+    _post_recovery_record(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        message=(
+            f"PR #{pr_number} rejected coder follow-up record: the response for round "
+            f"{dispatch_round} (attempt {attempt}, dispatched on `{dispatch_head}`, head now "
+            f"`{observed_head}`) was not accepted: {bounded}"
+        ),
+        metadata=PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=dispatch_round,
+            subject=observed_head,
+            prior_items=tuple(ledger),
+            state="blocking",
+            phase=CODER_FOLLOWUP_REJECTED_PHASE,
+            dispatch_round=dispatch_round,
+            dispatch_head=dispatch_head,
+            dispatch_attempt=attempt,
+            recovery_dispatch=attempt > 1,
+            carried_rejection_reasons=tuple(carried_reasons),
+            rejected_coder_followup_reason=bounded,
+            rejected_coder_followup_from_head=dispatch_head,
+            recovery_round_budget=budget,
+            **_architecture_metadata_fields(config),
+        ),
+    )
+
+
+def _record_coder_followup_rejection(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    error: BaseException,
+    dispatch_round: int,
+    pre_turn_head: str,
+    ledger: Sequence[UnresolvedReviewItem],
+    budget: RecoveryRoundBudget,
+    attempt: int,
+    recovery_dispatch: bool,
+    carried_reasons: Sequence[str] = (),
+) -> None:
+    """Persist a rejected coder follow-up when it left a recoverable state (#1292).
+
+    A rejection after a push strands the new head with no coder or reviewer
+    record; a rejected recovery dispatch must keep its attempt count even with
+    an unchanged head.  An ordinary first-attempt rejection on an unchanged head
+    writes nothing.  Never raises: the caller re-raises the original error.
+    """
+    try:
+        observed_head = get_pr_head_sha(runner, config, pr_number)
+        observed_head = (observed_head or "").strip()
+        if not observed_head or (observed_head == pre_turn_head and not recovery_dispatch):
+            return
+        _persist_rejected_coder_followup(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            dispatch_round=dispatch_round,
+            dispatch_head=pre_turn_head,
+            observed_head=observed_head,
+            ledger=ledger,
+            budget=budget,
+            attempt=attempt,
+            reason=str(error) or "rejected without a reason",
+            carried_reasons=carried_reasons,
+        )
+    except Exception as secondary:  # noqa: BLE001 - never mask the rejection
+        log(
+            config,
+            f"PR #{pr_number}: could not record the rejected coder follow-up "
+            f"({secondary}); the coder-dispatch record still carries the attempt",
+        )
+
+
+def _persist_head_review_recovery(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    round_number: int,
+    head_sha: str | None,
+    ledger: Sequence[UnresolvedReviewItem],
+    budget: RecoveryRoundBudget,
+    source: str,
+) -> None:
+    """Write the handoff that makes an ordinary head-review recovery resumable."""
+    _post_recovery_record(
+        runner,
+        config=config,
+        pr_number=pr_number,
+        message=(
+            f"PR #{pr_number} head review recovery record ({source}): the current head "
+            f"`{head_sha}` gets an ordinary review round {round_number} with the recorded "
+            "active items carried. No coder record was written."
+        ),
+        metadata=PostedRoundMetadata(
+            flow="pr",
+            role="summary",
+            agent="Orchestrator",
+            round_number=round_number,
+            subject=str(head_sha or "unknown"),
+            prior_items=tuple(ledger),
+            state="blocking",
+            phase=HEAD_REVIEW_RECOVERY_PHASE,
+            head_review_recovery_source=source,
+            recovery_round_budget=budget,
+            **_architecture_metadata_fields(config),
+        ),
+    )
+
+
 def _visibility_snapshot(
     *,
     fresh_records: Sequence[PostedRoundRecord] | None,
@@ -2557,18 +2818,27 @@ def _pr_amendment_start_round(
     pr_context: PullRequestReviewContext,
     configured_reviewers: Sequence[AgentName],
     scheduler_capabilities: object,
+    *,
+    runner: Runner | None = None,
+    config: AgentLoopConfig | None = None,
 ) -> int:
     """The round a PR resume would re-enter; only used to fill an error template."""
-    resumed = _resume_pr_round(
-        pr_context.comments,
-        head_sha=pr_context.metadata.head_sha,
-        configured_reviewers=configured_reviewers,
-        reconciliation_mode=(
-            "owner-scoped"
-            if getattr(scheduler_capabilities, "owner_scoped_reconciliation", False)
-            else "aggregate"
-        ),
-    )
+    try:
+        resumed = _resume_pr_round(
+            pr_context.comments,
+            head_sha=pr_context.metadata.head_sha,
+            configured_reviewers=configured_reviewers,
+            reconciliation_mode=(
+                "owner-scoped"
+                if getattr(scheduler_capabilities, "owner_scoped_reconciliation", False)
+                else "aggregate"
+            ),
+            trusted_actor=_cached_trusted_actor(runner) if runner is not None else None,
+            review_unrecorded_head=bool(config is not None and config.review_unrecorded_head),
+        )
+    except AgentLoopError:
+        # Only filling an error template; the real resume reports the refusal.
+        return 1
     return resumed.round_number if resumed is not None else 1
 
 

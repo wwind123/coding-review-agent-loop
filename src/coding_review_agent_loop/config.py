@@ -364,6 +364,9 @@ class AgentLoopConfig:
     # protection refused this token with HTTP 403 and the readable effective
     # rules show no strict enforcement (#1040).  Requires the waiver above.
     allow_unreadable_protection: bool = False
+    # Operator recovery for a refused PR resume (#1292): run an ordinary review
+    # round of the current head from the recorded active items.
+    review_unrecorded_head: bool = False
     # Runtime-only correlation value minted by the issue-created preflight.
     # It is intentionally not a CLI option: a later invocation must perform a
     # new preflight rather than accepting a PR-body token it did not create.
@@ -2062,6 +2065,7 @@ def config_from_args(
         managed_ci_adopt_existing_pr=getattr(args, "managed_ci_adopt_existing_pr", False),
         allow_unprotected_managed_ci=getattr(args, "allow_unprotected_managed_ci", False),
         allow_unreadable_protection=getattr(args, "allow_unreadable_protection", False),
+        review_unrecorded_head=bool(getattr(args, "review_unrecorded_head", False)),
         managed_ci_fresh_authorization=getattr(args, "managed_ci_fresh_authorization", False),
         managed_ci_issue_number=getattr(args, "managed_ci_issue", None),
         managed_ci_pr_mode=getattr(args, "command", None) == "pr",

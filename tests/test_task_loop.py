@@ -38,7 +38,7 @@ def test_task_loop_creates_pr_then_alternates_until_codex_approval(tmp_path):
     command_names = [cmd[:2] for cmd, _cwd in runner.commands]
     assert ["claude", "--print"] in command_names
     assert ["codex", "exec"] in command_names
-    assert len(runner.comments) == 4
+    assert len(runner.comments) == 5
     assert json.loads(runner.comments[0].split("\n", 1)[0])["kind"] == "task_result"
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
 

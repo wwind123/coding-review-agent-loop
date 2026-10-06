@@ -268,7 +268,7 @@ class FakeRunner(Runner):
         malformed_issue_view_numbers=None,
         malformed_pr_view_numbers=None,
         authenticated_actor=None,
-        serve_rest_issue_comments=False,
+        serve_rest_issue_comments=None,
     ):
         super().__init__(dry_run=False)
         # Opt-in REST issue-comment history (#1018): the paginated
@@ -281,6 +281,10 @@ class FakeRunner(Runner):
         # author-authenticated records can be recovered.  Unset keeps the
         # historical unresolvable-actor behavior.
         self.authenticated_actor = authenticated_actor
+        # PR recovery admission (#1292) resolves the authenticated actor on head
+        # advances; PR-mode fixtures answer with a default identity unless a test
+        # supplies its own.  Issue-mode fixtures keep the unresolvable behavior.
+        self.default_pr_actor = True
         self.claude_outputs = list(claude_outputs or [])
         self.codex_outputs = list(codex_outputs or [])
         self.gemini_outputs = list(gemini_outputs or [])
@@ -1247,6 +1251,9 @@ class FakeRunner(Runner):
                 posted_pr["createdAt"] = datetime.datetime.now(datetime.timezone.utc).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"
                 )
+            else:
+                # The default PR actor (#1292): REST attributes the comment to it.
+                posted_pr["_rest_author_id"] = 424242
             self.pr_payload.setdefault("comments", []).append(posted_pr)
             return CommandResult(cmd, cwd_path, "", "", 0)
 
@@ -1276,8 +1283,10 @@ class FakeRunner(Runner):
             self.issue_comments.append(posted)
             return CommandResult(cmd, cwd_path, "", "", 0)
 
-        if cmd[:3] == ["gh", "api", "user"] and self.authenticated_actor is not None:
-            login, actor_id = self.authenticated_actor
+        if cmd[:3] == ["gh", "api", "user"] and (
+            self.authenticated_actor is not None or self.default_pr_actor
+        ):
+            login, actor_id = self.authenticated_actor or ("coding-review-agent-loop", 424242)
             return CommandResult(
                 cmd, cwd_path, json_dumps({"login": login, "id": actor_id}), "", 0
             )
@@ -1392,9 +1401,17 @@ class FakeRunner(Runner):
 
         rest_comments = (
             re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments\?per_page=(\d+)&page=(\d+)(?:&since=[^&]+)?", cmd[2])
-            if cmd[:2] == ["gh", "api"] and len(cmd) > 2 and self.serve_rest_issue_comments
+            if cmd[:2] == ["gh", "api"] and len(cmd) > 2
             else None
         )
+        if rest_comments is not None and not self.serve_rest_issue_comments:
+            # PR recovery admission (#1292) reads the PR's REST comment history by
+            # default (unless a test explicitly disables REST with ``False``);
+            # every other issue's REST history stays opt-in.
+            if self.serve_rest_issue_comments is False or int(
+                rest_comments.group(1)
+            ) != self.pr_payload.get("number", 77):
+                rest_comments = None
         if rest_comments is not None:
             number, per_page, page = (int(value) for value in rest_comments.groups())
             # A PR's conversation comments are issue comments on GitHub.

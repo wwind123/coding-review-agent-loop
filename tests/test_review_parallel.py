@@ -902,6 +902,7 @@ def test_pr_parallel_resolves_disputed_scope_claim_and_tracks_translation_defect
     reconciliation = next(
         record for record in reviewer_metadata
         if record.role == "summary" and record.round_number == 2
+        and record.phase != "coder-dispatch"
     )
     assert gemini_round_two.dispositions[0].disposition == "resolved"
     assert [item.item_id for item in reconciliation.new_items] == ["item-2"]
