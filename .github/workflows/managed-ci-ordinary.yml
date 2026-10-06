@@ -1,0 +1,161 @@
+name: Managed CI ordinary suite (reusable)
+
+# Read-only ordinary entry point (#1210): the sharded suite for push,
+# pull_request and all-empty manual dispatch.  It shares the callee-owned
+# ci/managed scripts with managed-ci.yml, holds no write scope, and is never
+# the trusted gate.
+on:
+  workflow_call:
+    inputs:
+      test_command:
+        description: Test command run for every shard (a pytest command when shards > 1)
+        type: string
+        required: false
+        default: python -m pytest
+      install_command:
+        description: Command that installs the project and its test dependencies
+        type: string
+        required: false
+        default: python -m pip install -e '.[dev]'
+      python_version:
+        description: Python version used for the tests
+        type: string
+        required: false
+        default: '3.12'
+      shards:
+        description: Number of exact-head test shards (1 to 64)
+        type: number
+        required: false
+        default: 1
+      durations_file:
+        description: Optional caller-owned shard duration file (equal weights when absent)
+        type: string
+        required: false
+        default: ''
+
+jobs:
+  plan:
+    name: Plan shards
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Plan shard matrix
+        id: plan
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          count = int(os.environ['SHARDS'])
+          if not 1 <= count <= 64:
+              raise SystemExit('shards must be between 1 and 64')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('matrix=' + json.dumps(list(range(1, count + 1))) + '\n')
+          PY
+
+  test-shard:
+    needs: plan
+    name: Python ${{ inputs.python_version }} full suite (shard ${{ matrix.shard }}/${{ inputs.shards }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    permissions:
+      contents: read
+    env:
+      SHARDS: ${{ inputs.shards }}
+      SHARD_INDEX: ${{ matrix.shard }}
+      DURATIONS_FILE: ${{ inputs.durations_file }}
+      TEST_COMMAND: ${{ inputs.test_command }}
+      INSTALL_COMMAND: ${{ inputs.install_command }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+      # The reusable workflow's own scripts, from its own repository and
+      # revision.  An empty context fails closed instead of running unverified
+      # code or skipping the verifier.
+      - name: Require the reusable workflow revision
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          test -n "$WORKFLOW_REPOSITORY"
+          printf '%s' "$WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          echo "Callee: $WORKFLOW_REPOSITORY@$WORKFLOW_SHA"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .managed-ci
+          sparse-checkout: ci/managed
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Install dependencies
+        run: bash -c "$INSTALL_COMMAND"
+      - name: Run test shard
+        run: python .managed-ci/ci/managed/run_shard.py --shards "$SHARDS" --index "$SHARD_INDEX" --manifest shard-manifest/manifest.json --durations "$DURATIONS_FILE" --test-command "$TEST_COMMAND"
+      # Only passing legs publish a manifest; the attempt suffix keeps a
+      # "Re-run failed jobs" attempt from colliding with retained artifacts.
+      - uses: actions/upload-artifact@v4
+        if: success() && inputs.shards > 1
+        with:
+          name: shard-manifest-full-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: shard-manifest/manifest.json
+          if-no-files-found: error
+
+  # Aggregate keeping the original check name (#1235).  The literal gate runs
+  # no repository code, so a PR-modified verifier can never turn a non-success
+  # shard result into success.  The verifier comes from the reusable workflow's
+  # own revision, never from the tested commit.
+  test:
+    needs: test-shard
+    if: always() && needs.test-shard.result != 'skipped'
+    name: Python ${{ inputs.python_version }} full suite
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SHARD_RESULT: ${{ needs.test-shard.result }}
+    steps:
+      - name: Require every shard to succeed
+        run: test "$SHARD_RESULT" = success
+      # The reusable workflow's own scripts, from its own repository and
+      # revision.  An empty context fails closed instead of running unverified
+      # code or skipping the verifier.
+      - name: Require the reusable workflow revision
+        if: inputs.shards > 1
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          test -n "$WORKFLOW_REPOSITORY"
+          printf '%s' "$WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          echo "Callee: $WORKFLOW_REPOSITORY@$WORKFLOW_SHA"
+      - uses: actions/checkout@v4
+        if: inputs.shards > 1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .managed-ci
+          sparse-checkout: ci/managed
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        if: inputs.shards > 1
+        with:
+          python-version: ${{ inputs.python_version }}
+      - uses: actions/download-artifact@v4
+        if: inputs.shards > 1
+        with:
+          pattern: shard-manifest-full-*
+          path: shard-manifests
+      - name: Verify exactly-once shard coverage
+        if: inputs.shards > 1
+        run: python .managed-ci/ci/managed/ci_shard_verify.py shard-manifests --count ${{ inputs.shards }} --head ${{ github.sha }} --run-id ${{ github.run_id }} --result "$SHARD_RESULT"

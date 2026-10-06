@@ -1,0 +1,781 @@
+name: Managed CI (reusable)
+
+# Reusable managed-CI entry point (#1210).  A project calls it from a thin
+# workflow, forwarding the four managed dispatch inputs, and gets the complete
+# trust gate: dispatch validation against the live PR and the signed handoff
+# record, exact-head (sharded) testing, and the correlated final-ci/exact-head
+# status.  Inputs cover only project-specific parameters.  The trusted actor
+# comes from the caller repository's vars context
+# (AGENT_LOOP_MANAGED_ACTOR) and the default branch from the live repository
+# API; neither can be supplied or weakened through an input.
+on:
+  workflow_call:
+    inputs:
+      protocol_version:
+        description: Managed-CI protocol version forwarded from the dispatch
+        type: string
+        required: false
+        default: ''
+      pr_number:
+        description: Pull request being qualified, forwarded from the dispatch
+        type: string
+        required: false
+        default: ''
+      expected_head_sha:
+        description: Exact pull request head SHA, forwarded from the dispatch
+        type: string
+        required: false
+        default: ''
+      managed_nonce:
+        description: Fresh generation nonce, forwarded from the dispatch
+        type: string
+        required: false
+        default: ''
+      test_command:
+        description: Test command run for every shard (a pytest command when shards > 1)
+        type: string
+        required: false
+        default: python -m pytest
+      install_command:
+        description: Command that installs the project and its test dependencies
+        type: string
+        required: false
+        default: python -m pip install -e '.[dev]'
+      python_version:
+        description: Python version used for the tests
+        type: string
+        required: false
+        default: '3.12'
+      shards:
+        description: Number of exact-head test shards (1 to 64)
+        type: number
+        required: false
+        default: 1
+      durations_file:
+        description: Optional caller-owned shard duration file (equal weights when absent)
+        type: string
+        required: false
+        default: ''
+
+jobs:
+  validate-managed:
+    # All-empty manual dispatch is ordinary CI.  Every partial or non-empty
+    # managed input reaches this job and is rejected unless the complete
+    # dispatch contract and the live PR/audit tuple validate.
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '' ||
+       github.event.inputs.protocol_version != '' || github.event.inputs.pr_number != '' ||
+       github.event.inputs.expected_head_sha != '' || github.event.inputs.managed_nonce != '')
+    name: Validate managed exact-head dispatch
+    runs-on: ubuntu-latest
+    concurrency:
+      group: managed-ci-v2-pr-${{ inputs.pr_number }}-head-${{ inputs.expected_head_sha }}
+      cancel-in-progress: false
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+    outputs:
+      target_sha: ${{ steps.validate.outputs.target_sha }}
+      pr_number: ${{ steps.validate.outputs.pr_number }}
+      managed_nonce: ${{ steps.validate.outputs.managed_nonce }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      # The caller forwards the dispatch inputs explicitly.  The values this
+      # workflow validates must be the ones the dispatch event actually carried,
+      # so a caller cannot validate one tuple and test another.
+      - name: Require forwarded inputs to equal the dispatch event
+        env:
+          FORWARDED_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
+          FORWARDED_PR_NUMBER: ${{ inputs.pr_number }}
+          FORWARDED_EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          FORWARDED_MANAGED_NONCE: ${{ inputs.managed_nonce }}
+          EVENT_PROTOCOL_VERSION: ${{ github.event.inputs.protocol_version }}
+          EVENT_PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          EVENT_EXPECTED_HEAD_SHA: ${{ github.event.inputs.expected_head_sha }}
+          EVENT_MANAGED_NONCE: ${{ github.event.inputs.managed_nonce }}
+        run: |
+          test "$FORWARDED_PROTOCOL_VERSION" = "$EVENT_PROTOCOL_VERSION"
+          test "$FORWARDED_PR_NUMBER" = "$EVENT_PR_NUMBER"
+          test "$FORWARDED_EXPECTED_HEAD_SHA" = "$EVENT_EXPECTED_HEAD_SHA"
+          test "$FORWARDED_MANAGED_NONCE" = "$EVENT_MANAGED_NONCE"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate live PR and handoff record
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_API_URL: ${{ github.api_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_REF: ${{ github.ref }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+          CONFIGURED_ACTOR: ${{ vars.AGENT_LOOP_MANAGED_ACTOR }}
+          INPUT_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          INPUT_MANAGED_NONCE: ${{ inputs.managed_nonce }}
+        run: |
+          python - <<'PY'
+          import json
+          import math
+          import os
+          import re
+          import sys
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import urljoin
+          from urllib.request import Request, urlopen
+
+          # BEGIN MANAGED_CI_V2_VALIDATOR
+          # Source repository: wwind123/coding-review-agent-loop
+          # Source path: .github/workflows/managed-ci.yml
+          # Extraction boundary: validate() through its closing assertion.
+          # This block is copied verbatim into tests/fixtures/managed_ci/local_router.py.
+          def validate(
+              pr, pages, repo, num, sha, nonce, actor, revision, actor_id=None,
+              default_branch=None,
+          ):
+              def fail(reason):
+                  raise ValueError(reason)
+
+              def exact_int(value, name, positive=False):
+                  if type(value) is not int or (positive and value <= 0):
+                      fail('invalid ' + name)
+
+              def exact_string(value, name, pattern=None):
+                  if type(value) is not str or (pattern and not re.fullmatch(pattern, value)):
+                      fail('invalid ' + name)
+
+              # The live repository default branch, never a literal: a project's
+              # default branch is whatever the repository API reports (#1210).
+              def valid_branch(name):
+                  # git check-ref-format rules for a branch name (#1284).
+                  return (
+                      type(name) is str and name not in {'', '@'}
+                      and not re.search(r'[\x00-\x20\x7f~^:?*\[\\]', name)
+                      and not re.search(r'\.\.|@\{|//|\.lock(/|$)|(^|/)\.|[./]$|^[/-]', name)
+                  )
+
+              if not valid_branch(default_branch):
+                  fail('invalid default_branch')
+              if not isinstance(pr, dict):
+                  fail('live PR response is not an object')
+              labels = {
+                  item.get('name') for item in pr.get('labels', [])
+                  if isinstance(item, dict)
+              }
+              if pr.get('state') != 'open' or pr.get('draft') is not True:
+                  fail('live PR is not an open draft')
+              if pr.get('base', {}).get('ref') != default_branch:
+                  fail('live PR base is not the default branch')
+              if pr.get('head', {}).get('sha') != sha:
+                  fail('live PR head drifted')
+              if (pr.get('head', {}).get('repo') or {}).get('full_name') != repo:
+                  fail('live PR repository drifted')
+              pr_user = pr.get('user', {})
+              if pr_user.get('login') != actor or (actor_id is not None and type(pr_user.get('id')) is not int):
+                  fail('live PR author identity drifted')
+              if actor_id is not None and pr_user.get('id') != actor_id:
+                  fail('live PR author ID drifted')
+              if type(pr.get('number')) is not int or pr.get('number') != int(num):
+                  fail('live PR number drifted')
+              if not pr.get('head', {}).get('ref', '').startswith('agent-loop/managed-'):
+                  fail('live PR branch is not reserved')
+              if 'agent-loop-managed' not in labels:
+                  fail('live PR managed label is absent')
+              if not isinstance(pages, list):
+                  fail('comments response is not paginated JSON')
+
+              required = {
+                  'version', 'repository', 'pr', 'expected_head_sha', 'base_ref',
+                  'workflow_revision', 'generation', 'nonce', 'created_at', 'state',
+                  'run_id', 'run_attempt', 'terminal_run_id', 'terminal_run_attempt',
+                  'terminal_outcome', 'terminal_attempts',
+              }
+              allowed_states = {'prepared', 'dispatch-requested', 'attached', 'completed'}
+              # The whole stripped body must be exactly one record, optionally after a
+              # single fixed-template visible line (#935).  Nothing free-form can ride
+              # along; the bare form stays accepted during the writer transition.
+              envelope = re.compile(
+                  r'^(?:Managed CI authorization for exact head (?P<visible_sha>[0-9a-f]{40})\.\n\n)?'
+                  r'<!-- AGENT_MANAGED_CI_INTENT_V2 (?P<payload>.*?) -->$'
+              )
+              # A host that appends its fixed comment footer (#1043) stores the
+              # record followed by exactly this literal.  That form is matched
+              # against the raw, unstripped body, so no whitespace, doubled
+              # footer, or other trailing text can ride along with it.
+              host_footer = '\n\n---\n_Generated by [Claude Code](https://claude.ai/code)_'
+              footered_envelope = re.compile(
+                  r'(?:Managed CI authorization for exact head (?P<visible_sha>[0-9a-f]{40})\.\n\n)?'
+                  r'<!-- AGENT_MANAGED_CI_INTENT_V2 (?P<payload>.*?) -->'
+                  + re.escape(host_footer)
+              )
+              sha_re = r'[0-9a-f]{40}'
+              token_re = r'[A-Za-z0-9_-]{32}'
+              validated = []
+              for page in pages:
+                  if not isinstance(page, list):
+                      fail('malformed comments page')
+                  for comment in page:
+                      if not isinstance(comment, dict):
+                          fail('malformed comment object')
+                      user = comment.get('user')
+                      if not isinstance(user, dict) or type(user.get('login')) is not str:
+                          fail('malformed comment author')
+                      if user['login'] != actor:
+                          continue
+                      if actor_id is not None and user.get('id') != actor_id:
+                          fail('trusted comment author ID drifted')
+                      body = comment.get('body')
+                      if type(body) is not str:
+                          fail('trusted comment body is not text')
+                      match = envelope.fullmatch(body.strip())
+                      if match is None:
+                          match = footered_envelope.fullmatch(body)
+                      if match is None:
+                          continue
+                      try:
+                          record = json.loads(match.group('payload'))
+                      except json.JSONDecodeError:
+                          fail('trusted intent envelope contains malformed JSON')
+                      if not isinstance(record, dict):
+                          fail('trusted intent payload is not an object')
+                      if record.get('version') != 2:
+                          fail('unsupported intent version')
+                      if record.get('nonce') != nonce:
+                          continue
+                      visible_sha = match.group('visible_sha')
+                      if visible_sha is not None and visible_sha != record.get('expected_head_sha'):
+                          fail('visible intent line disagrees with the authorized head')
+                      if set(record) != required:
+                          fail('trusted intent has an invalid schema')
+                      exact_string(record.get('repository'), 'repository', r'[^/\s]+/[^/\s]+')
+                      exact_int(record.get('pr'), 'pr', True)
+                      exact_string(record.get('expected_head_sha'), 'expected_head_sha', sha_re)
+                      if not valid_branch(record.get('base_ref')):
+                          fail('invalid base_ref')
+                      exact_string(record.get('workflow_revision'), 'workflow_revision', sha_re)
+                      if actor_id is not None or record.get('generation') is not None:
+                          exact_string(record.get('generation'), 'generation', r'[A-Za-z0-9_-]+')
+                      exact_string(record.get('nonce'), 'nonce', token_re)
+                      exact_int(record.get('created_at'), 'created_at', True)
+                      exact_string(record.get('state'), 'state', r'(?:prepared|dispatch-requested|attached|completed)')
+                      if record['state'] not in allowed_states:
+                          fail('invalid lifecycle state')
+                      run_id, run_attempt = record.get('run_id'), record.get('run_attempt')
+                      if record['state'] in {'prepared', 'dispatch-requested'}:
+                          if run_id is not None or run_attempt is not None:
+                              fail('early lifecycle state has run fields')
+                      elif type(run_id) is not int or run_id <= 0 or type(run_attempt) is not int or run_attempt <= 0:
+                          fail('attached lifecycle state lacks paired run fields')
+                      terminal_id = record.get('terminal_run_id')
+                      terminal_attempt = record.get('terminal_run_attempt')
+                      if terminal_id is not None and (type(terminal_id) is not int or terminal_id <= 0):
+                          fail('invalid terminal run ID')
+                      if terminal_id is None and terminal_attempt is not None:
+                          fail('terminal attempt has no terminal run ID')
+                      if terminal_id is not None and (type(terminal_attempt) is not int or terminal_attempt <= 0):
+                          fail('invalid terminal run attempt')
+                      if record.get('terminal_outcome') not in {None, 'no-status'}:
+                          fail('invalid terminal outcome')
+                      attempts = record.get('terminal_attempts')
+                      if not isinstance(attempts, list):
+                          fail('terminal attempt history is not a list')
+                      seen_attempts = set()
+                      for item in attempts:
+                          if not isinstance(item, dict) or set(item) != {'run_id', 'run_attempt'}:
+                              fail('malformed terminal attempt history')
+                          item_id, item_attempt = item['run_id'], item['run_attempt']
+                          if type(item_id) is not int or item_id <= 0:
+                              fail('invalid terminal history run ID')
+                          if type(item_attempt) is not int or item_attempt <= 0:
+                              fail('invalid terminal history run attempt')
+                          key = (item_id, item_attempt)
+                          if key in seen_attempts:
+                              fail('duplicate terminal attempt history')
+                          seen_attempts.add(key)
+                      terminal_key = (terminal_id, terminal_attempt)
+                      if terminal_id is not None and terminal_key not in seen_attempts:
+                          fail('terminal run is absent from terminal attempt history')
+                      outcome = record.get('terminal_outcome')
+                      if record['state'] == 'prepared' and (
+                          terminal_id is not None
+                          or terminal_attempt is not None
+                          or outcome is not None
+                          or attempts
+                      ):
+                          fail('prepared intent has terminal lifecycle fields')
+                      if record['state'] == 'dispatch-requested':
+                          if terminal_id is not None and outcome != 'no-status':
+                              fail('dispatch-requested retry lacks no-status outcome')
+                      if record['state'] == 'attached' and outcome is not None:
+                          fail('attached intent has terminal outcome')
+                      if record['state'] == 'completed' and outcome == 'no-status':
+                          if (run_id, run_attempt) != terminal_key:
+                              fail('completed no-status record is not bound to its terminal run')
+                      if record['state'] in {'attached', 'completed'} and outcome is None:
+                          if (run_id, run_attempt) in seen_attempts:
+                              fail('active run is already terminal history')
+                      expected = {
+                          'repository': repo,
+                          'pr': int(num),
+                          'expected_head_sha': sha,
+                          'base_ref': default_branch,
+                          'workflow_revision': revision,
+                          'nonce': nonce,
+                      }
+                      if any(record[key] != value for key, value in expected.items()):
+                          fail('trusted intent binding drifted')
+                      validated.append(record)
+              if len(validated) != 1:
+                  fail('expected exactly one fresh intent for requested nonce')
+              if validated[0]['state'] == 'prepared':
+                  fail('prepared intent is not a dispatch authorization')
+              return validated[0]
+          # END MANAGED_CI_V2_VALIDATOR
+
+          def api_json(path):
+              request = Request(
+                  urljoin(os.environ['GH_API_URL'].rstrip('/') + '/', path.lstrip('/')),
+                  headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                           'Accept': 'application/vnd.github+json'},
+              )
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      payload = json.load(response)
+              except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+                  raise ValueError('GitHub API read failed for ' + path) from exc
+              if not isinstance(payload, (dict, list)):
+                  raise ValueError('GitHub API returned an invalid payload for ' + path)
+              return payload
+
+          def api_pages(path):
+              url = urljoin(os.environ['GH_API_URL'].rstrip('/') + '/', path.lstrip('/'))
+              pages = []
+              while url:
+                  request = Request(
+                      url,
+                      headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                               'Accept': 'application/vnd.github+json'},
+                  )
+                  try:
+                      with urlopen(request, timeout=30) as response:
+                          page = json.load(response)
+                          link = response.headers.get('Link', '')
+                  except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+                      raise ValueError('GitHub API pagination failed for ' + path) from exc
+                  if not isinstance(page, list):
+                      raise ValueError('GitHub API page is not an array for ' + path)
+                  pages.append(page)
+                  next_match = re.search(r'<([^>]+)>;\s*rel="next"', link)
+                  url = next_match.group(1) if next_match else None
+              return pages
+
+          # BEGIN MANAGED_CI_V2_DISPATCH_VALIDATOR
+          # Source repository: wwind123/coding-review-agent-loop
+          # Source path: .github/workflows/managed-ci.yml
+          # Extraction boundary: validate_dispatch() through its return value.
+          # A dispatch intent must be no more than 15 minutes old and may be at most 5
+          # minutes ahead of the runner clock. The producer creates the record
+          # immediately before dispatch; bounding both directions prevents replay while
+          # tolerating normal clock skew.
+          MAX_INTENT_AGE_SECONDS = 15 * 60
+          MAX_INTENT_FUTURE_SKEW_SECONDS = 5 * 60
+          def validate_dispatch(
+              *, protocol, pr_number_text, expected_head, nonce, repo, ref,
+              configured_actor, initiating_actor, rerun_actor, current_run_id,
+              current_run_attempt, current_time, api_json, api_pages, validate,
+          ):
+              if not (
+                  protocol == '2'
+                  and re.fullmatch(r'[1-9][0-9]*', pr_number_text or '')
+                  and re.fullmatch(r'[0-9a-f]{40}', expected_head or '')
+                  and re.fullmatch(r'[A-Za-z0-9_-]{32}', nonce or '')
+              ):
+                  raise ValueError('managed dispatch inputs must be complete protocol-v2 values')
+              if not re.fullmatch(r'[1-9][0-9]*', current_run_id or ''):
+                  raise ValueError('managed dispatch run ID is invalid')
+              if not re.fullmatch(r'[1-9][0-9]*', current_run_attempt or ''):
+                  raise ValueError('managed dispatch run attempt is invalid')
+              if (
+                  type(current_time) not in {int, float}
+                  or not math.isfinite(current_time)
+                  or current_time <= 0
+              ):
+                  raise ValueError('managed dispatch current time is invalid')
+              executing_run = (int(current_run_id), int(current_run_attempt))
+              trusted_actor = (configured_actor or '').strip()
+              if not re.fullmatch(r'[A-Za-z0-9-]+', trusted_actor):
+                  raise ValueError('managed dispatch trusted actor configuration is invalid')
+              live_user = api_json('users/' + trusted_actor)
+              live_login = live_user.get('login') if isinstance(live_user, dict) else None
+              live_id = live_user.get('id') if isinstance(live_user, dict) else None
+              if (
+                  not isinstance(live_login, str)
+                  or type(live_id) is not int
+                  or not isinstance(initiating_actor, str)
+                  or not isinstance(rerun_actor, str)
+                  or trusted_actor.casefold() != live_login.casefold()
+                  or initiating_actor.casefold() != live_login.casefold()
+                  or rerun_actor.casefold() != live_login.casefold()
+              ):
+                  raise ValueError('managed dispatch actors do not match the configured live identity')
+              live_repo = api_json('repos/' + repo)
+              if (
+                  not isinstance(live_repo, dict)
+                  or live_repo.get('full_name', '').casefold() != repo.casefold()
+              ):
+                  raise ValueError('managed dispatch repository identity could not be validated')
+              # The trusted workflow always executes from the live default branch.
+              default_branch = live_repo.get('default_branch')
+              if (
+                  type(default_branch) is not str
+                  or default_branch in {'', '@'}
+                  or re.search(r'[\x00-\x20\x7f~^:?*\[\\]', default_branch)
+                  or re.search(r'\.\.|@\{|//|\.lock(/|$)|(^|/)\.|[./]$|^[/-]', default_branch)
+              ):
+                  raise ValueError('managed dispatch default branch is unavailable')
+              if ref != 'refs/heads/' + default_branch:
+                  raise ValueError('managed dispatch must execute the base workflow from the default branch')
+              pr = api_json('repos/' + repo + '/pulls/' + pr_number_text)
+              base_commit = api_json(
+                  'repos/' + repo + '/commits/' + ''.join(
+                      ch if re.fullmatch(r'[A-Za-z0-9._~/-]', ch)
+                      else ''.join('%%%02X' % byte for byte in ch.encode('utf-8'))
+                      for ch in default_branch
+                  )
+              )
+              revision = base_commit.get('sha') if isinstance(base_commit, dict) else None
+              if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40}', revision):
+                  raise ValueError('managed dispatch base workflow revision is unavailable')
+              pages = api_pages('repos/' + repo + '/issues/' + pr_number_text + '/comments?per_page=100')
+              record = validate(
+                  pr, pages, repo, pr_number_text, expected_head, nonce,
+                  live_login, revision, live_id, default_branch=default_branch,
+              )
+              intent_age = current_time - record['created_at']
+              if intent_age > MAX_INTENT_AGE_SECONDS:
+                  raise ValueError('managed intent record is stale')
+              if intent_age < -MAX_INTENT_FUTURE_SKEW_SECONDS:
+                  raise ValueError('managed intent record is too far in the future')
+              record_run = (record.get('run_id'), record.get('run_attempt'))
+              if record['state'] == 'completed' and record.get('terminal_outcome') == 'no-status':
+                  terminal_key = (record.get('terminal_run_id'), record.get('terminal_run_attempt'))
+                  history = record.get('terminal_attempts')
+                  same_run_attempts = [
+                      item['run_attempt'] for item in history
+                      if item['run_id'] == record_run[0]
+                  ]
+                  # The driver records a no-status terminal attempt before a human or
+                  # operator reruns this same Actions run. Accept only the next attempt
+                  # of that same run; this rejects foreign, repeated, skipped, and
+                  # incoherent transitions.
+                  if (
+                      terminal_key != record_run
+                      or record_run[0] != executing_run[0]
+                      or not same_run_attempts
+                      or max(same_run_attempts) != record_run[1]
+                      or executing_run[1] != record_run[1] + 1
+                  ):
+                      raise ValueError('completed no-status retry run pair is incoherent')
+              elif record['state'] in {'attached', 'completed'} and record_run != executing_run:
+                  raise ValueError('managed intent run pair does not match executing Actions run')
+              return {
+                  'target_sha': expected_head,
+                  'pr_number': pr_number_text,
+                  'managed_nonce': nonce,
+                  'record': record,
+              }
+          # END MANAGED_CI_V2_DISPATCH_VALIDATOR
+
+          validated = validate_dispatch(
+              protocol=os.environ['INPUT_PROTOCOL_VERSION'],
+              pr_number_text=os.environ['INPUT_PR_NUMBER'],
+              expected_head=os.environ['INPUT_EXPECTED_HEAD_SHA'],
+              nonce=os.environ['INPUT_MANAGED_NONCE'],
+              repo=os.environ['GH_REPOSITORY'],
+              ref=os.environ.get('GH_REF'),
+              configured_actor=os.environ.get('CONFIGURED_ACTOR'),
+              initiating_actor=os.environ.get('GH_ACTOR'),
+              rerun_actor=os.environ.get('GH_TRIGGERING_ACTOR'),
+              current_run_id=os.environ.get('GH_RUN_ID'),
+              current_run_attempt=os.environ.get('GH_RUN_ATTEMPT'),
+              current_time=int(time.time()),
+              api_json=api_json,
+              api_pages=api_pages,
+              validate=validate,
+          )
+
+          output_path = os.environ['GITHUB_OUTPUT']
+          with open(output_path, 'a', encoding='utf-8') as output:
+              output.write('target_sha=' + validated['target_sha'] + '\n')
+              output.write('pr_number=' + validated['pr_number'] + '\n')
+              output.write('managed_nonce=' + validated['managed_nonce'] + '\n')
+          print('Managed dispatch validated for the exact live PR head.')
+          PY
+      - name: Plan shard matrix
+        id: plan
+        env:
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          count = int(os.environ['SHARDS'])
+          if not 1 <= count <= 64:
+              raise SystemExit('shards must be between 1 and 64')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write('matrix=' + json.dumps(list(range(1, count + 1))) + '\n')
+          PY
+
+
+  exact-head-shard:
+    needs: validate-managed
+    if: needs.validate-managed.result == 'success'
+    name: Test validated exact head (shard ${{ matrix.shard }}/${{ inputs.shards }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.validate-managed.outputs.matrix) }}
+    # One group per shard: GitHub keeps a single pending job per group, so a
+    # shared group would replace (cancel) sibling legs.
+    concurrency:
+      group: managed-ci-v2-pr-${{ needs.validate-managed.outputs.pr_number }}-head-${{ needs.validate-managed.outputs.target_sha }}-shard-${{ matrix.shard }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    env:
+      SHARDS: ${{ inputs.shards }}
+      SHARD_INDEX: ${{ matrix.shard }}
+      DURATIONS_FILE: ${{ inputs.durations_file }}
+      TEST_COMMAND: ${{ inputs.test_command }}
+      INSTALL_COMMAND: ${{ inputs.install_command }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate-managed.outputs.target_sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+      - name: Verify exact checkout
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.validate-managed.outputs.target_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      # The reusable workflow's own scripts, from its own repository and
+      # revision.  An empty context fails closed instead of running unverified
+      # code or skipping the verifier.
+      - name: Require the reusable workflow revision
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          test -n "$WORKFLOW_REPOSITORY"
+          printf '%s' "$WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          echo "Callee: $WORKFLOW_REPOSITORY@$WORKFLOW_SHA"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .managed-ci
+          sparse-checkout: ci/managed
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Install dependencies
+        run: bash -c "$INSTALL_COMMAND"
+      - name: Run test shard
+        run: python .managed-ci/ci/managed/run_shard.py --shards "$SHARDS" --index "$SHARD_INDEX" --manifest shard-manifest/manifest.json --durations "$DURATIONS_FILE" --test-command "$TEST_COMMAND"
+      # Only passing legs publish a manifest; the attempt suffix keeps a
+      # "Re-run failed jobs" attempt from colliding with retained artifacts.
+      - uses: actions/upload-artifact@v4
+        if: success() && inputs.shards > 1
+        with:
+          name: shard-manifest-exact-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: shard-manifest/manifest.json
+          if-no-files-found: error
+
+  # Aggregate keeping the original check name; publish-exact-head reads this
+  # job's result.  It never checks out target_sha: PR-controlled code must not
+  # decide the result the publisher sees.
+  exact-head:
+    needs: [validate-managed, exact-head-shard]
+    if: always() && needs.validate-managed.result == 'success'
+    name: Test validated exact head
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SHARD_RESULT: ${{ needs.exact-head-shard.result }}
+    steps:
+      - name: Require every shard to succeed
+        run: test "$SHARD_RESULT" = success
+      # The reusable workflow's own scripts, from its own repository and
+      # revision.  An empty context fails closed instead of running unverified
+      # code or skipping the verifier.
+      - name: Require the reusable workflow revision
+        if: inputs.shards > 1
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          test -n "$WORKFLOW_REPOSITORY"
+          printf '%s' "$WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          echo "Callee: $WORKFLOW_REPOSITORY@$WORKFLOW_SHA"
+      - uses: actions/checkout@v4
+        if: inputs.shards > 1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .managed-ci
+          sparse-checkout: ci/managed
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        if: inputs.shards > 1
+        with:
+          python-version: ${{ inputs.python_version }}
+      - uses: actions/download-artifact@v4
+        if: inputs.shards > 1
+        with:
+          pattern: shard-manifest-exact-*
+          path: shard-manifests
+      - name: Verify exactly-once shard coverage
+        if: inputs.shards > 1
+        run: python .managed-ci/ci/managed/ci_shard_verify.py shard-manifests --count ${{ inputs.shards }} --head ${{ needs.validate-managed.outputs.target_sha }} --run-id ${{ github.run_id }} --result "$SHARD_RESULT"
+
+  publish-exact-head:
+    needs: [validate-managed, exact-head]
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '' ||
+       github.event.inputs.protocol_version != '' || github.event.inputs.pr_number != '' ||
+       github.event.inputs.expected_head_sha != '' || github.event.inputs.managed_nonce != '')
+    name: Publish final exact-head status
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Publish correlated terminal status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_API_URL: ${{ github.api_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ needs.validate-managed.outputs.target_sha }}
+          VALIDATION_RESULT: ${{ needs.validate-managed.result }}
+          TEST_RESULT: ${{ needs.exact-head.result }}
+          NONCE: ${{ needs.validate-managed.outputs.managed_nonce }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from urllib.request import Request, urlopen
+
+          # BEGIN MANAGED_CI_V2_PUBLISHER
+          # Source repository: wwind123/coding-review-agent-loop
+          # Source path: .github/workflows/managed-ci.yml
+          # Extraction boundary: build_status_request() through its return value.
+          def build_status_payload(
+              *, target_sha, validation_result, test_result, nonce, run_id,
+              run_attempt, server_url, repository,
+          ):
+              if (
+                  validation_result != 'success'
+                  or not isinstance(target_sha, str)
+                  or not re.fullmatch(r'[0-9a-f]{40}', target_sha)
+                  or not re.fullmatch(r'[A-Za-z0-9_-]{32}', nonce or '')
+                  or not re.fullmatch(r'[1-9][0-9]*', run_id or '')
+                  or not re.fullmatch(r'[1-9][0-9]*', run_attempt or '')
+                  or not isinstance(server_url, str)
+                  or not server_url
+                  or not isinstance(repository, str)
+                  or not repository
+              ):
+                  return None
+              state = 'success' if test_result == 'success' else 'failure'
+              description = (
+                  'nonce=' + nonce + ';run_id=' + run_id +
+                  ';attempt=' + run_attempt + ';result=' + state
+              )
+              return {
+                  'target_sha': target_sha,
+                  'payload': {
+                      'state': state,
+                      'context': 'final-ci/exact-head',
+                      'description': description,
+                      'target_url': server_url.rstrip('/') + '/' + repository +
+                                    '/actions/runs/' + run_id,
+                  },
+              }
+
+          def build_status_request(
+              *, target_sha, validation_result, test_result, nonce, run_id,
+              run_attempt, server_url, api_url, repository,
+          ):
+              payload_object = build_status_payload(
+                  target_sha=target_sha,
+                  validation_result=validation_result,
+                  test_result=test_result,
+                  nonce=nonce,
+                  run_id=run_id,
+                  run_attempt=run_attempt,
+                  server_url=server_url,
+                  repository=repository,
+              )
+              if (
+                  payload_object is None
+                  or not isinstance(api_url, str)
+                  or not api_url
+              ):
+                  return None
+              validated_target = payload_object['target_sha']
+              return {
+                  'target_sha': validated_target,
+                  'url': api_url.rstrip('/') + '/repos/' + repository +
+                         '/statuses/' + validated_target,
+                  'payload': payload_object['payload'],
+              }
+          # END MANAGED_CI_V2_PUBLISHER
+
+          request_plan = build_status_request(
+              target_sha=os.environ.get('TARGET_SHA', ''),
+              validation_result=os.environ.get('VALIDATION_RESULT', ''),
+              test_result=os.environ.get('TEST_RESULT', ''),
+              nonce=os.environ.get('NONCE', ''),
+              run_id=os.environ.get('RUN_ID', ''),
+              run_attempt=os.environ.get('RUN_ATTEMPT', ''),
+              server_url=os.environ.get('SERVER_URL', ''),
+              api_url=os.environ.get('GH_API_URL', ''),
+              repository=os.environ.get('GH_REPOSITORY', ''),
+          )
+          if request_plan is None:
+              print('Authorization failed before an exact target was established; no status written.')
+              raise SystemExit(0)
+          payload = json.dumps(request_plan['payload']).encode('utf-8')
+          request = Request(
+              request_plan['url'],
+              data=payload,
+              method='POST',
+              headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+                  'Content-Type': 'application/json',
+              },
+          )
+          with urlopen(request, timeout=30):
+              pass
+          print('Published correlated final-ci/exact-head status for the validated SHA.')
+          PY

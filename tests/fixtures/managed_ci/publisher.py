@@ -1,9 +1,9 @@
 """Extraction-bounded copy of the workflow's terminal publisher decision.
 
 Source repository: wwind123/coding-review-agent-loop
-Source commit: 1dde616f1f1b8274994548306f4ca255a9c98786
-Source block SHA-256: 818c8419655f01e205095d2046a28cd28050868148eed0bcbeb41b7a5af41c4b
-Source path: .github/workflows/ci.yml
+Source commit: b9be3320a11ae9bb610d027e07565e35ef82c0a2
+Source block SHA-256: 9953da242e797df2a176a5a6cd537b3df08bd2a0751ca17fab452d54bd57d8d1
+Source path: .github/workflows/managed-ci.yml
 Extraction boundary: ``build_status_request`` through its return value.
 The contract tests compare this fixture to the production workflow and invoke
 the extracted decision without making a GitHub request.
@@ -14,7 +14,7 @@ import re
 
 # BEGIN MANAGED_CI_V2_PUBLISHER
 # Source repository: wwind123/coding-review-agent-loop
-# Source path: .github/workflows/ci.yml
+# Source path: .github/workflows/managed-ci.yml
 # Extraction boundary: build_status_request() through its return value.
 def build_status_payload(
     *, target_sha, validation_result, test_result, nonce, run_id,

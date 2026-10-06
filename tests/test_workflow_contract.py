@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import textwrap
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -17,14 +18,26 @@ from fixtures.managed_ci import dispatch_validator, local_router, publisher
 
 
 ROOT = Path(__file__).parents[1]
-WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+CALLER = ROOT / ".github" / "workflows" / "ci.yml"
+WORKFLOW = ROOT / ".github" / "workflows" / "managed-ci.yml"
+ORDINARY = ROOT / ".github" / "workflows" / "managed-ci-ordinary.yml"
 LOCAL_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "local_router.py"
 DISPATCH_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "dispatch_validator.py"
 PUBLISHER_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "publisher.py"
 
 
 def _workflow_text() -> str:
+    """The reusable managed-CI workflow (validator, shards, publisher)."""
     return WORKFLOW.read_text(encoding="utf-8")
+
+
+def _caller_text() -> str:
+    """This repository's thin caller: triggers, markers, routing, wiring."""
+    return CALLER.read_text(encoding="utf-8")
+
+
+def _ordinary_text() -> str:
+    return ORDINARY.read_text(encoding="utf-8")
 
 
 def _extraction_block(text: str, marker_name: str) -> str:
@@ -54,9 +67,10 @@ def _fixture_source_digest(text: str) -> str:
 
 
 def _job_if_expression(text: str) -> str:
+    """The routing expression of the caller's ordinary ``ci`` job."""
     marker = "    if: >-\n"
-    start = text.index(marker, text.index("\n  test-shard:\n")) + len(marker)
-    end = text.index("    name: Python 3.12 full suite (shard", start)
+    start = text.index(marker, text.index("\n  ci:\n")) + len(marker)
+    end = text.index("    permissions:", start)
     return textwrap.dedent(text[start:end]).strip()
 
 
@@ -115,7 +129,7 @@ def _pages(*records, actor="agent-loop", actor_id=7):
     ]]
 
 
-def _validate(record, *, pr=None, pages=None, actor="agent-loop", actor_id=7):
+def _validate(record, *, pr=None, pages=None, actor="agent-loop", actor_id=7, default_branch="main"):
     return local_router.validate(
         pr or _pr(),
         pages if pages is not None else _pages(record),
@@ -126,11 +140,12 @@ def _validate(record, *, pr=None, pages=None, actor="agent-loop", actor_id=7):
         actor,
         "a" * 40,
         actor_id,
+        default_branch=default_branch,
     )
 
 
 def test_workflow_advertises_exact_activation_contract():
-    workflow = _workflow_text()
+    workflow = _caller_text()
 
     assert "AGENT_LOOP_MANAGED_CI_V2: enabled" in workflow
     assert "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1: enabled" in workflow
@@ -140,7 +155,6 @@ def test_workflow_advertises_exact_activation_contract():
         "pr_number",
         "expected_head_sha",
         "managed_nonce",
-        "final-ci/exact-head",
         "run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.managed_nonce != '' && format('managed-ci-v2 nonce={0}', inputs.managed_nonce) || github.workflow }}",
     ):
         assert required in workflow
@@ -196,7 +210,7 @@ def test_validator_accepts_each_dispatch_lifecycle_state(state):
 
 
 def test_workflow_advertises_visible_intent_capability():
-    assert "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1: enabled" in _workflow_text()
+    assert "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1: enabled" in _caller_text()
 
 
 def _visible_pages(record, *, prefix, actor="agent-loop", actor_id=7):
@@ -346,13 +360,13 @@ def _ordinary_route(action, pr, trusted_actor):
 
 
 def test_routing_matrix_is_label_race_safe_and_fail_open():
-    assert _job_if_expression(_workflow_text()) == """github.event_name == 'push' ||
+    assert _job_if_expression(_caller_text()) == """github.event_name == 'push' ||
 (github.event_name == 'workflow_dispatch' &&
  inputs.protocol_version == '' && inputs.pr_number == '' &&
  inputs.expected_head_sha == '' && inputs.managed_nonce == '') ||
 (github.event_name == 'pull_request' &&
  (github.event.action == 'unlabeled' ||
-  !(github.event.pull_request.base.ref == 'main' &&
+  !(github.event.pull_request.base.ref == github.event.repository.default_branch &&
     github.event.pull_request.base.repo.full_name == github.repository &&
     github.event.pull_request.head.repo.full_name == github.repository &&
     startsWith(github.event.pull_request.head.ref, 'agent-loop/managed-') &&
@@ -405,14 +419,14 @@ def test_draft_conversion_of_qualified_pr_is_a_documented_suppression_residual()
     assert _ordinary_route("synchronize", _pr(draft=True, labels=[]), "agent-loop") is True
 
 
-def _dispatch_validate(*, record=None, **overrides):
+def _dispatch_validate(*, record=None, default_branch="main", repo_payload=None, **overrides):
     values = {
         "protocol": "2",
         "pr_number_text": "7",
         "expected_head": "b" * 40,
         "nonce": "n" * 32,
         "repo": "OWNER/REPO",
-        "ref": "refs/heads/main",
+        "ref": "refs/heads/" + default_branch,
         "configured_actor": "agent-loop",
         "initiating_actor": "agent-loop",
         "rerun_actor": "agent-loop",
@@ -425,9 +439,12 @@ def _dispatch_validate(*, record=None, **overrides):
     revision = "a" * 40
     records = {
         "users/agent-loop": {"login": "agent-loop", "id": 7},
-        "repos/OWNER/REPO": {"full_name": "OWNER/REPO"},
-        "repos/OWNER/REPO/pulls/7": _pr(),
-        "repos/OWNER/REPO/commits/main": {"sha": revision},
+        "repos/OWNER/REPO": (
+            repo_payload if repo_payload is not None
+            else {"full_name": "OWNER/REPO", "default_branch": default_branch}
+        ),
+        "repos/OWNER/REPO/pulls/7": _pr(base={"ref": default_branch}),
+        "repos/OWNER/REPO/commits/" + urllib.parse.quote(default_branch, safe="/._~-"): {"sha": revision},
     }
 
     def api_json(path):
@@ -645,7 +662,7 @@ def test_workflow_keeps_exact_checkout_suite_and_safe_terminal_publisher():
     workflow = _workflow_text()
     assert "ref: ${{ needs.validate-managed.outputs.target_sha }}" in workflow
     assert 'test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"' in workflow
-    assert workflow.count("- run: python -m pytest") >= 2
+    assert 'run: python .managed-ci/ci/managed/run_shard.py --shards "$SHARDS"' in workflow
     assert "permissions:\n      statuses: write" in workflow
     assert "Authorization failed before an exact target was established; no status written." in workflow
     assert "context': 'final-ci/exact-head'" in workflow
@@ -653,7 +670,7 @@ def test_workflow_keeps_exact_checkout_suite_and_safe_terminal_publisher():
     assert "'nonce=' + nonce + ';run_id='" in workflow
     assert "cancel-in-progress: false" in workflow
     assert "GH_REF: ${{ github.ref }}" in workflow
-    assert "managed dispatch must execute the base workflow from main" in workflow
+    assert "managed dispatch must execute the base workflow from the default branch" in workflow
 
 
 def _publisher_payload(**overrides):
@@ -738,7 +755,7 @@ def _comment(body, *, login="agent-loop", actor_id=7, comment_id=1):
 
 
 def test_workflow_advertises_host_footer_capability():
-    assert f"{managed_ci.HOST_FOOTER_INTENT_MARKER}: enabled" in _workflow_text()
+    assert f"{managed_ci.HOST_FOOTER_INTENT_MARKER}: enabled" in _caller_text()
 
 
 def test_workflow_host_footer_literal_is_the_agent_constant():
@@ -819,7 +836,8 @@ def _classify(page, nonce="n" * 32):
 def _router(page, nonce="n" * 32):
     try:
         return local_router.validate(
-            _pr(), [page], "OWNER/REPO", "7", "b" * 40, nonce, "agent-loop", "a" * 40, 7
+            _pr(), [page], "OWNER/REPO", "7", "b" * 40, nonce, "agent-loop", "a" * 40, 7,
+            default_branch="main",
         ), None
     except ValueError as exc:
         return None, str(exc)
@@ -954,16 +972,16 @@ def _job_text(text: str, job_id: str) -> str:
 
 
 def test_ordinary_suite_is_sharded_with_original_aggregate_name():
-    text = _workflow_text()
+    text = _ordinary_text()
     shard = _job_text(text, "test-shard")
-    assert "name: Python 3.12 full suite (shard ${{ matrix.shard }}/3)" in shard
-    assert "fail-fast: false" in shard and "shard: [1, 2, 3]" in shard
-    assert "- run: python -m pytest -n auto\n" in shard
-    assert "CI_SHARD_INDEX: ${{ matrix.shard }}" in shard and "CI_SHARD_COUNT: 3" in shard
-    assert "if: success()" in shard
+    assert "name: Python ${{ inputs.python_version }} full suite (shard ${{ matrix.shard }}/${{ inputs.shards }})" in shard
+    assert "fail-fast: false" in shard and "shard: ${{ fromJSON(needs.plan.outputs.matrix) }}" in shard
+    assert 'run: python .managed-ci/ci/managed/run_shard.py --shards "$SHARDS" --index "$SHARD_INDEX"' in shard
+    assert "SHARDS: ${{ inputs.shards }}" in shard and "SHARD_INDEX: ${{ matrix.shard }}" in shard
+    assert "if: success() && inputs.shards > 1" in shard
     assert "name: shard-manifest-full-${{ matrix.shard }}-attempt-${{ github.run_attempt }}" in shard
     aggregate = _job_text(text, "test")
-    assert "name: Python 3.12 full suite\n" in aggregate
+    assert "name: Python ${{ inputs.python_version }} full suite\n" in aggregate
     assert "needs: test-shard" in aggregate
     assert "if: always() && needs.test-shard.result != 'skipped'" in aggregate
 
@@ -972,8 +990,9 @@ def test_exact_head_is_sharded_on_the_validated_target_with_one_aggregate():
     text = _workflow_text()
     shard = _job_text(text, "exact-head-shard")
     assert "needs: validate-managed" in shard
-    assert "name: Test validated exact head (shard ${{ matrix.shard }}/3)" in shard
-    assert "fail-fast: false" in shard and "shard: [1, 2, 3]" in shard
+    assert "name: Test validated exact head (shard ${{ matrix.shard }}/${{ inputs.shards }})" in shard
+    assert "fail-fast: false" in shard
+    assert "shard: ${{ fromJSON(needs.validate-managed.outputs.matrix) }}" in shard
     assert "ref: ${{ needs.validate-managed.outputs.target_sha }}" in shard
     assert 'test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"' in shard
     assert "-head-${{ needs.validate-managed.outputs.target_sha }}-shard-${{ matrix.shard }}" in shard
@@ -989,24 +1008,296 @@ def test_exact_head_is_sharded_on_the_validated_target_with_one_aggregate():
 
 
 @pytest.mark.parametrize(
-    "job,needs,head",
+    "workflow,job,needs,head",
     [
-        ("test", "test-shard", "${{ github.sha }}"),
-        ("exact-head", "exact-head-shard", "${{ needs.validate-managed.outputs.target_sha }}"),
+        (_ordinary_text, "test", "test-shard", "${{ github.sha }}"),
+        (_workflow_text, "exact-head", "exact-head-shard", "${{ needs.validate-managed.outputs.target_sha }}"),
     ],
 )
-def test_aggregates_gate_literally_and_verify_with_the_trusted_revision(job, needs, head):
-    block = _job_text(_workflow_text(), job)
+def test_aggregates_gate_literally_and_verify_with_the_callee_revision(workflow, job, needs, head):
+    block = _job_text(workflow(), job)
     env_part, steps_part = block.split("    steps:\n", 1)
     assert f"      SHARD_RESULT: ${{{{ needs.{needs}.result }}}}\n" in env_part
     gate = steps_part.index('run: test "$SHARD_RESULT" = success')
+    revision = steps_part.index("job.workflow_sha")
     checkout = steps_part.index("actions/checkout@v4")
-    verify = steps_part.index("python tests/ci_shard_verify.py")
-    assert gate < checkout < verify
+    verify = steps_part.index("python .managed-ci/ci/managed/ci_shard_verify.py")
+    assert gate < revision < checkout < verify
     assert "SHARD_RESULT:" not in steps_part
-    assert "ref: ${{ github.sha }}" in steps_part
+    # The verifier is checked out from the reusable workflow's own repository
+    # and revision; no step ever checks out the tested ref in the aggregate.
+    assert "repository: ${{ job.workflow_repository }}" in steps_part
+    assert "ref: ${{ job.workflow_sha }}" in steps_part
+    assert "sparse-checkout: ci/managed" in steps_part
     assert "target_sha }}\n          sparse" not in steps_part
-    assert "sparse-checkout: tests/ci_shard_verify.py" in steps_part
-    assert "python-version: '3.12'" in steps_part
+    assert "ref: ${{ needs.validate-managed.outputs.target_sha }}" not in steps_part
     assert f"--head {head}" in steps_part and '--result "$SHARD_RESULT"' in steps_part
-    assert "--count 3" in steps_part and "--run-id ${{ github.run_id }}" in steps_part
+    assert "--count ${{ inputs.shards }}" in steps_part and "--run-id ${{ github.run_id }}" in steps_part
+
+
+# --- reusable-workflow structure (#1210) ------------------------------------
+
+
+def _load(path):
+    import yaml
+
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def _perms(job):
+    value = job.get("permissions", {})
+    return value if isinstance(value, dict) else {}
+
+
+_RANK = {"none": 0, "read": 1, "write": 2}
+
+
+def _within(callee, caller):
+    return all(_RANK[level] <= _RANK[caller.get(scope, "none")] for scope, level in callee.items())
+
+
+def test_reusable_workflows_are_workflow_call_entry_points_with_project_inputs_only():
+    for path in (WORKFLOW, ORDINARY):
+        workflow = _load(path)
+        trigger = workflow.get(True, workflow.get("on"))
+        assert set(trigger) == {"workflow_call"}
+        inputs = trigger["workflow_call"]["inputs"]
+        assert {"test_command", "install_command", "python_version", "shards", "durations_file"} <= set(inputs)
+        # No input can carry trust: the actor and default branch come from vars
+        # and the live API inside the callee.
+        assert not {n for n in inputs if "actor" in n or "trusted" in n or "branch" in n or "base" in n}
+        assert "secrets" not in trigger["workflow_call"]
+    managed_inputs = _load(WORKFLOW).get(True)["workflow_call"]["inputs"]
+    for name in ("protocol_version", "pr_number", "expected_head_sha", "managed_nonce"):
+        assert managed_inputs[name]["type"] == "string" and managed_inputs[name]["default"] == ""
+    assert "vars.AGENT_LOOP_MANAGED_ACTOR" in _workflow_text()
+    assert "inputs.actor" not in _workflow_text()
+
+
+def test_caller_jobs_wire_each_entry_point_with_a_sufficient_permission_envelope():
+    caller = _load(CALLER)["jobs"]
+    assert set(caller) == {"ci", "managed"}
+    assert caller["ci"]["uses"] == "./.github/workflows/managed-ci-ordinary.yml"
+    assert caller["managed"]["uses"] == "./.github/workflows/managed-ci.yml"
+    # Fork pull_request runs and the ordinary entry point request no write scope.
+    assert caller["ci"]["permissions"] == {"contents": "read"}
+    assert caller["managed"]["permissions"] == {
+        "actions": "read", "contents": "read", "issues": "read",
+        "pull-requests": "read", "statuses": "write",
+    }
+    for caller_job, path in (("ci", ORDINARY), ("managed", WORKFLOW)):
+        envelope = _perms(caller[caller_job])
+        for job_id, job in _load(path)["jobs"].items():
+            assert _within(_perms(job), envelope), (path.name, job_id)
+            assert "permissions" in job, f"{path.name}:{job_id} must declare its own permissions"
+    ordinary_scopes = {s for j in _load(ORDINARY)["jobs"].values() for s in _perms(j)}
+    assert ordinary_scopes == {"contents"}
+    assert all(level == "read" for j in _load(ORDINARY)["jobs"].values() for level in _perms(j).values())
+    publishers = [
+        job_id for job_id, job in _load(WORKFLOW)["jobs"].items()
+        if _perms(job).get("statuses") == "write"
+    ]
+    assert publishers == ["publish-exact-head"]
+
+
+def test_caller_forwards_exactly_the_four_managed_inputs():
+    caller = _load(CALLER)
+    managed = caller["jobs"]["managed"]["with"]
+    for name in ("protocol_version", "pr_number", "expected_head_sha", "managed_nonce"):
+        assert managed[name] == "${{ inputs." + name + " }}"
+        assert name in caller[True]["workflow_dispatch"]["inputs"]
+    assert not any(name in caller["jobs"]["ci"]["with"] for name in managed if name.endswith("_nonce"))
+    assert "run-name" in caller
+    # The caller keeps the literal readiness markers the driver checks.
+    for marker in (
+        "AGENT_LOOP_MANAGED_CI_V2", "AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1",
+        "AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1", "AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1",
+    ):
+        assert caller["env"][marker] == "enabled"
+
+
+def test_caller_still_advertises_every_literal_the_driver_gates_on():
+    """The driver reads only the caller ci.yml; the reusable workflow is invisible to it."""
+    caller = _caller_text()
+    required = (
+        *managed_ci.V2_FEATURE_MARKERS,
+        managed_ci.RECOVERY_MARKER, "unlabeled",
+        managed_ci.VISIBLE_INTENT_MARKER, managed_ci.HOST_FOOTER_INTENT_MARKER,
+    )
+    assert [marker for marker in required if marker not in caller] == []
+
+
+def _caller_runs(inputs):
+    """Which caller jobs a workflow_dispatch with these inputs starts."""
+    managed = any(inputs.get(n, "") != "" for n in ("protocol_version", "pr_number", "expected_head_sha", "managed_nonce"))
+    return {"ci": not managed, "managed": managed}
+
+
+@pytest.mark.parametrize(
+    "inputs,expected",
+    [
+        ({}, {"ci": True, "managed": False}),
+        ({"protocol_version": "2"}, {"ci": False, "managed": True}),
+        ({"pr_number": "7"}, {"ci": False, "managed": True}),
+        ({"managed_nonce": "n" * 32}, {"ci": False, "managed": True}),
+        ({"protocol_version": "2", "pr_number": "7", "expected_head_sha": "b" * 40, "managed_nonce": "n" * 32},
+         {"ci": False, "managed": True}),
+    ],
+)
+def test_dispatch_routes_all_empty_to_ordinary_and_anything_else_to_managed(inputs, expected):
+    caller = _load(CALLER)["jobs"]
+    ci_if = " ".join(caller["ci"]["if"].split())
+    managed_if = " ".join(caller["managed"]["if"].split())
+    names = ("protocol_version", "pr_number", "expected_head_sha", "managed_nonce")
+    # The two expressions are exact complements over the four managed inputs.
+    all_empty = " && ".join(f"inputs.{n} == ''" for n in names)
+    any_set = " || ".join(f"inputs.{n} != ''" for n in names)
+    assert f"(github.event_name == 'workflow_dispatch' && {all_empty})" in ci_if
+    assert managed_if == f"github.event_name == 'workflow_dispatch' && ({any_set})"
+    assert _caller_runs(inputs) == expected
+
+
+def test_validate_job_rejects_forwarded_values_that_differ_from_the_dispatch_event():
+    job = _load(WORKFLOW)["jobs"]["validate-managed"]
+    first = job["steps"][0]
+    assert first["name"] == "Require forwarded inputs to equal the dispatch event"
+    for name in ("protocol_version", "pr_number", "expected_head_sha", "managed_nonce"):
+        assert first["env"]["FORWARDED_" + name.upper()] == "${{ inputs." + name + " }}"
+        assert first["env"]["EVENT_" + name.upper()] == "${{ github.event.inputs." + name + " }}"
+        assert f'test "$FORWARDED_{name.upper()}" = "$EVENT_{name.upper()}"' in first["run"]
+    # The condition also trips on event-only values, so a caller that forwards
+    # nothing while the event carries a value still reaches this rejection.
+    assert "github.event.inputs.managed_nonce != ''" in job["if"]
+    assert job["concurrency"]["group"] == (
+        "managed-ci-v2-pr-${{ inputs.pr_number }}-head-${{ inputs.expected_head_sha }}"
+    )
+    publish = _load(WORKFLOW)["jobs"]["publish-exact-head"]
+    assert "github.event.inputs.managed_nonce != ''" in publish["if"]
+
+
+def _strip_ref(step):
+    step = dict(step)
+    if "with" in step:
+        step["with"] = {k: v for k, v in step["with"].items() if k not in {"ref", "fetch-depth"}}
+        if not step["with"]:
+            del step["with"]
+    return step
+
+
+def _normalized_steps(job):
+    skipped = {"Verify exact checkout"}
+    return [_strip_ref(s) for s in job["steps"] if s.get("name") not in skipped]
+
+
+def test_shard_and_aggregate_bodies_match_across_entry_points_apart_from_the_tested_ref():
+    managed, ordinary = _load(WORKFLOW)["jobs"], _load(ORDINARY)["jobs"]
+    for managed_id, ordinary_id in (("exact-head-shard", "test-shard"), ("exact-head", "test")):
+        left, right = _normalized_steps(managed[managed_id]), _normalized_steps(ordinary[ordinary_id])
+        def canonical(steps):
+            text = json.dumps(steps, sort_keys=True)
+            for old in ("shard-manifest-exact-", "shard-manifest-full-"):
+                text = text.replace(old, "shard-manifest-KIND-")
+            text = text.replace("${{ needs.validate-managed.outputs.target_sha }}", "${{ github.sha }}")
+            return text
+        assert canonical(left) == canonical(right), managed_id
+        assert _within(_perms(managed[managed_id]), {"contents": "read"})
+        assert _perms(managed[managed_id]) == _perms(ordinary[ordinary_id])
+
+
+def test_default_branch_is_never_a_literal_in_the_trust_blocks():
+    text = _workflow_text()
+    for block in (_validator_block(text), _dispatch_block(text)):
+        assert "'main'" not in block and '"main"' not in block
+        assert "refs/heads/main" not in block and "commits/main" not in block
+    assert "refs/heads/' + default_branch" in _dispatch_block(text)
+    assert "'/commits/' + ''.join(" in _dispatch_block(text)
+    assert "'base_ref': default_branch" in _validator_block(text)
+    assert "pull_request.base.ref == github.event.repository.default_branch" in _caller_text()
+
+
+def test_validator_binds_the_base_to_the_live_default_branch():
+    record = _record(base_ref="trunk")
+    pr = _pr(base={"ref": "trunk"})
+    assert _validate(record, pr=pr, default_branch="trunk")["base_ref"] == "trunk"
+    # The same tuple is rejected when the repository's default branch is main.
+    with pytest.raises(ValueError, match="base is not the default branch"):
+        _validate(record, pr=pr, default_branch="main")
+    # An intent replayed for another target is rejected.
+    with pytest.raises(ValueError, match="binding drifted"):
+        _validate(_record(base_ref="main"), pr=pr, default_branch="trunk")
+    for bad in INVALID_BRANCHES:
+        with pytest.raises(ValueError):
+            _validate(_record(), default_branch=bad)
+
+
+def test_dispatch_validator_uses_the_live_default_branch_for_ref_and_revision():
+    result, calls = _dispatch_validate(
+        record=_record(base_ref="trunk"), default_branch="trunk"
+    )
+    assert result["target_sha"] == "b" * 40
+    assert "repos/OWNER/REPO/commits/trunk" in calls
+    assert "repos/OWNER/REPO/commits/main" not in calls
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # A workflow executing from an integration branch cannot self-certify.
+        {"ref": "refs/heads/refactor/1181"},
+        {"ref": "refs/heads/main", "default_branch": "trunk"},
+        {"ref": "refs/tags/main"},
+    ],
+)
+def test_dispatch_validator_rejects_a_ref_other_than_the_live_default_branch(overrides):
+    base = {"default_branch": overrides.pop("default_branch", "main")}
+    with pytest.raises(ValueError, match="from the default branch"):
+        _dispatch_validate(record=_record(base_ref=base["default_branch"]), **base, **overrides)
+
+
+def test_dispatch_validator_rejects_a_workflow_revision_bound_to_another_branch():
+    # The intent names the integration branch head, not the default-branch head.
+    with pytest.raises(ValueError, match="binding drifted"):
+        _dispatch_validate(record=_record(workflow_revision="c" * 40))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"full_name": "OWNER/REPO"}, {"full_name": "OWNER/REPO", "default_branch": ""},
+     {"full_name": "OWNER/REPO", "default_branch": 7}, {"full_name": "OWNER/REPO", "default_branch": "a..b"}],
+)
+def test_dispatch_validator_fails_closed_without_a_usable_default_branch(payload):
+    with pytest.raises(ValueError, match="default branch is unavailable"):
+        _dispatch_validate(repo_payload=payload)
+
+
+# Valid git branch names outside [A-Za-z0-9._/-] must work (git check-ref-format).
+VALID_BRANCHES = ["release\u00a0stable", "release+stable", "ünï/ブランチ", "feat#1", "a=b,c", "x@y", "main-2", "v1.0/rc"]
+INVALID_BRANCHES = [
+    None, 7, "", "@", "a b", "a\tb", "../x", "a..b", "/x", "x/", "a//b", "-x", "x.", ".x", "a/.b",
+    "a.lock", "a.lock/b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\\b", "a@{b", "a\x7fb",
+]
+
+
+@pytest.mark.parametrize("branch", VALID_BRANCHES)
+def test_every_valid_branch_name_is_accepted_as_the_default_branch(branch):
+    record = _record(base_ref=branch)
+    pr = _pr(base={"ref": branch})
+    assert _validate(record, pr=pr, default_branch=branch)["base_ref"] == branch
+    result, calls = _dispatch_validate(record=record, default_branch=branch)
+    assert result["target_sha"] == "b" * 40
+    # The branch is percent-encoded into the commit API path.
+    assert "repos/OWNER/REPO/commits/" + urllib.parse.quote(branch, safe="/._~-") in calls
+
+
+@pytest.mark.parametrize("branch", [b for b in INVALID_BRANCHES if b is not None])
+def test_invalid_branch_names_are_rejected_by_both_validators(branch):
+    with pytest.raises(ValueError):
+        _validate(_record(), default_branch=branch)
+    with pytest.raises(ValueError, match="default branch is unavailable"):
+        _dispatch_validate(repo_payload={"full_name": "OWNER/REPO", "default_branch": branch}, ref="refs/heads/x")
+
+
+@pytest.mark.parametrize("base_ref", ["a b", "x\ty", "a..b", "/x", "", "a~b"])
+def test_intent_base_ref_must_be_a_valid_branch_name(base_ref):
+    with pytest.raises(ValueError, match="invalid base_ref"):
+        _validate(_record(base_ref=base_ref))

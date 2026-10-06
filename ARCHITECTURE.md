@@ -941,8 +941,14 @@ complete pytest suite once, split across three duration-balanced shard legs
 (#1235) that each test the same validated SHA. A small aggregate keeps the
 original `Test validated exact head` check name: it fails unless every shard
 succeeded, using a workflow-literal result gate before any repository code,
-and then runs the trusted-revision `tests/ci_shard_verify.py` to prove from the
+and then runs the callee-owned `ci/managed/ci_shard_verify.py`, checked out
+from the reusable workflow's own repository and revision, to prove from the
 per-shard manifests that the shards covered the full collection exactly once.
+The whole boundary is a reusable `workflow_call` workflow
+(`.github/workflows/managed-ci.yml`, plus a read-only
+`managed-ci-ordinary.yml`) called by a thin `ci.yml` whose caller jobs grant
+exactly the permissions the callee jobs need; the dispatch must execute from the
+live default branch, whose head the intent's `workflow_revision` is bound to.
 The ordinary `Python 3.12 full suite` check is sharded the same way. An
 always-evaluated publisher writes the
 `final-ci/exact-head` status only for that validated SHA, correlating nonce,

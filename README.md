@@ -158,7 +158,12 @@ that exact SHA, installs the editable development dependencies, and runs the
 full `python -m pytest` suite once between them; an aggregate job named
 `Test validated exact head` succeeds only if every shard passed and the shard
 manifests prove exactly-once coverage. The ordinary `Python 3.12 full suite`
-check is sharded the same way. Shard balance comes from `tests/.test_durations`,
+check is sharded the same way. Both are provided by reusable `workflow_call`
+workflows in this repository (`.github/workflows/managed-ci.yml` and
+`managed-ci-ordinary.yml`, called by a thin `ci.yml`), so other projects can
+reuse the same validator and exact-head gate; the shard plugin and verifier
+live in `ci/managed/` and are checked out from the reusable workflow's own
+revision. Shard balance comes from `tests/.test_durations`,
 refreshed with
 `CI_SHARD_STORE_DURATIONS=tests/.test_durations python -m pytest -n auto`. The always-evaluated publisher writes
 `final-ci/exact-head` only for that validated target, with the nonce, run ID,

@@ -7218,7 +7218,7 @@ def test_v2_intent_body_is_bare_for_workflow_without_visible_capability():
         )
     local_router.validate(
         _visible_intent_pr(expected_head), pages, "OWNER/REPO", "7", expected_head,
-        "n" * 32, "agent-loop", revision, 7,
+        "n" * 32, "agent-loop", revision, 7, default_branch="main",
     )
 
 
@@ -7238,7 +7238,7 @@ def test_v2_intent_body_leads_with_fixed_visible_line_for_capable_workflow():
     pages = [[{"user": {"login": "agent-loop", "id": 7}, "body": body}]]
     validated = local_router.validate(
         _visible_intent_pr(expected_head), pages, "OWNER/REPO", "7", expected_head,
-        "n" * 32, "agent-loop", revision, 7,
+        "n" * 32, "agent-loop", revision, 7, default_branch="main",
     )
     assert validated["expected_head_sha"] == expected_head
 
@@ -7661,7 +7661,7 @@ def test_v2_emitted_lifecycle_records_are_accepted_by_pinned_consumers(tmp_path)
                 )
             with pytest.raises(ValueError, match="prepared intent"):
                 local_router.validate(
-                    pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision, 7
+                    pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision, 7, default_branch="main",
                 )
             with pytest.raises(ValueError, match="exactly one distinct qualifying intent"):
                 current_router.validate(
@@ -7675,7 +7675,7 @@ def test_v2_emitted_lifecycle_records_are_accepted_by_pinned_consumers(tmp_path)
                 pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision
             )
             local_router.validate(
-                pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision, 7
+                pr, pages, "OWNER/REPO", "7", expected_head, contract.nonce, "agent-loop", revision, 7, default_branch="main",
             )
 
 
@@ -10519,7 +10519,7 @@ def _router_pr():
 def _route(runner, nonce):
     return local_router.validate(
         _router_pr(), _page_for_router(runner), "OWNER/REPO", "7", V2_HEAD, nonce,
-        "agent-loop", V2_REVISION, 1,
+        "agent-loop", V2_REVISION, 1, default_branch="main",
     )
 
 
@@ -10614,7 +10614,7 @@ def _dispatch_validate(runner, *, current_time, nonce):
         current_run_attempt="1", current_time=current_time,
         api_json=lambda path: {
             "users/agent-loop": {"login": "agent-loop", "id": 1},
-            "repos/OWNER/REPO": {"full_name": "OWNER/REPO"},
+            "repos/OWNER/REPO": {"full_name": "OWNER/REPO", "default_branch": "main"},
             "repos/OWNER/REPO/pulls/7": _router_pr(),
             "repos/OWNER/REPO/commits/main": {"sha": V2_REVISION},
         }[path],
