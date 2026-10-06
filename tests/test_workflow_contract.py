@@ -129,7 +129,9 @@ def _pages(*records, actor="agent-loop", actor_id=7):
     ]]
 
 
-def _validate(record, *, pr=None, pages=None, actor="agent-loop", actor_id=7, default_branch="main"):
+def _validate(
+    record, *, pr=None, pages=None, actor="agent-loop", actor_id=7, default_branch="main", trusted_bases="",
+):
     return local_router.validate(
         pr or _pr(),
         pages if pages is not None else _pages(record),
@@ -141,6 +143,7 @@ def _validate(record, *, pr=None, pages=None, actor="agent-loop", actor_id=7, de
         "a" * 40,
         actor_id,
         default_branch=default_branch,
+        trusted_bases=trusted_bases,
     )
 
 
@@ -1211,7 +1214,7 @@ def test_default_branch_is_never_a_literal_in_the_trust_blocks():
         assert "refs/heads/main" not in block and "commits/main" not in block
     assert "refs/heads/' + default_branch" in _dispatch_block(text)
     assert "'/commits/' + ''.join(" in _dispatch_block(text)
-    assert "'base_ref': default_branch" in _validator_block(text)
+    assert "'base_ref': live_base" in _validator_block(text)
     assert "pull_request.base.ref == github.event.repository.default_branch" in _caller_text()
 
 
@@ -1220,14 +1223,96 @@ def test_validator_binds_the_base_to_the_live_default_branch():
     pr = _pr(base={"ref": "trunk"})
     assert _validate(record, pr=pr, default_branch="trunk")["base_ref"] == "trunk"
     # The same tuple is rejected when the repository's default branch is main.
-    with pytest.raises(ValueError, match="base is not the default branch"):
+    with pytest.raises(ValueError, match="not the default branch or a trusted base"):
         _validate(record, pr=pr, default_branch="main")
     # An intent replayed for another target is rejected.
-    with pytest.raises(ValueError, match="binding drifted"):
+    with pytest.raises(ValueError, match="live PR base does not equal"):
         _validate(_record(base_ref="main"), pr=pr, default_branch="trunk")
     for bad in INVALID_BRANCHES:
         with pytest.raises(ValueError):
             _validate(_record(), default_branch=bad)
+
+
+def test_trusted_exact_base_validates_and_default_only_without_variable():
+    record = _record(base_ref="refactor/1181")
+    pr = _pr(base={"ref": "refactor/1181"})
+    assert _validate(record, pr=pr, trusted_bases="refactor/1181")["base_ref"] == "refactor/1181"
+    # Variable unset or invalid: default branch only (today's behaviour).
+    for variable in ("", "   ", "*", "refactor/**", "x*/y", "refactor/1181 bad*"):
+        with pytest.raises(ValueError, match="not the default branch or a trusted base"):
+            _validate(record, pr=pr, trusted_bases=variable)
+    assert _validate(_record(), trusted_bases="")["base_ref"] == "main"
+
+
+def test_untrusted_intent_base_is_rejected():
+    record = _record(base_ref="feature/x")
+    pr = _pr(base={"ref": "feature/x"})
+    with pytest.raises(ValueError, match="not the default branch or a trusted base"):
+        _validate(record, pr=pr, trusted_bases="refactor/*")
+
+
+def test_intent_base_must_equal_the_live_base_even_when_both_are_trusted():
+    pr = _pr(base={"ref": "refactor/b"})
+    with pytest.raises(ValueError, match="live PR base does not equal the intent base_ref"):
+        _validate(_record(base_ref="refactor/a"), pr=pr, trusted_bases="refactor/a refactor/b")
+    # A trusted live base that differs from the (default-branch) intent.
+    with pytest.raises(ValueError, match="live PR base does not equal the intent base_ref"):
+        _validate(_record(base_ref="main"), pr=pr, trusted_bases="refactor/*")
+    # A default-branch live base cannot be satisfied by an integration intent.
+    with pytest.raises(ValueError, match="live PR base does not equal the intent base_ref"):
+        _validate(_record(base_ref="refactor/a"), pr=_pr(), trusted_bases="refactor/*")
+
+
+def test_variable_never_comes_from_a_workflow_input_or_the_pr():
+    text = _workflow_text()
+    assert "TRUSTED_BASES: ${{ vars.AGENT_LOOP_TRUSTED_BASES }}" in text
+    assert "inputs.trusted_bases" not in text
+    assert "AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1: enabled" in _caller_text()
+
+
+def test_dispatch_validator_accepts_an_allow_listed_integration_base_from_the_default_branch():
+    values = dict(record=_record(base_ref="refactor/1181"))
+    # The dispatch still executes from the default branch ref, never the base.
+    result, _ = _dispatch_validate_with_base(base="refactor/1181", trusted_bases="refactor/*", **values)
+    assert result["record"]["base_ref"] == "refactor/1181"
+    with pytest.raises(ValueError, match="from the default branch"):
+        _dispatch_validate_with_base(
+            base="refactor/1181", trusted_bases="refactor/*", ref="refs/heads/refactor/1181", **values
+        )
+    with pytest.raises(ValueError, match="trusted base"):
+        _dispatch_validate_with_base(base="refactor/1181", trusted_bases="", **values)
+
+
+def _dispatch_validate_with_base(*, base, trusted_bases, record, **overrides):
+    values = {
+        "protocol": "2", "pr_number_text": "7", "expected_head": "b" * 40, "nonce": "n" * 32,
+        "repo": "OWNER/REPO", "ref": "refs/heads/main", "configured_actor": "agent-loop",
+        "initiating_actor": "agent-loop", "rerun_actor": "agent-loop", "current_run_id": "200",
+        "current_run_attempt": "1", "current_time": 100,
+    }
+    values.update(overrides)
+    records = {
+        "users/agent-loop": {"login": "agent-loop", "id": 7},
+        "repos/OWNER/REPO": {"full_name": "OWNER/REPO", "default_branch": "main"},
+        "repos/OWNER/REPO/pulls/7": _pr(base={"ref": base}),
+        "repos/OWNER/REPO/commits/main": {"sha": "a" * 40},
+    }
+    return dispatch_validator.validate_dispatch(
+        **values, api_json=lambda path: records[path], api_pages=lambda path: _pages(record),
+        validate=local_router.validate, trusted_bases=trusted_bases,
+    ), None
+
+
+def test_trusted_bases_matcher_block_is_shared_verbatim_with_the_workflow():
+    import coding_review_agent_loop.managed_ci_bases as bases
+
+    source = Path(bases.__file__).read_text(encoding="utf-8")
+    assert _extraction_block(source, "MANAGED_CI_TRUSTED_BASES") == _extraction_block(
+        _workflow_text(), "MANAGED_CI_TRUSTED_BASES"
+    )
+    assert _extraction_block(source, "MANAGED_CI_TRUSTED_BASES") == _extraction_block(
+        Path(local_router.__file__).read_text(encoding="utf-8"), "MANAGED_CI_TRUSTED_BASES"
+    )
 
 
 def test_dispatch_validator_uses_the_live_default_branch_for_ref_and_revision():
@@ -1301,3 +1386,26 @@ def test_invalid_branch_names_are_rejected_by_both_validators(branch):
 def test_intent_base_ref_must_be_a_valid_branch_name(base_ref):
     with pytest.raises(ValueError, match="invalid base_ref"):
         _validate(_record(base_ref=base_ref))
+
+
+def test_integration_base_pr_keeps_ordinary_ci_and_it_is_never_the_trusted_gate():
+    # Fail-open: a managed draft into an integration base is not suppressed.
+    pr = _pr(base={"ref": "refactor/1181", "repo": {"full_name": "OWNER/REPO"}})
+    for action in ("opened", "synchronize", "reopened"):
+        assert _ordinary_route(action, pr, "agent-loop") is True
+    # The trusted gate is only the dispatch-validated managed workflow, which
+    # publishes final-ci/exact-head; the ordinary entry point never does.
+    assert "statuses" not in _ordinary_text()
+    assert "final-ci/exact-head" not in _ordinary_text()
+
+
+def test_pr_cannot_certify_itself_through_the_allow_list_or_the_workflow():
+    text = _workflow_text()
+    # The allow-list is a repository variable read inside the called workflow,
+    # alongside the actor; neither is a workflow_call input or a PR property.
+    trigger = _load(WORKFLOW).get(True)["workflow_call"]["inputs"]
+    assert not {name for name in trigger if "trust" in name or "base" in name or "actor" in name}
+    assert text.count("vars.AGENT_LOOP_TRUSTED_BASES") == 1
+    assert "AGENT_LOOP_TRUSTED_BASES" not in _ordinary_text()
+    # Dispatch always executes from the default branch, never the base.
+    assert "refs/heads/' + default_branch" in _dispatch_block(text)

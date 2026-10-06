@@ -13047,6 +13047,7 @@ class _M1047LivePrRunner(_FakeRunner):
             "draft": draft,
             "labels": [{"name": name} for name in labels],
             "head": {"sha": self.pr_payload.get("headRefOid")},
+            "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}},
         }
         self.events = [{
             "id": 101, "event": "labeled", "label": {"name": "agent-loop-managed"},
@@ -18244,3 +18245,40 @@ def test_inherited_guard_revision_after_an_episode_closed_by_approval_has_no_anc
     assert not any("step-back anchor" in str(c.args[-1]) for c in logged.call_args_list)
     posted = _plan_round_records(resumed)
     assert sum(1 for r in posted if r.step_back_entries) == 1
+
+
+def test_staged_direct_child_rerun_after_interrupted_integration_close_finishes_closure(
+    tmp_path, monkeypatch, capsys
+):
+    """Real run_issue_loop entry: a MERGED integration PR with an OPEN staged direct child (#1285)."""
+    import coding_review_agent_loop.issue_pr_handoff as handoff_module
+    from test_managed_ci_integration_bases import ScriptRunner
+
+    fresh, child, parent = _fresh_child_route_fixture(EXECUTION_DISPOSITION_DIRECT)
+    child = replace(child, number=42)
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("no agent, memory, dispatch or review may start")
+
+    monkeypatch.setattr(
+        orchestrator_module, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 42 else parent,
+    )
+    monkeypatch.setattr(orchestrator_module, "validate_open_issue", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator_module, "ensure_agent_workdirs", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator_module, "_freeze_prompt_architecture", lambda _r, config: config)
+    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: fresh)
+    monkeypatch.setattr(orchestrator_module, "prepare_agent_memory", forbidden)
+    monkeypatch.setattr(orchestrator_module, "_dispatch_decomposition_child", forbidden)
+    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", forbidden)
+    monkeypatch.setattr(
+        handoff_module, "authenticate_canonical_issue_pr",
+        lambda *a, **k: SimpleNamespace(pr_number=7, state="MERGED"),
+    )
+    runner = ScriptRunner(issue_state="open")
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop", base="refactor/1181")
+
+    assert run_issue_loop(runner, issue_number=42, config=config) == 0
+    assert [c for c in runner.commands if c[:3] == ["gh", "issue", "close"]]
+    assert not [c for c in runner.commands if "merge" in c and c[:2] == ["gh", "pr"]]
+    assert "without replaying the merge" in capsys.readouterr().out

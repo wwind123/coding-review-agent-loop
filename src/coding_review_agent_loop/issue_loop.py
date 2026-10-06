@@ -51,6 +51,7 @@ from .issue_pr_handoff import (
     require_pr_metadata_for_handoff,
     resolve_canonical_pr_for_issue,
 )
+from .integration_close import reconcile_merged_integration_child
 from .issue_pr_provenance import IssuePrProvenanceScope
 from .pr_contract import (
     format_pr_contract_comment,
@@ -208,6 +209,13 @@ def run_issue_loop(
         log(config, f"Validating issue #{issue_number}")
         validate_open_issue(runner, config=config, issue_number=issue_number)
         issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
+        # Before any routing (including the staged direct-child dispatch): an
+        # interrupted closure after a confirmed merge into an integration base
+        # is finished here, without a coder, review or merge replay.
+        if reconcile_merged_integration_child(
+            runner, config=config, issue_number=issue_number, issue_context=issue_context
+        ):
+            return 0
         staged_parent_issue = _infer_staged_parent_issue(issue_context)
         parent_issue_context = (
             get_issue_context(runner, config=config, issue_number=staged_parent_issue)

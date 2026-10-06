@@ -914,3 +914,58 @@ def test_docs_name_decompose_only_as_review_before_implementation_mode():
         a.help for a in issue_parser._actions if "--plan-execution-mode" in a.option_strings
     )
     assert "review-before-implementation" in help_text
+
+
+def test_docs_describe_trusted_integration_bases_and_their_limitation():
+    doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    readme = README.read_text(encoding="utf-8")
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+
+    assert "AGENT_LOOP_TRUSTED_BASES" in doc
+    assert "AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1" in doc
+    assert "`prefix/*`" in doc
+    assert (
+        "CI-level\nchanges that exist only on the integration branch (new jobs or steps in\n"
+        "`ci.yml`) do not apply to its PRs until they land on the default branch"
+    ) in doc
+    assert "narrowed but not\n  excluded atomically" in doc
+    assert "managed-ci.yml@<sha>" in doc
+    assert "AGENT_LOOP_TRUSTED_BASES" in readme
+    anchor = _github_anchor("Trusted integration bases (`AGENT_LOOP_TRUSTED_BASES`)")
+    assert f"docs/local_agent_loop.md#{anchor}" in readme
+    assert "Trusted integration bases (`AGENT_LOOP_TRUSTED_BASES`)" in doc
+    for phrase in ("AGENT_LOOP_TRUSTED_BASES", "dispatch_ref", "integration_close.py"):
+        assert phrase in architecture
+
+
+def test_adoption_snippet_carries_the_caller_routing_and_permissions():
+    import textwrap
+
+    doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    start = doc.index("name: CI\nenv:  # literal readiness markers")
+    snippet = doc[start : doc.index("```", start)]
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    def condition(text, job):
+        body = text[text.index(f"\n  {job}:\n") :]
+        marker = "    if: >-\n"
+        begin = body.index(marker) + len(marker)
+        return textwrap.dedent(body[begin : body.index("    permissions:", begin)]).strip()
+
+    for job in ("ci", "managed"):
+        assert condition(snippet, job) == condition(workflow, job)
+    assert "      statuses: write" in snippet and "AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1" in snippet
+    assert snippet.index("  ci:") < snippet.index("      contents: read") < snippet.index("  managed:")
+
+
+def test_duration_refresh_command_loads_the_callee_owned_shard_plugin():
+    # The conftest shim is gone, so a refresh only records durations when the
+    # plugin is put on PYTHONPATH and loaded explicitly.
+    for path in (README, LOCAL_AGENT_LOOP_DOC):
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        assert "CI_SHARD_STORE_DURATIONS=tests/.test_durations" in text, path
+        command = text[text.index("PYTHONPATH=ci/managed") :]
+        command = command[: command.index("-n auto") + len("-n auto")]
+        assert "CI_SHARD_STORE_DURATIONS=tests/.test_durations" in command, path
+        assert "${PYTHONPATH:+:$PYTHONPATH}" in command, path
+        assert "-p ci_shard_plugin" in command, path

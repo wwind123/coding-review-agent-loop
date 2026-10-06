@@ -13,6 +13,50 @@ import json
 import re
 
 
+# BEGIN MANAGED_CI_TRUSTED_BASES
+# Source repository: wwind123/coding-review-agent-loop
+# Source path: src/coding_review_agent_loop/managed_ci_bases.py
+# Extraction boundary: trusted_base_patterns() through base_is_trusted().
+def trusted_base_patterns(text):
+    def valid_branch(name):
+        return (
+            type(name) is str and name not in {'', '@'}
+            and not re.search(r'[\x00-\x20\x7f~^:?*\[\\]', name)
+            and not re.search(r'\.\.|@\{|//|\.lock(/|$)|(^|/)\.|[./]$|^[/-]', name)
+        )
+
+    if type(text) is not str:
+        return ()
+    patterns = []
+    for entry in re.split(r'[\s,]+', text.strip()):
+        if not entry:
+            continue
+        if entry.endswith('/*'):
+            if not valid_branch(entry[:-2]):
+                return ()
+            patterns.append((entry[:-1], True))
+        elif valid_branch(entry):
+            patterns.append((entry, False))
+        else:
+            return ()
+    return tuple(patterns)
+
+
+def base_is_trusted(base, default_branch, text):
+    if type(base) is not str or type(default_branch) is not str or not base:
+        return False
+    if base == default_branch:
+        return True
+    for pattern, is_prefix in trusted_base_patterns(text):
+        if is_prefix:
+            if base.startswith(pattern) and len(base) > len(pattern):
+                return True
+        elif base == pattern:
+            return True
+    return False
+# END MANAGED_CI_TRUSTED_BASES
+
+
 # BEGIN MANAGED_CI_V2_VALIDATOR
 # Source repository: wwind123/coding-review-agent-loop
 # Source path: .github/workflows/managed-ci.yml
@@ -20,7 +64,7 @@ import re
 # This block is copied verbatim into tests/fixtures/managed_ci/local_router.py.
 def validate(
     pr, pages, repo, num, sha, nonce, actor, revision, actor_id=None,
-    default_branch=None,
+    default_branch=None, trusted_bases='',
 ):
     def fail(reason):
         raise ValueError(reason)
@@ -53,8 +97,13 @@ def validate(
     }
     if pr.get('state') != 'open' or pr.get('draft') is not True:
         fail('live PR is not an open draft')
-    if pr.get('base', {}).get('ref') != default_branch:
-        fail('live PR base is not the default branch')
+    # The base is the live PR's real base: the default branch or one
+    # the repository owner allow-listed in AGENT_LOOP_TRUSTED_BASES
+    # (#1285).  The allow-list comes from repository variables, never
+    # from a PR or a workflow input.
+    live_base = pr.get('base', {}).get('ref')
+    if not base_is_trusted(live_base, default_branch, trusted_bases):
+        fail('live PR base is not the default branch or a trusted base')
     if pr.get('head', {}).get('sha') != sha:
         fail('live PR head drifted')
     if (pr.get('head', {}).get('repo') or {}).get('full_name') != repo:
@@ -203,11 +252,13 @@ def validate(
             if record['state'] in {'attached', 'completed'} and outcome is None:
                 if (run_id, run_attempt) in seen_attempts:
                     fail('active run is already terminal history')
+            if record['base_ref'] != live_base:
+                fail('live PR base does not equal the intent base_ref')
             expected = {
                 'repository': repo,
                 'pr': int(num),
                 'expected_head_sha': sha,
-                'base_ref': default_branch,
+                'base_ref': live_base,
                 'workflow_revision': revision,
                 'nonce': nonce,
             }

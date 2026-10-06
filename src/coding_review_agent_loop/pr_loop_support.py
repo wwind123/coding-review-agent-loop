@@ -67,6 +67,7 @@ from .managed_ci import (
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
     refresh_ordinary_recovery_capability,
+    require_recorded_base,
     render_managed_ci_resume_command,
     validate_ordinary_recovery_capability,
     verify_managed_pr_plan_binding,
@@ -177,6 +178,10 @@ class ExactHeadCiProof:
 
     head_sha: str
     source: str
+    # Qualification is bound to the base it was granted for (#1285); empty for
+    # sources that predate the recorded-base guard.
+    base_ref: str | None = None
+    repository: str | None = None
 
 
 def _render_ci_rerun_command(config: AgentLoopConfig, *, pr_number: int) -> str:
@@ -238,6 +243,10 @@ def _merge_with_exact_head_proof(
         raise AgentLoopError(
             f"PR #{pr_number} head changed after {proof.source} CI proof; no merge attempted."
         )
+    require_recorded_base(
+        runner, config=config, pr_number=pr_number, base_ref=proof.base_ref,
+        repository=proof.repository, head_sha=proof.head_sha, action="merge",
+    )
     merge_pr(runner, config, pr_number, expected_head_sha=proof.head_sha)
 
 

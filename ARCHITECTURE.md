@@ -949,7 +949,26 @@ The whole boundary is a reusable `workflow_call` workflow
 `managed-ci-ordinary.yml`) called by a thin `ci.yml` whose caller jobs grant
 exactly the permissions the callee jobs need; the dispatch must execute from the
 live default branch, whose head the intent's `workflow_revision` is bound to.
-The ordinary `Python 3.12 full suite` check is sharded the same way. An
+The ordinary `Python 3.12 full suite` check is sharded the same way.
+Integration targets (#1285): the live PR base must equal the intent's
+`base_ref` and be the default branch or match the owner-controlled
+`AGENT_LOOP_TRUSTED_BASES` repository variable (exact names or `prefix/*`,
+parsed by one matcher block shared verbatim by the workflow and
+`managed_ci_bases.py`; unset or invalid trusts the default branch only). The
+workflow, its revision and the dispatch ref always come from the default
+branch (`ManagedCiContract.dispatch_ref`), while `base_ref` carries the real
+base, so a branch cannot supply the workflow that qualifies it. Startup (and
+`managed-ci preflight`) refuses an untrusted, unreadable or unsupported
+(`AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1` absent) non-default `--base` before
+any agent work. `prepare_v2_merge`, manual qualification and the merge call
+re-read the live repository/base/head and re-check trust, releasing the
+qualified label on a retarget or revocation; GitHub's merge API guards only
+the head SHA, so the final retarget race is narrowed, not eliminated. After a
+confirmed merge into a non-default base the child issue is closed
+(`integration_close.py`), and an interrupted closure is retried from the
+authenticated MERGED PR by resume and `phase_progress` without replaying the
+merge. CI-level changes only on an integration branch do not apply to its PRs
+until they land on the default branch. An
 always-evaluated publisher writes the
 `final-ci/exact-head` status only for that validated SHA, correlating nonce,
 run ID, attempt, and Actions URL. Authorization failures before target

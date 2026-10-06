@@ -4148,7 +4148,7 @@ aggregate (skipped when routing suppresses CI, as before). After
 if a manifest is missing (for example expired artifacts) it asks for "Re-run
 all jobs". The partition uses `tests/.test_durations`; refresh it when balance
 drifts with
-`CI_SHARD_STORE_DURATIONS=tests/.test_durations python -m pytest -n auto`.
+`PYTHONPATH=ci/managed${PYTHONPATH:+:$PYTHONPATH} CI_SHARD_STORE_DURATIONS=tests/.test_durations python -m pytest -p ci_shard_plugin -n auto` (the plugin is not loaded automatically).
 Drift affects balance only, never coverage.
 
 The validator, exact-head shards, aggregate and publisher live in the reusable
@@ -4175,15 +4175,153 @@ context fails closed), and every leg runs `ci/managed/run_shard.py`, which
 injects `ci_shard_plugin` with `-p`. With `shards: 1` the command runs unchanged
 and only the literal result gate applies. The reusable jobs surface as
 `ci / ...` and `managed / ...` checks, so a branch-protection rule that
-requires the old bare check names must be updated at rollout. Until the default
-branch itself runs the reusable workflow, `tests/_ci_shard.py` and
-`tests/ci_shard_verify.py` remain as transition shims for the installed
-workflow. The publisher writes `final-ci/exact-head` only for
+requires the old bare check names must be updated at rollout. The default
+branch now is the reusable workflow's caller, so the stage-A transition shims
+(`tests/_ci_shard.py`, `tests/ci_shard_verify.py`) are gone: the plugin is only
+ever injected by `ci/managed/run_shard.py`. The publisher writes `final-ci/exact-head` only for
 that validated SHA and correlates its terminal description and Actions URL to
 the managed nonce, run ID, and current attempt. It writes nothing when
 authorization fails before a target exists, and publishes failure when
 checkout or tests fail. Pushes to `main` and ordinary manual dispatch remain
 full-suite paths.
+
+#### Trusted integration bases (`AGENT_LOOP_TRUSTED_BASES`)
+
+Risky multi-PR work can run on an integration branch with the full managed-CI
+guarantees (CI only after every reviewer approved, exact-head testing, the
+trusted `final-ci/exact-head` gate for auto-merge), not only PRs into the
+default branch. The repository owner declares the allowed integration bases in
+the `AGENT_LOOP_TRUSTED_BASES` Actions variable: whitespace- or
+comma-separated entries, each an exact branch name (`refactor/1181`) or a
+`prefix/*` pattern (`refactor/*`, which matches `refactor/1181` and
+`refactor/a/b` but not `refactor` or `refactorx/1`). Anything else (`*`, `**`,
+embedded wildcards, invalid ref names) makes the whole variable invalid. An
+unset or invalid variable trusts the default branch only, which is the behavior
+without the variable.
+
+```bash
+gh variable set AGENT_LOOP_TRUSTED_BASES --repo OWNER/REPO --body 'refactor/*'
+```
+
+Trust model:
+
+- The workflow always executes from the default branch, and the intent's
+  `workflow_revision` stays bound to the default-branch head. The tool reads
+  `ci.yml`, the workflow revision and the dispatch ref from the default branch
+  whatever `--base` is; the signed intent records the PR's real base in
+  `base_ref`.
+- The validator accepts a dispatch only when the live PR base equals the
+  intent's `base_ref` and that base is the default branch or matches
+  `AGENT_LOOP_TRUSTED_BASES`. The variable is read by the called workflow from
+  repository settings, never from a workflow input, so a PR cannot edit it or
+  the reusable workflow to qualify itself.
+- `--base` that is neither the default branch nor trusted is refused at startup
+  (and by `agent-loop managed-ci preflight --base X`) with a message naming
+  `AGENT_LOOP_TRUSTED_BASES`, before any agent or review cycle. An unreadable
+  variable, or a default-branch workflow without the
+  `AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1` marker, also refuses a non-default
+  base; neither affects default-branch runs.
+- Auto-merge and manual qualification re-read the live repository, base and
+  head and re-check trust before readying the PR, before publishing a manual
+  qualification record and before merging. A retarget, revoked allow-list entry
+  or moved head refuses, releases the qualified label and requires
+  re-qualification. Residual race: GitHub's merge API guards only the head SHA,
+  so a retarget between the final check and the merge call is narrowed but not
+  excluded atomically.
+- GitHub closes a closing-referenced issue only on a default-branch merge, so
+  after a confirmed merge into a trusted non-default base agent-loop closes the
+  child issue with a comment naming the PR and base. If the merge succeeded but
+  the close was interrupted, a later run (or the staged parent's
+  `phase_progress`) authenticates the MERGED PR and retries the closure without
+  replaying the merge, and reports unresolved closure instead of claiming the
+  stage complete.
+
+Known limitation: the workflow comes from the default branch, so CI-level
+changes that exist only on the integration branch (new jobs or steps in
+`ci.yml`) do not apply to its PRs until they land on the default branch. Test
+code and test infrastructure at the PR head do apply, because the workflow
+checks out and runs the exact head. Ordinary `pull_request` CI for an
+integration-base PR is not suppressed and is never the trusted gate.
+
+Adopting the reusable workflow in another project: copy the complete caller
+below (triggers, `run-name`, routing conditions and permissions), pinned to a
+commit SHA (put the tag in a comment, tags are mutable), and set
+`AGENT_LOOP_MANAGED_ACTOR` and, for integration branches,
+`AGENT_LOOP_TRUSTED_BASES`. The `if:` conditions are part of the contract: the
+`ci` job must not run for managed dispatches or for a managed default-base
+draft (that suppression is what makes CI run only after approval), and the
+`managed` job, which holds `statuses: write`, must not exist for push,
+`pull_request` or all-empty dispatch events.
+
+```yaml
+name: CI
+env:  # literal readiness markers the driver checks
+  AGENT_LOOP_MANAGED_CI_V2: enabled
+  AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1: enabled
+  AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1: enabled
+  AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1: enabled
+  AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1: enabled
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, unlabeled]
+  workflow_dispatch:
+    inputs:
+      protocol_version: {description: Managed-CI protocol version, required: false, default: ''}
+      pr_number: {description: Pull request being qualified, required: false, default: ''}
+      expected_head_sha: {description: Exact pull request head SHA, required: false, default: ''}
+      managed_nonce: {description: Fresh generation nonce, required: false, default: ''}
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.managed_nonce != '' && format('managed-ci-v2 nonce={0}', inputs.managed_nonce) || github.workflow }}
+jobs:
+  ci:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.protocol_version == '' && inputs.pr_number == '' &&
+       inputs.expected_head_sha == '' && inputs.managed_nonce == '') ||
+      (github.event_name == 'pull_request' &&
+       (github.event.action == 'unlabeled' ||
+        !(github.event.pull_request.base.ref == github.event.repository.default_branch &&
+          github.event.pull_request.base.repo.full_name == github.repository &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          startsWith(github.event.pull_request.head.ref, 'agent-loop/managed-') &&
+          github.event.pull_request.draft == true &&
+          vars.AGENT_LOOP_MANAGED_ACTOR != '' &&
+          github.event.pull_request.user.login == vars.AGENT_LOOP_MANAGED_ACTOR &&
+          (github.event.action == 'opened' ||
+           ((github.event.action == 'synchronize' || github.event.action == 'reopened') &&
+            contains(github.event.pull_request.labels.*.name, 'agent-loop-managed'))))))
+    permissions:
+      contents: read
+    uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci-ordinary.yml@<sha> # v1
+    with:
+      test_command: python -m pytest -n auto
+  managed:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '')
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: write
+    uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci.yml@<sha> # v1
+    with:
+      protocol_version: ${{ inputs.protocol_version }}
+      pr_number: ${{ inputs.pr_number }}
+      expected_head_sha: ${{ inputs.expected_head_sha }}
+      managed_nonce: ${{ inputs.managed_nonce }}
+      test_command: python -m pytest -n auto
+```
+
+An integration-base PR is deliberately not suppressed (the expression only
+suppresses when the base is the default branch), so its ordinary CI stays
+informational and is never the trusted gate.
+
+The callee takes no trusted-bases or actor input.
 
 For this sole-maintainer repository, install and qualify the workflow before
 using managed CI: set `AGENT_LOOP_MANAGED_ACTOR` to `wwind123`, authenticate

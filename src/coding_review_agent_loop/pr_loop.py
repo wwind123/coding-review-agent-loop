@@ -6477,6 +6477,8 @@ def run_pr_loop(
                                         proof=ExactHeadCiProof(
                                             head_sha=pr_metadata.head_sha or "",
                                             source="managed exact-head",
+                                            base_ref=managed_ci.base_ref,
+                                            repository=managed_ci.repository or config.repo,
                                         ),
                                     )
                                     print(
