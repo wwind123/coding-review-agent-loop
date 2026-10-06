@@ -19,6 +19,8 @@ from .errors import AgentInvocationError, AgentLoopError
 from .github import PullRequestMetadata, post_issue_comment
 from .logging import log
 from .protocol import (
+    EVIDENCE_REASK_MAX_CHARS,
+    render_evidence_rejection_detail,
     ParsedPlanReview,
     ParsedReview,
     StructuredCoderFollowup,
@@ -602,14 +604,12 @@ def _missing_judgement_field_reask_prompt(
     )
 
 
-_EVIDENCE_REASK_MAX_CHARS = 1500
+_EVIDENCE_REASK_MAX_CHARS = EVIDENCE_REASK_MAX_CHARS
 
 
 def _evidence_rejection_reask_prompt(prompt: str, detail: str) -> str:
     """Append one bounded, marker-free section quoting a rejected test citation."""
-    quoted = " ".join(sanitize_historical_text(detail).replace("<", "(").replace(">", ")").split())
-    if len(quoted) > _EVIDENCE_REASK_MAX_CHARS:
-        quoted = quoted[: _EVIDENCE_REASK_MAX_CHARS - 3] + "..."
+    quoted = render_evidence_rejection_detail(detail)
     return (
         f"{prompt}\n\n## Previous response not accepted: test evidence\n\n"
         f"The test observation you selected is not citable: {quoted}\n\n"

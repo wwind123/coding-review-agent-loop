@@ -6743,8 +6743,13 @@ argument and every other option on a fixed allow-list with values only in
 flags such as `--pass-with-no-tests`, `--only-changed`, `--last-failed`, and `--shard`,
 interactive `--ui`/`--debug`, `--config`/`--tsconfig`/global-setup options,
 custom `--reporter` modules, and a non-empty `NODE_OPTIONS` or
-`PW_TEST_REPORTER` stay unrecognized; `npx`/`pnpm`/`yarn` launch forms are not
-recognized), agent-loop
+`PW_TEST_REPORTER` stay unrecognized; `npx [--no-install|--no] playwright test`
+resolves to the local binary when it exists, and `npm run <script> [-- args]`,
+`pnpm run <script>` and `yarn [run] <script>` are recognized by statically
+resolving `<cwd>/package.json` to a single recognized command with no
+`pre`/`post` script, so the resolved command, not the package manager, is probed
+and launched; a plain `node <file>` must be run as `node --test <file>`, which
+counts as one runner test that passes only on exit 0), agent-loop
 performs a fixed `--version` bootstrap probe
 under the same five-second bound. Other launchers are never classified from
 stderr or an exit code. Results carry independent `wrapper_bootstrap`,

@@ -5653,3 +5653,69 @@ def test_matrix_review_guidance_mentions_coverage_map_only_when_applicable():
         _coverage_plan_context(applicability="not-applicable"), max_chars=None
     )
     assert "coverage map" not in not_applicable
+
+
+@pytest.mark.parametrize(
+    "script", ["npx playwright test --project=a", "pytest tests/"],
+)
+def test_rendered_recommendation_matches_recorded_package_script_rows_1294(tmp_path, script):
+    """A recorded ``npm run`` row is matched by the real memory-context lookup, and stops matching after an edit."""
+    import json as _json
+
+    memory_dir = tmp_path / "memory"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "package.json").write_text(_json.dumps({"scripts": {"test:x": script}}), encoding="utf-8")
+    (repo / "pyproject.toml").write_text(
+        '[project.optional-dependencies]\ndev = ["pytest-xdist"]\n', encoding="utf-8",
+    )
+    launcher = repo / "node_modules" / ".bin" / "playwright"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    command = ["npm", "run", "test:x"]
+    config = make_config(
+        tmp_path, claude_dir=repo, test_command=command, test_workers=3,
+        test_worker_enforcement="clamp", coder_test_command_timeout_seconds=1800,
+        agent_memory_dir=memory_dir,
+    )
+    from coding_review_agent_loop.prompts import _expected_worker_cohorts
+
+    cohorts = _expected_worker_cohorts(config, command)
+    # An enforced pytest body may run parallel or serial; both cohorts are
+    # recorded so the safest-watchdog lookup has a sample for every cohort.
+    if script.startswith("pytest"):
+        assert cohorts == ["3", "serial"]
+    now = datetime_type.now(timezone.utc)
+    direct_timeouts = []
+    for index, cohort in enumerate(cohorts):
+        for _ in range(3):
+            assert runtime.record_test_observation(
+                memory_dir, argv=command, cwd=repo, outcome="passed",
+                elapsed_seconds=30 + 30 * index, attempted_timeout_seconds=1800,
+                policy_ceiling_seconds=1800, timestamp=now, workers=cohort,
+                launch_integrity="verified",
+            )
+        direct = runtime.recommend_timeout(
+            memory_dir, argv=command, cwd=repo, policy_ceiling_seconds=1800, workers=cohort,
+        )
+        assert direct.successful_samples == 3 and direct.recommended_timeout_seconds < 1800
+        direct_timeouts.append(direct.recommended_timeout_seconds)
+    expected = max(direct_timeouts)
+
+    def render() -> str:
+        memory = AgentMemoryContext(
+            memory_dir=memory_dir, current_commit="abc123", last_analyzed_commit=None,
+            changed_files=(), repo_summary="REPO SUMMARY TEXT", architecture_map=None,
+            test_profile=None, toolchain=None,
+            runtime_observations=tuple(runtime.load_runtime_memory(memory_dir)),
+        )
+        return build_issue_prompt(56, config, memory=memory)
+
+    assert f"Recommended whole-command timeout: {expected}s" in render()
+    (repo / "package.json").write_text(
+        _json.dumps({"scripts": {"test:x": script + " --changed"}}), encoding="utf-8",
+    )
+    edited = render()
+    assert f"Recommended whole-command timeout: {expected}s" not in edited

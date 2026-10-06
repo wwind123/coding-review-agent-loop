@@ -108,6 +108,24 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "fields or canonical evidence rows."
         ),
     ),
+    "_node_test_hint": ShapeCheckClassification(
+        "fatal",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
+    "render_evidence_rejection_detail": ShapeCheckClassification(
+        "fatal",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
     "ParseDegradation.build": ShapeCheckClassification(
         "fatal",
         frozenset({"authentication-or-forgery"}),

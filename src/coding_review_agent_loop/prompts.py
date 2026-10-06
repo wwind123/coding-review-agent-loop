@@ -434,8 +434,16 @@ def _expected_worker_cohorts(config: AgentLoopConfig, command: Sequence[str]) ->
     try:
         from .test_workers import expected_workers_label, parallel_default_applies
 
+        from .test_runtime import resolve_adopted_package_script
+
         budget = preliminary_worker_budget(config)
         workdir = agent_workdir(config, config.coder)
+        # Advisory only (issue #1294): an adoptable package script is sized
+        # from its resolved body, exactly as the runner will run it.  The read
+        # never influences what is launched.
+        resolution = resolve_adopted_package_script(command, cwd=workdir)
+        if resolution is not None:
+            command = resolution.executed_argv
         labels = [expected_workers_label(command, budget=budget.workers, mode=budget.enforcement)]
         # Only a command the wrapper would give the default may use the
         # parallel cohort; a serial-only invocation (``--collect-only``,
@@ -1476,6 +1484,7 @@ def _structured_coder_followup_guidance(
         "When a listed item shows sub-items and you leave it in `remaining_items`, classify each open sub-item you addressed in the optional `addressed_sub_items` array (for example `[\"item-2.s1\"]`); the rest stay remaining. Listing an item in `addressed_items` implies every open sub-item is addressed. `addressed_sub_items` entries are advisory claims that the reviewer verifies; invalid entries are dropped, never rejected.",
         "Use `disputed_items` when a reviewer claim is factually incorrect (wrong pricing, stale diff reading, incorrect behavior assumption) or when the reviewer requests a change that is mutually incompatible with a verified approved-plan decision and you have counter-evidence. For a plan conflict, `dispute_evidence` must name the conflicting approved decision, concrete counter-evidence, and why the requested change is incompatible. Put the item ID in `disputed_items` instead of `addressed_items` or `remaining_items`; never park a verified plan conflict in `remaining_items`, whose retry semantics would silently recycle it. Ordinary implementation defects and evidence-backed correctness, security, compatibility, or test defects must be fixed and classified as addressed or genuinely remaining, never disputed merely because the implementation followed the plan. The reviewer will get one more turn to reconsider with your evidence attached. If the reviewer still blocks after seeing the evidence, the orchestrator will surface the disagreement to a human for resolution.",
         "When you use the managed `agent-loop run-tests` wrapper, report the exact command, outcome, caveats, test identifiers, and locations. The wrapper prints an invocation-local `execution_ref`; use that selector only in semantic coverage claims. Never copy a receipt ID into a risk claim, and never infer a selector from command text, test identifiers, list position, or outcome.",
+        "A standalone Node test script is citable only when run as `node --test <file>`; it counts as one runner test that passes only on exit 0. A package.json script is citable via `npm run <name>` (or `pnpm run`/`yarn run`) only when it is a single recognized test command with no pre/post scripts.",
         "If the approved plan delivered an applicable risk matrix, include `risk_test_matrix_claims` as a bounded JSON array of semantic claims. "
         + semantic_risk_claim_schema_text(include_coverage_map=include_coverage_map)
         + " "
@@ -1585,6 +1594,7 @@ Rules:
 - A null-PR blocker unrelated to signed requirements is valid with the empty ledger required by the rules above.
 - `tests_run` is optional and may be absent, `null`, or an empty array when no tests ran. When supplied, it contains only exact command strings; report why tests could not run in `summary`.
 - `test_observations` is optional display evidence; when supplied, report only exact managed-wrapper commands and outcomes. A legacy or direct-shell report remains capture-limited.
+- A standalone Node test script is citable only when run as `node --test <file>` (one runner test that passes only on exit 0); a package.json script is citable via `npm run <name>` only when it is a single recognized test command with no pre/post scripts.
 - When the approved-plan context contains an applicable risk matrix, report semantic `risk_test_matrix_claims` only: each claim names an approved `row_id`, current-turn `execution_refs`, actual test identifiers/locations, workflow/outcome/forbidden-effect assertions, and optional caveats. {semantic_risk_claim_schema_text(include_coverage_map=include_coverage_map)}{coverage_map_rules} Do not emit `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, or envelope bookkeeping. The orchestrator derives those fields from the approved matrix, authoritative journal, and authenticated PR head. Planned tests and unverified commands are not evidence.
 - Start directly with exactly one top-level JSON object. Put the `<!-- AGENT_STATE: blocking -->` footer immediately after it and only your standalone signature after the footer.
 

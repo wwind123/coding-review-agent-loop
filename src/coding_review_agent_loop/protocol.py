@@ -3202,6 +3202,91 @@ def _observation_projection_field(observation: object, name: str) -> object:
     return None
 
 
+_NODE_HINT_FILE_RE = re.compile(r"[A-Za-z0-9 ._/@+,=-]+")
+_NODE_HINT_EXTENSIONS = (".js", ".mjs", ".cjs", ".ts")
+
+
+EVIDENCE_REASK_MAX_CHARS = 1500
+
+
+def render_evidence_rejection_detail(detail: str) -> str:
+    """The exact text the evidence re-ask prompt quotes for a rejection detail.
+
+    Single definition shared with the re-ask renderer, so anything validated
+    against it reaches the coder unaltered: markers neutralized, whitespace runs
+    collapsed, and the whole detail capped.
+    """
+    neutralized = sanitize_historical_text(detail)  # shape-check: fatal:authentication-or-forgery
+    quoted = " ".join(neutralized.replace("<", "(").replace(">", ")").split())
+    if len(quoted) > EVIDENCE_REASK_MAX_CHARS:
+        quoted = quoted[: EVIDENCE_REASK_MAX_CHARS - 3] + "..."
+    return quoted
+
+
+def _node_test_hint(observation: object, message: str = "") -> str:
+    """Name the verifiable ``node --test <file>`` spelling, or nothing (#1294).
+
+    Derived only from the redacted projection, and only when the projection
+    signals that redaction left every token byte-for-byte intact, so an
+    altered, truncated or private path is never turned into a rerun command.
+    """
+    from .local_test_evidence import MAX_SAFE_COMMAND_BYTES, _UNPARSABLE_PREFIX
+    from .test_runtime import _is_node_test_runner
+
+    if _observation_projection_field(observation, "command_verbatim") is not True:
+        return ""
+    caveats = _observation_projection_field(observation, "caveats")
+    if isinstance(caveats, (list, tuple)) and any(
+        isinstance(item, str) and item.startswith(_UNPARSABLE_PREFIX) for item in caveats
+    ):
+        return ""
+    command = _observation_projection_field(observation, "command")
+    if isinstance(command, str):
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            return ""
+    elif isinstance(command, (list, tuple)):
+        tokens = [str(item) for item in command]
+    else:
+        return ""
+    if len(tokens) < 2 or tokens[0] not in {"node", "nodejs"}:
+        return ""
+    flags, file = tokens[1:-1], tokens[-1]
+    if "--test" in flags or not _is_node_test_runner(["--test", *flags, file]):
+        return ""
+    parts = file.split("/")
+    if (
+        not _NODE_HINT_FILE_RE.fullmatch(file)
+        or file.startswith(("/", "-"))
+        or ".." in parts
+        or not file.endswith(_NODE_HINT_EXTENSIONS)
+        or any(part == "" for part in parts)
+    ):
+        return ""
+    base = parts[-1].lower()
+    if not (
+        parts[0] in {"test", "tests", "e2e"}
+        or any(word in base for word in ("test", "spec", "e2e"))
+    ):
+        return ""
+    rerun = shlex.join(["node", "--test", *flags, file])
+    sentence = (
+        "To make it citable, re-run it through run-tests as: "
+        f"{rerun} (a standalone script counts as one runner test that passes only if it exits 0)."
+    )
+    # Emit only a sentence that reaches the coder unaltered: it must survive the
+    # label sanitizer AND the re-ask rendering (whitespace collapsing and the
+    # whole-message cap) after the message that precedes it, so an altered,
+    # collapsed or truncated rerun command is never shown.
+    if _safe_label(sentence, MAX_SAFE_COMMAND_BYTES * 2) != sentence:
+        return ""
+    rendered = render_evidence_rejection_detail(message + " " + sentence)  # shape-check: fatal:authentication-or-forgery
+    if not rendered.endswith(sentence):
+        return ""
+    return " " + sentence
+
+
 def _observation_command_label(observation: object) -> str:
     """Redacted, bounded command text; never reads raw argv attributes."""
     from .local_test_evidence import _UNPARSABLE_PREFIX, MAX_SAFE_COMMAND_BYTES, redact_test_command
@@ -4644,13 +4729,17 @@ def _parse_semantic_risk_coverage_claims(
                         reason="non-passing-selector",
                     )
                 if not _known_launch_integrity_passes(observation):
-                    raise NonRepairableEvidenceRejection(  # shape-check: fatal:authority-decision
+                    launch_integrity_message = (
                         f"{refs_context} selector `{ref}` has known non-authoritative "
                         "launch-integrity state and cannot be selected before authentication: "
                         f"{'; '.join(_launch_integrity_failure_reasons(observation))}; "
                         f"command: {_observation_command_label(observation)}; "
                         f"observed at {_observation_timestamp_label(observation)}. "
-                        "Cite a different observation whose launch was fully verified.",
+                        "Cite a different observation whose launch was fully verified."
+                    )
+                    node_test_hint = _node_test_hint(observation, launch_integrity_message)  # shape-check: fatal:authentication-or-forgery
+                    raise NonRepairableEvidenceRejection(  # shape-check: fatal:authority-decision
+                        launch_integrity_message + node_test_hint,
                         reason="launch-integrity",
                     )
         # Then the first degradable defect wins, in a fixed order, so every

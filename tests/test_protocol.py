@@ -6737,3 +6737,118 @@ def test_plan_review_followup_finding_reference_folded_1230():
 def test_plan_review_finding_reference_rejections_1230(item, message):
     with pytest.raises(AgentLoopError, match=message):
         parse_structured_plan_review(_plan_review_with_blocking([item]), reviewer="OpenAI Codex")
+
+
+# --- plain node test script guidance (issue #1294) ----------------------------
+
+
+def _node_hint_rejection(command, *, redact_first=False, cwd="/tmp/hint-workdir"):
+    from coding_review_agent_loop.local_test_evidence import LocalTestObservation, redact_observation
+
+    observation = LocalTestObservation(
+        command=tuple(command), outcome="passed", provenance="parent-observed",
+        execution_ref="turn:observation-1", cwd=cwd,
+        wrapper_bootstrap="verified", inner_exec="started", suite_start="unknown",
+    )
+    if redact_first:
+        observation = redact_observation(observation)
+    with pytest.raises(NonRepairableEvidenceRejection) as raised:
+        _validate_claims_envelope(
+            "issue_implementation",
+            [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
+            catalog=[observation],
+        )
+    assert raised.value.reason == "launch-integrity"
+    return str(raised.value)
+
+
+@pytest.mark.parametrize("redact_first", [False, True])
+def test_plain_node_test_script_rejection_names_node_test_spelling(redact_first):
+    message = _node_hint_rejection(("node", "tests/test_x.js"), redact_first=redact_first)
+    assert "node --test tests/test_x.js" in message
+    assert "exits 0" in message
+
+
+@pytest.mark.parametrize("redact_first", [False, True])
+def test_plain_node_hint_shell_quotes_a_filename_with_spaces(redact_first):
+    import shlex
+
+    message = _node_hint_rejection(("node", "tests/my test.js"), redact_first=redact_first)
+    assert "node --test 'tests/my test.js'" in message
+    assert shlex.split("node --test 'tests/my test.js'")[2] == "tests/my test.js"
+
+
+@pytest.mark.parametrize("redact_first", [False, True])
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("node", "tests/my\ttest.js"),
+        ("node", "tests/my\x01test.js"),
+        ("node", "tests/it`s.js"),
+        ("node", "tests/it's.js"),
+        ("node", "tests/tëst.js"),
+        ("node", "/home/user/private/tests/test_x.js"),
+        ("node", "../other/tests/test_x.js"),
+        ("env", "A=1", "node", "tests/test_x.js"),
+        ("node", "server.js"),
+        ("pytest", "tests/test_x.py"),
+        ("node", "tests/" + "a" * 5000 + "_test.js"),
+    ],
+)
+def test_plain_node_hint_is_omitted_when_it_could_be_wrong_or_leak(command, redact_first):
+    message = _node_hint_rejection(command, redact_first=redact_first)
+    assert "node --test" not in message
+    assert "private" not in message
+
+
+def test_plain_node_hint_requires_a_verbatim_projection_signal():
+    message = _node_hint_rejection(("node", "tests/test_x.js"))
+    assert "node --test" in message
+    from coding_review_agent_loop.protocol import _node_test_hint
+
+    assert _node_test_hint({"command": "node tests/test_x.js", "caveats": []}) == ""
+    assert _node_test_hint({"command": "node tests/test_x.js", "command_verbatim": False}) == ""
+    assert "node --test tests/test_x.js" in _node_test_hint(
+        {"command": "node tests/test_x.js", "command_verbatim": True}
+    )
+
+
+def _reask_text(command):
+    from coding_review_agent_loop.architecture_contract import _evidence_rejection_reask_prompt
+
+    message = _node_hint_rejection(command)
+    return message, _evidence_rejection_reask_prompt("PROMPT", message)
+
+
+def test_plain_node_hint_is_omitted_for_a_filename_the_reask_rendering_would_alter():
+    # Consecutive spaces would collapse in the re-ask prompt into a different file.
+    message, rendered = _reask_text(("node", "tests/my  test.js"))
+    assert "node --test" not in message and "node --test" not in rendered
+    message, rendered = _reask_text(("node", "tests/my test.js"))
+    assert "node --test 'tests/my test.js'" in rendered
+
+
+@pytest.mark.parametrize("length", [100, 300, 400, 440, 460, 480, 500])
+def test_plain_node_hint_never_reaches_the_coder_truncated_or_altered(length):
+    name = "tests/" + "a" * length + "_test.js"
+    message, rendered = _reask_text(("node", name))
+    if "node --test" in rendered:
+        # Shown only when the complete, unaltered rerun command fits the re-ask cap.
+        assert f"node --test {name}" in rendered
+        assert "..." not in rendered.split("test evidence")[1]
+    else:
+        assert "node --test" not in message
+
+
+def test_plain_node_hint_is_omitted_when_the_whole_message_would_exceed_the_reask_cap():
+    from coding_review_agent_loop.protocol import EVIDENCE_REASK_MAX_CHARS
+
+    # A verbatim, relative, test-like path long enough that the message plus the
+    # hint cannot fit the cap: no hint and no truncated rerun command.
+    for length in range(380, 520, 4):
+        name = "tests/" + "a" * length + "_test.js"
+        message, rendered = _reask_text(("node", name))
+        if f"node --test {name}" not in message:
+            assert "node --test" not in rendered
+            return
+    pytest.fail("no length reached the cap; widen the range")

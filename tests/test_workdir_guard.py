@@ -47,7 +47,7 @@ def test_workdir_managed_traversal_uses_runtime_contract():
 @pytest.mark.parametrize("launcher", [
     "/home/wwind123/.local/bin/agent-loop run-tests",
     shlex.join([sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests"]),
-])
+], ids=["agent-loop-entry-point", "python-module"])
 @pytest.mark.parametrize("prefix", [
     "env -u AGENT_LOOP_INVOCATION_ID",
     "env --unset AGENT_LOOP_INVOCATION_ID",
@@ -180,7 +180,7 @@ def test_malformed_managed_run_tests_never_gets_a_wrapper_exemption(tmp_path):
 @pytest.mark.parametrize("wrapper", [
     "/home/wwind123/.local/bin/agent-loop run-tests",
     shlex.join([sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests"]),
-])
+], ids=["agent-loop-entry-point", "python-module"])
 @pytest.mark.parametrize("chain", [
     "pwd && git status --branch --short && {wrapper}",
     "pwd ; {wrapper} ; git status --short",
