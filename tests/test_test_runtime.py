@@ -3376,47 +3376,63 @@ def _lp_script(path, text, mode=0o755):
     return path
 
 
+_LP_TEMPLATE_BODY = (
+    "import re\nimport sys\nfrom pytest import console_main\nif __name__ == '__main__':\n"
+    "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+    "    sys.exit(console_main())\n"
+)
+
+
+def _lp_status_equal_without_probe(argv, tmp_path, *, env=None):
+    """Run with and without classification: same status, never classified."""
+    kwargs = dict(cwd=tmp_path, timeout_seconds=120, echo_output=False, env=env)
+    plain = run_foreground_test(argv, **kwargs)
+    classified = run_foreground_test(argv, classify_pre_collection=True, **kwargs)
+    assert classified.returncode == plain.returncode, argv
+    assert classified.pre_collection_launch_failure is None, argv
+    return classified
+
+
 def test_launchers_outside_the_allowlist_get_no_probe_and_are_never_classified(tmp_path, monkeypatch):
-    _lp_write(tmp_path, _LP_PASSING)
     real = os.path.realpath(sys.executable)
     base = dict(os.environ)
     bin_dir = tmp_path / "bin"
     wrapper = _lp_script(bin_dir / "python3", f'#!/bin/sh\nexec {real} "$@"\n')
+    isolating = _lp_script(tmp_path / "iso" / "python3", f'#!/bin/sh\nexec {real} -I "$@"\n')
     trampoline = _lp_script(bin_dir / "pytest", f'#!/bin/sh\nexec {real} -I -m pytest "$@"\n')
-    shell_python_script = _lp_script(
-        tmp_path / "wrapped" / "pytest",
-        f"#!{wrapper}\nimport sys\nfrom pytest import console_main\nif __name__ == '__main__':\n"
-        "    sys.exit(console_main())\n",
-    )
-    env_form = _lp_script(
-        tmp_path / "envform" / "pytest",
-        "#!/usr/bin/env python3\nimport sys\nfrom pytest import console_main\nif __name__ == '__main__':\n"
-        "    sys.exit(console_main())\n",
-    )
+    valid = f"#!{{}}\n{_LP_TEMPLATE_BODY}"
+    shebang_wrapper = _lp_script(tmp_path / "wrapped" / "pytest", valid.format(wrapper))
+    shebang_isolating = _lp_script(tmp_path / "isolated" / "pytest", valid.format(isolating))
+    shebang_dash_i = _lp_script(tmp_path / "dashi" / "pytest", valid.format(f"{real} -I"))
+    shebang_dash_e = _lp_script(tmp_path / "dashe" / "pytest", valid.format(f"{real} -E"))
+    env_form = _lp_script(tmp_path / "envform" / "pytest", valid.format("/usr/bin/env python3"))
     nontemplate = _lp_script(
-        tmp_path / "other" / "pytest", f"#!{real}\nimport os\nos.system('echo hi')\nimport pytest\n",
+        tmp_path / "other" / "pytest",
+        f"#!{real}\nimport sys\nfrom pytest import console_main\nsys.exit(console_main() or 0)\n",
     )
+    path_env = {**base, "PATH": f"{bin_dir}:{base['PATH']}"}
     cases = [
-        ([sys.executable, "-I", "-m", "pytest"], base),
-        ([sys.executable, "-E", "-m", "pytest"], base),
-        ([str(wrapper), "-m", "pytest"], base),
-        ([str(trampoline)], base),
-        ([str(shell_python_script)], base),
-        (["pytest"], {**base, "PATH": f"{bin_dir}:{base['PATH']}"}),
-        ([str(env_form)], {**base, "PATH": f"{bin_dir}:{base['PATH']}"}),
-        ([str(nontemplate)], base),
+        ("dash-I", [sys.executable, "-I", "-m", "pytest"], base),
+        ("dash-E", [sys.executable, "-E", "-m", "pytest"], base),
+        ("shell-python-wrapper", [str(wrapper), "-m", "pytest"], base),
+        ("isolating-wrapper", [str(isolating), "-m", "pytest"], base),
+        ("trampoline", [str(trampoline)], base),
+        ("shebang-wrapper", [str(shebang_wrapper)], base),
+        ("shebang-isolating-wrapper", [str(shebang_isolating)], base),
+        ("shebang-dash-I", [str(shebang_dash_i)], base),
+        ("shebang-dash-E", [str(shebang_dash_e)], base),
+        ("env-shebang-via-wrapper-path", [str(env_form)], path_env),
+        ("non-template", [str(nontemplate)], base),
     ]
-    for argv, env in cases:
-        assert lp.prepare_lifecycle_probe([*argv, "test_x.py", "--bogus-flag"], env, tmp_path) is None, argv
-    for argv in ([sys.executable, "-I", "-m", "pytest"], [str(trampoline)]):
-        for tail, code in ((["test_x.py", "-p", "no:cacheprovider"], 0), (["test_x.py", "--bogus-flag"], 4)):
-            result = run_foreground_test(
-                [*argv, *tail], cwd=tmp_path, timeout_seconds=120, echo_output=False,
-                classify_pre_collection=True,
-            )
-            # ``-I`` also hides user site-packages, so only the classification is stable.
-            assert result.pre_collection_launch_failure is None
-            assert result.returncode in {code, 1, None}
+    _lp_write(tmp_path, {"test_x.py": _LP_NOT_INJECTED})
+    for label, launcher, env in cases:
+        argv = [*launcher, "-q", "-p", "no:cacheprovider", "test_x.py"]
+        assert lp.prepare_lifecycle_probe([*argv, "--bogus-flag"], env, tmp_path) is None, label
+        for tail in ([], ["--bogus-flag"]):
+            result = _lp_status_equal_without_probe([*argv, *tail], tmp_path, env=env)
+            if label.startswith("shebang-wrapper") or label in {"shell-python-wrapper", "env-shebang-via-wrapper-path"}:
+                # These interpreters work, so the target ran and saw no probe.
+                assert result.returncode == (4 if tail else 0), label
     # A forced preflight failure on a native interpreter means no injection.
     monkeypatch.setattr(lp, "_PREFLIGHT_CODE", "import sys; sys.exit(3)")
     assert lp.prepare_lifecycle_probe([sys.executable, "-m", "pytest", "test_x.py"], base, tmp_path) is None
@@ -3663,7 +3679,10 @@ def test_env_shebang_trampoline_gets_no_injection_and_keeps_the_exit_status(tmp_
     assert classified.pre_collection_launch_failure is None
 
 
-@pytest.mark.parametrize("variant", ["pathname_pattern", "pyc_load", "retained_set_overflow", "ini_addopts_target"])
+@pytest.mark.parametrize(
+    "variant",
+    ["pathname_pattern", "pyc_load", "retained_set_overflow", "ini_addopts_target", "non_py_explicit_target"],
+)
 def test_further_pre_parse_test_code_variants_are_not_classified(tmp_path, variant):
     files = {"pytest.ini": "[pytest]\n", "loader.py": _LP_FIRE_MODULE}
     extra = ["-p", "no:terminal", "-s"]
@@ -3696,6 +3715,15 @@ def test_further_pre_parse_test_code_variants_are_not_classified(tmp_path, varia
             "import glob\nfor path in glob.glob('filler/*.py'):\n    open(path).close()\n"
         )
         extra = ["-p", "userplug"]
+    elif variant == "non_py_explicit_target":
+        files.update({
+            "cases.spec": _LP_FIRE,
+            "userplug.py": (
+                "NS = {}\nexec(compile(open('cases.spec').read(), 'cases.spec', 'exec'), NS)\nFIRE = NS['fire']\n"
+            ),
+            "conftest.py": "import userplug\nuserplug.FIRE()\n",
+        })
+        extra += ["-p", "userplug", "cases.spec"]
     else:
         files.update({
             "pytest.ini": "[pytest]\naddopts = -p no:terminal -s cases.py\n",
@@ -3765,6 +3793,7 @@ _LP_NOT_INJECTED = (
     "def test_not_injected():\n"
     "    assert '_agent_loop_lifecycle_probe' not in sys.modules\n"
     "    assert 'AGENT_LOOP_LIFECYCLE_PROBE_SPEC' not in os.environ\n"
+    "    assert not any('lifecycle_probe' in arg for arg in sys.argv)\n"
 )
 
 
@@ -3772,6 +3801,9 @@ def test_excluded_launchers_and_setup_failures_run_the_original_command_through_
     tmp_path, monkeypatch
 ):
     real = os.path.realpath(sys.executable)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(lp.tempfile, "tempdir", str(scratch))
     wrapper = _lp_script(tmp_path / "bin" / "python3", f'#!/bin/sh\nexec {real} "$@"\n')
     _lp_write(tmp_path, {"test_x.py": _LP_NOT_INJECTED})
     base = ["-m", "pytest", "-q", "-p", "no:cacheprovider", "test_x.py"]
@@ -3779,6 +3811,7 @@ def test_excluded_launchers_and_setup_failures_run_the_original_command_through_
         ("wrapper", [str(wrapper), *base]),
         ("setup-failure", [sys.executable, *base]),
         ("preflight-failure", [sys.executable, *base]),
+        ("excl-failure", [sys.executable, *base]),
     ]
     for label, argv in cases:
         with monkeypatch.context() as patched:
@@ -3788,6 +3821,15 @@ def test_excluded_launchers_and_setup_failures_run_the_original_command_through_
                 patched.setattr(lp.tempfile, "mkdtemp", failing)
             elif label == "preflight-failure":
                 patched.setattr(lp, "_PREFLIGHT_CODE", "import sys; sys.exit(3)")
+            elif label == "excl-failure":
+                real_open = os.open
+
+                def failing_open(path, flags, *args, **kwargs):
+                    if flags & os.O_EXCL and "agent-loop-lifecycle-probe-" in str(path):
+                        raise OSError("exists")
+                    return real_open(path, flags, *args, **kwargs)
+
+                patched.setattr(lp.os, "open", failing_open)
             passing = run_foreground_test(
                 argv, cwd=tmp_path, timeout_seconds=120, echo_output=False, classify_pre_collection=True,
             )
@@ -3797,6 +3839,7 @@ def test_excluded_launchers_and_setup_failures_run_the_original_command_through_
             )
         assert (passing.returncode, passing.pre_collection_launch_failure) == (0, None), label
         assert (usage.returncode, usage.pre_collection_launch_failure) == (4, None), label
+    assert list(scratch.iterdir()) == []  # no partial probe allocation is left behind
 
 
 def test_missing_pytest_is_non_evidence_through_the_unmocked_cli_fallback(tmp_path, monkeypatch):
@@ -3840,21 +3883,41 @@ def test_unchanged_head_stop_message_keeps_route_suffix_and_is_byte_identical_wi
     assert with_receipts.endswith(route) and "unsuperseded failure receipts" in with_receipts
 
 
-def test_configured_gate_usage_error_is_a_failed_test_result_not_a_launcher_failure(tmp_path):
-    from types import SimpleNamespace
+@pytest.mark.parametrize("entry", ["run_optional_tests", "run_pre_review_tests"])
+def test_configured_gate_usage_error_keeps_its_routing_through_the_gate_workflow(
+    tmp_path, monkeypatch, entry
+):
+    """Issue #1182: the configured gate neither injects the probe nor classifies."""
+    import contextlib
 
     from coding_review_agent_loop import checks
     from coding_review_agent_loop.runner import Runner
 
-    _lp_write(tmp_path, _LP_PASSING)
-    result = Runner().run_test_command(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_x.py", "--bogus-flag"],
-        cwd=tmp_path, timeout_seconds=120,
+    _lp_write(tmp_path, {"test_x.py": _LP_NOT_INJECTED})
+    config = make_config(
+        tmp_path,
+        test_command=(sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_x.py", "--bogus-flag"),
+        pre_review_tests=True,
     )
-    assert result.pre_collection_launch_failure is None
-    assert (result.outcome, result.returncode) == ("failed", 4)
-    config = SimpleNamespace(coder_test_command_timeout_seconds=120)
+    monkeypatch.setattr(checks, "active_workdir", lambda cfg: tmp_path)
+    monkeypatch.setattr(checks, "gate_window", lambda *a, **k: contextlib.nullcontext())
+    recorded = []
+    real_record = checks._record_gate_observation
+
+    def spy(cfg, result):
+        recorded.append(result)
+        return real_record(cfg, result)
+
+    monkeypatch.setattr(checks, "_record_gate_observation", spy)
     with pytest.raises(AgentLoopError) as raised:
-        checks._raise_for_gate_result(result, config)
+        getattr(checks, entry)(Runner(), config)
     assert "failed with exit 4" in str(raised.value)
     assert "could not start" not in str(raised.value)
+    (result,) = recorded
+    assert (result.outcome, result.returncode) == ("failed", 4)
+    assert result.pre_collection_launch_failure is None
+    # The same gate command without the bogus flag proves no probe was injected.
+    clean = Runner().run_test_command(
+        list(config.test_command[:-1]), cwd=tmp_path, timeout_seconds=120,
+    )
+    assert (clean.outcome, clean.returncode) == ("passed", 0)

@@ -132,8 +132,9 @@ def _see(path) -> None:
     if not isinstance(path, str) or not path:
         return
     if _S.phase == 1:
-        if not (path.endswith(".py") or path.endswith(".pyc")):
-            return
+        # Every path is retained, whatever its extension: an explicit target
+        # (for example ``cases.spec``) can only be recognised once the resolved
+        # arguments are known.  Overflow is a veto, never a silent drop.
         if path not in _S.retained:
             if len(_S.retained) >= _MAX_RETAINED:
                 _veto()

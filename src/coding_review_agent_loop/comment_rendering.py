@@ -228,6 +228,9 @@ def _render_test_observation_citations(
         elif claim == "base-reproduction" and observed.attribution.state != "base-reproduction":
             supported = False
             reason = "unverified: receipt does not support a base reproduction"
+        if observed is not None and observed.is_non_evidence_launch_failure:
+            # A citation never turns a non-evidence launch failure into evidence.
+            reason = "pre-collection launch failure (not evidence)"
         if supported:
             cited.add(receipt_id)
         lines.append(

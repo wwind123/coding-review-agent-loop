@@ -4321,3 +4321,29 @@ def test_broker_classifies_a_pytest_less_native_interpreter_without_mocking_the_
         assert reconcile_test_observations(server.journal).authoritative_failures == ()
     finally:
         server.stop()
+
+
+def test_citing_a_non_evidence_receipt_keeps_the_non_evidence_label(tmp_path):
+    import shlex
+    from dataclasses import replace as _replace
+
+    from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+    from coding_review_agent_loop.runner import Runner
+
+    registry = EnvironmentIdentityRegistry()
+    command = (sys.executable, "-m", "pytest", "tests/x.py")
+    launch = _replace(_non_evidence(registry, receipt="launch-receipt"), command=command)
+    runner = Runner()
+    runner._environment_registry = registry
+    runner._local_test_observations.append(launch)
+    rendered = runner.render_local_test_evidence(cwd=tmp_path)
+    citation = SimpleNamespace(
+        receipt_id="launch-receipt", command=shlex.join(command), claim="passed",
+    )
+    public = _render_test_observation_citations(
+        [citation], local_test_evidence=rendered, current_test_turn_id="turn-opaque",
+    )
+    (line,) = [item for item in public.splitlines() if "launch-receipt" in item]
+    assert "pre-collection launch failure (not evidence)" in line
+    assert "verified against the parent journal" not in line
+    assert "uncited authoritative" not in public
