@@ -299,9 +299,15 @@ from .validated_agent import (
     _log_repair_attempts,
     _run_validated_agent,
 )
+from .risk_coverage_map import (
+    coverage_map_applies,
+    extract_coverage_map_section,
+    render_coverage_map,
+)
 from .response_validation import (
     _current_test_turn_observations,
     _derive_authenticated_risk_evidence_for_coder,
+    final_risk_coverage_assessment,
     _build_requirements_context,
     _surfaced_reviewer_requirement_ids,
     _reviewer_requirement_identity_ids,
@@ -440,6 +446,7 @@ def run_pr_loop(
     pre_review_test_pending: bool = False,
     managed_pr_origin: tuple[str, str, str, str | None] | None = None,
     managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None,
+    initial_coverage_map: str | None = None,
     managed_ci_issue_number: int | None = None,
 ) -> int:
     owned_usage_context = usage_context is None
@@ -1965,6 +1972,7 @@ def run_pr_loop(
         unresolved_items: list[UnresolvedReviewItem] = []
         pr_compact_prior_summaries: list[str] = []
         latest_coder_output: str | None = None
+        latest_coder_coverage_map: str | None = None
         latest_coder_metadata: PostedRoundMetadata | None = None
         next_unresolved_item_number = 1
         start_round_number = 1
@@ -2082,6 +2090,32 @@ def run_pr_loop(
                 bound_compact_prior_summaries(resumed_round.compact_prior_summaries)
             )
             latest_coder_output = resumed_round.coder_output
+            # A stored comment may predate the rendering boundary, so the map is
+            # restored only for an applicable matrix and only when unambiguous.
+            latest_coder_coverage_map = (
+                initial_coverage_map
+                if initial_coverage_map
+                and resumed_round.coder_metadata is not None
+                and resumed_round.coder_metadata.round_number == 1
+                else None
+            ) or (
+                extract_coverage_map_section(
+                    resumed_round.coder_comment_body,
+                    expected_revision=(
+                        resumed_round.coder_metadata.subject
+                        if resumed_round.coder_metadata is not None else None
+                    ),
+                    # The coder's persisted response must not name the heading:
+                    # otherwise the stored section may be coder-authored prose.
+                    coder_response=(
+                        resumed_round.coder_metadata.raw_structured_coder_response
+                        if resumed_round.coder_metadata is not None else None
+                    ),
+                    require_coder_clean=True,
+                )
+                if coverage_map_applies(approved_plan_context)
+                else None
+            )
             latest_coder_metadata = resumed_round.coder_metadata
             qualification_checkpoint = resumed_round.qualification_checkpoint
             next_unresolved_item_number = resumed_round.next_unresolved_item_number
@@ -2757,6 +2791,7 @@ def run_pr_loop(
                 latest_coder_metadata,
                 head_sha=pr_metadata.head_sha,
                 assigned_workdir=active_workdir(config),
+                coverage_map=latest_coder_coverage_map,
             ) + _evidence_review_context(
                 prior_unresolved_items, response_head=evidence_response_head
             )
@@ -7467,6 +7502,23 @@ def run_pr_loop(
                     and updated_pr_context.metadata.head_sha == followup_dispatch_head
                     else None
                 )
+                followup_bound_head = (
+                    _followup_derived_risk_evidence.bound_head_sha
+                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                    and _followup_derived_risk_evidence is not None
+                    else None
+                )
+                followup_coverage_assessment = (
+                    final_risk_coverage_assessment(
+                        coder_response.marker_value,
+                        approved_plan_context=approved_plan_context,
+                        workdir=active_workdir(config),
+                        initial_head_sha=updated_pr_context.metadata.head_sha,
+                        derived=_followup_derived_risk_evidence,
+                    )
+                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                    else None
+                )
                 if isinstance(coder_response.marker_value, StructuredCoderFollowup):
                     public_comment = render_public_agent_comment(
                         kind="coder_followup",
@@ -7479,11 +7531,17 @@ def run_pr_loop(
                         current_test_turn_id=coder_response.acquisition_test_turn_id,
                         matrix_evidence_render_decision=matrix_evidence_render_decision,
                         head_unchanged_sha=head_unchanged_sha,
+                        coverage_assessment=followup_coverage_assessment,
                     )
                 elif head_unchanged_sha is not None:
                     public_comment = add_coder_followup_head_unchanged_notice(
                         public_comment, head_unchanged_sha
                     )
+                # Carry the orchestrator's own rendering, never text re-parsed from a
+                # comment that also holds coder prose (#1290).
+                latest_coder_coverage_map = (
+                    render_coverage_map(followup_coverage_assessment) or None
+                )
 
                 qualification_checkpoint = _machine_obligation_checkpoint(
                     unresolved_items,
@@ -7509,7 +7567,11 @@ def run_pr_loop(
                     role="coder",
                     agent=coder_name,
                     round_number=coder_record_round,
-                    subject=str(updated_pr_context.metadata.head_sha or "unknown"),
+                    subject=str(
+                        followup_bound_head
+                        or updated_pr_context.metadata.head_sha
+                        or "unknown"
+                    ),
                     prior_items=tuple(unresolved_items),
                     raw_structured_coder_response=raw_structured_coder_response,
                     local_test_evidence=local_test_evidence,

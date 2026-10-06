@@ -67,6 +67,12 @@ from .protocol import (
     semantic_risk_claim_schema_text,
 )
 from .runner import Runner
+from .risk_coverage_map import (
+    CommittedTree,
+    CoverageAssessment,
+    check_coverage_map,
+    coverage_map_applies,
+)
 from .local_test_evidence import reconcile_test_observations, stable_tracked_tree_snapshot
 from .workdirs import active_workdir
 from .workdir_guard import (
@@ -271,6 +277,7 @@ def _post_auth_correction_prompt(
     matrix_row_ids: Sequence[str],
     diagnostics: Sequence[PostAuthClaimDiagnostic],
     execution_catalog: Sequence[Mapping[str, object]],
+    include_coverage_map: bool = False,
 ) -> str:
     return (
         "The orchestrator authenticated the PR, then found a bounded semantic "
@@ -285,7 +292,14 @@ def _post_auth_correction_prompt(
         "execution exists. Command strings and handles outside this catalog "
         "are dropped and leave the row unverified, so omit a claim that has no "
         "admissible handle instead of inventing one. "
-        + semantic_risk_claim_schema_text()
+        + semantic_risk_claim_schema_text(include_coverage_map=include_coverage_map)
+        + (
+            " You may correct only `risk_test_matrix_claims` (selectors and "
+            "facts, including `test_level`); do not add, remove, or alter "
+            "`risk_test_matrix_coverage_gaps` or any other coder field."
+            if include_coverage_map
+            else ""
+        )
         + " If you cannot truthfully state a fact, leave it empty rather than "
         "inventing it; the row then stays unverified.\n\n"
         f"Response kind: {parsed.kind}\n"
@@ -370,6 +384,61 @@ _NON_ACTIONABLE_RISK_DIAGNOSTICS = frozenset({
     UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
     DEGRADED_ROW_CLAIM_DIAGNOSTIC,
 })
+
+
+def assess_risk_coverage_map(
+    parsed: StructuredIssueImplementation | StructuredCoderFollowup,
+    *,
+    approved_plan_context: ApprovedPlanContext | None,
+    workdir: Path,
+    head_sha: str | None,
+) -> CoverageAssessment | None:
+    """Run the deterministic coverage-map check for one pinned PR head (#1290).
+
+    Returns ``None`` when the plan has no applicable delivered matrix, so those
+    plans are unaffected.  The tree is pinned to ``head_sha`` (the authenticated
+    PR head, never local HEAD); an unavailable commit yields an ``unverified``
+    assessment rather than a vacuous pass.
+    """
+    if not coverage_map_applies(approved_plan_context):
+        return None
+    claims = parsed.risk_test_matrix_claims
+    gaps = parsed.risk_test_matrix_coverage_gaps
+    return check_coverage_map(
+        approved_plan_context.risk_test_matrix_payload,
+        enforceable_row_ids=approved_plan_context.risk_test_matrix_expected_row_ids,
+        claims=claims.claims if claims is not None else (),
+        gaps=gaps.gaps if gaps is not None else (),
+        tree=CommittedTree.resolve(workdir, head_sha),
+    )
+
+
+def final_risk_coverage_assessment(
+    parsed: StructuredIssueImplementation | StructuredCoderFollowup,
+    *,
+    approved_plan_context: ApprovedPlanContext | None,
+    workdir: Path,
+    initial_head_sha: str | None,
+    derived: DerivedRiskEvidenceResult | None = None,
+) -> CoverageAssessment | None:
+    """Assess the final post-correction claims at the head derivation bound to.
+
+    The head is carried explicitly from derivation (``bound_head_sha``), never
+    re-read from the remote, so a later push cannot silently rebind the map.
+    """
+    if not coverage_map_applies(approved_plan_context):
+        return None
+    head = (
+        derived.bound_head_sha
+        if derived is not None and derived.bound_head_sha is not None
+        else initial_head_sha
+    )
+    return assess_risk_coverage_map(
+        parsed,
+        approved_plan_context=approved_plan_context,
+        workdir=workdir,
+        head_sha=head,
+    )
 
 
 def _derive_authenticated_risk_evidence_for_coder(
@@ -501,6 +570,7 @@ def _derive_authenticated_risk_evidence_for_coder(
             matrix_row_ids=approved_plan_context.risk_test_matrix_expected_row_ids,
             diagnostics=actionable,
             execution_catalog=_safe_execution_handle_catalog(catalog),
+            include_coverage_map=coverage_map_applies(approved_plan_context),
         )
         try:
             correction_result = run_agent_result(
@@ -561,6 +631,8 @@ def _derive_authenticated_risk_evidence_for_coder(
                         risk_test_matrix_evidence=corrected_result.evidence,
                         risk_test_matrix_diagnostics=corrected_result.diagnostics,
                     )
+                if corrected_result is not None:
+                    corrected_result = dataclasses_replace(corrected_result, bound_head_sha=head_sha)
                 return corrected_parsed, corrected_result
             if corrected_head is not None:
                 raced_parsed, raced_result = _derive_authenticated_risk_evidence_for_coder(
@@ -608,6 +680,8 @@ def _derive_authenticated_risk_evidence_for_coder(
                         risk_test_matrix_evidence=raced_result.evidence,
                         risk_test_matrix_diagnostics=raced_result.diagnostics,
                     )
+                if raced_result is not None:
+                    raced_result = dataclasses_replace(raced_result, bound_head_sha=corrected_head)
                 return raced_parsed, raced_result
             correction_error = "semantic correction was discarded because the authenticated PR head changed"
         diagnostic = PostAuthClaimDiagnostic(
@@ -619,6 +693,7 @@ def _derive_authenticated_risk_evidence_for_coder(
             result,
             diagnostics=tuple((*result.diagnostics, diagnostic)),
         )
+    result = dataclasses_replace(result, bound_head_sha=head_sha)
     return dataclasses_replace(
         parsed,
         risk_test_matrix_evidence=result.evidence,

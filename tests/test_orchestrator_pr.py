@@ -19830,3 +19830,284 @@ def test_manual_push_after_completed_head_review_recovery_does_not_revive_pre_ha
     # item-1 was cleared by the fresh review: nothing is carried to C or sent to a coder.
     assert "claude" not in _agent_order_1292(runner)
     assert _agent_order_1292(runner)[:1] == ["codex"]
+
+
+# --- #1290: coder follow-up round comment carries the coverage map -------------
+
+def _init_followup_checkout(workdir):
+    import subprocess
+
+    env = {
+        **__import__("os").environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=workdir, check=True, capture_output=True, text=True, env=env
+        ).stdout.strip()
+
+    git("init", "-q")
+    (workdir / "tests").mkdir(exist_ok=True)
+    (workdir / "tests" / "test_orchestrator_pr.py").write_text("def test_followup_workflow():\n    pass\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "followup head")
+    return git("rev-parse", "HEAD")
+
+
+@pytest.mark.parametrize("mode", ["claim", "gap-only", "none", "not-applicable"])
+def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
+    tmp_path, monkeypatch, mode
+):
+    with_matrix = mode in {"claim", "gap-only"}
+    if with_matrix:
+        plan_context = _followup_matrix_context()
+    elif mode == "not-applicable":
+        na_matrix = parse_risk_test_matrix({
+            "applicability": "not-applicable", "rows": [], "important_exclusions": [],
+            "not_applicable_rationale": "Formatting-only change without any stateful path.",
+        })
+        na_identity = risk_test_matrix_identity(na_matrix)
+        plan_context = orchestrator.make_approved_plan_context(
+            "Approved plan.\n\n" + render_risk_test_matrix_section(na_matrix),
+            source_locator="test na plan",
+            risk_test_matrix_contract_version=1,
+            risk_test_matrix_payload=na_matrix.to_payload(),
+            risk_test_matrix_changes_payload=(),
+            risk_test_matrix_identity=na_identity,
+            risk_test_matrix_boundary_digest=na_identity,
+        )
+    else:
+        plan_context = None
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
+    head = _init_followup_checkout(config.claude_dir)
+    current = _followup_observation(
+        execution_ref="coder-turn:observation-2", receipt_id="receipt-current-head",
+        head=head, timestamp="2026-01-01T00:00:01Z",
+    )
+    raw = structured_coder_followup(
+        addressed_items=["item-1"],
+        summary="The follow-up was completed and the selected workflow was exercised.",
+    )
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["risk_test_matrix_claims"] = [{
+        "row_id": "followup-derived-evidence",
+        "execution_refs": [current.execution_ref],
+        "test_identifiers": ["tests/test_orchestrator_pr.py::test_followup_workflow"],
+        "test_locations": ["tests/test_orchestrator_pr.py"],
+        "workflow_path_claim": "The real PR follow-up caller reached post-head derivation.",
+        "outcome_assertions": ["The selected managed observation passed."],
+        "forbidden_effect_assertions": ["The PR handoff was retained."],
+        "caveats": [],
+        "test_level": "workflow",
+    }]
+    if mode == "not-applicable":
+        payload.pop("risk_test_matrix_claims")
+    if mode == "gap-only":
+        payload.pop("risk_test_matrix_claims")
+        payload["risk_test_matrix_coverage_gaps"] = [{
+            "row_id": "followup-derived-evidence",
+            "reason": "cannot be driven through the real follow-up caller here",
+            "proposed_correction": "downgrade the row to a unit test",
+        }]
+    text = json.dumps(payload) + raw[end:]
+    parsed = validate_structured_coder_followup(
+        text,
+        required_architecture_impact_contract=1,
+        delivered_risk_test_matrix=plan_context.risk_test_matrix_payload if plan_context else None,
+        delivered_risk_test_matrix_identity=plan_context.risk_test_matrix_identity if plan_context else None,
+        required_risk_test_matrix_contract=1 if plan_context else 0,
+        delivered_risk_test_matrix_row_ids=("followup-derived-evidence",) if plan_context else None,
+        execution_catalog=(current,),
+    )
+    assert parsed is not None
+    coder_response = ValidatedAgentResponse(
+        text=text, session_id="coder-session", marker_value=parsed,
+        acquisition_test_turn_id="coder-turn", acquisition_test_observations=(current,),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="blocking", summary="Needs work.", blocking_items=["Exercise follow-up evidence derivation."],
+            ),
+            structured_pr_review(
+                state="approved", summary="Covered.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        pr_payload={"headRefOid": "predecessor-head"},
+        git_head="predecessor-head",
+    )
+    coder_calls = []
+    real_validated_agent = orchestrator._run_validated_agent
+
+    def fake_validated_agent(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            coder_calls.append(kwargs.get("prompt"))
+            runner.pr_payload["headRefOid"] = head
+            runner.simulate_agent_turn(config, config.claude_dir, head=head)
+            return coder_response
+        return real_validated_agent(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", fake_validated_agent)
+    monkeypatch.setattr(
+        orchestrator, "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head=head, tracked_digest="tree-current", complete=True, stable=True, status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "_read_assigned_workdir_head", lambda *_a, **_k: head)
+
+    assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context) == 0
+
+    assert len(coder_calls) == 1, "the follow-up path never sends a coverage re-ask"
+    coder_comment = next(
+        item["body"] for item in runner.pr_payload["comments"]
+        if isinstance(item, dict) and isinstance(item.get("body"), str)
+        and "AGENT_LOOP_META: " in item["body"]
+        and _decode_round_metadata(
+            item["body"].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+        ).role == "coder"
+    )
+    review_prompts = [
+        cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]
+    ]
+    if with_matrix:
+        assert "### Risk-matrix coverage map" in coder_comment
+        assert f"complete at {head}" in coder_comment
+        assert "Risk-matrix coverage map" in review_prompts[-1]
+        assert "after one coverage re-ask" not in coder_comment
+    else:
+        assert "Risk-matrix coverage map" not in coder_comment
+
+
+def test_run_pr_loop_followup_semantic_correction_keeps_original_gaps_and_fixes_claims(
+    tmp_path, monkeypatch
+):
+    def row(row_id, level):
+        return {
+            "row_id": row_id, "label": f"Behaviour {row_id}",
+            "entry_path_or_mode": "PR follow-up", "initial_state": "blocking review",
+            "event": "follow-up authenticated", "expected_outcome": "map rendered",
+            "forbidden_side_effects": ["No re-ask."], "proposed_test_level": level,
+            "proposed_test_location": "tests/test_orchestrator_pr.py",
+            "applicability": "required", "related_scope_item_ids": ["scope-1"],
+            "execution_owner": "one-shot",
+        }
+
+    matrix = parse_risk_test_matrix({
+        "applicability": "applicable",
+        "rows": [row("followup-a", "orchestrator"), row("followup-b", "unit")],
+        "important_exclusions": ["Planned tests are not evidence."],
+    })
+    identity = risk_test_matrix_identity(matrix)
+    plan_context = orchestrator.make_approved_plan_context(
+        "Approved plan.\n\n" + render_risk_test_matrix_section(matrix),
+        source_locator="test two-row plan",
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
+    head = _init_followup_checkout(config.claude_dir)
+    current = _followup_observation(
+        execution_ref="coder-turn:observation-2", receipt_id="receipt-current-head",
+        head=head, timestamp="2026-01-01T00:00:01Z",
+    )
+
+    def claim(**extra):
+        return {
+            "row_id": "followup-a", "execution_refs": [current.execution_ref],
+            "test_identifiers": ["tests/test_orchestrator_pr.py::test_followup_workflow"],
+            "test_locations": ["tests/test_orchestrator_pr.py"],
+            "workflow_path_claim": "The real follow-up caller ran.",
+            "outcome_assertions": ["It passed."], "forbidden_effect_assertions": ["No re-ask."],
+            "caveats": [], **extra,
+        }
+
+    def gap(reason):
+        return {"row_id": "followup-b", "reason": reason, "proposed_correction": "downgrade the row"}
+
+    raw = structured_coder_followup(addressed_items=["item-1"], summary="Follow-up with correction.")
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    original = dict(payload)
+    # Unknown selector -> actionable diagnostic; no test_level -> deficiency.
+    original["risk_test_matrix_claims"] = [claim(execution_refs=["coder-turn:not-in-catalog"])]
+    original["risk_test_matrix_coverage_gaps"] = [gap("original gap reason")]
+    text = json.dumps(original) + raw[end:]
+    corrected = dict(payload)
+    corrected["risk_test_matrix_claims"] = [claim(test_level="workflow")]
+    corrected["risk_test_matrix_coverage_gaps"] = [gap("CHANGED BY CORRECTION")]
+    corrected_text = json.dumps(corrected) + raw[end:]
+    parsed = validate_structured_coder_followup(
+        text, required_architecture_impact_contract=1,
+        delivered_risk_test_matrix=plan_context.risk_test_matrix_payload,
+        delivered_risk_test_matrix_identity=identity, required_risk_test_matrix_contract=1,
+        delivered_risk_test_matrix_row_ids=("followup-a", "followup-b"),
+        execution_catalog=(current,),
+    )
+    assert parsed is not None
+    coder_response = ValidatedAgentResponse(
+        text=text, session_id="coder-session", marker_value=parsed,
+        acquisition_test_turn_id="coder-turn", acquisition_test_observations=(current,),
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="blocking", summary="Needs work.", blocking_items=["Fix the follow-up."]),
+            structured_pr_review(
+                state="approved", summary="Covered.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        pr_payload={"headRefOid": "predecessor-head"}, git_head="predecessor-head",
+    )
+    coder_calls = []
+    real_validated_agent = orchestrator._run_validated_agent
+
+    def fake_validated_agent(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            coder_calls.append(1)
+            runner.pr_payload["headRefOid"] = head
+            runner.simulate_agent_turn(config, config.claude_dir, head=head)
+            return coder_response
+        return real_validated_agent(*args, **kwargs)
+
+    corrections = []
+    real_run_agent_result = orchestrator.run_agent_result
+
+    def fake_correction(*a, **kw):
+        if kw.get("label") != "semantic-evidence-correction":
+            return real_run_agent_result(*a, **kw)
+        corrections.append(1)
+        return SimpleNamespace(text=corrected_text)
+
+    monkeypatch.setattr(orchestrator, "_run_validated_agent", fake_validated_agent)
+    monkeypatch.setattr(orchestrator, "run_agent_result", fake_correction)
+    monkeypatch.setattr(
+        orchestrator, "stable_tracked_tree_snapshot",
+        lambda _workdir: SimpleNamespace(
+            head=head, tracked_digest="tree-current", complete=True, stable=True, status_clean=True,
+        ),
+    )
+    monkeypatch.setattr(orchestrator, "_read_assigned_workdir_head", lambda *_a, **_k: head)
+
+    assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context) == 0
+
+    assert corrections == [1] and len(coder_calls) == 1
+    coder_comment = next(
+        item["body"] for item in runner.pr_payload["comments"]
+        if isinstance(item, dict) and isinstance(item.get("body"), str)
+        and "AGENT_LOOP_META: " in item["body"]
+        and _decode_round_metadata(
+            item["body"].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
+        ).role == "coder"
+    )
+    section = coder_comment.split("### Risk-matrix coverage map")[1]
+    assert f"complete at {head}" in section
+    assert "declared level workflow" in section
+    assert "original gap reason" in section and "CHANGED BY CORRECTION" not in section
+    review_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    assert "original gap reason" in review_prompts[-1] and "CHANGED BY CORRECTION" not in review_prompts[-1]

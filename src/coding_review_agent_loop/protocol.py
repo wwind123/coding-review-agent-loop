@@ -927,6 +927,13 @@ SEMANTIC_RISK_CLAIM_FACT_KEYS = (
     "forbidden_effect_assertions",
 )
 SEMANTIC_RISK_CLAIM_OPTIONAL_KEYS = ("caveats",)
+# Coverage-map keys (#1290) are accepted by the parser but only named in the
+# producer text when the approved-plan matrix is applicable, so ungated prompts
+# and the default schema text stay unchanged.
+SEMANTIC_RISK_CLAIM_COVERAGE_KEYS = ("test_level",)
+SEMANTIC_RISK_TEST_LEVELS = ("unit", "integration", "workflow")
+SEMANTIC_RISK_COVERAGE_GAP_KEYS = ("row_id", "reason", "proposed_correction")
+SEMANTIC_RISK_COVERAGE_GAPS_FIELD = "risk_test_matrix_coverage_gaps"
 SEMANTIC_RISK_CLAIM_KEYS = (
     SEMANTIC_RISK_CLAIM_REQUIRED_KEYS
     + SEMANTIC_RISK_CLAIM_FACT_KEYS
@@ -938,6 +945,7 @@ def semantic_risk_claim_example(
     *,
     row_id: str = "example-row-id",
     execution_ref: str = "exec-ref-from-this-turn-catalog",
+    include_coverage_map: bool = False,
 ) -> dict[str, object]:
     """Return one complete example claim row containing every schema key."""
     example: dict[str, object] = {
@@ -950,6 +958,8 @@ def semantic_risk_claim_example(
         "forbidden_effect_assertions": ["No envelope rejection is raised."],
         "caveats": [],
     }
+    if include_coverage_map:
+        example["test_level"] = "unit"
     return example
 
 
@@ -957,19 +967,50 @@ def semantic_risk_claim_example_json(
     *,
     row_id: str = "example-row-id",
     execution_ref: str = "exec-ref-from-this-turn-catalog",
+    include_coverage_map: bool = False,
 ) -> str:
     """Render the shared complete claim-row example as compact JSON."""
     return json.dumps(
-        semantic_risk_claim_example(row_id=row_id, execution_ref=execution_ref),
+        semantic_risk_claim_example(
+            row_id=row_id,
+            execution_ref=execution_ref,
+            include_coverage_map=include_coverage_map,
+        ),
         separators=(", ", ": "),
     )
 
 
-def semantic_risk_claim_schema_text() -> str:
-    """Describe the exact claim-row keys for prompt and repair surfaces."""
+def semantic_risk_claim_schema_text(
+    *,
+    include_coverage_map: bool = False,
+    preserve_optional_keys: bool = False,
+) -> str:
+    """Describe the exact claim-row keys for prompt and repair surfaces.
+
+    ``include_coverage_map`` adds the ``test_level`` key to the exact-key list
+    and example (#1290).  ``preserve_optional_keys`` keeps the default example
+    but describes ``test_level`` as an optional, preserve-only key, for repair
+    instructions that must neither add nor strip it.
+    """
+    keys = SEMANTIC_RISK_CLAIM_KEYS
+    if include_coverage_map:
+        keys = keys + SEMANTIC_RISK_CLAIM_COVERAGE_KEYS
+    text = _semantic_risk_claim_schema_text_base(keys, include_coverage_map)
+    if preserve_optional_keys and not include_coverage_map:
+        text += (
+            " A claim may also carry an optional `test_level` key "
+            "(`unit`, `integration`, or `workflow`); it is preserve-only: carry "
+            "it exactly as the source has it and never add, change, or drop it."
+        )
+    return text
+
+
+def _semantic_risk_claim_schema_text_base(
+    keys: tuple[str, ...], include_coverage_map: bool
+) -> str:
     return (
         "Each `risk_test_matrix_claims` row uses exactly these keys: "
-        + ", ".join(f"`{key}`" for key in SEMANTIC_RISK_CLAIM_KEYS)
+        + ", ".join(f"`{key}`" for key in keys)
         + ". `row_id` and a non-empty `execution_refs` list are mandatory. "
         "`execution_refs` holds only the opaque selectors printed by "
         "`agent-loop run-tests` in this turn, never command strings or test "
@@ -986,8 +1027,15 @@ def semantic_risk_claim_schema_text() -> str:
         f"first {RISK_MATRIX_MAX_LIST_ITEMS} entries and the row records a "
         "caveat naming the loss, so split broader coverage across additional "
         "approved rows instead of overflowing one list. `caveats` is optional. "
-        "Complete example row: "
-        + semantic_risk_claim_example_json()
+        + (
+            "`test_level` is the level the cited tests actually exercise: one of "
+            "`unit`, `integration`, or `workflow` (workflow means driving the "
+            "real orchestrator paths). "
+            if include_coverage_map
+            else ""
+        )
+        + "Complete example row: "
+        + semantic_risk_claim_example_json(include_coverage_map=include_coverage_map)
     )
 
 
@@ -1021,9 +1069,11 @@ class SemanticRiskCoverageClaim:
     caveats: tuple[str, ...] = ()
     dropped_execution_refs: tuple[str, ...] = ()
     truncated_fact_fields: tuple[str, ...] = ()
+    # Declared level the cited tests exercise (#1290); None when absent or invalid.
+    test_level: str | None = None
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "row_id": sanitize_historical_text(self.row_id),  # shape-check: fatal:authentication-or-forgery
             "execution_refs": [sanitize_historical_text(item) for item in self.execution_refs],  # shape-check: fatal:authentication-or-forgery
             "test_identifiers": [sanitize_historical_text(item) for item in self.test_identifiers],  # shape-check: fatal:authentication-or-forgery
@@ -1033,6 +1083,9 @@ class SemanticRiskCoverageClaim:
             "forbidden_effect_assertions": [sanitize_historical_text(item) for item in self.forbidden_effect_assertions],  # shape-check: fatal:authentication-or-forgery
             "caveats": [sanitize_historical_text(item) for item in self.caveats],  # shape-check: fatal:authentication-or-forgery
         }
+        if self.test_level is not None:
+            payload["test_level"] = self.test_level
+        return payload
 
 
 @dataclass(frozen=True)
@@ -1070,6 +1123,37 @@ class SemanticRiskCoverageClaims:
 
 
 @dataclass(frozen=True)
+class SemanticRiskCoverageGap:
+    """One coder-declared, evidence-backed untestable-as-specified row (#1290)."""
+
+    row_id: str
+    reason: str
+    proposed_correction: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "row_id": sanitize_historical_text(self.row_id),  # shape-check: fatal:authentication-or-forgery
+            "reason": sanitize_historical_text(self.reason),  # shape-check: fatal:authentication-or-forgery
+            "proposed_correction": sanitize_historical_text(self.proposed_correction),  # shape-check: fatal:authentication-or-forgery
+        }
+
+
+@dataclass(frozen=True)
+class SemanticRiskCoverageGaps:
+    """Typed carrier for ``risk_test_matrix_coverage_gaps``.
+
+    Never persisted as authority.  ``degradations`` records dropped entries and
+    is an accessor beside the gaps, never part of ``to_payload``.
+    """
+
+    gaps: tuple[SemanticRiskCoverageGap, ...] = ()
+    degradations: tuple[ParseDegradation, ...] = ()
+
+    def to_payload(self) -> list[dict[str, object]]:
+        return [gap.to_payload() for gap in self.gaps]  # shape-check: fatal:authentication-or-forgery
+
+
+@dataclass(frozen=True)
 class StructuredCoderFollowup:
     schema_version: int
     kind: str
@@ -1102,6 +1186,8 @@ class StructuredCoderFollowup:
     # Advisory sub-item claims (#958): never change persisted sub-item status.
     addressed_sub_items: tuple[str, ...] = ()
     sub_item_claim_degradations: tuple[ParseDegradation, ...] = ()
+    # Coder-declared untestable rows (#1290); never persisted as authority.
+    risk_test_matrix_coverage_gaps: SemanticRiskCoverageGaps | None = None
 
 
 @dataclass(frozen=True)
@@ -1127,6 +1213,8 @@ class StructuredIssueImplementation:
     test_observation_degradations: tuple[ParseDegradation, ...] = ()
     # Orchestrator-derived, never parsed: see StructuredCoderFollowup.
     out_of_checkout_tests_run: tuple[str, ...] = ()
+    # Coder-declared untestable rows (#1290); never persisted as authority.
+    risk_test_matrix_coverage_gaps: SemanticRiskCoverageGaps | None = None
 
 
 @dataclass(frozen=True)
@@ -2232,6 +2320,8 @@ class DerivedRiskEvidenceResult:
 
     evidence: RiskTestMatrixEvidence
     diagnostics: tuple[PostAuthClaimDiagnostic, ...] = ()
+    # The exact PR head SHA this derivation bound to (#1290); in-memory only.
+    bound_head_sha: str | None = None
 
     @property
     def risk_test_matrix_evidence(self) -> RiskTestMatrixEvidence:
@@ -2280,6 +2370,7 @@ CLAIM_ROW_ID_MALFORMED_RULE = "row_id is not a valid matrix-specific identifier"
 CLAIM_ROW_ID_ABSENT_RULE = "row_id key is absent"
 CLAIM_ROW_ID_MISTYPED_RULE = "row_id is not a string"
 CLAIM_DROPPED_OUTCOME = "claim-dropped"
+COVERAGE_GAP_DROPPED_OUTCOME = "gap-dropped"
 # Claim-scope rules converted from envelope rejections by the stage-3 audit
 # (#927).  Each drops the one claim, or every claim for a non-array field.
 CLAIM_NOT_OBJECT_RULE = "claim is not a JSON object"
@@ -4601,6 +4692,7 @@ def _parse_semantic_risk_coverage_claims(
         unknown_keys = sorted(
             key for key in payload
             if key not in SEMANTIC_RISK_CLAIM_KEYS
+            and key not in SEMANTIC_RISK_CLAIM_COVERAGE_KEYS
         )
         if defect is None and unknown_keys:
             defect = (
@@ -4654,6 +4746,18 @@ def _parse_semantic_risk_coverage_claims(
                 unapproved_claim_row_ids.append((drop_record, unapproved_row_id))
             continue
         bookkeeping: list[str] = []
+        test_level: str | None = None
+        if "test_level" in payload and payload["test_level"] is not None:
+            raw_level = payload["test_level"]
+            normalized_level = raw_level.strip().lower() if isinstance(raw_level, str) else None
+            if normalized_level in SEMANTIC_RISK_TEST_LEVELS:
+                test_level = normalized_level
+            else:
+                # Degrade, not reject: the claim stays, the level reads absent.
+                bookkeeping.append(
+                    "test_level was not one of unit, integration, or workflow "
+                    f"({_json_type_label(raw_level)}); treated as undeclared."
+                )
         if dropped_refs:
             bookkeeping.append(_dropped_execution_refs_caveat(dropped_refs))  # shape-check: fatal:authentication-or-forgery
         if truncated_facts:
@@ -4678,6 +4782,7 @@ def _parse_semantic_risk_coverage_claims(
             caveats=caveats,
             dropped_execution_refs=tuple(dropped_refs),
             truncated_fact_fields=tuple(field for field, _ in truncated_facts),
+            test_level=test_level,
         )
         result.append(claim)
     return SemanticRiskCoverageClaims(
@@ -4686,6 +4791,85 @@ def _parse_semantic_risk_coverage_claims(
         degradations=tuple(degradations),
         unapproved_claim_row_ids=tuple(unapproved_claim_row_ids),
     )
+
+
+def _gap_degradations(drops: Sequence[tuple[str, str, object]]) -> tuple[ParseDegradation, ...]:
+    return tuple(
+        ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+            element_path=path, rule=rule, observed=observed, outcome=COVERAGE_GAP_DROPPED_OUTCOME,
+        )
+        for path, rule, observed in drops
+    )
+
+
+def _parse_semantic_risk_coverage_gaps(
+    payload: Mapping[str, object],
+    *,
+    context: str,
+    expected_row_ids: Sequence[str] | None = None,
+) -> SemanticRiskCoverageGaps | None:
+    """Parse ``risk_test_matrix_coverage_gaps`` with drop-not-reject semantics (#1290).
+
+    Returns ``None`` when the field is absent so payloads stay unchanged.
+    Malformed entries, unknown or non-enforceable row IDs, and duplicate row
+    IDs are dropped with one bounded ``ParseDegradation`` each; the envelope is
+    never rejected for a gap defect.  The array is bounded to
+    ``SEMANTIC_RISK_CLAIMS_MAX_ROWS`` entries and each string to
+    ``SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES``; entries past the row bound are
+    dropped with a record.
+    """
+    if "risk_test_matrix_coverage_gaps" not in payload:
+        return None
+    value = payload["risk_test_matrix_coverage_gaps"]
+    drops: list[tuple[str, str, object]] = []
+    if not isinstance(value, list):
+        drops.append((context, "risk_test_matrix_coverage_gaps is not a JSON array; no gap is kept", _json_type_label(value)))
+        return SemanticRiskCoverageGaps((), _gap_degradations(drops))  # shape-check: fatal:authentication-or-forgery
+    allowed = None if expected_row_ids is None else set(expected_row_ids)
+    counts: dict[str, int] = {}
+    for raw in value[:SEMANTIC_RISK_CLAIMS_MAX_ROWS]:
+        candidate = raw.get("row_id") if isinstance(raw, dict) else None
+        if isinstance(candidate, str):
+            counts[candidate.strip()] = counts.get(candidate.strip(), 0) + 1
+    gaps: list[SemanticRiskCoverageGap] = []
+    for index, raw in enumerate(value):
+        path = f"{context}[{index}]"
+        if index >= SEMANTIC_RISK_CLAIMS_MAX_ROWS:
+            drops.append((path, f"gap exceeds the {SEMANTIC_RISK_CLAIMS_MAX_ROWS}-entry bound", "over-bound entry"))
+            continue
+        if not isinstance(raw, dict):
+            drops.append((path, "gap is not a JSON object", _json_type_label(raw)))
+            continue
+        if set(raw) != set(SEMANTIC_RISK_COVERAGE_GAP_KEYS):
+            drops.append((path, "gap must have exactly row_id, reason, and proposed_correction", _neutralize_identifier_like(_dropped_ref_preview(", ".join(sorted(str(k) for k in raw))))))  # shape-check: fatal:authentication-or-forgery
+            continue
+        fields: dict[str, str] = {}
+        bad: str | None = None
+        for key in SEMANTIC_RISK_COVERAGE_GAP_KEYS:
+            item = raw[key]
+            if not isinstance(item, str) or not item.strip():
+                bad = f"{key} is not a non-blank string"
+                break
+            if len(item.encode("utf-8")) > SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES:
+                bad = f"{key} exceeds the {SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES}-byte bound"
+                break
+            fields[key] = item.strip()
+        if bad is not None:
+            drops.append((path, f"gap {bad}", "invalid gap field"))
+            continue
+        row_id = fields["row_id"]
+        if allowed is not None and row_id not in allowed:
+            drops.append((f"{path}.row_id", "gap row_id is not an enforceable approved row", _neutralize_identifier_like(_dropped_ref_preview(row_id))))  # shape-check: fatal:authentication-or-forgery
+            continue
+        if counts.get(row_id, 0) > 1:
+            drops.append((f"{path}.row_id", "gap row_id is declared more than once", _neutralize_identifier_like(_dropped_ref_preview(row_id))))  # shape-check: fatal:authentication-or-forgery
+            continue
+        gaps.append(SemanticRiskCoverageGap(
+            row_id=row_id,
+            reason=fields["reason"],
+            proposed_correction=fields["proposed_correction"],
+        ))
+    return SemanticRiskCoverageGaps(tuple(gaps), _gap_degradations(drops))  # shape-check: fatal:authentication-or-forgery
 
 
 def _fact_defect_observed(value: object, rule: str) -> str:
@@ -6449,6 +6633,7 @@ def validate_structured_coder_followup(
         "tests_run",
         "test_observations",
         "risk_test_matrix_claims",
+        "risk_test_matrix_coverage_gaps",
         "disputed_items",
         "dispute_evidence",
         "architecture_impact",
@@ -6506,6 +6691,11 @@ def validate_structured_coder_followup(
             expected_row_ids=delivered_risk_test_matrix_row_ids,
             execution_catalog=execution_catalog,
         )
+    coverage_gaps = _parse_semantic_risk_coverage_gaps(  # shape-check: fatal:payload-bound
+        payload,
+        context="coder_followup.risk_test_matrix_coverage_gaps",
+        expected_row_ids=delivered_risk_test_matrix_row_ids,
+    )
     risk_evidence = None
     if allow_historical_canonical_evidence and "risk_test_matrix_evidence" in payload:
         risk_evidence = parse_risk_test_matrix_evidence(  # shape-check: fatal:authentication-or-forgery
@@ -6610,6 +6800,7 @@ def validate_structured_coder_followup(
         test_observation_degradations=test_observation_degradations,
         architecture_impact=architecture_impact,
         risk_test_matrix_claims=risk_claims,
+        risk_test_matrix_coverage_gaps=coverage_gaps,
         risk_test_matrix_evidence=risk_evidence,
         architecture_impact_contract=architecture_impact_contract,
         architecture_impact_degradations=architecture_impact_degradations,
@@ -6703,6 +6894,7 @@ def validate_structured_issue_implementation(
     optional_fields = {
         "tests_run", "test_observations", "architecture_impact",
         "risk_test_matrix_claims",
+        "risk_test_matrix_coverage_gaps",
     }
     if allow_historical_canonical_evidence:
         optional_fields.add("risk_test_matrix_evidence")
@@ -6769,6 +6961,11 @@ def validate_structured_issue_implementation(
             expected_row_ids=delivered_risk_test_matrix_row_ids,
             execution_catalog=execution_catalog,
         )
+    coverage_gaps = _parse_semantic_risk_coverage_gaps(  # shape-check: fatal:payload-bound
+        payload,
+        context="issue_implementation.risk_test_matrix_coverage_gaps",
+        expected_row_ids=delivered_risk_test_matrix_row_ids,
+    )
     risk_evidence = None
     if allow_historical_canonical_evidence and "risk_test_matrix_evidence" in payload:
         risk_evidence = parse_risk_test_matrix_evidence(  # shape-check: fatal:authentication-or-forgery
@@ -6812,6 +7009,7 @@ def validate_structured_issue_implementation(
         risk_test_matrix_evidence=risk_evidence,
         architecture_impact_contract=architecture_impact_contract,
         architecture_impact_degradations=architecture_impact_degradations,
+        risk_test_matrix_coverage_gaps=coverage_gaps,
     )
     # An unsatisfied required contract outranks the semantic conflict, as the
     # former raise did: return it so the seam refuses it rather than letting a

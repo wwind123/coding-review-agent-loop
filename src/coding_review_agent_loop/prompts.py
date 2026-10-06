@@ -61,6 +61,7 @@ from .protocol import (
     semantic_risk_claim_schema_text,
 )
 from .protocol_markers import sanitize_historical_text, sanitize_untrusted_prose
+from .risk_coverage_map import classify_required_level, coverage_map_applies, enforceable_rows
 from .finding_history import (
     PHASE_PLAN as _HISTORY_PHASE_PLAN,
     PHASE_PR as _HISTORY_PHASE_PR,
@@ -1412,11 +1413,25 @@ For clarification:
 """
 
 
+_RISK_COVERAGE_MAP_RULES = (
+    "Before reporting the PR, account for every enforceable row listed under the risk-matrix coverage "
+    "obligations: either a claim citing at least one committed test (`path::test_name` in "
+    "`test_identifiers` and/or a path in `test_locations`), a non-empty `workflow_path_claim` and "
+    "`outcome_assertions`, and a `test_level` (`unit`, `integration`, or `workflow`) at least the row's "
+    "required level, or an entry in `risk_test_matrix_coverage_gaps` (objects with exactly `row_id`, "
+    "`reason`, and `proposed_correction`) for a row that genuinely cannot be tested as specified, with "
+    "the evidence-backed correction a reviewer would otherwise request. A row with no test, or tested "
+    "below its required level, is a gap to close before reporting, not something to leave for review. "
+    "Cited test files must be committed and pushed to the PR. Never list a row in both."
+)
+
+
 def _structured_coder_followup_guidance(
     *,
     reviewer_name: str,
     human_requirements_context: CoderHumanRequirementsPromptContext,
     coder_signature: str,
+    include_coverage_map: bool = False,
 ) -> str:
     example_human_requirement_dispositions = (
         [{
@@ -1449,7 +1464,8 @@ def _structured_coder_followup_guidance(
         '    "checked_discussion_directly": false',
         "  },",
         '  "tests_run": ["python -m pytest tests/test_agent_loop.py -k followup"],',
-        '  "risk_test_matrix_claims": []',
+        '  "risk_test_matrix_claims": []' + (',' if include_coverage_map else ''),
+        *(['  "risk_test_matrix_coverage_gaps": []'] if include_coverage_map else []),
         "}",
         "",
         "Required structured fields: `schema_version`, `kind`, `state`, `summary`, `addressed_items`, `remaining_items`, `human_requirements`, `human_requirement_dispositions`, and `architecture_impact` for this fresh coder turn. `addressed_item_notes`, `remaining_item_notes`, `disputed_items`, `dispute_evidence`, `tests_run`, and `test_observations` are optional.",
@@ -1461,9 +1477,14 @@ def _structured_coder_followup_guidance(
         "Use `disputed_items` when a reviewer claim is factually incorrect (wrong pricing, stale diff reading, incorrect behavior assumption) or when the reviewer requests a change that is mutually incompatible with a verified approved-plan decision and you have counter-evidence. For a plan conflict, `dispute_evidence` must name the conflicting approved decision, concrete counter-evidence, and why the requested change is incompatible. Put the item ID in `disputed_items` instead of `addressed_items` or `remaining_items`; never park a verified plan conflict in `remaining_items`, whose retry semantics would silently recycle it. Ordinary implementation defects and evidence-backed correctness, security, compatibility, or test defects must be fixed and classified as addressed or genuinely remaining, never disputed merely because the implementation followed the plan. The reviewer will get one more turn to reconsider with your evidence attached. If the reviewer still blocks after seeing the evidence, the orchestrator will surface the disagreement to a human for resolution.",
         "When you use the managed `agent-loop run-tests` wrapper, report the exact command, outcome, caveats, test identifiers, and locations. The wrapper prints an invocation-local `execution_ref`; use that selector only in semantic coverage claims. Never copy a receipt ID into a risk claim, and never infer a selector from command text, test identifiers, list position, or outcome.",
         "If the approved plan delivered an applicable risk matrix, include `risk_test_matrix_claims` as a bounded JSON array of semantic claims. "
-        + semantic_risk_claim_schema_text()
+        + semantic_risk_claim_schema_text(include_coverage_map=include_coverage_map)
         + " "
-        "Claims may name only approved row IDs and execution_ref selectors printed by the current managed-test turn. The orchestrator supplies the matrix identity, canonical rows, statuses, ordering, receipt citations, mappings, and authoritative caveats after PR/head authentication. Omit the claim set when no row was exercised; the orchestrator will retain complete non-verified rows.",
+        "Claims may name only approved row IDs and execution_ref selectors printed by the current managed-test turn. The orchestrator supplies the matrix identity, canonical rows, statuses, ordering, receipt citations, mappings, and authoritative caveats after PR/head authentication. "
+        + (
+            _RISK_COVERAGE_MAP_RULES
+            if include_coverage_map
+            else "Omit the claim set when no row was exercised; the orchestrator will retain complete non-verified rows."
+        ),
         "Do not include `risk_test_matrix_evidence` as a JSON object with exactly `matrix_identity` and `rows`, or \"evidence_citations\". Do not emit `risk_test_matrix_evidence` as an array or legacy `coverage_level` either; those canonical fields are removed during fresh semantic repair.",
         _agent_unavailable_guidance(coder_signature),
     ]
@@ -1491,6 +1512,7 @@ def _structured_issue_implementation_guidance(
     *,
     human_requirements_context: CoderHumanRequirementsPromptContext,
     coder_signature: str,
+    include_coverage_map: bool = False,
 ) -> str:
     """Return the one structured result contract shared by implementation turns."""
     if human_requirements_context.surfaced_requirement_ids:
@@ -1541,6 +1563,7 @@ def _structured_issue_implementation_guidance(
         "human_requirement_dispositions": disposition_example,
         "tests_run": ["python -m pytest tests/test_protocol.py -q"],
         "risk_test_matrix_claims": [],
+        **({"risk_test_matrix_coverage_gaps": []} if include_coverage_map else {}),
         "architecture_impact": {
             "status": "unchanged", "rationale": "No architectural contract changed.",
             "affected_components": [], "dependencies": [], "execution_data_flows": [],
@@ -1549,6 +1572,7 @@ def _structured_issue_implementation_guidance(
             "canonical_document_rationale": "",
         },
     }
+    coverage_map_rules = (" " + _RISK_COVERAGE_MAP_RULES) if include_coverage_map else ""
     return f"""Use this mandatory structured `issue_implementation` result so the orchestrator can validate the implementation deterministically:
 
 {json.dumps(example, indent=2)}
@@ -1561,7 +1585,7 @@ Rules:
 - A null-PR blocker unrelated to signed requirements is valid with the empty ledger required by the rules above.
 - `tests_run` is optional and may be absent, `null`, or an empty array when no tests ran. When supplied, it contains only exact command strings; report why tests could not run in `summary`.
 - `test_observations` is optional display evidence; when supplied, report only exact managed-wrapper commands and outcomes. A legacy or direct-shell report remains capture-limited.
-- When the approved-plan context contains an applicable risk matrix, report semantic `risk_test_matrix_claims` only: each claim names an approved `row_id`, current-turn `execution_refs`, actual test identifiers/locations, workflow/outcome/forbidden-effect assertions, and optional caveats. {semantic_risk_claim_schema_text()} Do not emit `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, or envelope bookkeeping. The orchestrator derives those fields from the approved matrix, authoritative journal, and authenticated PR head. Planned tests and unverified commands are not evidence.
+- When the approved-plan context contains an applicable risk matrix, report semantic `risk_test_matrix_claims` only: each claim names an approved `row_id`, current-turn `execution_refs`, actual test identifiers/locations, workflow/outcome/forbidden-effect assertions, and optional caveats. {semantic_risk_claim_schema_text(include_coverage_map=include_coverage_map)}{coverage_map_rules} Do not emit `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, or envelope bookkeeping. The orchestrator derives those fields from the approved matrix, authoritative journal, and authenticated PR head. Planned tests and unverified commands are not evidence.
 - Start directly with exactly one top-level JSON object. Put the `<!-- AGENT_STATE: blocking -->` footer immediately after it and only your standalone signature after the footer.
 
 The structured result is the public implementation record. Do not add prose,
@@ -1764,6 +1788,35 @@ def _labeled_issue_context_block(
     )
 
 
+def _risk_coverage_checklist_lines(plan_context: ApprovedPlanContext) -> list[str]:
+    """Render enforceable rows as explicit coverage obligations (#1290)."""
+    rows = enforceable_rows(
+        plan_context.risk_test_matrix_payload, plan_context.risk_test_matrix_expected_row_ids
+    )
+    lines = [
+        "",
+        "Risk-matrix coverage obligations (map every enforceable row before reporting the PR)",
+    ]
+    for row in rows:
+        required = classify_required_level(row.get("proposed_test_level", ""))
+        level_text = (
+            f"{required} (from `{row.get('proposed_test_level', '')}`)"
+            if required is not None
+            else f"unclassified: no level check (`{row.get('proposed_test_level', '')}`)"
+        )
+        lines.extend([
+            f"- [ ] {row.get('row_id', '')}: {row.get('label', '')}",
+            "    behaviour: path/mode={path}; initial={initial}; event={event}; expected={expected}".format(
+                path=row.get("entry_path_or_mode", ""), initial=row.get("initial_state", ""),
+                event=row.get("event", ""), expected=row.get("expected_outcome", ""),
+            ),
+            f"    required level: {level_text}",
+            f"    proposed location: {row.get('proposed_test_location', '')}",
+            "    forbidden side effects: " + ("; ".join(row.get("forbidden_side_effects", [])) or "none"),
+        ])
+    return lines
+
+
 def format_approved_plan_context(
     plan_context: ApprovedPlanContext | None,
     *,
@@ -1806,11 +1859,21 @@ def format_approved_plan_context(
                     "other rows are read-only pending obligations."
                 )
             pending_ids = set(plan_context.risk_test_matrix_pending_row_ids)
+            if coverage_map_applies(plan_context):
+                lines.extend(_risk_coverage_checklist_lines(plan_context))
             for row in matrix.get("rows", []):
                 if not isinstance(row, dict):
                     continue
+                if coverage_map_applies(plan_context) and row.get("row_id") not in pending_ids and (
+                    row.get("row_id") in set(plan_context.risk_test_matrix_expected_row_ids or ())
+                ):
+                    continue
                 ownership_note = (
                     "[read-only pending obligation] "
+                    + (
+                        "(outside this turn's coverage checklist) "
+                        if coverage_map_applies(plan_context) else ""
+                    )
                     if row.get("row_id") in pending_ids else "[enforceable] "
                 )
                 lines.append(
@@ -1991,6 +2054,10 @@ def approved_plan_reconciliation_guidance(
     if plan_context.is_available and (text_rendered or plan_context.matrix_available):
         matrix_review_guidance = (
             "When the approved context contains an applicable risk matrix, verify every delivered row against the actual workflow path and expected outcome. A helper or earlier guard is not evidence for an orchestration row; check forbidden side effects with suitable assertions, instrumentation, or shared guards, without requiring brittle line checks. Outstanding or caveated row evidence remains blocking/incomplete as appropriate, and defects outside the matrix remain reviewable.\n"
+            + (
+                "When the coder comment carries a Risk-matrix coverage map, check coverage in one pass and dispute specific map entries rather than discovering gaps round by round; treat a declared gap's proposed correction as a reviewable claim. The map guarantees completeness only, not that a cited test exercises its row.\n"
+                if coverage_map_applies(plan_context) else ""
+            )
             if plan_context.matrix_available else ""
         )
         canonical_note = (
@@ -3973,6 +4040,7 @@ approved plan, run relevant tests, commit, push, and open a pull request against
 {human_requirements_context.block}{_structured_issue_implementation_guidance(
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
+    include_coverage_map=coverage_map_applies(plan_context),
 )}
 {_labeled_issue_context_block(parent_issue_context, label="Authoritative parent issue context")}
 {_labeled_issue_context_block(issue_context, label="Target child/primary issue context")}
@@ -4022,6 +4090,7 @@ def build_completion_recovery_prompt(
     implementation_contract = _structured_issue_implementation_guidance(
         human_requirements_context=human_requirements_context,
         coder_signature=coder_signature,
+        include_coverage_map=coverage_map_applies(approved_plan_context),
     )
     return f"""Your previous turn on this same implementation ended without a valid
 terminal response, and its text suggested required work (tests, a build, or
@@ -5103,6 +5172,7 @@ Do not create a new PR.
     reviewer_name=reviewer_name,
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
+    include_coverage_map=coverage_map_applies(approved_plan_context),
 )}This is round {round_number}. Use blocking to hand the updated PR back to {reviewer_name}.
 If you cannot safely address the review, explain why and still use the blocking
 marker so a human can intervene. Do not place your signature before the
@@ -5169,6 +5239,7 @@ Same-PR follow-ups:
     reviewer_name=reviewer_name,
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
+    include_coverage_map=coverage_map_applies(approved_plan_context),
 )}This is round {round_number}. Use blocking to hand the updated PR back to {reviewer_name}.
 If you cannot safely address the follow-ups, explain why and still use the
 blocking marker so a human can intervene. Do not place your signature before
@@ -5234,6 +5305,7 @@ push if practical, alongside the conflict resolution):
     reviewer_name=reviewer_name,
     human_requirements_context=human_requirements_context,
     coder_signature=coder_signature,
+    include_coverage_map=coverage_map_applies(approved_plan_context),
 )}This is round {round_number}. Use blocking to hand the resolved PR back for review.
 If you cannot safely resolve the conflict, explain why and still use the blocking
 marker so a human can intervene. Do not place your signature before the

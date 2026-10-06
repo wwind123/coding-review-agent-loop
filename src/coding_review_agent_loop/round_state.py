@@ -772,6 +772,9 @@ class ResumedReviewRound:
     completed_reviews: tuple[PostedRoundRecord, ...]
     next_unresolved_item_number: int
     ledger_may_be_incomplete: bool = False
+    # Public coder comment of the anchor round; only its orchestrator-authored
+    # coverage-map section is consumed (#1290), never the coder's own prose.
+    coder_comment_body: str | None = None
     compact_prior_summaries: tuple[str, ...] = ()
     unrecorded_head_advance: bool = False
     reconciled: bool = False
@@ -2272,10 +2275,16 @@ def _sanitize_durable_coder_response(raw: str | None) -> str | None:
         "coder_followup",
     }:
         return raw
-    if "risk_test_matrix_claims" not in payload:
+    if (
+        "risk_test_matrix_claims" not in payload
+        and "risk_test_matrix_coverage_gaps" not in payload
+    ):
         return raw
     payload = dict(payload)
     payload.pop("risk_test_matrix_claims", None)
+    # Coverage-map gap declarations are a fresh-turn acquisition contract too
+    # and are never persisted as authority (#1290).
+    payload.pop("risk_test_matrix_coverage_gaps", None)
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + normalized[end:]
 
 
@@ -4561,6 +4570,7 @@ def _recover_unrecorded_pr_head_advance(
         compact_prior_summaries=compact_prior_summaries,
         unrecorded_head_advance=True,
         coder_metadata=latest_coder_record.metadata if latest_coder_record else None,
+        coder_comment_body=latest_coder_record.body if latest_coder_record else None,
         local_test_evidence=(
             latest_coder_record.metadata.local_test_evidence
             if latest_coder_record is not None
@@ -5274,6 +5284,7 @@ def _resume_pr_round_from_records(
             else None
         ),
         coder_metadata=latest_coder_record.metadata if latest_coder_record else None,
+        coder_comment_body=latest_coder_record.body if latest_coder_record else None,
         completed_reviews=tuple(reviewer_records[agent_display_name(agent)] for agent in configured_reviewers if agent_display_name(agent) in reviewer_records),
         # Item IDs are never reused: keep the global high-water mark across heads
         # (recovery rounds, and the rounds that follow a recovery push, resume on

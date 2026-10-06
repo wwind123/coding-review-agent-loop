@@ -5520,3 +5520,136 @@ def test_phased_delivery_guard_predicate_agrees_with_the_prompt_guard(tmp_path):
     for mode in sorted(PLAN_EXECUTION_MODES):
         guard = _phased_plan_guard(make_config(tmp_path, plan_execution_mode=mode))
         assert phased_delivery_guard_active(mode) == bool(guard), mode
+
+
+# --- #1290: risk-matrix coverage obligations -----------------------------------
+
+def _coverage_plan_context(*, applicability: str = "applicable", pending: bool = False):
+    from dataclasses import replace as _replace
+    from coding_review_agent_loop.protocol import (
+        parse_risk_test_matrix,
+        risk_test_matrix_identity,
+    )
+    from coding_review_agent_loop.round_state import make_approved_plan_context
+
+    def row(row_id: str, level: str, owner: str = "one-shot") -> dict:
+        return {
+            "row_id": row_id,
+            "label": f"Behaviour {row_id}",
+            "entry_path_or_mode": "issue plan-first",
+            "initial_state": "approved plan",
+            "event": "coder reports",
+            "expected_outcome": f"outcome {row_id}",
+            "forbidden_side_effects": [f"no side effect {row_id}"],
+            "proposed_test_level": level,
+            "proposed_test_location": f"tests/test_{row_id}.py",
+            "applicability": "applicable",
+            "related_scope_item_ids": ["scope-1"],
+            "execution_owner": owner,
+        }
+
+    if applicability == "applicable":
+        payload = {
+            "applicability": "applicable",
+            "rows": [row("row-wf", "workflow"), row("row-man", "manual review")]
+            + ([row("row-later", "unit", owner="stage-2")] if pending else []),
+            "important_exclusions": [],
+        }
+    else:
+        payload = {
+            "applicability": "not-applicable", "rows": [], "important_exclusions": [],
+            "not_applicable_rationale": "Formatting-only change without any stateful path.",
+        }
+    matrix = parse_risk_test_matrix(payload)
+    identity = risk_test_matrix_identity(matrix)
+    context = make_approved_plan_context(
+        None,
+        expected_hash="a" * 16,
+        expected_subject="b" * 64,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    if pending:
+        context = _replace(
+            context,
+            risk_test_matrix_enforceable_row_ids=("row-wf", "row-man"),
+            risk_test_matrix_pending_row_ids=("row-later",),
+            risk_test_matrix_execution_owner="one-shot",
+        )
+    return context
+
+
+def test_implementation_prompt_lists_every_enforceable_row_as_a_checklist_item(tmp_path):
+    config = make_config(tmp_path, coder="claude")
+    prompt = build_issue_implementation_prompt(
+        56, "1. Fix it.", config, approved_plan_context=_coverage_plan_context(pending=True)
+    )
+    assert "Risk-matrix coverage obligations (map every enforceable row before reporting the PR)" in prompt
+    assert "- [ ] row-wf: Behaviour row-wf" in prompt
+    assert "required level: workflow" in prompt
+    assert "- [ ] row-man: Behaviour row-man" in prompt
+    assert "unclassified: no level check" in prompt
+    assert "proposed location: tests/test_row-wf.py" in prompt
+    assert "forbidden side effects: no side effect row-wf" in prompt
+    # Pending rows are read-only and never checklist items.
+    assert "- [ ] row-later" not in prompt
+    assert "[read-only pending obligation] (outside this turn's coverage checklist) Row row-later" in prompt
+    # Producer guidance is gated on the applicable matrix.
+    assert "`test_level`" in prompt
+    assert '"risk_test_matrix_coverage_gaps": []' in prompt
+    assert "is a gap to close before reporting" in prompt
+
+
+def test_prompts_without_applicable_matrix_have_no_coverage_text(tmp_path):
+    config = make_config(tmp_path, coder="claude")
+    baseline = build_issue_implementation_prompt(56, "1. Fix it.", config)
+    not_applicable = build_issue_implementation_prompt(
+        56, "1. Fix it.", config,
+        approved_plan_context=_coverage_plan_context(applicability="not-applicable"),
+    )
+    for prompt in (baseline, not_applicable):
+        assert "test_level" not in prompt
+        assert "risk_test_matrix_coverage_gaps" not in prompt
+        assert "coverage obligations" not in prompt
+
+
+def test_followup_prompt_coverage_guidance_is_gated_on_applicable_matrix(tmp_path):
+    config = make_config(tmp_path, coder="claude")
+    gated = build_followup_prompt(
+        77, 1, "Needs tests.", config, approved_plan_context=_coverage_plan_context()
+    )
+    ungated = build_followup_prompt(77, 1, "Needs tests.", config)
+    assert "risk_test_matrix_coverage_gaps" in gated and "`test_level`" in gated
+    assert "risk_test_matrix_coverage_gaps" not in ungated and "test_level" not in ungated
+
+
+def test_post_auth_correction_prompt_includes_test_level_only_when_applicable():
+    from coding_review_agent_loop.response_validation import _post_auth_correction_prompt
+    from coding_review_agent_loop.protocol import StructuredIssueImplementation, StructuredHumanRequirementsPayload
+
+    parsed = StructuredIssueImplementation(
+        schema_version=1, kind="issue_implementation", state="blocking", summary="s", pr_number=1,
+        human_requirements=StructuredHumanRequirementsPayload(addressed_ids=(), checked_discussion_directly=False),
+        human_requirement_dispositions=(),
+    )
+    kwargs = dict(matrix_row_ids=["r"], diagnostics=[], execution_catalog=[])
+    gated = _post_auth_correction_prompt(parsed, include_coverage_map=True, **kwargs)
+    plain = _post_auth_correction_prompt(parsed, **kwargs)
+    assert "`test_level`" in gated
+    assert "do not add, remove, or alter `risk_test_matrix_coverage_gaps`" in gated
+    assert "test_level" not in plain and "coverage_gaps" not in plain
+
+
+def test_matrix_review_guidance_mentions_coverage_map_only_when_applicable():
+    from coding_review_agent_loop.prompts import format_approved_plan_context  # noqa: F401
+    import coding_review_agent_loop.prompts as module
+
+    applicable = module._approved_plan_review_context_block(_coverage_plan_context(), max_chars=None)
+    assert "dispute specific map entries" in applicable
+    not_applicable = module._approved_plan_review_context_block(
+        _coverage_plan_context(applicability="not-applicable"), max_chars=None
+    )
+    assert "coverage map" not in not_applicable

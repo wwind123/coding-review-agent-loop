@@ -851,9 +851,9 @@ def test_m780_12_generated_child_dispatch_enforces_owned_rows_and_keeps_later_ro
     )
     assert orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
-    assert "Row row-stage-one" in prompt
+    assert "- [ ] row-stage-one:" in prompt
     assert "Row row-stage-two" in prompt
-    assert "[enforceable]" in prompt
+    assert "Risk-matrix coverage obligations" in prompt
     assert "[read-only pending obligation]" in prompt
 
 
@@ -910,9 +910,9 @@ def test_m780_12_separately_planned_child_requires_parent_row_and_uses_child_pro
     )
     assert orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
-    assert "Row row-stage-one" in prompt
-    assert "[enforceable]" in prompt
-    assert "Row child-local" in prompt
+    assert "- [ ] row-stage-one:" in prompt
+    assert "Risk-matrix coverage obligations" in prompt
+    assert "- [ ] child-local:" in prompt
 
 
 def oversized_fresh_staged_plan():
@@ -2493,7 +2493,7 @@ def test_m931_open_child_pr_is_readmitted_or_rejected_identically_on_both_paths(
     else:
         assert run() == 0
         prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
-        assert "Row row-stage-one" in prompt and "Row child-local" in prompt
+        assert "- [ ] row-stage-one:" in prompt and "- [ ] child-local:" in prompt
     # Neither path replans the child or re-invokes the implementation coder.
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 

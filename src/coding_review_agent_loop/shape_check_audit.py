@@ -236,6 +236,44 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "fields or canonical evidence rows."
         ),
     ),
+    "SemanticRiskCoverageGap.to_payload": ShapeCheckClassification(
+        "fatal",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
+    "SemanticRiskCoverageGaps.to_payload": ShapeCheckClassification(
+        "fatal",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
+    "_gap_degradations": ShapeCheckClassification(
+        "mixed",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
+    "_parse_semantic_risk_coverage_gaps": ShapeCheckClassification(
+        "mixed",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Drops one coverage-gap entry per defect (malformed, unknown or non-enforceable "
+            "row, duplicate, over-bound) with one bounded parse-degradation record, never "
+            "rejecting the envelope (#1290). Fatal sites: authentication-or-forgery: marker "
+            "neutralization through sanitize_historical_text, identity digests, "
+            "orchestrator-owned authority fields or canonical evidence rows."
+        ),
+    ),
     "_bounded_discuss_synthesis_list": ShapeCheckClassification(
         "fatal",
         frozenset({"no-conservative-reading", "payload-bound"}),

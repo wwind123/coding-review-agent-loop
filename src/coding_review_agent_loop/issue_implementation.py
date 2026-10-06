@@ -32,6 +32,7 @@ from .decomposition import (
 from .child_topology import NeedsHumanDecision
 from .errors import (
     AgentInvocationError,
+    CheckoutVerificationError,
     AgentLoopError,
 )
 from .expected_closure import (
@@ -115,9 +116,11 @@ from .architecture_contract import (
     _TerminalNoPrImplementation,
     _TerminalIssueImplementationConflict,
     _architecture_mode_validators,
+    _risk_coverage_reask_prompt,
     _surface_decomposition_degradations,
     _surface_refused_decomposition,
 )
+from .risk_coverage_map import coverage_map_applies, render_coverage_map
 from .validated_agent import (
     CompletionRecoveryPolicy,
     _run_validated_agent,
@@ -126,6 +129,8 @@ from .response_validation import (
     _validate_issue_implementation_response,
     _current_test_turn_observations,
     _derive_authenticated_risk_evidence_for_coder,
+    assess_risk_coverage_map,
+    final_risk_coverage_assessment,
     _post_no_pr_implementation_terminal_comment,
     _post_structured_issue_implementation_terminal_comment,
     _degrade_out_of_checkout_tests,
@@ -482,77 +487,86 @@ def _implement_approved_issue(
         _print_unprotected_managed_ci_warning(managed_ci_creation_intent.protection_mode)
     log(config, f"Planning approved; invoking {coder_name} to implement issue #{issue_number}")
     assigned_head_before = _read_assigned_workdir_head(runner, implementation_config)
-    coder_response = _run_validated_agent(
-        runner,
-        agent=implementation_config.coder,
-        config=implementation_config,
-        prompt=build_issue_implementation_prompt(
-            issue_number,
-            approved_plan,
-            implementation_config,
-            memory,
-            issue_context=issue_context,
-            salvage_summary=salvage_summary,
-            staged_parent_issue=staged_parent_issue,
-            managed_ci_creation_intent=managed_ci_creation_intent,
-            approved_plan_context=approved_plan_context,
-            parent_issue_context=parent_issue_context,
-        ),
+    implementation_prompt = build_issue_implementation_prompt(
+        issue_number,
+        approved_plan,
+        implementation_config,
+        memory,
+        issue_context=issue_context,
+        salvage_summary=salvage_summary,
+        staged_parent_issue=staged_parent_issue,
+        managed_ci_creation_intent=managed_ci_creation_intent,
+        approved_plan_context=approved_plan_context,
+        parent_issue_context=parent_issue_context,
+    )
+
+    def _invoke_implementation_coder(prompt, *, session_id, attempt_label, invoke_config=implementation_config):
+        log(config, f"Invoking {coder_name} for approved-plan implementation ({attempt_label})")
+        return _run_validated_agent(
+            runner,
+            agent=invoke_config.coder,
+            config=invoke_config,
+            prompt=prompt,
+            session_id=session_id,
+            marker_description="structured issue_implementation result, blocking, or clarification",
+            require_architecture_impact_contract=True,
+            **_architecture_mode_validators(lambda mode: lambda text: _validate_issue_implementation_response(
+                text,
+                human_requirements=implementation_requirements,
+                require_architecture_impact=True,
+                delivered_risk_test_matrix=(
+                    approved_plan_context.risk_test_matrix_payload
+                    if approved_plan_context is not None and approved_plan_context.matrix_available
+                    else None
+                ),
+                delivered_risk_test_matrix_identity=(
+                    approved_plan_context.risk_test_matrix_identity
+                    if approved_plan_context is not None and approved_plan_context.matrix_available
+                    else None
+                ),
+                require_risk_test_matrix_contract=(
+                    approved_plan_context is not None and approved_plan_context.matrix_available
+                ),
+                authoritative_test_observations=_current_test_turn_observations(runner),
+                execution_catalog=_current_test_turn_observations(runner),
+                delivered_risk_test_matrix_row_ids=(
+                    approved_plan_context.risk_test_matrix_expected_row_ids
+                    if approved_plan_context is not None and approved_plan_context.matrix_available
+                    else None
+                ), architecture_status_mode=mode,
+            )),
+            usage_context=usage_context,
+            role="coder",
+            reask_on_evidence_rejection=True,
+            use_repair=True,
+            repair_expected_kind="issue_implementation",
+            repair_surfaced_requirement_ids=implementation_human_requirements_context.surfaced_requirement_ids,
+            repair_requires_direct_discussion_ack=implementation_human_requirements_context.requires_direct_discussion_ack,
+            salvage_context=SalvageContext(
+                repo=implementation_config.repo,
+                issue_number=issue_number,
+                scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
+                agent=implementation_config.coder,
+                run_id=usage_context.run_id,
+                approved_plan_hash=plan_hash,
+            ),
+            operation_description="approved-plan implementation",
+            completion_recovery=CompletionRecoveryPolicy(
+                issue_number=issue_number,
+                issue_context=issue_context,
+                approved_plan_context=approved_plan_context,
+                parent_issue_context=parent_issue_context,
+                human_requirements=implementation_requirements,
+            ),
+            managed_ci_recovery_protection=(
+                managed_ci_creation_intent.protection_mode
+                if managed_ci_creation_intent is not None else None
+            ),
+        )
+    coder_response = _invoke_implementation_coder(
+        implementation_prompt,
         session_id=implementation_session_id,
-        marker_description="structured issue_implementation result, blocking, or clarification",
-        require_architecture_impact_contract=True,
-        **_architecture_mode_validators(lambda mode: lambda text: _validate_issue_implementation_response(
-            text,
-            human_requirements=implementation_requirements,
-            require_architecture_impact=True,
-            delivered_risk_test_matrix=(
-                approved_plan_context.risk_test_matrix_payload
-                if approved_plan_context is not None and approved_plan_context.matrix_available
-                else None
-            ),
-            delivered_risk_test_matrix_identity=(
-                approved_plan_context.risk_test_matrix_identity
-                if approved_plan_context is not None and approved_plan_context.matrix_available
-                else None
-            ),
-            require_risk_test_matrix_contract=(
-                approved_plan_context is not None and approved_plan_context.matrix_available
-            ),
-            authoritative_test_observations=_current_test_turn_observations(runner),
-            execution_catalog=_current_test_turn_observations(runner),
-            delivered_risk_test_matrix_row_ids=(
-                approved_plan_context.risk_test_matrix_expected_row_ids
-                if approved_plan_context is not None and approved_plan_context.matrix_available
-                else None
-            ), architecture_status_mode=mode,
-        )),
-        usage_context=usage_context,
-        role="coder",
-        reask_on_evidence_rejection=True,
-        use_repair=True,
-        repair_expected_kind="issue_implementation",
-        repair_surfaced_requirement_ids=implementation_human_requirements_context.surfaced_requirement_ids,
-        repair_requires_direct_discussion_ack=implementation_human_requirements_context.requires_direct_discussion_ack,
-        salvage_context=SalvageContext(
-            repo=implementation_config.repo,
-            issue_number=issue_number,
-            scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
-            agent=implementation_config.coder,
-            run_id=usage_context.run_id,
-            approved_plan_hash=plan_hash,
-        ),
-        operation_description="approved-plan implementation",
-        completion_recovery=CompletionRecoveryPolicy(
-            issue_number=issue_number,
-            issue_context=issue_context,
-            approved_plan_context=approved_plan_context,
-            parent_issue_context=parent_issue_context,
-            human_requirements=implementation_requirements,
-        ),
-        managed_ci_recovery_protection=(
-            managed_ci_creation_intent.protection_mode
-            if managed_ci_creation_intent is not None else None
-        ),
+        attempt_label="initial",
     )
     coder_output = coder_response.text
     implementation_result = coder_response.marker_value
@@ -601,44 +615,138 @@ def _implement_approved_issue(
         )
     else:
         raise AgentLoopError("Issue implementation validator returned an unknown result type.")
-    validate_assigned_head_advanced(
-        before_head=assigned_head_before,
-        after_head=_read_assigned_workdir_head(runner, implementation_config),
-        assigned_workdir=active_workdir(implementation_config),
-    )
+    def _authenticate_reported_pr(cfg):
+        """Read-only identity and managed-CI authorization of the reported PR."""
+        validate_assigned_head_advanced(
+            before_head=assigned_head_before,
+            after_head=_read_assigned_workdir_head(runner, cfg),
+            assigned_workdir=active_workdir(cfg),
+        )
+        validate_open_pr(runner, config=cfg, pr_number=pr_number)
+        context = get_pr_review_context(runner, config=cfg, pr_number=pr_number)
+        handoff: AuthenticatedIssueCreatedHandoff | None = None
+        if managed_ci_creation_intent is not None:
+            handoff = authenticate_issue_created_handoff(
+                runner,
+                config=cfg,
+                intent=managed_ci_creation_intent,
+                issue_number=issue_number,
+                pr_number=pr_number,
+                metadata=context.metadata,
+            )
+            if handoff.override_nonce is not None:
+                # Install the expected nonce before any PR/issue publication.  It
+                # remains runtime-only and is revalidated at run_pr_loop entry.
+                cfg = dataclasses_replace(
+                    cfg, managed_ci_expected_override_nonce=handoff.override_nonce,
+                )
+        else:
+            reject_forged_protocol_markers(
+                context.metadata.body or "",
+                surface=f"pull-request #{pr_number} body",
+            )
+        return context, handoff, cfg
+
+    def _read_only_reference_guards(context, cfg):
+        validate_pr_references_issue(
+            runner,
+            config=cfg,
+            pr_number=pr_number,
+            issue_number=issue_number,
+            staged_parent_issue=staged_parent_issue,
+            body=context.metadata.body,
+        )
+        validate_pr_expected_closing_issues(
+            runner,
+            config=cfg,
+            pr_number=pr_number,
+            expected_issue_ids=closing_contract.issue_ids,
+            body=context.metadata.body,
+        )
+
     log(config, f"{coder_name} reported PR #{pr_number}; validating it is open")
-    validate_open_pr(runner, config=implementation_config, pr_number=pr_number)
-    initial_pr_context = get_pr_review_context(runner, config=implementation_config, pr_number=pr_number)
-    managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None
-    if managed_ci_creation_intent is not None:
-        managed_ci_handoff = authenticate_issue_created_handoff(
+    initial_pr_context, managed_ci_handoff, implementation_config = _authenticate_reported_pr(
+        implementation_config
+    )
+    coverage_reask_used = False
+    coverage_discard_note: str | None = None
+    if coverage_map_applies(approved_plan_context):
+        # Read-only guards run before any coverage invocation so a wrongly
+        # reported PR never receives a mutating continuation (#1290).
+        _read_only_reference_guards(initial_pr_context, implementation_config)
+        gate_assessment = assess_risk_coverage_map(
+            implementation_result,
+            approved_plan_context=approved_plan_context,
+            workdir=active_workdir(implementation_config),
+            head_sha=initial_pr_context.metadata.head_sha,
+        )
+        if gate_assessment is not None and gate_assessment.deficiencies and gate_assessment.tree_available:
+            coverage_reask_used = True
+            log(
+                config,
+                f"Risk-matrix coverage map incomplete for PR #{pr_number} "
+                f"({', '.join(gate_assessment.deficient_row_ids)}); sending one coverage re-ask",
+            )
+            try:
+                reask_response = _invoke_implementation_coder(
+                    _risk_coverage_reask_prompt(implementation_prompt, gate_assessment),
+                    session_id=coder_response.session_id,
+                    attempt_label="coverage-reask",
+                    invoke_config=implementation_config,
+                )
+            except CheckoutVerificationError:
+                raise
+            except AgentLoopError as exc:
+                coverage_discard_note = (
+                    f"coverage re-ask response discarded: invocation failed ({type(exc).__name__})"
+                )
+                log(config, coverage_discard_note)
+            else:
+                reask_result = reask_response.marker_value
+                if isinstance(reask_result, _TerminalIssueImplementationConflict):
+                    reask_result = _TerminalIssueImplementationConflict(
+                        _degrade_out_of_checkout_tests(
+                            reask_result.parsed, config=implementation_config
+                        )
+                    )
+                    _post_structured_issue_implementation_terminal_comment(
+                        runner,
+                        config=implementation_config,
+                        issue_number=issue_number,
+                        parsed=reask_result.parsed,
+                        model_used=reask_response.model_used,
+                    )
+                    raise AgentLoopError(
+                        "Coder implementation result was not accepted for handoff because a signed "
+                        "human requirement is blocked."
+                    )
+                if (
+                    isinstance(reask_result, StructuredIssueImplementation)
+                    and reask_result.pr_number == pr_number
+                ):
+                    coder_response = reask_response
+                    coder_output = reask_response.text
+                    implementation_result = reask_result
+                else:
+                    coverage_discard_note = (
+                        "coverage re-ask response discarded: it did not report the same PR"
+                    )
+                    log(config, coverage_discard_note)
+            # The re-ask may have pushed or edited the PR whether or not its
+            # response was adopted, so re-authenticate the refreshed PR before
+            # any publication binds its head or body.
+            initial_pr_context, managed_ci_handoff, implementation_config = _authenticate_reported_pr(
+                implementation_config
+            )
+            _read_only_reference_guards(initial_pr_context, implementation_config)
+    if managed_ci_handoff is not None:
+        managed_ci_handoff = _publish_issue_authorization_with_recovery(
             runner,
             config=implementation_config,
-            intent=managed_ci_creation_intent,
-            issue_number=issue_number,
-            pr_number=pr_number,
+            handoff=managed_ci_handoff,
             metadata=initial_pr_context.metadata,
-        )
-        if managed_ci_handoff.override_nonce is not None:
-            # Install the expected nonce before any PR/issue publication.  It
-            # remains runtime-only and is revalidated at run_pr_loop entry.
-            implementation_config = dataclasses_replace(
-                implementation_config,
-                managed_ci_expected_override_nonce=managed_ci_handoff.override_nonce,
-            )
-        if managed_ci_handoff is not None:
-            managed_ci_handoff = _publish_issue_authorization_with_recovery(
-                runner,
-                config=implementation_config,
-                handoff=managed_ci_handoff,
-                metadata=initial_pr_context.metadata,
-                issue_number=issue_number,
-                approved_plan_hash_value=plan_hash,
-            )
-    else:
-        reject_forged_protocol_markers(
-            initial_pr_context.metadata.body or "",
-            surface=f"pull-request #{pr_number} body",
+            issue_number=issue_number,
+            approved_plan_hash_value=plan_hash,
         )
     if isinstance(implementation_result, StructuredIssueImplementation):
         implementation_result = _validate_structured_response_tests_with_post_pr_context(
@@ -748,6 +856,21 @@ def _implement_approved_issue(
             runner, config=implementation_config, pr_number=pr_number
         ).metadata.head_sha,
     )
+    final_coverage_assessment = final_risk_coverage_assessment(
+        implementation_result,
+        approved_plan_context=approved_plan_context,
+        workdir=active_workdir(implementation_config),
+        initial_head_sha=initial_pr_context.metadata.head_sha,
+        derived=_initial_derived_risk_evidence,
+    )
+    # Evidence was derived for this exact head (the raced head when semantic
+    # correction observed a push), so the round record binds to it too.
+    bound_round_head = (
+        _initial_derived_risk_evidence.bound_head_sha
+        if _initial_derived_risk_evidence is not None
+        and _initial_derived_risk_evidence.bound_head_sha is not None
+        else initial_pr_context.metadata.head_sha
+    )
     initial_local_test_evidence = runner.render_local_test_evidence(
         current_head=initial_pr_context.metadata.head_sha,
         legacy_tests_run=implementation_result.tests_run,
@@ -762,13 +885,16 @@ def _implement_approved_issue(
             model_used=coder_response.model_used,
             local_test_evidence=initial_local_test_evidence,
             current_test_turn_id=coder_response.acquisition_test_turn_id,
+            coverage_assessment=final_coverage_assessment,
+            coverage_reask_used=coverage_reask_used,
+            coverage_discard_note=coverage_discard_note,
         ),
         PostedRoundMetadata(
             flow="pr",
             role="coder",
             agent=coder_name,
             round_number=1,
-            subject=str(initial_pr_context.metadata.head_sha or "unknown"),
+            subject=str(bound_round_head or "unknown"),
             prior_items=(),
             raw_structured_coder_response=coder_output,
             local_test_evidence=initial_local_test_evidence,
@@ -814,6 +940,16 @@ def _implement_approved_issue(
         usage_context=usage_context,
         pre_review_test_pending=True,
         managed_ci_handoff=managed_ci_handoff,
+        # The orchestrator's own rendering of the final assessment, carried
+        # directly so round 1 never depends on re-parsing the stored comment.
+        initial_coverage_map=(
+            render_coverage_map(
+                final_coverage_assessment,
+                reask_used=coverage_reask_used,
+                discard_note=coverage_discard_note,
+            )
+            or None
+        ),
     )
 
 

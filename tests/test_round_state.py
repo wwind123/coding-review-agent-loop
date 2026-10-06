@@ -1011,3 +1011,21 @@ def test_prior_head_reconstruction_stops_at_the_head_review_handoff_boundary():
     # pre-handoff coder response is never restored.
     resumed = _resume([*history[:3], verdict("blocking")], _NEWER)
     assert resumed is not None and resumed.coder_output is None
+
+
+def test_durable_sanitizer_strips_coverage_gaps_like_claims():
+    import json
+    from coding_review_agent_loop.round_state import _sanitize_durable_coder_response
+
+    payload = {
+        "kind": "issue_implementation",
+        "summary": "s",
+        "risk_test_matrix_claims": [{"row_id": "r"}],
+        "risk_test_matrix_coverage_gaps": [{"row_id": "r", "reason": "x", "proposed_correction": "y"}],
+    }
+    sanitized = _sanitize_durable_coder_response(json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->")
+    body = json.loads(sanitized.split("\n<!--")[0])
+    assert "risk_test_matrix_claims" not in body
+    assert "risk_test_matrix_coverage_gaps" not in body
+    gaps_only = {"kind": "coder_followup", "risk_test_matrix_coverage_gaps": []}
+    assert "risk_test_matrix_coverage_gaps" not in _sanitize_durable_coder_response(json.dumps(gaps_only))

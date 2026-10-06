@@ -8,6 +8,11 @@ import html
 import json
 import re
 import shlex
+from .risk_coverage_map import (
+    CoverageAssessment,
+    neutralize_coverage_map_heading,
+    render_coverage_map,
+)
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -1550,6 +1555,9 @@ def _render_public_coder_followup_comment(
     current_test_turn_id: str | None = None,
     matrix_evidence_render_decision: MatrixEvidenceRenderDecision | None = None,
     head_unchanged_sha: str | None = None,
+    coverage_assessment: CoverageAssessment | None = None,
+    coverage_reask_used: bool = False,
+    coverage_discard_note: str | None = None,
 ) -> str:
     item_by_id = {item.item_id: item for item in prior_items}
 
@@ -1663,6 +1671,13 @@ def _render_public_coder_followup_comment(
     )
     if matrix_evidence:
         sections.append(matrix_evidence)
+    coverage_map = render_coverage_map(
+        coverage_assessment,
+        reask_used=coverage_reask_used,
+        discard_note=coverage_discard_note,
+    )
+    if coverage_map:
+        sections.append(coverage_map)
     if parsed_followup.human_requirement_dispositions:
         sections.append(
             "\n".join(
@@ -1677,7 +1692,7 @@ def _render_public_coder_followup_comment(
         )
     sections.append(f"<!-- AGENT_STATE: {parsed_followup.state} -->")
     sections.append(f"-- {_comment_signature(agent, config, model_used)}")
-    return "\n\n".join(section for section in sections if section)
+    return _join_sections_protecting_coverage_map(sections, coverage_map)
 
 
 def _render_coder_sub_item_progress(
@@ -1820,6 +1835,9 @@ def _render_public_issue_implementation_comment(
     model_used: str | None = None,
     local_test_evidence: str | None = None,
     current_test_turn_id: str | None = None,
+    coverage_assessment: CoverageAssessment | None = None,
+    coverage_reask_used: bool = False,
+    coverage_discard_note: str | None = None,
 ) -> str:
     """Render an implementation result without exposing its JSON envelope."""
     has_blocked_requirement = any(
@@ -1869,6 +1887,13 @@ def _render_public_issue_implementation_comment(
     )
     if matrix_evidence:
         sections.append(matrix_evidence)
+    coverage_map = render_coverage_map(
+        coverage_assessment,
+        reask_used=coverage_reask_used,
+        discard_note=coverage_discard_note,
+    )
+    if coverage_map:
+        sections.append(coverage_map)
     human_section = render_human_requirement_dispositions(
         parsed.human_requirement_dispositions
     )
@@ -1880,7 +1905,7 @@ def _render_public_issue_implementation_comment(
             f"-- {_comment_signature(agent, config, model_used)}",
         ]
     )
-    return "\n\n".join(section for section in sections if section)
+    return _join_sections_protecting_coverage_map(sections, coverage_map)
 
 
 def _extract_plan_human_requirements_block(text: str) -> str:
@@ -2302,6 +2327,21 @@ def normalize_freeform_signature(
     return f"{text.rstrip(chr(10))}\n{canonical}"
 
 
+def _join_sections_protecting_coverage_map(sections: Sequence[str], coverage_map: str) -> str:
+    """Join comment sections so only the orchestrator's own map keeps its heading.
+
+    Coder-authored sections (summary, notes, dispositions) are rendered
+    verbatim, so any occurrence of the coverage-map heading in them is
+    neutralized; extraction of the reviewer-facing map from a round comment can
+    then never return coder prose (#1290).
+    """
+    return "\n\n".join(
+        section if (coverage_map and section is coverage_map) else neutralize_coverage_map_heading(section)
+        for section in sections
+        if section
+    )
+
+
 def render_public_agent_comment(
     *,
     kind: str,
@@ -2327,6 +2367,9 @@ def render_public_agent_comment(
     compact: bool = False,
     matrix_evidence_render_decision: MatrixEvidenceRenderDecision | None = None,
     head_unchanged_sha: str | None = None,
+    coverage_assessment: CoverageAssessment | None = None,
+    coverage_reask_used: bool = False,
+    coverage_discard_note: str | None = None,
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
@@ -2371,6 +2414,9 @@ def render_public_agent_comment(
             current_test_turn_id=current_test_turn_id,
             matrix_evidence_render_decision=matrix_evidence_render_decision,
             head_unchanged_sha=head_unchanged_sha,
+            coverage_assessment=coverage_assessment,
+            coverage_reask_used=coverage_reask_used,
+            coverage_discard_note=coverage_discard_note,
         )
     if kind == "issue_implementation":
         if not isinstance(parsed, StructuredIssueImplementation):
@@ -2384,6 +2430,9 @@ def render_public_agent_comment(
             model_used=model_used,
             local_test_evidence=local_test_evidence,
             current_test_turn_id=current_test_turn_id,
+            coverage_assessment=coverage_assessment,
+            coverage_reask_used=coverage_reask_used,
+            coverage_discard_note=coverage_discard_note,
         )
     if kind == "plan_revision":
         if not isinstance(parsed, StructuredPlanRevision):

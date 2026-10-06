@@ -1459,6 +1459,64 @@ supply the reviewer's decision, and repair preservation rejects any
 still goes to repair, and near-miss aliases still normalize or degrade as
 before (#1185).
 
+#### Risk-matrix coverage map (#1290)
+
+For an applicable matrix the approved-plan implementation prompt renders every
+enforceable row as a checklist item (row ID, behaviour, required level, proposed
+location, forbidden side effects); read-only pending rows keep their one-line
+form and are labelled as outside the turn's checklist. Plans with no,
+not-applicable, or unavailable matrices are unaffected: their prompts, parsing,
+and round comments are unchanged.
+
+Claims may declare `test_level` (`unit`, `integration`, or `workflow`; invalid
+values degrade to undeclared with a caveat) and a response may carry an optional
+top-level `risk_test_matrix_coverage_gaps` array of `{row_id, reason,
+proposed_correction}` objects for a row that genuinely cannot be tested as
+specified. Malformed, unknown-row, and duplicate gap entries are dropped with
+parse-degradation records, never rejecting the envelope. Neither field is
+persisted as authority, and repair may carry both only verbatim (repair
+instructions describe `test_level` as optional preserve-only and list the gaps
+field among the preserved fields).
+
+`risk_coverage_map.py` is a pure completeness check, distinct from canonical
+evidence. The required level is classified from the row's free-text
+`proposed_test_level` by keyword precedence: workflow (`workflow`, `orchestrat`,
+`end-to-end`, `e2e`), then integration, then unit (`unit`, `protocol`, `parser`,
+`helper`), otherwise unclassified (completeness and path checks only). The
+deficiency codes, in matrix-row order, are `missing-row`, `ambiguous` (claimed
+and gapped), `missing-test-reference`, `missing-assertion-claim`,
+`nonexistent-test-path`, `missing-level`, and `under-level`. A declared gap
+satisfies its row. Every probe for one assessment is pinned to one resolved
+commit SHA via `git ls-tree` and accepts only regular-file blobs (mode 100644 or
+100755); directories, symlinks, gitlinks, and uncommitted files do not exist.
+The check never runs tests and does not judge whether a cited test exercises its
+row: it guarantees completeness and well-formedness only, and that semantic
+accuracy stays with the reviewer.
+
+The gate runs once, after `run_validated_agent` has accepted the implementation
+response through any acceptance path (normal, envelope normalization, repair,
+an authoritative artifact, completion recovery) and after the reported PR has
+passed every read-only identity, managed-CI authorization, issue-reference, and
+closing-contract guard, but before any publication. It assesses the PR's pushed
+head, so a locally committed but unpushed test is a deficiency. On deficiencies
+the coder is re-asked exactly once in the same session, with the frozen prompt
+plus a section naming the deficient rows and codes. This re-ask is separate from
+the evidence re-ask, never routes through repair, and does not consume
+`agent_max_retries`. A same-PR response is adopted; a null-PR, clarification,
+different-PR, or recoverably failed re-ask is discarded and the first response is
+kept. After the re-ask returns, the PR is refreshed and its read-only guards
+re-run before authorization and handoff records are published, so no record binds
+a pre-re-ask head. A map that is still incomplete does not fail the run.
+
+After post-authentication semantic correction a final assessment is recomputed
+from the final claims and the original gaps against the authenticated PR head
+(unverified, never complete, when that commit is not available locally) and
+rendered as a `### Risk-matrix coverage map` section in the implementation
+round comment, and reaches the first reviewer through the round's coder
+context. Coder follow-up round comments carry the same section computed at the
+follow-up head, with no coverage re-ask on follow-ups. The section is display
+only: persisted round metadata and canonical evidence schemas do not change.
+
 Broader handoff atomicity for other envelope failures after a PR is pushed is
 owned by #827 and #828.
 
