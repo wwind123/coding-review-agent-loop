@@ -67,8 +67,9 @@ def _authorized_base(runner: Runner, config: AgentLoopConfig, pr_number: int) ->
     from .github import read_rest_issue_comments
     from .managed_ci import (
         IntentBinding,
-        _advertised_managed_actor,
         _api_json,
+        _read_managed_actor_variable,
+        _resolve_advertised_actor,
         match_intent_envelope,
         validate_intent_record,
     )
@@ -88,7 +89,13 @@ def _authorized_base(runner: Runner, config: AgentLoopConfig, pr_number: int) ->
             envelopes.append((comment, match))
     if not envelopes:
         return None
-    actor = _advertised_managed_actor(runner, config)
+    variable = _read_managed_actor_variable(runner, config.gh_cmd, config.repo, github_api_cwd())
+    if variable.status == "absent" or (variable.status == "readable" and not (variable.value or "").strip()):
+        # The trusted actor is confirmed unconfigured, so no author can be
+        # authenticated: every envelope is unauthenticated discussion and there
+        # is no historical authorization (a confirmed absence, not a read failure).
+        return None
+    actor, _source = _resolve_advertised_actor(variable, config.managed_ci_trusted_actor)
     live = _api_json(runner, config, f"users/{actor}", quiet=True) if actor else {}
     actor_id = live.get("id") if isinstance(live.get("id"), int) else None
     if not actor or actor_id is None:

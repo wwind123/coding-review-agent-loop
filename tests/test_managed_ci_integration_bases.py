@@ -708,6 +708,10 @@ def test_a_complete_valid_record_authorizes_and_footered_form_is_accepted(tmp_pa
         }], False),
         ("unrelated-author-envelope", [intent_comment("refactor/1181", login="mallory", user_id=9)], False),
         ("no-comments", [], False),
+        ("unrelated-envelope-with-actor-variable-unset",
+         [intent_comment("refactor/1181", login="mallory", user_id=9)], True),
+        ("trusted-looking-envelope-with-actor-variable-unset",
+         [intent_comment("refactor/1181")], True),
         ("mention-with-actor-variable-unset", [{
             "id": 5, "created_at": "2026-01-01T00:00:00Z", "user": {"login": "reviewer", "id": 9},
             "body": "AGENT_MANAGED_CI_INTENT_V2",
@@ -745,3 +749,39 @@ def test_authenticated_integration_record_still_rejects_a_default_branch_merge(t
     assert close_child_after_integration_merge(
         runner, config=config, issue_context=_issue_context(), pr_number=7
     ) == "unresolved"
+
+
+def test_unreadable_actor_variable_still_fails_closed_for_envelopes(tmp_path):
+    class ForbiddenVariable(ScriptRunner):
+        def run(self, args, *, cwd, **kw):
+            cmd = [str(a) for a in args]
+            if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/actions/variables/AGENT_LOOP_MANAGED_ACTOR"):
+                self.commands.append(cmd)
+                return CommandResult(cmd, Path(cwd), "", "gh: Forbidden (HTTP 403)", 1)
+            return super().run(args, cwd=cwd, **kw)
+
+    runner = ForbiddenVariable(pr=_merged("main"), comments=[intent_comment("refactor/1181", login="mallory", user_id=9)])
+    config = _config(tmp_path, base="main", base_provenance="repository-default", managed_ci_trusted_actor=None)
+    assert close_child_after_integration_merge(
+        runner, config=config, issue_context=_issue_context(), pr_number=7
+    ) == "unresolved"
+
+
+def test_staged_completion_guard_accepts_default_merge_with_unset_actor_variable(tmp_path):
+    from coding_review_agent_loop.integration_close import require_child_closed_or_report
+
+    class NoActor(ScriptRunner):
+        def run(self, args, *, cwd, **kw):
+            cmd = [str(a) for a in args]
+            if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/actions/variables/AGENT_LOOP_MANAGED_ACTOR"):
+                self.commands.append(cmd)
+                return CommandResult(cmd, Path(cwd), "", "gh: Not Found (HTTP 404)", 1)
+            return super().run(args, cwd=cwd, **kw)
+
+    runner = NoActor(pr=_merged("main"), comments=[intent_comment("refactor/1181", login="mallory", user_id=9)], issue_state="closed")
+    config = _config(tmp_path, base="main", base_provenance="repository-default")
+    # The real guard the staged-completion hook uses: complete, nothing closed or posted.
+    assert require_child_closed_or_report(
+        runner, config=config, issue_context=_issue_context(), pr_number=7
+    )
+    assert not runner.commands_matching("gh", "issue", "close")
