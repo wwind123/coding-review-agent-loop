@@ -936,3 +936,23 @@ def test_docs_describe_trusted_integration_bases_and_their_limitation():
     assert "Trusted integration bases (`AGENT_LOOP_TRUSTED_BASES`)" in doc
     for phrase in ("AGENT_LOOP_TRUSTED_BASES", "dispatch_ref", "integration_close.py"):
         assert phrase in architecture
+
+
+def test_adoption_snippet_carries_the_caller_routing_and_permissions():
+    import textwrap
+
+    doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    start = doc.index("name: CI\nenv:  # literal readiness markers")
+    snippet = doc[start : doc.index("```", start)]
+    workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    def condition(text, job):
+        body = text[text.index(f"\n  {job}:\n") :]
+        marker = "    if: >-\n"
+        begin = body.index(marker) + len(marker)
+        return textwrap.dedent(body[begin : body.index("    permissions:", begin)]).strip()
+
+    for job in ("ci", "managed"):
+        assert condition(snippet, job) == condition(workflow, job)
+    assert "      statuses: write" in snippet and "AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1" in snippet
+    assert snippet.index("  ci:") < snippet.index("      contents: read") < snippet.index("  managed:")

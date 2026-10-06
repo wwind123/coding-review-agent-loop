@@ -4,6 +4,8 @@ import json
 import re
 import zlib
 
+import unittest.mock
+
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
@@ -2818,12 +2820,19 @@ def test_child_merge_of_the_last_stage_records_parent_completion(
     )
 
     def merge_hook():
-        orchestrator_module._record_staged_parent_completion_after_merge(
-            runner,
-            config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
-            issue_context=_staged_child_context(100),
-            pr_number=merged_pr,
-        )
+        with unittest.mock.patch(
+            "coding_review_agent_loop.execution_policy.require_child_closed_or_report",
+            return_value=True,
+        ), unittest.mock.patch(
+            "coding_review_agent_loop.phase_progress.close_child_after_integration_merge",
+            return_value="default-branch",
+        ):
+            orchestrator_module._record_staged_parent_completion_after_merge(
+                runner,
+                config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
+                issue_context=_staged_child_context(100),
+                pr_number=merged_pr,
+            )
 
     merge_hook()
 
@@ -2870,12 +2879,21 @@ def _delivered_two_stage_runner(*, extra_parent_comments=(), merge_commit_913=Tr
 
 
 def _run_merge_hook(runner, tmp_path):
-    orchestrator_module._record_staged_parent_completion_after_merge(
-        runner,
-        config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
-        issue_context=_staged_child_context(100),
-        pr_number=913,
-    )
+    # These default-branch scenarios predate integration-base closure (#1285);
+    # that gate has its own tests in test_managed_ci_integration_bases.py.
+    with unittest.mock.patch(
+        "coding_review_agent_loop.execution_policy.require_child_closed_or_report",
+        return_value=True,
+    ), unittest.mock.patch(
+        "coding_review_agent_loop.phase_progress.close_child_after_integration_merge",
+        return_value="default-branch",
+    ):
+        orchestrator_module._record_staged_parent_completion_after_merge(
+            runner,
+            config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
+            issue_context=_staged_child_context(100),
+            pr_number=913,
+        )
 
 
 def test_completion_record_is_not_published_without_every_merge_commit(tmp_path, capsys):

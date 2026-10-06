@@ -51,6 +51,7 @@ from .issue_pr_handoff import (
     require_pr_metadata_for_handoff,
     resolve_canonical_pr_for_issue,
 )
+from .integration_close import reconcile_merged_integration_child
 from .issue_pr_provenance import IssuePrProvenanceScope
 from .pr_contract import (
     format_pr_contract_comment,
@@ -436,6 +437,12 @@ def run_issue_loop(
         # coder in either direct or plan-first mode, so a rerun after an
         # interrupted PR review resumes that PR instead of creating a
         # duplicate (#589).
+        # An interrupted closure after a confirmed merge into an integration
+        # base is finished here, without a coder, review or merge replay.
+        if reconcile_merged_integration_child(
+            runner, config=config, issue_number=issue_number, issue_context=issue_context
+        ):
+            return 0
         resolved_pr = resolve_canonical_pr_for_issue(
             runner,
             config=config,

@@ -300,20 +300,22 @@ def _resolve_agent_phase(
     if child_state == "OPEN":
         if authenticated is None or pr_state == "OPEN":
             return STATUS_IN_PROGRESS, child_state, pr_number, pr_state
-        if pr_state == "MERGED" and _just_merged_matches(
-            just_merged, child_issue_number=child_issue_number, pr_number=pr_number
-        ):
-            return STATUS_COMPLETE, child_state, pr_number, pr_state
-        if (
-            pr_state == "MERGED"
-            and pr_number is not None
-            and close_child_after_integration_merge(
+        if pr_state == "MERGED" and pr_number is not None:
+            outcome = close_child_after_integration_merge(
                 runner, config=config, issue_context=child_context, pr_number=pr_number
-            ) in {"closed", "already-closed"}
-        ):
-            # An authenticated MERGED non-default-base PR whose child was left
-            # open by an interrupted completion: closure retried, no merge replay.
-            return STATUS_COMPLETE, "CLOSED", pr_number, pr_state
+            )
+            if outcome in {"closed", "already-closed"}:
+                # An authenticated MERGED non-default-base PR whose child was
+                # left open by an interrupted completion: closure retried, no
+                # merge replay.
+                return STATUS_COMPLETE, "CLOSED", pr_number, pr_state
+            # The #1018 just-merged tolerance (GitHub closes the child
+            # asynchronously) holds only for a *confirmed* default-branch merge,
+            # never for unknown or unauthenticated integration evidence.
+            if outcome == "default-branch" and _just_merged_matches(
+                just_merged, child_issue_number=child_issue_number, pr_number=pr_number
+            ):
+                return STATUS_COMPLETE, child_state, pr_number, pr_state
         raise AgentLoopError(
             f"Issue #{parent_issue} phase {phase_index} (`{stage_id}`) child issue "
             f"#{child_issue_number} is OPEN but its canonical implementation PR "

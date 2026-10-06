@@ -13,6 +13,7 @@ from coding_review_agent_loop.integration_close import (
     close_child_after_integration_merge,
     require_child_closed_or_report,
 )
+from coding_review_agent_loop.managed_ci import QUALIFICATION_MARKER as QUALIFICATION_MARKER_TEXT
 from coding_review_agent_loop.managed_ci import (
     QUALIFIED_LABEL,
     TRUSTED_BASES_MARKER,
@@ -120,10 +121,6 @@ def test_default_branch_and_non_managed_runs_are_never_refused(tmp_path):
     enforce_trusted_base_at_startup(runner, _config(tmp_path, base="main"))
     enforce_trusted_base_at_startup(runner, _config(tmp_path, managed_ci=False, auto_merge=False))
     enforce_trusted_base_at_startup(runner, _config(tmp_path, dry_run=True))
-    # Unreadable repository metadata cannot affect the default-branch path either.
-    broken = ScriptRunner()
-    broken.default = None
-    enforce_trusted_base_at_startup(broken, _config(tmp_path, base="main"))
 
 
 def test_trusted_base_problem_never_assumes_trust_on_read_failure(tmp_path):
@@ -220,7 +217,6 @@ def test_prepare_v2_merge_and_manual_qualification_use_the_guard(tmp_path):
 def test_workflow_source_ref_is_the_default_branch_not_the_base(tmp_path):
     runner = ScriptRunner()
     assert managed_ci._workflow_source_ref(runner, _config(tmp_path), "refactor/1181") == "main"
-    assert managed_ci._workflow_source_ref(ScriptRunner(default=None), _config(tmp_path), "x") == "x"
 
 
 def test_legacy_contract_without_dispatch_ref_resumes_only_on_the_default_branch(tmp_path):
@@ -272,15 +268,60 @@ def test_close_is_a_noop_when_already_closed_and_never_for_default_or_unmerged(t
     default_merge = ScriptRunner(pr={
         "merged": True, "merged_at": "t", "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}}, "body": "Closes #42",
     })
-    assert close_child_after_integration_merge(default_merge, config=cfg, issue_context=ctx, pr_number=7) == "skipped"
+    assert close_child_after_integration_merge(default_merge, config=cfg, issue_context=ctx, pr_number=7) == "default-branch"
     unmerged = ScriptRunner(merged=False)
-    assert close_child_after_integration_merge(unmerged, config=cfg, issue_context=ctx, pr_number=7) == "skipped"
+    assert close_child_after_integration_merge(unmerged, config=cfg, issue_context=ctx, pr_number=7) == "not-merged"
     no_reference = ScriptRunner(pr={
         "merged": True, "merged_at": "t", "base": {"ref": "refactor/1181", "repo": {"full_name": "OWNER/REPO"}}, "body": "Refs #42",
     })
-    assert close_child_after_integration_merge(no_reference, config=cfg, issue_context=ctx, pr_number=7) == "skipped"
+    assert close_child_after_integration_merge(no_reference, config=cfg, issue_context=ctx, pr_number=7) == "unresolved"
     for runner in (default_merge, unmerged, no_reference):
         assert not runner.commands_matching("gh", "issue", "close")
+
+
+def test_unreadable_post_merge_evidence_is_unresolved_never_complete(tmp_path, capsys):
+    cfg, ctx = _config(tmp_path), _issue_context()
+
+    class Broken(ScriptRunner):
+        def __init__(self, fail, **kw):
+            super().__init__(**kw)
+            self.fail = fail
+
+        def run(self, args, *, cwd, **kw):
+            cmd = [str(a) for a in args]
+            if cmd[:2] == ["gh", "api"] and cmd[2] == self.fail:
+                self.commands.append(cmd)
+                return CommandResult(cmd, Path(cwd), "", "gh: boom (HTTP 502)", 1)
+            return super().run(args, cwd=cwd, **kw)
+
+    for fail in ("repos/OWNER/REPO/pulls/7", "repos/OWNER/REPO", "repos/OWNER/REPO/issues/42"):
+        runner = Broken(fail)
+        assert close_child_after_integration_merge(runner, config=cfg, issue_context=ctx, pr_number=7) == "unresolved"
+        assert not require_child_closed_or_report(runner, config=cfg, issue_context=ctx, pr_number=7)
+        assert not runner.commands_matching("gh", "issue", "close")
+    assert "could not be" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("merged_base", "variable", "recorded"),
+    [
+        ("refactor/other", "refactor/*", "refactor/1181"),   # a different trusted base than recorded
+        ("feature/x", "refactor/*", None),                    # an untrusted base
+        ("refactor/1181", None, None),                        # allow-list revoked
+    ],
+)
+def test_close_authenticates_the_recorded_base_before_mutating(tmp_path, merged_base, variable, recorded):
+    pr = {
+        "merged": True, "merged_at": "t", "body": "Closes #42",
+        "base": {"ref": merged_base, "repo": {"full_name": "OWNER/REPO"}},
+    }
+    runner = ScriptRunner(pr=pr, variable=variable)
+    outcome = close_child_after_integration_merge(
+        runner, config=_config(tmp_path, base="refactor/1181", base_provenance="explicit"),
+        issue_context=_issue_context(), pr_number=7, expected_base=recorded,
+    )
+    assert outcome == "unresolved"
+    assert not runner.commands_matching("gh", "issue", "close")
 
 
 def test_failed_close_is_reported_unresolved_and_never_replays_the_merge(tmp_path, capsys):
@@ -288,7 +329,7 @@ def test_failed_close_is_reported_unresolved_and_never_replays_the_merge(tmp_pat
     assert not require_child_closed_or_report(
         runner, config=_config(tmp_path), issue_context=_issue_context(), pr_number=7
     )
-    assert "could not be closed" in capsys.readouterr().out
+    assert "could not be confirmed" in capsys.readouterr().out
     assert not runner.commands_matching("gh", "pr", "merge")
     # A later run retries the closure from the authenticated MERGED PR.
     retry = ScriptRunner()
@@ -339,3 +380,190 @@ def test_dispatch_reads_revision_and_dispatches_from_the_default_branch(tmp_path
     reads = [c[2] for c in runner.commands if len(c) > 2 and "/commits/" in c[2]]
     assert reads == ["repos/OWNER/REPO/commits/main"]
     assert not [c for c in runner.commands if any("dispatches" in part for part in c)]
+
+
+# --- fail closed without an established default branch (round-1 item 1) ----------------
+
+
+class _NoMetadata(ScriptRunner):
+    """Repository metadata is unreadable; an integration workflow differs from the default."""
+
+    def run(self, args, *, cwd, **kw):
+        cmd = [str(a) for a in args]
+        if cmd[:3] == ["gh", "api", "repos/OWNER/REPO"]:
+            self.commands.append(cmd)
+            return CommandResult(cmd, Path(cwd), "", "gh: Bad Gateway (HTTP 502)", 1)
+        return super().run(args, cwd=cwd, **kw)
+
+
+@pytest.mark.parametrize("base", ["refactor/1181", "main"])
+def test_unreadable_repository_metadata_refuses_startup_for_every_base(tmp_path, base):
+    runner = _NoMetadata()
+    with pytest.raises(AgentLoopError, match="AGENT_LOOP_TRUSTED_BASES"):
+        resolve_base_branch(_config(tmp_path, base=base), runner)
+    assert all("--method" not in c for c in runner.commands)
+
+
+def test_workflow_source_and_trust_never_fall_back_to_the_integration_base(tmp_path):
+    runner = _NoMetadata()
+    with pytest.raises(AgentLoopError, match="cannot be established"):
+        managed_ci._workflow_source_ref(runner, _config(tmp_path), "refactor/1181")
+    assert trusted_base_problem(
+        runner, gh_cmd="gh", repo="OWNER/REPO", cwd=tmp_path, base="refactor/1181",
+        default_branch=None, workflow_text=WORKFLOW,
+    )
+    # No workflow or revision read was ever issued against the integration branch.
+    assert not any("refactor/1181" in " ".join(c) for c in runner.commands)
+
+
+def test_activation_paths_read_only_from_the_default_branch_or_fail_closed(tmp_path):
+    from coding_review_agent_loop.github import PullRequestMetadata
+
+    metadata = PullRequestMetadata(
+        number=7, repo="OWNER/REPO", title="t", head_branch="agent-loop/managed-1",
+        base_branch="refactor/1181", head_sha="abc", url="u", body="",
+    )
+    for runner in (ScriptRunner(), _NoMetadata()):
+        config = _config(tmp_path)
+        try:
+            managed_ci.activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata)
+        except AgentLoopError:
+            pass
+        reads = [" ".join(c) for c in runner.commands]
+        assert not any("ref=refactor/1181" in r or "commits/refactor/1181" in r for r in reads)
+        assert not [c for c in runner.commands if any("dispatches" in part for part in c)]
+
+
+def test_preflight_creation_reads_the_workflow_from_the_default_branch(tmp_path):
+    runner = ScriptRunner()
+    try:
+        managed_ci.preflight_managed_ci_creation(runner, config=_config(tmp_path), issue_number=42)
+    except AgentLoopError:
+        pass
+    reads = [c[2] for c in runner.commands if len(c) > 2 and "/contents/.github/workflows/" in c[2]]
+    assert reads and all(r.endswith("ref=main") for r in reads)
+
+
+# --- interrupted closure (round-1 items 2-4) --------------------------------------------
+
+
+def test_issue_resume_reconciles_a_merged_integration_pr_without_replaying_the_merge(tmp_path, monkeypatch, capsys):
+    import coding_review_agent_loop.issue_pr_handoff as handoff
+    from coding_review_agent_loop.integration_close import reconcile_merged_integration_child
+
+    class Auth:
+        pr_number, state = 7, "MERGED"
+
+    monkeypatch.setattr(handoff, "authenticate_canonical_issue_pr", lambda *a, **k: Auth())
+    runner = ScriptRunner(issue_state="open")
+    assert reconcile_merged_integration_child(
+        runner, config=_config(tmp_path), issue_number=42, issue_context=_issue_context()
+    )
+    assert runner.commands_matching("gh", "issue", "close") and not runner.commands_matching("gh", "pr", "merge")
+    # A failed close never reports completion; an OPEN PR or default-branch merge defers to normal resume.
+    failing = ScriptRunner(close_rc=1)
+    with pytest.raises(AgentLoopError, match="could not be authenticated"):
+        reconcile_merged_integration_child(
+            failing, config=_config(tmp_path), issue_number=42, issue_context=_issue_context()
+        )
+    Auth.state = "OPEN"
+    assert not reconcile_merged_integration_child(
+        ScriptRunner(), config=_config(tmp_path), issue_number=42, issue_context=_issue_context()
+    )
+
+
+def test_run_issue_loop_reconciles_before_canonical_pr_resolution():
+    import inspect
+
+    import coding_review_agent_loop.issue_loop as issue_loop
+
+    source = inspect.getsource(issue_loop.run_issue_loop)
+    assert source.index("reconcile_merged_integration_child(") < source.index("resolved_pr = resolve_canonical_pr_for_issue(")
+
+
+def test_parent_completion_is_not_recorded_when_post_merge_evidence_is_unreadable(tmp_path, monkeypatch):
+    import coding_review_agent_loop.execution_policy as policy
+
+    def explode(*a, **k):
+        raise AssertionError("parent completion must not proceed")
+
+    monkeypatch.setattr(policy, "get_issue_context", explode)
+    monkeypatch.setattr(policy, "resolve_staged_phase_progress", explode)
+    monkeypatch.setattr(policy, "record_staged_completion", explode)
+
+    class PrUnreadable(ScriptRunner):
+        def run(self, args, *, cwd, **kw):
+            cmd = [str(a) for a in args]
+            if cmd[:3] == ["gh", "api", "repos/OWNER/REPO/pulls/7"]:
+                return CommandResult(cmd, Path(cwd), "", "gh: boom (HTTP 502)", 1)
+            return super().run(args, cwd=cwd, **kw)
+
+    policy._record_staged_parent_completion_after_merge(
+        PrUnreadable(), config=_config(tmp_path), issue_context=_issue_context(), pr_number=7
+    )
+
+
+# --- orchestration rows through the real boundaries (round-1 item 5) -----------------------
+
+
+class SeqRunner(ScriptRunner):
+    """pulls/7 answers from a sequence (last repeated); other endpoints as ScriptRunner."""
+
+    def __init__(self, prs, **kw):
+        super().__init__(**kw)
+        self.prs = list(prs)
+
+    def run(self, args, *, cwd, **kw):
+        cmd = [str(a) for a in args]
+        if cmd[:3] == ["gh", "api", "repos/OWNER/REPO/pulls/7"]:
+            self.commands.append(cmd)
+            pr = self.prs.pop(0) if len(self.prs) > 1 else self.prs[0]
+            return CommandResult(cmd, Path(cwd), json.dumps(pr), "", 0)
+        return super().run(args, cwd=cwd, **kw)
+
+
+def _live(base):
+    return {"state": "open", "draft": False, "labels": [], "head": {"sha": "abc"},
+            "base": {"ref": base, "repo": {"full_name": "OWNER/REPO"}}}
+
+
+@pytest.mark.parametrize(
+    ("after", "variable"),
+    [("refactor/b", "refactor/*"), ("feature/x", "refactor/*"), ("main", "refactor/*"), ("refactor/a", "other/*")],
+    ids=["trusted-retarget", "untrusted-retarget", "default-retarget", "revoked"],
+)
+def test_merge_boundary_refuses_a_change_after_the_initial_check(tmp_path, after, variable):
+    from coding_review_agent_loop.pr_loop_support import ExactHeadCiProof, _merge_with_exact_head_proof
+
+    # The intent was granted for refactor/a; the live base changes between the first and the final read.
+    runner = SeqRunner([_live(after)], variable="refactor/*" if variable == "refactor/*" else variable)
+    runner.variable = variable
+    # Allow-list revocation leaves the base itself unchanged.
+    if after == "refactor/a":
+        runner.prs = [_live("refactor/a")]
+    with pytest.raises(AgentLoopError, match="merge refused"):
+        _merge_with_exact_head_proof(
+            runner, config=_config(tmp_path), pr_number=7,
+            proof=ExactHeadCiProof(head_sha="abc", source="managed exact-head", base_ref="refactor/a", repository="OWNER/REPO"),
+        )
+    assert not [c for c in runner.commands if "merge" in " ".join(c) and c[:2] != ["gh", "api"]]
+    assert not [c for c in runner.commands if "--method" in c and "merge" in " ".join(c)]
+    assert any("DELETE" in c and any(QUALIFIED_LABEL in part for part in c) for c in runner.commands)
+
+
+@pytest.mark.parametrize("adopted", [False, True], ids=["issue-created", "adopted"])
+def test_manual_qualification_refuses_a_retarget_after_the_initial_check(tmp_path, adopted):
+    contract = ManagedCiContract(
+        protocol_version=2, base_ref="refactor/a", dispatch_ref="main",
+        trusted_actor_login="agent-loop", trusted_actor_id=1, repository="OWNER/REPO",
+        adopted_existing_pr=adopted, issue_created_pr=not adopted,
+    )
+    # Reads: labels, initial guard (both still refactor/a), then the recorded-base guard sees feature/x.
+    runner = SeqRunner([_live("refactor/a"), _live("refactor/a"), _live("feature/x")], variable="refactor/*")
+    with pytest.raises(AgentLoopError, match="manual qualification refused"):
+        managed_ci._publish_manual_v2_qualification(
+            runner, config=_config(tmp_path, base="refactor/a"), pr_number=7, expected_head_sha="abc",
+            contract=contract, reviewers=("Codex",),
+        )
+    assert not runner.commands_matching("gh", "pr", "ready")
+    assert not [c for c in runner.commands if any(QUALIFICATION_MARKER_TEXT in part for part in c)]

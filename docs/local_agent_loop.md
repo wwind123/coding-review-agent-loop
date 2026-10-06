@@ -4243,20 +4243,65 @@ code and test infrastructure at the PR head do apply, because the workflow
 checks out and runs the exact head. Ordinary `pull_request` CI for an
 integration-base PR is not suppressed and is never the trusted gate.
 
-Adopting the reusable workflow in another project: call both entry points from
-a thin `ci.yml`, pinned to a commit SHA (put the tag in a comment, tags are
-mutable), keep the caller permissions below, set `AGENT_LOOP_MANAGED_ACTOR`
-and, for integration branches, `AGENT_LOOP_TRUSTED_BASES`:
+Adopting the reusable workflow in another project: copy the complete caller
+below (triggers, `run-name`, routing conditions and permissions), pinned to a
+commit SHA (put the tag in a comment, tags are mutable), and set
+`AGENT_LOOP_MANAGED_ACTOR` and, for integration branches,
+`AGENT_LOOP_TRUSTED_BASES`. The `if:` conditions are part of the contract: the
+`ci` job must not run for managed dispatches or for a managed default-base
+draft (that suppression is what makes CI run only after approval), and the
+`managed` job, which holds `statuses: write`, must not exist for push,
+`pull_request` or all-empty dispatch events.
 
 ```yaml
+name: CI
+env:  # literal readiness markers the driver checks
+  AGENT_LOOP_MANAGED_CI_V2: enabled
+  AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1: enabled
+  AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1: enabled
+  AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1: enabled
+  AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1: enabled
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, unlabeled]
+  workflow_dispatch:
+    inputs:
+      protocol_version: {description: Managed-CI protocol version, required: false, default: ''}
+      pr_number: {description: Pull request being qualified, required: false, default: ''}
+      expected_head_sha: {description: Exact pull request head SHA, required: false, default: ''}
+      managed_nonce: {description: Fresh generation nonce, required: false, default: ''}
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.managed_nonce != '' && format('managed-ci-v2 nonce={0}', inputs.managed_nonce) || github.workflow }}
 jobs:
   ci:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.protocol_version == '' && inputs.pr_number == '' &&
+       inputs.expected_head_sha == '' && inputs.managed_nonce == '') ||
+      (github.event_name == 'pull_request' &&
+       (github.event.action == 'unlabeled' ||
+        !(github.event.pull_request.base.ref == github.event.repository.default_branch &&
+          github.event.pull_request.base.repo.full_name == github.repository &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          startsWith(github.event.pull_request.head.ref, 'agent-loop/managed-') &&
+          github.event.pull_request.draft == true &&
+          vars.AGENT_LOOP_MANAGED_ACTOR != '' &&
+          github.event.pull_request.user.login == vars.AGENT_LOOP_MANAGED_ACTOR &&
+          (github.event.action == 'opened' ||
+           ((github.event.action == 'synchronize' || github.event.action == 'reopened') &&
+            contains(github.event.pull_request.labels.*.name, 'agent-loop-managed'))))))
     permissions:
       contents: read
     uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci-ordinary.yml@<sha> # v1
     with:
       test_command: python -m pytest -n auto
   managed:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '')
     permissions:
       actions: read
       contents: read
@@ -4272,10 +4317,11 @@ jobs:
       test_command: python -m pytest -n auto
 ```
 
-The caller also keeps the `workflow_dispatch` input declarations, `run-name`
-and the literal readiness markers, including
-`AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1`. The callee takes no trusted-bases or
-actor input.
+An integration-base PR is deliberately not suppressed (the expression only
+suppresses when the base is the default branch), so its ordinary CI stays
+informational and is never the trusted gate.
+
+The callee takes no trusted-bases or actor input.
 
 For this sole-maintainer repository, install and qualify the workflow before
 using managed CI: set `AGENT_LOOP_MANAGED_ACTOR` to `wwind123`, authenticate

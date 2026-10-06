@@ -7180,7 +7180,14 @@ def _workflow_source_ref(runner: Runner, config: AgentLoopConfig, fallback: str 
     default-branch behavior unchanged; the hosted validator and the
     trusted-base checks remain the authority for anything else.
     """
-    return _read_repo_default_branch(runner, config.gh_cmd, config.repo, github_api_cwd()) or fallback
+    default_branch = _read_repo_default_branch(runner, config.gh_cmd, config.repo, github_api_cwd())
+    if default_branch is None:
+        raise AgentLoopError(
+            f"The default branch of {config.repo} could not be read, so the trusted managed-CI "
+            f"workflow source cannot be established (base {fallback!r} is never used as a "
+            "substitute). Retry once repository metadata is readable."
+        )
+    return default_branch
 
 
 def _contract_dispatch_ref(runner: Runner, config: AgentLoopConfig, contract: ManagedCiContract) -> str:
@@ -7229,7 +7236,14 @@ def trusted_base_problem(
     branch workflow to advertise trusted-base support and the repository
     variable to allow-list it; an unreadable variable never grants trust.
     """
-    if not base or not default_branch or base == default_branch:
+    if not base:
+        return None
+    if not default_branch:
+        return (
+            f"base {base!r} cannot be verified: the repository default branch could not be read; "
+            "trust is never assumed on a read failure"
+        )
+    if base == default_branch:
         return None
     if require_marker and (workflow_text is None or TRUSTED_BASES_MARKER not in workflow_text):
         return (
@@ -7263,7 +7277,13 @@ def enforce_trusted_base_at_startup(runner: Runner, config: AgentLoopConfig) -> 
         return
     cwd = github_api_cwd()
     default_branch = _read_repo_default_branch(runner, config.gh_cmd, config.repo, cwd)
-    if default_branch is None or default_branch == config.base:
+    if default_branch is None:
+        raise AgentLoopError(
+            f"Managed CI cannot verify --base {config.base!r}: the default branch of "
+            f"{config.repo} could not be read, so {TRUSTED_BASES_VARIABLE} trust is never assumed. "
+            "No review cycle was spent; retry once repository metadata is readable."
+        )
+    if default_branch == config.base:
         return
     workflow, _ = _probe_raw_workflow(
         runner, ManagedCiProbeContext(config.repo, config.gh_cmd, cwd), default_branch
