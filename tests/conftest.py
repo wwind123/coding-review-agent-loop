@@ -1,3 +1,5 @@
+import platform
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -8,6 +10,34 @@ from orchestrator_split_guard import install_patch_propagation
 # split (#1181) moves into extracted modules; installed once per process, so
 # every xdist worker gets it too.
 install_patch_propagation()
+
+
+def _release_specific_interpreter_paths():
+    # Only a path naming this exact patch release (a hosted toolcache path such
+    # as .../Python/3.12.14/x64/bin/python) can differ between CI runners; a
+    # generic /usr/bin/python3 also appears as a literal in many test ids.
+    release = platform.python_version()
+    return tuple(path for path in (sys.executable,) if path and release in path)
+
+
+def host_specific_node_ids(node_ids, host_paths=None):
+    """Return node ids that embed a release-specific interpreter path.
+
+    Managed CI shards verify that every shard collected the same node ids, and
+    shards can land on runners with different Python patch releases, so an id
+    built from ``sys.executable`` splits the collection between shards.
+    """
+    paths = _release_specific_interpreter_paths() if host_paths is None else host_paths
+    return sorted(node_id for node_id in node_ids if any(path in node_id for path in paths))
+
+
+def pytest_collection_modifyitems(config, items):
+    unstable = host_specific_node_ids(item.nodeid for item in items)
+    if unstable:
+        raise pytest.UsageError(
+            "test ids must not embed the interpreter path; give the parametrization "
+            "explicit ids: " + ", ".join(unstable[:5])
+        )
 
 
 @pytest.fixture(autouse=True)
