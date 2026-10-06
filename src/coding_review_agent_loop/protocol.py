@@ -3216,7 +3216,8 @@ def render_evidence_rejection_detail(detail: str) -> str:
     against it reaches the coder unaltered: markers neutralized, whitespace runs
     collapsed, and the whole detail capped.
     """
-    quoted = " ".join(sanitize_historical_text(detail).replace("<", "(").replace(">", ")").split())
+    neutralized = sanitize_historical_text(detail)  # shape-check: fatal:authentication-or-forgery
+    quoted = " ".join(neutralized.replace("<", "(").replace(">", ")").split())
     if len(quoted) > EVIDENCE_REASK_MAX_CHARS:
         quoted = quoted[: EVIDENCE_REASK_MAX_CHARS - 3] + "..."
     return quoted
@@ -3280,7 +3281,7 @@ def _node_test_hint(observation: object, message: str = "") -> str:
     # collapsed or truncated rerun command is never shown.
     if _safe_label(sentence, MAX_SAFE_COMMAND_BYTES * 2) != sentence:
         return ""
-    rendered = render_evidence_rejection_detail(message + " " + sentence)
+    rendered = render_evidence_rejection_detail(message + " " + sentence)  # shape-check: fatal:authentication-or-forgery
     if not rendered.endswith(sentence):
         return ""
     return " " + sentence
@@ -4736,9 +4737,9 @@ def _parse_semantic_risk_coverage_claims(
                         f"observed at {_observation_timestamp_label(observation)}. "
                         "Cite a different observation whose launch was fully verified."
                     )
+                    node_test_hint = _node_test_hint(observation, launch_integrity_message)  # shape-check: fatal:authentication-or-forgery
                     raise NonRepairableEvidenceRejection(  # shape-check: fatal:authority-decision
-                        launch_integrity_message
-                        + _node_test_hint(observation, launch_integrity_message),
+                        launch_integrity_message + node_test_hint,
                         reason="launch-integrity",
                     )
         # Then the first degradable defect wins, in a fixed order, so every
