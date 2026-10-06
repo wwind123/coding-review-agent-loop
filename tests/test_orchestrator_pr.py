@@ -9650,7 +9650,8 @@ def test_resume_pr_round_prefers_latest_metadata_ledger_for_same_head_replay():
 
     assert resumed is not None
     assert [item.item_id for item in resumed.prior_items] == ["item-1"]
-    assert resumed.next_unresolved_item_number == 4
+    # The numbering high-water mark is global (the older head held item-9): IDs are never reused.
+    assert resumed.next_unresolved_item_number == 10
     assert [record.metadata.agent for record in resumed.completed_reviews] == ["Gemini"]
 
 def test_pr_loop_resume_hybrid_history_prefers_metadata_ledger_over_legacy_markdown(tmp_path):
@@ -19610,13 +19611,6 @@ def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_t
         url="https://github.com/OWNER/REPO/actions/runs/555",
     )
     failed_checks = _watch_check_board("failing", failing=(failed_check,))
-    outcomes = iter(
-        [
-            ManagedCiOutcome(status="failed", checks=failed_checks, head_sha="abc123"),
-            ManagedCiOutcome(status="failed", checks=failed_checks, head_sha="abc123-coder-1"),
-            ManagedCiOutcome(status="failed", checks=failed_checks, head_sha="abc123-coder-2"),
-        ]
-    )
     runner = FakeRunner(
         codex_outputs=[
             structured_pr_review(state="approved", summary="Approved."),
@@ -19635,31 +19629,76 @@ def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_t
         authenticated_actor=_ACTOR_1292,
     )
     config = make_config(tmp_path, auto_merge=True, max_rounds=1)
+    qualified_heads = []
+
+    def watcher(*args, **kwargs):
+        head = runner.pr_payload["headRefOid"]  # the actual current head at each observation
+        qualified_heads.append(head)
+        return ManagedCiOutcome(status="failed", checks=failed_checks, head_sha=head)
+
     monkeypatch.setattr(
         orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
     monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification", lambda *args, **kwargs: next(outcomes)
-    )
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", watcher)
     monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
 
     # Round 1 (the final round): the watcher grants its one extension, then the
     # CI-repair coder pushes and is rejected.
     with pytest.raises(AgentLoopError, match="live remote target"):
         run_pr_loop(runner, pr_number=77, config=config)
+    pushed = runner.pr_payload["headRefOid"]
+    assert qualified_heads == ["abc123"]
     (first_dispatch,) = _records_1292(runner, "coder-dispatch")
     assert first_dispatch.recovery_round_budget == _Budget1292(2, True, False)
     (rejection,) = _records_1292(runner, "coder-followup-rejected")
     assert rejection.recovery_round_budget == _Budget1292(2, True, False)
 
-    # The restart restores that budget, so the recovery coder is dispatched; a
-    # later watcher failure after the following review is refused a second extension.
-    with pytest.raises(AgentLoopError):
+    # The restart restores that budget: the recovery coder is dispatched in the
+    # original slot, its record lands one round later, the reviewers publish for
+    # the new head, and the next watcher failure is refused a second extension.
+    with pytest.raises(AgentLoopError, match=r"blocking issues after round 2") as refused:
         run_pr_loop(runner, pr_number=77, config=config)
+    recovered_head = runner.pr_payload["headRefOid"]
+    assert recovered_head != pushed
+    assert qualified_heads == ["abc123", pushed, recovered_head]  # the third failure was observed
     second_dispatch = _records_1292(runner, "coder-dispatch")[1]
     assert second_dispatch.dispatch_attempt == 2 and second_dispatch.dispatch_round == 1
     assert second_dispatch.recovery_round_budget == _Budget1292(2, True, False)
-    claude_runs = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
-    assert len(claude_runs) == 2  # no third coder: the extension was not granted again
-    assert len([c for c in _records_1292(runner, "coder-dispatch")]) == 2
+    (coder_record,) = [
+        r for r in _records_1292(runner) if r.role == "coder" and r.subject == recovered_head
+    ]
+    assert coder_record.round_number == 2
+    reviews = [
+        r for r in _records_1292(runner)
+        if r.role == "reviewer" and r.subject == recovered_head and r.round_number == 2
+    ]
+    assert reviews  # the following reviewer round published for the recovered head
+    assert "managed-exact-head-ci" in str(refused.value)  # refused: no second extension
+    assert len([c for c, _ in runner.commands if c[:1] == ["claude"]]) == 2  # no third coder
+    assert len(_records_1292(runner, "coder-dispatch")) == 2  # no second extension was granted
+
+
+def test_incomplete_rest_page_that_omits_a_recovery_record_stops_before_any_agent_call(tmp_path):
+    """Row rest-identity-acquisition: a valid page that lacks the handoff is incomplete."""
+    records = [
+        *_history_1292(), _dispatch_1292(),
+        _rejection_1292(attempt=2, subject=_B_1292, reason="again",
+                        carried_rejection_reasons=("first",)),
+    ]
+    runner = _stranded_runner_1292(records, _B_1292)
+    original = runner.run
+
+    def omitting_run(cmd, *args, **kwargs):
+        result = original(cmd, *args, **kwargs)
+        if cmd[:2] == ["gh", "api"] and "/comments?per_page=" in cmd[2] and "&since=" not in cmd[2]:
+            page = json.loads(result.stdout)
+            return CommandResult(cmd, result.cwd, json.dumps(page[:-1]), "", 0)  # drop the newest
+        return result
+
+    runner.run = omitting_run
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
+    with pytest.raises(AgentLoopError, match="cannot be authenticated"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _agent_order_1292(runner) == []  # no coder, no reviewer, no ordinary fallback
+    assert _records_1292(runner, "head-review-recovery") == []

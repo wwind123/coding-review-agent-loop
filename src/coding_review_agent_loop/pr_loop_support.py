@@ -133,6 +133,7 @@ from .round_state import (
     ResumedReviewRound,
     _recovery_record_problems,
     pr_resume_needs_author_admission,
+    unauthenticated_recovery_record_indexes,
     sanitize_recovery_reason,
 )
 from .protocol_markers import (
@@ -2174,6 +2175,13 @@ def _resume_pr_round_admitted(
         comments = merge_pr_comment_transport_identity(
             runner, config=config, pr_number=pr_number, comments=tuple(comments)  # type: ignore[arg-type]
         )
+        missing = unauthenticated_recovery_record_indexes(comments)
+        if missing:
+            raise AgentLoopError(
+                "PR recovery records cannot be authenticated: the REST comment read did not "
+                f"cover recovery record(s) at comment index {', '.join(map(str, missing))}; "
+                "rerun once the complete comment history is readable."
+            )
         trusted_actor = resolve_authenticated_github_actor(runner, config=config)
     return _resume_pr_round(
         comments,

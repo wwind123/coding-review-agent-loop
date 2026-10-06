@@ -949,3 +949,18 @@ def test_partially_published_recovery_keeps_the_global_item_number_high_water_ma
     ]
     resumed = _resume(history, _NEW)
     assert resumed is not None and resumed.next_unresolved_item_number == 8
+
+
+@pytest.mark.parametrize("stage", ["recovery-coder-record", "coder-then-reviewer"])
+def test_item_numbers_stay_global_after_a_successful_recovery_push(stage):
+    """Generalizes the partial-publication rule: no reconstruction restarts numbering per head."""
+    high = tuple(_item(n, f"Item {n}.") for n in range(1, 8))
+    history = [
+        _coder(), _reviewer(new_items=high),
+        _dispatch(items=(_item(1),)), _rejection(items=(_item(1),)),
+        _coder(subject=_NEWER, round_number=2, items=(_item(1),)),
+    ]
+    if stage == "coder-then-reviewer":
+        history.append(_reviewer(subject=_NEWER, round_number=2, items=(_item(1),)))
+    resumed = _resume(history, _NEWER)
+    assert resumed is not None and resumed.next_unresolved_item_number == 8

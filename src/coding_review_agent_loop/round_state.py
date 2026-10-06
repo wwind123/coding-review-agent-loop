@@ -4105,6 +4105,21 @@ def _admit_recovery_records(
     )
 
 
+def unauthenticated_recovery_record_indexes(comments: Sequence[object]) -> tuple[int, ...]:
+    """Indexes of recovery-phase records whose comment carries no author identity.
+
+    After the REST identity merge every comment that was matched has a numeric
+    author ID.  A recovery record left without one was not covered by the REST
+    read (a page omitted it), so it can be neither admitted nor ruled out.
+    """
+    return tuple(
+        record.index
+        for record in _extract_round_metadata_records(comments, flow="pr")
+        if record.metadata.phase in RECOVERY_RECORD_PHASES
+        and getattr(comments[record.index], "author_id", None) is None
+    )
+
+
 def pr_resume_needs_author_admission(
     comments: Sequence[object],
     head_sha: str | None,
@@ -5203,12 +5218,11 @@ def _resume_pr_round_from_records(
         ),
         coder_metadata=latest_coder_record.metadata if latest_coder_record else None,
         completed_reviews=tuple(reviewer_records[agent_display_name(agent)] for agent in configured_reviewers if agent_display_name(agent) in reviewer_records),
+        # Item IDs are never reused: keep the global high-water mark across heads
+        # (recovery rounds, and the rounds that follow a recovery push, resume on
+        # a head whose own records may carry only low, still-active numbers).
         next_unresolved_item_number=_max_unresolved_item_number_from_records(
             list(walk_records)
-            if review_handoff is not None
-            # A recovery round must keep the global high-water mark: earlier
-            # heads may hold higher (resolved) item numbers.
-            else [record for record in records if record.metadata.subject == head_sha]
         )
         + 1,
         ledger_may_be_incomplete=ledger_may_be_incomplete,

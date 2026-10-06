@@ -1251,6 +1251,9 @@ class FakeRunner(Runner):
                 posted_pr["createdAt"] = datetime.datetime.now(datetime.timezone.utc).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"
                 )
+            else:
+                # The default PR actor (#1292): REST attributes the comment to it.
+                posted_pr["_rest_author_id"] = 424242
             self.pr_payload.setdefault("comments", []).append(posted_pr)
             return CommandResult(cmd, cwd_path, "", "", 0)
 
