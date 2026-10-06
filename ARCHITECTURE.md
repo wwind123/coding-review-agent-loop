@@ -1213,6 +1213,28 @@ full. A deferred request is re-derived from the reviewer record that raised
 it. A malformed evidence record becomes the non-bypassable `unknown`
 obligation.
 
+A rejected coder follow-up is recoverable (#1292). A coder turn can push and
+then be rejected by a post-response validator, which discards the response but
+not the push. Before every PR coder dispatch the orchestrator therefore posts a
+`coder-dispatch` summary (dispatch round and head, immutable ledger snapshot,
+bounded round budget, attempt number, carried reasons); on a rejection after a
+push, or any rejected recovery dispatch, it posts a `coder-followup-rejected`
+summary keyed to the observed head with a bounded, redacted reason. Ordinary
+selection never sees dispatch records. Resume admits these records only from
+the authenticated GitHub actor, using author identities fetched from REST and
+only when needed, validates each live record per phase before reading any
+recovery field (a malformed live record stops resume before any agent call),
+and uses one newest-first walk, shared by the current head and the latest prior
+head, to pick the live handoff. Later coder, reviewer or head-review records
+retire a handoff. A coder handoff resumes a coder round in its original slot
+with the restored bounded budget and a prompt that names both heads and the
+reason, up to `MAX_REJECTED_DISPATCH_ATTEMPTS`. Head-review recovery (a legacy
+qualification-checkpoint anchor, or `agent-loop pr N --review-unrecorded-head`)
+is an ordinary review round of the current head: it carries only the ledger, the
+bounded budget and a `head-review-recovery` handoff that supersedes earlier
+checkpoints, and never overrides review scheduling or merge-conflict routing.
+Nothing force-pushes or writes a coder-role record on the operator's behalf.
+
 Resume reconstructs state from recorded evidence and then checks it against the
 live PR, issue, plan, requirements, and policy. GitHub metadata is durable but
 not a blanket authorization token. A lost local response or uncommitted patch

@@ -543,6 +543,13 @@ Run `agent-loop <command> --help` for the complete options for one workflow.
 The [full CLI guide](docs/local_agent_loop.md#usage) covers lifecycle and resume
 behavior in detail.
 
+If `agent-loop pr <number>` refuses to resume because a coder follow-up pushed a
+commit and was then rejected (or the PR head otherwise advanced without a
+recorded handoff), rerun with `--review-unrecorded-head`. It runs an ordinary
+review round of the current head with the recorded active items carried, never
+force-pushes, and never posts a record in the coder's name. See
+[rejected coder follow-ups](docs/local_agent_loop.md#rejected-coder-follow-ups-and-head-review-recovery-1292).
+
 For an issue-created managed-CI PR whose original authorization comment is
 missing, recovery is deliberately explicit. On a voluntary or plan-limited
 base, use `--managed-ci-fresh` with `--managed-ci` and the unprotected waiver;

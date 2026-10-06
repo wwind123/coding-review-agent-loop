@@ -221,6 +221,7 @@ from .round_state import (
     scope_approved_plan_matrix,
     recover_approved_plan_context,
     _resume_pr_round,
+    RecoveryRoundBudget,
 )
 from .protocol_markers import TrustedBody
 from .review_scheduling import (
@@ -399,6 +400,11 @@ from .pr_loop_support import (
     _ordinary_checks_snapshot_is_authoritative,
     _managed_success_supersedes_ordinary_checks,
     _persist_qualification_checkpoint,
+    _persist_coder_dispatch,
+    _persist_head_review_recovery,
+    _record_coder_followup_rejection,
+    _resume_pr_round_admitted,
+    _cached_trusted_actor,
     _visibility_snapshot,
     _latest_pr_reviewer_records,
     _reviewer_needs_fresh_context,
@@ -1896,7 +1902,8 @@ def run_pr_loop(
                 pr_number=pr_number,
                 configured=scheduler_contract,
                 start_round_number=lambda: _pr_amendment_start_round(
-                    initial_pr_context, configured_reviewers, scheduler_capabilities
+                    initial_pr_context, configured_reviewers, scheduler_capabilities,
+                    runner=runner, config=config,
                 ),
                 amendments_recognized=bool(pr_board_amendments),
             ),
@@ -1974,8 +1981,11 @@ def run_pr_loop(
         # the coder round made no progress -- stop cleanly instead of looping.
         conflict_dispatch_head_sha: str | None = None
         latest_mergeability: PullRequestMergeability | None = None
-        resumed_round = _resume_pr_round(
-            initial_pr_context.comments,
+        resumed_round = _resume_pr_round_admitted(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            comments=initial_pr_context.comments,
             head_sha=initial_pr_context.metadata.head_sha,
             configured_reviewers=configured_reviewers,
             reconciliation_mode=(
@@ -2112,6 +2122,31 @@ def run_pr_loop(
             else:
                 request_automatic_scheduler_fallback("qualification checkpoint is invalid")
                 final_sweep_pending = True
+        # Bounded budget carried by a recovery record (#1292), restored under
+        # the same bound.  It never carries lifecycle, approvals or identities,
+        # and no recovery path grants an extension of its own.
+        recovery_budget = (
+            resumed_round.recovery_round_budget if resumed_round is not None else None
+        )
+        if recovery_budget is not None and qualification_checkpoint is None:
+            if (
+                recovery_budget.valid
+                and config.max_rounds <= recovery_budget.allowed_rounds <= config.max_rounds + 2
+            ):
+                allowed_rounds = recovery_budget.allowed_rounds
+                watch_failure_extension_used = recovery_budget.watch_failure_extension_used
+                watch_head_extension_used = recovery_budget.watch_head_extension_used
+            else:
+                request_automatic_scheduler_fallback(
+                    "recovery record budget is invalid or out of bound"
+                )
+                final_sweep_pending = True
+        if resumed_round is not None and resumed_round.head_review_recovery is not None:
+            log(
+                config,
+                f"PR #{pr_number}: head-review recovery ({resumed_round.head_review_recovery}) "
+                f"runs an ordinary review round {resumed_round.round_number} of the current head",
+            )
         # Exact-head evidence state (#1068).  A freeze or release record is a
         # handoff boundary that carries the round budget; restore it under the
         # same bound as a qualification checkpoint before the pre-round guard.
@@ -2428,6 +2463,31 @@ def run_pr_loop(
                     request_automatic_scheduler_fallback("qualification inputs changed during resume")
                     final_sweep_pending = True
             current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
+            if (
+                current_resume is not None
+                and current_resume.head_review_recovery is not None
+                and current_resume.head_review_recovery_post_required
+            ):
+                # The handoff is written before any reviewer is dispatched so an
+                # interruption resumes with this ledger, round and budget.
+                _persist_head_review_recovery(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    round_number=current_resume.round_number,
+                    head_sha=pr_metadata.head_sha,
+                    ledger=current_resume.prior_items,
+                    budget=RecoveryRoundBudget(
+                        allowed_rounds,
+                        watch_failure_extension_used,
+                        watch_head_extension_used,
+                    ),
+                    source=current_resume.head_review_recovery,
+                )
+                resumed_round = dataclasses_replace(
+                    current_resume, head_review_recovery_post_required=False
+                )
+                current_resume = resumed_round
             unresolved_items = _reconcile_human_requirements_ack_item(
                 current_resume.prior_items if current_resume is not None else unresolved_items,
                 coder_output=latest_coder_output,
@@ -2941,12 +3001,22 @@ def run_pr_loop(
             )
             if skip_reviewers_for_recovery:
                 if current_resume is not None and current_resume.unrecorded_head_advance:
-                    log(
-                        config,
-                        f"Round {round_number}: PR head advanced to {current_pr_subject} "
-                        "without current-head coder metadata; routing recovered prior items "
-                        f"through {coder_name} before review",
-                    )
+                    if current_resume.rejected_coder_followup_reason:
+                        log(
+                            config,
+                            f"Round {round_number}: coder recovery (attempt "
+                            f"{(current_resume.dispatch_attempt or 1) + 1}) after a rejected "
+                            f"coder follow-up dispatched on "
+                            f"{current_resume.rejected_coder_followup_from_head}; routing the "
+                            f"carried items through {coder_name} before review",
+                        )
+                    else:
+                        log(
+                            config,
+                            f"Round {round_number}: PR head advanced to {current_pr_subject} "
+                            "without current-head coder metadata; routing recovered prior items "
+                            f"through {coder_name} before review",
+                        )
                 else:
                     log(
                         config,
@@ -3795,6 +3865,8 @@ def run_pr_loop(
                             if scheduler_capabilities.owner_scoped_reconciliation
                             else "aggregate"
                         ),
+                        trusted_actor=_cached_trusted_actor(runner),
+                        review_unrecorded_head=config.review_unrecorded_head,
                     ),
                     fingerprint=_pr_recovery_fingerprint,
                 )
@@ -4817,6 +4889,7 @@ def run_pr_loop(
                                 get_pr_review_context(runner, config=config, pr_number=pr_number),
                                 configured_reviewers,
                                 scheduler_capabilities,
+                                runner=runner, config=config,
                             ),
                         )
                     )
@@ -6958,7 +7031,26 @@ def run_pr_loop(
                 + "\n\n".join(reviewer_summaries.values()) + "\n\n"
                 if reviewer_summaries else ""
             )
-            if current_resume is not None and current_resume.unrecorded_head_advance:
+            if (
+                current_resume is not None
+                and current_resume.unrecorded_head_advance
+                and current_resume.rejected_coder_followup_reason
+            ):
+                # The orchestrator rejected the previous coder turn (#1292).
+                summary_context = (
+                    f"Recovery context: the previous coder follow-up (attempt "
+                    f"{current_resume.dispatch_attempt or 1}) was dispatched on "
+                    f"`{current_resume.rejected_coder_followup_from_head or 'unknown'}`; the "
+                    f"current head is `{pr_metadata.head_sha or 'unknown'}`. The orchestrator "
+                    "did not accept its response: "
+                    f"{current_resume.rejected_coder_followup_reason} Nothing from that attempt "
+                    "was reviewed or recorded. Check each recovered item against the current "
+                    "head, fix the cause of the rejection, and report only valid in-checkout "
+                    "test evidence. List an item in addressed_items only after confirming the "
+                    "current head satisfies it.\n\n"
+                    + summary_context
+                )
+            elif current_resume is not None and current_resume.unrecorded_head_advance:
                 # The external head may or may not contain the fixes; the
                 # coder must check each recovered item against it (#1034).
                 summary_context = (
@@ -7144,321 +7236,376 @@ def run_pr_loop(
                     "persisted before coder handoff."
                 ),
             )
-            coder_response = _run_validated_agent(
+            # Record the slot, ledger, budget and attempt before the coder can
+            # push, so a rejected or interrupted turn is resumable (#1292).  If
+            # the record cannot be written, the coder is not dispatched.
+            pre_turn_ledger = tuple(unresolved_items)
+            pre_turn_head = str(pr_metadata.head_sha or "")
+            dispatch_budget = RecoveryRoundBudget(
+                allowed_rounds, watch_failure_extension_used, watch_head_extension_used
+            )
+            coder_recovery_resume = (
+                current_resume
+                if current_resume is not None
+                and current_resume.unrecorded_head_advance
+                and current_resume.dispatch_attempt is not None
+                else None
+            )
+            dispatch_attempt = (
+                coder_recovery_resume.dispatch_attempt + 1
+                if coder_recovery_resume is not None
+                else 1
+            )
+            dispatch_carried_reasons = (
+                coder_recovery_resume.carried_rejection_reasons
+                if coder_recovery_resume is not None
+                else ()
+            )
+            _persist_coder_dispatch(
                 runner,
-                agent=config.coder,
                 config=config,
-                prompt=followup_prompt,
-                session_id=coder_session_id,
-                marker_description="<!-- AGENT_STATE: approved|blocking -->",
-                require_architecture_impact_contract=True,
-                **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements: _validate_coder_followup_response(
-                    text,
-                    unresolved_items=items,
-                    human_requirements=human_requirements,
-                    # Every new coder-followup response is v1. A missing
-                    # document must not silently downgrade the protocol.
-                    required_architecture_impact_contract=1,
-                    delivered_risk_test_matrix=(
-                        approved_plan_context.risk_test_matrix_payload
-                        if approved_plan_context is not None and approved_plan_context.matrix_available
-                        else None
-                    ),
-                    delivered_risk_test_matrix_identity=(
-                        approved_plan_context.risk_test_matrix_identity
-                        if approved_plan_context is not None and approved_plan_context.matrix_available
-                        else None
-                    ),
-                    required_risk_test_matrix_contract=(
-                        1 if approved_plan_context is not None and approved_plan_context.matrix_available
-                        else 0
-                    ),
-                    authoritative_test_observations=_current_test_turn_observations(runner),
-                    execution_catalog=_current_test_turn_observations(runner),
-                    delivered_risk_test_matrix_row_ids=(
-                        approved_plan_context.risk_test_matrix_expected_row_ids
-                        if approved_plan_context is not None and approved_plan_context.matrix_available
-                        else None
-                    ), architecture_status_mode=mode,
-                )),
-                usage_context=usage_context,
-                role="coder",
-                use_repair=True,
-                repair_expected_kind="coder_followup",
-                repair_unresolved_item_ids=repair_unresolved_item_ids,
-                repair_surfaced_requirement_ids=coder_human_requirements_context.surfaced_requirement_ids,
-                repair_requires_direct_discussion_ack=coder_human_requirements_context.requires_direct_discussion_ack,
-                salvage_context=SalvageContext(
-                    repo=config.repo,
-                    issue_number=None if issue_context is None else issue_context.number,
-                    scope=PR_FOLLOWUP_SALVAGE_SCOPE,
-                    agent=config.coder,
-                    run_id=usage_context.run_id,
-                ),
-                operation_description="PR feedback follow-up",
+                pr_number=pr_number,
+                dispatch_round=round_number,
+                dispatch_head=pre_turn_head,
+                ledger=pre_turn_ledger,
+                budget=dispatch_budget,
+                attempt=dispatch_attempt,
+                carried_reasons=dispatch_carried_reasons,
             )
-            coder_output = coder_response.text
-            coder_session_id = coder_response.session_id
-            latest_coder_output = coder_output
-            public_comment = coder_output
-            raw_structured_coder_response: str | None = None
-            if isinstance(coder_response.marker_value, StructuredCoderFollowup):
-                coder_response = dataclasses_replace(
-                    coder_response,
-                    marker_value=_degrade_out_of_checkout_tests(
-                        coder_response.marker_value, config=config
-                    ),
-                )
-                validate_test_observation_citations_within_workdir(
-                    coder_response.marker_value.test_observations,
-                    assigned_workdir=active_workdir(config),
-                )
-                raw_structured_coder_response = coder_output
-                if coder_response.marker_value.disputed_items:
-                    unresolved_items = _apply_dispute_evidence(
-                        unresolved_items,
-                        disputed_items=coder_response.marker_value.disputed_items,
-                        dispute_evidence=coder_response.marker_value.dispute_evidence,
-                    )
-                    disputed_names = ", ".join(coder_response.marker_value.disputed_items)
-                    log(
-                        config,
-                        f"Round {round_number}: {coder_name} disputed item(s) {disputed_names} "
-                        "with counter-evidence; will surface to human if reviewer still blocks",
-                    )
-                public_comment = render_public_agent_comment(
-                    kind="coder_followup",
-                    parsed=coder_response.marker_value,
+            try:
+                coder_response = _run_validated_agent(
+                    runner,
                     agent=config.coder,
-                    prior_items=tuple(unresolved_items),
                     config=config,
-                    model_used=coder_response.model_used,
+                    prompt=followup_prompt,
+                    session_id=coder_session_id,
+                    marker_description="<!-- AGENT_STATE: approved|blocking -->",
+                    require_architecture_impact_contract=True,
+                    **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements: _validate_coder_followup_response(
+                        text,
+                        unresolved_items=items,
+                        human_requirements=human_requirements,
+                        # Every new coder-followup response is v1. A missing
+                        # document must not silently downgrade the protocol.
+                        required_architecture_impact_contract=1,
+                        delivered_risk_test_matrix=(
+                            approved_plan_context.risk_test_matrix_payload
+                            if approved_plan_context is not None and approved_plan_context.matrix_available
+                            else None
+                        ),
+                        delivered_risk_test_matrix_identity=(
+                            approved_plan_context.risk_test_matrix_identity
+                            if approved_plan_context is not None and approved_plan_context.matrix_available
+                            else None
+                        ),
+                        required_risk_test_matrix_contract=(
+                            1 if approved_plan_context is not None and approved_plan_context.matrix_available
+                            else 0
+                        ),
+                        authoritative_test_observations=_current_test_turn_observations(runner),
+                        execution_catalog=_current_test_turn_observations(runner),
+                        delivered_risk_test_matrix_row_ids=(
+                            approved_plan_context.risk_test_matrix_expected_row_ids
+                            if approved_plan_context is not None and approved_plan_context.matrix_available
+                            else None
+                        ), architecture_status_mode=mode,
+                    )),
+                    usage_context=usage_context,
+                    role="coder",
+                    use_repair=True,
+                    repair_expected_kind="coder_followup",
+                    repair_unresolved_item_ids=repair_unresolved_item_ids,
+                    repair_surfaced_requirement_ids=coder_human_requirements_context.surfaced_requirement_ids,
+                    repair_requires_direct_discussion_ack=coder_human_requirements_context.requires_direct_discussion_ack,
+                    salvage_context=SalvageContext(
+                        repo=config.repo,
+                        issue_number=None if issue_context is None else issue_context.number,
+                        scope=PR_FOLLOWUP_SALVAGE_SCOPE,
+                        agent=config.coder,
+                        run_id=usage_context.run_id,
+                    ),
+                    operation_description="PR feedback follow-up",
                 )
-            else:
-                validate_response_tests_within_workdir(
-                    coder_output,
-                    assigned_workdir=active_workdir(config),
-                )
-                public_comment = normalize_freeform_signature(
-                    coder_output, agent=config.coder, config=config, model_used=coder_response.model_used
-                )
-
-            unresolved_items = _reconcile_human_requirements_ack_item(
-                unresolved_items,
-                coder_output=coder_output,
-                human_requirements=human_requirements,
-                source_round=round_number,
-            )
-            updated_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
-            unresolved_items = _advance_machine_obligations_for_head(
-                unresolved_items,
-                current_head_sha=updated_pr_context.metadata.head_sha,
-            )
-            # Reconcile the coder's assigned checkout with the freshly fetched
-            # PR head before deriving any canonical evidence. The builder also
-            # takes an independent stable snapshot, so a mismatch is retained
-            # as non-verified evidence rather than discarding the PR handoff.
-            assigned_worktree_head_after_followup = _read_assigned_workdir_head(
-                runner, config
-            )
-            if isinstance(coder_response.marker_value, StructuredCoderFollowup):
-                derived_followup, _followup_derived_risk_evidence = (
-                    _derive_authenticated_risk_evidence_for_coder(
-                        coder_response.marker_value,
-                        approved_plan_context=approved_plan_context,
-                        runner=runner,
+                coder_output = coder_response.text
+                coder_session_id = coder_response.session_id
+                latest_coder_output = coder_output
+                public_comment = coder_output
+                raw_structured_coder_response: str | None = None
+                if isinstance(coder_response.marker_value, StructuredCoderFollowup):
+                    coder_response = dataclasses_replace(
+                        coder_response,
+                        marker_value=_degrade_out_of_checkout_tests(
+                            coder_response.marker_value, config=config
+                        ),
+                    )
+                    validate_test_observation_citations_within_workdir(
+                        coder_response.marker_value.test_observations,
                         assigned_workdir=active_workdir(config),
-                        head_sha=updated_pr_context.metadata.head_sha,
-                        predecessor_head=pr_metadata.head_sha,
+                    )
+                    raw_structured_coder_response = coder_output
+                    if coder_response.marker_value.disputed_items:
+                        unresolved_items = _apply_dispute_evidence(
+                            unresolved_items,
+                            disputed_items=coder_response.marker_value.disputed_items,
+                            dispute_evidence=coder_response.marker_value.dispute_evidence,
+                        )
+                        disputed_names = ", ".join(coder_response.marker_value.disputed_items)
+                        log(
+                            config,
+                            f"Round {round_number}: {coder_name} disputed item(s) {disputed_names} "
+                            "with counter-evidence; will surface to human if reviewer still blocks",
+                        )
+                    public_comment = render_public_agent_comment(
+                        kind="coder_followup",
+                        parsed=coder_response.marker_value,
+                        agent=config.coder,
+                        prior_items=tuple(unresolved_items),
                         config=config,
-                        session_id=coder_response.session_id,
-                        invocation_id=coder_response.acquisition_test_turn_id,
-                        _closed_execution_catalog=coder_response.acquisition_test_observations,
-                        _journal_observations=coder_response.acquisition_test_observations,
-                        assigned_worktree_head=assigned_worktree_head_after_followup,
-                        reauthenticate_head=lambda: get_pr_review_context(
-                            runner, config=config, pr_number=pr_number
-                        ).metadata.head_sha,
+                        model_used=coder_response.model_used,
                     )
-                )
-                coder_response = dataclasses_replace(
-                    coder_response,
-                    marker_value=derived_followup,
-                )
-            local_test_evidence = runner.render_local_test_evidence(
-                current_head=updated_pr_context.metadata.head_sha,
-                legacy_tests_run=(
-                    coder_response.marker_value.tests_run
-                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
-                    else None
-                ),
-                cwd=active_workdir(config),
-                prior_local_test_evidence=(
-                    latest_coder_metadata.local_test_evidence
-                    if latest_coder_metadata is not None
-                    else None
-                ),
-            )
-            # The coder metadata record posted below is numbered one past the
-            # loop round; the matrix-evidence anchor must use that number.
-            coder_record_round = round_number + 1
-            if isinstance(coder_response.marker_value, StructuredCoderFollowup):
-                pr_finding_history.record_fix(
-                    coder_response.marker_value,
-                    published_round=coder_record_round,
-                    agent=coder_name,
-                )
-                log_declared_generalization(
-                    coder_response.marker_value,
-                    log=lambda message: log(config, message),
-                    round_number=round_number,
-                    agent=coder_name,
-                    step_back_directed=bool(step_back_guidance),
-                )
-            matrix_evidence_render_decision = None
-            if (
-                isinstance(coder_response.marker_value, StructuredCoderFollowup)
-                and coder_response.marker_value.risk_test_matrix_evidence is not None
-            ):
-                matrix_evidence_render_decision = resolve_matrix_evidence_render(
-                    coder_response.marker_value.risk_test_matrix_evidence,
-                    latest_coder_metadata,
-                    coder_record_round,
-                )
-            # The head this follow-up was dispatched against; persisted so the
-            # head-unchanged framing below survives resume (#1034).
-            followup_dispatch_head = (
-                pr_metadata.head_sha
-                if _is_followup_dispatch_head(pr_metadata.head_sha)
-                else None
-            )
-            head_unchanged_sha = (
-                followup_dispatch_head
-                if followup_dispatch_head is not None
-                and updated_pr_context.metadata.head_sha == followup_dispatch_head
-                else None
-            )
-            if isinstance(coder_response.marker_value, StructuredCoderFollowup):
-                public_comment = render_public_agent_comment(
-                    kind="coder_followup",
-                    parsed=coder_response.marker_value,
-                    agent=config.coder,
-                    prior_items=tuple(unresolved_items),
-                    config=config,
-                    model_used=coder_response.model_used,
-                    local_test_evidence=local_test_evidence,
-                    current_test_turn_id=coder_response.acquisition_test_turn_id,
-                    matrix_evidence_render_decision=matrix_evidence_render_decision,
-                    head_unchanged_sha=head_unchanged_sha,
-                )
-            elif head_unchanged_sha is not None:
-                public_comment = add_coder_followup_head_unchanged_notice(
-                    public_comment, head_unchanged_sha
-                )
+                else:
+                    validate_response_tests_within_workdir(
+                        coder_output,
+                        assigned_workdir=active_workdir(config),
+                    )
+                    public_comment = normalize_freeform_signature(
+                        coder_output, agent=config.coder, config=config, model_used=coder_response.model_used
+                    )
 
-            qualification_checkpoint = _machine_obligation_checkpoint(
-                unresolved_items,
-                current_head_sha=updated_pr_context.metadata.head_sha,
-                base_branch=updated_pr_context.metadata.base_branch or config.base,
-                allowed_rounds=allowed_rounds,
-                watch_failure_extension_used=watch_failure_extension_used,
-                watch_head_extension_used=watch_head_extension_used,
-                plan_digest=(
-                    approved_plan_context.plan_hash
-                    if approved_plan_context is not None else None
-                ),
-                requirements_digest=_qualification_digest(
-                    tuple(requirement.requirement_id for requirement in human_requirements)
-                ),
-                acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
-                scheduler_digest=_qualification_digest(
-                    _prior_item_ledger_signature(unresolved_items)
-                ),
-            )
-            latest_coder_metadata = PostedRoundMetadata(
-                flow="pr",
-                role="coder",
-                agent=coder_name,
-                round_number=coder_record_round,
-                subject=str(updated_pr_context.metadata.head_sha or "unknown"),
-                prior_items=tuple(unresolved_items),
-                raw_structured_coder_response=raw_structured_coder_response,
-                local_test_evidence=local_test_evidence,
-                risk_test_matrix_evidence=(
-                    coder_response.marker_value.risk_test_matrix_evidence.to_payload()
-                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                unresolved_items = _reconcile_human_requirements_ack_item(
+                    unresolved_items,
+                    coder_output=coder_output,
+                    human_requirements=human_requirements,
+                    source_round=round_number,
+                )
+                updated_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+                unresolved_items = _advance_machine_obligations_for_head(
+                    unresolved_items,
+                    current_head_sha=updated_pr_context.metadata.head_sha,
+                )
+                # Reconcile the coder's assigned checkout with the freshly fetched
+                # PR head before deriving any canonical evidence. The builder also
+                # takes an independent stable snapshot, so a mismatch is retained
+                # as non-verified evidence rather than discarding the PR handoff.
+                assigned_worktree_head_after_followup = _read_assigned_workdir_head(
+                    runner, config
+                )
+                if isinstance(coder_response.marker_value, StructuredCoderFollowup):
+                    derived_followup, _followup_derived_risk_evidence = (
+                        _derive_authenticated_risk_evidence_for_coder(
+                            coder_response.marker_value,
+                            approved_plan_context=approved_plan_context,
+                            runner=runner,
+                            assigned_workdir=active_workdir(config),
+                            head_sha=updated_pr_context.metadata.head_sha,
+                            predecessor_head=pr_metadata.head_sha,
+                            config=config,
+                            session_id=coder_response.session_id,
+                            invocation_id=coder_response.acquisition_test_turn_id,
+                            _closed_execution_catalog=coder_response.acquisition_test_observations,
+                            _journal_observations=coder_response.acquisition_test_observations,
+                            assigned_worktree_head=assigned_worktree_head_after_followup,
+                            reauthenticate_head=lambda: get_pr_review_context(
+                                runner, config=config, pr_number=pr_number
+                            ).metadata.head_sha,
+                        )
+                    )
+                    coder_response = dataclasses_replace(
+                        coder_response,
+                        marker_value=derived_followup,
+                    )
+                local_test_evidence = runner.render_local_test_evidence(
+                    current_head=updated_pr_context.metadata.head_sha,
+                    legacy_tests_run=(
+                        coder_response.marker_value.tests_run
+                        if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                        else None
+                    ),
+                    cwd=active_workdir(config),
+                    prior_local_test_evidence=(
+                        latest_coder_metadata.local_test_evidence
+                        if latest_coder_metadata is not None
+                        else None
+                    ),
+                )
+                # The coder metadata record posted below is numbered one past the
+                # loop round; the matrix-evidence anchor must use that number.
+                coder_record_round = round_number + 1
+                if isinstance(coder_response.marker_value, StructuredCoderFollowup):
+                    pr_finding_history.record_fix(
+                        coder_response.marker_value,
+                        published_round=coder_record_round,
+                        agent=coder_name,
+                    )
+                    log_declared_generalization(
+                        coder_response.marker_value,
+                        log=lambda message: log(config, message),
+                        round_number=round_number,
+                        agent=coder_name,
+                        step_back_directed=bool(step_back_guidance),
+                    )
+                matrix_evidence_render_decision = None
+                if (
+                    isinstance(coder_response.marker_value, StructuredCoderFollowup)
                     and coder_response.marker_value.risk_test_matrix_evidence is not None
+                ):
+                    matrix_evidence_render_decision = resolve_matrix_evidence_render(
+                        coder_response.marker_value.risk_test_matrix_evidence,
+                        latest_coder_metadata,
+                        coder_record_round,
+                    )
+                # The head this follow-up was dispatched against; persisted so the
+                # head-unchanged framing below survives resume (#1034).
+                followup_dispatch_head = (
+                    pr_metadata.head_sha
+                    if _is_followup_dispatch_head(pr_metadata.head_sha)
                     else None
-                ),
-                risk_test_matrix_evidence_full_round=(
-                    matrix_evidence_render_decision.anchor_round
-                    if matrix_evidence_render_decision is not None
+                )
+                head_unchanged_sha = (
+                    followup_dispatch_head
+                    if followup_dispatch_head is not None
+                    and updated_pr_context.metadata.head_sha == followup_dispatch_head
                     else None
-                ),
-                risk_test_matrix_diagnostics=(
-                    tuple(
-                        diagnostic.to_payload()
-                        for diagnostic in coder_response.marker_value.risk_test_matrix_diagnostics
+                )
+                if isinstance(coder_response.marker_value, StructuredCoderFollowup):
+                    public_comment = render_public_agent_comment(
+                        kind="coder_followup",
+                        parsed=coder_response.marker_value,
+                        agent=config.coder,
+                        prior_items=tuple(unresolved_items),
+                        config=config,
+                        model_used=coder_response.model_used,
+                        local_test_evidence=local_test_evidence,
+                        current_test_turn_id=coder_response.acquisition_test_turn_id,
+                        matrix_evidence_render_decision=matrix_evidence_render_decision,
+                        head_unchanged_sha=head_unchanged_sha,
                     )
-                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
-                    else ()
-                ),
-                compact_prior_summaries=tuple(pr_compact_prior_summaries),
-                model_used=coder_response.model_used,
-                acquisition_outcome=coder_response.acquisition_outcome,
-                acquisition_returncode=coder_response.acquisition_returncode,
-                scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
-                reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
-                scheduler_previous_sha=(pr_metadata.head_sha if selective_policy else None),
-                scheduler_current_sha=(
-                    str(updated_pr_context.metadata.head_sha or "unknown")
-                    if selective_policy else None
-                ),
-                scheduler_obligation_digest=(
-                    hashlib.sha256(
-                        repr(_prior_item_ledger_signature(unresolved_items)).encode("utf-8")
-                    ).hexdigest()[:16]
-                    if selective_policy else None
-                ),
-                scheduler_selected_reviewers=(
-                    tuple(sorted(selected_reviewer_names))
-                    if selective_policy else ()
-                ),
-                scheduler_paused_reviewers=(
-                    scheduler_decision.paused_reviewers
-                    if selective_policy and scheduler_decision is not None else ()
-                ),
-                scheduler_reasons=(
-                    (
-                        (scheduler_decision.reason, classification.reason)
-                        if scheduler_decision is not None else ()
+                elif head_unchanged_sha is not None:
+                    public_comment = add_coder_followup_head_unchanged_notice(
+                        public_comment, head_unchanged_sha
                     )
-                    + (
-                        ("external/unrecorded head advance requires full board",)
-                        if external_recovery_full_board else ()
-                    )
-                ) if selective_policy else (),
-                scheduler_final_sweep=(final_sweep if selective_policy else None),
-                scheduler_force_full=(scheduler_recorded_force_full if selective_policy else None),
-                scheduler_force_full_source=(
-                    scheduler_recorded_force_full_source if selective_policy else None
-                ),
-                scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
-                scheduler_phase=(scheduler_decision.phase if selective_policy and scheduler_decision is not None else None),
-                scheduler_primary_reviewer=(scheduler_contract.primary_reviewer if selective_policy else None),
-                scheduler_approved_reviewers=(
-                    tuple(sorted(unchanged_head_approvals)) if selective_policy else ()
-                ),
-                scheduler_active_owners=(scheduler_decision.active_owners if selective_policy and scheduler_decision is not None else ()),
-                scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
-                qualification_checkpoint=qualification_checkpoint,
-                followup_dispatch_head=followup_dispatch_head,
-                step_back_entries=step_back_entries,
-                **_test_observation_degradation_fields(coder_response.marker_value),
-                **_architecture_metadata_fields(
-                    config, result=coder_response.marker_value
-                ),
-            )
+
+                qualification_checkpoint = _machine_obligation_checkpoint(
+                    unresolved_items,
+                    current_head_sha=updated_pr_context.metadata.head_sha,
+                    base_branch=updated_pr_context.metadata.base_branch or config.base,
+                    allowed_rounds=allowed_rounds,
+                    watch_failure_extension_used=watch_failure_extension_used,
+                    watch_head_extension_used=watch_head_extension_used,
+                    plan_digest=(
+                        approved_plan_context.plan_hash
+                        if approved_plan_context is not None else None
+                    ),
+                    requirements_digest=_qualification_digest(
+                        tuple(requirement.requirement_id for requirement in human_requirements)
+                    ),
+                    acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
+                    scheduler_digest=_qualification_digest(
+                        _prior_item_ledger_signature(unresolved_items)
+                    ),
+                )
+                latest_coder_metadata = PostedRoundMetadata(
+                    flow="pr",
+                    role="coder",
+                    agent=coder_name,
+                    round_number=coder_record_round,
+                    subject=str(updated_pr_context.metadata.head_sha or "unknown"),
+                    prior_items=tuple(unresolved_items),
+                    raw_structured_coder_response=raw_structured_coder_response,
+                    local_test_evidence=local_test_evidence,
+                    risk_test_matrix_evidence=(
+                        coder_response.marker_value.risk_test_matrix_evidence.to_payload()
+                        if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                        and coder_response.marker_value.risk_test_matrix_evidence is not None
+                        else None
+                    ),
+                    risk_test_matrix_evidence_full_round=(
+                        matrix_evidence_render_decision.anchor_round
+                        if matrix_evidence_render_decision is not None
+                        else None
+                    ),
+                    risk_test_matrix_diagnostics=(
+                        tuple(
+                            diagnostic.to_payload()
+                            for diagnostic in coder_response.marker_value.risk_test_matrix_diagnostics
+                        )
+                        if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                        else ()
+                    ),
+                    compact_prior_summaries=tuple(pr_compact_prior_summaries),
+                    model_used=coder_response.model_used,
+                    acquisition_outcome=coder_response.acquisition_outcome,
+                    acquisition_returncode=coder_response.acquisition_returncode,
+                    scheduler_contract=(scheduler_contract.as_dict() if selective_policy else None),
+                    reviewer_board_amendment_digest=(pr_amendment_digest if selective_policy else None),
+                    scheduler_previous_sha=(pr_metadata.head_sha if selective_policy else None),
+                    scheduler_current_sha=(
+                        str(updated_pr_context.metadata.head_sha or "unknown")
+                        if selective_policy else None
+                    ),
+                    scheduler_obligation_digest=(
+                        hashlib.sha256(
+                            repr(_prior_item_ledger_signature(unresolved_items)).encode("utf-8")
+                        ).hexdigest()[:16]
+                        if selective_policy else None
+                    ),
+                    scheduler_selected_reviewers=(
+                        tuple(sorted(selected_reviewer_names))
+                        if selective_policy else ()
+                    ),
+                    scheduler_paused_reviewers=(
+                        scheduler_decision.paused_reviewers
+                        if selective_policy and scheduler_decision is not None else ()
+                    ),
+                    scheduler_reasons=(
+                        (
+                            (scheduler_decision.reason, classification.reason)
+                            if scheduler_decision is not None else ()
+                        )
+                        + (
+                            ("external/unrecorded head advance requires full board",)
+                            if external_recovery_full_board else ()
+                        )
+                    ) if selective_policy else (),
+                    scheduler_final_sweep=(final_sweep if selective_policy else None),
+                    scheduler_force_full=(scheduler_recorded_force_full if selective_policy else None),
+                    scheduler_force_full_source=(
+                        scheduler_recorded_force_full_source if selective_policy else None
+                    ),
+                    scheduler_calls_avoided=(scheduler_calls_avoided if selective_policy else None),
+                    scheduler_phase=(scheduler_decision.phase if selective_policy and scheduler_decision is not None else None),
+                    scheduler_primary_reviewer=(scheduler_contract.primary_reviewer if selective_policy else None),
+                    scheduler_approved_reviewers=(
+                        tuple(sorted(unchanged_head_approvals)) if selective_policy else ()
+                    ),
+                    scheduler_active_owners=(scheduler_decision.active_owners if selective_policy and scheduler_decision is not None else ()),
+                    scheduler_scope_digest=(hashlib.sha256(repr(classification.changed_paths).encode("utf-8")).hexdigest()[:16] if selective_policy else None),
+                    qualification_checkpoint=qualification_checkpoint,
+                    followup_dispatch_head=followup_dispatch_head,
+                    step_back_entries=step_back_entries,
+                    **_test_observation_degradation_fields(coder_response.marker_value),
+                    **_architecture_metadata_fields(
+                        config, result=coder_response.marker_value
+                    ),
+                )
+            except AgentLoopError as coder_followup_error:
+                # A coder that pushed and was then rejected leaves a head with no
+                # coder or reviewer record; persist why, then surface the original
+                # error unchanged.
+                _record_coder_followup_rejection(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    error=coder_followup_error,
+                    dispatch_round=round_number,
+                    pre_turn_head=pre_turn_head,
+                    ledger=pre_turn_ledger,
+                    budget=dispatch_budget,
+                    attempt=dispatch_attempt,
+                    recovery_dispatch=dispatch_attempt > 1,
+                    carried_reasons=dispatch_carried_reasons,
+                )
+                raise
             post_pr_comment(
                 runner,
                 config=config,

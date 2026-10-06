@@ -1186,6 +1186,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Complete expected-closing issue set for this existing PR; repeatable.",
     )
     pr.add_argument(
+        "--review-unrecorded-head",
+        action="store_true",
+        help=(
+            "Operator recovery for a PR whose resume is refused (for example a coder "
+            "follow-up that pushed and was then rejected): run an ordinary review round "
+            "of the current head with the recorded active items carried. Never "
+            "force-pushes and never posts a coder-role record."
+        ),
+    )
+    pr.add_argument(
         "--supersede-expected-closing-contract",
         action="store_true",
         help="Explicitly widen a recovered expected-closing contract with a proper superset.",

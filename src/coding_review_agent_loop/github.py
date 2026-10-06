@@ -2144,6 +2144,29 @@ def read_rest_issue_comments(
     return _parse_issue_comments(raw_transport_comments)
 
 
+def merge_pr_comment_transport_identity(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    comments: tuple[IssueComment, ...],
+) -> tuple[IssueComment, ...]:
+    """Attach REST author IDs to a ``gh pr view`` comment projection (#1292).
+
+    The GraphQL-shaped projection carries no numeric author IDs, so recovery
+    records cannot be admitted from it.  An incomplete or empty REST read fails
+    closed instead of reading as an empty history.
+    """
+    transport = read_rest_issue_comments(
+        runner,
+        config=config,
+        issue_number=pr_number,
+        purpose="PR recovery records cannot be authenticated",
+        reject_empty_output=True,
+    )
+    return _merge_transport_comments(comments, transport, issue_number=pr_number)
+
+
 def _merge_transport_comments(
     comments: tuple[IssueComment, ...],
     transport_comments: tuple[IssueComment, ...],

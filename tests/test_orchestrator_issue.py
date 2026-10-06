@@ -2665,7 +2665,7 @@ def test_issue_loop_creates_pr_then_alternates_until_codex_approval(tmp_path):
     command_names = [cmd[:2] for cmd, _cwd in runner.commands]
     assert ["claude", "--print"] in command_names
     assert ["codex", "exec"] in command_names
-    assert len(runner.comments) == 5
+    assert len(runner.comments) == 6
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
     assert list((tmp_path / "logs").glob("*-claude-attempt1.log"))
     assert list((tmp_path / "logs").glob("*-codex.log"))
@@ -2868,7 +2868,7 @@ def test_issue_loop_can_use_codex_as_coder_and_claude_as_reviewer(tmp_path):
         ["codex", "exec"],
         ["claude", "--print"],
     ]
-    assert len(runner.comments) == 5
+    assert len(runner.comments) == 6
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
 
 def test_issue_loop_runs_pre_review_tests_after_coder_changes(tmp_path):
@@ -6656,7 +6656,7 @@ def test_codex_issue_loop_alternates_until_claude_approval(tmp_path):
 
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
-    assert len(runner.comments) == 5
+    assert len(runner.comments) == 6
     assert runner.comments[-1].startswith("**Review verdict:** Approved\n\nLGTM.")
 
 def test_codex_issue_loop_requires_codex_to_report_pr_number(tmp_path):

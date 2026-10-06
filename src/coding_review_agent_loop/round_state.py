@@ -308,6 +308,19 @@ class PostedRoundMetadata:
     # record, so the step-back trigger can be suppressed for that history.
     step_back_entries: tuple[Mapping[str, object], ...] = ()
     step_back_status: str = "absent"
+    # Coder-recovery and head-review-recovery records (#1292).  All are
+    # optional and omitted from the encoding when unset, so every historical
+    # record re-encodes byte-identically.  A malformed scalar decodes as
+    # absent (never raises); ``_recovery_record_problems`` then reports it.
+    dispatch_round: int | None = None
+    dispatch_head: str | None = None
+    dispatch_attempt: int | None = None
+    recovery_dispatch: bool | None = None
+    carried_rejection_reasons: tuple[str, ...] = ()
+    rejected_coder_followup_reason: str | None = None
+    rejected_coder_followup_from_head: str | None = None
+    head_review_recovery_source: str | None = None
+    recovery_round_budget: "RecoveryRoundBudget | None" = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -776,6 +789,20 @@ class ResumedReviewRound:
     broken_evidence_freeze_head: str | None = None
     # Head-scoped evidence clearances carried by the latest terminal record.
     evidence_clearances: tuple[tuple[str, str], ...] = ()
+    # Coder-recovery context (#1292): why the previous coder follow-up was not
+    # accepted, the head it was dispatched on, and its consecutive attempt.
+    rejected_coder_followup_reason: str | None = None
+    rejected_coder_followup_from_head: str | None = None
+    dispatch_attempt: int | None = None
+    # Bounded round budget carried by a recovery record.
+    recovery_round_budget: "RecoveryRoundBudget | None" = None
+    # ``legacy-checkpoint`` or ``operator`` when the resume is an ordinary
+    # review round of the current head; ``post_required`` is True while the
+    # handoff record for the current head has not been written yet.
+    head_review_recovery: str | None = None
+    head_review_recovery_post_required: bool = False
+    # Rejection reasons carried into the next coder-dispatch record (bounded).
+    carried_rejection_reasons: tuple[str, ...] = ()
 
 
 PLAN_VALIDATION_DIAGNOSTIC_SUFFIX = "[diagnostic truncated]"
@@ -2252,6 +2279,211 @@ def _sanitize_durable_coder_response(raw: str | None) -> str | None:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + normalized[end:]
 
 
+CODER_DISPATCH_PHASE = "coder-dispatch"
+CODER_FOLLOWUP_REJECTED_PHASE = "coder-followup-rejected"
+HEAD_REVIEW_RECOVERY_PHASE = "head-review-recovery"
+RECOVERY_RECORD_PHASES = frozenset(
+    {CODER_DISPATCH_PHASE, CODER_FOLLOWUP_REJECTED_PHASE, HEAD_REVIEW_RECOVERY_PHASE}
+)
+HEAD_REVIEW_RECOVERY_SOURCES = frozenset({"operator", "legacy-checkpoint"})
+MAX_REJECTED_DISPATCH_ATTEMPTS = 2
+MAX_RECOVERY_REASON_CHARS = 2000
+NO_REASON_TEXT = "rejected without a reason"
+UNRECORDED_DISPATCH_REASON = (
+    "the previous coder follow-up response was not recorded (rejected or interrupted)"
+)
+REVIEW_UNRECORDED_HEAD_HINT = (
+    "Rerun with `--review-unrecorded-head` to run an ordinary review round of the "
+    "current head from the recorded items."
+)
+
+
+def sanitize_recovery_reason(value: object) -> str:
+    """Bound and redact a rejection reason before it is persisted or prompted."""
+    text = value if isinstance(value, str) else str(value)
+    text = sanitize_historical_text(text)
+    # A reason is quoted into a public comment and a prompt: it must never carry
+    # an HTML-comment protocol marker of its own.
+    text = HTML_COMMENT_RE.sub("[comment removed]", text)
+    text = _PLAN_VALIDATION_SENSITIVE_RE.sub("[redacted]", text)
+    text = "".join(
+        character for character in text if character in "\n\r\t" or ord(character) >= 32
+    ).strip()
+    if not text:
+        return NO_REASON_TEXT
+    if len(text) > MAX_RECOVERY_REASON_CHARS:
+        text = text[: MAX_RECOVERY_REASON_CHARS - 3].rstrip() + "..."
+    return text
+
+
+@dataclass(frozen=True)
+class RecoveryRoundBudget:
+    """Bounded round budget carried by a recovery record."""
+
+    allowed_rounds: int
+    watch_failure_extension_used: bool
+    watch_head_extension_used: bool
+    valid: bool = True
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "allowed_rounds": self.allowed_rounds,
+            "watch_failure_extension_used": self.watch_failure_extension_used,
+            "watch_head_extension_used": self.watch_head_extension_used,
+        }
+
+    @classmethod
+    def invalid(cls) -> "RecoveryRoundBudget":
+        return cls(0, False, False, valid=False)
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "RecoveryRoundBudget":
+        if not isinstance(value, Mapping):
+            return cls.invalid()
+        allowed = value.get("allowed_rounds")
+        failure = value.get("watch_failure_extension_used")
+        head = value.get("watch_head_extension_used")
+        if (
+            isinstance(allowed, bool)
+            or not isinstance(allowed, int)
+            or allowed < 1
+            or not isinstance(failure, bool)
+            or not isinstance(head, bool)
+        ):
+            return cls.invalid()
+        return cls(allowed, failure, head)
+
+    @classmethod
+    def from_checkpoint(
+        cls, checkpoint: "QualificationCheckpoint | None"
+    ) -> "RecoveryRoundBudget | None":
+        if checkpoint is None:
+            return None
+        if not checkpoint.valid:
+            return cls.invalid()
+        return cls(
+            checkpoint.allowed_rounds,
+            checkpoint.watch_failure_extension_used,
+            checkpoint.watch_head_extension_used,
+        )
+
+
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
+    """Names of the fields that make a recovery record structurally invalid.
+
+    Rules are per phase; no head rule is shared across phases.  An empty tuple
+    means valid.  Callers must run this before reading any recovery field.
+    """
+    phase = metadata.phase
+    problems: list[str] = []
+    budget = metadata.recovery_round_budget
+    budget_ok = budget is not None and budget.valid
+    if phase in {CODER_DISPATCH_PHASE, CODER_FOLLOWUP_REJECTED_PHASE}:
+        if not _is_positive_int(metadata.dispatch_round):
+            problems.append("dispatch_round")
+        if not metadata.dispatch_head:
+            problems.append("dispatch_head")
+        attempt = metadata.dispatch_attempt
+        if not _is_positive_int(attempt) or attempt > MAX_REJECTED_DISPATCH_ATTEMPTS:
+            problems.append("dispatch_attempt")
+        if not isinstance(metadata.recovery_dispatch, bool) or (
+            _is_positive_int(attempt)
+            and metadata.recovery_dispatch != (attempt > 1)
+        ):
+            problems.append("recovery_dispatch")
+        if not budget_ok:
+            problems.append("recovery_round_budget")
+        if phase == CODER_DISPATCH_PHASE:
+            if not metadata.dispatch_head or metadata.subject != metadata.dispatch_head:
+                problems.append("subject")
+            if not _is_positive_int(metadata.dispatch_round) or (
+                metadata.round_number != metadata.dispatch_round + 1
+            ):
+                problems.append("round_number")
+        else:
+            if not metadata.subject or metadata.subject == "unknown":
+                problems.append("subject")
+            if (
+                not metadata.rejected_coder_followup_from_head
+                or metadata.rejected_coder_followup_from_head != metadata.dispatch_head
+            ):
+                problems.append("rejected_coder_followup_from_head")
+            if not metadata.rejected_coder_followup_reason:
+                problems.append("rejected_coder_followup_reason")
+            if not _is_positive_int(metadata.dispatch_round) or (
+                metadata.round_number != metadata.dispatch_round
+            ):
+                problems.append("round_number")
+    elif phase == HEAD_REVIEW_RECOVERY_PHASE:
+        if metadata.head_review_recovery_source not in HEAD_REVIEW_RECOVERY_SOURCES:
+            problems.append("head_review_recovery_source")
+        if not budget_ok:
+            problems.append("recovery_round_budget")
+        if not _is_positive_int(metadata.round_number):
+            problems.append("round_number")
+    return tuple(problems)
+
+
+def _decode_recovery_fields(payload: Mapping[str, object]) -> dict[str, object]:
+    """Decode the optional #1292 recovery fields; a malformed one is absent."""
+    fields: dict[str, object] = {}
+    for key in ("dispatch_round", "dispatch_attempt"):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            fields[key] = value
+    for key in (
+        "dispatch_head",
+        "rejected_coder_followup_reason",
+        "rejected_coder_followup_from_head",
+        "head_review_recovery_source",
+    ):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            fields[key] = value
+    if isinstance(payload.get("recovery_dispatch"), bool):
+        fields["recovery_dispatch"] = payload["recovery_dispatch"]
+    reasons = payload.get("carried_rejection_reasons")
+    if isinstance(reasons, list) and all(isinstance(item, str) for item in reasons):
+        fields["carried_rejection_reasons"] = tuple(
+            sanitize_recovery_reason(item)
+            for item in reasons[:MAX_REJECTED_DISPATCH_ATTEMPTS]
+        )
+    if "recovery_round_budget" in payload:
+        fields["recovery_round_budget"] = RecoveryRoundBudget.from_mapping(
+            payload["recovery_round_budget"]
+        )
+    return fields
+
+
+def _encode_recovery_fields(metadata: PostedRoundMetadata) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    for key in (
+        "dispatch_round",
+        "dispatch_head",
+        "dispatch_attempt",
+        "recovery_dispatch",
+        "rejected_coder_followup_reason",
+        "rejected_coder_followup_from_head",
+        "head_review_recovery_source",
+    ):
+        value = getattr(metadata, key)
+        if value is not None:
+            payload[key] = value
+    if metadata.carried_rejection_reasons:
+        payload["carried_rejection_reasons"] = list(metadata.carried_rejection_reasons)
+    if metadata.recovery_round_budget is not None:
+        payload["recovery_round_budget"] = (
+            metadata.recovery_round_budget.as_dict()
+            if metadata.recovery_round_budget.valid
+            else {"allowed_rounds": 0}
+        )
+    return payload
+
+
 def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
     payload = {
         "flow": metadata.flow,
@@ -2438,6 +2670,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["evidence_release"] = metadata.evidence_release.as_dict()
     if metadata.evidence_clearances:
         payload["evidence_clearances"] = [list(pair) for pair in metadata.evidence_clearances]
+    payload.update(_encode_recovery_fields(metadata))
     return encode_mapping(payload)
 
 
@@ -2845,6 +3078,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             ),
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
             plan_execution_mode=_decode_execution_mode(payload.get("plan_execution_mode")),
+            **_decode_recovery_fields(payload),
             **_decode_step_back_fields(payload),
             **_decode_evidence_fields(payload),
             **_decode_matrix_evidence_full_round(payload),
@@ -3410,6 +3644,16 @@ def _plan_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
     )
 
 
+PR_PRE_RECONCILIATION_PHASES = frozenset(
+    {
+        "scheduler-prelaunch",
+        CODER_DISPATCH_PHASE,
+        CODER_FOLLOWUP_REJECTED_PHASE,
+        HEAD_REVIEW_RECOVERY_PHASE,
+    }
+)
+
+
 def _pr_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
     """True when the PR round holds an actual reconciliation summary.
 
@@ -3419,7 +3663,7 @@ def _pr_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
     """
     return any(
         record.metadata.role == "summary"
-        and record.metadata.phase != "scheduler-prelaunch"
+        and record.metadata.phase not in PR_PRE_RECONCILIATION_PHASES
         for record in records
     )
 
@@ -3439,7 +3683,7 @@ def _active_pr_items(items: Sequence[UnresolvedReviewItem]) -> list[UnresolvedRe
 
 
 def _latest_qualification_checkpoint(
-    records: Sequence[PostedRoundRecord], *, head_sha: str
+    records: Sequence[PostedRoundRecord], *, head_sha: str, min_index: int = -1
 ) -> QualificationCheckpoint | None:
     """Return the newest checkpoint bound to the live head.
 
@@ -3448,6 +3692,8 @@ def _latest_qualification_checkpoint(
     treating malformed persistence as an absent, safe-to-merge state.
     """
     for record in reversed(records):
+        if record.index <= min_index:
+            break
         checkpoint = record.metadata.qualification_checkpoint
         if checkpoint is not None and record.metadata.subject == head_sha:
             return checkpoint
@@ -3455,7 +3701,7 @@ def _latest_qualification_checkpoint(
 
 
 def _latest_qualification_checkpoint_record(
-    records: Sequence[PostedRoundRecord], *, head_sha: str
+    records: Sequence[PostedRoundRecord], *, head_sha: str, min_index: int = -1
 ) -> PostedRoundRecord | None:
     """Return the metadata record that anchors the latest qualification checkpoint.
 
@@ -3466,6 +3712,8 @@ def _latest_qualification_checkpoint_record(
     that summary as a durable round anchor.
     """
     for record in reversed(records):
+        if record.index <= min_index:
+            break
         if (
             record.metadata.subject == head_sha
             and record.metadata.qualification_checkpoint is not None
@@ -3808,13 +4056,308 @@ def _evidence_boundary_ledger(
     )
 
 
+class _RecoveryRefusal(AgentLoopError):
+    """A refusal ``--review-unrecorded-head`` is allowed to override (#1292)."""
+
+
+def _strip_bot_suffix(login: object) -> object:
+    if isinstance(login, str) and login.endswith("[bot]"):
+        return login[: -len("[bot]")]
+    return login
+
+
+def _recovery_record_admitted(
+    record: PostedRoundRecord,
+    comments: Sequence[object],
+    trusted_actor: tuple[str, int] | None,
+) -> bool:
+    """True only when the authenticated GitHub actor authored ``record``.
+
+    Round metadata is not authenticated in general; this check applies only to
+    the record kinds and anchor branch added by #1292.
+    """
+    if trusted_actor is None:
+        return False
+    login, actor_id = trusted_actor
+    if not 0 <= record.index < len(comments):
+        return False
+    comment = comments[record.index]
+    author_id = getattr(comment, "author_id", None)
+    return (
+        isinstance(author_id, int)
+        and not isinstance(author_id, bool)
+        and author_id == actor_id
+        and _strip_bot_suffix(getattr(comment, "author", None)) == _strip_bot_suffix(login)
+    )
+
+
+def _admit_recovery_records(
+    records: Sequence[PostedRoundRecord],
+    comments: Sequence[object],
+    trusted_actor: tuple[str, int] | None,
+) -> tuple[PostedRoundRecord, ...]:
+    """Drop new-phase records the authenticated actor did not author."""
+    return tuple(
+        record
+        for record in records
+        if record.metadata.phase not in RECOVERY_RECORD_PHASES
+        or _recovery_record_admitted(record, comments, trusted_actor)
+    )
+
+
+def pr_resume_needs_author_admission(
+    comments: Sequence[object],
+    head_sha: str | None,
+    review_unrecorded_head: bool = False,
+) -> bool:
+    """Whether resuming needs REST identities and the authenticated actor."""
+    if review_unrecorded_head:
+        return True
+    records = _extract_round_metadata_records(comments, flow="pr")
+    if any(record.metadata.phase in RECOVERY_RECORD_PHASES for record in records):
+        return True
+    return bool(
+        records
+        and head_sha
+        and not any(record.metadata.subject == head_sha for record in records)
+    )
+
+
+def _coder_handoff_is_live(
+    records: Sequence[PostedRoundRecord], handoff: PostedRoundRecord
+) -> bool:
+    """A coder-recovery handoff is retired by any later coder, reviewer or review handoff."""
+    for record in records:
+        if record.index <= handoff.index:
+            continue
+        metadata = record.metadata
+        if metadata.role in {"coder", "reviewer"} or metadata.phase == HEAD_REVIEW_RECOVERY_PHASE:
+            return False
+    return True
+
+
+def _head_review_handoff_is_live(
+    records: Sequence[PostedRoundRecord], handoff: PostedRoundRecord
+) -> bool:
+    """A head-review handoff is retired by a later coder/reviewer record or reconciliation on its subject."""
+    for record in records:
+        if record.index <= handoff.index or record.metadata.subject != handoff.metadata.subject:
+            continue
+        metadata = record.metadata
+        if metadata.role in {"coder", "reviewer"}:
+            return False
+        if (
+            metadata.role == "summary"
+            and metadata.round_number == handoff.metadata.round_number
+            and (
+                metadata.phase in {"reconciliation", "authoritative"}
+                or metadata.phase in EVIDENCE_TERMINAL_PHASES
+            )
+        ):
+            return False
+    return True
+
+
+def _live_recovery_handoff(
+    records: Sequence[PostedRoundRecord], subject: str, *, head_moved: bool
+) -> PostedRoundRecord | None:
+    """The newest live recovery handoff on ``subject``, validated before any field is read.
+
+    Candidacy and liveness use only fields that always decode (index, phase,
+    subject, role, core round).  A structurally invalid live candidate raises
+    before any agent call.  Only a valid first-attempt dispatch on the current
+    head is skipped, because ordinary resume must behave as it did before.
+    """
+    candidates: list[PostedRoundRecord] = []
+    for record in records:
+        metadata = record.metadata
+        if metadata.subject != subject:
+            continue
+        if metadata.phase in {CODER_DISPATCH_PHASE, CODER_FOLLOWUP_REJECTED_PHASE}:
+            if _coder_handoff_is_live(records, record):
+                candidates.append(record)
+        elif metadata.phase == HEAD_REVIEW_RECOVERY_PHASE:
+            if _head_review_handoff_is_live(records, record):
+                candidates.append(record)
+    for record in reversed(candidates):
+        problems = _recovery_record_problems(record.metadata)
+        if problems:
+            raise _RecoveryRefusal(
+                f"Recovery record at comment index {record.index} "
+                f"(phase {record.metadata.phase}) is malformed: {', '.join(problems)}. "
+                "Rerun with --review-unrecorded-head to review the current head."
+            )
+        metadata = record.metadata
+        if (
+            not head_moved
+            and metadata.phase == CODER_DISPATCH_PHASE
+            and metadata.dispatch_attempt == 1
+            and metadata.recovery_dispatch is False
+        ):
+            continue
+        return record
+    return None
+
+
+def _consume_recovery_handoff(
+    records: Sequence[PostedRoundRecord],
+    handoff: PostedRoundRecord,
+    *,
+    head_moved: bool,
+) -> ResumedReviewRound | None:
+    metadata = handoff.metadata
+    next_number = _max_unresolved_item_number_from_records(records) + 1
+    ledger = tuple(_active_pr_items(metadata.prior_items))
+    if metadata.phase == HEAD_REVIEW_RECOVERY_PHASE:
+        if not ledger:
+            return None
+        return ResumedReviewRound(
+            round_number=metadata.round_number,
+            prior_items=ledger,
+            coder_output=None,
+            completed_reviews=(),
+            next_unresolved_item_number=next_number,
+            ledger_may_be_incomplete=True,
+            qualification_checkpoint=None,
+            recovery_round_budget=metadata.recovery_round_budget,
+            head_review_recovery=metadata.head_review_recovery_source,
+            head_review_recovery_post_required=head_moved,
+        )
+    reason = metadata.rejected_coder_followup_reason or UNRECORDED_DISPATCH_REASON
+    carried = (*metadata.carried_rejection_reasons, reason)[-MAX_REJECTED_DISPATCH_ATTEMPTS:]
+    attempt = metadata.dispatch_attempt or 1
+    if attempt >= MAX_REJECTED_DISPATCH_ATTEMPTS:
+        listed = "; ".join(f"({number}) {text}" for number, text in enumerate(carried, 1))
+        raise _RecoveryRefusal(
+            f"Coder recovery stopped after {attempt} consecutive rejected or interrupted "
+            f"follow-up attempts at round {metadata.dispatch_round}. Recorded reasons: {listed}. "
+            + REVIEW_UNRECORDED_HEAD_HINT
+        )
+    if not ledger:
+        return None
+    return ResumedReviewRound(
+        round_number=int(metadata.dispatch_round or metadata.round_number),
+        prior_items=ledger,
+        coder_output=None,
+        completed_reviews=(),
+        next_unresolved_item_number=next_number,
+        ledger_may_be_incomplete=False,
+        unrecorded_head_advance=True,
+        qualification_checkpoint=None,
+        rejected_coder_followup_reason=reason,
+        rejected_coder_followup_from_head=metadata.dispatch_head,
+        dispatch_attempt=attempt,
+        recovery_round_budget=metadata.recovery_round_budget,
+        carried_rejection_reasons=carried,
+    )
+
+
+def _legacy_checkpoint_head_review(
+    anchor: PostedRoundRecord,
+    records: Sequence[PostedRoundRecord],
+    *,
+    comments: Sequence[object],
+    trusted_actor: tuple[str, int] | None,
+) -> ResumedReviewRound | None:
+    """Recover a PR stranded on a pre-handoff qualification checkpoint (#1292).
+
+    The checkpoint may have preceded a coder dispatch or a required head review;
+    legacy records cannot tell which, so both become an ordinary review round of
+    the current head at the anchor's own round.  Only the bounded budget carries.
+    """
+    if not _is_legacy_checkpoint_anchor(anchor, comments, trusted_actor):
+        return None
+    metadata = anchor.metadata
+    ledger = tuple(_active_pr_items(metadata.prior_items))
+    if not ledger:
+        return None
+    return ResumedReviewRound(
+        round_number=metadata.round_number,
+        prior_items=ledger,
+        coder_output=None,
+        completed_reviews=(),
+        next_unresolved_item_number=_max_unresolved_item_number_from_records(records) + 1,
+        ledger_may_be_incomplete=True,
+        unrecorded_head_advance=False,
+        qualification_checkpoint=None,
+        recovery_round_budget=RecoveryRoundBudget.from_checkpoint(
+            metadata.qualification_checkpoint
+        ),
+        head_review_recovery="legacy-checkpoint",
+        head_review_recovery_post_required=True,
+    )
+
+
+def _operator_head_review_resume(
+    walk_records: Sequence[PostedRoundRecord],
+    records: Sequence[PostedRoundRecord],
+) -> ResumedReviewRound | None:
+    """``--review-unrecorded-head``: an ordinary review round of the current head."""
+    if not records:
+        return None
+    latest = records[-1].metadata
+    ledger = _active_pr_items(latest.prior_items)
+    if latest.role in {"reviewer", "summary"}:
+        _append_active_pr_new_items(ledger, (records[-1],))
+    budget: RecoveryRoundBudget | None = None
+    for record in reversed(walk_records):
+        metadata = record.metadata
+        if _recovery_record_problems(metadata):
+            continue
+        if metadata.recovery_round_budget is not None and metadata.recovery_round_budget.valid:
+            budget = metadata.recovery_round_budget
+            break
+        if metadata.qualification_checkpoint is not None:
+            candidate = RecoveryRoundBudget.from_checkpoint(metadata.qualification_checkpoint)
+            if candidate is not None and candidate.valid:
+                budget = candidate
+                break
+    if not ledger:
+        return None
+    return ResumedReviewRound(
+        round_number=latest.round_number,
+        prior_items=tuple(ledger),
+        coder_output=None,
+        completed_reviews=(),
+        next_unresolved_item_number=_max_unresolved_item_number_from_records(walk_records) + 1,
+        ledger_may_be_incomplete=True,
+        qualification_checkpoint=None,
+        recovery_round_budget=budget,
+        head_review_recovery="operator",
+        head_review_recovery_post_required=True,
+    )
+
+
 def _recover_unrecorded_pr_head_advance(
     records: Sequence[PostedRoundRecord],
     *,
     head_sha: str,
     reconciliation_mode: str = "aggregate",
+    walk_records: Sequence[PostedRoundRecord] | None = None,
+    comments: Sequence[object] = (),
+    trusted_actor: tuple[str, int] | None = None,
 ) -> ResumedReviewRound | None:
+    """Recover a head that carries no records of its own.
+
+    ``records`` is the ordinary view (coder-dispatch records excluded);
+    ``walk_records`` additionally holds the admitted dispatch records the
+    recovery-handoff walk inspects.
+    """
     records = _drop_unterminated_evidence_response_records(records)
+    walk_view = (
+        records
+        if walk_records is None
+        else _drop_unterminated_evidence_response_records(walk_records)
+    )
+    prior_walk_records = [
+        record for record in walk_view if record.metadata.subject != head_sha
+    ]
+    if prior_walk_records:
+        handoff = _live_recovery_handoff(
+            walk_view, prior_walk_records[-1].metadata.subject, head_moved=True
+        )
+        if handoff is not None:
+            return _consume_recovery_handoff(walk_view, handoff, head_moved=True)
     prior_records = [record for record in records if record.metadata.subject != head_sha]
     if not prior_records:
         return None
@@ -3920,7 +4463,12 @@ def _recover_unrecorded_pr_head_advance(
         coder_output = None
         compact_prior_summaries = ()
     else:
-        return None
+        return _legacy_checkpoint_head_review(
+            selection.anchor_record,
+            records,
+            comments=comments,
+            trusted_actor=trusted_actor,
+        )
 
     if not recovered_items:
         return None
@@ -3944,7 +4492,26 @@ def _recover_unrecorded_pr_head_advance(
     )
 
 
-def _latest_prior_pr_subject_is_coherent(records: Sequence[PostedRoundRecord], *, head_sha: str) -> bool:
+def _is_legacy_checkpoint_anchor(
+    record: PostedRoundRecord,
+    comments: Sequence[object],
+    trusted_actor: tuple[str, int] | None,
+) -> bool:
+    metadata = record.metadata
+    return (
+        metadata.role == "summary"
+        and metadata.phase == "qualification-checkpoint"
+        and _recovery_record_admitted(record, comments, trusted_actor)
+    )
+
+
+def _latest_prior_pr_subject_is_coherent(
+    records: Sequence[PostedRoundRecord],
+    *,
+    head_sha: str,
+    comments: Sequence[object] = (),
+    trusted_actor: tuple[str, int] | None = None,
+) -> bool:
     prior_records = [record for record in records if record.metadata.subject != head_sha]
     if not prior_records:
         return True
@@ -3956,10 +4523,14 @@ def _latest_prior_pr_subject_is_coherent(records: Sequence[PostedRoundRecord], *
     selection = _select_current_round_records(records, subject=latest_prior_subject)
     if selection is None:
         return False
-    return any(
+    if any(
         record.metadata.role in {"coder", "reviewer"}
         for record in selection.current_round_records
-    )
+    ):
+        return True
+    # An admitted pre-handoff qualification checkpoint is a recoverable anchor
+    # (#1292): the new head gets an ordinary review round of its own.
+    return _is_legacy_checkpoint_anchor(selection.anchor_record, comments, trusted_actor)
 
 
 def _plan_subject(text: str) -> str:
@@ -4467,14 +5038,51 @@ def _resume_pr_round(
     head_sha: str | None,
     configured_reviewers: Sequence[AgentName],
     reconciliation_mode: str = "aggregate",
+    trusted_actor: tuple[str, int] | None = None,
+    review_unrecorded_head: bool = False,
 ) -> ResumedReviewRound | None:
     if not head_sha:
         return None
-    records = _drop_unterminated_evidence_response_records(
+    all_records = _drop_unterminated_evidence_response_records(
         _extract_round_metadata_records(comments, flow="pr")
     )
-    if not records:
+    if not all_records:
         return None
+    # Only authenticated-actor recovery records are admitted; the walk sees the
+    # admitted coder-dispatch records, ordinary selection never does.
+    walk_records = _admit_recovery_records(all_records, comments, trusted_actor)
+    records = tuple(
+        record for record in walk_records if record.metadata.phase != CODER_DISPATCH_PHASE
+    )
+    try:
+        return _resume_pr_round_from_records(
+            comments,
+            walk_records=walk_records,
+            records=records,
+            head_sha=head_sha,
+            configured_reviewers=configured_reviewers,
+            reconciliation_mode=reconciliation_mode,
+            trusted_actor=trusted_actor,
+        )
+    except _RecoveryRefusal:
+        if not review_unrecorded_head:
+            raise
+        return _operator_head_review_resume(walk_records, records)
+
+
+def _resume_pr_round_from_records(
+    comments: Sequence[object],
+    *,
+    walk_records: Sequence[PostedRoundRecord],
+    records: Sequence[PostedRoundRecord],
+    head_sha: str,
+    configured_reviewers: Sequence[AgentName],
+    reconciliation_mode: str,
+    trusted_actor: tuple[str, int] | None,
+) -> ResumedReviewRound | None:
+    handoff = _live_recovery_handoff(walk_records, head_sha, head_moved=False)
+    if handoff is not None:
+        return _consume_recovery_handoff(walk_records, handoff, head_moved=False)
     current_head_records = [record for record in records if record.metadata.subject == head_sha]
     if current_head_records and current_head_records[-1].metadata.phase in EVIDENCE_TERMINAL_PHASES:
         # The latest current-head record is the single freeze or release
@@ -4496,24 +5104,43 @@ def _resume_pr_round(
     selection = _select_current_round_records(records, subject=head_sha)
     if selection is None:
         recovered = _recover_unrecorded_pr_head_advance(
-            records, head_sha=head_sha, reconciliation_mode=reconciliation_mode
+            records,
+            head_sha=head_sha,
+            reconciliation_mode=reconciliation_mode,
+            walk_records=walk_records,
+            comments=comments,
+            trusted_actor=trusted_actor,
         )
         if recovered is not None:
             return recovered
-        if _latest_prior_pr_subject_is_coherent(records, head_sha=head_sha):
+        if _latest_prior_pr_subject_is_coherent(
+            records, head_sha=head_sha, comments=comments, trusted_actor=trusted_actor
+        ):
             return None
         latest_prior_subject = records[-1].metadata.subject
-        raise AgentLoopError(
+        raise _RecoveryRefusal(
             "PR head advanced without a recorded coder follow-up and the metadata-backed "
             "handoff could not be recovered safely. "
             f"Current head: {head_sha}. Latest recorded metadata subject: {latest_prior_subject}. "
-            "Rerun after posting a valid structured coder follow-up for the current head "
-            "or repair the metadata-backed handoff."
+            + REVIEW_UNRECORDED_HEAD_HINT
+            + " Do not hand-author a coder follow-up in the coder's name."
         )
     current_round_records = selection.current_round_records
     anchor_metadata = selection.anchor_record.metadata
+    review_handoff = next(
+        (
+            record
+            for record in reversed(records)
+            if record.metadata.subject == head_sha
+            and record.metadata.phase == HEAD_REVIEW_RECOVERY_PHASE
+            and not _recovery_record_problems(record.metadata)
+        ),
+        None,
+    )
+    # A head-review handoff supersedes every earlier checkpoint on this head.
+    superseded_below = review_handoff.index if review_handoff is not None else -1
     checkpoint_record = _latest_qualification_checkpoint_record(
-        records, head_sha=head_sha
+        records, head_sha=head_sha, min_index=superseded_below
     )
     latest_coder_record = next(
         (
@@ -4571,13 +5198,31 @@ def _resume_pr_round(
             if latest_coder_record is not None
             else ()
         ),
-        reconciled=_pr_round_is_reconciled(current_round_records),
+        reconciled=_pr_round_is_reconciled(
+            tuple(
+                record
+                for record in current_round_records
+                if record.index >= superseded_below
+            )
+        ),
         local_test_evidence=(
             latest_coder_record.metadata.local_test_evidence
             if latest_coder_record is not None
             else None
         ),
-        qualification_checkpoint=_latest_qualification_checkpoint(records, head_sha=head_sha),
+        qualification_checkpoint=_latest_qualification_checkpoint(
+            records, head_sha=head_sha, min_index=superseded_below
+        ),
+        recovery_round_budget=(
+            review_handoff.metadata.recovery_round_budget
+            if review_handoff is not None
+            else None
+        ),
+        head_review_recovery=(
+            review_handoff.metadata.head_review_recovery_source
+            if review_handoff is not None
+            else None
+        ),
     )
 
 

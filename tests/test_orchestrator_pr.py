@@ -7978,7 +7978,7 @@ def test_pr_loop_fix_and_summarize_sends_same_pr_followups_to_coder_then_rerevie
 
     agent_commands = [cmd[:2] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
     assert agent_commands == [["codex", "exec"], ["claude", "--print"], ["codex", "exec"]]
-    assert len(runner.comments) == 4
+    assert len(runner.comments) == 5
     followup_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
     assert "requested same-PR follow-ups" in followup_prompt
     assert "remains blocked pending another review round" in followup_prompt
@@ -8319,7 +8319,7 @@ def test_pr_loop_reruns_all_reviewers_when_any_reviewer_blocks(tmp_path):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert len(runner.comments) == 5
+    assert len(runner.comments) == 6
     followup_prompt = next(
         cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"] and "Address the review below" in cmd[-1]
     )
@@ -8560,7 +8560,7 @@ def test_pr_loop_stops_on_incomplete_review_without_coder_followup(tmp_path):
 
     coder_commands = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     assert len(coder_commands) == 1
-    assert len(runner.comments) == 2
+    assert len(runner.comments) == 3
     assert "Review incomplete" not in "\n".join(runner.comments)
 
 
@@ -8747,7 +8747,7 @@ def test_pr_loop_posts_human_readable_item_labels_in_new_and_prior_sections(tmp_
         "<!-- AGENT_STATE: blocking -->\n"
         "-- OpenAI Codex: unknown model (medium)"
     )
-    assert runner.comments[2] == (
+    assert runner.comments[3] == (
         "**Review verdict:** Approved\n\n"
         "Looks good.\n\n"
         "### Prior unresolved item dispositions\n"
@@ -10406,7 +10406,7 @@ def test_pr_loop_rejects_structured_followup_live_target_tests_before_posting(tm
     with pytest.raises(AgentLoopError, match="live remote target"):
         run_pr_loop(runner, pr_number=77, config=config)
 
-    assert len(runner.comments) == 1
+    assert len(runner.comments) == 3
     assert runner.comments[0].startswith("**Review verdict:** Blocking")
     assert not any("Added the test." in comment for comment in runner.comments)
 
@@ -10632,7 +10632,7 @@ def test_run_pr_loop_freeform_coder_followup_includes_model(tmp_path):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     # First PR comment is the reviewer blocking; second is the coder followup
-    followup_body = runner.pr_payload["comments"][1]["body"]
+    followup_body = runner.pr_payload["comments"][2]["body"]
     stripped = _strip_round_metadata(followup_body)
     assert stripped.endswith("-- Anthropic Claude: gpt-5.5 (medium)")
 
@@ -18825,3 +18825,593 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
         assert "CI github-pr-checks" not in by_round.get("Round 3", "")
         assert "repaired-3" not in text
         assert "GitHub PR checks are failing" not in text
+
+
+# --- Coder follow-up rejected after a push (#1292) ---------------------------
+
+_ACTOR_1292 = ("agent-actor", 4242)
+_LIVE_TARGET_FOLLOWUP = structured_coder_followup(
+    summary="Added the test.",
+    addressed_items=["item-1"],
+    tests_run=["pytest tests/test_foo.py https://live.example"],
+    reviewer="OpenAI Codex",
+)
+_VALID_FOLLOWUP = structured_coder_followup(
+    summary="Added the test, in checkout.",
+    addressed_items=["item-1"],
+    tests_run=["pytest tests/test_foo.py"],
+    reviewer="OpenAI Codex",
+)
+
+
+def _records_1292(runner, phase=None):
+    records = []
+    for comment in runner.pr_payload["comments"]:
+        match = re.search(
+            r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_:-]+)\s*-->", comment["body"]
+        )
+        if match is None:
+            continue
+        metadata = _decode_round_metadata(match.group("payload"))
+        if phase is None or metadata.phase == phase:
+            records.append(metadata)
+    return records
+
+
+def _blocking_review_1292(item="Add a regression test."):
+    return structured_pr_review(
+        state="blocking", summary="Needs a test.", blocking_items=[item],
+        reviewer="Anthropic Claude",
+    )
+
+
+def _approving_review_1292():
+    return structured_pr_review(
+        state="approved", summary="Resolved.", reviewer="Anthropic Claude",
+        prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+    )
+
+
+def _rejected_push_runner_1292(*, coder_outputs=(_LIVE_TARGET_FOLLOWUP,), reviews=None, **kwargs):
+    return FakeRunner(
+        claude_outputs=list(reviews or [_blocking_review_1292(), _approving_review_1292()]),
+        codex_outputs=list(coder_outputs),
+        authenticated_actor=_ACTOR_1292,
+        **kwargs,
+    )
+
+
+def _coder_prompts_1292(runner):
+    return [cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]
+
+
+def test_post_push_rejection_records_the_pushed_head_and_resumes_a_coder_recovery(tmp_path):
+    runner = _rejected_push_runner_1292(coder_outputs=[_LIVE_TARGET_FOLLOWUP, _VALID_FOLLOWUP])
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    pushed = runner.pr_payload["headRefOid"]
+    assert pushed != "abc123"
+    (dispatch,) = _records_1292(runner, "coder-dispatch")
+    (rejection,) = _records_1292(runner, "coder-followup-rejected")
+    assert (dispatch.subject, dispatch.dispatch_head, dispatch.dispatch_attempt) == ("abc123", "abc123", 1)
+    assert dispatch.recovery_dispatch is False and dispatch.round_number == 2
+    assert rejection.subject == pushed  # keyed to the pushed head ...
+    assert rejection.dispatch_head == rejection.rejected_coder_followup_from_head == "abc123"
+    assert rejection.round_number == rejection.dispatch_round == 1
+    assert "live remote target" in rejection.rejected_coder_followup_reason
+    assert [item.item_id for item in rejection.prior_items] == ["item-1"]
+    assert rejection.recovery_round_budget.allowed_rounds == config.max_rounds
+    assert not any(record.role == "coder" for record in _records_1292(runner) if record.subject == pushed)
+    assert runner.pr_payload["headRefOid"] == pushed  # no reset or force-push
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    recovery_prompt = _coder_prompts_1292(runner)[1]
+    assert "live remote target" in recovery_prompt
+    assert "attempt 1" in recovery_prompt
+    assert "`abc123`" in recovery_prompt and f"`{pushed}`" in recovery_prompt
+    assert "Nothing from that attempt was reviewed or recorded" in recovery_prompt
+    second_dispatch = _records_1292(runner, "coder-dispatch")[1]
+    assert second_dispatch.dispatch_attempt == 2 and second_dispatch.recovery_dispatch is True
+    assert second_dispatch.dispatch_round == 1  # the original slot
+    assert second_dispatch.carried_rejection_reasons
+    assert any(record.role == "coder" for record in _records_1292(runner))
+    assert [cmd[:1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]  # reviewers ran
+
+
+def test_unchanged_head_first_attempt_rejection_records_nothing_and_resume_is_unchanged(tmp_path):
+    runner = _rejected_push_runner_1292(advance_pr_head_on_coder_followup=False)
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    assert _records_1292(runner, "coder-followup-rejected") == []
+    (dispatch,) = _records_1292(runner, "coder-dispatch")
+    assert dispatch.dispatch_attempt == 1 and dispatch.recovery_dispatch is False
+    resumed = _resume_pr_round(
+        runner.pr_payload["comments"] and [
+            IssueComment(
+                author=_ACTOR_1292[0], created_at=None, body=comment["body"], author_id=_ACTOR_1292[1]
+            )
+            for comment in runner.pr_payload["comments"]
+        ],
+        head_sha="abc123", configured_reviewers=("claude",),
+        trusted_actor=_ACTOR_1292,
+    )
+    # The first-attempt dispatch is ignored: resume is the ordinary checkpoint-free round.
+    assert resumed is None or resumed.rejected_coder_followup_reason is None
+
+
+def test_rejection_record_ledger_is_the_pre_dispatch_snapshot(tmp_path):
+    disputing = structured_coder_followup(
+        summary="Disputed.", disputed_items=["item-1"], dispute_evidence={"item-1": "x"},
+        tests_run=["pytest tests/test_foo.py https://live.example"], reviewer="OpenAI Codex",
+    )
+    runner = _rejected_push_runner_1292(coder_outputs=[disputing])
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    (rejection,) = _records_1292(runner, "coder-followup-rejected")
+    assert [(item.item_id, item.status, item.text) for item in rejection.prior_items] == [
+        ("item-1", "blocking", "Add a regression test.")
+    ]
+
+
+def test_dispatch_record_failure_stops_before_the_coder_runs(tmp_path):
+    runner = _rejected_push_runner_1292()
+    original = runner.run
+
+    def failing_run(cmd, *args, **kwargs):
+        if cmd[:3] == ["gh", "pr", "comment"]:
+            body_path = Path(cmd[cmd.index("--body-file") + 1]) if "--body-file" in cmd else None
+            text = body_path.read_text(encoding="utf-8") if body_path else "\n".join(cmd)
+            if "coder dispatch record" in text:
+                raise AgentLoopError("cannot post")
+        return original(cmd, *args, **kwargs)
+
+    runner.run = failing_run
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    with pytest.raises(AgentLoopError, match="cannot post"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _coder_prompts_1292(runner) == []
+
+
+def test_rejection_record_post_failure_keeps_the_original_error_and_the_attempt_limit(tmp_path):
+    runner = _rejected_push_runner_1292(
+        coder_outputs=[_LIVE_TARGET_FOLLOWUP, _LIVE_TARGET_FOLLOWUP, _VALID_FOLLOWUP],
+        reviews=[_blocking_review_1292(), _approving_review_1292()],
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    original = runner.run
+
+    def failing_run(cmd, *args, **kwargs):
+        if cmd[:3] == ["gh", "pr", "comment"]:
+            body_path = Path(cmd[cmd.index("--body-file") + 1]) if "--body-file" in cmd else None
+            text = body_path.read_text(encoding="utf-8") if body_path else "\n".join(cmd)
+            if "rejected coder follow-up record" in text:
+                raise RuntimeError("rejection post failed")
+        return original(cmd, *args, **kwargs)
+
+    runner.run = failing_run
+    # The attempt-2 rejection cannot be recorded; the original error still surfaces.
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    runner.run = original
+    assert len(_records_1292(runner, "coder-followup-rejected")) == 1
+    # The attempt-2 dispatch record still carries the attempt: resume stops at the limit.
+    with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as raised:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "consecutive" in str(raised.value)
+    assert len(_coder_prompts_1292(runner)) == 2  # no third coder dispatch
+
+
+_A_1292, _B_1292, _C_1292 = "a" * 40, "b" * 40, "c" * 40
+from coding_review_agent_loop.protocol import UnresolvedReviewItem  # noqa: E402
+from coding_review_agent_loop.round_state import RecoveryRoundBudget as _Budget1292  # noqa: E402
+
+
+def _item_1292(number=1, text="Add a regression test."):
+    return UnresolvedReviewItem(
+        item_id=f"item-{number}", reviewer="Anthropic Claude", source_round=1, text=text,
+        status="blocking",
+    )
+
+
+def _meta_1292(role, phase="authoritative", *, subject=_A_1292, round_number=1, items=(),
+               new_items=(), **extra):
+    return PostedRoundMetadata(
+        flow="pr", role=role, agent="Claude" if role != "summary" else "Orchestrator",
+        round_number=round_number, subject=subject, prior_items=tuple(items),
+        new_items=tuple(new_items), state="blocking", phase=phase, **extra,
+    )
+
+
+def _seed_1292(*records, actor=_ACTOR_1292, forged=()):
+    comments = []
+    for index, metadata in enumerate(records):
+        who = ("mallory", 9) if index in forged else actor
+        comments.append(
+            {
+                "author": {"login": who[0]},
+                "_rest_author_id": who[1],
+                "createdAt": f"2026-05-20T09:{index:02d}:00Z",
+                "body": _attach_round_metadata("record\n-- Orchestrator", metadata),
+            }
+        )
+    return comments
+
+
+def _history_1292():
+    """A round-1 coder and a reviewer round on head A that raised item-1."""
+    return [
+        _meta_1292("coder"),
+        _meta_1292("reviewer", new_items=(_item_1292(),)),
+    ]
+
+
+def _dispatch_1292(subject=_A_1292, attempt=1, budget=None, **extra):
+    values = dict(
+        dispatch_round=1, dispatch_head=subject, dispatch_attempt=attempt,
+        recovery_dispatch=attempt > 1, recovery_round_budget=budget or _Budget1292(5, False, False),
+    )
+    values.update(extra)
+    return _meta_1292(
+        "summary", "coder-dispatch", subject=subject, round_number=2, items=(_item_1292(),),
+        **values,
+    )
+
+
+def _rejection_1292(subject=_B_1292, attempt=1, budget=None, reason="live remote target", **extra):
+    values = dict(
+        dispatch_round=1, dispatch_head=_A_1292, dispatch_attempt=attempt,
+        recovery_dispatch=attempt > 1, rejected_coder_followup_reason=reason,
+        rejected_coder_followup_from_head=_A_1292,
+        recovery_round_budget=budget or _Budget1292(5, False, False),
+    )
+    values.update(extra)
+    return _meta_1292(
+        "summary", "coder-followup-rejected", subject=subject, round_number=1,
+        items=(_item_1292(),), **values,
+    )
+
+
+def _handoff_1292(subject=_B_1292, round_number=1, source="operator", budget=None):
+    return _meta_1292(
+        "summary", "head-review-recovery", subject=subject, round_number=round_number,
+        items=(_item_1292(),), head_review_recovery_source=source,
+        recovery_round_budget=budget or _Budget1292(5, False, False),
+    )
+
+
+def _checkpoint_1292(subject=_A_1292, lifecycle="repair_required"):
+    return _meta_1292(
+        "summary", "qualification-checkpoint", subject=subject, round_number=2,
+        items=(_item_1292(),),
+        qualification_checkpoint=QualificationCheckpoint(
+            obligation_kind="managed-exact-head-ci", obligation_identity="ci",
+            lifecycle=lifecycle, failed_head_sha=_A_1292,
+            candidate_head_sha=_B_1292 if lifecycle == "awaiting_current_head_review" else None,
+            allowed_rounds=5, watch_failure_extension_used=False, watch_head_extension_used=False,
+        ),
+    )
+
+
+def _stranded_runner_1292(records, head, *, forged=(), **kwargs):
+    outputs = kwargs.pop("codex_outputs", None)
+    return FakeRunner(
+        codex_outputs=outputs if outputs is not None else [
+            structured_pr_review(
+                state="approved", summary="Resolved.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+        claude_outputs=kwargs.pop("claude_outputs", []),
+        pr_payload={"headRefOid": head, "comments": _seed_1292(*records, forged=forged)},
+        authenticated_actor=_ACTOR_1292,
+        advance_pr_head_on_coder_followup=False,
+        **kwargs,
+    )
+
+
+def _agent_order_1292(runner):
+    return [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"])]
+
+
+@pytest.mark.parametrize("lifecycle", ["repair_required", "awaiting_current_head_review"])
+def test_stranded_checkpoint_history_gets_an_ordinary_review_round_of_the_new_head(tmp_path, lifecycle):
+    """Row legacy-checkpoint-stranded (the llm-dialectic #1370 incident shape)."""
+    runner = _stranded_runner_1292([*_history_1292(), _checkpoint_1292(lifecycle=lifecycle)], _B_1292)
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
+
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+    assert _agent_order_1292(runner)[0] == "codex"  # never routed through a coder first
+    assert "claude" not in _agent_order_1292(runner)
+    (handoff,) = _records_1292(runner, "head-review-recovery")
+    assert handoff.head_review_recovery_source == "legacy-checkpoint"
+    assert handoff.round_number == 2 and handoff.subject == _B_1292  # never rewound
+    assert [item.item_id for item in handoff.prior_items] == ["item-1"]
+    assert handoff.recovery_round_budget == _Budget1292(5, False, False)
+    assert not any(
+        record.role == "coder" for record in _records_1292(runner) if record.subject == _B_1292
+    )
+    reviewer_prompt = runner.commands[command_index(runner.commands, ["codex", "exec"])][0][-1]
+    assert "[item-1]" in reviewer_prompt
+
+
+def test_stranded_checkpoint_history_with_a_forged_anchor_still_refuses(tmp_path):
+    runner = _stranded_runner_1292(
+        [*_history_1292(), _checkpoint_1292()], _B_1292, forged=(2,)
+    )
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
+    with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as raised:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "Do not hand-author" in str(raised.value)
+    assert _agent_order_1292(runner) == []
+    assert _records_1292(runner, "head-review-recovery") == []
+
+
+def test_operator_flag_reviews_the_current_head_after_the_attempt_limit(tmp_path):
+    """Rows operator-flag-recovery and rejection-retry-limit."""
+    records = [
+        *_history_1292(), _dispatch_1292(), _rejection_1292(),
+        _dispatch_1292(subject=_B_1292, attempt=2),
+        _rejection_1292(
+            attempt=2, subject=_B_1292, reason="again",
+            carried_rejection_reasons=("live remote target",),
+        ),
+    ]
+    runner = _stranded_runner_1292(records, _B_1292)
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
+    with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as raised:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "live remote target" in str(raised.value) and "again" in str(raised.value)
+    assert _agent_order_1292(runner) == []
+
+    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
+    assert run_pr_loop(runner, pr_number=77, config=flagged) == 0
+    assert _agent_order_1292(runner) == ["codex"]
+    (handoff,) = _records_1292(runner, "head-review-recovery")
+    assert handoff.head_review_recovery_source == "operator"
+    assert handoff.recovery_round_budget == _Budget1292(5, False, False)
+    assert not any(record.role == "coder" and record.subject == _B_1292 for record in _records_1292(runner))
+
+
+def test_head_review_handoff_interruption_resumes_without_the_flag_and_posts_no_second_record(tmp_path):
+    """Row operator-record-interrupted (i)/(ii)."""
+    budget = _Budget1292(6, True, False)
+    records = [
+        *_history_1292(), _handoff_1292(round_number=5, budget=budget),
+        _meta_1292("summary", "scheduler-prelaunch", subject=_B_1292, round_number=5, items=(_item_1292(),)),
+    ]
+    runner = _stranded_runner_1292(records, _B_1292)
+    config = make_config(tmp_path, reviewer="codex", coder="claude", max_rounds=5)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _agent_order_1292(runner) == ["codex"]
+    assert len(_records_1292(runner, "head-review-recovery")) == 1  # the original handoff
+    reconciled = [
+        record for record in _records_1292(runner)
+        if record.role == "reviewer" and record.subject == _B_1292
+    ]
+    assert reconciled and all(record.round_number == 5 for record in reconciled)
+
+
+def test_head_review_handoff_survives_a_further_head_advance(tmp_path):
+    """Row resume-after-rejection variant (ii)."""
+    budget = _Budget1292(5, False, False)
+    records = [*_history_1292(), _handoff_1292(round_number=2, budget=budget)]
+    runner = _stranded_runner_1292(records, _C_1292)
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    new_handoffs = [r for r in _records_1292(runner, "head-review-recovery") if r.subject == _C_1292]
+    assert len(new_handoffs) == 1 and new_handoffs[0].round_number == 2
+    assert [item.item_id for item in new_handoffs[0].prior_items] == ["item-1"]
+    assert _agent_order_1292(runner) == ["codex"]
+
+
+def test_rejection_survives_a_further_head_advance_and_keeps_its_attempt(tmp_path):
+    """Row resume-after-rejection variant (i)."""
+    records = [*_history_1292(), _dispatch_1292(), _rejection_1292()]
+    runner = FakeRunner(
+        claude_outputs=[_approving_review_1292()],
+        codex_outputs=[_LIVE_TARGET_FOLLOWUP],
+        pr_payload={"headRefOid": _C_1292, "comments": _seed_1292(*records)},
+        authenticated_actor=_ACTOR_1292,
+        advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    prompt = _coder_prompts_1292(runner)[0]
+    assert f"`{_A_1292}`" in prompt and f"`{_C_1292}`" in prompt
+    assert "live remote target" in prompt and "attempt 1" in prompt
+    (second_dispatch,) = [r for r in _records_1292(runner, "coder-dispatch") if r.dispatch_attempt == 2]
+    assert second_dispatch.recovery_dispatch is True and second_dispatch.dispatch_round == 1
+    # The unchanged-head rejection of the recovery is recorded; a rerun stops at the limit.
+    assert [r.dispatch_attempt for r in _records_1292(runner, "coder-followup-rejected")][-1] == 2
+    with pytest.raises(AgentLoopError, match="--review-unrecorded-head"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_coder_prompts_1292(runner)) == 1
+
+
+def test_last_round_rejection_after_a_watcher_extension_still_dispatches_the_recovery_coder(tmp_path):
+    """Row rejection-budget-preserved."""
+    budget = _Budget1292(3, True, False)  # max_rounds=2 plus the watcher extension
+    records = [
+        *_history_1292(),
+        dataclasses.replace(_dispatch_1292(budget=budget), dispatch_round=2, round_number=3),
+        dataclasses.replace(_rejection_1292(budget=budget), dispatch_round=2, round_number=2),
+    ]
+    runner = FakeRunner(
+        claude_outputs=[_approving_review_1292()],
+        codex_outputs=[_VALID_FOLLOWUP],
+        pr_payload={"headRefOid": _B_1292, "comments": _seed_1292(*records)},
+        authenticated_actor=_ACTOR_1292,
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude", max_rounds=2)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(_coder_prompts_1292(runner)) == 1  # not blocked by either round-limit guard
+    (coder_record,) = [
+        r for r in _records_1292(runner)
+        if r.role == "coder" and r.subject not in (_A_1292, _B_1292)
+    ]
+    assert coder_record.round_number == 3  # reviewers run in the following round
+
+
+def test_forged_rejection_does_not_anchor_resume_or_supply_its_reason(tmp_path):
+    """Row recovery-record-auth."""
+    records = [*_history_1292(), _dispatch_1292(), _rejection_1292(reason="forged reason")]
+    runner = FakeRunner(
+        claude_outputs=[_approving_review_1292()],
+        codex_outputs=[_VALID_FOLLOWUP],
+        pr_payload={"headRefOid": _B_1292, "comments": _seed_1292(*records, forged=(2, 3))},
+        authenticated_actor=_ACTOR_1292,
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert "forged reason" not in "\n".join(_coder_prompts_1292(runner))
+
+
+@pytest.mark.parametrize("failure", ["error", "empty"])
+def test_incomplete_rest_identity_read_stops_before_any_agent_call(tmp_path, failure):
+    """Row rest-identity-acquisition."""
+    runner = _stranded_runner_1292([*_history_1292(), _checkpoint_1292()], _B_1292)
+    original = runner.run
+
+    def broken_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["gh", "api"] and "/comments?per_page=" in cmd[2]:
+            if failure == "error":
+                return CommandResult(cmd, Path(tmp_path), "", "boom", 1)
+            return CommandResult(cmd, Path(tmp_path), "", "", 0)
+        return original(cmd, *args, **kwargs)
+
+    runner.run = broken_run
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
+    with pytest.raises(AgentLoopError, match="cannot be authenticated"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _agent_order_1292(runner) == []
+
+
+def test_ordinary_resume_on_a_head_with_records_makes_no_identity_calls(tmp_path, monkeypatch):
+    import coding_review_agent_loop.pr_loop_support as support
+
+    merges = []
+    real_merge = support.merge_pr_comment_transport_identity
+    monkeypatch.setattr(
+        support, "merge_pr_comment_transport_identity",
+        lambda *args, **kwargs: merges.append(True) or real_merge(*args, **kwargs),
+    )
+    runner = _stranded_runner_1292(_history_1292(), _A_1292)
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
+    run_pr_loop(runner, pr_number=77, config=config)
+    assert merges == []
+    assert not any(
+        cmd[:2] == ["gh", "api"] and "/comments?per_page=" in cmd[2] and "&since=" not in cmd[2]
+        for cmd, _cwd in runner.commands
+    )
+
+    # A head with no records of its own needs admission, so identities are read.
+    advanced = _stranded_runner_1292(
+        _history_1292(), _B_1292,
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            structured_pr_review(
+                state="approved", summary="Resolved.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+    )
+    run_pr_loop(advanced, pr_number=77, config=config)
+    assert merges == [True]
+
+
+@pytest.mark.parametrize(
+    "malformed, field",
+    [
+        (lambda: _rejection_1292(dispatch_attempt=None), "dispatch_attempt"),
+        (lambda: _rejection_1292(dispatch_round=None), "dispatch_round"),
+        (lambda: _dispatch_1292(subject=_B_1292, attempt=2, recovery_dispatch=False), "recovery_dispatch"),
+    ],
+)
+def test_malformed_live_recovery_record_stops_before_any_agent_call_and_the_flag_recovers(
+    tmp_path, malformed, field
+):
+    """Row metadata-compat on the production resume path."""
+    record = malformed()
+    head = record.subject
+    runner = _stranded_runner_1292([*_history_1292(), record], head)
+    config = make_config(tmp_path, reviewer="codex", coder="claude")
+    with pytest.raises(AgentLoopError, match=rf"comment index 2 .*malformed.*{field}"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _agent_order_1292(runner) == []
+
+    flagged = make_config(tmp_path, reviewer="codex", coder="claude", review_unrecorded_head=True)
+    assert run_pr_loop(runner, pr_number=77, config=flagged) == 0
+    (handoff,) = _records_1292(runner, "head-review-recovery")
+    assert handoff.recovery_round_budget.allowed_rounds == flagged.max_rounds  # default budget
+    # The posted handoff retires the malformed record: a later restart is not blocked.
+    again = _stranded_runner_1292([], head)
+    again.pr_payload["comments"] = runner.pr_payload["comments"]
+    resumed = _resume_pr_round(
+        [
+            IssueComment(author=_ACTOR_1292[0], created_at=None, body=c["body"], author_id=_ACTOR_1292[1])
+            for c in runner.pr_payload["comments"]
+        ],
+        head_sha=head, configured_reviewers=("codex",), trusted_actor=_ACTOR_1292,
+    )
+    assert resumed is None or resumed.rejected_coder_followup_reason is None
+
+
+def test_recovery_rejected_without_a_push_then_operator_recovery_and_interruption(tmp_path):
+    """Rows recovery-rejected-no-push and rejection-superseded (the full chain)."""
+    runner = _rejected_push_runner_1292(
+        coder_outputs=[_LIVE_TARGET_FOLLOWUP, _LIVE_TARGET_FOLLOWUP],
+        reviews=[_blocking_review_1292()],
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    pushed = runner.pr_payload["headRefOid"]
+
+    runner.advance_pr_head_on_coder_followup = False  # the recovery coder does not push
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    second = _records_1292(runner, "coder-followup-rejected")[-1]
+    assert second.subject == second.dispatch_head == second.rejected_coder_followup_from_head == pushed
+    assert second.dispatch_attempt == 2 and second.recovery_dispatch is True
+
+    with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as limit:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert "consecutive" in str(limit.value)
+    assert len(_coder_prompts_1292(runner)) == 2  # the limit stops a third dispatch
+
+    flagged = make_config(tmp_path, coder="codex", reviewer="claude", review_unrecorded_head=True)
+    runner.claude_outputs.clear()  # interrupt right after the handoff: no reviewer output
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=flagged)
+    (handoff,) = _records_1292(runner, "head-review-recovery")
+    assert handoff.subject == pushed and handoff.head_review_recovery_source == "operator"
+
+    runner.claude_outputs.append(_approving_review_1292())
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0  # no flag needed
+    assert len(_records_1292(runner, "head-review-recovery")) == 1  # resumed from the handoff
+    assert len(_coder_prompts_1292(runner)) == 2  # no further coder dispatch
+
+
+def test_review_unrecorded_head_flag_parses_on_pr_only_and_defaults_off(tmp_path):
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.config import config_from_args
+
+    parser = build_parser()
+    base = ["pr", "123", "--repo", "OWNER/REPO", "--codex-dir", str(tmp_path / "codex")]
+    assert config_from_args(parser.parse_args(base), FakeRunner()).review_unrecorded_head is False
+    flagged = parser.parse_args([*base, "--review-unrecorded-head"])
+    assert config_from_args(flagged, FakeRunner()).review_unrecorded_head is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(["issue", "5", "--repo", "OWNER/REPO", "--review-unrecorded-head"])
