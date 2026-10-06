@@ -120,7 +120,7 @@ from .architecture_contract import (
     _surface_decomposition_degradations,
     _surface_refused_decomposition,
 )
-from .risk_coverage_map import coverage_map_applies
+from .risk_coverage_map import coverage_map_applies, render_coverage_map
 from .validated_agent import (
     CompletionRecoveryPolicy,
     _run_validated_agent,
@@ -940,6 +940,16 @@ def _implement_approved_issue(
         usage_context=usage_context,
         pre_review_test_pending=True,
         managed_ci_handoff=managed_ci_handoff,
+        # The orchestrator's own rendering of the final assessment, carried
+        # directly so round 1 never depends on re-parsing the stored comment.
+        initial_coverage_map=(
+            render_coverage_map(
+                final_coverage_assessment,
+                reask_used=coverage_reask_used,
+                discard_note=coverage_discard_note,
+            )
+            or None
+        ),
     )
 
 

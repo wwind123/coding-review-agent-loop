@@ -446,6 +446,7 @@ def run_pr_loop(
     pre_review_test_pending: bool = False,
     managed_pr_origin: tuple[str, str, str, str | None] | None = None,
     managed_ci_handoff: AuthenticatedIssueCreatedHandoff | None = None,
+    initial_coverage_map: str | None = None,
     managed_ci_issue_number: int | None = None,
 ) -> int:
     owned_usage_context = usage_context is None
@@ -2092,12 +2093,25 @@ def run_pr_loop(
             # A stored comment may predate the rendering boundary, so the map is
             # restored only for an applicable matrix and only when unambiguous.
             latest_coder_coverage_map = (
+                initial_coverage_map
+                if initial_coverage_map
+                and resumed_round.coder_metadata is not None
+                and resumed_round.coder_metadata.round_number == 1
+                else None
+            ) or (
                 extract_coverage_map_section(
                     resumed_round.coder_comment_body,
                     expected_revision=(
                         resumed_round.coder_metadata.subject
                         if resumed_round.coder_metadata is not None else None
                     ),
+                    # The coder's persisted response must not name the heading:
+                    # otherwise the stored section may be coder-authored prose.
+                    coder_response=(
+                        resumed_round.coder_metadata.raw_structured_coder_response
+                        if resumed_round.coder_metadata is not None else None
+                    ),
+                    require_coder_clean=True,
                 )
                 if coverage_map_applies(approved_plan_context)
                 else None

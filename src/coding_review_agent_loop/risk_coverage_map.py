@@ -17,6 +17,7 @@ never persisted as authority.
 
 from __future__ import annotations
 
+import json
 import posixpath
 import re
 import subprocess
@@ -423,8 +424,45 @@ _STATUS_RE = re.compile(
 )
 
 
+def coder_response_names_coverage_heading(raw: str | None) -> bool:
+    """True when a stored coder response could have authored a coverage heading.
+
+    Fails closed: an empty, unparseable or non-object response, or any decoded
+    string (summary, notes, evidence) naming the heading phrase, counts as
+    possible coder authorship.  The orchestrator's own section never appears in
+    the coder's persisted response, so this separates coder prose from the
+    genuine section without any new persisted field (#1290).
+    """
+    if not raw or not raw.strip():
+        return True
+    if _COVERAGE_HEADING_RE.search(raw):
+        return True
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(raw.lstrip())
+    except (ValueError, TypeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    pending: list[object] = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, str):
+            if _COVERAGE_HEADING_RE.search(value):
+                return True
+        elif isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, (list, tuple)):
+            pending.extend(value)
+    return False
+
+
 def extract_coverage_map_section(
-    body: str | None, *, expected_revision: str | None = None
+    body: str | None,
+    *,
+    expected_revision: str | None = None,
+    coder_response: str | None = None,
+    require_coder_clean: bool = False,
 ) -> str | None:
     """Return the orchestrator-authored coverage-map section of a stored round comment.
 
@@ -436,6 +474,8 @@ def extract_coverage_map_section(
     conservatively omitted rather than guessed at (#1290).
     """
     if not body or len(_COVERAGE_HEADING_RE.findall(body)) != 1:
+        return None
+    if require_coder_clean and coder_response_names_coverage_heading(coder_response):
         return None
     marker = "\n\n" + COVERAGE_MAP_HEADING + "\n"
     index = body.find(marker)
