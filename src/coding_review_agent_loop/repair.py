@@ -1499,7 +1499,8 @@ def _build_repair_prompt(
         "handles plus test facts and caveats. Do not generate or preserve matrix identities, "
         "canonical rows, receipt IDs/citations, mappings, statuses, ordering, or a final "
         "risk-test evidence envelope. Fresh legacy evidence fields are removed. "
-        + semantic_risk_claim_schema_text()
+        "Preserve `risk_test_matrix_coverage_gaps` verbatim when the source has it, and emit none when it does not. "
+        + semantic_risk_claim_schema_text(preserve_optional_keys=True)
         + " Never invent `execution_refs`, test identifiers, or assertions; leave an unknown "
         "fact empty or remove the claim row rather than fabricate facts.\n"
         if expected_kind in {"issue_implementation", "coder_followup"} else ""
@@ -1596,8 +1597,8 @@ def _issue_implementation_instruction(
     return (
         "## Issue implementation repair rules:\n"
         "Repair only the issue_implementation envelope. Preserve `summary`, `pr_number`, "
-        "`tests_run`, semantic `risk_test_matrix_claims`, and the meaning of every disposition; do not invent a PR identity. "
-        + semantic_risk_claim_schema_text()
+        "`tests_run`, semantic `risk_test_matrix_claims`, `risk_test_matrix_coverage_gaps` (verbatim; emit none when the source has none), and the meaning of every disposition; do not invent a PR identity. "
+        + semantic_risk_claim_schema_text(preserve_optional_keys=True)
         + " Never invent `execution_refs`, test identifiers, or assertions; leave an unknown fact "
         "empty or remove the claim row rather than fabricate facts. "
         "Remove fresh `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, and other legacy evidence-envelope fields instead of recreating them. "

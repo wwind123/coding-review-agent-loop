@@ -2302,3 +2302,71 @@ def test_review_repair_without_an_assessment_is_accepted_with_the_record(tmp_pat
     assert [r.outcome for r in parsed.architecture_impact_degradations] == [
         "degraded-to-undetermined"
     ]
+
+
+# --- #1290: coverage-map fields are preserve-only for repair ------------------
+
+def _coverage_source() -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "issue_implementation",
+        "state": "blocking",
+        "summary": "The implementation is complete.",
+        "pr_number": 77,
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+        "risk_test_matrix_claims": [{
+            "row_id": "row-1",
+            "execution_refs": ["turn:valid"],
+            "test_identifiers": ["tests/test_protocol.py::test_valid"],
+            "test_locations": ["tests/test_protocol.py"],
+            "workflow_path_claim": "The current workflow path ran.",
+            "outcome_assertions": ["The selected test passed."],
+            "forbidden_effect_assertions": ["No unauthorized effect occurred."],
+            "test_level": "workflow",
+        }],
+        "risk_test_matrix_coverage_gaps": [
+            {"row_id": "row-2", "reason": "not testable", "proposed_correction": "split the row"},
+        ],
+    }
+
+
+def test_repair_accepts_prompt_compliant_candidate_keeping_level_and_gaps_verbatim():
+    source = _coverage_source()
+    check(source, deepcopy(source))
+
+
+@pytest.mark.parametrize("mutation", ["alter_level", "strip_level", "alter_gap", "drop_gaps"])
+def test_repair_rejects_altered_level_or_gaps(mutation):
+    source = _coverage_source()
+    target = deepcopy(source)
+    if mutation == "alter_level":
+        target["risk_test_matrix_claims"][0]["test_level"] = "unit"
+    elif mutation == "strip_level":
+        del target["risk_test_matrix_claims"][0]["test_level"]
+    elif mutation == "alter_gap":
+        target["risk_test_matrix_coverage_gaps"][0]["reason"] = "different"
+    else:
+        del target["risk_test_matrix_coverage_gaps"]
+    with pytest.raises(AgentLoopError, match="risk_test_matrix_(claims.test_level|coverage_gaps)"):
+        check(source, target)
+
+
+def test_repair_cannot_invent_level_or_gaps():
+    source = _coverage_source()
+    del source["risk_test_matrix_claims"][0]["test_level"]
+    del source["risk_test_matrix_coverage_gaps"]
+    invented_level = deepcopy(source)
+    invented_level["risk_test_matrix_claims"][0]["test_level"] = "workflow"
+    with pytest.raises(AgentLoopError, match="test_level"):
+        check(source, invented_level)
+    invented_gap = deepcopy(source)
+    invented_gap["risk_test_matrix_coverage_gaps"] = [
+        {"row_id": "row-2", "reason": "r", "proposed_correction": "c"}
+    ]
+    with pytest.raises(AgentLoopError, match="risk_test_matrix_coverage_gaps"):
+        check(source, invented_gap)
+    check(source, deepcopy(source))
+    empty_gaps = deepcopy(source)
+    empty_gaps["risk_test_matrix_coverage_gaps"] = []
+    check(source, empty_gaps)

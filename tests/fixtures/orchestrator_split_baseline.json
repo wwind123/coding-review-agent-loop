@@ -59,6 +59,7 @@
   "review_scheduling",
   "review_spool",
   "review_step_back",
+  "risk_coverage_map",
   "round_state",
   "round_transport",
   "round_visibility",

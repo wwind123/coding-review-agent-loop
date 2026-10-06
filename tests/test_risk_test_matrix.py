@@ -2020,7 +2020,7 @@ def test_complete_fitting_matrix_context_keeps_matrix_enforceable() -> None:
     from coding_review_agent_loop.prompts import format_approved_plan_context
 
     rendered = format_approved_plan_context(context, max_chars=5_000)
-    assert "Row row-ordinary" in rendered
+    assert "- [ ] row-ordinary:" in rendered
     assert "matrix: unavailable" not in rendered
 
 
@@ -2060,7 +2060,7 @@ def test_matrix_priority_omits_large_canonical_prose_before_small_matrix() -> No
     from coding_review_agent_loop.prompts import format_approved_plan_context
 
     rendered = format_approved_plan_context(context, max_chars=5_000)
-    assert "Row row-ordinary" in rendered
+    assert "- [ ] row-ordinary:" in rendered
     assert "Canonical approved plan text: omitted" in rendered
     assert "matrix: unavailable" not in rendered
 
@@ -3172,3 +3172,148 @@ def test_matrix_string_list_normalization_keeps_scalar_fields_and_wrapper_change
     normalized, paths = normalize_risk_test_matrix_string_lists(payload)
     assert paths == ("risk_test_matrix_changes[0].row_ids",)
     assert normalized["risk_test_matrix"]["rows"][0]["label"] == "label stays a string"
+
+
+# --- #1290: coverage-map schema (test_level and coverage gaps) -----------------
+
+def _coverage_claim_payload(**extra) -> dict[str, object]:
+    return {
+        "row_id": "row-a",
+        "execution_refs": ["ref-1"],
+        "test_identifiers": ["tests/test_x.py::test_a"],
+        "test_locations": ["tests/test_x.py"],
+        "workflow_path_claim": "path",
+        "outcome_assertions": ["outcome"],
+        "forbidden_effect_assertions": ["none"],
+        "caveats": [],
+        **extra,
+    }
+
+
+def _parse_claims_1290(claims: list[object]):
+    from coding_review_agent_loop.protocol import _parse_semantic_risk_coverage_claims
+
+    return _parse_semantic_risk_coverage_claims(
+        claims, context="issue_implementation.risk_test_matrix_claims", expected_row_ids=["row-a", "row-b"]
+    )
+
+
+def test_test_level_parses_normalizes_and_degrades_without_dropping_the_claim() -> None:
+    parsed = _parse_claims_1290([_coverage_claim_payload(test_level=" Workflow ")])
+    assert [c.test_level for c in parsed.claims] == ["workflow"]
+    assert parsed.claims[0].to_payload()["test_level"] == "workflow"
+
+    invalid = _parse_claims_1290([_coverage_claim_payload(test_level="e2e")])
+    assert len(invalid.claims) == 1
+    assert invalid.claims[0].test_level is None
+    assert "test_level" not in invalid.claims[0].to_payload()
+    assert any("test_level" in caveat for caveat in invalid.claims[0].caveats)
+
+    wrong_type = _parse_claims_1290([_coverage_claim_payload(test_level=3)])
+    assert len(wrong_type.claims) == 1 and wrong_type.claims[0].test_level is None
+
+
+def test_absent_test_level_leaves_payload_unchanged() -> None:
+    parsed = _parse_claims_1290([_coverage_claim_payload()])
+    assert "test_level" not in parsed.claims[0].to_payload()
+    assert parsed.claims[0].test_level is None
+
+
+def _impl_with_gaps(gaps: object, *, kind: str = "issue_implementation") -> str:
+    import json as _json
+    from agent_loop_helpers import structured_issue_implementation
+
+    base = _json.loads(structured_issue_implementation().split("\n<!--")[0])
+    base["risk_test_matrix_coverage_gaps"] = gaps
+    return _json.dumps(base) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def test_coverage_gaps_parse_and_drop_without_rejecting_the_envelope() -> None:
+    from coding_review_agent_loop.protocol import validate_structured_issue_implementation
+
+    good = {"row_id": "row-a", "reason": "cannot be driven", "proposed_correction": "use a unit row"}
+    parsed = validate_structured_issue_implementation(
+        _impl_with_gaps([
+            good,
+            {"row_id": "row-b", "reason": "", "proposed_correction": "x"},          # blank
+            {"row_id": "row-zzz", "reason": "r", "proposed_correction": "c"},       # unknown row
+            {"row_id": "row-b", "reason": "r", "proposed_correction": "c", "x": 1},  # extra key
+            "not-an-object",
+        ]),
+        delivered_risk_test_matrix_row_ids=["row-a", "row-b"],
+    )
+    assert parsed is not None
+    gaps = parsed.risk_test_matrix_coverage_gaps
+    assert [g.row_id for g in gaps.gaps] == ["row-a"]
+    assert len(gaps.degradations) == 4
+    assert gaps.to_payload() == [good]
+
+
+def test_duplicate_gap_rows_are_all_dropped_and_non_array_is_degraded() -> None:
+    from coding_review_agent_loop.protocol import validate_structured_issue_implementation
+
+    entry = {"row_id": "row-a", "reason": "r", "proposed_correction": "c"}
+    parsed = validate_structured_issue_implementation(
+        _impl_with_gaps([entry, dict(entry)]), delivered_risk_test_matrix_row_ids=["row-a"]
+    )
+    assert parsed.risk_test_matrix_coverage_gaps.gaps == ()
+    assert len(parsed.risk_test_matrix_coverage_gaps.degradations) == 2
+    not_array = validate_structured_issue_implementation(
+        _impl_with_gaps({"row_id": "row-a"}), delivered_risk_test_matrix_row_ids=["row-a"]
+    )
+    assert not_array.risk_test_matrix_coverage_gaps.gaps == ()
+    assert len(not_array.risk_test_matrix_coverage_gaps.degradations) == 1
+
+
+def test_absent_gaps_field_is_none() -> None:
+    from coding_review_agent_loop.protocol import validate_structured_issue_implementation
+    from agent_loop_helpers import structured_issue_implementation
+
+    parsed = validate_structured_issue_implementation(structured_issue_implementation())
+    assert parsed.risk_test_matrix_coverage_gaps is None
+
+
+def test_coverage_gaps_parse_on_coder_followup() -> None:
+    import json as _json
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+
+    payload = {
+        "schema_version": 1, "kind": "coder_followup", "state": "blocking",
+        "summary": "s", "addressed_items": [], "remaining_items": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+        "architecture_impact": {
+            "status": "unchanged", "rationale": "No architectural contract changed.",
+            "affected_components": [], "dependencies": [], "execution_data_flows": [],
+            "persistence": [], "public_contracts": [], "security_boundaries": [],
+            "canonical_document_action": "no-change", "canonical_document_path": None,
+            "canonical_document_rationale": "",
+        },
+        "risk_test_matrix_coverage_gaps": [
+            {"row_id": "row-a", "reason": "r", "proposed_correction": "c"},
+            {"row_id": "nope", "reason": "r", "proposed_correction": "c"},
+        ],
+    }
+    parsed = validate_structured_coder_followup(
+        _json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        delivered_risk_test_matrix_row_ids=["row-a"],
+    )
+    assert [g.row_id for g in parsed.risk_test_matrix_coverage_gaps.gaps] == ["row-a"]
+
+
+def test_default_claim_schema_text_and_example_are_unchanged_by_coverage_keys() -> None:
+    from coding_review_agent_loop.protocol import (
+        semantic_risk_claim_example,
+        semantic_risk_claim_schema_text,
+    )
+
+    default = semantic_risk_claim_schema_text()
+    assert "test_level" not in default
+    assert "test_level" not in semantic_risk_claim_example()
+    gated = semantic_risk_claim_schema_text(include_coverage_map=True)
+    assert "`test_level`" in gated
+    assert semantic_risk_claim_example(include_coverage_map=True)["test_level"] == "unit"
+    preserved = semantic_risk_claim_schema_text(preserve_optional_keys=True)
+    assert "preserve-only" in preserved
+    assert preserved.endswith("never add, change, or drop it.")
+    assert preserved.startswith(default.rstrip()[:200])

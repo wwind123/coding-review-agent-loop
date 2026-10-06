@@ -620,6 +620,33 @@ def _evidence_rejection_reask_prompt(prompt: str, detail: str) -> str:
     )
 
 
+_COVERAGE_REASK_MAX_ROWS = 24
+
+
+def _risk_coverage_reask_prompt(prompt: str, assessment: object) -> str:
+    """Append one bounded, marker-free section naming the deficient coverage rows (#1290)."""
+    levels = {entry.row_id: entry for entry in getattr(assessment, "entries", ())}
+    lines = []
+    for deficiency in tuple(getattr(assessment, "deficiencies", ()))[:_COVERAGE_REASK_MAX_ROWS * 3]:
+        entry = levels.get(deficiency.row_id)
+        required = (entry.required_level if entry is not None else None) or "unclassified"
+        detail = " ".join(sanitize_historical_text(deficiency.detail).replace("<", "(").replace(">", ")").split())
+        lines.append(
+            f"- {sanitize_historical_text(deficiency.row_id)}: {deficiency.code} "
+            f"(required level: {required}){': ' + detail if detail else ''}"
+        )
+    return (
+        f"{prompt}\n\n## Previous response not ready for review: risk-matrix coverage map\n\n"
+        "The orchestrator checked your coverage map against the PR head and found these rows "
+        "incomplete:\n" + "\n".join(lines) + "\n\n"
+        "You may add and commit tests and push them to the same PR. Rerun them through "
+        "`agent-loop run-tests` in this turn (selectors from the previous turn are not "
+        "selectable) and resubmit your full structured result for the SAME PR. If a row "
+        "genuinely cannot be tested as specified, declare it in `risk_test_matrix_coverage_gaps` "
+        "with a reason and the evidence-backed correction. This is the only coverage re-ask.\n"
+    )
+
+
 def _surface_decomposition_degradations(
     runner: Runner, *, config: AgentLoopConfig, issue_number: int, decomposition: object
 ) -> None:

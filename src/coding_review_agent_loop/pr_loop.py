@@ -299,9 +299,11 @@ from .validated_agent import (
     _log_repair_attempts,
     _run_validated_agent,
 )
+from .risk_coverage_map import extract_coverage_map_section
 from .response_validation import (
     _current_test_turn_observations,
     _derive_authenticated_risk_evidence_for_coder,
+    final_risk_coverage_assessment,
     _build_requirements_context,
     _surfaced_reviewer_requirement_ids,
     _reviewer_requirement_identity_ids,
@@ -1965,6 +1967,7 @@ def run_pr_loop(
         unresolved_items: list[UnresolvedReviewItem] = []
         pr_compact_prior_summaries: list[str] = []
         latest_coder_output: str | None = None
+        latest_coder_coverage_map: str | None = None
         latest_coder_metadata: PostedRoundMetadata | None = None
         next_unresolved_item_number = 1
         start_round_number = 1
@@ -2082,6 +2085,9 @@ def run_pr_loop(
                 bound_compact_prior_summaries(resumed_round.compact_prior_summaries)
             )
             latest_coder_output = resumed_round.coder_output
+            latest_coder_coverage_map = extract_coverage_map_section(
+                resumed_round.coder_comment_body
+            )
             latest_coder_metadata = resumed_round.coder_metadata
             qualification_checkpoint = resumed_round.qualification_checkpoint
             next_unresolved_item_number = resumed_round.next_unresolved_item_number
@@ -2757,6 +2763,7 @@ def run_pr_loop(
                 latest_coder_metadata,
                 head_sha=pr_metadata.head_sha,
                 assigned_workdir=active_workdir(config),
+                coverage_map=latest_coder_coverage_map,
             ) + _evidence_review_context(
                 prior_unresolved_items, response_head=evidence_response_head
             )
@@ -7467,6 +7474,19 @@ def run_pr_loop(
                     and updated_pr_context.metadata.head_sha == followup_dispatch_head
                     else None
                 )
+                followup_coverage_assessment = (
+                    final_risk_coverage_assessment(
+                        coder_response.marker_value,
+                        approved_plan_context=approved_plan_context,
+                        workdir=active_workdir(config),
+                        initial_head_sha=updated_pr_context.metadata.head_sha,
+                        reauthenticate_head=lambda: get_pr_review_context(
+                            runner, config=config, pr_number=pr_number
+                        ).metadata.head_sha,
+                    )
+                    if isinstance(coder_response.marker_value, StructuredCoderFollowup)
+                    else None
+                )
                 if isinstance(coder_response.marker_value, StructuredCoderFollowup):
                     public_comment = render_public_agent_comment(
                         kind="coder_followup",
@@ -7479,11 +7499,13 @@ def run_pr_loop(
                         current_test_turn_id=coder_response.acquisition_test_turn_id,
                         matrix_evidence_render_decision=matrix_evidence_render_decision,
                         head_unchanged_sha=head_unchanged_sha,
+                        coverage_assessment=followup_coverage_assessment,
                     )
                 elif head_unchanged_sha is not None:
                     public_comment = add_coder_followup_head_unchanged_notice(
                         public_comment, head_unchanged_sha
                     )
+                latest_coder_coverage_map = extract_coverage_map_section(public_comment)
 
                 qualification_checkpoint = _machine_obligation_checkpoint(
                     unresolved_items,

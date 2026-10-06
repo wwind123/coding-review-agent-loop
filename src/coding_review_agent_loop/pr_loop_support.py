@@ -330,6 +330,7 @@ def _coder_followup_review_context(
     *,
     head_sha: str | None,
     assigned_workdir: Path | None = None,
+    coverage_map: str | None = None,
 ) -> str:
     if not text or metadata is None:
         return ""
@@ -371,6 +372,9 @@ def _coder_followup_review_context(
         payload["risk_test_matrix_diagnostics"] = [
             dict(item) for item in metadata.risk_test_matrix_diagnostics
         ]
+    if coverage_map:
+        # Orchestrator-authored completeness map (#1290); display-only context.
+        payload["risk_matrix_coverage_map"] = coverage_map
     if isinstance(parsed, StructuredCoderFollowup):
         payload.update(
             addressed_items=parsed.addressed_items,

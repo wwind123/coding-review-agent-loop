@@ -18282,3 +18282,162 @@ def test_staged_direct_child_rerun_after_interrupted_integration_close_finishes_
     assert [c for c in runner.commands if c[:3] == ["gh", "issue", "close"]]
     assert not [c for c in runner.commands if "merge" in c and c[:2] == ["gh", "pr"]]
     assert "without replaying the merge" in capsys.readouterr().out
+
+
+# --- #1290: risk-matrix coverage gate workflow tests ---------------------------
+
+def _coverage_harness(tmp_path, monkeypatch, **kwargs):
+    from coverage_reask_helpers import CoverageHarness
+
+    return CoverageHarness(tmp_path, monkeypatch, **kwargs)
+
+
+def test_workflow_missing_row_reasks_once_and_corrected_map_reaches_review(tmp_path, monkeypatch):
+    from coverage_reask_helpers import claim, complete_claims, response_text
+
+    h = _coverage_harness(tmp_path, monkeypatch)
+    h.script = [
+        h.response(response_text(claims=[claim("row-wf"), claim("row-unit", level="unit")])),
+        h.response(response_text(claims=complete_claims())),
+    ]
+    assert h.run() == 0
+    assert len(h.calls) == 2
+    assert "row-man: missing-row" in h.calls[1]["prompt"]
+    assert f"complete at {h.head}" in h.coder_comment()
+    assert "after one coverage re-ask" in h.coder_comment()
+    assert all(k.get("label") == "semantic-evidence-correction" for _a, k in h.agent_result_calls)
+    assert h.run_pr_calls
+
+
+def test_workflow_complete_map_and_no_matrix_plans_never_reask(tmp_path, monkeypatch):
+    from coverage_reask_helpers import complete_claims, response_text
+
+    complete = _coverage_harness(tmp_path / "complete", monkeypatch)
+    complete.script = [complete.response(response_text(claims=complete_claims()))]
+    assert complete.run() == 0 and len(complete.calls) == 1
+    assert f"complete at {complete.head}" in complete.coder_comment()
+
+    plain = _coverage_harness(tmp_path / "plain", monkeypatch, applicable=False)
+    plain.script = [plain.response(response_text())]
+    assert plain.run() == 0 and len(plain.calls) == 1
+    assert "Risk-matrix coverage map" not in plain.coder_comment()
+
+
+def test_workflow_deficiency_codes_and_incomplete_after_reask_reach_review(tmp_path, monkeypatch):
+    from coverage_reask_helpers import claim, response_text
+
+    h = _coverage_harness(tmp_path, monkeypatch)
+    bad = response_text(claims=[
+        claim("row-wf", level="unit"),
+        claim("row-unit", level="unit", path="tests/gone.py"),
+        claim("row-man", level=None, refs=False),
+    ])
+    h.script = [h.response(bad), h.response(bad)]
+    assert h.run() == 0
+    assert len(h.calls) == 2
+    prompt = h.calls[1]["prompt"]
+    for expected in ("row-wf: under-level", "row-unit: nonexistent-test-path", "row-man: missing-test-reference"):
+        assert expected in prompt
+    assert f"incomplete at {h.head} after one coverage re-ask" in h.coder_comment()
+    assert h.run_pr_calls
+
+
+def test_workflow_gate_is_never_reached_for_pr_less_responses(tmp_path, monkeypatch):
+    from coverage_reask_helpers import claim, response_text
+
+    h = _coverage_harness(tmp_path, monkeypatch)
+    h.script = [h.response(response_text(claims=[claim("row-wf")], pr_number=None))]
+    with pytest.raises(AgentLoopError):
+        h.run()
+    assert len(h.calls) == 1 and h.run_pr_calls == []
+
+
+def test_workflow_pr_head_binding_local_only_unavailable_and_raced_heads(tmp_path, monkeypatch):
+    from coverage_reask_helpers import claim, response_text
+
+    local = _coverage_harness(tmp_path / "local", monkeypatch)
+    local.commit_file("tests/test_new.py", push=False)
+    text = response_text(claims=[
+        claim("row-wf", path="tests/test_new.py"), claim("row-unit", level="unit"), claim("row-man", level=None),
+    ])
+    local.script = [local.response(text), local.response(text)]
+    assert local.run() == 0
+    assert "row-wf: nonexistent-test-path" in local.calls[1]["prompt"]
+    assert f"incomplete at {local.head}" in local.coder_comment()
+    assert len(local.calls) == 2
+
+    missing = _coverage_harness(tmp_path / "missing", monkeypatch)
+    missing.runner.pr_payload["headRefOid"] = "e" * 40
+    missing.script = [missing.response(response_text(claims=[claim("row-wf")]))]
+    assert missing.run() == 0
+    assert len(missing.calls) == 1
+    assert "unverified: authenticated PR tree unavailable" in missing.coder_comment()
+
+
+def test_workflow_managed_ci_authenticates_before_reask_and_again_before_publication(tmp_path, monkeypatch):
+    from coverage_reask_helpers import claim, complete_claims, response_text
+
+    nonce = "workflow-managed-nonce"
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56", trusted_actor="agent-loop",
+        protection_mode="voluntary", audit_nonce=nonce,
+    )
+    body = f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}"
+    h = _coverage_harness(
+        tmp_path, monkeypatch, pr_body=body,
+        pr_overrides={"headRefName": "agent-loop/managed-56"},
+        managed_ci=True, managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+    )
+    events: list[tuple[str, str]] = []
+    handoff = _managed_issue_handoff(nonce=nonce)
+
+    def authenticate(*_a, **kwargs):
+        events.append(("authenticate", kwargs["metadata"].head_sha))
+        return handoff
+
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
+    monkeypatch.setattr(
+        orchestrator_module, "publish_issue_created_authorization",
+        lambda *_a, **kwargs: events.append(("publish", kwargs["metadata"].head_sha)) or handoff,
+    )
+
+    def reask(harness):
+        events.append(("reask", harness.runner.pr_payload["headRefOid"]))
+        harness.commit_file("tests/test_pushed.py", push=True)
+        return harness.response(response_text(claims=complete_claims()))
+
+    h.script = [h.response(response_text(claims=[claim("row-wf"), claim("row-unit", level="unit")])), reask]
+    assert h.run() == 0
+    refreshed = h.runner.pr_payload["headRefOid"]
+    assert events == [
+        ("authenticate", h.head), ("reask", h.head), ("authenticate", refreshed), ("publish", refreshed),
+    ]
+
+
+def test_workflow_managed_ci_auth_failure_blocks_any_coverage_invocation(tmp_path, monkeypatch):
+    from coverage_reask_helpers import claim, response_text
+
+    intent = ManagedCiCreationIntent(
+        branch="agent-loop/managed-56", trusted_actor="agent-loop",
+        protection_mode="voluntary", audit_nonce="n",
+    )
+    h = _coverage_harness(
+        tmp_path, monkeypatch,
+        managed_ci=True, managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+    )
+    published: list[object] = []
+
+    def reject(*_a, **_k):
+        raise AgentLoopError("managed handoff rejected")
+
+    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", reject)
+    monkeypatch.setattr(
+        orchestrator_module, "publish_issue_created_authorization",
+        lambda *_a, **_k: published.append(1),
+    )
+    h.script = [h.response(response_text(claims=[claim("row-wf")]))]
+    with pytest.raises(AgentLoopError, match="managed handoff rejected"):
+        h.run()
+    assert len(h.calls) == 1 and published == [] and h.runner.comments == []

@@ -5067,3 +5067,21 @@ def test_plan_review_repair_prompt_names_requirement_id_with_example():
     prompt = cmd[cmd.index("--prompt") + 1]
     assert "`requirement_id` set to the exact surfaced requirement label" in prompt
     assert '"requirement_id": "hr-' + "ab12" * 16 + '"' in prompt
+
+
+# --- #1290: repair instructions agree with coverage-map preservation ----------
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_repair_prompts_describe_test_level_and_gaps_as_preserve_only(kind):
+    from coding_review_agent_loop.repair import _build_repair_prompt
+    from coding_review_agent_loop.protocol import semantic_risk_claim_example_json
+
+    prompt = _build_repair_prompt("malformed", expected_kind=kind)
+    assert "optional `test_level` key" in prompt
+    assert "preserve-only" in prompt
+    assert "never add, change, or drop it" in prompt
+    assert "risk_test_matrix_coverage_gaps" in prompt
+    # The default example is unchanged: it does not carry test_level.
+    assert semantic_risk_claim_example_json() in prompt
+    assert '"test_level"' not in prompt
+    assert "strip `test_level`" not in prompt

@@ -1225,6 +1225,13 @@ def validate_repair_preservation(
                 if not target_matches:
                     continue
                 candidate = target_matches[0]
+                # ``test_level`` is preserve-only (#1290): repair may neither
+                # mint, alter, nor strip it.
+                require(
+                    candidate.get("test_level") == source_claim.get("test_level")
+                    and ("test_level" in candidate) == ("test_level" in source_claim),
+                    "risk_test_matrix_claims.test_level",
+                )
                 for field in (
                     "execution_refs", "test_identifiers", "test_locations",
                     "workflow_path_claim", "outcome_assertions",
@@ -1256,6 +1263,14 @@ def validate_repair_preservation(
                             all(fragment in target_fragments for fragment in source_fragments),
                             f"risk_test_matrix_claims.{field}",
                         )
+        # Coverage-gap declarations are coder-authored and carried verbatim;
+        # repair may not invent, alter, or drop them (#1290).
+        source_gaps = source.get("risk_test_matrix_coverage_gaps")
+        target_gaps = target.get("risk_test_matrix_coverage_gaps")
+        if "risk_test_matrix_coverage_gaps" in source:
+            require(target_gaps == source_gaps, "risk_test_matrix_coverage_gaps")
+        else:
+            require(target_gaps in (None, []), "risk_test_matrix_coverage_gaps")
         if "risk_test_matrix_evidence" in source:
             # Canonical evidence is orchestrator-owned. Fresh semantic repair
             # may remove this legacy field, but historical compatibility still
