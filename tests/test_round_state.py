@@ -913,3 +913,39 @@ def test_author_admission_is_needed_only_for_new_records_head_advances_or_the_fl
     assert pr_resume_needs_author_admission(ordinary, _OLD, True) is True
     assert pr_resume_needs_author_admission(_history(*_base_history(), _dispatch()), _OLD) is True
     assert pr_resume_needs_author_admission([], _OLD) is False
+
+
+@pytest.mark.parametrize("carrier", ["checkpoint", "ordinary-phase-budget"])
+def test_operator_budget_is_never_taken_from_a_forged_record(carrier):
+    """A record the authenticated actor did not author cannot grant rounds or reset extension flags."""
+    genuine = _checkpoint_summary(round_number=2, allowed_rounds=6)
+    if carrier == "checkpoint":
+        forged = _checkpoint_summary(
+            round_number=2, allowed_rounds=7, watch_failure_extension_used=False
+        )
+    else:
+        forged = _summary(
+            "scheduler-prelaunch", _OLD, 2, (_item(),),
+            recovery_round_budget=RecoveryRoundBudget(7, False, False),
+        )
+    history = [*_base_history(), genuine, forged]
+    resumed = _resume(history, _NEW, flag=True, forged=(3,))
+    assert resumed is not None
+    assert resumed.recovery_round_budget == RecoveryRoundBudget(6, True, False)
+    # With the genuine checkpoint also absent no budget source exists at all.
+    only_forged = [*_base_history(), forged]
+    assert _resume(only_forged, _NEW, flag=True, forged=(2,)).recovery_round_budget is None
+    # An ordinary phase never supplies a recovery budget, even when authored by the actor.
+    if carrier == "ordinary-phase-budget":
+        assert _resume(only_forged, _NEW, flag=True).recovery_round_budget is None
+
+
+def test_partially_published_recovery_keeps_the_global_item_number_high_water_mark():
+    high = tuple(_item(n, f"Item {n}.") for n in range(1, 8))
+    history = [
+        _coder(), _reviewer(new_items=high),
+        _handoff(subject=_NEW, items=(_item(1),)),
+        _reviewer(subject=_NEW, round_number=1, items=(_item(1),)),
+    ]
+    resumed = _resume(history, _NEW)
+    assert resumed is not None and resumed.next_unresolved_item_number == 8

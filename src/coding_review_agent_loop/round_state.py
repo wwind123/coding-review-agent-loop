@@ -4291,6 +4291,9 @@ def _legacy_checkpoint_head_review(
 def _operator_head_review_resume(
     walk_records: Sequence[PostedRoundRecord],
     records: Sequence[PostedRoundRecord],
+    *,
+    comments: Sequence[object] = (),
+    trusted_actor: tuple[str, int] | None = None,
 ) -> ResumedReviewRound | None:
     """``--review-unrecorded-head``: an ordinary review round of the current head."""
     if not records:
@@ -4302,9 +4305,19 @@ def _operator_head_review_resume(
     budget: RecoveryRoundBudget | None = None
     for record in reversed(walk_records):
         metadata = record.metadata
+        # Every budget source is authenticated: recovery records were admitted
+        # already, and a qualification checkpoint (or any other record) only
+        # counts when the authenticated actor authored it.  Only recovery
+        # phases may carry a recovery budget.
+        if not _recovery_record_admitted(record, comments, trusted_actor):
+            continue
         if _recovery_record_problems(metadata):
             continue
-        if metadata.recovery_round_budget is not None and metadata.recovery_round_budget.valid:
+        if (
+            metadata.phase in RECOVERY_RECORD_PHASES
+            and metadata.recovery_round_budget is not None
+            and metadata.recovery_round_budget.valid
+        ):
             budget = metadata.recovery_round_budget
             break
         if metadata.qualification_checkpoint is not None:
@@ -5067,7 +5080,9 @@ def _resume_pr_round(
     except _RecoveryRefusal:
         if not review_unrecorded_head:
             raise
-        return _operator_head_review_resume(walk_records, records)
+        return _operator_head_review_resume(
+            walk_records, records, comments=comments, trusted_actor=trusted_actor
+        )
 
 
 def _resume_pr_round_from_records(
@@ -5189,7 +5204,11 @@ def _resume_pr_round_from_records(
         coder_metadata=latest_coder_record.metadata if latest_coder_record else None,
         completed_reviews=tuple(reviewer_records[agent_display_name(agent)] for agent in configured_reviewers if agent_display_name(agent) in reviewer_records),
         next_unresolved_item_number=_max_unresolved_item_number_from_records(
-            [record for record in records if record.metadata.subject == head_sha]
+            list(walk_records)
+            if review_handoff is not None
+            # A recovery round must keep the global high-water mark: earlier
+            # heads may hold higher (resolved) item numbers.
+            else [record for record in records if record.metadata.subject == head_sha]
         )
         + 1,
         ledger_may_be_incomplete=ledger_may_be_incomplete,

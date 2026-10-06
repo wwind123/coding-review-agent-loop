@@ -19415,3 +19415,251 @@ def test_review_unrecorded_head_flag_parses_on_pr_only_and_defaults_off(tmp_path
     assert config_from_args(flagged, FakeRunner()).review_unrecorded_head is True
     with pytest.raises(SystemExit):
         parser.parse_args(["issue", "5", "--repo", "OWNER/REPO", "--review-unrecorded-head"])
+
+
+# --- Review feedback on #1296: authenticated budgets, numbering, matrix paths --
+
+
+def _rec_1292(items=None):
+    return ReviewItemDisposition(item_id="item-1", reviewer="Codex", disposition="resolved")
+
+
+from coding_review_agent_loop.protocol import ReviewItemDisposition  # noqa: E402
+
+
+@pytest.mark.parametrize("source", ["legacy-checkpoint", "operator"])
+def test_head_review_recovery_under_primary_then_panel_gates_the_panel_and_bounds_the_coder(
+    tmp_path, monkeypatch, source
+):
+    """Rows legacy-checkpoint-stranded / operator-flag-recovery: ordinary primary gate, no override."""
+    monkeypatch.setattr(
+        orchestrator, "_observe_pr_transition",
+        lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
+    )
+    if source == "legacy-checkpoint":
+        records = [*_history_1292(), _checkpoint_1292()]
+        flag = False
+    else:
+        records = [
+            *_history_1292(), _dispatch_1292(), _rejection_1292(attempt=2, subject=_B_1292,
+                                                                carried_rejection_reasons=("a",), reason="b"),
+        ]
+        flag = True
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[
+            _staged_review(
+                reviewer="OpenAI Codex", state="blocking",
+                blocking_items=[{"text": "gap", "fix_scope": ["src/x.py"]}],
+                dispositions=[{"item_id": "item-1", "disposition": "blocking", "note": "The regression test is still missing on src/x.py; add it with evidence."}],
+            )
+        ],
+        pr_payload={"headRefOid": _B_1292, "comments": _seed_1292(*records)},
+        authenticated_actor=_ACTOR_1292,
+    )
+    config = _staged_config(tmp_path, review_unrecorded_head=flag, coder="claude")
+    with pytest.raises(Exception):  # scripted outputs run out after the coder turn
+        run_pr_loop(runner, pr_number=77, config=config)
+    sequence = _agent_sequence(runner)
+    assert sequence[:2] == ["codex", "claude"]  # primary first, panel gated, then the coder
+    assert "gemini" not in sequence[:2] and "agy" not in sequence[:2]
+    (handoff,) = _records_1292(runner, "head-review-recovery")
+    assert handoff.head_review_recovery_source == source
+    coder_dispatches = [
+        r for r in _records_1292(runner, "coder-dispatch") if r.dispatch_head == _B_1292
+    ]
+    assert coder_dispatches and coder_dispatches[-1].dispatch_attempt == 1
+    assert coder_dispatches[-1].round_number > handoff.round_number  # after the handoff
+
+
+def test_legacy_recovery_on_a_confirmed_merge_conflict_uses_the_standard_conflict_route(tmp_path):
+    records = [*_history_1292(), _checkpoint_1292()]
+    runner = FakeRunner(
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[_approving_review_1292().replace("Anthropic Claude", "OpenAI Codex")],
+        pr_payload={
+            "headRefOid": _B_1292, "comments": _seed_1292(*records),
+            "mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY", "baseRefName": "main",
+        },
+        authenticated_actor=_ACTOR_1292,
+    )
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    with pytest.raises(Exception):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert _agent_order_1292(runner)[0] == "claude"  # conflict route, reviewers skipped
+    assert len(_records_1292(runner, "head-review-recovery")) == 1
+    dispatch = [r for r in _records_1292(runner, "coder-dispatch") if r.dispatch_head == _B_1292]
+    assert dispatch and dispatch[0].dispatch_attempt == 1
+
+
+def test_partial_publication_after_a_handoff_supersedes_the_stale_repair_checkpoint(tmp_path):
+    """Row operator-record-interrupted variant (iv), through run_pr_loop."""
+    budget = _Budget1292(6, True, False)
+    stale = dataclasses.replace(_checkpoint_1292(subject=_B_1292), round_number=6)
+    reviewed = dataclasses.replace(
+        _meta_1292(
+            "reviewer", subject=_B_1292, round_number=6, items=(_item_1292(),),
+            dispositions=(_rec_1292(),),
+        ),
+        agent="Codex", state="approved",
+        canonical_reviewer_response=structured_pr_review(
+            state="approved", summary="Resolved.",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ),
+    )
+    records = [
+        *_history_1292(), stale,
+        _handoff_1292(round_number=6, budget=budget), reviewed,
+    ]
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(
+                state="approved", summary="Resolved.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+        gemini_outputs=[
+            structured_pr_review(
+                state="approved", summary="Resolved.", reviewer="Google Gemini",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            )
+        ],
+        pr_payload={"headRefOid": _B_1292, "comments": _seed_1292(*records)},
+        authenticated_actor=_ACTOR_1292,
+        advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), coder="claude", max_rounds=5)
+    # Round 6 exceeds max_rounds: only the handoff's extended budget admits it.
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert "claude" not in _agent_sequence(runner)  # the stale repair skip did not return
+    assert "gemini" in _agent_sequence(runner)
+    assert len(_records_1292(runner, "head-review-recovery")) == 1
+
+
+def test_operator_recovery_above_max_rounds_needs_an_authenticated_budget_source(tmp_path):
+    """Row operator-flag-recovery: no rounds are granted without an admitted source."""
+    checkpoint = dataclasses.replace(
+        _checkpoint_1292(),
+        round_number=3,
+        qualification_checkpoint=QualificationCheckpoint(
+            obligation_kind="managed-exact-head-ci", obligation_identity="ci",
+            lifecycle="repair_required", failed_head_sha=_A_1292, candidate_head_sha=None,
+            allowed_rounds=3, watch_failure_extension_used=True, watch_head_extension_used=False,
+        ),
+    )
+    prelaunch = _meta_1292(
+        "summary", "scheduler-prelaunch", round_number=3, items=(_item_1292(),)
+    )
+    records = [*_history_1292(), checkpoint, prelaunch]
+    config = make_config(
+        tmp_path, reviewer="codex", coder="claude", max_rounds=2, review_unrecorded_head=True
+    )
+    # Forged checkpoint (index 2): no admitted source, so the override refuses.
+    forged = _stranded_runner_1292(records, _B_1292, forged=(2,))
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(forged, pr_number=77, config=config)
+    assert _agent_order_1292(forged) == []
+    assert _records_1292(forged, "head-review-recovery") == []
+    # Authenticated checkpoint: its used-extension budget is restored and carried.
+    genuine = _stranded_runner_1292(records, _B_1292)
+    assert run_pr_loop(genuine, pr_number=77, config=config) == 0
+    (handoff,) = _records_1292(genuine, "head-review-recovery")
+    assert handoff.round_number == 3
+    assert handoff.recovery_round_budget == _Budget1292(3, True, False)
+
+
+def test_rejection_after_the_live_ledger_was_rewritten_persists_the_pre_dispatch_snapshot(
+    tmp_path, monkeypatch
+):
+    """Row rejection-ledger-snapshot: the failure comes after _apply_dispute_evidence ran."""
+    import coding_review_agent_loop.pr_loop as pr_loop_module
+
+    seen = []
+    real_apply = pr_loop_module._apply_dispute_evidence
+
+    def recording_apply(items, **kwargs):
+        result = real_apply(items, **kwargs)
+        seen.append((tuple(items), tuple(result)))
+        return result
+
+    def failing_derive(*args, **kwargs):
+        raise AgentLoopError("derived evidence rejected")
+
+    monkeypatch.setattr(pr_loop_module, "_apply_dispute_evidence", recording_apply)
+    monkeypatch.setattr(pr_loop_module, "_derive_authenticated_risk_evidence_for_coder", failing_derive)
+    disputing = structured_coder_followup(
+        summary="Disputed.", disputed_items=["item-1"],
+        dispute_evidence={"item-1": "The suite already covers it."}, reviewer="OpenAI Codex",
+    )
+    runner = _rejected_push_runner_1292(coder_outputs=[disputing])
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+    with pytest.raises(AgentLoopError, match="derived evidence rejected"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    before, after = seen[0]
+    assert before != after  # the live ledger really was rewritten by the rejected turn
+    (rejection,) = _records_1292(runner, "coder-followup-rejected")
+    assert tuple(rejection.prior_items) == before
+
+
+def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_twice(
+    tmp_path, monkeypatch
+):
+    """Row rejection-budget-preserved, through the real watcher on the final round."""
+    failed_check = PullRequestCheck(
+        name="final-ci/exact-head", kind="check_run", status="failure",
+        url="https://github.com/OWNER/REPO/actions/runs/555",
+    )
+    failed_checks = _watch_check_board("failing", failing=(failed_check,))
+    outcomes = iter(
+        [
+            ManagedCiOutcome(status="failed", checks=failed_checks, head_sha="abc123"),
+            ManagedCiOutcome(status="failed", checks=failed_checks, head_sha="abc123-coder-1"),
+            ManagedCiOutcome(status="failed", checks=failed_checks, head_sha="abc123-coder-2"),
+        ]
+    )
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Approved."),
+            structured_pr_review(
+                state="approved", summary="Approved after the CI fix.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=[
+            structured_coder_followup(
+                summary="Fixed CI.", addressed_items=["item-1"],
+                tests_run=["pytest tests/test_foo.py https://live.example"],
+            ),
+            structured_coder_followup(summary="Fixed CI in checkout.", addressed_items=["item-1"]),
+        ],
+        authenticated_actor=_ACTOR_1292,
+    )
+    config = make_config(tmp_path, auto_merge=True, max_rounds=1)
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+    )
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification", lambda *args, **kwargs: next(outcomes)
+    )
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+
+    # Round 1 (the final round): the watcher grants its one extension, then the
+    # CI-repair coder pushes and is rejected.
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    (first_dispatch,) = _records_1292(runner, "coder-dispatch")
+    assert first_dispatch.recovery_round_budget == _Budget1292(2, True, False)
+    (rejection,) = _records_1292(runner, "coder-followup-rejected")
+    assert rejection.recovery_round_budget == _Budget1292(2, True, False)
+
+    # The restart restores that budget, so the recovery coder is dispatched; a
+    # later watcher failure after the following review is refused a second extension.
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    second_dispatch = _records_1292(runner, "coder-dispatch")[1]
+    assert second_dispatch.dispatch_attempt == 2 and second_dispatch.dispatch_round == 1
+    assert second_dispatch.recovery_round_budget == _Budget1292(2, True, False)
+    claude_runs = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    assert len(claude_runs) == 2  # no third coder: the extension was not granted again
+    assert len([c for c in _records_1292(runner, "coder-dispatch")]) == 2

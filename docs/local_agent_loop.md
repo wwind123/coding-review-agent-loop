@@ -5565,7 +5565,7 @@ Two sources use it:
    limit, or a malformed recovery record). It never force-pushes and never posts
    a coder-role record. The budget comes from the latest admitted valid
    budget-carrying record (dispatch, rejected-follow-up, head-review or
-   checkpoint); a malformed record is never a budget source, and without any
+   checkpoint); a malformed record is never a budget source, every candidate must be authored by the authenticated actor (a forged checkpoint or an ordinary-phase record never supplies a budget), and without any
    source the defaults apply, so a round above `--max-rounds` is refused rather
    than granted. Without the flag the refusal remains and its message names the
    flag instead of suggesting a hand-written coder follow-up.
