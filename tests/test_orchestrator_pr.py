@@ -20111,3 +20111,35 @@ def test_run_pr_loop_followup_semantic_correction_keeps_original_gaps_and_fixes_
     assert "original gap reason" in section and "CHANGED BY CORRECTION" not in section
     review_prompts = [cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
     assert "original gap reason" in review_prompts[-1] and "CHANGED BY CORRECTION" not in review_prompts[-1]
+
+
+def test_gate_details_separate_excluded_dispatch_from_failing_pr_checks(tmp_path):
+    from coding_review_agent_loop.checks import _pr_check_details
+    from coding_review_agent_loop.github import get_pr_checks
+    from test_ci_health import (
+        SUITE_DISPATCH, _StubGhRunner, _cr, _dispatch, _history, _listing, _metadata,
+    )
+
+    neg = _cr(2, "validate", "failure", suite=SUITE_DISPATCH, run=7000)
+    ok = _cr(1, "ci", "success", run=5000)
+    board = get_pr_checks(
+        _StubGhRunner(
+            check_runs_payload=_listing(neg, ok),
+            dispatch_payload=_dispatch(),
+            history_stdout=_history(neg, ok),
+        ),
+        config=make_config(tmp_path),
+        metadata=_metadata(),
+    )
+    assert board.state == "passing"
+    details = _pr_check_details(board)
+    assert any(d.startswith("Excluded ad hoc workflow_dispatch checks") for d in details)
+    assert not any(d.startswith("Failing checks") for d in details)
+
+    failing = get_pr_checks(
+        _StubGhRunner(check_runs_payload=_listing(_cr(1, "ci", "failure", run=5000))),
+        config=make_config(tmp_path),
+        metadata=_metadata(),
+    )
+    assert failing.state == "failing"
+    assert any(d.startswith("Failing checks") for d in _pr_check_details(failing))

@@ -1740,6 +1740,12 @@ def format_pr_checks(checks: PullRequestChecks) -> str:
         lines.append(f"- Required checks not yet reporting: {', '.join(checks.missing_required)}")
     if checks.branch_protection_note:
         lines.append(f"- Branch protection: {checks.branch_protection_note}")
+    if checks.excluded:
+        lines.append(
+            "- Excluded ad hoc workflow_dispatch checks (operator diagnostics, not PR checks):"
+        )
+        for note in checks.exclusion_notes or tuple(c.name for c in checks.excluded):
+            lines.append(f"  - {note}")
     if checks.infrastructure_stalls:
         lines.append("- External CI infrastructure stalls:")
         for stall in checks.infrastructure_stalls:

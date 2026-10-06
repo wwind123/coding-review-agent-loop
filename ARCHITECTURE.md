@@ -913,11 +913,30 @@ review feedback without waiting for unfinished checks. Post-approval watching
 and automatic merging use bounded gates, including infrastructure-failure
 classification and fresh mergeability checks.
 
+The counted board is the current-head board minus check runs positively
+identified as ad hoc `workflow_dispatch` runs (operator diagnostics such as a
+deliberate negative-evidence dispatch). `github.get_pr_checks` applies one
+per-observation predicate: a check run is excluded only when it comes from the
+GitHub Actions app, its own `check_suite.id` belongs to a same-repository,
+non-managed `workflow_dispatch` run on the head, and any URL-derived run id
+agrees. The managed qualification run (`managed-ci-v2 nonce=`) and every commit
+status context, including `final-ci/exact-head`, always count. When a candidate
+exists, the board is rebuilt from the paginated `filter=all` history (decoded
+without `--slurp`); the predicate runs before any collapsing, only fully
+identified same-suite reruns are collapsed, and conflicting or identity-less
+observations stay independent so they still reach `shadowed`. If the lookup
+fails nothing is excluded; if history is unusable while a candidate exists the
+board is non-authoritative (partial query, unavailable unless failing) and can
+neither pass the gate nor qualify managed success. Exclusions are recorded in
+`PullRequestChecks.excluded`/`exclusion_notes`, rendered separately and logged.
+Cost: one dispatch-run read per fetch whenever Actions check runs are present,
+plus the history read only when a candidate exists.
+
 Managed CI is a repository-integrated alternative: intermediate runs may be
 suppressed, then a reviewed candidate receives an authenticated final workflow
 dispatch. Version-2 intent records track generation, nonce, run, and attempt.
-Qualification requires correlated exact-head evidence and the complete check
-board, not a model's statement that CI passed. Head changes invalidate the
+Qualification requires correlated exact-head evidence and the full counted
+check board, not a model's statement that CI passed. Head changes invalidate the
 proof. Automatic merge uses `--match-head-commit`; explicit managed CI can
 qualify for manual merging instead.
 

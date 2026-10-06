@@ -2053,8 +2053,8 @@ def _managed_success_supersedes_ordinary_checks(
 
     Returns ``(verdict, predicate)`` with verdict ``not_applicable``, ``cleared``
     or ``unqualified``. Only a ``github-pr-checks`` revalidation candidate at the
-    qualified head is considered; the judgement is made from the full,
-    unfiltered exact-head board and never from obligation text.
+    qualified head is considered; the judgement is made from the full counted
+    exact-head board and never from obligation text.
     """
     candidates = [
         item
