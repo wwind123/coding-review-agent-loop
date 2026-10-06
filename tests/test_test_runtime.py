@@ -3029,6 +3029,23 @@ def test_non_package_npx_run_keeps_npx_spelling_in_result_and_cli_row(tmp_path, 
 
 # --- pre-collection launch failures (issue #1182) ----------------------------
 
+
+@pytest.fixture(autouse=True)
+def _lp_isolated_pytest_environment(monkeypatch):
+    """Child pytest runs must not inherit the outer run's pytest controls.
+
+    Managed CI exports ``PYTEST_ADDOPTS=-p ci_shard_plugin`` and xdist exports
+    its worker variables; an inherited ``-p`` plugin is (correctly) an early
+    plugin for the probe and, under ``-I``/``-E`` or a replaced PYTHONPATH, an
+    import error.
+    """
+    for name in (
+        "PYTEST_ADDOPTS", "PYTEST_PLUGINS", "PYTEST_XDIST_AUTO_NUM_WORKERS", "PYTEST_XDIST_WORKER",
+        "PYTEST_XDIST_WORKER_COUNT", "PYTEST_XDIST_TESTRUNUID", "PYTEST_CURRENT_TEST",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 from coding_review_agent_loop import lifecycle_probe as lp  # noqa: E402
 from coding_review_agent_loop.test_workers import WorkerBudget  # noqa: E402
 
@@ -3120,7 +3137,7 @@ def test_standard_console_script_usage_error_is_classified(tmp_path):
     script = tmp_path / "bin" / "pytest"
     script.parent.mkdir()
     script.write_text(
-        f"#!{os.path.realpath(sys.executable)}\nimport sys\nfrom pytest import console_main\n"
+        f"#!{sys.executable}\nimport sys\nfrom pytest import console_main\n"
         "if __name__ == '__main__':\n    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n"
         "    sys.exit(console_main())\n",
         encoding="utf-8",
@@ -3438,7 +3455,7 @@ _LP_ISOLATED_LABELS = {"dash-I", "isolating-wrapper", "trampoline", "shebang-iso
 
 
 def _lp_launcher(tmp_path, label):
-    real = os.path.realpath(sys.executable)
+    real = sys.executable
     base = dict(os.environ)
     bin_dir = tmp_path / "bin"
     wrapper = _lp_script(bin_dir / "python3", f'#!/bin/sh\nexec {real} "$@"\n')
@@ -3590,7 +3607,7 @@ def test_no_pytest_route_needs_eligibility_report_and_check():
 
 def test_python_named_shell_wrapper_is_never_classified_as_missing_pytest(tmp_path):
     python = _lp_no_pytest_python(tmp_path)
-    real = os.path.realpath(sys.executable)
+    real = sys.executable
     wrapper = _lp_script(
         tmp_path / "bin" / "python3",
         f'#!/bin/sh\nif [ "$1" = "-m" ]; then exec {real} "$@"; else exec {python} "$@"; fi\n',
@@ -3685,7 +3702,7 @@ _LP_FIRE_MODULE = (
 
 
 def test_console_script_with_an_expression_in_a_standard_line_gets_no_injection(tmp_path):
-    real = os.path.realpath(sys.executable)
+    real = sys.executable
     _lp_write(tmp_path, {"test_x.py": _LP_FIRE})
     template = (
         f"#!{real}\nimport re\nimport sys\nfrom pytest import console_main\n"
@@ -3707,7 +3724,7 @@ def test_console_script_with_an_expression_in_a_standard_line_gets_no_injection(
 
 
 def test_env_shebang_trampoline_gets_no_injection_and_keeps_the_exit_status(tmp_path):
-    real = os.path.realpath(sys.executable)
+    real = sys.executable
     _lp_write(tmp_path, _LP_PASSING)
     trampoline = _lp_script(tmp_path / "bin" / "env", f'#!/bin/sh\nshift\nexec {real} -I "$@"\n')
     script = _lp_script(
@@ -3902,7 +3919,7 @@ _LP_NOT_INJECTED = (
 def test_excluded_launchers_and_setup_failures_run_the_original_command_through_the_runner(
     tmp_path, monkeypatch, failure
 ):
-    real = os.path.realpath(sys.executable)
+    real = sys.executable
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     monkeypatch.setattr(lp.tempfile, "tempdir", str(scratch))
