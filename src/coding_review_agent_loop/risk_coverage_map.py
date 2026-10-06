@@ -412,14 +412,49 @@ def neutralize_coverage_map_heading(text: str) -> str:
     return _COVERAGE_HEADING_RE.sub("risk-matrix coverage-map (quoted)", text)
 
 
-def extract_coverage_map_section(body: str | None) -> str | None:
-    """Return the orchestrator-authored coverage-map section of a round comment."""
-    if not body or COVERAGE_MAP_HEADING not in body:
+_ANCHOR_HEADINGS = (
+    "\n### Result\n",  # implementation comments
+    "\n### Addressed items\n",  # coder follow-up comments
+    "\n### Remaining items\n",
+    "\n### Disputed items\n",
+)
+_STATUS_RE = re.compile(
+    r"- \*\*Status:\*\* (?:(?:complete|incomplete) at (?P<rev>[0-9a-f]{7,64})\b|unverified:)"
+)
+
+
+def extract_coverage_map_section(
+    body: str | None, *, expected_revision: str | None = None
+) -> str | None:
+    """Return the orchestrator-authored coverage-map section of a stored round comment.
+
+    Stored comments may predate the rendering boundary that neutralizes the
+    heading in coder prose, so the section is accepted only when it is
+    unambiguous: the heading phrase occurs exactly once in the whole body, as a
+    section heading after the last result heading, with a well-formed status
+    line (naming ``expected_revision`` when one is supplied).  Anything else is
+    conservatively omitted rather than guessed at (#1290).
+    """
+    if not body or len(_COVERAGE_HEADING_RE.findall(body)) != 1:
         return None
-    section = body.split(COVERAGE_MAP_HEADING, 1)[1]
+    marker = "\n\n" + COVERAGE_MAP_HEADING + "\n"
+    index = body.find(marker)
+    if index == -1:
+        return None
+    result_index = max(body.rfind(anchor) for anchor in _ANCHOR_HEADINGS)
+    if result_index == -1 or index < result_index:
+        return None
+    section = body[index + 2 :]
     cut = len(section)
-    for marker in ("\n\n### ", "\n\n## ", "\n\n<!--", "\n\n--"):
-        index = section.find(marker)
-        if index != -1:
-            cut = min(cut, index)
-    return (COVERAGE_MAP_HEADING + section[:cut]).strip()
+    for cut_marker in ("\n\n### ", "\n\n## ", "\n\n<!--", "\n\n--"):
+        found = section.find(cut_marker)
+        if found != -1:
+            cut = min(cut, found)
+    section = section[:cut].strip()
+    status = _STATUS_RE.search(section)
+    if status is None:
+        return None
+    revision = status.group("rev")
+    if expected_revision and revision and not str(expected_revision).startswith(revision):
+        return None
+    return section

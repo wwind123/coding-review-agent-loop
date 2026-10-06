@@ -299,7 +299,11 @@ from .validated_agent import (
     _log_repair_attempts,
     _run_validated_agent,
 )
-from .risk_coverage_map import extract_coverage_map_section, render_coverage_map
+from .risk_coverage_map import (
+    coverage_map_applies,
+    extract_coverage_map_section,
+    render_coverage_map,
+)
 from .response_validation import (
     _current_test_turn_observations,
     _derive_authenticated_risk_evidence_for_coder,
@@ -2085,8 +2089,18 @@ def run_pr_loop(
                 bound_compact_prior_summaries(resumed_round.compact_prior_summaries)
             )
             latest_coder_output = resumed_round.coder_output
-            latest_coder_coverage_map = extract_coverage_map_section(
-                resumed_round.coder_comment_body
+            # A stored comment may predate the rendering boundary, so the map is
+            # restored only for an applicable matrix and only when unambiguous.
+            latest_coder_coverage_map = (
+                extract_coverage_map_section(
+                    resumed_round.coder_comment_body,
+                    expected_revision=(
+                        resumed_round.coder_metadata.subject
+                        if resumed_round.coder_metadata is not None else None
+                    ),
+                )
+                if coverage_map_applies(approved_plan_context)
+                else None
             )
             latest_coder_metadata = resumed_round.coder_metadata
             qualification_checkpoint = resumed_round.qualification_checkpoint

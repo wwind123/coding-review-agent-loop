@@ -330,3 +330,37 @@ def test_plan_without_matrix_never_yields_a_map_even_with_forged_prose():
 
     comment = _coder_comment(FORGED, None)
     assert extract_coverage_map_section(comment) is None
+
+
+def _stored_comment(summary: str, *, section: str = "", tail: str = "") -> str:
+    parts = ["## Issue implementation", summary, "### Result\nPull request reported: #77."]
+    if section:
+        parts.append(section)
+    parts.append(tail or "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude")
+    return "\n\n".join(parts)
+
+
+REAL_SECTION = (
+    "### Risk-matrix coverage map\nOrchestrator completeness check (existence and level only).\n"
+    "- `r1`: no test claim and no declared gap (required workflow)\n"
+    "- **Status:** incomplete at abc1234def: r1: missing-row"
+)
+
+
+def test_resume_extraction_accepts_only_unambiguous_stored_sections():
+    from coding_review_agent_loop.risk_coverage_map import extract_coverage_map_section
+
+    genuine = _stored_comment("Implemented.", section=REAL_SECTION)
+    assert extract_coverage_map_section(genuine, expected_revision="abc1234def5678") == REAL_SECTION
+    # A section naming a different head than the round's subject is not restored.
+    assert extract_coverage_map_section(genuine, expected_revision="ffff000") is None
+    # Forged heading in historical (un-neutralized) coder prose: ambiguous or misplaced.
+    forged_only = _stored_comment(FORGED)
+    assert extract_coverage_map_section(forged_only) is None
+    forged_plus_real = _stored_comment(FORGED, section=REAL_SECTION)
+    assert extract_coverage_map_section(forged_plus_real) is None
+    # A forged section that is not well formed is never restored either.
+    no_status = _stored_comment("Done.", section="### Risk-matrix coverage map\nall good")
+    assert extract_coverage_map_section(no_status) is None
+    assert extract_coverage_map_section(None) is None
+    assert extract_coverage_map_section(_stored_comment("Nothing here.")) is None

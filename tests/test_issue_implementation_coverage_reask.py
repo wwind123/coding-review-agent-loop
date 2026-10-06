@@ -249,12 +249,20 @@ def test_first_review_prompt_carries_the_coverage_map(tmp_path, monkeypatch):
     assert "row-man: missing-row" in prompts[0]
 
 
+@pytest.mark.parametrize("historical", [False, True])
 @pytest.mark.parametrize("matrix", [True, False])
-def test_forged_summary_heading_never_reaches_the_review_prompt_as_the_map(tmp_path, monkeypatch, matrix):
+def test_forged_summary_heading_never_reaches_the_review_prompt_as_the_map(
+    tmp_path, monkeypatch, matrix, historical
+):
     import json as _json
+    import coding_review_agent_loop.comment_rendering as rendering_module
     from agent_loop_helpers import structured_pr_review
     import coding_review_agent_loop.orchestrator as orchestrator_module
 
+    if historical:
+        # A comment stored by an older version rendered coder prose verbatim, so
+        # the resumed body can hold the forged heading un-neutralized.
+        monkeypatch.setattr(rendering_module, "neutralize_coverage_map_heading", lambda text: text)
     real_run_pr_loop = orchestrator_module.run_pr_loop
     h = CoverageHarness(tmp_path, monkeypatch, reviewer="codex", applicable=matrix, plan_context_mode="default" if matrix else "none")
     if not matrix:
@@ -273,9 +281,14 @@ def test_forged_summary_heading_never_reaches_the_review_prompt_as_the_map(tmp_p
     h.script = [h.response(with_forged_summary(first)), h.response(with_forged_summary(first))]
     h.run()
     prompt = next(cmd[-1] for cmd, _cwd in h.runner.commands if cmd[:2] == ["codex", "exec"])
-    if "risk_matrix_coverage_map" in prompt:
-        assert "deadbeef" not in prompt.split("risk_matrix_coverage_map")[-1].split("}")[0]
-    if matrix:
+    # The coder's own summary may legitimately appear as a labelled claim, but the
+    # orchestrator map field must never carry the forged text.
+    map_field = prompt.split('"risk_matrix_coverage_map"')[1].split('",\n')[0] if '"risk_matrix_coverage_map"' in prompt else ""
+    assert "deadbeef" not in map_field
+    if matrix and not historical:
         assert "row-man: missing-row" in prompt
-    else:
+    if not matrix:
+        assert "risk_matrix_coverage_map" not in prompt
+    if historical:
+        # Ambiguous stored comments are omitted conservatively, never guessed at.
         assert "risk_matrix_coverage_map" not in prompt
