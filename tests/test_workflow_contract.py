@@ -1409,3 +1409,357 @@ def test_pr_cannot_certify_itself_through_the_allow_list_or_the_workflow():
     assert "AGENT_LOOP_TRUSTED_BASES" not in _ordinary_text()
     # Dispatch always executes from the default branch, never the base.
     assert "refs/heads/' + default_branch" in _dispatch_block(text)
+
+
+# --- split layout: validate / caller-owned jobs / publish (#1313) -----------
+
+VALIDATE = ROOT / ".github" / "workflows" / "managed-ci-validate.yml"
+PUBLISH = ROOT / ".github" / "workflows" / "managed-ci-publish.yml"
+SPLIT_CALLER = ROOT / "tests" / "fixtures" / "managed_ci" / "split_caller.yml"
+ATTEST_ACTION = ROOT / ".github" / "actions" / "managed-ci-attest" / "action.yml"
+GUARD_FIXTURE = ROOT / "tests" / "fixtures" / "managed_ci" / "split_status_guard.py"
+FORWARDED = ("protocol_version", "pr_number", "expected_head_sha", "managed_nonce")
+
+
+def _trigger(path):
+    workflow = _load(path)
+    return workflow.get(True, workflow.get("on"))
+
+
+def _step_by_name(job, name):
+    return next(step for step in job["steps"] if step.get("name") == name)
+
+
+def test_split_entry_points_are_workflow_call_with_exactly_the_documented_inputs():
+    validate = _trigger(VALIDATE)
+    assert set(validate) == {"workflow_call"}
+    assert set(validate["workflow_call"]["inputs"]) == set(FORWARDED)
+    assert set(validate["workflow_call"]["outputs"]) == {
+        "target_sha", "pr_number", "nonce", "run_id", "attempt",
+    }
+    publish = _trigger(PUBLISH)
+    assert set(publish) == {"workflow_call"}
+    assert set(publish["workflow_call"]["inputs"]) == set(FORWARDED) | {
+        "target_sha", "nonce", "validation_result", "needs_results", "expected_attestations",
+    }
+    for trigger in (validate, publish):
+        assert "secrets" not in trigger["workflow_call"]
+        for spec in trigger["workflow_call"]["inputs"].values():
+            assert spec["type"] == "string" and spec["default"] == ""
+
+
+def test_only_the_publish_status_job_holds_a_write_scope_in_the_split_layout():
+    validate_jobs = _load(VALIDATE)["jobs"]
+    publish_jobs = _load(PUBLISH)["jobs"]
+    assert set(validate_jobs) == {"validate"} and set(publish_jobs) == {"verify", "publish"}
+    assert _perms(validate_jobs["validate"]) == {
+        "actions": "read", "contents": "read", "issues": "read", "pull-requests": "read",
+    }
+    assert _perms(publish_jobs["verify"]) == {"actions": "read", "contents": "read"}
+    assert _perms(publish_jobs["publish"]) == {"statuses": "write"}
+    writers = [
+        (path.name, job_id)
+        for path, jobs in ((VALIDATE, validate_jobs), (PUBLISH, publish_jobs))
+        for job_id, job in jobs.items()
+        if "write" in _perms(job).values()
+    ]
+    assert writers == [("managed-ci-publish.yml", "publish")]
+    caller = _load(SPLIT_CALLER)["jobs"]
+    for job_id, job in caller.items():
+        if job_id == "publish":
+            assert _perms(job)["statuses"] == "write"
+        else:
+            assert "write" not in _perms(job).values(), job_id
+
+
+def test_validator_step_is_byte_identical_to_the_legacy_workflow():
+    legacy = _workflow_text()
+    validate = VALIDATE.read_text(encoding="utf-8")
+    legacy_step = legacy[
+        legacy.index("      - name: Validate live PR and handoff record\n"):
+        legacy.index("      - name: Plan shard matrix\n")
+    ].rstrip("\n")
+    split_step = validate[validate.index("      - name: Validate live PR and handoff record\n"):].rstrip("\n")
+    assert split_step == legacy_step
+    for marker in ("MANAGED_CI_V2_VALIDATOR", "MANAGED_CI_V2_DISPATCH_VALIDATOR", "MANAGED_CI_TRUSTED_BASES"):
+        assert _extraction_block(validate, marker) == _extraction_block(legacy, marker)
+    forwarded = "      - name: Require forwarded inputs to equal the dispatch event\n"
+    assert validate[validate.index(forwarded):validate.index(forwarded) + 900] == legacy[
+        legacy.index(forwarded):legacy.index(forwarded) + 900
+    ]
+
+
+def test_publisher_and_status_guard_blocks_match_their_fixtures():
+    publish = PUBLISH.read_text(encoding="utf-8")
+    assert _publisher_block(publish) == _publisher_block(PUBLISHER_FIXTURE.read_text(encoding="utf-8"))
+    assert _extraction_block(publish, "MANAGED_CI_SPLIT_STATUS_GUARD") == _extraction_block(
+        GUARD_FIXTURE.read_text(encoding="utf-8"), "MANAGED_CI_SPLIT_STATUS_GUARD"
+    )
+
+
+def test_status_job_runs_the_guard_before_the_builder_and_reads_only_the_verify_result():
+    publish = _load(PUBLISH)["jobs"]["publish"]
+    assert publish["needs"] == "verify"
+    assert publish["if"].startswith("always()")
+    assert all("uses" not in step or "checkout" not in step["uses"] for step in publish["steps"])
+    assert not any("download-artifact" in step.get("uses", "") for step in publish["steps"])
+    assert len(publish["steps"]) == 1
+    step = publish["steps"][0]
+    assert step["env"]["TEST_RESULT"] == "${{ needs.verify.result }}"
+    assert step["env"]["VALIDATION_RESULT"] == "${{ inputs.validation_result }}"
+    script = step["run"]
+    assert script.index("correlation_matches(") < script.index("request_plan = build_status_request(")
+    assert script.count("test_result=os.environ.get('TEST_RESULT', '')") == 1
+
+
+def test_verify_job_is_always_gated_on_validation_and_ends_with_a_literal_check():
+    verify = _load(PUBLISH)["jobs"]["verify"]
+    assert verify["if"].startswith("always()")
+    assert "inputs.validation_result == 'success'" in verify["if"]
+    assert verify["steps"][-1]["run"] == 'test "$VERIFY_RESULT" = success'
+    names = [step.get("name", step.get("uses")) for step in verify["steps"]]
+    assert names[0] == "Require the reusable workflow revision"
+    text = PUBLISH.read_text(encoding="utf-8")
+    assert "attempts/$RUN_ATTEMPT/jobs" in text
+    assert "ref: ${{ job.workflow_sha }}" in text
+
+
+@pytest.mark.parametrize(
+    "job", [("validate", VALIDATE), ("verify", PUBLISH), ("publish", PUBLISH)],
+    ids=lambda j: j[0],
+)
+def test_split_routing_guards_keep_an_all_empty_dispatch_out(job):
+    job_id, path = job
+    condition = _load(path)["jobs"][job_id]["if"]
+    assert "github.event_name == 'workflow_dispatch'" in condition
+    for name in FORWARDED:
+        assert f"inputs.{name} != ''" in condition
+        assert f"github.event.inputs.{name} != ''" in condition
+
+
+def test_split_layout_leaves_the_legacy_workflows_and_caller_unchanged():
+    # The legacy entry points keep their jobs, markers and publisher.
+    assert list(_load(WORKFLOW)["jobs"]) == [
+        "validate-managed", "exact-head-shard", "exact-head", "publish-exact-head",
+    ]
+    assert list(_load(ORDINARY)["jobs"])
+    assert set(_load(CALLER)["jobs"]) == {"ci", "managed"}
+    assert "AGENT_LOOP_MANAGED_CI_V2: enabled" in _caller_text()
+    assert "final-ci/exact-head" in _workflow_text()
+
+
+EXPECTED_JOBS = ("services", "unit")
+
+
+def test_fixture_caller_pins_every_use_and_checks_out_the_literal_target_first():
+    caller = _load(SPLIT_CALLER)["jobs"]
+    text = SPLIT_CALLER.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if "uses: wwind123/" in line:
+            assert re.search(r"@[0-9a-f]{40} # managed-ci-split-v1$", line), line
+    for job_id in EXPECTED_JOBS:
+        job = caller[job_id]
+        assert _perms(job) == {"contents": "read"}
+        assert job["needs"] == "validate"
+        steps = job["steps"]
+        assert steps[0]["uses"].startswith("actions/checkout@")
+        assert steps[0]["with"]["ref"] == "${{ needs.validate.outputs.target_sha }}"
+        assert steps[1]["run"] == 'test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"'
+        assert steps[1]["env"]["EXPECTED_HEAD_SHA"] == "${{ needs.validate.outputs.target_sha }}"
+        assert re.search(r"managed-ci-attest@[0-9a-f]{40}$", steps[-1]["uses"])
+        assert steps[-1]["with"]["target_sha"] == "${{ needs.validate.outputs.target_sha }}"
+        # Install and test steps only come after the head check.
+        assert all("uses" in s and "attest" in s["uses"] or "run" in s for s in steps[2:])
+
+
+def test_fixture_caller_publish_covers_every_need_and_declares_a_literal_expected_set():
+    publish = _load(SPLIT_CALLER)["jobs"]["publish"]
+    assert publish["if"] == "always()"
+    assert set(publish["needs"]) == {"validate", *EXPECTED_JOBS}
+    with_ = publish["with"]
+    assert with_["needs_results"] == "${{ toJSON(needs) }}"
+    assert with_["validation_result"] == "${{ needs.validate.result }}"
+    assert with_["target_sha"] == "${{ needs.validate.outputs.target_sha }}"
+    assert "${{" not in with_["expected_attestations"]
+    expected = json.loads(with_["expected_attestations"])
+    assert {e["needs_key"] for e in expected} == set(EXPECTED_JOBS)
+    assert {e["attestation_id"] for e in expected} == {"services", "unit-a", "unit-b"}
+
+
+def test_attest_action_rejects_non_sha_refs_and_requires_the_artifact():
+    action = _load(ATTEST_ACTION)
+    steps = action["runs"]["steps"]
+    pin = next(s for s in steps if s.get("id") == "pin")
+    assert "^[0-9a-f]{40}$" in pin["run"]
+    upload = steps[-1]
+    assert upload["uses"].startswith("actions/upload-artifact@")
+    assert upload["with"]["if-no-files-found"] == "error"
+
+
+# -- status-step behaviour: the real publish step against a recording stub ----
+
+
+def _run_status_step(monkeypatch, *, forwarded=None, event=None, **overrides):
+    import io
+    import os
+    import urllib.request
+
+    step = _load(PUBLISH)["jobs"]["publish"]["steps"][0]
+    script = step["run"].split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    tuple_ = {
+        "protocol_version": "2", "pr_number": "7",
+        "expected_head_sha": "b" * 40, "managed_nonce": "n" * 32,
+    }
+    env = {
+        "GH_TOKEN": "t", "GH_API_URL": "https://api.github.com", "GH_REPOSITORY": "OWNER/REPO",
+        "TARGET_SHA": "b" * 40, "VALIDATION_RESULT": "success", "TEST_RESULT": "success",
+        "NONCE": "n" * 32, "RUN_ID": "200", "RUN_ATTEMPT": "1", "SERVER_URL": "https://github.com",
+    }
+    for key, value in {**tuple_, **(forwarded or {})}.items():
+        env["FORWARDED_" + key.upper()] = value
+    for key, value in {**tuple_, **(event or {})}.items():
+        env["EVENT_" + key.upper()] = value
+    env.update(overrides)
+    requests = []
+
+    def fake_urlopen(request, timeout=None):
+        requests.append(request)
+        return io.BytesIO(b"{}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(os, "environ", env)
+    try:
+        exec(compile(script, "publish-step", "exec"), {"__name__": "__main__"})
+    except SystemExit as exc:
+        assert exc.code in (0, None)
+    return requests
+
+
+@pytest.mark.parametrize(
+    ("verify_result", "state"),
+    [("success", "success"), ("failure", "failure"), ("cancelled", "failure"), ("skipped", "failure")],
+)
+def test_status_step_writes_exactly_one_status_on_the_event_sha(monkeypatch, verify_result, state):
+    requests = _run_status_step(monkeypatch, TEST_RESULT=verify_result)
+    assert len(requests) == 1
+    assert requests[0].full_url == "https://api.github.com/repos/OWNER/REPO/statuses/" + "b" * 40
+    body = json.loads(requests[0].data)
+    assert body["state"] == state and body["context"] == "final-ci/exact-head"
+    assert body["description"] == "nonce=" + "n" * 32 + ";run_id=200;attempt=1;result=" + state
+    assert body["target_url"] == "https://github.com/OWNER/REPO/actions/runs/200"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"TARGET_SHA": "c" * 40},
+        {"NONCE": "m" * 32},
+        {"VALIDATION_RESULT": "failure"},
+        {"VALIDATION_RESULT": "skipped"},
+        {"VALIDATION_RESULT": ""},
+        {"FORWARDED_PR_NUMBER": "8"},
+        {"FORWARDED_PROTOCOL_VERSION": "3"},
+        {"FORWARDED_EXPECTED_HEAD_SHA": "c" * 40},
+        {"FORWARDED_MANAGED_NONCE": "m" * 32},
+    ],
+)
+@pytest.mark.parametrize("verify_result", ["success", "failure"])
+def test_status_step_writes_nothing_for_drifted_or_unvalidated_correlation(
+    monkeypatch, overrides, verify_result
+):
+    assert _run_status_step(monkeypatch, TEST_RESULT=verify_result, **overrides) == []
+
+
+# -- composition: extracted validator + current-attempt verifier --------------
+
+
+def _attestation_module():
+    import sys
+
+    callee = str(ROOT / "ci" / "managed")
+    sys.path.insert(0, callee)
+    try:
+        import attestation
+    finally:
+        sys.path.remove(callee)
+    return attestation
+
+
+EXPECTED_SET = [
+    {"attestation_id": "services", "job_name": "services", "needs_key": "services"},
+    {"attestation_id": "unit-a", "job_name": "unit (a)", "needs_key": "unit"},
+]
+
+
+def _verify_attempt(attempt, *, attested_attempts, jobs_ok=True):
+    """Run the verifier as publish would at ``attempt``.
+
+    ``attested_attempts`` maps attestation id -> attempts that left an artifact.
+    """
+    module = _attestation_module()
+    artifacts = []
+    for entry in EXPECTED_SET:
+        for held in attested_attempts[entry["attestation_id"]]:
+            rec = module.build_record(
+                attestation_id=entry["attestation_id"], job_name=entry["job_name"],
+                target_sha="b" * 40, head_sha="b" * 40, run_id=200, run_attempt=held,
+                repository="OWNER/REPO", job_status="success",
+            )
+            artifacts.append((
+                module.artifact_name(entry["attestation_id"], held),
+                {"attestation.json": json.dumps(rec).encode()},
+            ))
+    api_jobs = [{"name": e["job_name"], "conclusion": "success"} for e in EXPECTED_SET]
+    needs = {k: {"result": "success"} for k in ("validate", "services", "unit")}
+    return module.verify(EXPECTED_SET, artifacts, api_jobs, needs, 200, attempt, "b" * 40, "OWNER/REPO")
+
+
+_NO_STATUS_RECORD = dict(
+    run_id=200, run_attempt=1, terminal_run_id=200, terminal_run_attempt=1,
+    terminal_attempts=[{"run_id": 200, "run_attempt": 1}], terminal_outcome="no-status",
+)
+
+
+def test_authorized_no_status_retry_validates_then_verifies_only_current_attempt_artifacts():
+    validated, _ = _dispatch_validate(
+        record=_record("completed", **_NO_STATUS_RECORD), current_run_attempt="2",
+    )
+    assert validated["target_sha"] == "b" * 40
+    # Retained attempt-1 artifacts plus a complete attempt-2 set verify.
+    both = {"services": [1, 2], "unit-a": [1, 2]}
+    assert _verify_attempt(2, attested_attempts=both) == []
+    # A retry that carried an expected job over from attempt 1 fails as missing.
+    carried = {"services": [1, 2], "unit-a": [1]}
+    errors = _verify_attempt(2, attested_attempts=carried)
+    assert any("missing attestation for 'unit-a'" in e for e in errors)
+    # Attempt-1 attestations are never accepted for attempt 2.
+    assert _verify_attempt(2, attested_attempts={"services": [1], "unit-a": [1]})
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        # stale intent
+        {"record": _record("completed", **_NO_STATUS_RECORD), "current_run_attempt": "2", "current_time": 10_000},
+        # unmatched attempt (skips an attempt)
+        {"record": _record("completed", **_NO_STATUS_RECORD), "current_run_attempt": "3"},
+        # rerun of an attached record whose run pair differs
+        {"record": _record("attached", run_id=200, run_attempt=1), "current_run_attempt": "2"},
+        # rerun after a published (completed with a status) terminal
+        {
+            "record": _record(
+                "completed", run_id=200, run_attempt=1, terminal_run_id=200,
+                terminal_run_attempt=1, terminal_attempts=[{"run_id": 200, "run_attempt": 1}],
+                terminal_outcome="success",
+            ),
+            "current_run_attempt": "2",
+        },
+    ],
+)
+def test_unauthorized_reruns_are_rejected_before_any_verifier_or_status(monkeypatch, case):
+    module = _attestation_module()
+    monkeypatch.setattr(module, "verify", lambda *a, **k: pytest.fail("verifier must not run"))
+    with pytest.raises(ValueError):
+        _dispatch_validate(**case)
+    # The publish status step sees a non-success validation and writes nothing.
+    assert _run_status_step(monkeypatch, VALIDATION_RESULT="failure", TEST_RESULT="skipped") == []

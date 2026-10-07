@@ -1,0 +1,309 @@
+name: Managed CI publish (reusable)
+
+# Split-layout publish entry point (#1313).  Job verify is read-only: it checks
+# the caller's expected-attestation set against the current-attempt
+# attestation artifacts, the Actions jobs API conclusions and the caller's
+# needs results.  Job publish is the only job anywhere in the split layout with
+# statuses: write; it runs no repository code and downloads nothing.  An
+# attestation is an untrusted correlation claim: the pass/fail authority is
+# the jobs API conclusion plus the default-branch caller's composition.
+on:
+  workflow_call:
+    inputs:
+      protocol_version:
+        description: Managed-CI protocol version forwarded from the dispatch
+        type: string
+        required: false
+        default: ''
+      pr_number:
+        description: Pull request being qualified, forwarded from the dispatch
+        type: string
+        required: false
+        default: ''
+      expected_head_sha:
+        description: Exact pull request head SHA, forwarded from the dispatch
+        type: string
+        required: false
+        default: ''
+      managed_nonce:
+        description: Fresh generation nonce, forwarded from the dispatch
+        type: string
+        required: false
+        default: ''
+      target_sha:
+        description: Validated target SHA (needs.validate.outputs.target_sha)
+        type: string
+        required: false
+        default: ''
+      nonce:
+        description: Validated nonce (needs.validate.outputs.nonce)
+        type: string
+        required: false
+        default: ''
+      validation_result:
+        description: Result of the validate job (needs.validate.result)
+        type: string
+        required: false
+        default: ''
+      needs_results:
+        description: toJSON(needs) of the caller's publish job
+        type: string
+        required: false
+        default: ''
+      expected_attestations:
+        description: Literal JSON expected-attestation set declared in the default-branch caller
+        type: string
+        required: false
+        default: ''
+
+jobs:
+  verify:
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' &&
+      inputs.validation_result == 'success' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '' ||
+       github.event.inputs.protocol_version != '' || github.event.inputs.pr_number != '' ||
+       github.event.inputs.expected_head_sha != '' || github.event.inputs.managed_nonce != '')
+    name: Verify split attestations
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      # The reusable workflow's own scripts, from its own repository and
+      # revision.  An empty context fails closed.
+      - name: Require the reusable workflow revision
+        env:
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          test -n "$WORKFLOW_REPOSITORY"
+          printf '%s' "$WORKFLOW_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          echo "Callee: $WORKFLOW_REPOSITORY@$WORKFLOW_SHA"
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .managed-ci
+          sparse-checkout: ci/managed
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      # Without merge-multiple each artifact lands in its own directory.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: managed-ci-attest-*
+          path: attestations
+      - name: List current-attempt jobs from the API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -o pipefail
+          gh api --paginate "repos/$GH_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" --jq '.jobs[]' | jq -s '.' > "$RUNNER_TEMP/jobs.json"
+      - name: Verify attestations
+        id: verify
+        env:
+          EXPECTED_ATTESTATIONS: ${{ inputs.expected_attestations }}
+          NEEDS_RESULTS: ${{ inputs.needs_results }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          if python3 .managed-ci/ci/managed/attestation.py verify --expected "$EXPECTED_ATTESTATIONS" --needs "$NEEDS_RESULTS" --artifacts-dir attestations --jobs-file "$RUNNER_TEMP/jobs.json" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --target-sha "$TARGET_SHA" --repository "$GH_REPOSITORY"; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Require verified attestations
+        env:
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
+        run: test "$VERIFY_RESULT" = success
+
+  publish:
+    needs: verify
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '' ||
+       github.event.inputs.protocol_version != '' || github.event.inputs.pr_number != '' ||
+       github.event.inputs.expected_head_sha != '' || github.event.inputs.managed_nonce != '')
+    name: Publish final exact-head status
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      - name: Publish correlated terminal status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_API_URL: ${{ github.api_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+          VALIDATION_RESULT: ${{ inputs.validation_result }}
+          TEST_RESULT: ${{ needs.verify.result }}
+          NONCE: ${{ inputs.nonce }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SERVER_URL: ${{ github.server_url }}
+          FORWARDED_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
+          FORWARDED_PR_NUMBER: ${{ inputs.pr_number }}
+          FORWARDED_EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+          FORWARDED_MANAGED_NONCE: ${{ inputs.managed_nonce }}
+          EVENT_PROTOCOL_VERSION: ${{ github.event.inputs.protocol_version }}
+          EVENT_PR_NUMBER: ${{ github.event.inputs.pr_number }}
+          EVENT_EXPECTED_HEAD_SHA: ${{ github.event.inputs.expected_head_sha }}
+          EVENT_MANAGED_NONCE: ${{ github.event.inputs.managed_nonce }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from urllib.request import Request, urlopen
+
+          # BEGIN MANAGED_CI_SPLIT_STATUS_GUARD
+          # Source repository: wwind123/coding-review-agent-loop
+          # Source path: .github/workflows/managed-ci-publish.yml
+          # Extraction boundary: correlation_matches() through its return value.
+          # The status job trusts nothing it was handed: every forwarded input and the
+          # supplied target and nonce must equal the values the dispatch event carried,
+          # and validation must have succeeded. Any mismatch means no status is written.
+          FORWARDED_KEYS = ('protocol_version', 'pr_number', 'expected_head_sha', 'managed_nonce')
+          def correlation_matches(*, forwarded, event, target_sha, nonce, validation_result):
+              if validation_result != 'success':
+                  return False
+              if not isinstance(forwarded, dict) or not isinstance(event, dict):
+                  return False
+              for key in FORWARDED_KEYS:
+                  supplied = forwarded.get(key)
+                  dispatched = event.get(key)
+                  if not isinstance(supplied, str) or not isinstance(dispatched, str):
+                      return False
+                  if supplied != dispatched:
+                      return False
+              return (
+                  isinstance(target_sha, str)
+                  and isinstance(nonce, str)
+                  and target_sha == event['expected_head_sha']
+                  and nonce == event['managed_nonce']
+              )
+          # END MANAGED_CI_SPLIT_STATUS_GUARD
+
+          # BEGIN MANAGED_CI_V2_PUBLISHER
+          # Source repository: wwind123/coding-review-agent-loop
+          # Source path: .github/workflows/managed-ci.yml
+          # Extraction boundary: build_status_request() through its return value.
+          def build_status_payload(
+              *, target_sha, validation_result, test_result, nonce, run_id,
+              run_attempt, server_url, repository,
+          ):
+              if (
+                  validation_result != 'success'
+                  or not isinstance(target_sha, str)
+                  or not re.fullmatch(r'[0-9a-f]{40}', target_sha)
+                  or not re.fullmatch(r'[A-Za-z0-9_-]{32}', nonce or '')
+                  or not re.fullmatch(r'[1-9][0-9]*', run_id or '')
+                  or not re.fullmatch(r'[1-9][0-9]*', run_attempt or '')
+                  or not isinstance(server_url, str)
+                  or not server_url
+                  or not isinstance(repository, str)
+                  or not repository
+              ):
+                  return None
+              state = 'success' if test_result == 'success' else 'failure'
+              description = (
+                  'nonce=' + nonce + ';run_id=' + run_id +
+                  ';attempt=' + run_attempt + ';result=' + state
+              )
+              return {
+                  'target_sha': target_sha,
+                  'payload': {
+                      'state': state,
+                      'context': 'final-ci/exact-head',
+                      'description': description,
+                      'target_url': server_url.rstrip('/') + '/' + repository +
+                                    '/actions/runs/' + run_id,
+                  },
+              }
+
+          def build_status_request(
+              *, target_sha, validation_result, test_result, nonce, run_id,
+              run_attempt, server_url, api_url, repository,
+          ):
+              payload_object = build_status_payload(
+                  target_sha=target_sha,
+                  validation_result=validation_result,
+                  test_result=test_result,
+                  nonce=nonce,
+                  run_id=run_id,
+                  run_attempt=run_attempt,
+                  server_url=server_url,
+                  repository=repository,
+              )
+              if (
+                  payload_object is None
+                  or not isinstance(api_url, str)
+                  or not api_url
+              ):
+                  return None
+              validated_target = payload_object['target_sha']
+              return {
+                  'target_sha': validated_target,
+                  'url': api_url.rstrip('/') + '/repos/' + repository +
+                         '/statuses/' + validated_target,
+                  'payload': payload_object['payload'],
+              }
+          # END MANAGED_CI_V2_PUBLISHER
+
+          forwarded = {
+              'protocol_version': os.environ.get('FORWARDED_PROTOCOL_VERSION', ''),
+              'pr_number': os.environ.get('FORWARDED_PR_NUMBER', ''),
+              'expected_head_sha': os.environ.get('FORWARDED_EXPECTED_HEAD_SHA', ''),
+              'managed_nonce': os.environ.get('FORWARDED_MANAGED_NONCE', ''),
+          }
+          event = {
+              'protocol_version': os.environ.get('EVENT_PROTOCOL_VERSION', ''),
+              'pr_number': os.environ.get('EVENT_PR_NUMBER', ''),
+              'expected_head_sha': os.environ.get('EVENT_EXPECTED_HEAD_SHA', ''),
+              'managed_nonce': os.environ.get('EVENT_MANAGED_NONCE', ''),
+          }
+          if not correlation_matches(
+              forwarded=forwarded,
+              event=event,
+              target_sha=os.environ.get('TARGET_SHA', ''),
+              nonce=os.environ.get('NONCE', ''),
+              validation_result=os.environ.get('VALIDATION_RESULT', ''),
+          ):
+              print('Correlation guard rejected the forwarded tuple; no status written.')
+              raise SystemExit(0)
+          request_plan = build_status_request(
+              target_sha=os.environ.get('TARGET_SHA', ''),
+              validation_result=os.environ.get('VALIDATION_RESULT', ''),
+              test_result=os.environ.get('TEST_RESULT', ''),
+              nonce=os.environ.get('NONCE', ''),
+              run_id=os.environ.get('RUN_ID', ''),
+              run_attempt=os.environ.get('RUN_ATTEMPT', ''),
+              server_url=os.environ.get('SERVER_URL', ''),
+              api_url=os.environ.get('GH_API_URL', ''),
+              repository=os.environ.get('GH_REPOSITORY', ''),
+          )
+          if request_plan is None:
+              print('Authorization failed before an exact target was established; no status written.')
+              raise SystemExit(0)
+          payload = json.dumps(request_plan['payload']).encode('utf-8')
+          request = Request(
+              request_plan['url'],
+              data=payload,
+              method='POST',
+              headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+                  'Content-Type': 'application/json',
+              },
+          )
+          with urlopen(request, timeout=30):
+              pass
+          print('Published correlated final-ci/exact-head status for the validated SHA.')
+          PY
