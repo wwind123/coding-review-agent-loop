@@ -1168,7 +1168,7 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
         frozenset({"authentication-or-forgery", "authority-decision", "orchestrator-authored", "payload-bound"}),
         (
             "Drops one claim per claim-scope defect with one bounded record (#926, #927). "
-            "Stays fatal for CLAIM_RESERVED_AUTHORITY_KEYS, the row, ref, caveat and "
+            "Stays fatal for CLAIM_RESERVED_AUTHORITY_KEYS, the row, caveat and "
             "16,384-byte hard caps, an over-bound dropped value (including the discarded tail of an over-long execution_refs list, #1300), catalog collisions and "
             "non-passing or launch-integrity-unknown in-catalog selectors; previews are "
             "marker-neutralized. Fatal sites: authentication-or-forgery: marker "
