@@ -1826,3 +1826,78 @@ def test_unauthorized_reruns_are_rejected_before_any_verifier_or_status(monkeypa
         _dispatch_validate(**case)
     # The publish status step sees a non-success validation and writes nothing.
     assert _run_status_step(monkeypatch, VALIDATION_RESULT="failure", TEST_RESULT="skipped") == []
+
+
+# -- preparation path: the real jobs-listing step against a stubbed `gh` -------
+
+_GOOD_PAGE = json.dumps({"jobs": [
+    {"name": "services", "conclusion": "success"},
+    {"name": "unit (a)", "conclusion": "success"},
+]})
+_OBJECT_JOBS_PAGE = json.dumps({"jobs": {
+    "x": {"name": "services", "conclusion": "success"},
+    "y": {"name": "unit (a)", "conclusion": "success"},
+}})
+
+
+def _run_jobs_listing_step(tmp_path, *, gh_stdout, gh_exit):
+    """Run the publish workflow's own listing step; return the step exit code."""
+    import os
+    import stat
+    import subprocess
+
+    step = _step_by_name(_load(PUBLISH)["jobs"]["verify"], "List current-attempt jobs from the API")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    payload = tmp_path / "gh_payload.txt"
+    payload.write_text(gh_stdout, encoding="utf-8")
+    stub = bin_dir / "gh"
+    stub.write_text(f'#!/bin/sh\ncat "{payload}"\nexit {gh_exit}\n', encoding="utf-8")
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / ".managed-ci").symlink_to(ROOT)
+    runner_temp = tmp_path / "runner"
+    runner_temp.mkdir()
+    env = {
+        **os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GH_TOKEN": "t",
+        "GH_REPOSITORY": "OWNER/REPO", "RUN_ID": "200", "RUN_ATTEMPT": "1",
+        "RUNNER_TEMP": str(runner_temp),
+    }
+    done = subprocess.run(
+        ["bash", "-e", "-c", step["run"]], cwd=work, env=env, capture_output=True, text=True,
+    )
+    return done.returncode, runner_temp / "jobs.json"
+
+
+@pytest.mark.parametrize(
+    ("gh_stdout", "gh_exit", "prep_ok"),
+    [
+        (_GOOD_PAGE, 0, True),
+        (_OBJECT_JOBS_PAGE, 0, False),  # object-valued jobs must not flatten into a list
+        ("not json", 0, False),
+        ("", 0, False),
+        (_GOOD_PAGE, 1, False),  # valid output but the API command failed: pipefail propagates
+    ],
+    ids=["well-formed", "object-valued-jobs", "non-json", "empty", "api-exit-nonzero"],
+)
+def test_jobs_listing_failure_becomes_a_guarded_failure_status(
+    monkeypatch, tmp_path, gh_stdout, gh_exit, prep_ok
+):
+    code, jobs_file = _run_jobs_listing_step(tmp_path, gh_stdout=gh_stdout, gh_exit=gh_exit)
+    assert (code == 0) is prep_ok
+    if prep_ok:
+        assert [j["name"] for j in json.loads(jobs_file.read_text())] == ["services", "unit (a)"]
+    # The verify job fails when its preparation step fails; the status job then
+    # publishes exactly one failure on the validated event SHA.
+    validated, _ = _dispatch_validate()
+    errors = [] if prep_ok else ["jobs listing failed"]
+    requests = _publish_after_verify(monkeypatch, validated, 1, errors)
+    assert len(requests) == 1
+    assert requests[0].full_url.endswith("/statuses/" + validated["target_sha"])
+    body = json.loads(requests[0].data)
+    assert body["state"] == ("success" if prep_ok else "failure")
+    assert body["description"] == (
+        "nonce=" + "n" * 32 + ";run_id=200;attempt=1;result=" + body["state"]
+    )
+    assert body["target_url"] == "https://github.com/OWNER/REPO/actions/runs/200"
