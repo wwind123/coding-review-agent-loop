@@ -328,15 +328,21 @@ reserved fatal row-ID case is a value beyond the 16,384-byte hard cap, which is
 unbounded input. The remaining claim-scope defects are claim drops too
 (#927), each with one record: a claim that is not an object, an absent, empty
 or ill-typed `execution_refs`, an admissible selector repeated within one
-claim, an unknown key, an ill-typed fact or one over the field bound, a
+claim of eight or fewer refs, an unknown key, an ill-typed fact or one over the field bound, a
 selector over the field bound when no catalog is supplied, and a
 `risk_test_matrix_claims` value that is not an array, which keeps no claim and
 records one field-scope drop. A claim with several defects keeps exactly one
 record, and the row-ID rules win. Authority violations and hard bounds stay
 fatal and are checked before any degradation, so a degradable defect never
-masks them: keys that name orchestrator-owned verification authority
+masks them. An `execution_refs` list of more than eight well-typed refs is not
+one of them (#1300): it is de-duplicated and trimmed to its first eight
+distinct selectors, with a caveat naming the rest and a warning log, before any
+authority check, so only kept selectors are evaluated or cited; the discarded
+raw occurrences stay bounded by the dropped-value cap, and an unsuperseded
+journal failure named only by a discarded selector still makes the row
+incomplete, because the complete journal is scanned. The fatal set is: keys that name orchestrator-owned verification authority
 (`status`, `evidence_citations`, `receipt_id`, `command`, `claim`), the row,
-ref, caveat and 16,384-byte caps, a dropped value whose compact JSON exceeds
+caveat and 16,384-byte caps, a dropped value whose compact JSON exceeds
 the same byte bound (for a claim dropped only by a row-ID rule, which already
 passed every per-field bound, only the discarded tail of an over-long fact list
 is measured), catalog collisions, in-catalog selectors that are

@@ -1019,6 +1019,13 @@ def _semantic_risk_claim_schema_text_base(
         "the row stays unverified, rather than inventing one. "
         "One selector may appear in several rows when that run executed each "
         "row's tests; list a selector at most once within a row. "
+        f"`execution_refs` holds at most {SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS} "
+        "selectors; cite only the runs that executed this row's tests, not every "
+        f"run. A list over {SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS} keeps its "
+        f"first {SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS} distinct selectors and "
+        "records a caveat naming the rest, which cannot verify the row; a "
+        "repeated selector in a list of "
+        f"{SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS} or fewer still drops the claim. "
         "Every fact key ("
         + ", ".join(f"`{key}`" for key in SEMANTIC_RISK_CLAIM_FACT_KEYS)
         + ") must be present and non-empty for the row to verify; a missing, "
@@ -1068,6 +1075,9 @@ class SemanticRiskCoverageClaim:
     forbidden_effect_assertions: tuple[str, ...]
     caveats: tuple[str, ...] = ()
     dropped_execution_refs: tuple[str, ...] = ()
+    # Selectors removed by over-bound normalisation (#1300); like
+    # ``dropped_execution_refs`` they are disclosed only through the caveat.
+    overflow_execution_refs: tuple[str, ...] = ()
     truncated_fact_fields: tuple[str, ...] = ()
     # Declared level the cited tests exercise (#1290); None when absent or invalid.
     test_level: str | None = None
@@ -4405,23 +4415,22 @@ def _optional_semantic_fact_list(
     return rendered, None
 
 
-def _semantic_execution_ref_list(value: object, *, context: str) -> tuple[tuple[str, ...], str | None]:
+def _semantic_execution_ref_list(
+    value: object, *, context: str
+) -> tuple[tuple[tuple[int, str, str], ...], str | None]:
     """Validate ``execution_refs`` structure without the field bound.
 
-    Returns the well-typed selectors and the claim-scope rule, if any.  Refs
-    over the 1,024-byte field bound must reach the parser's drop branch
-    (#859), so only the eight-ref count and the explicit hard cap reject.
+    Returns the well-typed items as ``(index, raw, stripped)`` and the
+    claim-scope rule, if any.  Refs over the 1,024-byte field bound must reach
+    the parser's drop branch (#859), so only the explicit hard cap rejects; a
+    list over the eight-ref bound is normalised by the caller (#1300).
     A non-list value, a non-string or blank item and an empty list are claim
     defects (#927); the well-typed items are still returned, so authority
     decisions on real broker handles run on a claim that is being dropped.
     """
     if not isinstance(value, list):
         return (), CLAIM_EXECUTION_REFS_MISTYPED_RULE
-    if len(value) > SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS:
-        raise AgentLoopError(  # shape-check: fatal:payload-bound
-            f"{context} exceeds the {SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS}-item bound."
-        )
-    rendered: list[str] = []
+    rendered: list[tuple[int, str, str]] = []
     rule: str | None = None
     for index, item in enumerate(value):
         if isinstance(item, str):
@@ -4431,10 +4440,32 @@ def _semantic_execution_ref_list(value: object, *, context: str) -> tuple[tuple[
         if not isinstance(item, str) or not item.strip():
             rule = CLAIM_EXECUTION_REFS_MISTYPED_RULE
             continue
-        rendered.append(item.strip())
+        rendered.append((index, item, item.strip()))
     if rule is None and not rendered:
         rule = CLAIM_EXECUTION_REFS_EMPTY_RULE
     return tuple(rendered), rule
+
+
+def _normalize_overlong_execution_refs(
+    items: Sequence[tuple[int, str, str]],
+) -> tuple[
+    list[tuple[int, str, str]], list[tuple[int, str, str]], list[tuple[int, str, str]]
+]:
+    """De-duplicate by stripped value, then keep the first bound distinct items.
+
+    Returns ``(kept, discarded_duplicates, discarded_overflow)`` (#1300).
+    """
+    distinct: list[tuple[int, str, str]] = []
+    duplicates: list[tuple[int, str, str]] = []
+    seen: set[str] = set()
+    for item in items:
+        if item[2] in seen:
+            duplicates.append(item)
+        else:
+            seen.add(item[2])
+            distinct.append(item)
+    bound = SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS
+    return distinct[:bound], duplicates, distinct[bound:]
 
 
 def _truncate_utf8(text: str, max_bytes: int) -> str:
@@ -4454,10 +4485,34 @@ def _dropped_ref_preview(ref: str) -> str:
 
 def _dropped_execution_refs_caveat(dropped_refs: Sequence[str]) -> str:
     """Name dropped refs in one caveat within the semantic field bound."""
-    prefix = (
+    return _named_refs_caveat(  # shape-check: fatal:authentication-or-forgery
         "Dropped execution_refs that are not current-turn `agent-loop run-tests` "
-        "selectors (they cannot verify this row): "
+        "selectors (they cannot verify this row): ",
+        dropped_refs,
     )
+
+
+def _overflow_execution_refs_caveat(
+    duplicates: Sequence[str], overflow: Sequence[str]
+) -> str:
+    """Disclose over-bound normalisation of ``execution_refs`` (#1300)."""
+    # Name the distinct over-bound selectors first, then the removed
+    # duplicates; the shared helper bounds the text and adds ``(+N more)``.
+    names = list(dict.fromkeys((*overflow, *duplicates)))
+    counts = (
+        f"{len(overflow)} over-bound selector(s) and "
+        f"{len(duplicates)} duplicate occurrence(s) removed"
+    )
+    return _named_refs_caveat(  # shape-check: fatal:authentication-or-forgery
+        f"Over-long execution_refs were trimmed to the first "
+        f"{SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS} distinct selectors "
+        f"({counts}; they cannot verify this row): ",
+        names,
+    )
+
+
+def _named_refs_caveat(prefix: str, dropped_refs: Sequence[str]) -> str:
+    """Name refs after ``prefix`` in one caveat within the semantic field bound."""
     budget = SEMANTIC_RISK_CLAIMS_MAX_FIELD_BYTES
     parts: list[str] = []
     for index, ref in enumerate(dropped_refs):
@@ -4566,7 +4621,7 @@ def _parse_semantic_risk_coverage_claims(
     Still fatal, because they forge or decide authority or are unbounded
     input, and always evaluated before any degradation so a degradable
     defect never masks them: a key in ``CLAIM_RESERVED_AUTHORITY_KEYS``;
-    more than 24 claims, eight refs or 16 caveats; any string beyond the
+    more than 24 claims or 16 caveats; any string beyond the
     16,384-byte hard cap; a dropped value whose compact JSON exceeds
     ``DROPPED_VALUE_MAX_BYTES``; catalog collisions, checked before the
     non-array degradation; and in-catalog selectors that are not passing
@@ -4575,6 +4630,12 @@ def _parse_semantic_risk_coverage_claims(
     start not authoritative) -- these are real broker handles, so selecting
     one is an authority decision, not a format defect (#990).  Without a
     catalog (historical and unit callers) selectors are kept verbatim.
+
+    An ``execution_refs`` list with more than eight well-typed items is
+    de-duplicated and trimmed to its first eight distinct selectors (#1300),
+    even when the claim is also dropped for a mistyped item, so no selector
+    past the bound reaches an authority check.  The discarded raw occurrences
+    stay bounded by ``DROPPED_VALUE_MAX_BYTES``.
     """
     # ``None`` means no approved set was delivered (historical and unit
     # callers).  An explicitly empty set is a real scope -- a stage that owns
@@ -4650,11 +4711,36 @@ def _parse_semantic_risk_coverage_claims(
         row_id, row_defect = _claim_row_id_or_degradation(payload, context=row_id_context)  # shape-check: fatal:payload-bound
         refs_context = f"{claim_context}.execution_refs"
         if "execution_refs" in payload:
-            raw_refs, refs_rule = _semantic_execution_ref_list(  # shape-check: fatal:payload-bound
+            ref_items, refs_rule = _semantic_execution_ref_list(  # shape-check: fatal:payload-bound
                 payload["execution_refs"], context=refs_context
             )
         else:
-            raw_refs, refs_rule = (), CLAIM_EXECUTION_REFS_ABSENT_RULE
+            ref_items, refs_rule = (), CLAIM_EXECUTION_REFS_ABSENT_RULE
+        overflow_duplicates: list[str] = []
+        overflow_refs: list[str] = []
+        if len(ref_items) > SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS:
+            # Normalise whatever ``refs_rule`` says, so no selector past the
+            # bound ever reaches an authority check (#1300).
+            kept_items, dup_items, over_items = _normalize_overlong_execution_refs(ref_items)
+            # The discarded raw occurrences (padding included) are bounded
+            # before any degradation decision can mask them.
+            _check_dropped_value_bound(  # shape-check: fatal:payload-bound
+                [raw for _i, raw, _s in (*dup_items, *over_items)],
+                context=refs_context,
+            )
+            overflow_duplicates = [s for _i, _r, s in dup_items]
+            overflow_refs = [s for _i, _r, s in over_items]
+            _logger.warning(
+                "%s listed %d execution_refs; kept %d distinct, discarded %d "
+                "duplicate and %d over-bound selector(s).",
+                refs_context,
+                len(ref_items),
+                len(kept_items),
+                len(dup_items),
+                len(over_items),
+            )
+            ref_items = tuple(kept_items)
+        raw_refs = tuple(stripped for _i, _r, stripped in ref_items)
         caveats_value = payload.get("caveats", [])
         if (
             isinstance(caveats_value, list)
@@ -4856,6 +4942,8 @@ def _parse_semantic_risk_coverage_claims(
                 )
         if dropped_refs:
             bookkeeping.append(_dropped_execution_refs_caveat(dropped_refs))  # shape-check: fatal:authentication-or-forgery
+        if overflow_duplicates or overflow_refs:
+            bookkeeping.append(_overflow_execution_refs_caveat(overflow_duplicates, overflow_refs))  # shape-check: fatal:authentication-or-forgery
         if truncated_facts:
             bookkeeping.append(
                 _truncated_fact_lists_caveat([message for _, message in truncated_facts])
@@ -4877,6 +4965,7 @@ def _parse_semantic_risk_coverage_claims(
             forbidden_effect_assertions=fact_lists["forbidden_effect_assertions"],
             caveats=caveats,
             dropped_execution_refs=tuple(dropped_refs),
+            overflow_execution_refs=tuple((*overflow_refs, *overflow_duplicates)),
             truncated_fact_fields=tuple(field for field, _ in truncated_facts),
             test_level=test_level,
         )

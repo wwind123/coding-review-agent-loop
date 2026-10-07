@@ -2611,7 +2611,6 @@ def test_semantic_matrix_claim_format_defects_drop_only_that_claim_927(kind, mut
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
-        (lambda c: c.update(execution_refs=[f"cmd-{i}" for i in range(9)]), "8-item bound"),
         (lambda c: c.update(execution_refs=["x" * 16_385]), "16384-byte bound"),
         (lambda c: c.update(workflow_path_claim="x" * 16_385), "16384-byte bound"),
         (lambda c: c.update(test_identifiers=["x" * 16_385]), "16384-byte bound"),
@@ -6852,3 +6851,17 @@ def test_plain_node_hint_is_omitted_when_the_whole_message_would_exceed_the_reas
             assert "node --test" not in rendered
             return
     pytest.fail("no length reached the cap; widen the range")
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_overlong_execution_refs_normalise_without_rejection_1300(kind):
+    refs = [f"turn:observation-{i}" for i in range(8)]
+    refs += [refs[0], refs[1], "turn:observation-8"]
+    catalog = [{**_ADMISSIBLE_CATALOG[0], "execution_ref": ref} for ref in dict.fromkeys(refs)]
+    parsed = _validate_claims_envelope(
+        kind, [{"row_id": "row-1", "execution_refs": refs}], catalog=catalog
+    )
+    [claim] = parsed.risk_test_matrix_claims.claims
+    assert claim.execution_refs == tuple(refs[:8])
+    assert claim.overflow_execution_refs == ("turn:observation-8", refs[0], refs[1])
+    assert parsed.risk_test_matrix_claims.degradations == ()
