@@ -17,7 +17,10 @@ inputs:
 runs:
   using: composite
   steps:
+    # The nested checkout step re-evaluates github.action_* for itself, so the
+    # validated identity of *this* action is captured here as step outputs.
     - name: Require a pinned action revision
+      id: pin
       shell: bash
       env:
         ACTION_REPOSITORY: ${{ github.action_repository }}
@@ -26,10 +29,12 @@ runs:
         test -n "$ACTION_REPOSITORY" || { echo "action repository context is empty" >&2; exit 1; }
         printf '%s' "$ACTION_REF" | grep -Eq '^[0-9a-f]{40}$' || { echo "action ref must be a 40-hex commit SHA (tags and branches are rejected)" >&2; exit 1; }
         echo "Attest action: $ACTION_REPOSITORY@$ACTION_REF"
+        echo "repository=$ACTION_REPOSITORY" >> "$GITHUB_OUTPUT"
+        echo "ref=$ACTION_REF" >> "$GITHUB_OUTPUT"
     - uses: actions/checkout@v4
       with:
-        repository: ${{ github.action_repository }}
-        ref: ${{ github.action_ref }}
+        repository: ${{ steps.pin.outputs.repository }}
+        ref: ${{ steps.pin.outputs.ref }}
         path: .managed-ci-attest
         sparse-checkout: ci/managed
         sparse-checkout-cone-mode: false

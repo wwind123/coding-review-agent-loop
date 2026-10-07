@@ -306,3 +306,106 @@ def test_action_ref_check_rejects_non_sha():
     assert not pattern.match("managed-ci-split-v1")
     assert not pattern.match("main")
     assert not pattern.match("")
+
+
+def test_action_checkout_uses_captured_identity_not_nested_context():
+    text = ACTION.read_text()
+    checkout = text[text.index("actions/checkout"):text.index("Write attestation")]
+    assert "steps.pin.outputs.repository" in checkout and "steps.pin.outputs.ref" in checkout
+    assert "github.action_" not in checkout
+    assert 'id: pin' in text
+
+
+@pytest.mark.parametrize("name", [
+    "managed-ci-attest-unit-a-attempt-1\n",
+    "managed-ci-attest-unit-a\n-attempt-1",
+])
+def test_artifact_name_trailing_newline_rejected(name):
+    assert attestation.parse_artifact_name(name) is None
+    assert run(artifacts=good_artifacts() + [(name, {})])
+
+
+@pytest.mark.parametrize("field,value", [
+    ("attestation_id", "unit-a\n"), ("target_sha", TARGET + "\n"),
+    ("head_sha", TARGET + "\n"), ("repository", REPO + "\n"),
+])
+def test_record_fields_reject_trailing_newline(field, value):
+    assert attestation.validate_record(record(EXPECTED[0], **{field: value}))
+
+
+def test_expected_and_publisher_inputs_reject_trailing_newline():
+    assert run(expected=[dict(EXPECTED[0], attestation_id="unit-a\n"), EXPECTED[1]])
+    assert run(expected=[dict(EXPECTED[0], needs_key="unit-a\n"), EXPECTED[1]])
+    assert attestation.verify(EXPECTED, good_artifacts(), jobs(), NEEDS, RUN_ID, ATTEMPT, TARGET + "\n", REPO)
+    assert attestation.verify(EXPECTED, good_artifacts(), jobs(), NEEDS, RUN_ID, ATTEMPT, TARGET, REPO + "\n")
+
+
+def test_oversized_record_refused_before_writing(repo, tmp_path):
+    head = _git(repo, "rev-parse", "HEAD")
+    out = tmp_path / "out"
+    e = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
+    e.update(GITHUB_RUN_ID="9001", GITHUB_RUN_ATTEMPT="2", GITHUB_REPOSITORY=REPO)
+    result = subprocess.run(
+        [sys.executable, str(CALLEE / "attestation.py"), "write", "--target-sha", head,
+         "--attestation-id", "unit-a", "--job-name", "unit (a)", "--output-dir", str(out),
+         "--workdir", str(repo), "--job-status", "x" * attestation.MAX_RECORD_BYTES],
+        capture_output=True, text=True, env=e,
+    )
+    assert result.returncode != 0
+    assert not out.exists()
+
+
+# --- verify CLI loader --------------------------------------------------------
+
+def _cli_verify(tmp_path, layout):
+    arts = tmp_path / "arts"
+    for rel, content in layout.items():
+        path = arts / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    jobs_file = tmp_path / "jobs.json"
+    jobs_file.write_text(json.dumps(jobs()))
+    return subprocess.run(
+        [sys.executable, str(CALLEE / "attestation.py"), "verify",
+         "--expected", json.dumps(EXPECTED), "--needs", json.dumps(NEEDS),
+         "--artifacts-dir", str(arts), "--jobs-file", str(jobs_file),
+         "--run-id", str(RUN_ID), "--run-attempt", str(ATTEMPT),
+         "--target-sha", TARGET, "--repository", REPO],
+        capture_output=True, text=True,
+    )
+
+
+def _good_layout():
+    return {f"{n}/attestation.json": f for n, d in good_artifacts() for f in [d["attestation.json"]]}
+
+
+def test_cli_verify_accepts_clean_layout(tmp_path):
+    result = _cli_verify(tmp_path, _good_layout())
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("extra", [
+    {"managed-ci-attest-unit-a-attempt-1/nested/attestation.json": b"{}"},
+    {"managed-ci-attest-unit-a-attempt-1/other.json": b"{}"},
+    {"managed-ci-attest-stray-attempt-1": b"x"},
+])
+def test_cli_verify_rejects_extra_or_stray_contents(tmp_path, extra):
+    layout = _good_layout()
+    layout.update(extra)
+    assert _cli_verify(tmp_path, layout).returncode != 0
+
+
+def test_cli_verify_same_basename_cannot_be_overwritten_by_valid_record(tmp_path):
+    layout = _good_layout()
+    name = "managed-ci-attest-unit-a-attempt-1"
+    good = layout.pop(f"{name}/attestation.json")
+    layout[f"{name}/a/attestation.json"] = b"not json"
+    layout[f"{name}/b/attestation.json"] = good
+    assert _cli_verify(tmp_path, layout).returncode != 0
+
+
+def test_cli_verify_nested_lone_record_not_normalised_to_root(tmp_path):
+    layout = _good_layout()
+    name = "managed-ci-attest-unit-a-attempt-1"
+    layout[f"{name}/sub/attestation.json"] = layout.pop(f"{name}/attestation.json")
+    assert _cli_verify(tmp_path, layout).returncode != 0

@@ -54,7 +54,7 @@ def artifact_name(attestation_id: str, run_attempt: int) -> str:
 
 
 def parse_artifact_name(name: str) -> tuple[str, int] | None:
-    match = _ARTIFACT_RE.match(name) if isinstance(name, str) else None
+    match = _ARTIFACT_RE.fullmatch(name) if isinstance(name, str) else None
     if not match:
         return None
     return match.group(1), int(match.group(2))
@@ -80,18 +80,18 @@ def validate_record(record) -> list[str]:
     if record["schema"] != SCHEMA:
         errors.append(f"unsupported schema {record['schema']!r}")
     value = record["attestation_id"]
-    if not (isinstance(value, str) and _ID_RE.match(value)):
+    if not (isinstance(value, str) and _ID_RE.fullmatch(value)):
         errors.append("attestation_id is malformed")
     value = record["job_name"]
     if not (isinstance(value, str) and 0 < len(value) <= 256):
         errors.append("job_name is malformed")
     for key in ("target_sha", "head_sha"):
-        if not (isinstance(record[key], str) and _SHA_RE.match(record[key])):
+        if not (isinstance(record[key], str) and _SHA_RE.fullmatch(record[key])):
             errors.append(f"{key} is not a lowercase 40-hex SHA")
     for key in ("run_id", "run_attempt"):
         if not (_is_int(record[key]) and record[key] > 0):
             errors.append(f"{key} is not a positive integer")
-    if not (isinstance(record["repository"], str) and _REPO_RE.match(record["repository"])):
+    if not (isinstance(record["repository"], str) and _REPO_RE.fullmatch(record["repository"])):
         errors.append("repository is not owner/name")
     if not isinstance(record["job_status"], str):
         errors.append("job_status is not a string")
@@ -125,7 +125,7 @@ def validate_expected(expected) -> list[str]:
             errors.append(f"{label} must be an object with exactly {', '.join(EXPECTED_FIELDS)}")
             continue
         entry_id, name, key = entry["attestation_id"], entry["job_name"], entry["needs_key"]
-        if not (isinstance(entry_id, str) and _ID_RE.match(entry_id)):
+        if not (isinstance(entry_id, str) and _ID_RE.fullmatch(entry_id)):
             errors.append(f"{label}.attestation_id is malformed")
         elif entry_id in ids:
             errors.append(f"{label}: duplicate attestation_id {entry_id!r}")
@@ -137,7 +137,7 @@ def validate_expected(expected) -> list[str]:
             errors.append(f"{label}: duplicate job_name {name!r}")
         else:
             names.add(name)
-        if not (isinstance(key, str) and _NEEDS_KEY_RE.match(key)):
+        if not (isinstance(key, str) and _NEEDS_KEY_RE.fullmatch(key)):
             errors.append(f"{label}.needs_key is malformed")
     return errors
 
@@ -160,9 +160,9 @@ def verify(expected, artifacts, api_jobs, needs_results, run_id, run_attempt, ta
         return errors
     if not (_is_int(run_id) and run_id > 0 and _is_int(run_attempt) and run_attempt > 0):
         return ["publisher run_id and run_attempt must be positive integers"]
-    if not (isinstance(target_sha, str) and _SHA_RE.match(target_sha)):
+    if not (isinstance(target_sha, str) and _SHA_RE.fullmatch(target_sha)):
         return ["target_sha is not a lowercase 40-hex SHA"]
-    if not (isinstance(repository, str) and _REPO_RE.match(repository)):
+    if not (isinstance(repository, str) and _REPO_RE.fullmatch(repository)):
         return ["repository is not owner/name"]
 
     by_id = {entry["attestation_id"]: entry for entry in expected}
@@ -295,7 +295,7 @@ def _git_head(workdir: str) -> str:
 
 
 def cmd_write(args) -> int:
-    if not _SHA_RE.match(args.target_sha or ""):
+    if not _SHA_RE.fullmatch(args.target_sha or ""):
         print("refusing to attest: target_sha is not a lowercase 40-hex SHA", file=sys.stderr)
         return 1
     try:
@@ -326,9 +326,13 @@ def cmd_write(args) -> int:
     if problems:
         print("refusing to attest: " + "; ".join(problems), file=sys.stderr)
         return 1
+    payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+    if len(payload) > MAX_RECORD_BYTES:
+        print(f"refusing to attest: record is {len(payload)} bytes, over the {MAX_RECORD_BYTES} cap", file=sys.stderr)
+        return 1
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    (out / RECORD_FILENAME).write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+    (out / RECORD_FILENAME).write_bytes(payload)
     print(artifact_name(args.attestation_id, run_attempt))
     return 0
 
@@ -336,9 +340,20 @@ def cmd_write(args) -> int:
 def _load_artifacts(directory: Path) -> list[tuple[str, dict]]:
     artifacts = []
     for child in sorted(directory.iterdir()):
-        if child.is_dir():
-            files = {p.name: p.read_bytes() for p in sorted(child.rglob("*")) if p.is_file()}
+        if child.is_dir() and not child.is_symlink():
+            # Keep each file's path relative to the artifact root so nested or
+            # same-basename files cannot collapse into one root attestation.json.
+            files = {}
+            for p in sorted(child.rglob("*")):
+                if p.is_dir() and not p.is_symlink():
+                    continue
+                key = p.relative_to(child).as_posix()
+                files[key if p.is_file() and not p.is_symlink() else key + " (not a regular file)"] = (
+                    p.read_bytes() if p.is_file() and not p.is_symlink() else b""
+                )
             artifacts.append((child.name, files))
+        else:
+            artifacts.append((child.name, None))  # a stray non-directory entry fails verification
     return artifacts
 
 
