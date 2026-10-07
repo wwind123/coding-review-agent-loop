@@ -1005,6 +1005,21 @@ The whole boundary is a reusable `workflow_call` workflow
 exactly the permissions the callee jobs need; the dispatch must execute from the
 live default branch, whose head the intent's `workflow_revision` is bound to.
 The ordinary `Python 3.12 full suite` check is sharded the same way.
+Split layout (#1313): an adopter whose tests need services or a routed matrix
+composes `managed-ci-validate.yml` (read-only; its validator step is byte-identical
+to the single-job workflow), caller-owned read-only test jobs, and
+`managed-ci-publish.yml`. Every test job checks out the literal validated SHA,
+asserts `HEAD`, and ends with the pinned `managed-ci-attest` action. Publish has a
+read-only `verify` job (current-attempt attestation artifacts, the jobs API
+conclusion per expected job name, and the caller's `toJSON(needs)`, against a
+literal expected set declared in the default-branch caller) and a status job that
+alone holds `statuses: write`. The status job re-checks that the forwarded
+inputs, target SHA and nonce equal the dispatch event, and that validation ran in
+this very run attempt (the caller forwards validate's `run_id`/`attempt` outputs, so a
+validate job carried over by "Re-run failed jobs" never publishes), before feeding
+`needs.verify.result` to the unchanged status builder. Attestations are untrusted
+correlation claims; trust rests on the default-branch composition and API
+conclusions. The validator, driver and single-job workflows are unchanged.
 Integration targets (#1285): the live PR base must equal the intent's
 `base_ref` and be the default branch or match the owner-controlled
 `AGENT_LOOP_TRUSTED_BASES` repository variable (exact names or `prefix/*`,

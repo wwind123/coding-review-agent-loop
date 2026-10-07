@@ -1,0 +1,109 @@
+# Fixture split-layout caller (#1313): the default-branch workflow an adopter
+# composes.  Every `uses` is pinned to a full commit SHA with the tag only as a
+# trailing comment.  The contract tests assert its trust-relevant shape.
+name: CI
+on:
+  workflow_dispatch:
+    inputs:
+      protocol_version: {required: false, default: ''}
+      pr_number: {required: false, default: ''}
+      expected_head_sha: {required: false, default: ''}
+      managed_nonce: {required: false, default: ''}
+
+jobs:
+  validate:
+    uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci-validate.yml@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+    with:
+      protocol_version: ${{ inputs.protocol_version }}
+      pr_number: ${{ inputs.pr_number }}
+      expected_head_sha: ${{ inputs.expected_head_sha }}
+      managed_nonce: ${{ inputs.managed_nonce }}
+
+  services:
+    needs: validate
+    if: needs.validate.result == 'success'
+    name: services
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        ports: ['5432:5432']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.target_sha }}
+          fetch-depth: 1
+      - name: Verify exact checkout
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.validate.outputs.target_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - name: Install dependencies
+        run: python -m pip install -e '.[dev]'
+      - name: Run tests
+        run: python -m pytest tests/integration -q
+      - uses: wwind123/coding-review-agent-loop/.github/actions/managed-ci-attest@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
+        with:
+          target_sha: ${{ needs.validate.outputs.target_sha }}
+          attestation_id: services
+          job_name: services
+
+  unit:
+    needs: validate
+    if: needs.validate.result == 'success'
+    name: unit (${{ matrix.cell }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: [a, b]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.target_sha }}
+          fetch-depth: 1
+      - name: Verify exact checkout
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.validate.outputs.target_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - name: Install dependencies
+        run: python -m pip install -e '.[dev]'
+      - name: Run tests
+        run: python -m pytest tests -q -k ${{ matrix.cell }}
+      - uses: wwind123/coding-review-agent-loop/.github/actions/managed-ci-attest@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
+        with:
+          target_sha: ${{ needs.validate.outputs.target_sha }}
+          attestation_id: unit-${{ matrix.cell }}
+          job_name: unit (${{ matrix.cell }})
+
+  publish:
+    needs: [validate, services, unit]
+    if: always()
+    uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci-publish.yml@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    with:
+      protocol_version: ${{ inputs.protocol_version }}
+      pr_number: ${{ inputs.pr_number }}
+      expected_head_sha: ${{ inputs.expected_head_sha }}
+      managed_nonce: ${{ inputs.managed_nonce }}
+      target_sha: ${{ needs.validate.outputs.target_sha }}
+      nonce: ${{ needs.validate.outputs.nonce }}
+      validation_result: ${{ needs.validate.result }}
+      validation_run_id: ${{ needs.validate.outputs.run_id }}
+      validation_attempt: ${{ needs.validate.outputs.attempt }}
+      needs_results: ${{ toJSON(needs) }}
+      expected_attestations: >-
+        [{"attestation_id":"services","job_name":"services","needs_key":"services"},
+         {"attestation_id":"unit-a","job_name":"unit (a)","needs_key":"unit"},
+         {"attestation_id":"unit-b","job_name":"unit (b)","needs_key":"unit"}]
