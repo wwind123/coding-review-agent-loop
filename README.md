@@ -175,6 +175,14 @@ before target validation write no status; checkout or test failures publish a
 terminal non-success result. Keep queued work on ordinary CI until this
 post-merge live qualification is complete.
 
+Adopters whose tests need services, extra setup or a routed matrix can use the
+split layout instead (a read-only `validate` entry point, caller-owned test
+jobs that end with the `managed-ci-attest` action, and an attested `publish`
+entry point); see
+[split layout](docs/local_agent_loop.md#split-layout-validate-caller-owned-test-jobs-publish)
+for the SHA-pinned template, the security contract and the routed-matrix
+migration notes. The single-job workflows stay supported.
+
 ### Process-tree containment
 
 Agent subprocesses and repository test gates use a shared per-user containment
