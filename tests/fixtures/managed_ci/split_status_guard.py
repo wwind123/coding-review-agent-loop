@@ -16,8 +16,21 @@ the guard together with the extracted status builder without a GitHub request.
 # supplied target and nonce must equal the values the dispatch event carried,
 # and validation must have succeeded. Any mismatch means no status is written.
 FORWARDED_KEYS = ('protocol_version', 'pr_number', 'expected_head_sha', 'managed_nonce')
-def correlation_matches(*, forwarded, event, target_sha, nonce, validation_result):
+def correlation_matches(
+    *, forwarded, event, target_sha, nonce, validation_result,
+    validation_run_id, validation_attempt, run_id, run_attempt,
+):
     if validation_result != 'success':
+        return False
+    # Validation must have run in this very run attempt: a validate job carried
+    # over from an earlier attempt (for example by "Re-run failed jobs") never
+    # re-checked the completed audit record, freshness or rerun actor.
+    if not (
+        isinstance(validation_run_id, str) and isinstance(validation_attempt, str)
+        and isinstance(run_id, str) and isinstance(run_attempt, str)
+        and run_id != '' and run_attempt != ''
+        and validation_run_id == run_id and validation_attempt == run_attempt
+    ):
         return False
     if not isinstance(forwarded, dict) or not isinstance(event, dict):
         return False

@@ -357,6 +357,42 @@ def _load_artifacts(directory: Path) -> list[tuple[str, dict]]:
     return artifacts
 
 
+def collect_jobs(text: str) -> list:
+    """Concatenate the ``jobs`` arrays of concatenated paginated API pages.
+
+    Each page must be a JSON object whose ``jobs`` is an array of objects; any
+    other shape (including an object-valued ``jobs``) is an error.
+    """
+    decoder = json.JSONDecoder()
+    jobs: list = []
+    index, pages = 0, 0
+    while True:
+        while index < len(text) and text[index].isspace():
+            index += 1
+        if index >= len(text):
+            break
+        page, index = decoder.raw_decode(text, index)
+        if not isinstance(page, dict) or not isinstance(page.get("jobs"), list):
+            raise ValueError("jobs API page is not an object with a jobs array")
+        if not all(isinstance(job, dict) for job in page["jobs"]):
+            raise ValueError("jobs API page has a non-object job entry")
+        jobs.extend(page["jobs"])
+        pages += 1
+    if pages == 0:
+        raise ValueError("jobs API returned no pages")
+    return jobs
+
+
+def cmd_jobs(args) -> int:
+    try:
+        jobs = collect_jobs(sys.stdin.read())
+    except ValueError as exc:
+        print(f"jobs listing failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(jobs))
+    return 0
+
+
 def cmd_verify(args) -> int:
     try:
         expected = json.loads(args.expected)
@@ -395,6 +431,8 @@ def main(argv=None) -> int:
     write.add_argument("--output-dir", required=True)
     write.add_argument("--workdir", default=".")
     write.set_defaults(func=cmd_write)
+    listing = sub.add_parser("jobs", help="validate paginated jobs API pages on stdin and print the jobs array")
+    listing.set_defaults(func=cmd_jobs)
     check = sub.add_parser("verify", help="verify downloaded attestations")
     check.add_argument("--expected", required=True, help="JSON expected set")
     check.add_argument("--needs", required=True, help="JSON toJSON(needs) object")

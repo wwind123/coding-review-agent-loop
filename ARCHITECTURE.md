@@ -1014,7 +1014,9 @@ read-only `verify` job (current-attempt attestation artifacts, the jobs API
 conclusion per expected job name, and the caller's `toJSON(needs)`, against a
 literal expected set declared in the default-branch caller) and a status job that
 alone holds `statuses: write`. The status job re-checks that the forwarded
-inputs, target SHA and nonce equal the dispatch event before feeding
+inputs, target SHA and nonce equal the dispatch event, and that validation ran in
+this very run attempt (the caller forwards validate's `run_id`/`attempt` outputs, so a
+validate job carried over by "Re-run failed jobs" never publishes), before feeding
 `needs.verify.result` to the unchanged status builder. Attestations are untrusted
 correlation claims; trust rests on the default-branch composition and API
 conclusions. The validator, driver and single-job workflows are unchanged.

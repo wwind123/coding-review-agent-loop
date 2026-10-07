@@ -1440,7 +1440,7 @@ def test_split_entry_points_are_workflow_call_with_exactly_the_documented_inputs
     publish = _trigger(PUBLISH)
     assert set(publish) == {"workflow_call"}
     assert set(publish["workflow_call"]["inputs"]) == set(FORWARDED) | {
-        "target_sha", "nonce", "validation_result", "needs_results", "expected_attestations",
+        "target_sha", "nonce", "validation_result", "validation_run_id", "validation_attempt", "needs_results", "expected_attestations",
     }
     for trigger in (validate, publish):
         assert "secrets" not in trigger["workflow_call"]
@@ -1516,6 +1516,8 @@ def test_verify_job_is_always_gated_on_validation_and_ends_with_a_literal_check(
     verify = _load(PUBLISH)["jobs"]["verify"]
     assert verify["if"].startswith("always()")
     assert "inputs.validation_result == 'success'" in verify["if"]
+    assert "inputs.validation_run_id == format('{0}', github.run_id)" in verify["if"]
+    assert "inputs.validation_attempt == format('{0}', github.run_attempt)" in verify["if"]
     assert verify["steps"][-1]["run"] == 'test "$VERIFY_RESULT" = success'
     names = [step.get("name", step.get("uses")) for step in verify["steps"]]
     assert names[0] == "Require the reusable workflow revision"
@@ -1579,6 +1581,8 @@ def test_fixture_caller_publish_covers_every_need_and_declares_a_literal_expecte
     with_ = publish["with"]
     assert with_["needs_results"] == "${{ toJSON(needs) }}"
     assert with_["validation_result"] == "${{ needs.validate.result }}"
+    assert with_["validation_run_id"] == "${{ needs.validate.outputs.run_id }}"
+    assert with_["validation_attempt"] == "${{ needs.validate.outputs.attempt }}"
     assert with_["target_sha"] == "${{ needs.validate.outputs.target_sha }}"
     assert "${{" not in with_["expected_attestations"]
     expected = json.loads(with_["expected_attestations"])
@@ -1620,6 +1624,8 @@ def _run_status_step(monkeypatch, *, forwarded=None, event=None, **overrides):
     for key, value in {**tuple_, **(event or {})}.items():
         env["EVENT_" + key.upper()] = value
     env.update(overrides)
+    env.setdefault("VALIDATION_RUN_ID", env["RUN_ID"])
+    env.setdefault("VALIDATION_ATTEMPT", env["RUN_ATTEMPT"])
     requests = []
 
     def fake_urlopen(request, timeout=None):
@@ -1657,6 +1663,11 @@ def test_status_step_writes_exactly_one_status_on_the_event_sha(monkeypatch, ver
         {"VALIDATION_RESULT": "failure"},
         {"VALIDATION_RESULT": "skipped"},
         {"VALIDATION_RESULT": ""},
+        # validation carried over from another attempt or run
+        {"RUN_ATTEMPT": "2", "VALIDATION_ATTEMPT": "1"},
+        {"VALIDATION_ATTEMPT": "2"},
+        {"VALIDATION_RUN_ID": "201"},
+        {"VALIDATION_RUN_ID": ""},
         {"FORWARDED_PR_NUMBER": "8"},
         {"FORWARDED_PROTOCOL_VERSION": "3"},
         {"FORWARDED_EXPECTED_HEAD_SHA": "c" * 40},
@@ -1691,7 +1702,7 @@ EXPECTED_SET = [
 ]
 
 
-def _verify_attempt(attempt, *, attested_attempts, jobs_ok=True):
+def _verify_attempt(attempt, *, attested_attempts, target="b" * 40, run_id=200):
     """Run the verifier as publish would at ``attempt``.
 
     ``attested_attempts`` maps attestation id -> attempts that left an artifact.
@@ -1702,7 +1713,7 @@ def _verify_attempt(attempt, *, attested_attempts, jobs_ok=True):
         for held in attested_attempts[entry["attestation_id"]]:
             rec = module.build_record(
                 attestation_id=entry["attestation_id"], job_name=entry["job_name"],
-                target_sha="b" * 40, head_sha="b" * 40, run_id=200, run_attempt=held,
+                target_sha=target, head_sha=target, run_id=run_id, run_attempt=held,
                 repository="OWNER/REPO", job_status="success",
             )
             artifacts.append((
@@ -1711,7 +1722,22 @@ def _verify_attempt(attempt, *, attested_attempts, jobs_ok=True):
             ))
     api_jobs = [{"name": e["job_name"], "conclusion": "success"} for e in EXPECTED_SET]
     needs = {k: {"result": "success"} for k in ("validate", "services", "unit")}
-    return module.verify(EXPECTED_SET, artifacts, api_jobs, needs, 200, attempt, "b" * 40, "OWNER/REPO")
+    return module.verify(EXPECTED_SET, artifacts, api_jobs, needs, run_id, attempt, target, "OWNER/REPO")
+
+
+def _publish_after_verify(monkeypatch, validated, attempt, errors):
+    """Feed validate's outputs and the verifier outcome into the real status step."""
+    tuple_ = {
+        "protocol_version": "2", "pr_number": validated["pr_number"],
+        "expected_head_sha": validated["target_sha"], "managed_nonce": validated["managed_nonce"],
+    }
+    return _run_status_step(
+        monkeypatch, forwarded=tuple_, event=tuple_,
+        TARGET_SHA=validated["target_sha"], NONCE=validated["managed_nonce"],
+        RUN_ID="200", RUN_ATTEMPT=str(attempt),
+        VALIDATION_RUN_ID="200", VALIDATION_ATTEMPT=str(attempt),
+        TEST_RESULT="failure" if errors else "success",
+    )
 
 
 _NO_STATUS_RECORD = dict(
@@ -1720,46 +1746,83 @@ _NO_STATUS_RECORD = dict(
 )
 
 
-def test_authorized_no_status_retry_validates_then_verifies_only_current_attempt_artifacts():
+def test_fully_attested_run_publishes_one_success_on_the_validated_sha(monkeypatch):
+    validated, _ = _dispatch_validate()
+    errors = _verify_attempt(1, attested_attempts={"services": [1], "unit-a": [1]})
+    assert errors == []
+    requests = _publish_after_verify(monkeypatch, validated, 1, errors)
+    assert len(requests) == 1
+    assert requests[0].full_url.endswith("/statuses/" + validated["target_sha"])
+    body = json.loads(requests[0].data)
+    assert body == {
+        "state": "success", "context": "final-ci/exact-head",
+        "description": "nonce=" + "n" * 32 + ";run_id=200;attempt=1;result=success",
+        "target_url": "https://github.com/OWNER/REPO/actions/runs/200",
+    }
+    # A missing attestation turns the same composed path into one failure status.
+    errors = _verify_attempt(1, attested_attempts={"services": [1], "unit-a": []})
+    requests = _publish_after_verify(monkeypatch, validated, 1, errors)
+    assert [json.loads(r.data)["state"] for r in requests] == ["failure"]
+
+
+def test_authorized_no_status_retry_validates_verifies_and_publishes_for_the_next_attempt(monkeypatch):
     validated, _ = _dispatch_validate(
         record=_record("completed", **_NO_STATUS_RECORD), current_run_attempt="2",
     )
     assert validated["target_sha"] == "b" * 40
-    # Retained attempt-1 artifacts plus a complete attempt-2 set verify.
-    both = {"services": [1, 2], "unit-a": [1, 2]}
-    assert _verify_attempt(2, attested_attempts=both) == []
+    # Retained attempt-1 artifacts plus a complete attempt-2 set verify and publish success.
+    errors = _verify_attempt(
+        2, attested_attempts={"services": [1, 2], "unit-a": [1, 2]}, target=validated["target_sha"],
+    )
+    assert errors == []
+    requests = _publish_after_verify(monkeypatch, validated, 2, errors)
+    assert len(requests) == 1
+    body = json.loads(requests[0].data)
+    assert body["state"] == "success" and "attempt=2;" in body["description"]
     # A retry that carried an expected job over from attempt 1 fails as missing.
-    carried = {"services": [1, 2], "unit-a": [1]}
-    errors = _verify_attempt(2, attested_attempts=carried)
+    errors = _verify_attempt(
+        2, attested_attempts={"services": [1, 2], "unit-a": [1]}, target=validated["target_sha"],
+    )
     assert any("missing attestation for 'unit-a'" in e for e in errors)
+    requests = _publish_after_verify(monkeypatch, validated, 2, errors)
+    assert [json.loads(r.data)["state"] for r in requests] == ["failure"]
     # Attempt-1 attestations are never accepted for attempt 2.
     assert _verify_attempt(2, attested_attempts={"services": [1], "unit-a": [1]})
 
 
+def test_validation_carried_over_from_an_earlier_attempt_never_publishes(monkeypatch):
+    """Re-running failed jobs keeps the old validate outputs (attempt 1); the guard rejects them."""
+    validated, _ = _dispatch_validate()
+    tuple_ = {
+        "protocol_version": "2", "pr_number": "7",
+        "expected_head_sha": validated["target_sha"], "managed_nonce": validated["managed_nonce"],
+    }
+    for verify_result in ("failure", "success"):
+        assert _run_status_step(
+            monkeypatch, forwarded=tuple_, event=tuple_, RUN_ATTEMPT="2",
+            VALIDATION_RUN_ID="200", VALIDATION_ATTEMPT="1", TEST_RESULT=verify_result,
+        ) == []
+
+
+_PUBLISHED_RECORD = dict(run_id=200, run_attempt=1)  # completed with a status: no terminal_outcome
+
+
 @pytest.mark.parametrize(
-    "case",
+    ("case", "message"),
     [
-        # stale intent
-        {"record": _record("completed", **_NO_STATUS_RECORD), "current_run_attempt": "2", "current_time": 10_000},
-        # unmatched attempt (skips an attempt)
-        {"record": _record("completed", **_NO_STATUS_RECORD), "current_run_attempt": "3"},
-        # rerun of an attached record whose run pair differs
-        {"record": _record("attached", run_id=200, run_attempt=1), "current_run_attempt": "2"},
-        # rerun after a published (completed with a status) terminal
-        {
-            "record": _record(
-                "completed", run_id=200, run_attempt=1, terminal_run_id=200,
-                terminal_run_attempt=1, terminal_attempts=[{"run_id": 200, "run_attempt": 1}],
-                terminal_outcome="success",
-            ),
-            "current_run_attempt": "2",
-        },
+        ({"record": _record("completed", **_NO_STATUS_RECORD), "current_run_attempt": "2", "current_time": 10_000}, "stale"),
+        ({"record": _record("completed", **_NO_STATUS_RECORD), "current_run_attempt": "3"}, "incoherent"),
+        ({"record": _record("attached", run_id=200, run_attempt=1), "current_run_attempt": "2"}, "does not match"),
+        # rerun after a published success or failure: the driver completes the
+        # record without a terminal outcome.
+        ({"record": _record("completed", **_PUBLISHED_RECORD), "current_run_attempt": "2"}, "does not match"),
     ],
+    ids=["stale", "skipped-attempt", "attached-other-attempt", "published-status"],
 )
-def test_unauthorized_reruns_are_rejected_before_any_verifier_or_status(monkeypatch, case):
+def test_unauthorized_reruns_are_rejected_before_any_verifier_or_status(monkeypatch, case, message):
     module = _attestation_module()
     monkeypatch.setattr(module, "verify", lambda *a, **k: pytest.fail("verifier must not run"))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=message):
         _dispatch_validate(**case)
     # The publish status step sees a non-success validation and writes nothing.
     assert _run_status_step(monkeypatch, VALIDATION_RESULT="failure", TEST_RESULT="skipped") == []

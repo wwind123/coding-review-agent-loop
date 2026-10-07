@@ -409,3 +409,43 @@ def test_cli_verify_nested_lone_record_not_normalised_to_root(tmp_path):
     name = "managed-ci-attest-unit-a-attempt-1"
     layout[f"{name}/sub/attestation.json"] = layout.pop(f"{name}/attestation.json")
     assert _cli_verify(tmp_path, layout).returncode != 0
+
+
+# --- jobs API page collection (#1313) ----------------------------------------
+
+
+def test_collect_jobs_concatenates_pages():
+    pages = json.dumps({"jobs": [{"name": "a"}]}) + "\n" + json.dumps({"jobs": [{"name": "b"}]})
+    assert [j["name"] for j in attestation.collect_jobs(pages)] == ["a", "b"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "",
+        "not json",
+        '{"jobs": {"x": {"name": "unit (a)", "conclusion": "success"}}}',
+        '{"jobs": "nope"}',
+        '{"total_count": 1}',
+        '[{"name": "a"}]',
+        '{"jobs": [{"name": "a"}]} trailing',
+        '{"jobs": [1]}',
+    ],
+)
+def test_collect_jobs_rejects_malformed_pages(text):
+    with pytest.raises(ValueError):
+        attestation.collect_jobs(text)
+
+
+def test_jobs_subcommand_fails_closed_on_a_malformed_page():
+    script = CALLEE / "attestation.py"
+    bad = subprocess.run(
+        [sys.executable, str(script), "jobs"], input='{"jobs": {"x": {"name": "a"}}}',
+        capture_output=True, text=True,
+    )
+    assert bad.returncode != 0 and bad.stdout == ""
+    good = subprocess.run(
+        [sys.executable, str(script), "jobs"], input='{"jobs": [{"name": "a"}]}',
+        capture_output=True, text=True,
+    )
+    assert good.returncode == 0 and json.loads(good.stdout) == [{"name": "a"}]

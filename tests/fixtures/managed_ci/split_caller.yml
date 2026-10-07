@@ -100,6 +100,8 @@ jobs:
       target_sha: ${{ needs.validate.outputs.target_sha }}
       nonce: ${{ needs.validate.outputs.nonce }}
       validation_result: ${{ needs.validate.result }}
+      validation_run_id: ${{ needs.validate.outputs.run_id }}
+      validation_attempt: ${{ needs.validate.outputs.attempt }}
       needs_results: ${{ toJSON(needs) }}
       expected_attestations: >-
         [{"attestation_id":"services","job_name":"services","needs_key":"services"},

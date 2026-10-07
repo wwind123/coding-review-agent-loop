@@ -45,6 +45,16 @@ on:
         type: string
         required: false
         default: ''
+      validation_run_id:
+        description: Run ID of the validate job (needs.validate.outputs.run_id)
+        type: string
+        required: false
+        default: ''
+      validation_attempt:
+        description: Run attempt of the validate job (needs.validate.outputs.attempt)
+        type: string
+        required: false
+        default: ''
       needs_results:
         description: toJSON(needs) of the caller's publish job
         type: string
@@ -61,6 +71,8 @@ jobs:
     if: >-
       always() && github.event_name == 'workflow_dispatch' &&
       inputs.validation_result == 'success' &&
+      inputs.validation_run_id == format('{0}', github.run_id) &&
+      inputs.validation_attempt == format('{0}', github.run_attempt) &&
       (inputs.protocol_version != '' || inputs.pr_number != '' ||
        inputs.expected_head_sha != '' || inputs.managed_nonce != '' ||
        github.event.inputs.protocol_version != '' || github.event.inputs.pr_number != '' ||
@@ -102,7 +114,7 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -o pipefail
-          gh api --paginate "repos/$GH_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" --jq '.jobs[]' | jq -s '.' > "$RUNNER_TEMP/jobs.json"
+          gh api --paginate "repos/$GH_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" | python3 .managed-ci/ci/managed/attestation.py jobs > "$RUNNER_TEMP/jobs.json"
       - name: Verify attestations
         id: verify
         env:
@@ -143,6 +155,8 @@ jobs:
           GH_REPOSITORY: ${{ github.repository }}
           TARGET_SHA: ${{ inputs.target_sha }}
           VALIDATION_RESULT: ${{ inputs.validation_result }}
+          VALIDATION_RUN_ID: ${{ inputs.validation_run_id }}
+          VALIDATION_ATTEMPT: ${{ inputs.validation_attempt }}
           TEST_RESULT: ${{ needs.verify.result }}
           NONCE: ${{ inputs.nonce }}
           RUN_ID: ${{ github.run_id }}
@@ -171,8 +185,21 @@ jobs:
           # supplied target and nonce must equal the values the dispatch event carried,
           # and validation must have succeeded. Any mismatch means no status is written.
           FORWARDED_KEYS = ('protocol_version', 'pr_number', 'expected_head_sha', 'managed_nonce')
-          def correlation_matches(*, forwarded, event, target_sha, nonce, validation_result):
+          def correlation_matches(
+              *, forwarded, event, target_sha, nonce, validation_result,
+              validation_run_id, validation_attempt, run_id, run_attempt,
+          ):
               if validation_result != 'success':
+                  return False
+              # Validation must have run in this very run attempt: a validate job carried
+              # over from an earlier attempt (for example by "Re-run failed jobs") never
+              # re-checked the completed audit record, freshness or rerun actor.
+              if not (
+                  isinstance(validation_run_id, str) and isinstance(validation_attempt, str)
+                  and isinstance(run_id, str) and isinstance(run_attempt, str)
+                  and run_id != '' and run_attempt != ''
+                  and validation_run_id == run_id and validation_attempt == run_attempt
+              ):
                   return False
               if not isinstance(forwarded, dict) or not isinstance(event, dict):
                   return False
@@ -275,6 +302,10 @@ jobs:
               target_sha=os.environ.get('TARGET_SHA', ''),
               nonce=os.environ.get('NONCE', ''),
               validation_result=os.environ.get('VALIDATION_RESULT', ''),
+              validation_run_id=os.environ.get('VALIDATION_RUN_ID', ''),
+              validation_attempt=os.environ.get('VALIDATION_ATTEMPT', ''),
+              run_id=os.environ.get('RUN_ID', ''),
+              run_attempt=os.environ.get('RUN_ATTEMPT', ''),
           ):
               print('Correlation guard rejected the forwarded tuple; no status written.')
               raise SystemExit(0)
