@@ -4300,6 +4300,313 @@ authorization fails before a target exists, and publishes failure when
 checkout or tests fail. Pushes to `main` and ordinary manual dispatch remain
 full-suite paths.
 
+#### Split layout: validate, caller-owned test jobs, publish
+
+The single-job `managed-ci.yml` and `managed-ci-ordinary.yml` workflows above
+remain supported and unchanged. Adopters whose tests need more than
+`test_command` (service containers, apt or Node setup, a routed matrix, a
+separate admission run) can instead compose three stages in their
+default-branch workflow, using the reusable entry points
+`managed-ci-validate.yml` and `managed-ci-publish.yml` and the
+`managed-ci-attest` composite action. A reusable workflow cannot call back into
+a caller-supplied test workflow (`uses:` must be a literal), so the caller owns
+the test jobs and `publish` verifies them.
+
+1. `validate` runs today's dispatch validation, read-only, and outputs
+   `target_sha`, `pr_number`, `nonce`, `run_id` and `attempt`.
+2. Caller-owned test jobs (`needs: validate`, `contents: read` only). Each
+   starts with a literal `actions/checkout` of `needs.validate.outputs.target_sha`
+   and a `git rev-parse HEAD` assertion before any install or test step, and
+   ends with the `managed-ci-attest` action.
+3. `publish` has a read-only `verify` job and a status-only job. The status job
+   is the only job anywhere in the layout with `statuses: write`.
+
+Every `uses` (including `actions/checkout`) is pinned to a full 40-hex commit
+SHA with the release tag only as a trailing comment; the attest action rejects
+any other ref.
+
+Install the caller as `.github/workflows/ci.yml`. The driver reads only that
+file for readiness, so it must keep the literal `AGENT_LOOP_MANAGED_CI_*`
+declarations, the `final-ci/exact-head` context, the `agent-loop-managed`
+label, the `expected_head_sha` input, the `pull_request` triggers including
+`unlabeled`, and the nonce-correlated `run-name`; the driver finds the
+dispatched run by that name. Referencing the reusable workflows does not supply
+their text to those checks. The PostgreSQL service needs `POSTGRES_PASSWORD`
+and a health check, and the test step must use matching connection settings.
+
+```yaml split-caller-template
+name: CI
+
+# These declarations are intentionally literal.  The local driver reads them
+# from ci.yml as readiness gates (the label agent-loop-managed and the status
+# context final-ci/exact-head are also required literals).
+env:
+  AGENT_LOOP_MANAGED_CI_V2: enabled
+  AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1: enabled
+  AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1: enabled
+  AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1: enabled
+  AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1: enabled
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, unlabeled]
+  workflow_dispatch:
+    inputs:
+      protocol_version: {required: false, default: ''}
+      pr_number: {required: false, default: ''}
+      expected_head_sha: {required: false, default: ''}
+      managed_nonce: {required: false, default: ''}
+
+# The driver discovers the dispatched run by this nonce-correlated name.
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.managed_nonce != '' && format('managed-ci-v2 nonce={0}', inputs.managed_nonce) || github.workflow }}
+
+jobs:
+  # Ordinary CI for pushes, all-empty manual dispatch and PRs that are not a
+  # complete trusted managed draft; a managed draft is qualified by the split
+  # jobs below instead.
+  ordinary:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.protocol_version == '' && inputs.pr_number == '' &&
+       inputs.expected_head_sha == '' && inputs.managed_nonce == '') ||
+      (github.event_name == 'pull_request' &&
+       (github.event.action == 'unlabeled' ||
+        !(github.event.pull_request.base.ref == github.event.repository.default_branch &&
+          github.event.pull_request.base.repo.full_name == github.repository &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          startsWith(github.event.pull_request.head.ref, 'agent-loop/managed-') &&
+          github.event.pull_request.draft == true &&
+          vars.AGENT_LOOP_MANAGED_ACTOR != '' &&
+          github.event.pull_request.user.login == vars.AGENT_LOOP_MANAGED_ACTOR &&
+          (github.event.action == 'opened' ||
+           ((github.event.action == 'synchronize' || github.event.action == 'reopened') &&
+            contains(github.event.pull_request.labels.*.name, 'agent-loop-managed'))))))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest tests -q
+
+  validate:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '')
+    uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci-validate.yml@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
+    with:
+      protocol_version: ${{ inputs.protocol_version }}
+      pr_number: ${{ inputs.pr_number }}
+      expected_head_sha: ${{ inputs.expected_head_sha }}
+      managed_nonce: ${{ inputs.managed_nonce }}
+
+  services:
+    needs: validate
+    if: needs.validate.result == 'success'
+    name: services
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.target_sha }}
+          fetch-depth: 1
+      - name: Verify exact checkout
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.validate.outputs.target_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - name: Install dependencies
+        run: python -m pip install -e '.[dev]'
+      - name: Run tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: python -m pytest tests/integration -q
+      - uses: wwind123/coding-review-agent-loop/.github/actions/managed-ci-attest@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
+        with:
+          target_sha: ${{ needs.validate.outputs.target_sha }}
+          attestation_id: services
+          job_name: services
+
+  unit:
+    needs: validate
+    if: needs.validate.result == 'success'
+    name: unit (${{ matrix.cell }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        cell: [a, b]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.target_sha }}
+          fetch-depth: 1
+      - name: Verify exact checkout
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.validate.outputs.target_sha }}
+        run: test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - name: Install dependencies
+        run: python -m pip install -e '.[dev]'
+      - name: Run tests
+        run: python -m pytest tests -q -k ${{ matrix.cell }}
+      - uses: wwind123/coding-review-agent-loop/.github/actions/managed-ci-attest@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
+        with:
+          target_sha: ${{ needs.validate.outputs.target_sha }}
+          attestation_id: unit-${{ matrix.cell }}
+          job_name: unit (${{ matrix.cell }})
+
+  publish:
+    needs: [validate, services, unit]
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '')
+    uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci-publish.yml@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
+    permissions:
+      actions: read
+      contents: read
+      statuses: write
+    with:
+      protocol_version: ${{ inputs.protocol_version }}
+      pr_number: ${{ inputs.pr_number }}
+      expected_head_sha: ${{ inputs.expected_head_sha }}
+      managed_nonce: ${{ inputs.managed_nonce }}
+      target_sha: ${{ needs.validate.outputs.target_sha }}
+      nonce: ${{ needs.validate.outputs.nonce }}
+      validation_result: ${{ needs.validate.result }}
+      validation_run_id: ${{ needs.validate.outputs.run_id }}
+      validation_attempt: ${{ needs.validate.outputs.attempt }}
+      needs_results: ${{ toJSON(needs) }}
+      expected_attestations: >-
+        [{"attestation_id":"services","job_name":"services","needs_key":"services"},
+         {"attestation_id":"unit-a","job_name":"unit (a)","needs_key":"unit"},
+         {"attestation_id":"unit-b","job_name":"unit (b)","needs_key":"unit"}]
+```
+
+The template matches the fixture caller `tests/fixtures/managed_ci/split_caller.yml`,
+and a docs test keeps the two in step. Replace the placeholder SHA with the
+commit SHA the release tag resolves to.
+
+**Security contract.**
+
+- The trust root is the default-branch caller. Managed dispatch executes it, so
+  a PR cannot change the composition. The caller declares four things
+  literally: (a) each expected test job's first steps check out
+  `needs.validate.outputs.target_sha` and assert `git rev-parse HEAD` equals it
+  before any install or test step; (b) the expected-attestation set; (c)
+  `needs` on `validate` and every expected job; (d) the permissions (test jobs
+  `contents: read`).
+- Only the `publish` status job holds `statuses: write`. `validate`, `verify`
+  and every caller test job are read-only; PR-controlled test code never runs
+  with write permission, and the status job runs no repository code and
+  downloads nothing.
+- Pass/fail authority is the Actions jobs API conclusion of each expected job
+  name in the current attempt, plus the caller-evaluated `toJSON(needs)`
+  results. PR code can influence neither.
+- An attestation is an **untrusted correlation claim**. It is written inside a
+  runner that has executed PR-head code, so PR code can forge, alter or
+  suppress it; it does not prove that the pinned writer ran or that `head_sha`
+  is true. `publish` uses it only for correlation and accounting: a declared
+  identity reached its final step in this run and attempt naming the validated
+  target. A missing, duplicate, extra or mis-bound record fails the run, which
+  mainly catches misconfiguration (a wrong ref, a missing attest step, a stale
+  artifact). Trust rests on the default-branch literal checkout plus HEAD check
+  and the API job conclusion. As in the single-job model, PR-controlled tests
+  can still exit 0.
+- The status job runs its own correlation guard before building a status: the
+  forwarded inputs, `target_sha` and `nonce` must equal the dispatch event
+  inputs and `validation_result` must be `success`; otherwise it writes no
+  status. Once the guard passes, any verify failure, skip or cancellation
+  publishes `failure` on the validated target, and only a fully verified run
+  publishes `success`. The status context, description and target URL are the
+  same as the single-job publisher's.
+- The expected set is a **literal** in the default-branch caller; it is never
+  computed from job outputs. An empty, malformed, duplicated or oversized set
+  fails closed.
+
+**Reruns.** The only supported in-run recovery is the driver-authorized
+no-status retry: the intent must be at most 15 minutes old and the retry must be
+the next attempt of the same run. Re-run **every** expected job (`Re-run all
+jobs`). `publish` selects only current-attempt attestations, so retained
+earlier-attempt artifacts are ignored, and a retry that carries over an
+expected job from the earlier attempt fails as missing. Every other rerun
+(after a published status, with a stale intent, or with an unmatched attempt) is
+rejected by `validate` and writes no status. Recover with a fresh managed
+dispatch.
+
+**Migration notes: a routed matrix plus a separate admission run
+(llm-dialectic).** llm-dialectic routes a `suite` (docs-contract, smoke, full or
+none) at run time and runs a separate Redis-admission job against service
+containers. Because the expected set is literal, a route that omits or skips a
+declared cell during managed qualification makes `publish` fail closed: safe,
+but it blocks qualification. Avoid this by making a managed dispatch always
+route to a fixed, declared set of cells, with the expected list matching that
+set exactly. PR code cannot widen or narrow either side, because both live in
+the default-branch caller. Keep services (`postgres`, `redis`), apt, ICU, Node
+and docs checks in the caller-owned jobs, and give the admission run its own
+job, attestation id and `needs_key`:
+
+```yaml split-routed-matrix-example
+  route:
+    needs: validate
+    if: needs.validate.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.route.outputs.matrix }}
+    steps:
+      - id: route
+        run: |
+          # A managed dispatch always runs the full, fixed cell set.
+          echo 'matrix=[{"suite":"docs-contract"},{"suite":"smoke"},{"suite":"full"}]' >> "$GITHUB_OUTPUT"
+  test:
+    needs: [validate, route]
+    name: test (${{ matrix.suite }})
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.route.outputs.matrix) }}
+    # ...checkout of the validated SHA, HEAD check, setup, tests, then attest with
+    # attestation_id: test-${{ matrix.suite }} and job_name: test (${{ matrix.suite }})
+  redis-admission:
+    needs: validate
+    name: redis-admission
+    # ...services: redis, checkout, HEAD check, pytest -m redis, then attest
+  publish:
+    needs: [validate, route, test, redis-admission]
+    with:
+      expected_attestations: >-
+        [{"attestation_id":"test-docs-contract","job_name":"test (docs-contract)","needs_key":"test"},
+         {"attestation_id":"test-smoke","job_name":"test (smoke)","needs_key":"test"},
+         {"attestation_id":"test-full","job_name":"test (full)","needs_key":"test"},
+         {"attestation_id":"redis-admission","job_name":"redis-admission","needs_key":"redis-admission"}]
+```
+
+Whenever the route job changes, update the expected list in the same change; a
+docs test compares the two in this example. The `route` job itself is not
+attested, but it must appear in `needs`, so its result is checked by the
+`needs_results` rule. Confirm the rendered job names of matrix cells with the
+cross-repo probe before relying on them.
+
 #### Trusted integration bases (`AGENT_LOOP_TRUSTED_BASES`)
 
 Risky multi-PR work can run on an integration branch with the full managed-CI
