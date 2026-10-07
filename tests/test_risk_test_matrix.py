@@ -3404,9 +3404,13 @@ def test_overlong_refs_are_normalised_with_caveat_and_one_warning_1300(caplog):
     assert parsed.degradations == ()
     [claim] = parsed.claims
     assert claim.execution_refs == tuple(_REFS_1300[:8])
-    assert claim.overflow_execution_refs == (_REFS_1300[8],)
+    # Distinct overflow first, then every removed duplicate occurrence.
+    assert claim.overflow_execution_refs == (_REFS_1300[8], _REFS_1300[0], _REFS_1300[1])
     [caveat] = [c for c in claim.caveats if "trimmed" in c]
-    assert _REFS_1300[8] in caveat and "2 duplicate" in caveat
+    assert "1 over-bound selector(s) and 2 duplicate occurrence(s)" in caveat
+    for name in (_REFS_1300[8], _REFS_1300[0], _REFS_1300[1]):
+        assert f"`{name}`" in caveat
+    assert "more)" not in caveat
     assert len(caveat.encode()) <= 1024
     warnings = [r for r in caplog.records if "execution_refs" in r.getMessage()]
     assert len(warnings) == 1
@@ -3487,15 +3491,74 @@ def test_discarded_tail_just_under_bound_and_oversize_item_1300():
 
 
 def test_overflow_caveat_coexists_with_other_bookkeeping_1300():
-    claim = _claim_927("row-a", [*_REFS_1300[:8], "unknown-ref", *_REFS_1300[8:]])
+    # The unknown ref sits among the first 8 distinct refs, so it is kept for
+    # the catalog lookup and lands in ``dropped_execution_refs``.
+    claim = _claim_927("row-a", [*_REFS_1300[:7], "unknown-ref", *_REFS_1300[7:]])
     claim["caveats"] = [f"c{i}" for i in range(16)]
     claim["test_identifiers"] = [f"t{i}" for i in range(20)]
     parsed = _parse_927([claim], catalog=_CATALOG_1300)
     [kept] = parsed.claims
+    assert kept.dropped_execution_refs == ("unknown-ref",)
+    assert kept.overflow_execution_refs == tuple(_REFS_1300[7:])
     assert len(kept.caveats) <= 16
     assert any("trimmed" in c for c in kept.caveats)
+    assert any(c.startswith("Dropped execution_refs") for c in kept.caveats)
     assert any("Truncated" in c for c in kept.caveats)
     assert all(len(c.encode()) <= 1024 for c in kept.caveats)
+    result = _derive_1300(parsed, _CATALOG_1300)
+    assert any(d.code == "unknown-execution-ref" for d in result.diagnostics)
+
+
+def test_duplicate_only_overflow_is_recorded_and_named_1300():
+    refs = [*_REFS_1300[:8], _REFS_1300[0], _REFS_1300[0], _REFS_1300[3]]
+    [claim] = _parse_927([_claim_927("row-a", refs)], catalog=_CATALOG_1300).claims
+    assert claim.execution_refs == tuple(_REFS_1300[:8])
+    assert claim.overflow_execution_refs == (_REFS_1300[0], _REFS_1300[0], _REFS_1300[3])
+    [caveat] = [c for c in claim.caveats if "trimmed" in c]
+    assert "0 over-bound selector(s) and 3 duplicate occurrence(s)" in caveat
+    assert f"`{_REFS_1300[0]}`" in caveat and f"`{_REFS_1300[3]}`" in caveat
+    assert "overflow_execution_refs" not in claim.to_payload()
+
+
+def test_overflow_caveat_budget_adds_omission_suffix_1300():
+    refs = [*_REFS_1300[:8], *(f"extra-ref-{i:03d}-" + "x" * 40 for i in range(60))]
+    [claim] = _parse_927([_claim_927("row-a", refs)], catalog=None).claims
+    [caveat] = [c for c in claim.caveats if "trimmed" in c]
+    assert len(caveat.encode()) <= 1024
+    assert "more)" in caveat
+    assert len(claim.overflow_execution_refs) == 60
+
+
+def _tail_1300(kind, total_bytes):
+    """Two raw whitespace-padded discarded items whose compact JSON is exactly total_bytes."""
+    names = ("r0", "r1") if kind == "duplicates" else ("x0", "x1")
+    base = [names[0], names[1]]
+    size = len(json.dumps(base, separators=(",", ":")).encode())
+    pad = total_bytes - size
+    first, second = pad // 2, pad - pad // 2
+    return [names[0] + " " * first, names[1] + " " * second]
+
+
+@pytest.mark.parametrize("kind", ["duplicates", "distinct"])
+@pytest.mark.parametrize("with_blank", [False, True])
+def test_discarded_tail_boundary_measures_raw_compact_json_1300(kind, with_blank):
+    kept = [f"r{i}" for i in range(8)]
+    limit = DROPPED_VALUE_MAX_BYTES
+    extra = [" "] if with_blank else []
+    # A claim dropped for a degradable defect is also bounded as a whole, so
+    # the at-limit tail is only acceptable without the blank item.
+    tail = _tail_1300(kind, 500 if with_blank else limit)
+    parsed = _parse_927([_claim_927("row-a", kept + tail + extra)], catalog=None)
+    if with_blank:
+        assert parsed.claims == ()
+        [record] = parsed.degradations
+        assert "execution_refs" in record.element_path
+    else:
+        [claim] = parsed.claims
+        assert claim.execution_refs == tuple(kept)
+    over = _tail_1300(kind, limit + 1)
+    with pytest.raises(AgentLoopError, match="byte bound"):
+        _parse_927([_claim_927("row-a", kept + over + extra)], catalog=None)
 
 
 @pytest.mark.parametrize(

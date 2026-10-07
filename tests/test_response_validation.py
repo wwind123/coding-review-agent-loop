@@ -974,3 +974,57 @@ def test_coder_followup_with_overlong_execution_refs_validates_without_repair_13
     [claim] = parsed.risk_test_matrix_claims.claims
     assert claim.execution_refs == tuple(refs[:8])
     assert parsed.risk_test_matrix_claims.degradations == ()
+
+
+def test_followup_overlong_refs_through_validated_agent_never_repairs_1300(tmp_path):
+    """#1300: the pr_loop validated-agent seam accepts an 11-ref claim on the first pass."""
+    from unittest.mock import patch
+
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+
+    refs = [f"turn:observation-{i}" for i in range(9)] + ["turn:observation-0", "turn:observation-1"]
+    payload = _degradable_followup_payload("coder_followup")
+    payload["risk_test_matrix_claims"] = [{"row_id": "row-1", "execution_refs": refs}]
+    payload["test_observations"] = []
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    catalog = [
+        {"execution_ref": ref, "outcome": "passed", "provenance": "parent-observed"}
+        for ref in dict.fromkeys(refs)
+    ]
+    repair_calls: list[object] = []
+
+    def fake_repair(raw, **kwargs):
+        repair_calls.append(raw)
+        return None, None, []
+
+    runner = FakeRunner(codex_outputs=[text])
+    config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
+    with patch.object(orchestrator, "_run_structured_repair", fake_repair):
+        response = orchestrator._run_validated_agent(
+            runner,
+            agent="codex",
+            config=config,
+            prompt="FOLLOWUP PROMPT",
+            session_id=None,
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda body: validate_structured_coder_followup(
+                body, delivered_risk_test_matrix_row_ids=["row-1"], execution_catalog=catalog
+            ),
+            use_repair=True,
+            repair_expected_kind="coder_followup",
+            role="coder",
+            operation_description="coder follow-up",
+        )
+
+    assert repair_calls == []
+    assert len([c for c, _cwd in runner.commands if c[:1] == ["codex"]]) == 1
+    # The accepted text is the agent's first-pass output, unmodified.
+    assert response.text == text
+    parsed = validate_structured_coder_followup(
+        response.text, delivered_risk_test_matrix_row_ids=["row-1"], execution_catalog=catalog
+    )
+    [claim] = parsed.risk_test_matrix_claims.claims
+    assert claim.execution_refs == tuple(refs[:8])
+    assert claim.overflow_execution_refs == (refs[8], refs[0], refs[1])
+    assert parsed.risk_test_matrix_claims.degradations == ()

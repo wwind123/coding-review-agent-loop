@@ -6863,5 +6863,5 @@ def test_overlong_execution_refs_normalise_without_rejection_1300(kind):
     )
     [claim] = parsed.risk_test_matrix_claims.claims
     assert claim.execution_refs == tuple(refs[:8])
-    assert claim.overflow_execution_refs == ("turn:observation-8",)
+    assert claim.overflow_execution_refs == ("turn:observation-8", refs[0], refs[1])
     assert parsed.risk_test_matrix_claims.degradations == ()

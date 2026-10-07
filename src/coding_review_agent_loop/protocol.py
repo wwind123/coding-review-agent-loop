@@ -4496,14 +4496,18 @@ def _overflow_execution_refs_caveat(
     duplicates: Sequence[str], overflow: Sequence[str]
 ) -> str:
     """Disclose over-bound normalisation of ``execution_refs`` (#1300)."""
-    note = (
-        f" ({len(duplicates)} duplicate occurrence(s) removed)" if duplicates else ""
+    # Name the distinct over-bound selectors first, then the removed
+    # duplicates; the shared helper bounds the text and adds ``(+N more)``.
+    names = list(dict.fromkeys((*overflow, *duplicates)))
+    counts = (
+        f"{len(overflow)} over-bound selector(s) and "
+        f"{len(duplicates)} duplicate occurrence(s) removed"
     )
     return _named_refs_caveat(  # shape-check: fatal:authentication-or-forgery
         f"Over-long execution_refs were trimmed to the first "
-        f"{SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS} distinct selectors{note}; "
-        "dropped over-bound selectors (they cannot verify this row): ",
-        overflow if overflow else duplicates,
+        f"{SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS} distinct selectors "
+        f"({counts}; they cannot verify this row): ",
+        names,
     )
 
 
@@ -4961,7 +4965,7 @@ def _parse_semantic_risk_coverage_claims(
             forbidden_effect_assertions=fact_lists["forbidden_effect_assertions"],
             caveats=caveats,
             dropped_execution_refs=tuple(dropped_refs),
-            overflow_execution_refs=tuple(overflow_refs),
+            overflow_execution_refs=tuple((*overflow_refs, *overflow_duplicates)),
             truncated_fact_fields=tuple(field for field, _ in truncated_facts),
             test_level=test_level,
         )
