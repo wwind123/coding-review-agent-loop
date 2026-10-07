@@ -424,6 +424,24 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "fields or canonical evidence rows."
         ),
     ),
+    "_named_refs_caveat": ShapeCheckClassification(
+        "fatal",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
+    "_overflow_execution_refs_caveat": ShapeCheckClassification(
+        "fatal",
+        frozenset({"authentication-or-forgery"}),
+        (
+            "Fatal sites: authentication-or-forgery: marker neutralization through "
+            "sanitize_historical_text, identity digests, orchestrator-owned authority "
+            "fields or canonical evidence rows."
+        ),
+    ),
     "_dropped_execution_refs_caveat": ShapeCheckClassification(
         "fatal",
         frozenset({"authentication-or-forgery"}),
@@ -1151,7 +1169,7 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
         (
             "Drops one claim per claim-scope defect with one bounded record (#926, #927). "
             "Stays fatal for CLAIM_RESERVED_AUTHORITY_KEYS, the row, ref, caveat and "
-            "16,384-byte hard caps, an over-bound dropped value, catalog collisions and "
+            "16,384-byte hard caps, an over-bound dropped value (including the discarded tail of an over-long execution_refs list, #1300), catalog collisions and "
             "non-passing or launch-integrity-unknown in-catalog selectors; previews are "
             "marker-neutralized. Fatal sites: authentication-or-forgery: marker "
             "neutralization through sanitize_historical_text, identity digests, "
@@ -1230,8 +1248,8 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
         "fatal",
         frozenset({"payload-bound"}),
         (
-            "Fatal sites: payload-bound: a hard cap or count bound that keeps an accepted "
-            "payload bounded."
+            "Fatal sites: payload-bound: the 16,384-byte hard cap on each raw item; the "
+            "eight-ref count is normalised by the caller (#1300), not rejected."
         ),
     ),
     "_unapproved_row_claim_message": ShapeCheckClassification(

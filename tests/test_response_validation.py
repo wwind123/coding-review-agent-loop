@@ -953,3 +953,24 @@ def test_unparseable_envelope_with_degradable_claims_still_rejects_whole(kind):
     for broken in (text[: len(text) // 2] + footer, text + " trailing prose" + footer):
         with pytest.raises(AgentLoopError, match="Structured"):
             validator(broken)
+
+
+def test_coder_followup_with_overlong_execution_refs_validates_without_repair_1300():
+    """#1300: a pure cardinality defect is normalised, so no repair is needed."""
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+
+    payload = _degradable_followup_payload("coder_followup")
+    refs = [f"turn:observation-{i}" for i in range(11)]
+    payload["risk_test_matrix_claims"] = [{"row_id": "row-1", "execution_refs": refs}]
+    payload["test_observations"] = []
+    text = json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    catalog = [
+        {"execution_ref": ref, "outcome": "passed", "provenance": "parent-observed"}
+        for ref in refs
+    ]
+    parsed = validate_structured_coder_followup(
+        text, delivered_risk_test_matrix_row_ids=["row-1"], execution_catalog=catalog
+    )
+    [claim] = parsed.risk_test_matrix_claims.claims
+    assert claim.execution_refs == tuple(refs[:8])
+    assert parsed.risk_test_matrix_claims.degradations == ()

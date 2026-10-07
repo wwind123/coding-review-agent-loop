@@ -2967,7 +2967,8 @@ def test_reserved_authority_key_rejects_while_ordinary_unknown_keys_degrade_927(
     [
         (lambda c: c.update(workflow_path_claim="x" * 16_385), "16384-byte bound"),
         (lambda c: c.update(test_identifiers=["x" * 16_385]), "16384-byte bound"),
-        (lambda c: c.update(execution_refs=[f"invocation:observation-{i}" for i in range(9)]), "8-item bound"),
+        (lambda c: c.update(execution_refs=[f"r{i}" for i in range(8)] + [" r0" + " " * 9_000] * 2), "bound"),
+        (lambda c: c.update(execution_refs=[f"r{i}" for i in range(8)] + [f"x{i}" + " " * 9_000 for i in range(2)]), "bound"),
         (lambda c: c.update(caveats=[f"c{i}" for i in range(17)]), "16-item bound"),
     ],
 )
@@ -3363,3 +3364,148 @@ def test_non_evidence_launch_failure_does_not_block_matrix_evidence() -> None:
     forged_result = _derive_with((passing, forged))
     assert any(d.code == "unsuperseded-journal-failure" for d in forged_result.diagnostics)
     assert forged_result.evidence.rows[0].status == "incomplete"
+
+
+# --- #1300: over-long execution_refs are normalised, not rejected ---------
+
+import logging  # noqa: E402
+
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS,
+    semantic_risk_claim_schema_text,
+)
+
+_CATALOG_1300 = tuple(
+    _derived_observation(execution_ref=f"invocation:observation-{i}", receipt_id=f"receipt-{i}")
+    for i in range(11)
+)
+_REFS_1300 = [c.execution_ref for c in _CATALOG_1300]
+
+
+def _derive_1300(parsed, observations):
+    return derive_risk_test_matrix_evidence(
+        matrix=_matrix_927(),
+        claims=parsed,
+        observations=observations,
+        execution_catalog=observations,
+        invocation_id="turn-current",
+        current_head="head-current",
+        current_tree_digest="tree-current",
+        authenticated_checkout_head="head-current",
+        authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(_matrix_927()),
+    )
+
+
+def test_overlong_refs_are_normalised_with_caveat_and_one_warning_1300(caplog):
+    refs = _REFS_1300[:8] + [_REFS_1300[0], _REFS_1300[1], _REFS_1300[8]]
+    with caplog.at_level(logging.WARNING, logger="coding_review_agent_loop.protocol"):
+        parsed = _parse_927([_claim_927("row-a", refs)], catalog=_CATALOG_1300)
+    assert parsed.degradations == ()
+    [claim] = parsed.claims
+    assert claim.execution_refs == tuple(_REFS_1300[:8])
+    assert claim.overflow_execution_refs == (_REFS_1300[8],)
+    [caveat] = [c for c in claim.caveats if "trimmed" in c]
+    assert _REFS_1300[8] in caveat and "2 duplicate" in caveat
+    assert len(caveat.encode()) <= 1024
+    warnings = [r for r in caplog.records if "execution_refs" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "execution_refs listed 11" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize("count", [3, 8])
+def test_refs_within_bound_are_unchanged_1300(count, caplog):
+    with caplog.at_level(logging.WARNING, logger="coding_review_agent_loop.protocol"):
+        parsed = _parse_927([_claim_927("row-a", _REFS_1300[:count])], catalog=_CATALOG_1300)
+    [claim] = parsed.claims
+    assert claim.execution_refs == tuple(_REFS_1300[:count])
+    assert claim.overflow_execution_refs == ()
+    assert claim.caveats == ()
+    assert not caplog.records
+
+
+def test_repeated_ref_within_bound_still_drops_claim_1300():
+    parsed = _parse_927([_claim_927("row-a", [_REFS_1300[0], _REFS_1300[0]])], catalog=_CATALOG_1300)
+    assert parsed.claims == ()
+    assert len(parsed.degradations) == 1
+
+
+def test_overflow_refs_carry_no_authority_but_journal_failure_counts_1300():
+    failing = _derived_observation(
+        execution_ref="invocation:observation-failed", receipt_id="receipt-failed", outcome="failed"
+    )
+    # All passing: verified from the kept refs only, no citation for dropped.
+    parsed = _parse_927([_claim_927("row-a", _REFS_1300)], catalog=_CATALOG_1300)
+    [claim] = parsed.claims
+    assert claim.execution_refs == tuple(_REFS_1300[:8])
+    result = _derive_1300(parsed, _CATALOG_1300)
+    [row] = [r for r in result.evidence.rows if r.row_id == "row-a"]
+    assert row.status == "verified"
+    assert {c.receipt_id for c in row.evidence_citations} <= {f"receipt-{i}" for i in range(8)}
+
+    # A failing handle only past the bound: no parse rejection, row incomplete.
+    catalog = (*_CATALOG_1300[:10], failing)
+    refs = [c.execution_ref for c in catalog]
+    parsed = _parse_927([_claim_927("row-a", refs)], catalog=catalog)
+    result = _derive_1300(parsed, catalog)
+    [row] = [r for r in result.evidence.rows if r.row_id == "row-a"]
+    assert row.status == "incomplete"
+    assert all(c.receipt_id != "receipt-failed" for c in row.evidence_citations)
+    assert any(d.code == "unsuperseded-journal-failure" for d in result.diagnostics)
+
+    # Variant 3: same plus a blank item -> dropped claim, no authority rejection.
+    parsed = _parse_927([_claim_927("row-a", [*refs, "  "])], catalog=catalog)
+    assert parsed.claims == ()
+    [record] = parsed.degradations
+    assert "execution_refs" in record.element_path
+
+    # A failing handle within the kept 8 still raises.
+    with pytest.raises(_ProtocolNonRepairable):
+        _parse_927([_claim_927("row-a", [failing.execution_ref, *refs[:9]])], catalog=(*catalog,))
+
+
+@pytest.mark.parametrize("padding_variant", ["duplicates", "distinct"])
+@pytest.mark.parametrize("row_id", ["row-a", "unapproved-row", 7])
+def test_padded_discarded_tail_rejects_before_degradation_1300(padding_variant, row_id):
+    kept = [f"r{i}" for i in range(8)]
+    if padding_variant == "duplicates":
+        tail = ["r0" + " " * 10_000, "r1" + " " * 10_000]
+    else:
+        tail = ["x0" + " " * 10_000, "x1" + " " * 10_000]
+    claim = _claim_927("row-a", kept + tail)
+    claim["row_id"] = row_id
+    with pytest.raises(AgentLoopError, match="byte bound"):
+        _parse_927([claim], catalog=None)
+
+
+def test_discarded_tail_just_under_bound_and_oversize_item_1300():
+    kept = [f"r{i}" for i in range(8)]
+    parsed = _parse_927([_claim_927("row-a", kept + ["x" * 100, "y" * 100])], catalog=None)
+    assert len(parsed.claims) == 1
+    with pytest.raises(AgentLoopError, match="16384-byte bound"):
+        _parse_927([_claim_927("row-a", kept + ["z" * 16_385])], catalog=None)
+
+
+def test_overflow_caveat_coexists_with_other_bookkeeping_1300():
+    claim = _claim_927("row-a", [*_REFS_1300[:8], "unknown-ref", *_REFS_1300[8:]])
+    claim["caveats"] = [f"c{i}" for i in range(16)]
+    claim["test_identifiers"] = [f"t{i}" for i in range(20)]
+    parsed = _parse_927([claim], catalog=_CATALOG_1300)
+    [kept] = parsed.claims
+    assert len(kept.caveats) <= 16
+    assert any("trimmed" in c for c in kept.caveats)
+    assert any("Truncated" in c for c in kept.caveats)
+    assert all(len(c.encode()) <= 1024 for c in kept.caveats)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"include_coverage_map": True}, {"preserve_optional_keys": True}],
+)
+def test_schema_text_states_execution_ref_bound_1300(kwargs):
+    text = semantic_risk_claim_schema_text(**kwargs)
+    bound = SEMANTIC_RISK_CLAIMS_MAX_EXECUTION_REFS
+    assert f"holds at most {bound} selectors" in text
+    assert "not every run" in text
+    assert "list a selector at most once within a row" in text
+    assert f"in a list of {bound} or fewer still drops the claim" in text

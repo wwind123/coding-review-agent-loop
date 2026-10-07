@@ -1456,7 +1456,15 @@ row reads `missing`. The dropped defects are:
 - a missing, empty, or ill-typed `execution_refs` (#855), or an admissible
   selector listed twice within one claim;
 - an unknown key, or an ill-typed, duplicated, or over-bound fact;
-- without an execution catalog, a selector over the 1,024-byte field bound.
+- without an execution catalog, a selector over the 1,024-byte field bound;
+- an `execution_refs` list longer than eight is not rejected (#1300): it is
+  de-duplicated and trimmed to its first eight distinct selectors, with a
+  caveat naming the dropped ones. The trim also runs before authority checks
+  when the claim is dropped for a mistyped item, so selectors past the bound
+  are never evaluated. The discarded raw occurrences are still bounded by the
+  dropped-value cap. A selector repeated within a list of eight or fewer still
+  drops the claim. Dropped selectors are never cited, but an unsuperseded
+  journal failure among them still makes the row incomplete.
 
 When one claim has several defects, exactly one record is kept, and the
 row-ID rules win.
@@ -1466,7 +1474,7 @@ authority or are unbounded input:
 
 - a claim key that names orchestrator-owned verification authority: `status`,
   `evidence_citations`, `receipt_id`, `command`, or `claim`;
-- more than 24 claims, eight refs, or 16 caveats, any value over the
+- more than 24 claims or 16 caveats, any value over the
   16,384-byte hard cap, or a dropped value whose compact JSON exceeds that
   bound;
 - a colliding catalog;
