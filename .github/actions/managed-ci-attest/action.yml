@@ -1,0 +1,54 @@
+name: Managed CI attest
+description: >-
+  Assert the checked-out HEAD equals the validated target SHA and upload a
+  managed-ci-attestation/1 record. Place it as the last step of a caller-owned
+  test job, pinned to a full commit SHA. The record is an untrusted correlation
+  claim; the publisher trusts the jobs API conclusion, not this artifact.
+inputs:
+  target_sha:
+    description: Validated target SHA (needs.validate.outputs.target_sha).
+    required: true
+  attestation_id:
+    description: Declared attestation id, matching the caller's expected set.
+    required: true
+  job_name:
+    description: Rendered job name, matching the caller's expected set.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Require a pinned action revision
+      shell: bash
+      env:
+        ACTION_REPOSITORY: ${{ github.action_repository }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        test -n "$ACTION_REPOSITORY" || { echo "action repository context is empty" >&2; exit 1; }
+        printf '%s' "$ACTION_REF" | grep -Eq '^[0-9a-f]{40}$' || { echo "action ref must be a 40-hex commit SHA (tags and branches are rejected)" >&2; exit 1; }
+        echo "Attest action: $ACTION_REPOSITORY@$ACTION_REF"
+    - uses: actions/checkout@v4
+      with:
+        repository: ${{ github.action_repository }}
+        ref: ${{ github.action_ref }}
+        path: .managed-ci-attest
+        sparse-checkout: ci/managed
+        sparse-checkout-cone-mode: false
+        persist-credentials: false
+    - name: Write attestation
+      id: write
+      shell: bash
+      env:
+        TARGET_SHA: ${{ inputs.target_sha }}
+        ATTESTATION_ID: ${{ inputs.attestation_id }}
+        JOB_NAME: ${{ inputs.job_name }}
+      run: |
+        out="$RUNNER_TEMP/managed-ci-attest-out"
+        rm -rf "$out"
+        name=$(python3 .managed-ci-attest/ci/managed/attestation.py write --target-sha "$TARGET_SHA" --attestation-id "$ATTESTATION_ID" --job-name "$JOB_NAME" --job-status success --output-dir "$out" --workdir "$GITHUB_WORKSPACE")
+        echo "artifact_name=$name" >> "$GITHUB_OUTPUT"
+        echo "out_dir=$out" >> "$GITHUB_OUTPUT"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.write.outputs.artifact_name }}
+        path: ${{ steps.write.outputs.out_dir }}/attestation.json
+        if-no-files-found: error
