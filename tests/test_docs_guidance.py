@@ -1012,9 +1012,35 @@ def test_split_template_matches_fixture_caller_and_pins_uses():
     uses = re.findall(r"uses: (\S+@\S+)", template)
     assert uses
     for ref in uses:
-        if ref.startswith("actions/"):
-            continue
         assert re.search(r"@[0-9a-f]{40}$", ref), ref
+    for line in template.splitlines():
+        if "uses:" in line and "@" in line:
+            assert re.search(r"@[0-9a-f]{40} # \S+$", line), line
+
+
+def test_split_template_satisfies_driver_readiness_and_run_name_contract():
+    from coding_review_agent_loop import managed_ci as mc
+
+    template = _doc_yaml_block(
+        LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8"), "split-caller-template"
+    )
+    for marker in (
+        *mc._CONTRACT_MARKERS,
+        *mc.V2_FEATURE_MARKERS,
+        mc.RECOVERY_MARKER,
+        mc.VISIBLE_INTENT_MARKER,
+        mc.HOST_FOOTER_INTENT_MARKER,
+        mc.TRUSTED_BASES_MARKER,
+    ):
+        assert marker in template, marker
+    assert "pull_request" in template and "unlabeled" in template
+    contract = type("C", (), {"nonce": "N0NCE"})()
+    run_name = mc._v2_run_name(contract)
+    assert run_name == "managed-ci-v2 nonce=N0NCE"
+    assert "format('managed-ci-v2 nonce={0}', inputs.managed_nonce)" in template
+    assert "run-name:" in template
+    # Services that need initialization settings must declare them.
+    assert "POSTGRES_PASSWORD" in template
 
 
 def test_split_routed_matrix_example_cells_equal_expected_set():

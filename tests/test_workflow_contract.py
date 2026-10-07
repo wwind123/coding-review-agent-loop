@@ -1576,7 +1576,7 @@ def test_fixture_caller_pins_every_use_and_checks_out_the_literal_target_first()
 
 def test_fixture_caller_publish_covers_every_need_and_declares_a_literal_expected_set():
     publish = _load(SPLIT_CALLER)["jobs"]["publish"]
-    assert publish["if"] == "always()"
+    assert publish["if"].startswith("always() && github.event_name == 'workflow_dispatch'")
     assert set(publish["needs"]) == {"validate", *EXPECTED_JOBS}
     with_ = publish["with"]
     assert with_["needs_results"] == "${{ toJSON(needs) }}"

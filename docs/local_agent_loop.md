@@ -4321,12 +4321,37 @@ the test jobs and `publish` verifies them.
 3. `publish` has a read-only `verify` job and a status-only job. The status job
    is the only job anywhere in the layout with `statuses: write`.
 
-Every `uses` is pinned to a full 40-hex commit SHA with the release tag only as
-a trailing comment; the attest action rejects any other ref.
+Every `uses` (including `actions/checkout`) is pinned to a full 40-hex commit
+SHA with the release tag only as a trailing comment; the attest action rejects
+any other ref.
+
+Install the caller as `.github/workflows/ci.yml`. The driver reads only that
+file for readiness, so it must keep the literal `AGENT_LOOP_MANAGED_CI_*`
+declarations, the `final-ci/exact-head` context, the `agent-loop-managed`
+label, the `expected_head_sha` input, the `pull_request` triggers including
+`unlabeled`, and the nonce-correlated `run-name`; the driver finds the
+dispatched run by that name. Referencing the reusable workflows does not supply
+their text to those checks. The PostgreSQL service needs `POSTGRES_PASSWORD`
+and a health check, and the test step must use matching connection settings.
 
 ```yaml split-caller-template
 name: CI
+
+# These declarations are intentionally literal.  The local driver reads them
+# from ci.yml as readiness gates (the label agent-loop-managed and the status
+# context final-ci/exact-head are also required literals).
+env:
+  AGENT_LOOP_MANAGED_CI_V2: enabled
+  AGENT_LOOP_MANAGED_CI_UNLABELED_RECOVERY_V1: enabled
+  AGENT_LOOP_MANAGED_CI_VISIBLE_INTENT_V1: enabled
+  AGENT_LOOP_MANAGED_CI_HOST_FOOTER_V1: enabled
+  AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1: enabled
+
 on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, unlabeled]
   workflow_dispatch:
     inputs:
       protocol_version: {required: false, default: ''}
@@ -4334,8 +4359,44 @@ on:
       expected_head_sha: {required: false, default: ''}
       managed_nonce: {required: false, default: ''}
 
+# The driver discovers the dispatched run by this nonce-correlated name.
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.managed_nonce != '' && format('managed-ci-v2 nonce={0}', inputs.managed_nonce) || github.workflow }}
+
 jobs:
+  # Ordinary CI for pushes, all-empty manual dispatch and PRs that are not a
+  # complete trusted managed draft; a managed draft is qualified by the split
+  # jobs below instead.
+  ordinary:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' &&
+       inputs.protocol_version == '' && inputs.pr_number == '' &&
+       inputs.expected_head_sha == '' && inputs.managed_nonce == '') ||
+      (github.event_name == 'pull_request' &&
+       (github.event.action == 'unlabeled' ||
+        !(github.event.pull_request.base.ref == github.event.repository.default_branch &&
+          github.event.pull_request.base.repo.full_name == github.repository &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          startsWith(github.event.pull_request.head.ref, 'agent-loop/managed-') &&
+          github.event.pull_request.draft == true &&
+          vars.AGENT_LOOP_MANAGED_ACTOR != '' &&
+          github.event.pull_request.user.login == vars.AGENT_LOOP_MANAGED_ACTOR &&
+          (github.event.action == 'opened' ||
+           ((github.event.action == 'synchronize' || github.event.action == 'reopened') &&
+            contains(github.event.pull_request.labels.*.name, 'agent-loop-managed'))))))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: python -m pip install -e '.[dev]'
+      - run: python -m pytest tests -q
+
   validate:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '')
     uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci-validate.yml@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
     permissions:
       actions: read
@@ -4358,9 +4419,14 @@ jobs:
     services:
       postgres:
         image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
         ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.validate.outputs.target_sha }}
           fetch-depth: 1
@@ -4371,6 +4437,8 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -e '.[dev]'
       - name: Run tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: python -m pytest tests/integration -q
       - uses: wwind123/coding-review-agent-loop/.github/actions/managed-ci-attest@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
         with:
@@ -4390,7 +4458,7 @@ jobs:
       matrix:
         cell: [a, b]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.validate.outputs.target_sha }}
           fetch-depth: 1
@@ -4410,7 +4478,10 @@ jobs:
 
   publish:
     needs: [validate, services, unit]
-    if: always()
+    if: >-
+      always() && github.event_name == 'workflow_dispatch' &&
+      (inputs.protocol_version != '' || inputs.pr_number != '' ||
+       inputs.expected_head_sha != '' || inputs.managed_nonce != '')
     uses: wwind123/coding-review-agent-loop/.github/workflows/managed-ci-publish.yml@0123456789abcdef0123456789abcdef01234567 # managed-ci-split-v1
     permissions:
       actions: read
