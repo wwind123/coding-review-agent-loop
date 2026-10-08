@@ -816,3 +816,44 @@ def test_step_back_sibling_escalation_takes_precedence_over_a_filled_stall_windo
     assert snapshots[2]["qualifies"] is True and snapshots[3]["qualifies"] is True
     assert rounds == [1, 2, 3]
     assert _coder_count(runner) == 3
+
+
+def test_reraised_duplicate_is_a_new_item_with_its_own_tag_and_the_original_keeps_its_tag(
+    tmp_path, monkeypatch
+):
+    """`tag-carry-forward`: a duplicate raise is a new item; neither item borrows the other's tag."""
+    calls = _spy_classifier(monkeypatch)
+    text = "Capture an admissible passing test observation for the rows"
+    runner = FakeRunner(
+        claude_outputs=[_coder(1), _coder(1, 2), _coder(1, 2)],
+        codex_outputs=[
+            _review([_tagged(text)]),
+            # The reviewer carries item-1 and raises the same text again, untagged.
+            _review([text], carried=["item-1"]),
+            _review(carried=["item-1", "item-2"]),
+            _review(resolved=["item-1", "item-2"]),
+        ],
+    )
+    config = _config(tmp_path)
+    assert run_pr_loop(
+        runner, pr_number=77, config=config, approved_plan_context=_plan_context("row-a")
+    ) == 0
+    by_round = {kwargs["review_round"]: kwargs for kwargs, _snap in calls}
+    for review_round in (2, 3):
+        tags = {
+            item.item_id: item.evidence_row_ids
+            for item in by_round[review_round]["open_items"] if not item.is_machine_obligation
+        }
+        assert tags == {"item-1": ("row-a",), "item-2": ()}
+    snapshots = _stall_snapshots(runner, config)
+    # The untagged duplicate is an ordinary finding, so no round qualifies.
+    assert all(
+        not snapshots[n]["qualifies"] and "untagged-finding" in snapshots[n]["reasons"]
+        for n in (2, 3)
+    )
+    # Replay from posted records keeps the same two items and tags.
+    coder = [r for r in _posted_records(runner, config) if r.metadata.role == "coder"][-1]
+    assert {
+        item.item_id: item.evidence_row_ids
+        for item in coder.metadata.prior_items if not item.is_machine_obligation
+    } == {"item-1": ("row-a",), "item-2": ()}
