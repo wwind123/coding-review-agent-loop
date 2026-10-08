@@ -137,6 +137,7 @@ def _next_unresolved_item(
     candidate_head_sha: str | None = None,
     obligation_identity: str | None = None,
     sub_items: Sequence[str] = (),
+    evidence_row_ids: Sequence[str] = (),
 ) -> UnresolvedReviewItem:
     if obligation_kind is not None and authority is None:
         authority = MACHINE_AUTHORITY
@@ -171,6 +172,12 @@ def _next_unresolved_item(
             ReviewSubItem(sub_item_id=f"item-{item_number}.s{position}", text=statement)
             for position, statement in enumerate(sub_items, 1)
         ) if authority not in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY} else (),
+        # Fixed at creation (#1324); machine obligations never carry the tag.
+        evidence_row_ids=(
+            tuple(evidence_row_ids)
+            if authority not in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY}
+            else ()
+        ),
     )
 
 
@@ -582,6 +589,36 @@ def _raise_unknown_prior_item_disposition(
     )
 
 
+def _validate_evidence_row_tags(
+    parsed: ParsedReview, approved_matrix_row_ids: Sequence[str] | None
+) -> None:
+    """Reject an ``evidence_row_ids`` tag the approved matrix cannot back (#1324).
+
+    ``approved_matrix_row_ids`` is the enforceable row set of the currently
+    approved matrix, or ``None`` when there is no applicable matrix.  Shape
+    errors come from the parser; this check supplies the matrix context and
+    runs inside the same bounded repair loop.
+    """
+    allowed = set(approved_matrix_row_ids or ())
+    for index, item in enumerate(parsed.blocking_items):
+        if not item.evidence_row_ids:
+            continue
+        if not approved_matrix_row_ids:
+            raise AgentLoopError(
+                f"pr_review.blocking_items at index {index}.evidence_row_ids is not allowed: "
+                "the approved plan has no applicable risk-test matrix. Remove the tag and "
+                "keep the finding as an ordinary blocking item."
+            )
+        unknown = [row_id for row_id in item.evidence_row_ids if row_id not in allowed]
+        if unknown:
+            raise AgentLoopError(
+                f"pr_review.blocking_items at index {index}.evidence_row_ids names unknown "
+                f"row(s) {', '.join(unknown)}; use only enforceable approved matrix rows: "
+                + ", ".join(sorted(allowed))
+                + "."
+            )
+
+
 def _validate_review_response(
     text: str,
     *,
@@ -589,10 +626,12 @@ def _validate_review_response(
     unresolved_items: Sequence[UnresolvedReviewItem],
     current_round_items: Sequence[UnresolvedReviewItem] = (),
     architecture_status_mode: str,
+    approved_matrix_row_ids: Sequence[str] | None = None,
 ) -> ParsedReview:
     parsed = parse_pr_review(
         text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
     )
+    _validate_evidence_row_tags(parsed, approved_matrix_row_ids)
 
     unresolved_by_id = {item.item_id: item for item in unresolved_items}
     dispositions = _maybe_fill_resolved_dispositions_from_prose(

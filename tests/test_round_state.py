@@ -1029,3 +1029,115 @@ def test_durable_sanitizer_strips_coverage_gaps_like_claims():
     assert "risk_test_matrix_coverage_gaps" not in body
     gaps_only = {"kind": "coder_followup", "risk_test_matrix_coverage_gaps": []}
     assert "risk_test_matrix_coverage_gaps" not in _sanitize_durable_coder_response(json.dumps(gaps_only))
+
+
+# --- evidence-only stall persistence (#1324) -------------------------------
+
+def _stall_payload(**overrides):
+    payload = {
+        "version": 1, "review_round": 2, "review_head": "a" * 40, "matrix_identity": "b" * 64,
+        "qualifies": True, "unsatisfied_row_ids": ["row-b", "row-a"], "reasons": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _coder_record(**overrides):
+    values = dict(flow="pr", role="coder", agent="Claude", round_number=3, subject="a" * 40)
+    values.update(overrides)
+    return PostedRoundMetadata(**values)
+
+
+def test_evidence_stall_snapshot_round_trips_sorted_and_is_omitted_when_none():
+    legacy = _coder_record()
+    assert "evidence_stall" not in decode_mapping(_encode_round_metadata(legacy))
+    assert _decode_round_metadata(_encode_round_metadata(legacy)) == legacy
+
+    record = _coder_record(evidence_stall=_stall_payload())
+    decoded = _decode_round_metadata(_encode_round_metadata(record))
+    assert decoded.evidence_stall["unsatisfied_row_ids"] == ["row-a", "row-b"]
+    assert _decode_round_metadata(_encode_round_metadata(decoded)) == decoded
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        _stall_payload(review_round=3),  # must equal enclosing round - 1
+        _stall_payload(qualifies="yes"),
+        _stall_payload(unsatisfied_row_ids="row-a"),
+        _stall_payload(version=2),
+    ],
+)
+def test_malformed_or_misnumbered_stall_snapshot_decodes_invalid_not_error(bad):
+    decoded = _decode_round_metadata(_encode_round_metadata(_coder_record(evidence_stall=bad)))
+    assert decoded.evidence_stall == {"invalid": True}
+
+
+def test_evidence_row_ids_tag_round_trips_and_legacy_items_are_byte_stable():
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+
+    plain = UnresolvedReviewItem(item_id="item-1", reviewer="Codex", source_round=1, text="t", status="blocking")
+    tagged = dataclasses.replace(plain, item_id="item-2", evidence_row_ids=("row-a", "row-b"))
+    encoded_plain = _encode_round_metadata(_coder_record(prior_items=(plain,)))
+    assert "evidence_row_ids" not in encoded_plain and "evidence_row_ids" not in decode_mapping(encoded_plain)["prior_items"][0]
+    decoded = _decode_round_metadata(_encode_round_metadata(_coder_record(prior_items=(plain, tagged))))
+    assert [item.evidence_row_ids for item in decoded.prior_items] == [(), ("row-a", "row-b")]
+
+
+@pytest.mark.parametrize("bad", ["row-a", [], [1], ["a", "a"], [""]])
+def test_malformed_stored_tag_degrades_to_an_ordinary_finding(bad):
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+    from coding_review_agent_loop.round_state import _deserialize_unresolved_item, _serialize_unresolved_item
+
+    item = UnresolvedReviewItem(item_id="item-1", reviewer="Codex", source_round=1, text="t", status="blocking")
+    payload = _serialize_unresolved_item(item)
+    payload["evidence_row_ids"] = bad
+    assert _deserialize_unresolved_item(payload).evidence_row_ids == ()
+
+
+def test_non_mapping_stall_value_in_stored_payload_decodes_invalid():
+    stored = decode_mapping(_encode_round_metadata(_coder_record()))
+    stored["evidence_stall"] = "not-a-mapping"
+    assert _decode_round_metadata(encode_mapping(stored)).evidence_stall == {"invalid": True}
+
+
+_CONTRADICTORY_STALL_SNAPSHOTS = [
+    pytest.param(_stall_payload(reasons=["checks-failing"]), id="qualifies-with-checks-failing"),
+    pytest.param(_stall_payload(reasons=["untagged-finding"]), id="qualifies-with-untagged-finding"),
+    pytest.param(_stall_payload(qualifies=False, reasons=["made-up-reason"]), id="unknown-reason"),
+    pytest.param(_stall_payload(qualifies=False, reasons=[]), id="non-qualifying-without-reason"),
+    pytest.param(_stall_payload(unsatisfied_row_ids=[]), id="qualifies-without-rows"),
+    pytest.param(_stall_payload(unsatisfied_row_ids=["row-a", "row-a"]), id="duplicate-rows"),
+    pytest.param(_stall_payload(review_head=""), id="qualifies-without-head"),
+    pytest.param(_stall_payload(matrix_identity=""), id="qualifies-without-identity"),
+    pytest.param(
+        _stall_payload(qualifies=False, reasons=["checks-failing", "checks-failing"]),
+        id="duplicate-reasons",
+    ),
+]
+
+
+@pytest.mark.parametrize("bad", _CONTRADICTORY_STALL_SNAPSHOTS)
+def test_contradictory_stall_snapshot_decodes_invalid_and_never_counts_toward_k(bad):
+    """`stall-legacy-compat` / `stall-window-reset`: corrupt history is non-qualifying."""
+    from coding_review_agent_loop.evidence_stall import StallRoundSnapshot, stall_window
+
+    decoded = _decode_round_metadata(_encode_round_metadata(_coder_record(evidence_stall=bad)))
+    assert decoded.evidence_stall == {"invalid": True}
+    current = StallRoundSnapshot(
+        review_round=3, review_head="a" * 40, matrix_identity="b" * 64, qualifies=True,
+        unsatisfied_row_ids=("row-a", "row-b"), reasons=(),
+    )
+    # Neither the decoded value nor the raw contradictory payload counts toward K.
+    for prior in (decoded.evidence_stall, bad):
+        window = stall_window(current, {2: prior}, 2)
+        assert window.stop is False and window.length == 1
+
+
+def test_consistent_non_qualifying_stall_snapshot_round_trips():
+    record = _coder_record(
+        evidence_stall=_stall_payload(qualifies=False, reasons=["untagged-finding", "checks-failing"])
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(record))
+    assert decoded.evidence_stall["reasons"] == ["checks-failing", "untagged-finding"]
+    assert decoded.evidence_stall["qualifies"] is False

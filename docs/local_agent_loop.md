@@ -3375,6 +3375,78 @@ remains in the cluster. The orchestrator records the step-back as reviewer-owned
 rebuilds the sweep for any reviewer whose review of that head is unpublished and
 never re-requests a published one.
 
+#### PR evidence-only stall stop
+
+A risk-matrix citation obligation can only be satisfied by tool-captured test
+observations. When the coder cannot capture admissible evidence (repeated
+`capture_incomplete`, a launcher the probe does not recognise), a PR can spend many
+rounds on evidence bookkeeping while CI is green and the diff is clean. The flag
+`--pr-evidence-stall-rounds K` (default 2, `0` disables; a negative value is
+rejected like `--pr-step-back-rounds`) stops that loop at the human-decision
+boundary (exit code 4) before the next coder turn.
+
+**Tag.** A `pr_review` `blocking_items` entry may be an object with an optional
+`evidence_row_ids` array: `{"text": "...", "evidence_row_ids": ["row-id"]}`. It marks a
+finding whose sole demand is admissible citation evidence for those approved
+risk-matrix rows. The tag is accepted only on `blocking_items` and only when the
+approved plan has an applicable matrix; row IDs must be unique and name enforceable
+approved rows. Unknown IDs, duplicates, or a tag without a matrix are rejected through
+the bounded format repair, which keeps each valid tag verbatim and never adds one. The
+tag is fixed when the orchestrator mints the item and stays on that stable item
+through ordinary `unresolved` dispositions (no re-declaration, no duplicate item); a
+reviewer who raises a new blocking item gives it its own tag. It is persisted on the
+item in round metadata, and a malformed stored tag degrades to an ordinary finding.
+
+**Classification.** The unsatisfied-row set is derived only from orchestrator-written
+state: the canonical `risk_test_matrix_evidence` and diagnostics on the coder record
+whose resulting head equals the current PR head, bound to the currently approved matrix
+identity. Enforceable rows whose canonical status is not `verified` are unsatisfied.
+Each row's explanation starts with `canonical-status:<status>` followed by the sorted
+row-specific diagnostic codes (for example `capture_incomplete`, `launch-integrity`,
+`checkout-head-mismatch`, `semantic-correction-exhausted`), so no row is listed with an
+empty explanation and no code is invented. A tag naming a verified row makes the item an
+ordinary finding; evidence for a different matrix identity, absent matrix evidence, or a
+head with no bound coder record never qualifies.
+
+A review round qualifies only when every open mandatory reviewer item carries a tag
+that is a subset of the unsatisfied rows, the only open machine obligations are
+`human-exact-head-evidence`, no check on the head is failing or infrastructure-stalled,
+and no evidence freeze is live. Failing checks are observed on the dispatch path after
+the existing post-review check snapshot and CI reconciliation, so a failure with no
+earlier CI obligation still disqualifies the round.
+
+**Window and stop.** Each coder follow-up record carries an `evidence_stall` snapshot
+(`review_round`, `review_head`, `matrix_identity`, `qualifies`, sorted
+`unsatisfied_row_ids`, sorted `reasons`) classifying the review that preceded it; the
+coder record is numbered one past the review round, so the snapshot's `review_round`
+must equal the record number minus one, and the snapshot must be internally
+consistent: `qualifies` is true exactly when `reasons` is empty, every reason belongs to
+the closed reason set, row IDs are unique, and a qualifying snapshot names its head,
+matrix identity, and at least one row. A snapshot that fails these checks decodes as
+invalid. The stop fires when K consecutive review rounds
+qualify with an identical unsatisfied-row set under the same matrix identity. A round
+with a code finding, a failing check, another machine obligation, a changed row set or
+matrix, or a missing or invalid snapshot resets the window, so a code-finding round
+followed by one evidence-only round never stops the run. Snapshots are written even when
+K is `0`, so re-enabling the stop evaluates history deterministically. Nothing is taken
+from agent output, so a resumed run (or a rerun after the stop) reaches the same
+decision from posted records; the stop posts no GitHub comment.
+
+**Stop message.** It names the PR, the exact head, the approved matrix identity prefix,
+K, and each unsatisfied row with its explanation, then offers: (1) continue so the
+coder retries capture (rerun with `--pr-evidence-stall-rounds 0` or a larger K);
+(2) convert the rows to the operator evidence freeze, which is not yet available in
+this version, so use (3); (3) override with a signed human decision through the existing
+signed-requirement path.
+
+**Precedence.** The existing evidence freeze, approval and finalization, step-back
+escalation, round limit, and merge-conflict handling run first and unchanged; the stall
+decision runs only on the ordinary path to a coder dispatch, makes no check API call of
+its own, and is not evaluated on a merge-conflict round. On the final allowed round the
+round-limit exit wins. The tag is reviewer-declared: the orchestrator verifies that the
+named rows are unsatisfied at the head, but cannot prove that a reviewer did not fold a
+code concern into a tagged item.
+
 #### Qualified panel evidence
 
 A qualified panel opening is derived from comment order: an operator-sourced

@@ -61,6 +61,7 @@ from .github import (
 )
 from .issue_pr_handoff import find_latest_issue_pr_handoff
 from .logging import log
+from . import evidence_stall as _evidence_stall
 from .managed_ci import (
     AuthenticatedIssueCreatedHandoff,
     FINAL_CONTEXT,
@@ -3626,3 +3627,146 @@ def _pr_step_back_carried_entries(
             record_index=-1,
         )
     return carried
+
+
+_EVIDENCE_STALL_EXPLANATION_LIMIT = 240
+
+
+def _evidence_stall_check_board(pr_checks: PullRequestChecks | None) -> _evidence_stall.CheckBoardSummary | None:
+    """Summarize the dispatch-path check snapshot; ``None`` when none was fetched."""
+    if pr_checks is None:
+        return None
+    return _evidence_stall.CheckBoardSummary(
+        failing=tuple(sorted(f"{check.kind}:{check.name}" for check in pr_checks.failing)),
+        infrastructure_stalls=tuple(
+            sorted(f"{check.kind}:{check.name}" for check in pr_checks.infrastructure_stalls)
+        ),
+    )
+
+
+def render_evidence_stall_decision(
+    pr_number: int,
+    head_sha: str,
+    matrix_identity: str,
+    rows: Mapping[str, str],
+    k: int,
+) -> str:
+    """Human-decision text for an evidence-only stall (#1324).
+
+    Names the PR, the exact head, the approved matrix identity prefix, K, and
+    each unsatisfied row with its orchestrator-derived explanation.
+    """
+    def clean(text: str) -> str:
+        text = " ".join(str(text).split()).replace("`", "'")
+        return text[:_EVIDENCE_STALL_EXPLANATION_LIMIT]
+
+    row_lines = "\n".join(
+        f"- `{clean(row_id)}`: {clean(explanation)}" for row_id, explanation in sorted(rows.items())
+    )
+    return (
+        f"PR #{pr_number} is stalled on evidence only at head `{head_sha}` "
+        f"(approved matrix `{matrix_identity[:12]}`): for {k} consecutive reviews every open "
+        "blocker has asked only for admissible citation evidence, no code finding, failing "
+        "check or other machine obligation was open, and the unsatisfied risk-matrix rows did "
+        "not change. Unsatisfied rows and why their capture failed:\n"
+        f"{row_lines}\n"
+        "Decide how to proceed:\n"
+        "1. Continue so the coder retries capture: rerun with `--pr-evidence-stall-rounds 0` "
+        "(or a larger K).\n"
+        "2. Convert the named rows to the operator evidence freeze: not yet available in this "
+        "version; use option 3.\n"
+        "3. Override with a signed human decision through the existing signed-requirement "
+        "path, then rerun the same command."
+    )
+
+
+def _pr_evidence_stall_decision(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    round_number: int,
+    head_sha: str | None,
+    approved_plan_context: ApprovedPlanContext | None,
+    open_items: Sequence[UnresolvedReviewItem],
+    pr_checks: PullRequestChecks | None,
+) -> dict[str, object] | None:
+    """Classify this review round and stop when the evidence-only window fills.
+
+    Evaluated on the ordinary dispatch path after the check-board snapshot and
+    CI-failure reconciliation, before any coder invocation.  State comes only
+    from orchestrator-owned records: the persisted canonical matrix evidence
+    bound to the current head, the ledger, and prior stall snapshots on posted
+    coder follow-up records.  Returns the snapshot payload to persist on the
+    coder follow-up record, or ``None`` when no applicable approved matrix
+    exists or history cannot be read.  Raises ``HumanDecisionRequiredError``
+    (exit 4) when K consecutive qualifying rounds share one unsatisfied-row set.
+    """
+    if (
+        approved_plan_context is None
+        or not approved_plan_context.matrix_available
+        or not approved_plan_context.risk_test_matrix_identity
+        or not head_sha
+    ):
+        return None
+    identity = approved_plan_context.risk_test_matrix_identity
+    enforceable = approved_plan_context.risk_test_matrix_expected_row_ids or ()
+    try:
+        records = _extract_round_metadata_records(
+            get_pr_review_context(runner, config=config, pr_number=pr_number).comments,
+            flow="pr",
+        )
+    except AgentLoopError as exc:
+        log(config, f"PR evidence stall suppressed: round history is unavailable ({exc})")
+        return None
+    coder_records = [
+        record
+        for record in records
+        if record.metadata.flow == "pr" and record.metadata.role == "coder"
+    ]
+    bound = next(
+        (record for record in reversed(coder_records) if record.metadata.subject == head_sha),
+        None,
+    )
+    unsatisfied = (
+        None
+        if bound is None
+        else _evidence_stall.unsatisfied_rows(
+            bound.metadata.risk_test_matrix_evidence,
+            bound.metadata.risk_test_matrix_diagnostics,
+            enforceable,
+            identity,
+        )
+    )
+    snapshot = _evidence_stall.classify_round(
+        review_round=round_number,
+        review_head=head_sha,
+        approved_identity=identity,
+        open_items=open_items,
+        unsatisfied=unsatisfied,
+        checks=_evidence_stall_check_board(pr_checks),
+        freeze_active=any(
+            item.is_machine_obligation
+            and item.obligation_kind == "human-exact-head-evidence"
+            and item.lifecycle == "evidence_frozen"
+            for item in open_items
+        ),
+    )
+    prior = {
+        record.metadata.round_number - 1: record.metadata.evidence_stall
+        for record in coder_records
+        if record.metadata.evidence_stall is not None
+    }
+    window = _evidence_stall.stall_window(snapshot, prior, config.pr_evidence_stall_rounds)
+    if window.stop and unsatisfied is not None:
+        log(
+            config,
+            f"Round {round_number}: PR #{pr_number} evidence-only stall for "
+            f"{window.length} consecutive reviews; stopping for a human decision",
+        )
+        raise HumanDecisionRequiredError(
+            render_evidence_stall_decision(
+                pr_number, head_sha, identity, unsatisfied.rows, config.pr_evidence_stall_rounds
+            )
+        )
+    return snapshot.to_payload()

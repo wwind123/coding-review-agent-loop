@@ -249,3 +249,63 @@ def test_departed_owner_requires_unanimous_configured_board():
         frozen, unanimous, evidence_response_head=H1, configured_reviewers=("Codex", "Gemini")
     )
     assert remaining == []
+
+
+# --- evidence_row_ids approved-matrix validation and carry-forward (#1324) ---
+
+def _evidence_review_text(tag):
+    import json
+
+    payload = {
+        "schema_version": 1, "kind": "pr_review", "state": "blocking", "summary": "s",
+        "blocking_items": [{"text": "need citations", "evidence_row_ids": tag}],
+        "prior_item_dispositions": [],
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex"
+
+
+def test_validator_accepts_known_rows_and_rejects_unknown_or_unbacked_tags():
+    from coding_review_agent_loop.errors import AgentLoopError
+    from coding_review_agent_loop.unresolved_items import _validate_review_response
+
+    kwargs = dict(reviewer="Codex", unresolved_items=(), architecture_status_mode="strict")
+    parsed = _validate_review_response(
+        _evidence_review_text(["row-a"]), approved_matrix_row_ids=("row-a", "row-b"), **kwargs
+    )
+    assert parsed.blocking_items[0].evidence_row_ids == ("row-a",)
+    with pytest.raises(AgentLoopError, match="unknown row"):
+        _validate_review_response(
+            _evidence_review_text(["row-z"]), approved_matrix_row_ids=("row-a",), **kwargs
+        )
+    with pytest.raises(AgentLoopError, match="no applicable risk-test matrix"):
+        _validate_review_response(_evidence_review_text(["row-a"]), approved_matrix_row_ids=None, **kwargs)
+
+
+def test_unresolved_disposition_keeps_the_tag_on_the_same_item():
+    from dataclasses import replace as _replace
+
+    from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
+    from coding_review_agent_loop.unresolved_items import (
+        _apply_unresolved_item_dispositions,
+        _next_unresolved_item,
+    )
+
+    item = _next_unresolved_item(
+        item_number=1, reviewer="Codex", source_round=1, text="need citations",
+        status="blocking", evidence_row_ids=("row-a",),
+    )
+    assert item.evidence_row_ids == ("row-a",)
+    machine = _next_unresolved_item(
+        item_number=2, reviewer="Orchestrator", source_round=1, text="m", status="blocking",
+        obligation_kind="merge-conflict", evidence_row_ids=("row-a",),
+        failed_head_sha="a" * 40,
+    )
+    assert machine.evidence_row_ids == ()
+    kept, _future = _apply_unresolved_item_dispositions(
+        [item],
+        {"item-1": [ReviewItemDisposition(
+            item_id="item-1", reviewer="Codex", disposition="blocking", note="still no citation"
+        )]},
+        round_number=2,
+    )
+    assert [(entry.item_id, entry.evidence_row_ids) for entry in kept] == [("item-1", ("row-a",))]

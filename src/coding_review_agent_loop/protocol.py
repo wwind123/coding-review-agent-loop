@@ -125,6 +125,10 @@ class ApprovedFollowup:
     # Optional ordered statements of a conjunctive finding (#958).  Empty for
     # every single-obligation finding.
     sub_items: tuple[str, ...] = ()
+    # Optional approved risk-matrix row IDs for a finding whose sole demand is
+    # admissible citation evidence for those rows (#1324).  Reviewer-declared;
+    # only ``blocking_items`` accept it, and the orchestrator verifies it.
+    evidence_row_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -239,8 +243,17 @@ class UnresolvedReviewItem:
     obligation_identity: str | None = None
     # Reviewer-declared sub-items; never carried by machine obligations.
     sub_items: tuple[ReviewSubItem, ...] = ()
+    # Evidence-only tag fixed when the orchestrator mints the item (#1324).
+    # Reviewer findings only; legacy and untagged items carry ().
+    evidence_row_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.evidence_row_ids and (
+            self.authority is not None
+            or self.obligation_kind is not None
+            or self.lifecycle is not None
+        ):
+            raise ValueError("machine obligations cannot carry evidence_row_ids")
         if self.sub_items:
             ids = [sub.sub_item_id for sub in self.sub_items]
             if len(set(ids)) != len(ids):
@@ -5307,6 +5320,7 @@ def _expect_review_finding_list(
     reviewer: str,
     degradations: list[ParseDegradation] | None = None,
     allow_sub_items: bool = True,
+    allow_evidence_row_ids: bool = False,
 ) -> tuple[ApprovedFollowup, ...]:
     """Accept legacy strings and the scoped PR finding representation."""
     value = payload.get(field_name, [])
@@ -5316,14 +5330,26 @@ def _expect_review_finding_list(
     for index, raw in enumerate(value):
         item_context = f"{context} at index {index}"
         sub_items: tuple[str, ...] = ()
+        evidence_row_ids: tuple[str, ...] = ()
         if isinstance(raw, str):
             text = _expect_non_empty_string(raw, context=item_context)  # shape-check: fatal:no-conservative-reading
             scope = None
         else:
             item = _expect_object(raw, context=item_context)  # shape-check: fatal:no-conservative-reading
             _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
-                item, context=item_context, required={"text"}, optional={"fix_scope", "sub_items"}
+                item,
+                context=item_context,
+                required={"text"},
+                optional={"fix_scope", "sub_items", "evidence_row_ids"},
             )
+            if "evidence_row_ids" in item:
+                if not allow_evidence_row_ids:
+                    raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                        f"{item_context}.evidence_row_ids is accepted only on `blocking_items`."
+                    )
+                evidence_row_ids = _expect_evidence_row_ids(  # shape-check: fatal:no-conservative-reading
+                    item["evidence_row_ids"], context=f"{item_context}.evidence_row_ids"
+                )
             text = _expect_non_empty_string(item["text"], context=f"{item_context}.text")  # shape-check: fatal:no-conservative-reading
             try:
                 scope = normalize_fix_scope(item.get("fix_scope")) if "fix_scope" in item else None  # shape-check: fatal:no-conservative-reading
@@ -5345,9 +5371,38 @@ def _expect_review_finding_list(
                 if record is not None and degradations is not None:
                     degradations.append(record)
         findings.append(
-            ApprovedFollowup(reviewer=reviewer, text=text, fix_scope=scope, sub_items=sub_items)
+            ApprovedFollowup(
+                reviewer=reviewer,
+                text=text,
+                fix_scope=scope,
+                sub_items=sub_items,
+                evidence_row_ids=evidence_row_ids,
+            )
         )
     return tuple(findings)
+
+
+EVIDENCE_ROW_IDS_MAX = 32
+
+
+def _expect_evidence_row_ids(value: object, *, context: str) -> tuple[str, ...]:
+    """Strictly parse a finding's ``evidence_row_ids`` tag (#1324)."""
+    if not isinstance(value, list) or not value:
+        raise AgentLoopError(f"{context} must be a non-empty JSON array of row ID strings.")  # shape-check: fatal:no-conservative-reading
+    if len(value) > EVIDENCE_ROW_IDS_MAX:
+        raise AgentLoopError(  # shape-check: fatal:payload-bound
+            f"{context} exceeds the {EVIDENCE_ROW_IDS_MAX}-row bound."
+        )
+    row_ids: list[str] = []
+    for index, raw in enumerate(value):
+        if not isinstance(raw, str) or not raw.strip() or len(raw) > 128:
+            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                f"{context} at index {index} must be a non-empty row ID string."
+            )
+        if raw in row_ids:
+            raise AgentLoopError(f"{context} repeats row ID `{raw}`.")  # shape-check: fatal:no-conservative-reading
+        row_ids.append(raw)
+    return tuple(row_ids)
 
 
 def _expect_optional_issue_id_list(
@@ -6600,7 +6655,7 @@ def parse_structured_pr_review(
     sub_item_degradations: list[ParseDegradation] = []
     blocking_items = _expect_review_finding_list(  # shape-check: fatal:no-conservative-reading
         payload, "blocking_items", context="pr_review.blocking_items", reviewer=reviewer,
-        degradations=sub_item_degradations,
+        degradations=sub_item_degradations, allow_evidence_row_ids=True,
     )
     same_pr_followups = _expect_review_finding_list(  # shape-check: fatal:no-conservative-reading
         payload, "same_pr_followups", context="pr_review.same_pr_followups", reviewer=reviewer,

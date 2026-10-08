@@ -792,6 +792,7 @@ The active planning human-requirements context above is authoritative. Do not us
 - If the same PR-review concern or paraphrase appears in blocking_items and same_pr_followups, keep blocking_items and drop the duplicate same_pr_followups entry.
 - If the same PR-review concern or paraphrase appears in same_pr_followups and future_followups, keep same_pr_followups/current-PR work and drop the duplicate future_followups entry.
 - If the same PR-review concern or paraphrase appears in blocking_items and future_followups, keep blocking_items and drop the duplicate future_followups entry.
+- A blocking item object may carry `evidence_row_ids`; keep a valid tag verbatim on the same item and never add one the source lacks.
 - If the same text appears in exact_head_evidence_requests and in blocking_items, same_pr_followups, or future_followups, keep it only in exact_head_evidence_requests (human-only exact-head evidence), drop the duplicate finding entry, and keep the original `state`. Never drop or reword an exact_head_evidence_requests entry.
 
 ## STATE RULES (Format C):
@@ -1446,6 +1447,7 @@ def _build_repair_prompt(
     require_execution_strategy_contract: bool = False,
     require_risk_test_matrix_contract: bool = False,
     reject_unsolicited_risk_test_matrix_contract: bool = False,
+    evidence_row_id_universe: Sequence[str] | None = None,
 ) -> str:
     if expected_kind is not None and expected_kind not in _SUPPORTED_EXPECTED_KINDS:
         raise ValueError(f"Unsupported expected repair kind: {expected_kind}")
@@ -1485,7 +1487,7 @@ def _build_repair_prompt(
     )
     prior_item_dispositions_instruction = _repair_prior_item_ids_instruction(
         allowed_prior_item_ids, unknown_prior_item_ids, same_round_context
-    )
+    ) + _repair_evidence_row_ids_instruction(expected_kind, evidence_row_id_universe)
     expected_kind_instruction = (
         "## Expected response kind:\n"
         f"You MUST repair this response as `{expected_kind}`. Output no other `kind` value.\n"
@@ -1936,6 +1938,7 @@ def execute_repair(
                         allow_legacy_matrix_removal=bool(
                             prompt_kwargs.get("reject_unsolicited_risk_test_matrix_contract")
                         ),
+                        evidence_row_id_universe=prompt_kwargs.get("evidence_row_id_universe"),
                         forbid_architecture_impact=forbid_architecture_impact,
                     )
                 except Exception as exc:
@@ -2165,6 +2168,21 @@ def _reviewer_human_requirements_instruction(
     )
 
 
+def _repair_evidence_row_ids_instruction(
+    expected_kind: str | None, universe: Sequence[str] | None
+) -> str:
+    if expected_kind != "pr_review" or universe is None:
+        return ""
+    allowed = ", ".join(sorted(universe)) or "(none: the approved plan has no applicable matrix)"
+    return (
+        "## Evidence row tags:\n"
+        "A blocking item may carry `evidence_row_ids` (approved risk-matrix row IDs for a finding "
+        "whose sole demand is admissible citation evidence). Keep every valid tag verbatim on "
+        "the same item and never add or change one. Remove a tag only when it names a row "
+        f"outside the allowed rows or when no matrix applies; allowed rows: {allowed}\n"
+    )
+
+
 def _repair_prior_item_ids_instruction(
     allowed_prior_item_ids: Sequence[str] | None,
     unknown_prior_item_ids: Sequence[str] | None,
@@ -2206,6 +2224,7 @@ def attempt_repair(
     require_execution_strategy_contract: bool = False,
     require_risk_test_matrix_contract: bool = False,
     reject_unsolicited_risk_test_matrix_contract: bool = False,
+    evidence_row_id_universe: Sequence[str] | None = None,
 ) -> str | None:
     """Call gemini-3.1-flash-lite via the Gemini CLI to reformat a malformed review response.
 
@@ -2226,6 +2245,7 @@ def attempt_repair(
         require_execution_strategy_contract=require_execution_strategy_contract,
         require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
+        evidence_row_id_universe=evidence_row_id_universe,
     )
     try:
         oversized_prompt = len(prompt.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES
@@ -2260,6 +2280,7 @@ def attempt_repair(
                 reviewer_requirement_ids=reviewer_requirement_ids,
                 allowed_prior_item_ids=allowed_prior_item_ids,
                 allow_legacy_matrix_removal=reject_unsolicited_risk_test_matrix_contract,
+                evidence_row_id_universe=evidence_row_id_universe,
             )
         except Exception as exc:
             _logger.debug("repair pass content preservation failed: %s", exc)

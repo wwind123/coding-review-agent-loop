@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -88,6 +89,10 @@ from .unresolved_items import (
     _upsert_evidence_obligation,
     release_evidence_freeze,
 )
+
+from .evidence_stall import stall_snapshot_is_consistent
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -321,6 +326,11 @@ class PostedRoundMetadata:
     rejected_coder_followup_from_head: str | None = None
     head_review_recovery_source: str | None = None
     recovery_round_budget: "RecoveryRoundBudget | None" = None
+    # Orchestrator-derived evidence-only stall snapshot (#1324), written only on
+    # PR coder follow-up records.  It classifies review round ``round_number - 1``
+    # and is omitted from the encoding when None.  An invalid stored value
+    # decodes as ``{"invalid": True}`` so history treats it as non-qualifying.
+    evidence_stall: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -1613,7 +1623,29 @@ def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
     payload.update({key: value for key, value in machine_fields.items() if value is not None})
     if item.sub_items:
         payload["sub_items"] = [_serialize_sub_item(sub) for sub in item.sub_items]
+    if item.evidence_row_ids:
+        payload["evidence_row_ids"] = list(item.evidence_row_ids)
     return payload
+
+
+def _deserialize_evidence_row_ids(payload: dict) -> tuple[str, ...]:
+    """Decode a persisted evidence tag; a malformed value yields none (#1324).
+
+    Dropping the tag degrades the item to an ordinary finding, so corrupt
+    history can never hide a finding from the stall detector.
+    """
+    raw = payload.get("evidence_row_ids")
+    if raw is None:
+        return ()
+    if (
+        not isinstance(raw, list)
+        or not raw
+        or any(not isinstance(entry, str) or not entry.strip() for entry in raw)
+        or len(set(raw)) != len(raw)
+    ):
+        logger.warning("Ignoring malformed evidence_row_ids on a persisted review item")
+        return ()
+    return tuple(raw)
 
 
 def _serialize_sub_item(sub: ReviewSubItem) -> dict[str, object]:
@@ -1750,7 +1782,11 @@ def _deserialize_unresolved_item(payload: object) -> UnresolvedReviewItem:
                 lifecycle="repair_required",
                 obligation_identity="invalid-machine-record",
             )
-    return UnresolvedReviewItem(**core, sub_items=_deserialize_sub_items(payload))
+    return UnresolvedReviewItem(
+        **core,
+        sub_items=_deserialize_sub_items(payload),
+        evidence_row_ids=_deserialize_evidence_row_ids(payload),
+    )
 
 
 _SCHEDULER_METADATA_KEYS = frozenset(
@@ -2625,6 +2661,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["plan_candidate_key"] = metadata.plan_candidate_key
     if metadata.followup_dispatch_head is not None:
         payload["followup_dispatch_head"] = metadata.followup_dispatch_head
+    if metadata.evidence_stall is not None:
+        payload["evidence_stall"] = dict(metadata.evidence_stall)
     if metadata.step_back_entries:
         payload["step_back_entries"] = [dict(entry) for entry in metadata.step_back_entries]
     if metadata.risk_test_matrix_evidence_full_round is not None:
@@ -2699,6 +2737,54 @@ def _decode_parse_degradations(value: object) -> tuple[ParseDegradation, ...]:
 # A Git commit SHA (SHA-1 or SHA-256, abbreviated or full) in lowercase hex;
 # placeholders such as ``unknown`` never qualify as a dispatch head (#1034).
 _FOLLOWUP_DISPATCH_HEAD_RE = re.compile(r"[0-9a-f]{4,64}")
+
+
+EVIDENCE_STALL_INVALID: Mapping[str, object] = {"invalid": True}
+
+
+def _decode_evidence_stall(payload: Mapping[str, object]) -> Mapping[str, object] | None:
+    """Decode the stall snapshot, never raising on a malformed value (#1324).
+
+    The snapshot's ``review_round`` must equal the enclosing record round
+    minus one and its content must be internally consistent; anything else
+    decodes as invalid and counts as non-qualifying.
+    """
+    if "evidence_stall" not in payload:
+        return None
+    raw = payload["evidence_stall"]
+    try:
+        round_number = payload.get("round_number")
+        if (
+            not isinstance(raw, dict)
+            or raw.get("version") != 1
+            or isinstance(raw.get("review_round"), bool)
+            or not isinstance(raw.get("review_round"), int)
+            or not isinstance(round_number, int)
+            or raw["review_round"] != round_number - 1
+            or not isinstance(raw.get("review_head"), str)
+            or not isinstance(raw.get("matrix_identity"), str)
+            or not isinstance(raw.get("qualifies"), bool)
+            or not isinstance(raw.get("unsatisfied_row_ids"), list)
+            or not all(isinstance(v, str) for v in raw["unsatisfied_row_ids"])
+            or not isinstance(raw.get("reasons"), list)
+            or not all(isinstance(v, str) for v in raw["reasons"])
+        ):
+            return EVIDENCE_STALL_INVALID
+    except (TypeError, KeyError):
+        return EVIDENCE_STALL_INVALID
+    # Contradictory or open-set content (qualifies with reasons, an unknown
+    # reason code, duplicate rows) is corrupt history, never a qualification.
+    if not stall_snapshot_is_consistent(raw):
+        return EVIDENCE_STALL_INVALID
+    return {
+        "version": 1,
+        "review_round": raw["review_round"],
+        "review_head": raw["review_head"],
+        "matrix_identity": raw["matrix_identity"],
+        "qualifies": raw["qualifies"],
+        "unsatisfied_row_ids": sorted(raw["unsatisfied_row_ids"]),
+        "reasons": sorted(raw["reasons"]),
+    }
 
 
 def _is_followup_dispatch_head(value: object) -> bool:
@@ -3086,6 +3172,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
                 payload, "reviewer_board_amendment_digest"
             ),
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
+            evidence_stall=_decode_evidence_stall(payload),
             plan_execution_mode=_decode_execution_mode(payload.get("plan_execution_mode")),
             **_decode_recovery_fields(payload),
             **_decode_step_back_fields(payload),

@@ -893,6 +893,23 @@ def test_operator_docs_document_the_pr_step_back_mechanism():
     assert "sweep" in text and "human-decision" in architecture
 
 
+def test_operator_docs_document_the_pr_evidence_stall_stop():
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "docs" / "local_agent_loop.md").read_text()
+    readme = (root / "README.md").read_text()
+    architecture = (root / "ARCHITECTURE.md").read_text()
+
+    assert "#### PR evidence-only stall stop" in text
+    for document in (text, readme, architecture):
+        assert "--pr-evidence-stall-rounds" in document
+    for term in ("`evidence_row_ids`", "`evidence_stall`", "`review_round`", "canonical-status:"):
+        assert term in text
+    assert "evidence_stall.py" in architecture
+    assert "no GitHub comment" in text
+
+
 def test_docs_name_decompose_only_as_review_before_implementation_mode():
     text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert "Staged plans under plan-only and implement-one-shot" in text

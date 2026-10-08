@@ -6865,3 +6865,60 @@ def test_overlong_execution_refs_normalise_without_rejection_1300(kind):
     assert claim.execution_refs == tuple(refs[:8])
     assert claim.overflow_execution_refs == ("turn:observation-8", refs[0], refs[1])
     assert parsed.risk_test_matrix_claims.degradations == ()
+
+
+# --- evidence_row_ids tag on pr_review blocking items (#1324) ---------------
+
+def _tagged_review(blocking=None, same_pr=None, future=None):
+    import json as _json
+
+    payload = {
+        "schema_version": 1, "kind": "pr_review", "state": "blocking", "summary": "s",
+        "blocking_items": blocking or [], "same_pr_followups": same_pr or [],
+        "future_followups": future or [], "prior_item_dispositions": [],
+    }
+    return _json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Reviewer"
+
+
+def test_evidence_row_ids_parse_on_blocking_items_only():
+    from coding_review_agent_loop.protocol import parse_structured_pr_review
+
+    parsed = parse_structured_pr_review(
+        _tagged_review(blocking=[{"text": "need citations", "evidence_row_ids": ["r1", "r2"]}, "plain"]),
+        reviewer="Codex",
+    )
+    assert [item.evidence_row_ids for item in parsed.blocking_items] == [("r1", "r2"), ()]
+
+
+@pytest.mark.parametrize(
+    "tag",
+    [[], "r1", ["r1", "r1"], [1], [""], ["x" * 129], ["r%d" % i for i in range(33)]],
+)
+def test_malformed_evidence_row_ids_are_rejected(tag):
+    from coding_review_agent_loop.protocol import parse_structured_pr_review
+
+    with pytest.raises(AgentLoopError, match="evidence_row_ids"):
+        parse_structured_pr_review(
+            _tagged_review(blocking=[{"text": "t", "evidence_row_ids": tag}]), reviewer="Codex"
+        )
+
+
+@pytest.mark.parametrize("field", ["same_pr", "future"])
+def test_evidence_row_ids_rejected_outside_blocking_items(field):
+    from coding_review_agent_loop.protocol import parse_structured_pr_review
+
+    with pytest.raises(AgentLoopError, match="only on `blocking_items`"):
+        parse_structured_pr_review(
+            _tagged_review(**{field: [{"text": "t", "evidence_row_ids": ["r1"]}]}), reviewer="Codex"
+        )
+
+
+def test_machine_obligations_cannot_carry_the_tag():
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+
+    with pytest.raises(ValueError, match="cannot carry evidence_row_ids"):
+        UnresolvedReviewItem(
+            item_id="item-1", reviewer="Orchestrator", source_round=1, text="t", status="blocking",
+            authority="machine", obligation_kind="merge-conflict", lifecycle="repair_required",
+            obligation_identity="merge-conflict", evidence_row_ids=("r1",),
+        )

@@ -101,6 +101,7 @@ Source paths below are relative to
 | Validated agent turn | `validated_agent.py` | Run telemetry and usage contexts, structured repair, completion recovery, and the validated agent turn shared by every role. |
 | Response validation | `response_validation.py` | Coder and plan response validators, human-requirement checks, and post-PR test/observation validation. |
 | Panel evidence | `panel_evidence.py` | PR/plan panel evidence, board-amendment notes, plan primary streak, and plan-growth gates. |
+| Evidence stall | `evidence_stall.py` | Pure evidence-only stall classification (#1324): derives the unsatisfied risk-matrix rows from persisted canonical evidence bound to the head and approved matrix identity, classifies a review round (closed reason set), and walks the K-round window; it performs no I/O. The dispatch-path decision and stop message live in `pr_loop_support.py`. |
 | Review step-back | `review_step_back.py` | Pure, history-derived step-back bookkeeping (#1251): classifies each primary review from its historical record as `new-finding`, `repeat-only`, or `approved`; derives the trigger streak and the active episode separately; derives the episode anchor (dissolved items and trade-offs from the step-back candidate record, #1278) with the planner and reviewer anchor blocks and the declaration-based list of reintroduced dissolved items, and renders the step-back planner guidance, the step-back reviewer notice, and the human-decision stop message. For the PR fix loop (#1251) it also projects finding locations, maps anchors across heads from supplied diff text (`SHIFTED`/`REWRITTEN`/`UNMAPPABLE`), clusters findings, applies the shared `in_cluster` membership rule, and renders the coder step-back, reviewer sweep, and sibling-escalation text; the git reads happen in `pr_loop_support.py`. It performs no I/O. |
 | Finding history | `finding_history.py` | Advisory, bounded per-run history of earlier rounds' findings (resolved ones included, each with its `path:line` references; CI failures as instances keyed by obligation identity plus failed head) and the agent's own previous fixes (#1273). A per-loop in-memory `FindingHistoryLedger` is seeded once from round records the loop already extracted (deferral outcomes replayed read-only by `round_state.canonical_history_item_outcomes`) and updated from the authoritative post-reconciliation ledger; status is never inferred from historical votes. Renders the standing proactive-generalization guidance (always present) plus at most 6 rounds / 6000 characters of history into every planner revision prompt and coder fix prompt (not the merge-conflict prompt), before any step-back text, and logs a declared `Generalization:` tagged proactive or step-back-directed. A failure inside the history degrades to an unavailable notice, never a stop; it performs no I/O and persists nothing. |
 | Review rounds | `review_rounds.py` | Review outcome classification, round-ledger helpers, parallel reviewer-turn launch, spool replay, and partial-round refusal. |
@@ -911,6 +912,35 @@ from the stored structured response. A carried item is not a sibling; it keeps t
 episode open while it is a member. The episode closes on the reviewer's approval
 or when no unresolved mandatory item of theirs is a member. A malformed entry
 suppresses the trigger and the stop with a log line.
+
+**PR evidence-only stall stop** (#1324; `--pr-evidence-stall-rounds` K, default 2,
+`0` disables). A `pr_review` blocking item may carry `evidence_row_ids`, parsed in
+`protocol.py` (blocking items only, bounded unique strings), validated against the
+enforceable rows of the approved matrix inside the review validation and repair loop
+(`unresolved_items._validate_review_response`; the repair preserves valid tags and
+invents none), and fixed on the stable `UnresolvedReviewItem` when it is minted.
+`evidence_stall.py` is pure: `unsatisfied_rows` derives `row_id -> explanation` from the
+persisted `risk_test_matrix_evidence` and diagnostics of the coder record whose subject
+is the current head, requiring the approved matrix identity (`canonical-status:<status>`
+plus the row's own sorted diagnostic codes; absent or other-identity evidence yields
+`evidence-absent` or `evidence-matrix-mismatch`, never "all rows unverified");
+`classify_round` returns a `StallRoundSnapshot` whose closed reason set disqualifies a
+round (untagged finding, tag naming a satisfied row, non-evidence machine obligation,
+failing or stalled checks, live freeze, unbound or mismatched evidence); `stall_window`
+walks back over consecutive qualifying snapshots with identical row sets and matrix
+identity. `pr_loop_support._pr_evidence_stall_decision` runs on the ordinary dispatch
+path in `pr_loop.py`, after the existing check-board fetch and CI-failure
+reconciliation and before any coder invocation; it is skipped on a merge-conflict
+round and adds no check fetch. It reads prior snapshots from freshly fetched round
+history and raises `HumanDecisionRequiredError` (exit 4) when the window reaches K.
+Otherwise it returns the snapshot, which `PostedRoundMetadata.evidence_stall` persists on
+the PR coder follow-up record (omitted when absent). The coder record for loop round r
+is numbered r+1, so the snapshot carries an explicit `review_round`; the decoder marks it
+invalid unless it equals the record number minus one and its content is consistent
+(`qualifies` exactly when `reasons` is empty, reasons from the closed set, unique row IDs,
+and a qualifying snapshot names its head, identity, and rows). An invalid or missing
+snapshot ends the window walk. History that cannot be decoded suppresses the stop with a log
+line. State is orchestrator-owned, so a resumed run recomputes the same decision.
 
 ### CI and Merge
 
