@@ -1,4 +1,2612 @@
 {
   "schema_version": 1,
-  "runs": []
+  "runs": [
+    {
+      "run_id": "pr-853",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 4 reviewer verdict comments on PR #853 (2026-09-19T07:52:23Z..2026-09-19T07:56:23Z) and the merge (2026-09-19T08:03:04Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #853 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 2, 'Claude=claude-opus-5 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #853 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-19T08:03:04Z; window end 2026-10-03T08:03:04Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #853 or source issue #846. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 4,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 4
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-857",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #857 (2026-09-19T08:32:45Z..2026-09-19T08:37:45Z) and the merge (2026-09-19T08:43:50Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #857 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 2, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #857 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-19T08:43:50Z; window end 2026-10-03T08:43:50Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #857 or source issue #849. Counted: none. Reviewed and not counted: #859 (pre-existing unknown-selector rejection deliberately kept out of #849 scope); #865 (pre-existing documented rejection; cites #849 as precedent); #913 (pre-existing 12-item bound; same family, not introduced); #916 (cites #849 as precedent only); #920 (cites #849 as precedent only); #924 (policy issue citing #849 as precedent). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-860",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #860 (2026-09-19T19:05:20Z..2026-09-19T19:09:53Z) and the merge (2026-09-19T19:15:56Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #860 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 2, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #860 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-19T19:15:56Z; window end 2026-10-03T19:15:56Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #860 or source issue #842. Counted: none. Reviewed and not counted: #878 (other tool-owned comments were outside #842's sidecar-label scope; scope extension, not a defect in #860). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-861",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #861 (2026-09-19T19:39:05Z..2026-09-19T19:47:11Z) and the merge (2026-09-19T19:53:21Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #861 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 2, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #861 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-19T19:53:21Z; window end 2026-10-03T19:53:21Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #861 or source issue #859. Counted: none. Reviewed and not counted: #865 (pre-existing documented rejection); #913 (pre-existing bound); #916 (precedent citation); #920 (precedent citation); #924 (precedent citation); #989 (cites #859 as an already-degraded case); #1009 (cites #859 as an already-degraded case). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-869",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 2 reviewer verdict comments on PR #869 (2026-09-19T21:25:22Z..2026-09-19T21:26:29Z) and the merge (2026-09-19T21:31:40Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #869 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 1, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #869 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-19T21:31:40Z; window end 2026-10-03T21:31:40Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #869 or source issue #862. Counted: none. Reviewed and not counted: #872 (CONTESTED: 'plan-revision analogue of #862' \u2014 pre-existing exclusion of plan_revision_patch from the strip, not introduced by #869); #874 (defect in the #872 fix (PR #873), not #869); #916 (precedent citation); #920 (precedent citation); #924 (precedent citation). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 2,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 1
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-877",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 5 reviewer verdict comments on PR #877 (2026-09-19T23:03:25Z..2026-09-19T23:28:36Z) and the merge (2026-09-19T23:33:52Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #877 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 3, 'Antigravity': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 3, 'Antigravity=Gemini 3.8 Flash (High)': 1, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #877 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-19T23:33:52Z; window end 2026-10-03T23:33:52Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #877 or source issue #868. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 4,
+        "reviewer_calls": 5,
+        "coder_followup_rounds": 2,
+        "escaped_defects": 0,
+        "calls_avoided": 6
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-883",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 7 reviewer verdict comments on PR #883 (2026-09-20T00:43:57Z..2026-09-20T01:00:22Z) and the merge (2026-09-20T01:05:54Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #883 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 3, 'Antigravity': 2, 'Claude': 2}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 3, 'Antigravity=Gemini 3.8 Flash (High)': 2, 'Claude=claude-opus-5 (medium)': 2}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #883 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-20T01:05:54Z; window end 2026-10-04T01:05:54Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #883 or source issue #878. Counted: #888 (Regression: #878 labels broke managed-CI dispatch; issue names PR #883 as the cause). Reviewed and not counted: #935 (consequence of the #888 revert (PR #889), not a separate #883 defect); #895 (unrelated hand-written PR citing #878). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 4,
+        "reviewer_calls": 7,
+        "coder_followup_rounds": 2,
+        "escaped_defects": 1,
+        "calls_avoided": 4
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-4",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-885",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #885 (2026-09-20T02:08:21Z..2026-09-20T02:09:41Z) and the merge (2026-09-20T02:34:50Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #885 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Antigravity': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #885 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-20T02:34:50Z; window end 2026-10-04T02:34:50Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #885 or source issue #856. Counted: none. Reviewed and not counted: #1072 (plan-size table mentions #856 only as a data point). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-893",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 15 reviewer verdict comments on PR #893 (2026-09-20T05:26:27Z..2026-09-20T10:19:54Z) and the merge (2026-09-20T10:26:10Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #893 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 13, 'Antigravity': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 13, 'Antigravity=Gemini 3.8 Flash (High)': 1, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #893 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-20T10:26:10Z; window end 2026-10-04T10:26:10Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #893 or source issue #871. Counted: none. Reviewed and not counted: #938 (evaluation issue citing #893 as motivation); #939 (evaluation issue citing #893); #1075 (cites the #871 incident as motivation, not a defect in #893). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 14,
+        "reviewer_calls": 15,
+        "coder_followup_rounds": 13,
+        "escaped_defects": 0,
+        "calls_avoided": 30
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-4",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-5",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-6",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-7",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-8",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-9",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-10",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-11",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-899",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 6 reviewer verdict comments on PR #899 (2026-09-20T10:50:42Z..2026-09-20T11:02:02Z) and the merge (2026-09-20T11:08:42Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #899 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Antigravity': 2, 'Claude': 2}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 2, 'Antigravity=Gemini 3.8 Flash (High)': 2, 'Claude=claude-opus-5 (medium)': 2}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #899 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-20T11:08:42Z; window end 2026-10-04T11:08:42Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #899 or source issue #892. Counted: none. Reviewed and not counted: #991 (CONTESTED: 'recurrence of #892' \u2014 same guard, different trigger (clean-main baseline run), not the launcher-spelling case #899 fixed). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 4,
+        "reviewer_calls": 6,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 3
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-912",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 8 reviewer verdict comments on PR #912 (2026-09-20T13:00:43Z..2026-09-20T15:38:25Z) and the merge (2026-09-20T15:45:13Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #912 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4, 5]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 4, 'Claude': 2, 'Antigravity': 2}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 4, 'Claude=claude-opus-5 (medium)': 2, 'Antigravity=Gemini 3.8 Flash (High)': 2}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #912 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-20T15:45:13Z; window end 2026-10-04T15:45:13Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #912 or source issue #904. Counted: none. Reviewed and not counted: #918 (staged-parent advancement machinery, not the scheduling module #912 added); #920 (precedent citation); #966 (cites #904 as an unaffected staged child). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 5,
+        "reviewer_calls": 8,
+        "coder_followup_rounds": 3,
+        "escaped_defects": 0,
+        "calls_avoided": 6
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-4",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-5",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-917",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 4 reviewer verdict comments on PR #917 (2026-09-20T15:16:52Z..2026-09-20T15:24:46Z) and the merge (2026-09-20T15:31:26Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #917 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Antigravity': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 2, 'Antigravity=Gemini 3.8 Flash (High)': 1, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #917 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-20T15:31:26Z; window end 2026-10-04T15:31:26Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #917 or source issue #915. Counted: none. Reviewed and not counted: #962 ('sibling defect in the same block' \u2014 pre-existing, introduced by #841 per the issue). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 4,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 4
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-919",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 20 reviewer verdict comments on PR #919 (2026-09-20T16:24:01Z..2026-09-20T20:30:01Z) and the merge (2026-09-20T20:37:19Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #919 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 14, 'Antigravity': 3, 'Claude': 3}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 14, 'Antigravity=Gemini 3.8 Flash (High)': 3, 'Claude=claude-opus-5 (medium)': 3}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #919 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-20T20:37:19Z; window end 2026-10-04T20:37:19Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #919 or source issue #905. Counted: none. Reviewed and not counted: #929 (deliberate reviewed design (child cycles reset plan policy); enhancement request). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 15,
+        "reviewer_calls": 20,
+        "coder_followup_rounds": 13,
+        "escaped_defects": 0,
+        "calls_avoided": 28
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-4",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-5",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-6",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-7",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-8",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-9",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-10",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-11",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-12",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-13",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-15",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-16",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-17",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-921",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 14 reviewer verdict comments on PR #921 (2026-09-20T20:50:39Z..2026-09-20T21:12:09Z) and the merge (2026-09-20T21:19:15Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #921 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4, 5, 6, 7]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 6, 'Antigravity': 3, 'Claude': 5}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 6, 'Antigravity=Gemini 3.8 Flash (High)': 3, 'Claude=claude-opus-5 (medium)': 5}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #921 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-20T21:19:15Z; window end 2026-10-04T21:19:15Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #921 or source issue #906. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 7,
+        "reviewer_calls": 14,
+        "coder_followup_rounds": 5,
+        "escaped_defects": 0,
+        "calls_avoided": 6
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-4",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-5",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-6",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-923",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 11 reviewer verdict comments on PR #923 (2026-09-20T22:29:05Z..2026-09-21T00:59:47Z) and the merge (2026-09-21T01:06:56Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #923 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4, 5, 6, 7, 8, 9]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 7, 'Antigravity': 2, 'Claude': 2}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 7, 'Antigravity=Gemini 3.8 Flash (High)': 2, 'Claude=claude-opus-5 (medium)': 2}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #923 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-21T01:06:56Z; window end 2026-10-05T01:06:56Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #923 or source issue #918. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 9,
+        "reviewer_calls": 11,
+        "coder_followup_rounds": 6,
+        "escaped_defects": 0,
+        "calls_avoided": 13
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-4",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-5",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-6",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-7",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": null
+        }
+      ]
+    },
+    {
+      "run_id": "pr-934",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #934 (2026-09-21T03:46:26Z..2026-09-21T03:49:26Z) and the merge (2026-09-21T03:56:48Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #934 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 1, 'Claude=claude-fable-5-1 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #934 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-21T03:56:48Z; window end 2026-10-05T03:56:48Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #934 or source issue #931. Counted: #936 (No re-plan path for a child plan the new #934 validator rejects; strands mid-flight children (the example #939 itself names as contested)). Reviewed and not counted: #942 (CONTESTED: pre-existing no-spill visible-body limit, triggered by #934's verbatim-preservation rule (superseded by #948)); #948 (CONTESTED: same as #942); #935 (unrelated (#888 consequence)). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 1,
+        "calls_avoided": 2
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-937",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 4 reviewer verdict comments on PR #937 (2026-09-21T04:57:08Z..2026-09-21T05:18:55Z) and the merge (2026-09-21T05:27:11Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #937 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 2, 'Claude=claude-fable-5-1 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #937 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-21T05:27:11Z; window end 2026-10-05T05:27:11Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #937 or source issue #936. Counted: #988 (Supersession rebind added by #937's re-plan path ('the atomic rebind' in its PR body) leaves the execution decision on the superseded hash; CONTESTED alternative: attribute to #986, which made the path reachable for admissible plans); #993 (CONTESTED, added v3 (found via #986's keyword search, cites neither #937 nor #936): sibling of #988 - the same #937 rebind strands the managed-CI authorization on the superseded hash). Reviewed and not counted: #942 (cites #936 as the route that got #925 this far); #948 (same); #943 (new capability request); #985 (scope extension to admissible plans; #937 was deliberately scoped to inadmissible plans). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 4,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 2,
+        "calls_avoided": 4
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-940",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "first-finding-permitted",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #940 (2026-09-21T06:13:19Z..2026-09-21T06:16:41Z) and the merge (2026-09-21T06:24:08Z) precede the #940 merge (2026-09-21T06:24:08Z, 74fabdde3381). Runs used ~/tools/coding-review-agent-loop (editable install); its reflog first reaches 74fabdd at 2026-09-21T06:24:29Z and the pre-merge HEAD 796bcd7 has no 'Review exhaustively' rule in prompts.py, so every review round ran on the pre-rule prompt. No per-round tool-commit record or captured prompt survives (usage logs pruned; #1111 run-start commit recording postdates the run). PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #940 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 1, 'Claude=claude-fable-5-1 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #940 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-21T06:24:08Z; window end 2026-10-05T06:24:08Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #940 or source issue #938. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-947",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 12 reviewer verdict comments on PR #947 (2026-09-21T09:56:06Z..2026-09-21T10:55:36Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #945 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #947 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 8, 'Claude': 4}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 8, 'Claude=claude-fable-5-1 (medium)': 4}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #947 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-21T11:04:26Z; window end 2026-10-05T11:04:26Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #947 or source issue #945. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 10,
+        "reviewer_calls": 12,
+        "coder_followup_rounds": 7,
+        "escaped_defects": 0,
+        "calls_avoided": 6
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-4",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-5",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-6",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-7",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-8",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-9",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-10",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-11",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-12",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-13",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-14",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-15",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-16",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-17",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-951",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 2 reviewer verdict comments on PR #951 (2026-09-21T12:35:47Z..2026-09-21T12:38:54Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #948 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #951 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 1, 'Claude=claude-fable-5-1 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #951 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-21T12:45:28Z; window end 2026-10-05T12:45:28Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #951 or source issue #948. Counted: none. Reviewed and not counted: #953 (CONTESTED: 'a related case remains' \u2014 residual metadata size is a different cause than #948's visible-body case); #956 (fix PR for #953); #959 (cites #948 as context); #1072 (test adjustment mentions #948). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 2,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 1
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-956",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 2 reviewer verdict comments on PR #956 (2026-09-21T20:57:29Z..2026-09-21T20:59:01Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #953 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #956 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 1, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #956 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-21T21:05:14Z; window end 2026-10-05T21:05:14Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #956 or source issue #953. Counted: none. Reviewed and not counted: #957 (cites tool HEAD 'Merge PR #956' only as environment); #958 (cites #953 as related); #959 (cites #953 as related); #964 (cites #953 as the other stall cause). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 2,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 1
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-963",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 4 reviewer verdict comments on PR #963 (2026-09-22T04:30:07Z..2026-09-22T04:46:39Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #962 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #963 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 3, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 3, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #963 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T04:55:39Z; window end 2026-10-06T04:55:39Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #963 or source issue #962. Counted: none. Reviewed and not counted: #966 ('sibling defect in managed-CI resume, fixed' \u2014 different check). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 4,
+        "reviewer_calls": 4,
+        "coder_followup_rounds": 2,
+        "escaped_defects": 0,
+        "calls_avoided": 3
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-965",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 5 reviewer verdict comments on PR #965 (2026-09-22T07:20:53Z..2026-09-22T07:38:21Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #964 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #965 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4, 5]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 4, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 4, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #965 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T07:47:14Z; window end 2026-10-06T07:47:14Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #965 or source issue #964. Counted: none. Reviewed and not counted: #966 (cites #964 as the other blocker, fixed). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 5,
+        "reviewer_calls": 5,
+        "coder_followup_rounds": 3,
+        "escaped_defects": 0,
+        "calls_avoided": 4
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-967",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #967 (2026-09-22T08:38:07Z..2026-09-22T08:49:00Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #966 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #967 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 2, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #967 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T08:54:36Z; window end 2026-10-06T08:54:36Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #967 or source issue #966. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-961",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 4 reviewer verdict comments on PR #961 (2026-09-22T05:01:46Z..2026-09-22T08:01:52Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #959 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #961 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 3, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 3, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #961 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T09:04:26Z; window end 2026-10-06T09:04:26Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #961 or source issue #959. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 4,
+        "coder_followup_rounds": 2,
+        "escaped_defects": 0,
+        "calls_avoided": 4
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-968",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 2 reviewer verdict comments on PR #968 (2026-09-22T09:15:05Z..2026-09-22T09:16:19Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #957 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #968 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 1, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #968 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T09:25:18Z; window end 2026-10-06T09:25:18Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #968 or source issue #957. Counted: none. Reviewed and not counted: #1060 (CONTESTED: fixes #969, a defect Claude flagged during #968's own review (approved-review follow-up filed 09:16Z, pre-merge) - caught by review and knowingly deferred, so not counted as escaped); #1169 (keyword match only: different finding key (requested_change), pre-existing synonym class). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 2,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 1
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": null
+        }
+      ]
+    },
+    {
+      "run_id": "pr-970",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #970 (2026-09-22T09:37:05Z..2026-09-22T09:46:21Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #941 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #970 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 2, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #970 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T09:55:09Z; window end 2026-10-06T09:55:09Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #970 or source issue #941. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-971",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #971 (2026-09-22T10:06:55Z..2026-09-22T10:15:38Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #909 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #971 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 2, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #971 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T10:24:35Z; window end 2026-10-06T10:24:35Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #971 or source issue #909. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-972",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 2 reviewer verdict comments on PR #972 (2026-09-22T10:35:26Z..2026-09-22T10:36:18Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #935 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #972 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 1, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #972 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T10:45:08Z; window end 2026-10-06T10:45:08Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #972 or source issue #935. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 2,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 1
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": null
+        }
+      ]
+    },
+    {
+      "run_id": "pr-974",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 2 reviewer verdict comments on PR #974 (2026-09-22T11:04:51Z..2026-09-22T11:05:44Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #870 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #974 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 1, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #974 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T11:14:33Z; window end 2026-10-06T11:14:33Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #974 or source issue #870. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 2,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 1
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-975",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 2 reviewer verdict comments on PR #975 (2026-09-22T12:22:22Z..2026-09-22T12:23:18Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #916 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #975 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-5.6-sol (medium)': 1, 'Claude=claude-opus-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #975 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T12:31:20Z; window end 2026-10-06T12:31:20Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #975 or source issue #916. Counted: none. Reviewed and not counted: #1018 (cites #916 as stage-1 work of parent #924; staged-parent completion record gap, not #975); #1185 (keyword match only: missing architecture_impact.status judgement field, not the synonym normalization #975 added). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 2,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 1
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-977",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 2 reviewer verdict comments on PR #977 (2026-09-22T23:00:15Z..2026-09-22T23:01:04Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #976 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #977 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-6-sol (medium)': 1, 'Claude=claude-opus-5-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #977 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-22T23:09:52Z; window end 2026-10-06T23:09:52Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #977 or source issue #976. Counted: none. Reviewed and not counted: #978 (independent fatal path found in the same round; #976 cited as the fixed sibling); #979 (different path (schema rejection before assembly)); #981 (unrelated (managed-ci-fresh in issue mode)); #1003 (same-shape list citation); #1072 (citation only). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 2,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 1
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-980",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 4 reviewer verdict comments on PR #980 (2026-09-23T00:32:25Z..2026-09-23T00:56:06Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #848 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #980 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 3, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-6-sol (medium)': 3, 'Claude=claude-opus-5-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #980 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T01:07:27Z; window end 2026-10-07T01:07:27Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #980 or source issue #848. Counted: #1008 (#848's PYTEST_PLUGINS=_agent_loop_worker_cap leaks into nested pytest runs; 'broken every full-suite run ... since #848 merged'). Reviewed and not counted: #987 (issue states 'not a defect in #848 - per-invocation was the reviewed and intended scope'); #981 (unrelated); #1073 (keyword: cap clamps but never enables xdist - design scope, not a regression); #1108 (keyword: capacity design follow-on); #1011 (fix PR for #1008); #1023 (fix PR for #987). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 4,
+        "reviewer_calls": 4,
+        "coder_followup_rounds": 2,
+        "escaped_defects": 1,
+        "calls_avoided": 3
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-4",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-5",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-6",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-982",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 4 reviewer verdict comments on PR #982 (2026-09-23T02:08:49Z..2026-09-23T02:23:09Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #979 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #982 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 3, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-6-sol (medium)': 3, 'Claude=claude-opus-5-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #982 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T02:32:17Z; window end 2026-10-07T02:32:17Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #982 or source issue #979. Counted: none. Reviewed and not counted: #990 (issue_implementation analogue, outside #979 scope); #1003 (list citation); #1167 (family citation); #1072 (citation only). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 4,
+        "reviewer_calls": 4,
+        "coder_followup_rounds": 2,
+        "escaped_defects": 0,
+        "calls_avoided": 3
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-983",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 4 reviewer verdict comments on PR #983 (2026-09-23T03:54:49Z..2026-09-23T04:08:38Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #943 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #983 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 3, 'Claude': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude']. Reviewer models {'Codex=gpt-6-sol (medium)': 3, 'Claude=claude-opus-5-5 (medium)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #983 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T04:19:20Z; window end 2026-10-07T04:19:20Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #983 or source issue #943. Counted: #1133 (CONTESTED: force-full latch recomputes the complete board from the original contract, reinstating a reviewer the #943 amendment removed ('three mechanisms, each defensible alone')). Reviewed and not counted: #984 (CONTESTED: removal-only was #943's scope; restore is a scope extension); #1095 (keyword: enhancement); #988 (keyword only); #1086 (fix PR for #984); #1072 (citation); #1097 (citation). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 4,
+        "reviewer_calls": 4,
+        "coder_followup_rounds": 2,
+        "escaped_defects": 1,
+        "calls_avoided": 3
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-4",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-5",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-6",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-986",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 6 reviewer verdict comments on PR #986 (2026-09-23T05:30:26Z..2026-09-23T05:53:35Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #985 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #986 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4, 5]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 4, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-6-sol (medium)': 4, 'Claude=claude-opus-5-5 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #986 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T06:04:45Z; window end 2026-10-07T06:04:45Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #986 or source issue #985. Counted: none. Reviewed and not counted: #988 (attributed to #937 (rebind origin); see #937); #993 (attributed to #937; see #937); #1005 (cites #986 as the pattern to mirror); #990 (cites #986 as precedent); #1013 (keyword: rebind-notice enhancement); #1006 (fix PR for #1005); #1039 (citation). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 5,
+        "reviewer_calls": 6,
+        "coder_followup_rounds": 3,
+        "escaped_defects": 0,
+        "calls_avoided": 8
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-992",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 4 reviewer verdict comments on PR #992 (2026-09-23T08:38:01Z..2026-09-23T08:46:22Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #988 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #992 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-6-sol (medium)': 2, 'Claude=claude-opus-5-5 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #992 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T08:56:59Z; window end 2026-10-07T08:56:59Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #992 or source issue #988. Counted: none. Reviewed and not counted: #993 (attributed to #937 (rebind origin); CONTESTED alternative: incomplete fix in #992 - #993 was filed 7 min after #992 merged, observed 'one step later' once #988's conflict cleared); #1087 (CONTESTED: #992's retirement requires a rebound PR; an unrealized decision with no PR is a different trigger (scope extension)); #997 (family citation); #1016 (family citation); #1018 (family citation); #1003 (citation); #1065 (cites #992 as the pattern to follow); #1088 (keyword: plain issue mode, different path); #994 (fix PR for #993); #1091 (fix PR for #1087). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 4,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 4
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-994",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 5 reviewer verdict comments on PR #994 (2026-09-23T09:17:37Z..2026-09-23T09:34:15Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #993 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #994 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 3, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-6-sol (medium)': 3, 'Claude=claude-opus-5-5 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #994 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T09:45:18Z; window end 2026-10-07T09:45:18Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #994 or source issue #993. Counted: none. Reviewed and not counted: #997 (family citation); #1016 (family citation); #1018 (family citation); #1003 (citation); #1065 (keyword: accumulated records, different mechanism); #1069 (keyword: enhancement building on #1066); #1063 (keyword: protection readability, different path); #1087 (keyword: execution decision, not managed-CI grant). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 4,
+        "reviewer_calls": 5,
+        "coder_followup_rounds": 2,
+        "escaped_defects": 0,
+        "calls_avoided": 6
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-998",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #998 (2026-09-23T10:50:36Z..2026-09-23T10:53:50Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #990 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #998 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-6-sol (medium)': 1, 'Claude=claude-opus-5-5 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #998 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T11:05:13Z; window end 2026-10-07T11:05:13Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #998 or source issue #990. Counted: none. Reviewed and not counted: #1167 (family citation); #1269 (keyword: Codex capacity classification, different path); #1175 (fix PR for #1167); #1017 (citation). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": null
+        }
+      ]
+    },
+    {
+      "run_id": "pr-1000",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #1000 (2026-09-23T13:45:45Z..2026-09-23T14:08:01Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #929 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #1000 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-6-sol (medium)': 1, 'Claude=claude-opus-5-5 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #1000 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T14:18:49Z; window end 2026-10-07T14:18:49Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #1000 or source issue #929. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-1001",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 3 reviewer verdict comments on PR #1001 (2026-09-23T14:44:56Z..2026-09-23T14:47:40Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #922 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #1001 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 1, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-6-sol (medium)': 1, 'Claude=claude-opus-5-5 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #1001 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T14:56:28Z; window end 2026-10-07T14:56:28Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #1001 or source issue #922. Counted: none. Reviewed and not counted: #1017 (citation in fix PR). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 2,
+        "reviewer_calls": 3,
+        "coder_followup_rounds": 0,
+        "escaped_defects": 0,
+        "calls_avoided": 2
+      },
+      "findings": []
+    },
+    {
+      "run_id": "pr-1002",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 4 reviewer verdict comments on PR #1002 (2026-09-23T15:01:39Z..2026-09-23T15:11:47Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #920 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #1002 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 2, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-6-sol (medium)': 2, 'Claude=claude-opus-5-5 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #1002 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T18:22:43Z; window end 2026-10-07T18:22:43Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #1002 or source issue #920. Counted: none. Reviewed and not counted: #1016 (keyword: row-ID regex drift, pre-existing). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 3,
+        "reviewer_calls": 4,
+        "coder_followup_rounds": 1,
+        "escaped_defects": 0,
+        "calls_avoided": 4
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-1004",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 5 reviewer verdict comments on PR #1004 (2026-09-23T18:41:34Z..2026-09-23T18:51:53Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #1003 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #1004 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 3, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-6-sol (medium)': 3, 'Claude=claude-opus-5-5 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #1004 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T19:02:58Z; window end 2026-10-07T19:02:58Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #1004 or source issue #1003. Counted: none. Reviewed and not counted: #1005 (cites #1003 as related; different mechanism). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 4,
+        "reviewer_calls": 5,
+        "coder_followup_rounds": 2,
+        "escaped_defects": 0,
+        "calls_avoided": 6
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-1006",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "All 7 reviewer verdict comments on PR #1006 (2026-09-23T20:05:50Z..2026-09-23T20:26:42Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #1005 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #1006 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [1, 2, 3, 4, 5, 6]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 5, 'Claude': 1, 'Antigravity': 1}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-6-sol (medium)': 5, 'Claude=claude-opus-5-5 (medium)': 1, 'Antigravity=Gemini 3.8 Flash (High)': 1}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #1006 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T20:38:02Z; window end 2026-10-07T20:38:02Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #1006 or source issue #1005. Counted: none. Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 6,
+        "reviewer_calls": 7,
+        "coder_followup_rounds": 4,
+        "escaped_defects": 0,
+        "calls_avoided": 10
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    },
+    {
+      "run_id": "pr-930",
+      "flow": "pr",
+      "policy": "primary-then-panel",
+      "primary_reviewer": "codex",
+      "review_contract": "exhaustive",
+      "review_contract_provenance": {
+        "source": "FLAGGED: PR #930 was implemented 2026-09-20/22 (before the rule, stranded per #936) and rebound after a re-plan; all of its 10 PR-review verdicts (2026-09-23T21:32:39Z..2026-09-23T22:57:46Z) post-date the #940 merge, so every review round used the exhaustive prompt. Implementation-era confound only; report figures with and without this run. All 10 reviewer verdict comments on PR #930 (2026-09-23T21:32:39Z..2026-09-23T22:57:46Z) follow the #940 merge (2026-09-21T06:24:08Z). ~/tools/coding-review-agent-loop reflog: HEAD reached 74fabdd at 2026-09-21T06:24:29Z and only fast-forwarded afterwards (rule present at a286aa6, 2026-09-22 23:10 PDT); the run process for issue #925 started after that pull (first run comment on the issue/its staged parent after 06:24:29Z), and the only run active at 06:24Z (PR #940) had finished, so no round straddles the change. Inferred from checkout reflog + comment timing; no per-round tool-commit record or captured prompt survives. PROPOSED.",
+        "verified": true
+      },
+      "provenance": {
+        "source": "PR #930 comment AGENT_LOOP_META (decoded): review_rounds = distinct PR-review reconciliation round records [2, 3, 4, 5, 6, 7, 8]; reviewer_calls = reviewer verdict comments (role=reviewer, flow=pr) {'Codex': 5, 'Antigravity': 2, 'Claude': 3}, excluding failed/unposted invocations; coder_followup_rounds = '## Coder follow-up' comments (initial '## Issue implementation' excluded); calls_avoided = last scheduler_calls_avoided. scheduler_contract: primary-then-panel, primary Codex, board ['Codex,Claude,Antigravity']. Reviewer models {'Codex=gpt-6-sol (medium)': 5, 'Antigravity=Gemini 3.8 Flash (High)': 2, 'Claude=claude-opus-5-5 (medium)': 3}. tokens/elapsed/cost unavailable: per-run usage-summary.json pruned (run-artifacts retained only from 2026-10-02).",
+        "verified": true
+      },
+      "label_provenance": {
+        "source": "PROPOSED from coder follow-up dispositions in PR #930 metadata (addressed=valid, disputed=invalid, otherwise unlabeled); not maintainer-triaged; severity not labeled",
+        "verified": false
+      },
+      "metric_provenance": {
+        "escaped_defects": {
+          "source": "PROPOSED, pending maintainer sign-off. merged 2026-09-23T23:08:49Z; window end 2026-10-07T23:08:49Z (14 days); observed 2026-10-07T23:18:24Z; searched all wwind123/coding-review-agent-loop issues and PRs created in (merge, window end] whose title/body references #930 or source issue #925. Counted: none. Reviewed and not counted: #1013 (enhancement request using #930 as evidence); #1103 (keyword: plan livelock, different path); #1185 (keyword: missing judgement field, not the near-miss normalization); #1250 (keyword: approved-review follow-up on another PR); #1017 (citation). Defects not citing the PR or its issue are not captured.",
+          "verified": true
+        }
+      },
+      "metrics": {
+        "review_rounds": 7,
+        "reviewer_calls": 10,
+        "coder_followup_rounds": 5,
+        "escaped_defects": 0,
+        "calls_avoided": 12
+      },
+      "findings": [
+        {
+          "id": "item-1",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-2",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-3",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-4",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-5",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-6",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-7",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-8",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-9",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-10",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-11",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-12",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": null
+        },
+        {
+          "id": "item-13",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-14",
+          "contributors": [
+            "Codex"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-15",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        },
+        {
+          "id": "item-16",
+          "contributors": [
+            "Claude"
+          ],
+          "severity": null,
+          "valid": true
+        }
+      ]
+    }
+  ]
 }
