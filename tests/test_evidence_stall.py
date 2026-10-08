@@ -220,3 +220,41 @@ def test_approved_matrix_row_ids_none_without_matrix():
     assert approved_matrix_row_ids(Ctx()) is None
     Ctx.matrix_available = True
     assert approved_matrix_row_ids(Ctx()) == ("row-a",)
+
+
+def _payload(**overrides):
+    payload = {
+        "review_round": 2, "review_head": "h" * 40, "matrix_identity": IDENTITY,
+        "qualifies": True, "unsatisfied_row_ids": ["row-a"], "reasons": [],
+    }
+    payload.update(overrides)
+    return payload
+
+
+import pytest  # noqa: E402
+
+from coding_review_agent_loop.evidence_stall import stall_snapshot_is_consistent  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("overrides", "consistent"),
+    [
+        ({}, True),
+        ({"qualifies": False, "reasons": ["untagged-finding"]}, True),
+        ({"qualifies": False, "reasons": ["checks-failing", "machine-obligation-open"], "unsatisfied_row_ids": []}, True),
+        ({"reasons": ["checks-failing"]}, False),  # qualifies with a reason
+        ({"qualifies": False, "reasons": []}, False),  # non-qualifying without a reason
+        ({"qualifies": False, "reasons": ["not-a-reason"]}, False),
+        ({"qualifies": False, "reasons": ["checks-failing", "checks-failing"]}, False),
+        ({"unsatisfied_row_ids": ["row-a", "row-a"]}, False),
+        ({"unsatisfied_row_ids": [""]}, False),
+        ({"unsatisfied_row_ids": []}, False),  # qualifying without rows
+        ({"review_head": ""}, False),
+        ({"matrix_identity": " "}, False),
+        ({"qualifies": "true"}, False),
+        ({"reasons": "checks-failing"}, False),
+    ],
+)
+def test_stall_snapshot_consistency_table(overrides, consistent):
+    """`stall-window-reset` / `stall-legacy-compat`: only consistent history can count toward K."""
+    assert stall_snapshot_is_consistent(_payload(**overrides)) is consistent
