@@ -1296,6 +1296,18 @@ class TypedPlanStages:
 # must not silently acquire fields that would alter decomposition semantics.
 EXECUTION_STRATEGY_CONTRACT_VERSION = 1
 EXECUTION_TOPOLOGY_SOURCE = "approved-plan-v1"
+# Keys the tool stamps next to a recommendation after acceptance (the rendered
+# ``topology_source`` line, the recommendation digest, and the contract
+# version).  A planner reading rendered context may copy them back into a
+# fresh or patched ``execution_recommendation`` object; they are dropped before
+# validation and logged, because the tool recomputes every one of them (#1333).
+# Any other unknown key is still rejected.  Add a newly stamped field here
+# explicitly rather than accepting arbitrary extra keys.
+TOOL_OWNED_EXECUTION_RECOMMENDATION_KEYS = frozenset({
+    "topology_source",
+    "recommendation_digest",
+    "execution_strategy_contract_version",
+})
 EXECUTION_AUTOMATION_CLASSES = frozenset({"agent-pr", "human-action", "manual-close"})
 # Per-child execution dispositions (#808).  The planner makes the semantic
 # readiness decision, plan reviewers approve or block it, and the orchestrator
@@ -5721,6 +5733,16 @@ def _expect_execution_recommendation(
     value: object, *, context: str, require_child_dispositions: bool = False
 ) -> ExecutionStrategyRecommendation:
     payload = _expect_object(value, context=context)  # shape-check: fatal:no-conservative-reading
+    tool_owned = [key for key in payload if key in TOOL_OWNED_EXECUTION_RECOMMENDATION_KEYS]
+    if tool_owned:
+        # #1333: a planner copies the tool-stamped keys from rendered context.
+        # Strip only these audited top-level keys before the exact-key check;
+        # the tool sets each of them itself after acceptance, so the drop is
+        # lossless.  Normalizing inside the parser keeps the response text
+        # untouched, which repair preservation pins byte-for-byte for patches.
+        payload = {key: item for key, item in payload.items() if key not in TOOL_OWNED_EXECUTION_RECOMMENDATION_KEYS}
+        for key in tool_owned:
+            _logger.warning("%s: dropped tool-owned key `%s` before validation", context, key)
     required = {
         "strategy", "rationale", "staging_feasibility", "scope_items",
         "coupling_constraints", "child_stages", "retained_parent_work",

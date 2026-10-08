@@ -328,7 +328,13 @@ reviewer is marked unavailable, the remaining reviewers still run, and a round i
 never falsely reported `approved`. A malformed-but-content-bearing structured
 review is recovered automatically when possible: safe skill normalization,
 envelope normalization, deterministic unknown-prior-item stripping against the
-complete carried ledger, and then model format repair. Local-loop repair now
+complete carried ledger, and then model format repair. A planner that copies a
+tool-owned `execution_recommendation` key (`topology_source`,
+`recommendation_digest`, `execution_strategy_contract_version`) from rendered
+context into a fresh plan or a semantic patch is also recovered deterministically:
+the parser drops those keys before validation and logs one normalization line per
+dropped key naming the operation path, while every other unknown key is still
+rejected (#1333). Local-loop repair now
 defaults to isolated Antigravity with `Gemini 3.8 Flash (Medium)` → `Gemini 3.7 Flash (Medium)`
 (a transient agy model-access failure is retried once per model); explicit repeatable
 repair models are tried first, followed by the configured Antigravity chain. Legacy

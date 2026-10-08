@@ -7376,6 +7376,21 @@ publication. Repair is limited to envelope presentation before assembly and
 must preserve the semantic patch, rationale, operation ordering, and base
 binding exactly.
 
+One planner-response shape needs no repair at all: a fresh plan or a
+`replace` operation on `execution_recommendation` whose object copies a
+tool-owned key the rendered plan prints next to the recommendation
+(`topology_source`, `recommendation_digest`, or
+`execution_strategy_contract_version`). The strict parser drops those keys
+before its exact-key check and logs one normalization line per dropped key,
+naming the key and the context path (for a patch,
+`plan_revision_patch.operations[N].value`), because the tool recomputes each
+of them after acceptance. The response text is never rewritten, so the
+byte-for-byte pinning of a semantic patch holds, and the assembled record and
+rendered section carry only the tool's `topology_source`. Any other unknown key
+in the recommendation or its nested objects is still rejected with the
+existing `has unknown field(s)` diagnostic and, for a semantic patch, still
+routes to the bounded replan (#1333).
+
 
 ## Pre-turn checkout verification
 
