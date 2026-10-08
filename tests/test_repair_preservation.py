@@ -2455,3 +2455,83 @@ def test_repair_prompt_mentions_tag_rule_only_for_pr_review_with_a_universe():
     prompt = _build_repair_prompt("{}", expected_kind="pr_review", evidence_row_id_universe=("r1", "r2"))
     assert "## Evidence row tags" in prompt and "r1, r2" in prompt
     assert "## Evidence row tags" not in _build_repair_prompt("{}", expected_kind="pr_review")
+
+
+_CODE_DEFECT = "The loader drops the retry budget"
+
+
+@pytest.mark.parametrize(
+    ("source_items", "repaired_items", "message"),
+    [
+        pytest.param(
+            # Same parent text, different sub-items: the tag stays on its own finding.
+            [
+                {"text": _EVIDENCE_TEXT, "sub_items": ["capture row r1"], "evidence_row_ids": ["r1"]},
+                {"text": _EVIDENCE_TEXT, "sub_items": [_CODE_DEFECT]},
+            ],
+            [
+                {"text": _EVIDENCE_TEXT, "sub_items": ["capture row r1"], "evidence_row_ids": ["r1"]},
+                {"text": _EVIDENCE_TEXT, "sub_items": [_CODE_DEFECT], "evidence_row_ids": ["r1"]},
+            ],
+            "must not add or change",
+            id="duplicate-text-different-sub-items",
+        ),
+        pytest.param(
+            # Tagged and untagged duplicates: one source tag cannot cover two targets.
+            [{"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r1"]}, _EVIDENCE_TEXT],
+            [
+                {"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r1"]},
+                {"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r1"]},
+            ],
+            "must not add or change",
+            id="tagged-untagged-duplicates",
+        ),
+        pytest.param(
+            # Sub-items moved onto the tagged finding: identity no longer corresponds.
+            [
+                {"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r1"]},
+                {"text": _CODE_DEFECT},
+            ],
+            [{"text": _EVIDENCE_TEXT, "sub_items": [_CODE_DEFECT], "evidence_row_ids": ["r1"]}],
+            "keep each valid evidence_row_ids tag",
+            id="untagged-defect-merged-into-tagged",
+        ),
+        pytest.param(
+            # Tag swapped between two findings with different sub-items.
+            [
+                {"text": _EVIDENCE_TEXT, "sub_items": ["capture row r1"], "evidence_row_ids": ["r1"]},
+                {"text": _EVIDENCE_TEXT, "sub_items": [_CODE_DEFECT]},
+            ],
+            [
+                {"text": _EVIDENCE_TEXT, "sub_items": ["capture row r1"]},
+                {"text": _EVIDENCE_TEXT, "sub_items": [_CODE_DEFECT], "evidence_row_ids": ["r1"]},
+            ],
+            "keep each valid evidence_row_ids tag",
+            id="tag-moved-to-sibling",
+        ),
+    ],
+)
+def test_repair_tag_matching_is_one_to_one_on_complete_finding_identity(
+    source_items, repaired_items, message
+):
+    from coding_review_agent_loop.repair_preservation import (
+        _validate_evidence_row_tag_preservation,
+    )
+
+    # The tag check itself rejects the transfer, independent of other guards...
+    with pytest.raises(AgentLoopError, match=message):
+        _validate_evidence_row_tag_preservation(
+            {"blocking_items": source_items}, {"blocking_items": repaired_items}
+        )
+    # ...and the full repair validation never accepts it.
+    with pytest.raises(AgentLoopError, match="Repair content preservation failed"):
+        validate_repair_preservation(_evidence_review(source_items), _evidence_review(repaired_items))
+
+
+def test_repair_keeps_two_tagged_duplicates_and_an_untagged_sibling_one_to_one():
+    items = [
+        {"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r1"]},
+        {"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r1"]},
+        {"text": _EVIDENCE_TEXT, "sub_items": [_CODE_DEFECT]},
+    ]
+    validate_repair_preservation(_evidence_review(items), _evidence_review(list(reversed(items))))

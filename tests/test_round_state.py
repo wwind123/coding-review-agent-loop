@@ -1099,3 +1099,45 @@ def test_non_mapping_stall_value_in_stored_payload_decodes_invalid():
     stored = decode_mapping(_encode_round_metadata(_coder_record()))
     stored["evidence_stall"] = "not-a-mapping"
     assert _decode_round_metadata(encode_mapping(stored)).evidence_stall == {"invalid": True}
+
+
+_CONTRADICTORY_STALL_SNAPSHOTS = [
+    pytest.param(_stall_payload(reasons=["checks-failing"]), id="qualifies-with-checks-failing"),
+    pytest.param(_stall_payload(reasons=["untagged-finding"]), id="qualifies-with-untagged-finding"),
+    pytest.param(_stall_payload(qualifies=False, reasons=["made-up-reason"]), id="unknown-reason"),
+    pytest.param(_stall_payload(qualifies=False, reasons=[]), id="non-qualifying-without-reason"),
+    pytest.param(_stall_payload(unsatisfied_row_ids=[]), id="qualifies-without-rows"),
+    pytest.param(_stall_payload(unsatisfied_row_ids=["row-a", "row-a"]), id="duplicate-rows"),
+    pytest.param(_stall_payload(review_head=""), id="qualifies-without-head"),
+    pytest.param(_stall_payload(matrix_identity=""), id="qualifies-without-identity"),
+    pytest.param(
+        _stall_payload(qualifies=False, reasons=["checks-failing", "checks-failing"]),
+        id="duplicate-reasons",
+    ),
+]
+
+
+@pytest.mark.parametrize("bad", _CONTRADICTORY_STALL_SNAPSHOTS)
+def test_contradictory_stall_snapshot_decodes_invalid_and_never_counts_toward_k(bad):
+    """`stall-legacy-compat` / `stall-window-reset`: corrupt history is non-qualifying."""
+    from coding_review_agent_loop.evidence_stall import StallRoundSnapshot, stall_window
+
+    decoded = _decode_round_metadata(_encode_round_metadata(_coder_record(evidence_stall=bad)))
+    assert decoded.evidence_stall == {"invalid": True}
+    current = StallRoundSnapshot(
+        review_round=3, review_head="a" * 40, matrix_identity="b" * 64, qualifies=True,
+        unsatisfied_row_ids=("row-a", "row-b"), reasons=(),
+    )
+    # Neither the decoded value nor the raw contradictory payload counts toward K.
+    for prior in (decoded.evidence_stall, bad):
+        window = stall_window(current, {2: prior}, 2)
+        assert window.stop is False and window.length == 1
+
+
+def test_consistent_non_qualifying_stall_snapshot_round_trips():
+    record = _coder_record(
+        evidence_stall=_stall_payload(qualifies=False, reasons=["untagged-finding", "checks-failing"])
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(record))
+    assert decoded.evidence_stall["reasons"] == ["checks-failing", "untagged-finding"]
+    assert decoded.evidence_stall["qualifies"] is False

@@ -936,8 +936,10 @@ history and raises `HumanDecisionRequiredError` (exit 4) when the window reaches
 Otherwise it returns the snapshot, which `PostedRoundMetadata.evidence_stall` persists on
 the PR coder follow-up record (omitted when absent). The coder record for loop round r
 is numbered r+1, so the snapshot carries an explicit `review_round`; the decoder marks it
-invalid unless it equals the record number minus one, and an invalid or missing snapshot
-ends the window walk. History that cannot be decoded suppresses the stop with a log
+invalid unless it equals the record number minus one and its content is consistent
+(`qualifies` exactly when `reasons` is empty, reasons from the closed set, unique row IDs,
+and a qualifying snapshot names its head, identity, and rows). An invalid or missing
+snapshot ends the window walk. History that cannot be decoded suppresses the stop with a log
 line. State is orchestrator-owned, so a resumed run recomputes the same decision.
 
 ### CI and Merge

@@ -924,15 +924,25 @@ def _pr_finding_view(entry: object) -> object:
 def _validate_evidence_row_tag_preservation(
     source: dict, target: dict, universe: Sequence[str] | None = None
 ) -> None:
-    """A repair keeps each valid ``evidence_row_ids`` tag verbatim and invents none (#1324)."""
+    """A repair keeps each valid ``evidence_row_ids`` tag verbatim and invents none (#1324).
 
-    def tagged(payload: dict) -> list[tuple[str, tuple[str, ...] | None]]:
-        entries = payload.get("blocking_items")
+    Tags are matched one-to-one on complete finding identity: the parent text
+    *and* its sub-items must correspond in both directions, and every source
+    or target entry is consumed by at most one match.  A tag therefore cannot
+    be copied onto a duplicate finding, onto a finding whose sub-items differ,
+    or onto a merged finding that absorbed an untagged code defect; such an
+    ambiguous transfer is rejected rather than resolved by guessing.
+    """
+
+    def entries(payload: dict) -> list[tuple[str, tuple[str, ...] | None]]:
+        raw_entries = payload.get("blocking_items")
         result: list[tuple[str, tuple[str, ...] | None]] = []
-        for entry in entries if isinstance(entries, list) else []:
-            if not isinstance(entry, dict) or not isinstance(entry.get("text"), str):
-                if isinstance(entry, str):
-                    result.append((entry, None))
+        for entry in raw_entries if isinstance(raw_entries, list) else []:
+            content = _pr_finding_text(entry)
+            if content is None:
+                continue
+            if isinstance(entry, str):
+                result.append((content, None))
                 continue
             raw = entry.get("evidence_row_ids")
             valid = (
@@ -943,34 +953,43 @@ def _validate_evidence_row_tag_preservation(
                 # repair may (and must) remove it; it never invents one.
                 and (universe is None or set(raw) <= set(universe))
             )
-            result.append((entry["text"], tuple(raw) if valid else None))
+            result.append((content, tuple(raw) if valid else None))
         return result
 
-    source_items, target_items = tagged(source), tagged(target)
+    def same_finding(left: str, right: str) -> bool:
+        left_fragments, right_fragments = _fragments(left), _fragments(right)
+        return bool(left_fragments) and bool(right_fragments) and (
+            _contains_fragments(right, left_fragments)
+            and _contains_fragments(left, right_fragments)
+        )
 
-    def match(text: str, candidates: list[tuple[str, tuple[str, ...] | None]]):
-        fragments = _fragments(text)
-        return [
-            candidate for candidate in candidates
-            if fragments and _contains_fragments(candidate[0], fragments)
+    source_items, target_items = entries(source), entries(target)
+    for tags in {tags for _, tags in (*source_items, *target_items) if tags is not None}:
+        sources = [text for text, item_tags in source_items if item_tags == tags]
+        targets = [text for text, item_tags in target_items if item_tags == tags]
+        edges = [
+            [j for j, target_text in enumerate(targets) if same_finding(source_text, target_text)]
+            for source_text in sources
         ]
+        owner: dict[int, int] = {}
 
-    for text, tags in source_items:
-        if tags is None:
-            continue
-        if not any(candidate[1] == tags for candidate in match(text, target_items)):
+        def augment(i: int, seen: set[int]) -> bool:
+            for j in edges[i]:
+                if j in seen:
+                    continue
+                seen.add(j)
+                if j not in owner or augment(owner[j], seen):
+                    owner[j] = i
+                    return True
+            return False
+
+        matched_sources = sum(1 for i in range(len(sources)) if augment(i, set()))
+        if matched_sources < len(sources):
             raise AgentLoopError(
                 "Repair content preservation failed for blocking_items.evidence_row_ids: "
                 "keep each valid evidence_row_ids tag verbatim on its finding."
             )
-    for text, tags in target_items:
-        if tags is None:
-            continue
-        sources = match(text, source_items) or [
-            candidate for candidate in source_items
-            if _contains_fragments(text, _fragments(candidate[0]))
-        ]
-        if not any(candidate[1] == tags for candidate in sources):
+        if len(owner) < len(targets):
             raise AgentLoopError(
                 "Repair content preservation failed for blocking_items.evidence_row_ids: "
                 "repair must not add or change an evidence_row_ids tag."

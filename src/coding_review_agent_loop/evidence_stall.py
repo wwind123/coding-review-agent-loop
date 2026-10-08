@@ -197,6 +197,40 @@ def classify_round(
     )
 
 
+def stall_snapshot_is_consistent(snapshot: Mapping[str, object]) -> bool:
+    """Whether a persisted stall snapshot is internally consistent (#1324).
+
+    ``qualifies`` must hold exactly when ``reasons`` is empty, every reason
+    must belong to the closed :data:`STALL_REASONS` set, row IDs and reasons
+    must be unique strings, and a qualifying snapshot must name its head,
+    matrix identity, and a non-empty unsatisfied-row set.  Anything else is
+    corrupt history and counts as non-qualifying.
+    """
+    qualifies = snapshot.get("qualifies")
+    reasons = snapshot.get("reasons")
+    row_ids = snapshot.get("unsatisfied_row_ids")
+    if not isinstance(qualifies, bool) or not isinstance(reasons, (list, tuple)):
+        return False
+    if not isinstance(row_ids, (list, tuple)):
+        return False
+    if any(not isinstance(reason, str) or reason not in STALL_REASONS for reason in reasons):
+        return False
+    if any(not isinstance(row_id, str) or not row_id.strip() for row_id in row_ids):
+        return False
+    if len(set(reasons)) != len(reasons) or len(set(row_ids)) != len(row_ids):
+        return False
+    if qualifies != (not reasons):
+        return False
+    if qualifies:
+        head = snapshot.get("review_head")
+        identity = snapshot.get("matrix_identity")
+        if not row_ids or not isinstance(head, str) or not head.strip():
+            return False
+        if not isinstance(identity, str) or not identity.strip():
+            return False
+    return True
+
+
 def stall_window(
     current: StallRoundSnapshot,
     prior_snapshots_by_review_round: Mapping[int, Mapping[str, object] | None],
@@ -204,7 +238,8 @@ def stall_window(
 ) -> StallWindow:
     """Count consecutive qualifying rounds ending at ``current``.
 
-    The walk ends at a missing, invalid, or non-qualifying snapshot, or one
+    The walk ends at a missing, invalid, inconsistent, or non-qualifying
+    snapshot (see :func:`stall_snapshot_is_consistent`), or one
     whose row set or matrix identity differs from the current snapshot's.  With
     ``k <= 0`` the detector never stops.
     """
@@ -218,6 +253,7 @@ def stall_window(
         if (
             not isinstance(snapshot, Mapping)
             or snapshot.get("invalid")
+            or not stall_snapshot_is_consistent(snapshot)
             or snapshot.get("review_round") != review_round
             or snapshot.get("qualifies") is not True
             or snapshot.get("matrix_identity") != current.matrix_identity

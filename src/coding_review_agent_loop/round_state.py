@@ -90,6 +90,8 @@ from .unresolved_items import (
     release_evidence_freeze,
 )
 
+from .evidence_stall import stall_snapshot_is_consistent
+
 logger = logging.getLogger(__name__)
 
 
@@ -2744,7 +2746,8 @@ def _decode_evidence_stall(payload: Mapping[str, object]) -> Mapping[str, object
     """Decode the stall snapshot, never raising on a malformed value (#1324).
 
     The snapshot's ``review_round`` must equal the enclosing record round
-    minus one; anything else decodes as invalid and counts as non-qualifying.
+    minus one and its content must be internally consistent; anything else
+    decodes as invalid and counts as non-qualifying.
     """
     if "evidence_stall" not in payload:
         return None
@@ -2768,6 +2771,10 @@ def _decode_evidence_stall(payload: Mapping[str, object]) -> Mapping[str, object
         ):
             return EVIDENCE_STALL_INVALID
     except (TypeError, KeyError):
+        return EVIDENCE_STALL_INVALID
+    # Contradictory or open-set content (qualifies with reasons, an unknown
+    # reason code, duplicate rows) is corrupt history, never a qualification.
+    if not stall_snapshot_is_consistent(raw):
         return EVIDENCE_STALL_INVALID
     return {
         "version": 1,

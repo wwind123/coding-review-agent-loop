@@ -3419,7 +3419,11 @@ earlier CI obligation still disqualifies the round.
 (`review_round`, `review_head`, `matrix_identity`, `qualifies`, sorted
 `unsatisfied_row_ids`, sorted `reasons`) classifying the review that preceded it; the
 coder record is numbered one past the review round, so the snapshot's `review_round`
-must equal the record number minus one. The stop fires when K consecutive review rounds
+must equal the record number minus one, and the snapshot must be internally
+consistent: `qualifies` is true exactly when `reasons` is empty, every reason belongs to
+the closed reason set, row IDs are unique, and a qualifying snapshot names its head,
+matrix identity, and at least one row. A snapshot that fails these checks decodes as
+invalid. The stop fires when K consecutive review rounds
 qualify with an identical unsatisfied-row set under the same matrix identity. A round
 with a code finding, a failing check, another machine obligation, a changed row set or
 matrix, or a missing or invalid snapshot resets the window, so a code-finding round
