@@ -1,5 +1,5 @@
 {
-  "artifact_sha256": "abbdd080bb9f98ac01bbc8e995ea9aa90d0f26925be9fea0a7b86af24685d057",
+  "artifact_sha256": "88ce3b4ecf74d2f93530321943942e11b94ced72991d6379b083ffd26850cc5e",
   "flows": {
     "plan": {
       "policies": {
@@ -431,87 +431,83 @@
         },
         "primary-then-panel": {
           "marginal_findings_beyond_primary": {
-            "reason": "no run for this policy declares a primary reviewer",
-            "status": "not-applicable",
+            "reason": "finding labels lack verified provenance for runs: pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-930, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-961, pr-963, pr-965, pr-967, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998",
+            "status": "unavailable",
             "value": null
           },
           "metrics": {
             "calls_avoided": {
-              "reason": "no frozen runs for this policy",
-              "status": "unavailable",
-              "value": null
+              "status": "verified",
+              "value": 216
             },
             "ci_failures": {
-              "reason": "no frozen runs for this policy",
+              "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
               "status": "unavailable",
               "value": null
             },
             "coder_followup_rounds": {
-              "reason": "no frozen runs for this policy",
-              "status": "unavailable",
-              "value": null
+              "status": "verified",
+              "value": 92
             },
             "disagreements": {
-              "reason": "no frozen runs for this policy",
+              "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
               "status": "unavailable",
               "value": null
             },
             "elapsed_seconds": {
-              "reason": "no frozen runs for this policy",
+              "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
               "status": "unavailable",
               "value": null
             },
             "escaped_defects": {
-              "reason": "no frozen runs for this policy",
-              "status": "unavailable",
-              "value": null
+              "status": "verified",
+              "value": 6
             },
             "estimated_cost": {
-              "reason": "no frozen runs for this policy",
+              "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
               "status": "unavailable",
               "value": null
             },
             "false_positives": {
-              "reason": "no frozen runs for this policy",
+              "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
               "status": "unavailable",
               "value": null
             },
             "review_rounds": {
-              "reason": "no frozen runs for this policy",
-              "status": "unavailable",
-              "value": null
+              "status": "verified",
+              "value": 183
             },
             "reviewer_calls": {
-              "reason": "no frozen runs for this policy",
-              "status": "unavailable",
-              "value": null
+              "status": "verified",
+              "value": 228
             },
             "tokens": {
-              "reason": "no frozen runs for this policy",
+              "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
               "status": "unavailable",
               "value": null
             },
             "withdrawals": {
-              "reason": "no frozen runs for this policy",
+              "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
               "status": "unavailable",
               "value": null
             }
           },
           "primary_to_panel_approval_regressions": {
-            "reason": "no run for this policy declares a primary reviewer",
-            "status": "not-applicable",
-            "value": null
-          },
-          "run_count": 0,
-          "severity_weighted_marginal_findings": {
-            "reason": "no run for this policy declares a primary reviewer",
-            "status": "not-applicable",
-            "value": null
-          },
-          "status": "unavailable",
-          "valid_unique_findings": {
-            "reason": "no frozen runs for this policy",
+            "reason": "approval-round measurement absent for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
             "status": "unavailable",
+            "value": null
+          },
+          "run_count": 45,
+          "severity_weighted_marginal_findings": {
+            "reason": "finding labels lack verified provenance for runs: pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-930, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-961, pr-963, pr-965, pr-967, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998",
+            "status": "unavailable",
+            "value": null
+          },
+          "status": "verified",
+          "valid_unique_findings": {
+            "reason": "finding labels lack verified provenance for runs: pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-930, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-961, pr-963, pr-965, pr-967, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998",
+            "status": "unavailable",
+            "unlabeled_findings": 17,
             "value": null
           }
         },
@@ -645,41 +641,34 @@
             },
             "primary-then-panel": {
               "coder_followup_rounds": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 41
               },
               "escaped_defects": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 2
               },
               "escaped_defects_per_run": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 0.07407407407407407
               },
               "review_rounds": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 95
               },
               "review_rounds_per_run": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 3.5185185185185186
               },
               "reviewer_calls": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 110
               },
               "reviewer_calls_per_run": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 4.074074074074074
               },
-              "run_count": 0
+              "run_count": 27
             },
             "selective-intermediate": {
               "coder_followup_rounds": {
@@ -763,41 +752,34 @@
             },
             "primary-then-panel": {
               "coder_followup_rounds": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 51
               },
               "escaped_defects": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 4
               },
               "escaped_defects_per_run": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 0.2222222222222222
               },
               "review_rounds": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 88
               },
               "review_rounds_per_run": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 4.888888888888889
               },
               "reviewer_calls": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 118
               },
               "reviewer_calls_per_run": {
-                "reason": "no frozen runs for this review contract and policy",
-                "status": "unavailable",
-                "value": null
+                "status": "verified",
+                "value": 6.555555555555555
               },
-              "run_count": 0
+              "run_count": 18
             },
             "selective-intermediate": {
               "coder_followup_rounds": {
@@ -840,7 +822,7 @@
           }
         }
       },
-      "run_count": 0,
+      "run_count": 45,
       "title": "Frozen PR review policy evaluation"
     }
   },
@@ -934,87 +916,83 @@
     },
     "primary-then-panel": {
       "marginal_findings_beyond_primary": {
-        "reason": "no run for this policy declares a primary reviewer",
-        "status": "not-applicable",
+        "reason": "finding labels lack verified provenance for runs: pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-930, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-961, pr-963, pr-965, pr-967, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998",
+        "status": "unavailable",
         "value": null
       },
       "metrics": {
         "calls_avoided": {
-          "reason": "no frozen runs for this policy",
-          "status": "unavailable",
-          "value": null
+          "status": "verified",
+          "value": 216
         },
         "ci_failures": {
-          "reason": "no frozen runs for this policy",
+          "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
           "status": "unavailable",
           "value": null
         },
         "coder_followup_rounds": {
-          "reason": "no frozen runs for this policy",
-          "status": "unavailable",
-          "value": null
+          "status": "verified",
+          "value": 92
         },
         "disagreements": {
-          "reason": "no frozen runs for this policy",
+          "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
           "status": "unavailable",
           "value": null
         },
         "elapsed_seconds": {
-          "reason": "no frozen runs for this policy",
+          "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
           "status": "unavailable",
           "value": null
         },
         "escaped_defects": {
-          "reason": "no frozen runs for this policy",
-          "status": "unavailable",
-          "value": null
+          "status": "verified",
+          "value": 6
         },
         "estimated_cost": {
-          "reason": "no frozen runs for this policy",
+          "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
           "status": "unavailable",
           "value": null
         },
         "false_positives": {
-          "reason": "no frozen runs for this policy",
+          "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
           "status": "unavailable",
           "value": null
         },
         "review_rounds": {
-          "reason": "no frozen runs for this policy",
-          "status": "unavailable",
-          "value": null
+          "status": "verified",
+          "value": 183
         },
         "reviewer_calls": {
-          "reason": "no frozen runs for this policy",
-          "status": "unavailable",
-          "value": null
+          "status": "verified",
+          "value": 228
         },
         "tokens": {
-          "reason": "no frozen runs for this policy",
+          "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
           "status": "unavailable",
           "value": null
         },
         "withdrawals": {
-          "reason": "no frozen runs for this policy",
+          "reason": "measurement absent or without verified provenance for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
           "status": "unavailable",
           "value": null
         }
       },
       "primary_to_panel_approval_regressions": {
-        "reason": "no run for this policy declares a primary reviewer",
-        "status": "not-applicable",
-        "value": null
-      },
-      "run_count": 0,
-      "severity_weighted_marginal_findings": {
-        "reason": "no run for this policy declares a primary reviewer",
-        "status": "not-applicable",
-        "value": null
-      },
-      "status": "unavailable",
-      "valid_unique_findings": {
-        "reason": "no frozen runs for this policy",
+        "reason": "approval-round measurement absent for runs: pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-963, pr-965, pr-967, pr-961, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998, pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-930",
         "status": "unavailable",
+        "value": null
+      },
+      "run_count": 45,
+      "severity_weighted_marginal_findings": {
+        "reason": "finding labels lack verified provenance for runs: pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-930, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-961, pr-963, pr-965, pr-967, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998",
+        "status": "unavailable",
+        "value": null
+      },
+      "status": "verified",
+      "valid_unique_findings": {
+        "reason": "finding labels lack verified provenance for runs: pr-1000, pr-1001, pr-1002, pr-1004, pr-1006, pr-853, pr-857, pr-860, pr-861, pr-869, pr-877, pr-883, pr-885, pr-893, pr-899, pr-912, pr-917, pr-919, pr-921, pr-923, pr-930, pr-934, pr-937, pr-940, pr-947, pr-951, pr-956, pr-961, pr-963, pr-965, pr-967, pr-968, pr-970, pr-971, pr-972, pr-974, pr-975, pr-977, pr-980, pr-982, pr-983, pr-986, pr-992, pr-994, pr-998",
+        "status": "unavailable",
+        "unlabeled_findings": 17,
         "value": null
       }
     },
