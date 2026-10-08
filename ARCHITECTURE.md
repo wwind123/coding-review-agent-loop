@@ -1576,7 +1576,17 @@ change, meaning every changed-only list, including the literal
 `execution_data_flows` key, is non-empty, and the payload names a real
 canonical-document action. Every other synonym, and an uncorroborated
 `modified`, becomes the parser-only `undetermined` status, which has no wire
-form and never resolves to `unchanged`.
+form and never resolves to `unchanged`. In every mode, an object item inside
+one of the assessment's list fields is flattened deterministically before
+validation to `key: value` text in the object's own key order, pairs joined by
+`; ` and list values by `, `, and the parser logs one normalization line per
+flattened item. The same renderability rule, exported from `protocol.py`, is
+what counts as positive evidence for the `modified` near miss and what repair
+preservation pins, so a renderable object survives a repair as the identical
+object or as its flattened string. Nested objects, nested lists, non-string
+scalars, empty values and empty objects still fail closed with an error that
+names the field and the offending key; string-list fields outside the
+assessment keep rejecting object items.
 
 Accepted text is canonicalized at one acceptance boundary that every
 successful exit of `_run_validated_agent` and of completion recovery goes

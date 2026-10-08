@@ -6922,3 +6922,311 @@ def test_machine_obligations_cannot_carry_the_tag():
             authority="machine", obligation_kind="merge-conflict", lifecycle="repair_required",
             obligation_identity="merge-conflict", evidence_row_ids=("r1",),
         )
+
+
+# --- #1330: object items in architecture_impact list fields flatten deterministically ---
+
+import logging as _logging_1330  # noqa: E402
+
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    classify_architecture_status_near_miss as _classify_1330,
+    parse_architecture_impact as _parse_impact_1330,
+    parse_architecture_impact_degradable as _parse_degradable_1330,
+    render_architecture_list_entry as _render_1330,
+    sanitize_architecture_impact as _sanitize_1330,
+    validate_structured_plan_state as _validate_plan_state_1330,
+)
+from coding_review_agent_loop.repair_preservation import (  # noqa: E402
+    canonicalize_architecture_near_miss_text as _canonicalize_1330,
+)
+
+_LOGGER_1330 = "coding_review_agent_loop.protocol"
+_FLATTENED_1330 = "flattened architecture-impact object item to text"
+_OBJECT_1330 = {"area": "x", "change": "y"}
+_LIST_OBJECT_1330 = {"tags": ["a", "b"], "note": "n"}
+_CHANGED_1330 = {
+    "status": "changed",
+    "rationale": "A typed registry replaces the ad hoc lookup.",
+    "affected_components": [_OBJECT_1330],
+    "dependencies": [],
+    "execution_data_flows": [],
+    "persistence": [],
+    "public_contracts": [],
+    "security_boundaries": [],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the registry.",
+}
+_MODIFIED_OBJECTS_1330 = {
+    "status": "modified",
+    "rationale": "The parser gains a flattening step.",
+    "affected_components": [{"name": "protocol parser", "change": "modified"}],
+    "dependencies": [{"from": "repair_preservation.py", "to": "protocol.py", "kind": "import"}],
+    "execution_data_flows": [{"flow": "response -> parser -> seam"}],
+    "persistence": [{"record": "round metadata degradation records"}],
+    "public_contracts": [{"contract": "architecture_impact list fields", "accepts": ["strings", "flat objects"]}],
+    "security_boundaries": [{"boundary": "agent payload trust boundary"}],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the flattening.",
+}
+_NON_RENDERABLE_1330 = [
+    pytest.param({}, "''", id="empty-object"),
+    pytest.param({"a": {"b": "c"}}, "'a'", id="nested-object"),
+    pytest.param({"n": 3}, "'n'", id="number"),
+    pytest.param({"ok": True}, "'ok'", id="boolean"),
+    pytest.param({"x": None}, "'x'", id="null"),
+    pytest.param({"x": ""}, "'x'", id="empty-string"),
+    pytest.param({"x": []}, "'x'", id="empty-list"),
+    pytest.param({"x": ["a", 1]}, "'x'", id="list-with-non-string"),
+    pytest.param({"x": ["a", ["b"]]}, "'x'", id="list-with-nested-list"),
+]
+
+
+def _flatten_lines_1330(caplog):
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == _LOGGER_1330 and _FLATTENED_1330 in r.getMessage()
+    ]
+
+
+def _with_impact_1330(text, impact):
+    head, sep, tail = text.partition("\n")
+    payload = json.loads(head)
+    payload["architecture_impact"] = impact
+    return json.dumps(payload) + sep + tail
+
+
+def test_coder_object_item_validates_without_repair_and_logs_1330(caplog):
+    text = _issue_implementation_text(architecture_impact=_CHANGED_1330)
+    with caplog.at_level(_logging_1330.WARNING, logger=_LOGGER_1330):
+        parsed = validate_structured_issue_implementation(
+            text, required_architecture_impact_contract=1, architecture_status_mode="degradable"
+        )
+    assert parsed is not None
+    assert parsed.architecture_impact.status == "changed"
+    assert parsed.architecture_impact.affected_components == ("area: x; change: y",)
+    assert parsed.architecture_impact_degradations == ()
+    lines = _flatten_lines_1330(caplog)
+    assert lines == [
+        "issue_implementation.architecture_impact at index 0: " + _FLATTENED_1330
+    ]
+    # The strict parse of the same text agrees: flattening is mode-independent.
+    strict = validate_structured_issue_implementation(text, required_architecture_impact_contract=1)
+    assert strict.architecture_impact.affected_components == ("area: x; change: y",)
+
+
+@pytest.mark.parametrize("kind", ["plan_review", "pr_review"])
+def test_review_object_item_with_list_value_flattens_1330(kind, caplog):
+    impact = dict(_DEFAULT_ARCHITECTURE_IMPACT, dependencies=[_LIST_OBJECT_1330])
+    if kind == "plan_review":
+        text = _with_impact_1330(structured_plan_review(summary="Plan is sound."), impact)
+        with caplog.at_level(_logging_1330.WARNING, logger=_LOGGER_1330):
+            parsed = parse_structured_plan_review(
+                text, reviewer="OpenAI Codex", architecture_status_mode="degradable"
+            )
+    else:
+        text = _with_impact_1330(structured_pr_review(summary="Review complete."), impact)
+        with caplog.at_level(_logging_1330.WARNING, logger=_LOGGER_1330):
+            parsed = parse_structured_pr_review(
+                text, reviewer="OpenAI Codex", architecture_status_mode="degradable"
+            )
+    assert parsed is not None
+    assert parsed.state == "approved"
+    assert parsed.architecture_impact.status == "unchanged"
+    assert parsed.architecture_impact.dependencies == ("tags: a, b; note: n",)
+    assert parsed.architecture_impact_degradations == ()
+    assert _flatten_lines_1330(caplog) == [
+        f"{kind}.architecture_impact at index 0: " + _FLATTENED_1330
+    ]
+
+
+def test_issue_fixtures_render_in_key_order_1330():
+    component = {
+        "name": "core/model_registry.py",
+        "change": "added",
+        "description": "Typed model registry replacing the ad hoc lookup.",
+    }
+    dependency = {
+        "from": "core/pricing.py",
+        "to": "core/model_registry.py",
+        "kind": "import",
+        "description": "Pricing reads model metadata from the registry.",
+    }
+    assert _render_1330(component) == (
+        "name: core/model_registry.py; change: added; "
+        "description: Typed model registry replacing the ad hoc lookup."
+    )
+    assert _render_1330(dependency) == (
+        "from: core/pricing.py; to: core/model_registry.py; kind: import; "
+        "description: Pricing reads model metadata from the registry."
+    )
+    assert _render_1330(_OBJECT_1330) == "area: x; change: y"
+    assert _render_1330(_LIST_OBJECT_1330) == "tags: a, b; note: n"
+    # The renderer does not sort: the agent's own key order survives.
+    assert _render_1330({"change": "y", "area": "x"}) == "change: y; area: x"
+    assert _render_1330("  plain  ") == "plain"
+    for value in ("", "   ", 7, None, True, ["a"], {}):
+        assert _render_1330(value) is None
+    parsed = _parse_impact_1330(
+        {"status": "changed", "rationale": "r", "affected_components": [component],
+         "dependencies": [dependency], "execution_data_flows": ["flow"], "persistence": ["p"],
+         "public_contracts": ["c"], "security_boundaries": ["s"],
+         "canonical_document_action": "update", "canonical_document_path": "ARCHITECTURE.md",
+         "canonical_document_rationale": "Document it."}
+    )
+    assert parsed.affected_components == (_render_1330(component),)
+    assert parsed.dependencies == (_render_1330(dependency),)
+
+
+def test_plain_string_items_are_unchanged_and_silent_1330(caplog):
+    impact = dict(
+        _DEFAULT_ARCHITECTURE_IMPACT,
+        affected_components=["parser", "  seam  "],
+        dependencies=["repair preservation"],
+    )
+    text = _issue_implementation_text(architecture_impact=impact)
+    with caplog.at_level(_logging_1330.WARNING, logger=_LOGGER_1330):
+        parsed = validate_structured_issue_implementation(text)
+    assert parsed.architecture_impact.affected_components == ("parser", "seam")
+    assert parsed.architecture_impact.dependencies == ("repair preservation",)
+    assert _flatten_lines_1330(caplog) == []
+
+
+@pytest.mark.parametrize("mode", ["strict", "legacy", "degradable"])
+@pytest.mark.parametrize("item,key", _NON_RENDERABLE_1330)
+def test_lossy_object_items_fail_closed_in_every_mode_1330(mode, item, key, caplog):
+    impact = dict(_DEFAULT_ARCHITECTURE_IMPACT, persistence=[item])
+    text = _issue_implementation_text(architecture_impact=impact)
+    expected = (
+        "issue_implementation.architecture_impact at index 0 object item must contain "
+        "only non-empty string or string-list values; got "
+    )
+    with caplog.at_level(_logging_1330.WARNING, logger=_LOGGER_1330):
+        with pytest.raises(AgentLoopError) as info:
+            validate_structured_issue_implementation(text, architecture_status_mode=mode)
+    assert str(info.value).startswith(expected)
+    assert str(info.value).endswith(f"for key {key}.")
+    assert _flatten_lines_1330(caplog) == []
+
+
+def test_non_string_key_fails_closed_1330():
+    with pytest.raises(AgentLoopError, match="non-string or empty key"):
+        _parse_impact_1330(
+            {"status": "unchanged", "rationale": "r", "uncertainty": [{"": "x"}]},
+            context="architecture_impact",
+        )
+    assert _render_1330({"": "x"}) is None
+
+
+def test_other_string_list_fields_still_reject_objects_1330(caplog):
+    text = structured_plan_state(plan_steps=["Step one.", {"step": "two"}])
+    with caplog.at_level(_logging_1330.WARNING, logger=_LOGGER_1330):
+        with pytest.raises(AgentLoopError, match=r"plan_state\.plan_steps at index 1 must be a string\."):
+            _validate_plan_state_1330(text)
+    assert _flatten_lines_1330(caplog) == []
+
+
+def _modified_with_1330(key, entries):
+    impact = json.loads(json.dumps(_MODIFIED_OBJECTS_1330))
+    impact[key] = entries
+    return impact
+
+
+def test_near_miss_classification_counts_renderable_objects_1330():
+    resolved, record = _classify_1330(_MODIFIED_OBJECTS_1330, context="issue_implementation.architecture_impact")
+    assert resolved == "changed"
+    assert record.outcome == "normalized-to-changed"
+    assert record.element_path == "issue_implementation.architecture_impact.status"
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [[{}], [{"a": {"b": "c"}}], [{"n": 1}], [""]],
+    ids=["empty-object", "nested", "number", "blank-string"],
+)
+@pytest.mark.parametrize("key", ["affected_components", "public_contracts"])
+def test_near_miss_classification_rejects_non_renderable_evidence_1330(key, entries):
+    resolved, record = _classify_1330(
+        _modified_with_1330(key, entries), context="issue_implementation.architecture_impact"
+    )
+    assert resolved == "undetermined"
+    assert record.outcome == "degraded-to-undetermined"
+    assert record.rule.endswith(f"positive evidence missing: {key}")
+
+
+def test_degradable_parse_of_corroborated_objects_is_changed_with_flat_strings_1330(caplog):
+    with caplog.at_level(_logging_1330.WARNING, logger=_LOGGER_1330):
+        impact, record = _parse_degradable_1330(
+            _MODIFIED_OBJECTS_1330, context="issue_implementation.architecture_impact"
+        )
+    assert impact.status == "changed"
+    assert record is not None and record.outcome == "normalized-to-changed"
+    assert impact.affected_components == ("name: protocol parser; change: modified",)
+    assert impact.dependencies == ("from: repair_preservation.py; to: protocol.py; kind: import",)
+    assert impact.execution_data_flows == ("flow: response -> parser -> seam",)
+    assert impact.persistence == ("record: round metadata degradation records",)
+    assert impact.public_contracts == (
+        "contract: architecture_impact list fields; accepts: strings, flat objects",
+    )
+    assert impact.security_boundaries == ("boundary: agent payload trust boundary",)
+    assert len(_flatten_lines_1330(caplog)) == 6
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [[{}], [{"a": {"b": "c"}}], [{"n": 1}], [""]],
+    ids=["empty-object", "nested", "number", "blank-string"],
+)
+def test_degradable_parse_with_non_renderable_entry_raises_1330(entries):
+    # Classification does not short-circuit validation: the payload parser
+    # still rejects the entry instead of returning an undetermined assessment.
+    with pytest.raises(AgentLoopError, match=r"architecture_impact at index 0"):
+        _parse_degradable_1330(
+            _modified_with_1330("dependencies", entries),
+            context="issue_implementation.architecture_impact",
+        )
+
+
+def test_degradable_parse_with_empty_evidence_is_undetermined_1330():
+    impact = json.loads(json.dumps(_MODIFIED_OBJECTS_1330))
+    for key in (
+        "affected_components", "dependencies", "execution_data_flows",
+        "persistence", "public_contracts", "security_boundaries",
+    ):
+        impact[key] = []
+    parsed, record = _parse_degradable_1330(impact, context="issue_implementation.architecture_impact")
+    assert parsed.status == "undetermined"
+    assert record is not None and record.outcome == "degraded-to-undetermined"
+
+
+def test_canonical_text_keeps_object_entries_and_reparses_1330():
+    text = _issue_implementation_text(architecture_impact=_MODIFIED_OBJECTS_1330)
+    canonical = _canonicalize_1330(text)
+    head = json.loads(canonical.partition("\n")[0])
+    expected = dict(_MODIFIED_OBJECTS_1330, status="changed")
+    assert head["architecture_impact"] == expected
+    assert canonical.endswith("\n<!-- AGENT_STATE: blocking -->\n-- Coder")
+    for mode in ("degradable", "legacy", "strict"):
+        parsed = validate_structured_issue_implementation(
+            canonical, required_architecture_impact_contract=1, architecture_status_mode=mode
+        )
+        assert parsed.architecture_impact.status == "changed"
+        assert parsed.architecture_impact.affected_components == (
+            "name: protocol parser; change: modified",
+        )
+        assert parsed.architecture_impact_degradations == ()
+
+
+def test_flattened_assessment_is_stored_as_plain_strings_1330():
+    parsed = validate_structured_issue_implementation(
+        _issue_implementation_text(architecture_impact=_CHANGED_1330),
+        required_architecture_impact_contract=1,
+    )
+    sanitized = _sanitize_1330(parsed.architecture_impact)
+    for key, value in sanitized.items():
+        if isinstance(value, list):
+            assert all(isinstance(entry, str) for entry in value), key
+    assert sanitized["affected_components"] == ["area: x; change: y"]
+    reparsed = _parse_impact_1330(sanitized, architecture_status_mode="legacy")
+    assert reparsed == parsed.architecture_impact

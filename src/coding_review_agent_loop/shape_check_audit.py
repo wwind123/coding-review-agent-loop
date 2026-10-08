@@ -725,6 +725,14 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "site."
         ),
     ),
+    "_flatten_labelled_object": ShapeCheckClassification(
+        "delegated",
+        frozenset(),
+        (
+            "Lossless object-item renderer behind the architecture_impact list fields "
+            "(#1330); the consequence is classified at each caller's annotated site."
+        ),
+    ),
     "_expect_test_observations": ShapeCheckClassification(
         "fatal",
         frozenset({"authentication-or-forgery"}),

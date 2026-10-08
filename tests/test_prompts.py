@@ -5810,3 +5810,18 @@ def test_pr_review_prompts_carry_evidence_row_tag_guidance_only_with_an_applicab
             7, 1, config, reviewer="codex", compact_context=compact,
             approved_plan_context=_coverage_plan_context(applicability="not-applicable"),
         ), compact
+
+
+def test_architecture_impact_guidance_says_list_fields_are_plain_strings_1330(tmp_path):
+    config = make_config(tmp_path)
+    phrase = "arrays of plain strings, not objects"
+    coder_prompt = build_issue_implementation_prompt(56, "1. Fix it.", config)
+    plan_prompt = build_issue_plan_prompt(56, config)
+    assert phrase in coder_prompt
+    assert phrase in plan_prompt
+    for prompt in (
+        build_issue_prompt(56, config),
+        build_plan_review_prompt(56, 1, "Plan.", config, reviewer="codex"),
+        build_task_prompt("Add a health endpoint.", config),
+    ):
+        assert phrase in prompt
