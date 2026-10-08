@@ -5789,3 +5789,24 @@ def test_prompts_describe_pre_collection_launch_failures_as_non_evidence(tmp_pat
         assert "pre-collection launch failure" in coder_prompt
         assert "fix the interpreter or flags and rerun" in coder_prompt
         assert "cleared only by a passing rerun of the same command" in coder_prompt
+
+
+# --- #1324: evidence-only row tag guidance -------------------------------------
+
+def test_pr_review_prompts_carry_evidence_row_tag_guidance_only_with_an_applicable_matrix(tmp_path):
+    config = make_config(tmp_path)
+    context = _coverage_plan_context()
+    for compact in (False, True):
+        with_matrix = build_review_prompt(
+            7, 1, config, reviewer="codex", approved_plan_context=context, compact_context=compact,
+        )
+        assert "evidence_row_ids" in with_matrix, compact
+        assert "Enforceable approved matrix rows: `row-wf`, `row-man`" in with_matrix, compact
+        assert "tag while it stays unresolved" in with_matrix, compact
+        assert "evidence_row_ids" not in build_review_prompt(
+            7, 1, config, reviewer="codex", compact_context=compact
+        ), compact
+        assert "evidence_row_ids" not in build_review_prompt(
+            7, 1, config, reviewer="codex", compact_context=compact,
+            approved_plan_context=_coverage_plan_context(applicability="not-applicable"),
+        ), compact

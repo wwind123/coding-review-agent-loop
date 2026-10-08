@@ -1388,6 +1388,36 @@ note. When your only open items are evidence requests you keep, use
 as approving the code. Do not re-emit a request you just resolved."""
 
 
+PR_REVIEW_EVIDENCE_ROW_TAG_GUIDANCE = """A `blocking_items` entry may be an object with an optional `evidence_row_ids`
+array: `{{"text": "...", "evidence_row_ids": ["row-id"]}}`. Use it only for a
+finding whose sole demand is admissible citation evidence (a passing,
+tool-captured test observation) for the listed approved risk-matrix rows, with
+no code defect in it. Keep every code defect in a separate untagged item. List
+only unique row IDs from the enforceable rows below; the orchestrator verifies
+each tag against the canonical evidence at the reviewed head, and a tag naming a
+satisfied row makes the item an ordinary finding. A tagged prior item keeps its
+tag while it stays unresolved; if the concern becomes a code defect, resolve or
+replace the item and raise a new untagged blocking item. Never put the tag on
+`same_pr_followups` or `future_followups`.
+Enforceable approved matrix rows: {rows}"""
+
+
+def _pr_review_evidence_row_tag_guidance(
+    approved_plan_context: ApprovedPlanContext | None,
+) -> str:
+    """Evidence-row tag guidance; empty unless an applicable approved matrix exists (#1324)."""
+    row_ids = (
+        approved_plan_context.risk_test_matrix_expected_row_ids
+        if approved_plan_context is not None and approved_plan_context.matrix_available
+        else None
+    )
+    if not row_ids:
+        return ""
+    return "\n\n" + PR_REVIEW_EVIDENCE_ROW_TAG_GUIDANCE.format(
+        rows=", ".join(f"`{row_id}`" for row_id in row_ids)
+    )
+
+
 def _agent_unavailable_guidance(signature: str) -> str:
     return f"""If an internal environment, permission, provider, or tooling problem makes it impossible to complete this assigned operation after safe recovery attempts, do not invent a blocking code finding or claim approval. Return this instead of the normal response schema:
 
@@ -4405,7 +4435,7 @@ POSIX paths. Never use globs, directories, absolute paths, or traversal.
 
 {PR_REVIEW_SUB_ITEM_GUIDANCE}
 
-{PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE}
+{PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE}{_pr_review_evidence_row_tag_guidance(approved_plan_context)}
 
 After the JSON object, include only:
 1. optional `<!-- HUMAN_REQUIREMENTS_RESOLVED -->`
@@ -5138,7 +5168,7 @@ POSIX paths. Never use globs, directories, absolute paths, or traversal.
 
 {PR_REVIEW_SUB_ITEM_GUIDANCE}
 
-{PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE}
+{PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE}{_pr_review_evidence_row_tag_guidance(approved_plan_context)}
 
 After the JSON object, include only:
 1. optional `<!-- HUMAN_REQUIREMENTS_RESOLVED -->`

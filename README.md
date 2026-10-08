@@ -1297,7 +1297,7 @@ full-board. In the PR fix loop, `--pr-step-back-rounds K` (default 3, `0` disabl
 `--pr-step-back-line-window N` (default 40) apply the same idea: once a reviewer has blocked K
 consecutive rounds with new findings clustered on one file span, the next coder turn must fix
 the whole class with one rule and a parametrized test, that reviewer sweeps the resulting head
-for every remaining instance, and a further clustered sibling stops for a human decision. A child-planning cycle inherits `--plan-review-policy`,
+for every remaining instance, and a further clustered sibling stops for a human decision. `--pr-evidence-stall-rounds K` (default 2, `0` disables) stops for a human decision (exit 4) when K consecutive PR reviews have only evidence-only blockers (findings tagged with approved risk-matrix rows that stay unverified at the head), no failing check, and an unchanged set of unsatisfied rows. A child-planning cycle inherits `--plan-review-policy`,
 `--primary-plan-reviewer`, `--plan-primary-stall-rounds`, `--plan-step-back-rounds`, and `--plan-step-back-escalation-rounds` but never the parent's `--plan-review-force-full`
 override, `--plan-reset-stall-streak`, or scheduler state. `review-evaluation` reports planning runs in
 their own `plan` flow, separately from the PR rows, so staged and full-board

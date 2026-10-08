@@ -57,6 +57,7 @@ from .protocol import (
     EXECUTION_DISPOSITION_DIRECT,
     EXECUTION_DISPOSITION_PLANNING,
 )
+from .evidence_stall import approved_matrix_row_ids
 from .errors import (
     AgentInvocationError,
     AgentLoopError,
@@ -396,6 +397,7 @@ from .pr_loop_support import (
     _append_evidence_barrier_note,
     _evidence_freeze_diagnostic,
     _publish_evidence_freeze,
+    _pr_evidence_stall_decision,
     _publish_evidence_release,
     _evidence_freeze_gate,
     _refuse_dispatch_while_evidence_frozen,
@@ -3103,6 +3105,7 @@ def run_pr_loop(
                     # enriches the UnknownPriorItemDispositionError
                     # message, so an empty tuple changes no outcome.
                     current_round_items=(), architecture_status_mode=mode,
+                    approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
                 ))
 
             def _pr_publication(reviewer_name: str):
@@ -4055,6 +4058,7 @@ def run_pr_loop(
                                     repair_allowed_prior_item_ids=tuple(
                                         item.item_id for item in prior_unresolved_items
                                     ),
+                                    repair_evidence_row_ids=approved_matrix_row_ids(approved_plan_context) or (),
                                     ledger_incomplete=round_ledger_incomplete,
                                     repair_resolved_history_item_ids=round_resolved_history_item_ids,
                                     role="reviewer",
@@ -4336,6 +4340,7 @@ def run_pr_loop(
                         reviewer=reviewer_name,
                         unresolved_items=items,
                         current_round_items=round_new_unresolved_items, architecture_status_mode=mode,
+                        approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
                     ))
                     review_response, review_failure = _capture_agent_invocation(
                         lambda: _same_round_replay_or_invoke(
@@ -4398,6 +4403,7 @@ def run_pr_loop(
                             repair_allowed_prior_item_ids=tuple(
                                 item.item_id for item in prior_unresolved_items
                             ),
+                            repair_evidence_row_ids=approved_matrix_row_ids(approved_plan_context) or (),
                             ledger_incomplete=round_ledger_incomplete,
                             repair_resolved_history_item_ids=round_resolved_history_item_ids,
                             role="reviewer",
@@ -4592,6 +4598,7 @@ def run_pr_loop(
                                     status="blocking",
                                     fix_scope=blocking_item.fix_scope,
                                     sub_items=blocking_item.sub_items,
+                                    evidence_row_ids=blocking_item.evidence_row_ids,
                                 )
                                 round_new_unresolved_items.append(tracked_item)
                                 reviewer_new_unresolved_items.append(tracked_item)
@@ -5140,6 +5147,7 @@ def run_pr_loop(
                                     reviewer=reviewer_name,
                                     unresolved_items=prior_unresolved_items,
                                     current_round_items=round_new_unresolved_items, architecture_status_mode="strict",
+                                    approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
                                 ),
                                 repair_kwargs={
                                     "expected_kind": "pr_review",
@@ -5147,6 +5155,7 @@ def run_pr_loop(
                                     "allowed_prior_item_ids": tuple(
                                         item.item_id for item in prior_unresolved_items
                                     ),
+                                    "evidence_row_id_universe": approved_matrix_row_ids(approved_plan_context) or (),
                                 },
                                 forbid_architecture_impact=_acknowledgement_repair_forbids_assessment(
                                     review_output
@@ -5194,6 +5203,7 @@ def run_pr_loop(
                                             text=item.text,
                                             status="blocking",
                                             sub_items=item.sub_items,
+                                            evidence_row_ids=item.evidence_row_ids,
                                         )
                                         round_new_unresolved_items.append(new_item)
                                         unresolved_items.append(new_item)
@@ -7065,6 +7075,23 @@ def run_pr_loop(
                         runner, config=config, pr_number=pr_number,
                         body=_format_pr_checks_comment(pr_number, "failing", details),
                     )
+            # Evidence-only stall (#1324): decided after the check snapshot and
+            # CI reconciliation above, before any coder invocation.  Not
+            # evaluated on the merge-conflict path, which makes no check calls.
+            evidence_stall_snapshot = (
+                None
+                if has_merge_conflict_item
+                else _pr_evidence_stall_decision(
+                    runner,
+                    config,
+                    pr_number=pr_number,
+                    round_number=round_number,
+                    head_sha=pr_metadata.head_sha,
+                    approved_plan_context=approved_plan_context,
+                    open_items=unresolved_items,
+                    pr_checks=pr_checks,
+                )
+            )
             stall_context = (
                 _coder_infrastructure_stall_notice(pr_checks.infrastructure_stalls)
                 if pr_checks is not None and is_wholly_infrastructure_blocked(pr_checks)
@@ -7596,6 +7623,7 @@ def run_pr_loop(
                         and coder_response.marker_value.risk_test_matrix_evidence is not None
                         else None
                     ),
+                    evidence_stall=evidence_stall_snapshot,
                     risk_test_matrix_evidence_full_round=(
                         matrix_evidence_render_decision.anchor_round
                         if matrix_evidence_render_decision is not None

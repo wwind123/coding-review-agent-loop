@@ -900,6 +900,83 @@ def _validate_review_architecture_decision(source: object, target: dict) -> None
         )
 
 
+
+def _pr_finding_text(entry: object) -> str | None:
+    """Comparable text of a PR finding: a string, or an object's ``text`` plus sub-items."""
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, dict) and isinstance(entry.get("text"), str):
+        sub_items = entry.get("sub_items")
+        extra = (
+            [child for child in sub_items if isinstance(child, str)]
+            if isinstance(sub_items, list) else []
+        )
+        return " ".join([entry["text"], *extra])
+    return None
+
+
+def _pr_finding_view(entry: object) -> object:
+    """The preservable content of a PR finding, without scheduler/tag metadata."""
+    text = _pr_finding_text(entry)
+    return entry if text is None or isinstance(entry, str) else text
+
+
+def _validate_evidence_row_tag_preservation(
+    source: dict, target: dict, universe: Sequence[str] | None = None
+) -> None:
+    """A repair keeps each valid ``evidence_row_ids`` tag verbatim and invents none (#1324)."""
+
+    def tagged(payload: dict) -> list[tuple[str, tuple[str, ...] | None]]:
+        entries = payload.get("blocking_items")
+        result: list[tuple[str, tuple[str, ...] | None]] = []
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict) or not isinstance(entry.get("text"), str):
+                if isinstance(entry, str):
+                    result.append((entry, None))
+                continue
+            raw = entry.get("evidence_row_ids")
+            valid = (
+                isinstance(raw, list) and raw
+                and all(isinstance(v, str) and v.strip() for v in raw)
+                and len(set(raw)) == len(raw)
+                # With a known matrix an unknown row makes the tag invalid, so
+                # repair may (and must) remove it; it never invents one.
+                and (universe is None or set(raw) <= set(universe))
+            )
+            result.append((entry["text"], tuple(raw) if valid else None))
+        return result
+
+    source_items, target_items = tagged(source), tagged(target)
+
+    def match(text: str, candidates: list[tuple[str, tuple[str, ...] | None]]):
+        fragments = _fragments(text)
+        return [
+            candidate for candidate in candidates
+            if fragments and _contains_fragments(candidate[0], fragments)
+        ]
+
+    for text, tags in source_items:
+        if tags is None:
+            continue
+        if not any(candidate[1] == tags for candidate in match(text, target_items)):
+            raise AgentLoopError(
+                "Repair content preservation failed for blocking_items.evidence_row_ids: "
+                "keep each valid evidence_row_ids tag verbatim on its finding."
+            )
+    for text, tags in target_items:
+        if tags is None:
+            continue
+        sources = match(text, source_items) or [
+            candidate for candidate in source_items
+            if _contains_fragments(text, _fragments(candidate[0]))
+        ]
+        if not any(candidate[1] == tags for candidate in sources):
+            raise AgentLoopError(
+                "Repair content preservation failed for blocking_items.evidence_row_ids: "
+                "repair must not add or change an evidence_row_ids tag."
+            )
+
+
 def validate_repair_preservation(
     raw: str,
     repaired: str,
@@ -910,6 +987,7 @@ def validate_repair_preservation(
     allowed_prior_item_ids: Sequence[str] | None = None,
     allow_legacy_matrix_removal: bool = False,
     forbid_architecture_impact: bool = False,
+    evidence_row_id_universe: Sequence[str] | None = None,
 ) -> None:
     """Reject observable losses, not certify semantic equivalence.
 
@@ -1418,12 +1496,14 @@ def validate_repair_preservation(
     available = [
         _normalized(
             _flatten_plan_review_finding(entry, item_context=field)
-            if source["kind"] == "plan_review" else entry
+            if source["kind"] == "plan_review"
+            else _pr_finding_text(entry)
         )
         for field in finding_fields
         for entry in target.get(field, [])
         if isinstance(entry, str)
         or (source["kind"] == "plan_review" and isinstance(entry, dict))
+        or (source["kind"] == "pr_review" and isinstance(_pr_finding_text(entry), str))
     ]
     available.sort(key=len)
     # A typed human-only evidence request (#1068) must survive repair.  When the
@@ -1448,12 +1528,16 @@ def validate_repair_preservation(
                 "exact_head_evidence_requests",
             )
             moved_to_evidence.add(_normalized_review_item_text(entry))
+    if source["kind"] == "pr_review":
+        _validate_evidence_row_tag_preservation(source, target, evidence_row_id_universe)
     for field in finding_fields:
         entries = source.get(field)
         if not isinstance(entries, list):
             continue
         for entry in entries:
-            fragments = _fragments(entry)
+            fragments = _fragments(
+                _pr_finding_view(entry) if source["kind"] == "pr_review" else entry
+            )
             if not fragments:
                 continue
             if (

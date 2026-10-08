@@ -645,6 +645,17 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "topology or discussion answer rather than a claim."
         ),
     ),
+    "_expect_evidence_row_ids": ShapeCheckClassification(
+        "fatal",
+        frozenset({"no-conservative-reading", "payload-bound"}),
+        (
+            "A malformed evidence-only tag is rejected for bounded format repair rather "
+            "than dropped, so a finding is never silently reclassified (#1324). Fatal "
+            "sites: no-conservative-reading: removing the element would weaken an "
+            "obligation, finding, disposition, approved topology or discussion answer "
+            "rather than a claim; payload-bound: the tag list exceeds its fixed bound."
+        ),
+    ),
     "_reject_evidence_request_overlap": ShapeCheckClassification(
         "fatal",
         frozenset({"no-conservative-reading"}),

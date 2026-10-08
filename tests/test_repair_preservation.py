@@ -2400,3 +2400,58 @@ def test_repair_cannot_mint_test_level_on_added_or_unsourced_rows(kind, source_c
         duplicate["risk_test_matrix_claims"].append(claim("row-1", test_level="unit"))
         with pytest.raises(AgentLoopError, match="test_level"):
             check(source, duplicate)
+
+
+# --- evidence_row_ids tag preservation (#1324) -------------------------------
+
+def _evidence_review(blocking):
+    import json as _json
+
+    return _json.dumps({
+        "schema_version": 1, "kind": "pr_review", "state": "blocking", "summary": "s",
+        "blocking_items": blocking, "prior_item_dispositions": [],
+    }) + "\n<!-- AGENT_STATE: blocking -->\n-- Codex"
+
+
+_EVIDENCE_TEXT = "Provide admissible citations for the widget flow"
+
+
+def test_repair_keeps_a_valid_evidence_tag_verbatim():
+    source = _evidence_review([{"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r1"]}])
+    validate_repair_preservation(source, source)
+
+
+@pytest.mark.parametrize(
+    "repaired_item",
+    [
+        _EVIDENCE_TEXT,  # tag dropped
+        {"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r2"]},  # tag changed
+    ],
+)
+def test_repair_cannot_drop_or_change_a_valid_tag(repaired_item):
+    source = _evidence_review([{"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r1"]}])
+    with pytest.raises(AgentLoopError, match="evidence_row_ids"):
+        validate_repair_preservation(source, _evidence_review([repaired_item]))
+
+
+def test_repair_cannot_invent_a_tag():
+    with pytest.raises(AgentLoopError, match="must not add or change"):
+        validate_repair_preservation(
+            _evidence_review([_EVIDENCE_TEXT]),
+            _evidence_review([{"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r1"]}]),
+        )
+
+
+def test_repair_may_drop_a_tag_naming_a_row_outside_the_approved_matrix():
+    source = _evidence_review([{"text": _EVIDENCE_TEXT, "evidence_row_ids": ["r9"]}])
+    validate_repair_preservation(source, _evidence_review([_EVIDENCE_TEXT]), evidence_row_id_universe=("r1",))
+    with pytest.raises(AgentLoopError, match="evidence_row_ids"):
+        validate_repair_preservation(source, _evidence_review([_EVIDENCE_TEXT]))
+
+
+def test_repair_prompt_mentions_tag_rule_only_for_pr_review_with_a_universe():
+    from coding_review_agent_loop.repair import _build_repair_prompt
+
+    prompt = _build_repair_prompt("{}", expected_kind="pr_review", evidence_row_id_universe=("r1", "r2"))
+    assert "## Evidence row tags" in prompt and "r1, r2" in prompt
+    assert "## Evidence row tags" not in _build_repair_prompt("{}", expected_kind="pr_review")

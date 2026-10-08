@@ -368,6 +368,7 @@ def _run_structured_repair(
                     "require_execution_strategy_contract",
                     "require_risk_test_matrix_contract",
                     "reject_unsolicited_risk_test_matrix_contract",
+                    "evidence_row_id_universe",
                 )
             ):
                 raise
@@ -376,6 +377,7 @@ def _run_structured_repair(
             legacy_kwargs.pop("require_execution_strategy_contract", None)
             legacy_kwargs.pop("require_risk_test_matrix_contract", None)
             legacy_kwargs.pop("reject_unsolicited_risk_test_matrix_contract", None)
+            legacy_kwargs.pop("evidence_row_id_universe", None)
             repaired = attempt_repair(raw, config.gemini_cmd, **legacy_kwargs)
         if repaired is None:
             return None, None, []
@@ -388,6 +390,7 @@ def _run_structured_repair(
                     raw,
                     repaired,
                     allowed_prior_item_ids=repair_kwargs.get("allowed_prior_item_ids"),
+                    evidence_row_id_universe=repair_kwargs.get("evidence_row_id_universe"),
                     forbid_architecture_impact=forbid,
                 )
             elif forbid:
@@ -980,6 +983,7 @@ def _run_validated_agent(
     require_risk_test_matrix_contract: bool = False,
     reject_unsolicited_risk_test_matrix_contract: bool = False,
     repair_allowed_prior_item_ids: Sequence[str] | None = None,
+    repair_evidence_row_ids: Sequence[str] | None = None,
     ledger_incomplete: bool = False,
     repair_resolved_history_item_ids: Sequence[str] | None = None,
     role: str | None = None,
@@ -2449,6 +2453,8 @@ def _run_validated_agent(
                             repair_kwargs["same_round_context"] = exc.same_round_description
                         elif repair_allowed_prior_item_ids is not None:
                             repair_kwargs["allowed_prior_item_ids"] = tuple(repair_allowed_prior_item_ids)
+                        if repair_expected_kind == "pr_review" and repair_evidence_row_ids is not None:
+                            repair_kwargs["evidence_row_id_universe"] = tuple(repair_evidence_row_ids)
                         original_validation_error = str(exc)
                         if marker_safety_failure:
                             marker_safety_repair_attempted = True

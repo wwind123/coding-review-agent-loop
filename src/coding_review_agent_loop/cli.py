@@ -958,6 +958,19 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--pr-evidence-stall-rounds",
+            type=int,
+            default=None,
+            metavar="K",
+            help=(
+                "In the PR fix loop, stop for a human decision (exit 4) before the next "
+                "coder turn once K consecutive reviews have only evidence-only blockers "
+                "(findings tagged with approved risk-matrix rows that are still unverified "
+                "at the head), no failing check or other machine obligation, and an "
+                "unchanged set of unsatisfied rows (default: 2; 0 disables)."
+            ),
+        )
+        subparser.add_argument(
             "--plan-reset-stall-streak",
             dest="plan_reset_stall_streak",
             action="store_true",
