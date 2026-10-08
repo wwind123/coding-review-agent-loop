@@ -16,6 +16,7 @@ from .protocol import (
     _normalize_requirement_label,
     normalize_response_file_structured_text,
     parse_plan_revision_patch,
+    render_architecture_list_entry,
 )
 from .protocol_markers import (
     RESERVED_MARKER_REGISTRY,
@@ -686,8 +687,13 @@ def _validate_review_grounding(
 
 
 def _schema_valid_architecture_entry(value: object) -> bool:
-    """Return whether one architecture-list entry can pass schema validation."""
-    return isinstance(value, str) and bool(value.strip())
+    """Return whether one architecture-list entry can pass schema validation.
+
+    Renderability is the parser's own rule (#1330): a non-blank string or a
+    flat object the parser flattens losslessly is accepted content that a
+    repair must preserve, in either representation.
+    """
+    return render_architecture_list_entry(value) is not None
 
 
 def _payload_and_trailing(text: str) -> tuple[dict | None, str]:
@@ -846,9 +852,14 @@ def _preserve_architecture_list(
 
     matched_source_by_target: dict[int, int] = {}
 
-    def can_match(source_entry: str, target_entry: object) -> bool:
-        fragments = _fragments(source_entry)
-        return not fragments or _contains_fragments(target_entry, fragments)
+    def can_match(source_entry: object, target_entry: object) -> bool:
+        # Compare rendered text on both sides so a source object matches
+        # either a retained identical object or its flattened string (#1330).
+        fragments = _fragments(render_architecture_list_entry(source_entry))
+        rendered_target = render_architecture_list_entry(target_entry)
+        return not fragments or (
+            rendered_target is not None and _contains_fragments(rendered_target, fragments)
+        )
 
     def augment(source_index: int, visited_targets: set[int]) -> bool:
         for target_index, target_entry in enumerate(target):

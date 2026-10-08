@@ -2535,3 +2535,84 @@ def test_repair_keeps_two_tagged_duplicates_and_an_untagged_sibling_one_to_one()
         {"text": _EVIDENCE_TEXT, "sub_items": [_CODE_DEFECT]},
     ]
     validate_repair_preservation(_evidence_review(items), _evidence_review(list(reversed(items))))
+
+
+# --- #1330: renderable object entries are pinned and matched by rendered text ---
+
+_OBJECT_1330 = {"area": "x", "change": "y"}
+_FLAT_1330 = "area: x; change: y"
+
+
+def _arch_source_1330(entries):
+    return {
+        "kind": "task_result",
+        "notes": "unexpected key",  # the unrelated, repairable defect
+        "architecture_impact": {"affected_components": entries},
+    }
+
+
+def _arch_target_1330(entries):
+    return {
+        "kind": "task_result",
+        "architecture_impact": {
+            "status": "unchanged",
+            "rationale": "No architectural contract changed.",
+            "affected_components": entries,
+        },
+    }
+
+
+@pytest.mark.parametrize("kept", [[_OBJECT_1330], [_FLAT_1330]], ids=["object", "flattened"])
+def test_object_only_list_survives_as_object_or_flattened_string_1330(kept):
+    source = _arch_source_1330([_OBJECT_1330])
+    validate_structured_task_result(valid_task_result(_arch_target_1330(kept)["architecture_impact"]))
+    check(source, _arch_target_1330(kept))
+
+
+@pytest.mark.parametrize(
+    "lost",
+    [[], ["area: x"], [{"area": "x"}], [{"area": "x", "change": "z"}], ["unrelated"]],
+    ids=["dropped", "truncated-string", "truncated-object", "altered-object", "replaced"],
+)
+def test_object_only_list_cannot_be_dropped_or_altered_1330(lost):
+    source = _arch_source_1330([_OBJECT_1330])
+    with pytest.raises(AgentLoopError, match="architecture_impact.affected_components"):
+        check(source, _arch_target_1330(lost))
+
+
+@pytest.mark.parametrize(
+    "kept",
+    [
+        ["kept", _OBJECT_1330],
+        ["kept", _FLAT_1330],
+        [_FLAT_1330, "kept"],
+        ["kept", _OBJECT_1330, "corrected"],
+    ],
+    ids=["object", "flattened", "reordered", "invalid-corrected"],
+)
+def test_mixed_list_keeps_renderable_entries_and_may_drop_invalid_1330(kept):
+    source = _arch_source_1330(["kept", _OBJECT_1330, 7])
+    validate_structured_task_result(valid_task_result(_arch_target_1330(kept)["architecture_impact"]))
+    check(source, _arch_target_1330(kept))
+
+
+@pytest.mark.parametrize(
+    "lost",
+    [["kept"], ["kept", "area: x; change: changed"], [_OBJECT_1330], ["kept", {"area": "x"}, 7]],
+    ids=["object-dropped", "object-text-altered", "string-dropped", "object-truncated"],
+)
+def test_mixed_list_cannot_lose_a_renderable_entry_1330(lost):
+    source = _arch_source_1330(["kept", _OBJECT_1330, 7])
+    with pytest.raises(AgentLoopError, match="architecture_impact.affected_components"):
+        check(source, _arch_target_1330(lost))
+
+
+def test_schema_valid_architecture_field_pins_renderable_objects_1330():
+    field = _rp._schema_valid_architecture_field
+    assert field("affected_components", [_OBJECT_1330]) is True
+    assert field("affected_components", [{"tags": ["a", "b"], "note": "n"}]) is True
+    assert field("affected_components", ["kept", 7]) is True
+    assert field("affected_components", []) is True
+    assert field("affected_components", [{}, {"a": {"b": "c"}}, {"n": 1}, "", 7]) is False
+    assert _rp._schema_valid_architecture_entry(_OBJECT_1330) is True
+    assert _rp._schema_valid_architecture_entry({"n": 1}) is False

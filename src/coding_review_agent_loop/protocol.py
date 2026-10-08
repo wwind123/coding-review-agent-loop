@@ -608,7 +608,14 @@ def architecture_impact_contract_for(
 
 
 def _non_blank_string_entries(value: object) -> bool:
-    return isinstance(value, list) and any(isinstance(item, str) and item.strip() for item in value)
+    """Positive evidence: at least one entry the payload parser would accept.
+
+    A renderable flat object counts exactly when `_expect_string_list` would
+    flatten it (#1330), so classification and the parse that follows agree.
+    """
+    return isinstance(value, list) and any(
+        render_architecture_list_entry(item) is not None for item in value
+    )
 
 
 def _near_miss_predicate_failure(payload: Mapping[str, object]) -> str | None:
@@ -820,22 +827,22 @@ def _parse_architecture_impact_payload(
     path_value = payload.get("canonical_document_path")
     if path_value is not None and (not isinstance(path_value, str) or not path_value.strip()):
         raise AgentLoopError(f"{context}.canonical_document_path must be a non-empty string or null.")  # shape-check: fatal:no-conservative-reading
-    combined = _expect_string_list(payload.get("execution_data_flows", []), context=f"{context}.execution_data_flows", item_context=context)  # shape-check: fatal:no-conservative-reading
-    execution = _expect_string_list(payload.get("execution_flows", []), context=f"{context}.execution_flows", item_context=context)  # shape-check: fatal:no-conservative-reading
-    data = _expect_string_list(payload.get("data_flows", []), context=f"{context}.data_flows", item_context=context)  # shape-check: fatal:no-conservative-reading
+    combined = _expect_string_list(payload.get("execution_data_flows", []), context=f"{context}.execution_data_flows", item_context=context, flatten_object_items=True)  # shape-check: fatal:no-conservative-reading
+    execution = _expect_string_list(payload.get("execution_flows", []), context=f"{context}.execution_flows", item_context=context, flatten_object_items=True)  # shape-check: fatal:no-conservative-reading
+    data = _expect_string_list(payload.get("data_flows", []), context=f"{context}.data_flows", item_context=context, flatten_object_items=True)  # shape-check: fatal:no-conservative-reading
     if not combined and (execution or data):
         combined = (*execution, *data)
     return ArchitectureImpact(
         status=status,
         rationale=rationale,
-        affected_components=_expect_string_list(payload.get("affected_components", []), context=f"{context}.affected_components", item_context=context),  # shape-check: fatal:no-conservative-reading
-        dependencies=_expect_string_list(payload.get("dependencies", []), context=f"{context}.dependencies", item_context=context),  # shape-check: fatal:no-conservative-reading
+        affected_components=_expect_string_list(payload.get("affected_components", []), context=f"{context}.affected_components", item_context=context, flatten_object_items=True),  # shape-check: fatal:no-conservative-reading
+        dependencies=_expect_string_list(payload.get("dependencies", []), context=f"{context}.dependencies", item_context=context, flatten_object_items=True),  # shape-check: fatal:no-conservative-reading
         execution_data_flows=combined,
         execution_flows=execution,
         data_flows=data,
-        persistence=_expect_string_list(payload.get("persistence", []), context=f"{context}.persistence", item_context=context),  # shape-check: fatal:no-conservative-reading
-        public_contracts=_expect_string_list(payload.get("public_contracts", []), context=f"{context}.public_contracts", item_context=context),  # shape-check: fatal:no-conservative-reading
-        security_boundaries=_expect_string_list(payload.get("security_boundaries", []), context=f"{context}.security_boundaries", item_context=context),  # shape-check: fatal:no-conservative-reading
+        persistence=_expect_string_list(payload.get("persistence", []), context=f"{context}.persistence", item_context=context, flatten_object_items=True),  # shape-check: fatal:no-conservative-reading
+        public_contracts=_expect_string_list(payload.get("public_contracts", []), context=f"{context}.public_contracts", item_context=context, flatten_object_items=True),  # shape-check: fatal:no-conservative-reading
+        security_boundaries=_expect_string_list(payload.get("security_boundaries", []), context=f"{context}.security_boundaries", item_context=context, flatten_object_items=True),  # shape-check: fatal:no-conservative-reading
         canonical_document_action=action,
         canonical_document_path=path_value,
         canonical_document_rationale=(
@@ -847,7 +854,7 @@ def _parse_architecture_impact_payload(
             else ""
         ),
         uncertainty=(
-            *_expect_string_list(payload.get("uncertainty", []), context=f"{context}.uncertainty", item_context=context),  # shape-check: fatal:no-conservative-reading
+            *_expect_string_list(payload.get("uncertainty", []), context=f"{context}.uncertainty", item_context=context, flatten_object_items=True),  # shape-check: fatal:no-conservative-reading
             *((normalization_note,) if normalization_note else ()),
         ),
     )
@@ -4186,18 +4193,112 @@ def _expect_non_empty_string(value: object, *, context: str) -> str:
     return normalized
 
 
+def _flat_object_defect(value: Mapping[object, object]) -> tuple[str, str] | None:
+    """Return `(key, description)` for the first value that cannot render losslessly.
+
+    A renderable object is non-empty, has only non-empty string keys, and every
+    value is a non-blank string or a non-empty list of non-blank strings.
+    Anything else (nested objects, nested lists, numbers, booleans, null, empty
+    strings, empty lists) would change meaning when rendered, so it is a defect.
+    """
+    if not value:
+        return "", "an empty object"
+    for key, child in value.items():
+        if not isinstance(key, str) or not key.strip():
+            return str(key), "a non-string or empty key"
+        if isinstance(child, str):
+            if not child.strip():
+                return key, "an empty string"
+            continue
+        if isinstance(child, list):
+            if not child:
+                return key, "an empty list"
+            for entry in child:
+                if isinstance(entry, bool) or not isinstance(entry, str):
+                    return key, "a list with a non-string entry"
+                if not entry.strip():
+                    return key, "a list with an empty string entry"
+            continue
+        if isinstance(child, Mapping):
+            return key, "a nested object"
+        if child is None:
+            return key, "null"
+        if isinstance(child, bool):
+            return key, "a boolean"
+        if isinstance(child, (int, float)):
+            return key, "a number"
+        return key, f"a {type(child).__name__} value"
+    return None
+
+
+def render_architecture_list_entry(value: object) -> str | None:
+    """Losslessly render one architecture-impact list entry, or None (#1330).
+
+    A non-blank string renders as its stripped text.  A flat object with only
+    string or string-list values renders one `key: value` pair per item in the
+    object's own key order, pairs joined by `; ` and list values joined by
+    `, `.  Every other value, including an object with a defect reported by
+    `_flat_object_defect`, returns None.  The payload parser, the near-miss
+    corroboration predicate and repair preservation all decide renderability
+    through this one helper.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if isinstance(value, Mapping) and _flat_object_defect(value) is None:
+        return _render_flat_object(value)
+    return None
+
+
+def _render_flat_object(value: Mapping[object, object]) -> str:
+    """Render an object already known to have no `_flat_object_defect`."""
+    pairs: list[str] = []
+    for key, child in value.items():
+        text = child.strip() if isinstance(child, str) else ", ".join(
+            entry.strip() for entry in child
+        )
+        pairs.append(f"{str(key).strip()}: {text}")
+    return "; ".join(pairs)
+
+
+def _flatten_labelled_object(value: Mapping[object, object], *, context: str) -> str:
+    """Render a flat object item to text, or raise naming the offending key."""
+    defect = _flat_object_defect(value)
+    if defect is not None:
+        key, description = defect
+        raise AgentLoopError(  # shape-check: delegated
+            f"{context} object item must contain only non-empty string or "
+            f"string-list values; got {description} for key {key!r}."
+        )
+    return _render_flat_object(value)
+
+
 def _expect_string_list(
     value: object,
     *,
     context: str,
     item_context: str,
     min_length: int = 0,
+    flatten_object_items: bool = False,
 ) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise AgentLoopError(f"{context} must be a JSON array.")  # shape-check: delegated
+    items: list[object] = []
+    for index, item in enumerate(value):
+        if flatten_object_items and isinstance(item, Mapping):
+            # Opt-in for the architecture_impact list fields only (#1330):
+            # flatten before validation so a structured item never needs a
+            # model repair pass, and leave an audit line for the normalization.
+            item = _flatten_labelled_object(item, context=f"{item_context} at index {index}")  # shape-check: delegated
+            _logger.warning(
+                "%s at index %d: flattened architecture-impact object item to text",
+                item_context,
+                index,
+            )
+        items.append(item)
     rendered = tuple(
         _expect_non_empty_string(item, context=f"{item_context} at index {index}")  # shape-check: delegated
-        for index, item in enumerate(value)
+        for index, item in enumerate(items)
     )
     if len(rendered) < min_length:
         raise AgentLoopError(f"{context} must contain at least {min_length} item(s).")  # shape-check: delegated

@@ -507,3 +507,141 @@ def test_plan_review_reask_keeps_frozen_prompt_and_publishes_nothing_between_tur
     assert runner.comments_at_reask is not None
     assert not any("GEMINI-UNIQUE" in c or "CODEX-BAD" in c for c in runner.comments_at_reask)
     assert repairs == []
+
+
+# --- #1330: object list items are accepted at the seam without repair ---
+
+from coding_review_agent_loop.errors import AgentInvocationError  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    validate_structured_issue_implementation,
+)
+from agent_loop_helpers import structured_issue_implementation  # noqa: E402
+
+_OBJ_CHANGED_1330 = {
+    "status": "changed",
+    "rationale": "A typed registry replaces the ad hoc lookup.",
+    "affected_components": [{"area": "x", "change": "y"}],
+    "dependencies": [],
+    "execution_data_flows": [],
+    "persistence": [],
+    "public_contracts": [],
+    "security_boundaries": [],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the registry.",
+}
+_OBJ_MODIFIED_1330 = {
+    "status": "modified",
+    "rationale": "The parser gains a flattening step.",
+    "affected_components": [{"name": "protocol parser", "change": "modified"}],
+    "dependencies": [{"from": "repair_preservation.py", "to": "protocol.py", "kind": "import"}],
+    "execution_data_flows": [{"flow": "response -> parser -> seam"}],
+    "persistence": [{"record": "round metadata degradation records"}],
+    "public_contracts": [{"contract": "architecture_impact list fields"}],
+    "security_boundaries": [{"boundary": "agent payload trust boundary"}],
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document the flattening.",
+}
+_EMPTY_MODIFIED_1330 = {
+    **{key: [] for key in (
+        "affected_components", "dependencies", "execution_data_flows",
+        "persistence", "public_contracts", "security_boundaries",
+    )},
+    "status": "modified",
+    "rationale": "Something changed.",
+    "canonical_document_action": "update",
+    "canonical_document_path": "ARCHITECTURE.md",
+    "canonical_document_rationale": "Document it.",
+}
+
+
+def _issue_validators_1330():
+    return _architecture_mode_validators(
+        lambda mode: lambda text: validate_structured_issue_implementation(
+            text, required_architecture_impact_contract=1, architecture_status_mode=mode
+        )
+    )
+
+
+def _run_issue_1330(runner, config):
+    return orchestrator._run_validated_agent(
+        runner,
+        agent="claude",
+        config=config,
+        prompt="Implement.",
+        session_id="sess-1",
+        marker_description="structured issue_implementation result",
+        **_issue_validators_1330(),
+        use_repair=True,
+        repair_expected_kind="issue_implementation",
+        role="coder",
+        operation_description="issue implementation",
+        require_architecture_impact_contract=True,
+    )
+
+
+def _claude(runner):
+    return ["\n".join(cmd) for cmd, _ in runner.commands if cmd[:1] == ["claude"]]
+
+
+def test_seam_accepts_declared_changed_with_object_entries_without_repair_1330(tmp_path):
+    text = _with_impact(structured_issue_implementation(), _OBJ_CHANGED_1330)
+    runner = FakeRunner(claude_outputs=[text])
+    config = make_config(tmp_path, agent_max_retries=0)
+    repairs: list[str] = []
+    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+        response = _run_issue_1330(runner, config)
+    assert repairs == []
+    assert len(_claude(runner)) == 1
+    parsed = response.marker_value
+    assert parsed.architecture_impact.status == "changed"
+    assert parsed.architecture_impact.affected_components == ("area: x; change: y",)
+    assert parsed.architecture_impact_degradations == ()
+    strict = validate_structured_issue_implementation(
+        response.text, required_architecture_impact_contract=1
+    )
+    assert strict.architecture_impact.affected_components == ("area: x; change: y",)
+
+
+def test_seam_accepts_corroborated_modified_with_object_entries_1330(tmp_path):
+    text = _with_impact(structured_issue_implementation(), _OBJ_MODIFIED_1330)
+    runner = FakeRunner(claude_outputs=[text])
+    config = make_config(tmp_path, agent_max_retries=0)
+    repairs: list[str] = []
+    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+        response = _run_issue_1330(runner, config)
+    assert repairs == []
+    assert len(_claude(runner)) == 1
+    parsed = response.marker_value
+    assert parsed.architecture_impact.status == "changed"
+    assert parsed.architecture_impact.affected_components == (
+        "name: protocol parser; change: modified",
+    )
+    assert [r.outcome for r in parsed.architecture_impact_degradations] == ["normalized-to-changed"]
+    head = json.loads(response.text.partition("\n")[0])
+    assert head["architecture_impact"]["status"] == "changed"
+    assert '"status": "modified"' not in response.text
+    strict = validate_structured_issue_implementation(
+        response.text, required_architecture_impact_contract=1
+    )
+    assert strict.architecture_impact.status == "changed"
+    assert strict.architecture_impact.dependencies == (
+        "from: repair_preservation.py; to: protocol.py; kind: import",
+    )
+
+
+def test_seam_still_refuses_modified_with_empty_evidence_1330(tmp_path):
+    text = _with_impact(structured_issue_implementation(), _EMPTY_MODIFIED_1330)
+    runner = FakeRunner(claude_outputs=[text])
+    config = make_config(tmp_path, agent_max_retries=0)
+    repairs: list[str] = []
+    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+        with pytest.raises(AgentInvocationError) as error:
+            _run_issue_1330(runner, config)
+    preserved = error.value.preserved_unsatisfied_response
+    assert preserved is not None and preserved.text == text
+    assert [r.outcome for r in preserved.architecture_impact_degradations] == [
+        "degraded-to-undetermined"
+    ]
+    assert "architecture_impact" in str(error.value)
