@@ -596,6 +596,14 @@ returned, so no reviewer can read a peer's findings mid-turn. A reviewer that
 must be retried, or a round interrupted mid-publication, is resumed from a
 private local spool rather than re-run against peers' posted reviews:
 
+Phase 1 also accepts named-seat configuration for preflight validation:
+`--reviewer-seat ID=BACKEND`, `--seat-model ID=MODEL`, `--seat-effort ID=EFFORT`,
+and `--seat-dir ID=PATH`. `--primary-reviewer-seat` and
+`--primary-plan-reviewer-seat` select a configured seat for the corresponding
+primary policy. Named review execution is currently gated until seat identity
+is carried through durable review state. Existing `--reviewer agy` with
+`--antigravity-models` remains one reviewer with an ordered fallback chain.
+
 ```bash
 agent-loop pr 456 \
   --repo OWNER/REPO \

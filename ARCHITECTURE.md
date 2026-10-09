@@ -1844,3 +1844,16 @@ the same style as `scheduler_metadata_status`: a missing key decodes as
 is a positive integer no later than the previous record's round; an `absent`
 status on a record with evidence is a pre-#959 record, which rendered the full
 list itself, so its own round is the anchor; `invalid` forces a full render.
+
+## Named reviewer seat preflight
+
+`reviewer_seats.py` defines an immutable seat configuration with a stable ID,
+backend, ordered model chain, optional supported effort, and optional workdir.
+The CLI validates named seats before command lookup, repository detection,
+workdir claims, and agent invocation. Validation covers reserved identities,
+model overlap within one backend, and explicit checkout collisions. Sandboxed
+permission checks use the seat's resolved backend and identify the rejected
+seat. During phase 1 the review loops still key durable state by backend, so
+named-seat execution stops at this preflight boundary. Legacy default seats
+continue through the existing backend-keyed paths with their historical
+signatures, metadata, quota behavior, and Antigravity settings lock.

@@ -32,6 +32,34 @@ PACKAGE_DIR = str(Path(coding_review_agent_loop.__file__).resolve().parent)
 WRAPPER = ("/opt/tools/venv/bin/python", "-m", "coding_review_agent_loop.cli", "run-tests")
 
 
+@pytest.mark.parametrize("backend", ["agy", "gemini"])
+def test_named_sandboxed_reviewer_is_refused_before_command_lookup(monkeypatch, capsys, backend):
+    from coding_review_agent_loop import cli
+
+    monkeypatch.setattr(cli, "config_from_args", lambda *a, **k: pytest.fail("command preflight ran"))
+    code = cli.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--agent-permissions", "sandboxed",
+        "--reviewer-seat", f"model-a={backend}", "--seat-model", "model-a=Model A",
+        "--primary-reviewer-seat", "model-a", "--pr-review-policy", "primary-then-panel",
+    ])
+    assert code == 1
+    error = capsys.readouterr().err
+    assert "model-a" in error and "sandboxed" in error
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+def test_named_sandboxed_supported_backend_reaches_phase_gate(monkeypatch, capsys, backend):
+    from coding_review_agent_loop import cli
+
+    monkeypatch.setattr(cli, "config_from_args", lambda *a, **k: pytest.fail("command preflight ran"))
+    code = cli.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--agent-permissions", "sandboxed",
+        "--reviewer-seat", f"model-a={backend}", "--seat-model", "model-a=Model A",
+    ])
+    assert code == 1
+    assert "execution is unavailable in phase 1" in capsys.readouterr().err
+
+
 def _executable(path: Path, body: str = "#!/bin/sh\nexit 0\n") -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")

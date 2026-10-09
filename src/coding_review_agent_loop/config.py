@@ -1880,6 +1880,13 @@ def config_from_args(
     *,
     invocation_argv: tuple[str, ...] = (),
 ) -> AgentLoopConfig:
+    from .reviewer_seats import resolve_reviewer_seats
+
+    if resolve_reviewer_seats(args):
+        raise AgentLoopError(
+            "Named reviewer seats are validated but review execution is unavailable in phase 1; "
+            "use legacy --reviewer until durable seat identity is enabled."
+        )
     configured_reviewers = tuple(args.reviewer or ["codex"])
     if len(set(configured_reviewers)) != len(configured_reviewers):
         raise AgentLoopError("--reviewer cannot include the same agent more than once.")

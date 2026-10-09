@@ -3475,6 +3475,63 @@ def test_config_rejects_duplicate_reviewers(tmp_path):
         config_from_args(args, FakeRunner())
 
 
+@pytest.mark.parametrize("seat_flags,expected", [
+    (["--reviewer-seat", "agy=agy", "--seat-model", "agy=Model"], "reserved"),
+    (["--reviewer-seat", "Orchestrator=codex", "--seat-model", "Orchestrator=m"], "reserved"),
+    (["--reviewer-seat", "a=agy", "--reviewer-seat", "a=agy", "--seat-model", "a=Model"], "Duplicate"),
+    (["--reviewer-seat", "a=agy"], "requires --seat-model"),
+    (["--reviewer-seat", "a=codex", "--seat-model", "a=one", "--seat-model", "a=two"], "fallback"),
+    (["--reviewer-seat", "a=agy", "--seat-model", "a=one", "--seat-effort", "a=high"], "unsupported"),
+    (["--reviewer-seat", "a=agy", "--seat-model", "a=Gemini 3.8 Flash (High)",
+      "--reviewer-seat", "b=agy", "--seat-model", "b=gemini-3.8-flash-high"], "overlap"),
+    (["--reviewer-seat", "a=agy", "--seat-model", "a=Model A",
+      "--antigravity-models", "Model B"], "not named antigravity seats"),
+    (["--reviewer-seat", "a=codex", "--seat-model", "a=Model A",
+      "--reviewer-codex-model", "Model B"], "requires an explicit legacy"),
+])
+def test_named_seat_validation_precedes_dispatch(tmp_path, monkeypatch, capsys, seat_flags, expected):
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    code = cli_module.main(["pr", "77", "--repo", "OWNER/REPO", *seat_flags])
+    assert code == 1
+    assert expected in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_valid_named_seats_are_gated_before_dispatch(monkeypatch, capsys):
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    code = cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "gemini-seat=agy",
+        "--seat-model", "gemini-seat=Gemini 3.8 Flash (High)",
+        "--reviewer-seat", "claude-seat=agy", "--seat-model", "claude-seat=Claude Opus 5.5 (Medium)",
+    ])
+    assert code == 1
+    assert "execution is unavailable in phase 1" in capsys.readouterr().err
+
+
+def test_discuss_rejects_named_seats(capsys):
+    code = cli_module.main([
+        "discuss", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "model-a=claude",
+        "--seat-model", "model-a=Model A",
+    ])
+    assert code == 1
+    assert "discuss does not support named" in capsys.readouterr().err
+
+
+def test_named_seat_rejects_legacy_implicit_model_and_coder_workdir(tmp_path, capsys):
+    common = ["pr", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "model-a=agy",
+              "--seat-model", "model-a=Gemini 3.8 Flash (High)"]
+    assert cli_module.main([*common, "--reviewer", "agy"]) == 1
+    assert "overlaps the legacy" in capsys.readouterr().err
+    checkout = tmp_path / "checkout"
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--coder", "claude",
+        "--claude-dir", str(checkout), "--reviewer-seat", "model-a=codex",
+        "--seat-model", "model-a=Model A", "--seat-dir", f"model-a={checkout}",
+    ]) == 1
+    assert "workdir collides with coder" in capsys.readouterr().err
+    assert not checkout.exists()
+
+
 def test_config_rejects_alias_and_canonical_duplicate_reviewers(tmp_path):
     parser = build_parser()
     args = parser.parse_args([
