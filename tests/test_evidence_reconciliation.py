@@ -236,3 +236,173 @@ def test_base_reproduction_citation_authority_is_unchanged(monkeypatch):
             assert _receipt_expected_status(current, claim=claim) == _receipt_expected_status(
                 previous, claim=claim
             )
+
+
+# --- #1329: the authenticated response-validation seam --------------------------
+
+import dataclasses
+from pathlib import Path
+from types import SimpleNamespace
+
+import coding_review_agent_loop.response_validation as validation_module
+from coding_review_agent_loop.protocol import validate_structured_coder_followup
+from coding_review_agent_loop.round_state import make_approved_plan_context
+from agent_loop_helpers import structured_coder_followup
+
+
+def _seam_row(registry, workdir, *, receipt, outcome, digest, head, minute,
+              state="current-head", claim=None):
+    return replace(
+        _journal_row(registry, receipt=receipt, outcome=outcome, digest=digest, head=head,
+                     minute=minute, state=state, claim=claim),
+        cwd=str(workdir),
+    )
+
+
+def _restored_failure(receipt, *, state="current-head", claim=None):
+    row = {
+        "command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"],
+        "outcome": "failed", "provenance": "parent-observed", "receipt_id": receipt,
+        "turn_id": "turn-current", "timestamp": "2026-10-09T09:59:00+00:00",
+        "attribution": {"state": state, "head": "head-a", "stable": True,
+                        "tracked_digest": "tree-a"},
+    }
+    if claim is not None:
+        row["claim"] = claim
+    return row
+
+
+def _validate_at_seam(monkeypatch, workdir, journal, *, selected, disable_classification=False):
+    """Run the real post-auth validation seam: snapshot, admissibility, both reconciles."""
+    matrix = _matrix()
+    identity = risk_test_matrix_identity(matrix)
+    plan_context = make_approved_plan_context(
+        None,
+        expected_hash="a" * 16,
+        expected_subject="b" * 64,
+        risk_test_matrix_contract_version=1,
+        risk_test_matrix_payload=matrix.to_payload(),
+        risk_test_matrix_changes_payload=(),
+        risk_test_matrix_identity=identity,
+        risk_test_matrix_boundary_digest=identity,
+    )
+    parsed = validate_structured_coder_followup(structured_coder_followup())
+    parsed = dataclasses.replace(parsed, risk_test_matrix_claims=SemanticRiskCoverageClaims((
+        SemanticRiskCoverageClaim(
+            row_id="row-gate",
+            execution_refs=tuple(f"turn-current:{receipt}" for receipt in selected),
+            test_identifiers=("tests/test_protocol.py::test_gate",),
+            test_locations=("tests/test_protocol.py",),
+            workflow_path_claim="The reviewer validation path ran.",
+            outcome_assertions=("The selected test passed.",),
+            forbidden_effect_assertions=("No failure was hidden.",),
+        ),
+    )))
+    snapshot = TrackedTreeSnapshot(
+        root=str(workdir), head="head-b", digest="all", tracked_digest="tree-b",
+        status_clean=True, complete=True, stable=True,
+    )
+    live = tuple(row for row in journal if isinstance(row, LocalTestObservation))
+    runner = SimpleNamespace(
+        latest_test_turn_id="turn-current",
+        current_test_turn_observations=lambda: live,
+        local_test_observations=lambda: tuple(journal),
+    )
+    reconciled = []
+
+    def capture(*args, **kwargs):
+        evidence = reconcile_test_observations(*args, **kwargs)
+        reconciled.append(evidence)
+        return evidence
+
+    with monkeypatch.context() as patch:
+        patch.setattr(validation_module, "stable_tracked_tree_snapshot", lambda _cwd: snapshot)
+        patch.setattr(validation_module, "reconcile_test_observations", capture)
+        if disable_classification:
+            patch.setattr(
+                evidence_module, "_classify_tree_change_failures", lambda *a, **k: None
+            )
+        derived, result = validation_module._derive_authenticated_risk_evidence_for_coder(
+            parsed,
+            approved_plan_context=plan_context,
+            runner=runner,
+            assigned_workdir=Path(workdir),
+            head_sha="head-b",
+            invocation_id="turn-current",
+            assigned_worktree_head="head-b",
+        )
+    assert result is not None
+    # The seam reconciles the journal first, then the selectable catalog.
+    journal_evidence = reconciled[0]
+    return (
+        derived.risk_test_matrix_evidence.rows[0],
+        {d.code for d in result.diagnostics},
+        journal_evidence,
+    )
+
+
+@pytest.mark.parametrize("failure_kind", ["obsolete-live", "obsolete-restored", "current-digest"])
+def test_validation_seam_journal_gate_ignores_only_historical_failures(
+    monkeypatch, tmp_path, failure_kind
+):
+    registry = EnvironmentIdentityRegistry()
+    passing = replace(
+        _seam_row(registry, tmp_path, receipt="pass-b", outcome="passed", digest="tree-b",
+                  head="head-b", minute=5),
+        scope=EvidenceScope("suite", ("tests/test_protocol.py::test_gate",)),
+    )
+    if failure_kind == "obsolete-live":
+        failure = _seam_row(registry, tmp_path, receipt="fail", outcome="failed",
+                            digest="tree-a", head="head-a", minute=0)
+    elif failure_kind == "obsolete-restored":
+        failure = _restored_failure("fail")
+    else:
+        failure = _seam_row(registry, tmp_path, receipt="fail", outcome="failed",
+                            digest="tree-b", head="head-b", minute=0)
+
+    row, codes, journal_evidence = _validate_at_seam(
+        monkeypatch, tmp_path, [failure, passing], selected=["pass-b"]
+    )
+    labels = {item.receipt_id: item.superseded_by for item in journal_evidence.observations}
+    assert labels["fail"] == (None if failure_kind == "current-digest" else TREE_CHANGE_SUPERSESSION)
+
+    if failure_kind == "current-digest":
+        assert "unsuperseded-journal-failure" in codes
+        assert row.status == "incomplete"
+    else:
+        assert "unsuperseded-journal-failure" not in codes
+        assert row.status == "verified"
+
+
+@pytest.mark.parametrize("selected", ["base-other-head", "base-current-digest"])
+def test_validation_seam_base_reproduction_status_is_unchanged(monkeypatch, tmp_path, selected):
+    registry = EnvironmentIdentityRegistry()
+    journal = [
+        _seam_row(registry, tmp_path, receipt="base-other-head", outcome="passed",
+                  digest="tree-a", head="head-a", minute=0, state="base-reproduction"),
+        _seam_row(registry, tmp_path, receipt="base-current-digest", outcome="passed",
+                  digest="tree-b", head="head-b", minute=1, state="base-reproduction"),
+        # Live and restored base failures, by state and by claim.
+        _seam_row(registry, tmp_path, receipt="base-live-state", outcome="failed",
+                  digest="tree-a", head="head-a", minute=2, state="base-reproduction"),
+        _seam_row(registry, tmp_path, receipt="base-live-claim", outcome="failed",
+                  digest="tree-a", head="head-a", minute=3, claim="base-reproduction"),
+        _restored_failure("base-restored-state", state="base-reproduction"),
+        _restored_failure("base-restored-claim", claim="base-reproduction"),
+    ]
+
+    now_row, now_codes, now_journal = _validate_at_seam(
+        monkeypatch, tmp_path, journal, selected=[selected]
+    )
+    today_row, today_codes, today_journal = _validate_at_seam(
+        monkeypatch, tmp_path, journal, selected=[selected], disable_classification=True
+    )
+
+    assert now_row == today_row
+    assert now_codes == today_codes
+    assert now_row.status != "verified"
+    assert now_journal.observations == today_journal.observations
+    assert not any(item.superseded_by for item in now_journal.observations)
+    assert set(now_journal.authoritative_failures) == {
+        "base-live-state", "base-live-claim", "base-restored-state", "base-restored-claim",
+    }

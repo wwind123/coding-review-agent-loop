@@ -239,6 +239,16 @@ def _render_test_observation_citations(
         if observed is not None and observed.is_non_evidence_launch_failure:
             # A citation never turns a non-evidence launch failure into evidence.
             reason = "pre-collection launch failure (not evidence)"
+        elif (
+            observed is not None
+            and observed.is_failure
+            and observed.superseded_by == TREE_CHANGE_SUPERSESSION
+        ):
+            # Issue #1329: a cited failure keeps its historical classification.
+            reason = (
+                "historical failure at an obsolete tree (not an outstanding "
+                f"obligation) `{observed.outcome}`"
+            )
         if supported:
             cited.add(receipt_id)
         lines.append(

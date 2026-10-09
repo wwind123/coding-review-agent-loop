@@ -1318,3 +1318,33 @@ def test_historical_rows_are_evicted_first_under_byte_pressure(monkeypatch, tmp_
     stop = _stop_text(canonical)
     assert "unsuperseded failure receipts" in stop
     assert "test_historical" not in stop
+
+
+def test_cited_historical_failure_keeps_its_historical_label(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    registry = EnvironmentIdentityRegistry()
+    rows = [
+        _evidence_row(registry, receipt="fail-a", outcome="failed", digest="tree-a",
+                      head="head-a", minute=0, test_path="tests/test_protocol.py"),
+        _evidence_row(registry, receipt="pass-b", outcome="passed", digest="tree-b",
+                      head="head-b", minute=5, test_path="tests/test_protocol.py"),
+    ]
+    canonical = _render_with_snapshot(monkeypatch, tmp_path, rows, registry)
+    command = f"{sys.executable} -m pytest tests/test_protocol.py -q"
+    citations = [
+        SimpleNamespace(receipt_id="fail-a", command=command, claim="current-result"),
+        SimpleNamespace(receipt_id="pass-b", command=command, claim="current-result"),
+    ]
+
+    comment = _render_test_observation_citations(
+        citations, local_test_evidence=canonical, current_test_turn_id="turn-1329"
+    )
+
+    (fail_line,) = [line for line in comment.splitlines() if "receipt `fail-a`" in line]
+    assert _HISTORICAL_LINE in fail_line
+    assert "`failed`" in fail_line
+    assert comment.count(_HISTORICAL_LINE) == 1
+    (pass_line,) = [line for line in comment.splitlines() if "receipt `pass-b`" in line]
+    assert _HISTORICAL_LINE not in pass_line
+    assert "uncited authoritative" not in comment

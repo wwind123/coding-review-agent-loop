@@ -4722,3 +4722,80 @@ def test_entry_facts_stay_with_their_rows_through_sort_and_dedup(monkeypatch):
     base_now = _by_receipt(evidence)["fail-base-a"]
     assert base_now == _by_receipt(today)["fail-base-a"]
     assert base_now.superseded_by is None
+
+
+def _historical_then_genuine(registry):
+    failure, passing = _obsolete_and_new(registry)
+    other_scope = EvidenceScope("suite", ("tests/test_other.py",))
+    genuine_fail = _at(
+        _observation(outcome="failed", timestamp="2026-10-09T10:06:00+00:00",
+                     receipt_id="fail-b", registry=registry, scope=other_scope),
+        digest="tree-b", head="head-b",
+    )
+    genuine_pass = _at(
+        _observation(outcome="passed", timestamp="2026-10-09T10:07:00+00:00",
+                     receipt_id="pass-b2", registry=registry, scope=other_scope),
+        digest="tree-b", head="head-b",
+    )
+    return reconcile_test_observations(
+        [failure, passing, genuine_fail, genuine_pass], current_head="head-b",
+        current_snapshot=_tree_snapshot(), registry=registry,
+    )
+
+
+def _as_live(evidence):
+    return list(evidence.observations)
+
+
+def _as_mappings(evidence):
+    return [row.to_dict() for row in evidence.observations]
+
+
+def _as_default_decode(evidence):
+    return list(decode_bounded_evidence(bounded_evidence_for_round(evidence)).observations)
+
+
+def _as_display_decode(evidence):
+    return list(
+        decode_bounded_evidence(
+            bounded_evidence_for_round(evidence), restore_classification=True
+        ).observations
+    )
+
+
+@pytest.mark.parametrize(
+    "restore",
+    [_as_live, _as_mappings, _as_default_decode, _as_display_decode],
+    ids=["live-object", "to-dict-mapping", "default-bounded-decode", "display-bounded-decode"],
+)
+def test_every_input_form_clears_the_tree_change_label_and_caveat(restore):
+    """Generalized #1329 rule: derived classification never survives any input form."""
+    registry = EnvironmentIdentityRegistry()
+    at_b = _historical_then_genuine(registry)
+    assert TREE_CHANGE_CAVEAT in _by_receipt(at_b)["fail-a"].caveats
+
+    later = [
+        ("head-a", _tree_snapshot(digest="tree-a", head="head-a")),
+        ("head-b", None),
+        ("head-b", _tree_snapshot(status_clean=False)),
+    ]
+    for head, snapshot in later:
+        again = reconcile_test_observations(
+            restore(at_b), current_head=head, current_snapshot=snapshot, registry=registry,
+        )
+        rows = _by_receipt(again)
+        assert rows["fail-a"].superseded_by is None
+        assert TREE_CHANGE_CAVEAT not in rows["fail-a"].caveats
+        assert "fail-a" in again.authoritative_failures
+        if restore in (_as_live, _as_display_decode):
+            # Genuine receipt supersession survives where the input carries it.
+            assert rows["fail-b"].superseded_by == "pass-b2"
+
+    # Restoring again at digest B re-derives the label with exactly one caveat.
+    again_b = reconcile_test_observations(
+        restore(at_b), current_head="head-b", current_snapshot=_tree_snapshot(),
+        registry=registry,
+    )
+    row = _by_receipt(again_b)["fail-a"]
+    assert row.superseded_by == TREE_CHANGE_SUPERSESSION
+    assert row.caveats.count(TREE_CHANGE_CAVEAT) == 1

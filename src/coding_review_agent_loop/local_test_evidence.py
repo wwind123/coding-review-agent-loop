@@ -784,14 +784,20 @@ class LocalTestEvidence:
 
 
 def _clear_tree_change_label(observation: LocalTestObservation) -> LocalTestObservation:
-    """Drop an earlier reconcile's tree-change label; keep genuine receipts."""
-    if observation.superseded_by != TREE_CHANGE_SUPERSESSION:
-        return observation
-    return replace(
-        observation,
-        superseded_by=None,
-        caveats=tuple(item for item in observation.caveats if item != TREE_CHANGE_CAVEAT),
+    """Drop an earlier reconcile's tree-change label and caveat; keep genuine receipts.
+
+    The caveat is stripped even when the label is already gone: mapping
+    coercion and the default bounded decode drop ``superseded_by`` but keep
+    caveats, and a stale caveat must never decorate a blocking failure.
+    """
+    label = (
+        None if observation.superseded_by == TREE_CHANGE_SUPERSESSION
+        else observation.superseded_by
     )
+    caveats = tuple(item for item in observation.caveats if item != TREE_CHANGE_CAVEAT)
+    if label == observation.superseded_by and caveats == observation.caveats:
+        return observation
+    return replace(observation, superseded_by=label, caveats=caveats)
 
 
 @dataclass(frozen=True)
