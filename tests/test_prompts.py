@@ -5844,3 +5844,115 @@ def test_architecture_impact_guidance_says_list_fields_are_plain_strings_1330(tm
         build_task_prompt("Add a health endpoint.", config),
     ):
         assert phrase in prompt
+
+
+# --- full-suite attainability guidance (#1343) -------------------------------
+
+
+_GENERIC_BACKEND_SENTENCE = (
+    " The backend whole-turn/invocation timeout must exceed the selected command watchdog with "
+    "enough headroom for analysis, edits, and reporting."
+)
+
+
+def test_claude_backend_guidance_names_the_call_limit_and_the_timeout_rule(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS", "1200")
+    monkeypatch.delenv("AGENT_LOOP_TEST_WORKER_HOST_SHARING", raising=False)
+    monkeypatch.delenv("BASH_DEFAULT_TIMEOUT_MS", raising=False)
+    config = make_config(tmp_path, coder="claude", coder_test_command_timeout_seconds=600)
+    budget = runtime.run_tests_foreground_budget_seconds(600)
+    text = prompts_module._coder_local_test_scope_guidance(config, structured=True)
+    assert (
+        f" For Claude, every Bash call in this turn defaults to a {budget}s limit, which covers the "
+        "run-tests watchdog, the shared-capacity wait and parent overhead. Run agent-loop run-tests in "
+        "the foreground and either omit the Bash timeout parameter or pass at least "
+        f"{budget * 1000} ms; never pass a smaller timeout for a test command. The whole-turn timeout "
+        "must still exceed this."
+    ) in text
+    assert budget >= 600 + 1200
+    assert _GENERIC_BACKEND_SENTENCE not in text
+
+
+def test_antigravity_and_generic_backend_guidance_are_unchanged(tmp_path):
+    antigravity = make_config(tmp_path, coder="antigravity", reviewer="codex")
+    text = prompts_module._coder_local_test_scope_guidance(antigravity)
+    assert (
+        f" For Antigravity, the configured print timeout is "
+        f"{antigravity.antigravity_print_timeout_seconds}s; it should exceed the selected "
+        "whole-command watchdog plus headroom of max(300s, 20%) (360s)."
+    ) in text
+    assert "For Claude" not in text
+    codex = make_config(tmp_path, coder="codex", reviewer="claude")
+    text = prompts_module._coder_local_test_scope_guidance(codex)
+    assert _GENERIC_BACKEND_SENTENCE in text and "For Claude" not in text
+    assert _GENERIC_BACKEND_SENTENCE in prompts_module._coder_local_test_scope_guidance(None)
+
+
+def _fake_test_python(tmp_path):
+    path = tmp_path / "venv" / "bin" / "python"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.symlink_to(sys.executable)
+    return path
+
+
+@pytest.mark.parametrize(
+    ("state", "expected", "absent"),
+    [
+        (0, "the parent's import check found pytest and pytest-xdist importable by", "could not import"),
+        (3, "could not import pytest, so it is not recommended", "found pytest and pytest-xdist"),
+        (4, "could not import pytest-xdist (`xdist.plugin`), so it is not recommended", "found pytest and pytest-xdist"),
+        (None, "was inconclusive, so it is not recommended", "found pytest and pytest-xdist"),
+    ],
+)
+def test_configured_interpreter_guidance_states_only_what_the_check_established(
+    tmp_path, monkeypatch, state, expected, absent,
+):
+    from coding_review_agent_loop import lifecycle_probe
+
+    python = _fake_test_python(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        lifecycle_probe, "xdist_import_check", lambda invocation, env, cwd: calls.append((invocation, cwd)) or state,
+    )
+    config = make_config(tmp_path, test_python=str(python))
+    text = prompts_module.parallel_test_worker_guidance(config)
+    assert expected in text and absent not in text
+    assert f"`{python}`" in text
+    assert calls == [((str(python),), config.claude_dir)]
+    if state == 0:
+        assert f"agent-loop run-tests -- {python} -m pytest" in text
+        assert "use the same interpreter consistently because supersession compares exact commands" in text
+    else:
+        assert f"agent-loop run-tests -- {python} -m pytest" not in text
+    # Never claims complete dev extras or that the suite fits the caps.
+    assert "dev extras" not in text and "will fit" not in text
+    assert "PEP 668" in text and "reported as not run, never as passed" in text
+
+
+def test_unconfigured_interpreter_renders_the_long_suite_sentence(tmp_path):
+    config = make_config(tmp_path)
+    text = prompts_module.parallel_test_worker_guidance(config)
+    assert "For long or full suites: `agent-loop run-tests` prints a foreground-budget notice" in text
+    assert "PEP 668" in text
+    assert "Configured test interpreter" not in text
+
+
+def test_interpreter_check_errors_degrade_to_todays_text(tmp_path, monkeypatch):
+    from coding_review_agent_loop import lifecycle_probe
+    from coding_review_agent_loop.test_workers import render_worker_guidance
+
+    def boom(*_a, **_k):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(lifecycle_probe, "xdist_import_check", boom)
+    config = make_config(tmp_path, test_python=str(_fake_test_python(tmp_path)))
+    text = prompts_module.parallel_test_worker_guidance(config)
+    from coding_review_agent_loop.test_workers import detect_parallel_support, repository_root
+
+    today = render_worker_guidance(
+        prompts_module.preliminary_worker_budget(config),
+        parallel_supported=detect_parallel_support(repository_root(config.claude_dir)),
+    )
+    assert text == today
+    assert "Configured test interpreter" not in text and "For long or full suites" not in text

@@ -153,6 +153,28 @@ class ResolvedInvocation:
     effort_source: str | None
 
 
+def validate_test_python(value: object) -> str:
+    """Validate ``--test-python`` and return its lexical path unchanged (#1343).
+
+    The path must be absolute and its realpath an existing regular file the
+    user can execute.  ``realpath`` is used only for this check; the stored,
+    exported, invoked and granted value is the path exactly as given.  There
+    is no PATH or ``.venv`` discovery.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise AgentLoopError("--test-python must be an absolute path to a Python interpreter.")
+    if not os.path.isabs(value):
+        raise AgentLoopError(f"--test-python must be an absolute path, not {value!r}.")
+    real = os.path.realpath(value)
+    if not os.path.exists(real):
+        raise AgentLoopError(f"--test-python {value!r} does not exist.")
+    if not os.path.isfile(real):
+        raise AgentLoopError(f"--test-python {value!r} is not a regular file.")
+    if not os.access(real, os.X_OK):
+        raise AgentLoopError(f"--test-python {value!r} is not executable.")
+    return value
+
+
 @dataclass(frozen=True)
 class AgentLoopConfig:
     repo: str
@@ -413,6 +435,10 @@ class AgentLoopConfig:
     # Finite run-level ceiling for local coder test commands.  Kept at the end
     # with a default so direct AgentLoopConfig callers remain source-compatible.
     coder_test_command_timeout_seconds: int = DEFAULT_TEST_TIMEOUT_SECONDS
+    # Operator-configured test interpreter (#1343), kept as the lexical
+    # absolute path: two virtualenv ``bin/python`` symlinks can share one real
+    # executable while exposing different site-packages.
+    test_python: str | None = None
     # Process-tree containment.  Values remain unparsed at the config boundary
     # so CLI strings such as ``70%`` and ``2GiB`` are resolved exactly once by
     # containment.policy_from_values().
@@ -540,6 +566,8 @@ class AgentLoopConfig:
                 "--coder-test-command-timeout-seconds must be a positive finite integer."
             )
         object.__setattr__(self, "coder_test_command_timeout_seconds", int(timeout))
+        if self.test_python is not None:
+            object.__setattr__(self, "test_python", validate_test_python(self.test_python))
         if self.repair_backend not in {"antigravity", "gemini", "codex", "claude"}:
             raise AgentLoopError("--repair-backend must be antigravity, gemini, codex, or claude.")
         if self.repair_backend in {"codex", "claude"}:
@@ -2054,6 +2082,7 @@ def config_from_args(
             "coder_test_command_timeout_seconds",
             DEFAULT_TEST_TIMEOUT_SECONDS,
         ),
+        test_python=getattr(args, "test_python", None),
         pre_review_tests=args.pre_review_tests,
         ci_timeout_seconds=args.ci_timeout_seconds,
         ci_poll_interval_seconds=args.ci_poll_interval_seconds,

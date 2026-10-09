@@ -125,7 +125,7 @@ Source paths below are relative to
 | Issue/PR association | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `expected_closure.py`, `managed_pr.py` | Bind the intended issue set, approved plan, and canonical PR; distinguish creation, recovery, and explicit adoption. |
 | CI and repository gates | `checks.py`, `ci_health.py`, `managed_ci.py`, `migrations.py` | Interpret the check board, classify infrastructure stalls, qualify exact heads, and validate migration topology. |
 | Optional workflow branches | `decomposition.py`, `child_topology.py`, `split_materialization.py`, `followups.py`, `semantic_dedupe.py`, `evidence_reconciliation.py` | Materialize typed child work, reconcile follow-ups, and support discussion evidence. |
-| Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `tool_provenance.py`, `logging.py`, `worker_telemetry.py` | Record invocation-local test selectors and authoritative observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success; `tool_provenance.py` validates the Git executable's location and reads the tool checkout only through `run_hardened_git` to record the running commit; runtime rows persist the launch triple (`wrapper_bootstrap`, `inner_exec`, `suite_start`) as diagnostics beside `launch_integrity`; `worker_telemetry.py` appends a disposable host-scoped worker-reservation log whose broker-lane attribution comes from the runner while standalone `run-tests` attribution is self-reported. `lifecycle_probe.py` and the `_agent_loop_lifecycle_probe` pytest plugin (beside the worker-cap plugin) give a direct-pytest run positive parent-observed lifecycle provenance, and with the parent importability check let `test_runtime.py` classify a run that exited before any test could run as a persisted non-evidence `launch-failed` row (pre-collection caveat first) that every authoritative-failure consumer excludes. |
+| Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `tool_provenance.py`, `logging.py`, `worker_telemetry.py` | Record invocation-local test selectors and authoritative observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success; `tool_provenance.py` validates the Git executable's location and reads the tool checkout only through `run_hardened_git` to record the running commit; runtime rows persist the launch triple (`wrapper_bootstrap`, `inner_exec`, `suite_start`) as diagnostics beside `launch_integrity`; `worker_telemetry.py` appends a disposable host-scoped worker-reservation log whose broker-lane attribution comes from the runner while standalone `run-tests` attribution is self-reported. `lifecycle_probe.py` and the `_agent_loop_lifecycle_probe` pytest plugin (beside the worker-cap plugin) give a direct-pytest run positive parent-observed lifecycle provenance, and with the parent importability check let `test_runtime.py` classify a run that exited before any test could run as a persisted non-evidence `launch-failed` row (pre-collection caveat first) that every authoritative-failure consumer excludes. `test_runtime.run_exit_code_probe` bounds every interpreter probe and tears down its process tree on every exit path; `run-tests` prints a pre-launch foreground-budget notice (suppressed only by the orchestrator-authored `AGENT_LOOP_SHELL_CAP_MS`), a pre-admission missing-xdist advisory for module launches and a timeout advisory, none of which is evidence. |
 
 `orchestrator.py` is a thin re-export facade over the lifecycle modules listed
 above, which were extracted from it by pure moves (#1181). Each extracted module
@@ -1474,6 +1474,15 @@ descendants but does not impose memory ceilings. Test-wrapper lane locks prevent
 recognized duplicate commands, not all overlapping work in arbitrary shells.
 Backend turn timeouts, whole-test-command watchdogs, and framework per-test
 timeouts are independent limits. See [containment](docs/local_agent_loop.md#process-tree-containment).
+
+An operator-configured `--test-python` interpreter is validated, exported to
+every coder as `AGENT_LOOP_TEST_PYTHON`, import-checked at each coder-prompt
+render and, in sandboxed mode, becomes the single granted test invocation. Claude
+coder turns get `BASH_DEFAULT_TIMEOUT_MS`/`BASH_MAX_TIMEOUT_MS` sized by
+`run_tests_foreground_budget_seconds` (watchdog ceiling, host-wait bound,
+parent overhead, headroom); every other backend and role carries an `unknown`
+shell-cap fact. Broker-owned detached runs are deferred. See
+[Running a long or full suite](docs/local_agent_loop.md#running-a-long-or-full-suite).
 
 A containment-aware test-worker budget (`test_workers.py`) is derived after
 admission from the limits that apply on each path (managed handle limits,

@@ -1165,3 +1165,52 @@ def test_hardened_probe_reads_clean_checkout(tmp_path, sandbox):
     (checkout / "a.txt").write_text("two\n", encoding="utf-8")
     status = probe(("status", "--porcelain"), checkout)
     assert status.returncode == 0 and "a.txt" in status.stdout
+
+
+# ------------------------------------------------- configured test interpreter (#1343)
+
+
+def _test_python(tmp_path):
+    path = tmp_path / "venv" / "bin" / "python"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.symlink_to(sys.executable)
+    return path
+
+
+def test_sandboxed_coder_grant_and_guidance_share_the_test_python_invocation(tmp_path, sandbox, monkeypatch):
+    from coding_review_agent_loop import lifecycle_probe, prompts
+
+    monkeypatch.setattr(lifecycle_probe, "xdist_import_check", lambda *a, **k: 0)
+    python = _test_python(tmp_path)
+    config = sandboxed_config(tmp_path, test_python=str(python), agent_memory=False)
+    sandbox["establish"](config)
+    invocation = test_runtime.resolve_coder_test_invocation(config)
+    assert invocation == test_runtime.render_test_wrapper(
+        (str(python), "-m", "pytest"), memory_dir=None, prefix=WRAPPER
+    )
+    rules = _allowed_tools(list(ap.role_permission_args(config, "claude", "coder")))
+    assert [rule for rule in rules if "run-tests" in rule] == [f"Bash({invocation})"]
+    assert f"`{invocation}`" in _coder_workdir_guidance(config)
+    worker_guidance = prompts.parallel_test_worker_guidance(config)
+    assert f"your granted test invocation `{invocation}` uses it" in worker_guidance
+    # Read-only roles, repair included, get no test grant.
+    for role in ("reviewer", "repair", None):
+        assert not any("run-tests" in rule for rule in _allowed_tools(list(ap.role_permission_args(config, "claude", role))))
+    assert ap.permission_class_for_role("repair") == ap.PERMISSION_CLASS_READ_ONLY
+
+
+def test_test_command_keeps_precedence_over_test_python_in_the_sandbox(tmp_path, sandbox, monkeypatch):
+    from coding_review_agent_loop import lifecycle_probe, prompts
+
+    monkeypatch.setattr(lifecycle_probe, "xdist_import_check", lambda *a, **k: 0)
+    python = _test_python(tmp_path)
+    config = sandboxed_config(tmp_path, test_python=str(python), test_command=("make", "test"))
+    sandbox["establish"](config)
+    invocation = test_runtime.resolve_coder_test_invocation(config)
+    assert invocation.endswith("-- make test")
+    rules = _allowed_tools(list(ap.role_permission_args(config, "claude", "coder")))
+    assert [rule for rule in rules if "run-tests" in rule] == [f"Bash({invocation})"]
+    worker_guidance = prompts.parallel_test_worker_guidance(config)
+    assert str(python) not in worker_guidance
+    assert "does not use it" in worker_guidance

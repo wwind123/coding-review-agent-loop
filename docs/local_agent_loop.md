@@ -7206,6 +7206,90 @@ Agents may use a learned sub-ceiling recommendation when rendered, but must
 continue to select focused tests and may split or shard long browser,
 integration, or end-to-end matrices.
 
+### Running a long or full suite
+
+A full-suite obligation must be attainable inside one coder turn. Two things
+used to make it unattainable: the coder ran a system `python3` without
+pytest-xdist (PEP 668 blocked installing it), so the suite ran serially; and the
+backend's per-call shell limit killed the `run-tests` client before the suite
+could finish. Five mechanisms address this. None of them is test evidence, and
+none changes a run's argv, environment, watchdog, exit code, classification or
+journal row.
+
+- **`--test-python PATH`.** The operator names an interpreter that has the
+  repository's dev extras. It must be an absolute path whose realpath is an
+  existing executable regular file; a relative, missing, directory or
+  non-executable value is a configuration error, and there is no PATH or
+  `.venv` discovery. The lexical path is stored, exported to every coder as
+  `AGENT_LOOP_TEST_PYTHON`, invoked and granted exactly as given, because two
+  virtualenv `bin/python` symlinks can share one executable while exposing
+  different site-packages. At each coder-prompt render the parent really
+  imports `pytest` and then `xdist.plugin` with it, through a process-tree
+  bounded probe. Guidance recommends the interpreter for broad and full-suite
+  runs only when both imports succeed (exit 0), and says only that they were
+  importable. Exit 3 or 4 names the module that failed; an inconclusive check
+  does not recommend it. Nothing is ever installed into any interpreter. In
+  sandboxed mode the coder's single test grant becomes the wrapped
+  `<test-python> -m pytest` invocation and the guidance names that exact
+  string; an explicit `--test-command` keeps its precedence.
+- **Missing-xdist advisory.** For a `<python> [validated flags] -m pytest`
+  module launch in a repository that declares pytest-xdist, `run-tests` checks
+  in the command's own launch context (interpreter, environment and cwd)
+  whether xdist imports, before host-capacity admission. Only when it cannot
+  is an advisory printed: it states that the import failed and that pytest may
+  run serially, reject worker options with a usage error, or fail while
+  loading the plugin, without predicting which. Console scripts, prefixed
+  commands, package scripts, non-pytest commands, non-declaring repositories
+  and argv that explicitly asks for serial execution or disables xdist
+  (`-n 0`, `--numprocesses=0`, `-p no:xdist`, `--dist no`) are never checked.
+  The check's elapsed time is excluded from the target's watchdog.
+- **Pre-launch foreground-budget notice.** Every `run-tests` invocation prints
+  and flushes one line before it dispatches the command. It names the whole
+  foreground lifetime: the target watchdog, the host-capacity admission wait
+  (when host sharing is on), fixed parent overhead and headroom of
+  `max(300s, 20%)`. If the shell's per-command limit is shorter, the shell can
+  kill the client first, and a required suite stopped that way must be
+  reported as not run, never as passed. The notice is flushed before dispatch,
+  so it survives a kill during admission or before the watchdog; a broker-run
+  target keeps running under parent observation to its own watchdog. It is
+  suppressed only when `AGENT_LOOP_SHELL_CAP_MS` is an integer of at least the
+  whole budget in milliseconds. The orchestrator sets that fact per backend:
+  Claude coder turns carry their effective default Bash limit, and every other
+  backend and read-only role carries `unknown`, overriding any ambient value.
+  `BASH_MAX_TIMEOUT_MS` is never trusted for suppression. A standalone run
+  outside the orchestrator trusts an operator-set value.
+- **Timeout advisory.** A command that reaches its watchdog gets one more
+  stderr line naming the chosen watchdog and the policy ceiling, with the
+  report-as-not-run rule.
+- **Claude shell-limit sizing.** In Claude Code, `BASH_MAX_TIMEOUT_MS` is only
+  the largest timeout the model may request; a Bash call without a timeout
+  runs under `BASH_DEFAULT_TIMEOUT_MS`, about two minutes by default. For the
+  exact `coder` role, `agents/claude.py` sets both to the foreground budget in
+  milliseconds: `1000 * (ceiling + host-wait bound + 4 * 30s snapshot + 2 *
+  10s import check + 2s broker send + max(300s, 20% of ceiling))`. A larger
+  operator value of either is kept, the maximum is never below the default,
+  and `AGENT_LOOP_SHELL_CAP_MS` is the effective default. The coder prompt
+  tells a Claude coder to omit the Bash timeout parameter or pass at least the
+  budget, never a smaller value. Reviewers, planners and the `repair` role are
+  read-only and keep both variables unchanged; formatting repair is
+  tool-disabled and never reaches the Claude backend. The `run-tests`
+  watchdog ceiling itself is unchanged, and admission wait is never counted
+  against the target.
+
+`AGENT_LOOP_TEST_PYTHON`, `AGENT_LOOP_SHELL_CAP_MS`, `BASH_DEFAULT_TIMEOUT_MS`
+and `BASH_MAX_TIMEOUT_MS` are exact-name environment-identity exclusions, so a
+Claude coder's numeric cap and another backend's `unknown` produce the same
+identity. Changing interpreters changes the command argv, so a failure under
+one interpreter is not superseded by a pass under another; use one interpreter
+consistently.
+
+Broker-owned detached runs (submit, then wait across several shell calls) are
+deferred: they need a new authenticated request type, pending receipts and
+turn-end semantics. Until then a serial suite that exceeds the watchdog
+ceiling, or a non-Claude shell limit shorter than the foreground lifetime,
+stays unattainable without a parallel-capable interpreter, and the coder
+reports it as not run.
+
 ### Launcher preflight and health memory
 
 `run-tests --preflight` is a bounded, non-mutating wrapper probe. It checks at

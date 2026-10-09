@@ -1416,6 +1416,10 @@ Other important boundaries:
 - `--test-command` adds a local gate before review and again before auto-merge. The
   finite watchdog defaults to 1,800 seconds and is configurable with
   `--coder-test-command-timeout-seconds SECONDS`.
+- `--test-python PATH` names an absolute interpreter with the repository's dev
+  extras (pytest, pytest-xdist). Coders receive it as `AGENT_LOOP_TEST_PYTHON`
+  and are pointed at it for broad and full-suite runs once a parent-side import
+  check succeeds; nothing is ever installed into it.
 - The tool validates assigned workdirs and reported test locations, but agent
   CLIs may still consume substantial CPU, memory, network, and provider quota.
 - Raw subprocess logs and salvage artifacts can contain sensitive repository
@@ -1439,6 +1443,14 @@ omitted, the wrapper uses the inherited run ceiling, or 1,800 seconds when run
 outside agent-loop. A positive finite override may be smaller than the ceiling;
 values above it are rejected before the child starts. Agent backends inherit the
 ceiling through `AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS`.
+
+Every invocation first prints a non-evidence notice naming its whole foreground
+budget (watchdog, host-capacity wait, overhead), so a coder whose shell limit is
+shorter knows to report a killed suite as not run. A `<python> -m pytest` launch
+in a repository that declares pytest-xdist gets an advisory when that
+interpreter cannot import xdist, and a command that reaches its watchdog gets a
+timeout advisory. Claude coder turns get Bash limits sized to the whole budget.
+See [Running a long or full suite](docs/local_agent_loop.md#running-a-long-or-full-suite).
 
 When agent memory is enabled, the wrapper records measured outcomes, elapsed
 time, the attempted cap, a privacy-preserving environment fingerprint, and

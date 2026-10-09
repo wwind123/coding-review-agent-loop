@@ -19,6 +19,7 @@ from .base import (
 )
 from ..logging import agent_log_path, log
 from ..runner import CommandResult, Runner, executable_identity_changed
+from ..test_runtime import agent_shell_environment
 from ..usage import UsageMetadata, coerce_int, first_present
 
 if TYPE_CHECKING:
@@ -358,6 +359,7 @@ class CodexBackend:
             "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
                 config.coder_test_command_timeout_seconds
             ),
+            **agent_shell_environment(config, "codex", role),
             **role_permission_env(config, "codex", role),
         }
         # Always deliver the prompt on stdin via `codex exec -` (#870): argv is

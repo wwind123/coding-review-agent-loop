@@ -4799,3 +4799,38 @@ def test_every_input_form_clears_the_tree_change_label_and_caveat(restore):
     row = _by_receipt(again_b)["fail-a"]
     assert row.superseded_by == TREE_CHANGE_SUPERSESSION
     assert row.caveats.count(TREE_CHANGE_CAVEAT) == 1
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"AGENT_LOOP_TEST_PYTHON": "/opt/venv/bin/python"},
+        {"BASH_MAX_TIMEOUT_MS": "4000000"},
+        {"BASH_DEFAULT_TIMEOUT_MS": "4000000"},
+        {"AGENT_LOOP_SHELL_CAP_MS": "4000000"},
+        {"AGENT_LOOP_SHELL_CAP_MS": "unknown"},
+        {
+            "AGENT_LOOP_TEST_PYTHON": "/opt/venv/bin/python",
+            "BASH_MAX_TIMEOUT_MS": "4000000",
+            "BASH_DEFAULT_TIMEOUT_MS": "4000000",
+            "AGENT_LOOP_SHELL_CAP_MS": "4000000",
+        },
+    ],
+)
+def test_shell_fact_variables_do_not_perturb_environment_identity(extra):
+    # Issue #1343: orchestrator-authored shell facts are exact-name exclusions.
+    registry = EnvironmentIdentityRegistry()
+    base = {"PATH": "/usr/bin", "TEST_INPUT": "one"}
+    plain = registry.capture(base)
+    assert registry.compare(plain, registry.capture({**base, **extra})) == "equivalent"
+
+
+def test_numeric_and_unknown_shell_caps_share_one_identity():
+    registry = EnvironmentIdentityRegistry()
+    base = {"PATH": "/usr/bin"}
+    claude_coder = registry.capture({**base, "AGENT_LOOP_SHELL_CAP_MS": "4242000", "BASH_DEFAULT_TIMEOUT_MS": "4242000"})
+    other_backend = registry.capture({**base, "AGENT_LOOP_SHELL_CAP_MS": "unknown"})
+    assert registry.compare(claude_coder, other_backend) == "equivalent"
+    # Exact names only: a lookalike variable still splits identity.
+    lookalike = registry.capture({**base, "AGENT_LOOP_SHELL_CAP_MS_EXTRA": "1"})
+    assert registry.compare(other_backend, lookalike) != "equivalent"

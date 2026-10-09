@@ -3418,7 +3418,10 @@ def _lp_spawns():
     spawns = []
 
     def spy(*args, **kwargs):
-        if kwargs.get("start_new_session"):  # the runner's target spawn, not a probe or preflight
+        # The runner's target spawn, not a probe or preflight; exit-code
+        # probes also get a process group (#1343) but discard all output.
+        exit_code_probe = kwargs.get("stdout") == subprocess.DEVNULL and kwargs.get("stderr") == subprocess.DEVNULL
+        if kwargs.get("start_new_session") and not exit_code_probe:
             env = kwargs.get("env")
             spawns.append((list(args[0]), dict(env) if env is not None else dict(os.environ)))
         return real_popen(*args, **kwargs)
@@ -4037,3 +4040,965 @@ def test_configured_gate_usage_error_keeps_its_routing_through_the_gate_workflow
         list(config.test_command[:-1]), cwd=tmp_path, timeout_seconds=120,
     )
     assert (clean.outcome, clean.returncode) == ("passed", 0)
+
+
+# --- full-suite attainability (issue #1343) ----------------------------------
+
+from coding_review_agent_loop import runner as runner_module  # noqa: E402
+from coding_review_agent_loop.test_workers import WorkerBudgetLock, HostWaitResult  # noqa: E402
+
+_XA_PREFIX = "agent-loop: advisory: pytest-xdist could not be imported"
+_NOTICE_PREFIX = "agent-loop: notice: this command may run for up to"
+_SRC = str(Path(runtime.__file__).resolve().parents[1])
+
+
+def _xa_project(root, *, declares=True, broken_xdist=True):
+    """A checkout that declares xdist and whose launch context cannot import it."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / ".git").mkdir(exist_ok=True)
+    _lp_write(root, _LP_PASSING)
+    if declares:
+        (root / "pyproject.toml").write_text(
+            '[project]\nname = "x"\n[project.optional-dependencies]\ndev = ["pytest-xdist>=3"]\n',
+            encoding="utf-8",
+        )
+    if broken_xdist:
+        # Discoverable but unimportable in this launch context (cwd first on
+        # sys.path for both ``-m`` and ``-c``).
+        _lp_write(root, {
+            "xdist/__init__.py": "",
+            "xdist/plugin.py": "raise ImportError('xdist unavailable in this context')\n",
+        })
+    return root
+
+
+def _xa_run(root, extra, *, env=None, budget=None, disable_check=False, monkeypatch=None, timeout=120, lock_root=None):
+    lines = []
+    argv = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *extra]
+    context = pytest.MonkeyPatch.context() if disable_check else contextlib.nullcontext()
+    with context as patched:
+        if disable_check:
+            patched.setattr(runner_module, "_xdist_advisory", lambda *a, **k: None)
+        result = run_foreground_test(
+            argv, cwd=root, timeout_seconds=timeout, echo_output=False, classify_pre_collection=True,
+            env=({**os.environ, **env} if env else None), worker_budget=budget,
+            output_callback=lines.append, worker_lock_root=lock_root,
+        )
+    return result, "".join(lines)
+
+
+def _advisories(output):
+    return [line for line in output.splitlines() if line.startswith(_XA_PREFIX)]
+
+
+def _assert_qualified_advisory(text):
+    assert "could not be imported by" in text
+    assert "although the repository declares it" in text
+    # Every possible outcome is qualified; none is predicted.
+    assert "may run serially" in text
+    assert "with a usage error" in text
+    assert "fail while loading the xdist plugin" in text
+    assert "will run serially" not in text and "will proceed" not in text
+    assert "do not install into a system interpreter" in text
+    assert "not test evidence" in text
+
+
+def test_explicit_n_without_xdist_gets_the_advisory_and_unchanged_classification(tmp_path):
+    root = _xa_project(tmp_path / "project")
+    env = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+    result, output = _xa_run(root, ["-n", "6", "test_x.py"], env=env)
+    (advisory,) = _advisories(output)
+    _assert_qualified_advisory(advisory)
+    assert "120s" in advisory
+    assert (result.outcome, result.returncode) == ("failed", 4)
+    assert result.pre_collection_launch_failure == _LP_USAGE_REASON
+    baseline, baseline_output = _xa_run(root, ["-n", "6", "test_x.py"], env=env, disable_check=True)
+    assert _advisories(baseline_output) == []
+    assert (baseline.outcome, baseline.returncode, baseline.pre_collection_launch_failure, baseline.args) == (
+        result.outcome, result.returncode, result.pre_collection_launch_failure, result.args,
+    )
+    # The advisory precedes any pytest output.
+    assert output.index(_XA_PREFIX) == 0
+
+
+@pytest.mark.parametrize("case", ["addopts", "broken-plugin"])
+def test_other_xdist_failures_get_the_advisory_and_todays_classification(tmp_path, case):
+    root = _xa_project(tmp_path / "project")
+    env = {"PYTEST_ADDOPTS": "-n 8"} if case == "addopts" else {}
+    result, output = _xa_run(root, ["test_x.py"], env=env)
+    (advisory,) = _advisories(output)
+    _assert_qualified_advisory(advisory)
+    baseline, _ = _xa_run(root, ["test_x.py"], env=env, disable_check=True)
+    assert (baseline.outcome, baseline.returncode, baseline.pre_collection_launch_failure, baseline.args) == (
+        result.outcome, result.returncode, result.pre_collection_launch_failure, result.args,
+    )
+
+
+def test_advisory_names_test_python_only_when_it_is_set(tmp_path):
+    root = _xa_project(tmp_path / "project")
+    env = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", runtime.ENV_TEST_PYTHON: "/opt/venv/bin/python"}
+    _result, output = _xa_run(root, ["test_x.py"], env=env)
+    (advisory,) = _advisories(output)
+    assert "$AGENT_LOOP_TEST_PYTHON" in advisory
+    _result, output = _xa_run(root, ["test_x.py"], env={"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"})
+    (advisory,) = _advisories(output)
+    assert "$AGENT_LOOP_TEST_PYTHON" not in advisory and "--test-python" in advisory
+
+
+def _budget(mode):
+    if mode is None:
+        return None
+    return WorkerBudget(workers=2, source="operator", enforcement=mode)
+
+
+_SERIAL_ARGS = (
+    ["-n", "0"], ["-n0"], ["-n=0"], ["--numprocesses", "0"], ["--numprocesses=0"],
+    ["-p", "no:xdist"], ["-pno:xdist"], ["-p=no:xdist"], ["--dist", "no"], ["--dist=no"],
+)
+
+
+@pytest.mark.parametrize("mode", [None, "off", "clamp", "refuse"])
+@pytest.mark.parametrize("extra", _SERIAL_ARGS, ids=lambda value: " ".join(value))
+def test_serial_or_no_xdist_argv_never_runs_the_check(tmp_path, monkeypatch, mode, extra):
+    from coding_review_agent_loop import lifecycle_probe
+
+    calls = []
+    monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", lambda *a, **k: calls.append(a) or 4)
+    root = _xa_project(tmp_path / "project")
+    argv = [sys.executable, "-m", "pytest", "-q", *extra, "test_x.py"]
+    assert runner_module._argv_requests_serial_or_no_xdist(argv)
+    assert runner_module._xdist_advisory(argv, None, root, 60, worker_budget=_budget(mode)) is None
+    assert calls == []
+
+
+@pytest.mark.parametrize("mode", [None, "off", "clamp"])
+def test_serial_argv_runs_with_no_check_and_no_advisory_under_each_budget_mode(tmp_path, monkeypatch, mode):
+    from coding_review_agent_loop import lifecycle_probe
+
+    calls = []
+    monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", lambda *a, **k: calls.append(a) or 4)
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_SHARING", "off")
+    root = _xa_project(tmp_path / "project", broken_xdist=False)
+    result, output = _xa_run(
+        root, ["-p", "no:xdist", "test_x.py"], budget=_budget(mode), lock_root=tmp_path / "locks",
+    )
+    assert result.outcome == "passed"
+    assert calls == [] and _advisories(output) == []
+
+
+def test_serial_helper_leaves_cohort_labels_unchanged():
+    from coding_review_agent_loop.test_workers import argv_only_workers_label, expected_workers_label
+
+    argv = [sys.executable, "-m", "pytest", "-n", "0"]
+    assert argv_only_workers_label(argv) == "unknown"
+    assert expected_workers_label(argv) == "unknown"
+    assert runner_module._argv_requests_serial_or_no_xdist(argv)
+    assert not runner_module._argv_requests_serial_or_no_xdist([sys.executable, "-m", "pytest", "-n", "4"])
+    assert not runner_module._argv_requests_serial_or_no_xdist([sys.executable, "-m", "pytest", "--", "-n", "0"])
+
+
+def _write_console_script(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"#!{sys.executable}\nimport sys\nfrom pytest import console_main\n"
+        "if __name__ == '__main__':\n    sys.argv[0] = sys.argv[0].removesuffix('.exe')\n"
+        "    sys.exit(console_main())\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+@pytest.mark.parametrize("shape", ["console-script", "env-prefix", "timeout-prefix", "isolated-flag", "non-pytest"])
+def test_ineligible_shapes_are_never_probed(tmp_path, monkeypatch, shape):
+    from coding_review_agent_loop import lifecycle_probe
+
+    calls = []
+    real = runtime.run_exit_code_probe
+    monkeypatch.setattr(runtime, "run_exit_code_probe", lambda argv, **k: calls.append(list(argv)) or real(argv, **k))
+    root = _xa_project(tmp_path / "project")
+    # A checkout-local xdist.py that raises: a console script's sys.path[0]
+    # is its script directory, so a -c check could only give a false advisory.
+    (root / "xdist.py").write_text("raise ImportError('shadow')\n", encoding="utf-8")
+    if shape == "console-script":
+        argv = [str(_write_console_script(root / "venv" / "bin" / "pytest")), "-q", "test_x.py"]
+    elif shape == "env-prefix":
+        argv = ["/usr/bin/env", "FOO=1", sys.executable, "-m", "pytest", "-q", "test_x.py"]
+    elif shape == "timeout-prefix":
+        argv = ["timeout", "100", sys.executable, "-m", "pytest", "-q", "test_x.py"]
+    elif shape == "isolated-flag":
+        argv = [sys.executable, "-I", "-m", "pytest", "-q", "test_x.py"]
+    else:
+        argv = [sys.executable, "-c", "pass"]
+    assert runner_module._xdist_advisory(argv, None, root, 60, worker_budget=None) is None
+    assert not any("xdist.plugin" in " ".join(call) for call in calls)
+    if shape == "console-script":
+        eligibility = lifecycle_probe.launch_eligibility_for(argv, dict(os.environ), root)
+        assert eligibility is not None and eligibility.shape == "console-script"
+
+
+def test_no_advisory_when_xdist_imports_only_via_the_callers_pythonpath(tmp_path):
+    root = _xa_project(tmp_path / "project", broken_xdist=False)
+    extra = tmp_path / "extra-path"
+    _lp_write(extra, {"xdist/__init__.py": "", "xdist/plugin.py": ""})
+    pythonpath = os.pathsep.join(filter(None, [str(extra), os.environ.get("PYTHONPATH")]))
+    env = {**os.environ, "PYTHONPATH": pythonpath}
+    argv = [sys.executable, "-m", "pytest", "test_x.py"]
+    assert runner_module._xdist_advisory(argv, env, root, 60, worker_budget=None) is None
+    # Without that path entry the same launch context cannot import xdist.
+    root_broken = _xa_project(tmp_path / "broken")
+    assert runner_module._xdist_advisory(argv, None, root_broken, 60, worker_budget=None) is not None
+
+
+@pytest.mark.parametrize("result", ["undeclared", "unknown", "raises", "importable"])
+def test_no_advisory_for_undeclared_repo_unknown_or_raising_checks(tmp_path, monkeypatch, result):
+    from coding_review_agent_loop import lifecycle_probe
+
+    root = _xa_project(tmp_path / "project", declares=result != "undeclared")
+    if result == "unknown":
+        monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", lambda *a, **k: None)
+    elif result == "raises":
+        def boom(*_a, **_k):
+            raise RuntimeError("probe exploded")
+        monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", boom)
+    elif result == "importable":
+        monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", lambda *a, **k: 0)
+    calls = []
+    if result == "undeclared":
+        monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", lambda *a, **k: calls.append(a) or 4)
+    argv = [sys.executable, "-m", "pytest", "test_x.py"]
+    assert runner_module._xdist_advisory(argv, None, root, 60, worker_budget=None) is None
+    assert calls == []
+
+
+def test_package_script_launches_get_no_check(tmp_path, monkeypatch):
+    from coding_review_agent_loop import lifecycle_probe
+
+    calls = []
+    monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", lambda *a, **k: calls.append(a) or 4)
+    root = _xa_project(tmp_path / "project")
+    executed = (sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_x.py")
+    resolution = runtime.PackageScriptResolution(
+        requested_argv=("npm", "run", "test"), manager="npm", script_name="test",
+        body=" ".join(executed), appended_args=(), env_prefix_tokens=(), executed_argv=executed,
+    )
+    lines = []
+    result = run_foreground_test(
+        ["npm", "run", "test"], cwd=root, timeout_seconds=60, echo_output=False,
+        classify_pre_collection=True, package_script=resolution, output_callback=lines.append,
+    )
+    assert calls == [] and _advisories("".join(lines)) == []
+    assert result.args == list(executed) or tuple(result.args) == executed
+
+
+def _slow_check(seconds, value=4):
+    def check(*_args, **_kwargs):
+        time.sleep(seconds)
+        return value
+    return check
+
+
+@pytest.mark.parametrize("mode", [None, "off", "clamp"])
+def test_check_time_is_excluded_from_the_target_watchdog(tmp_path, monkeypatch, mode):
+    from coding_review_agent_loop import lifecycle_probe
+
+    if mode == "clamp":
+        monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_SHARING", "on")
+        monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS", "0")
+    else:
+        monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_SHARING", "off")
+    # Check and target each fit the watchdog alone, but not together.
+    monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", _slow_check(5.0))
+    root = _xa_project(tmp_path / "project", broken_xdist=False)
+    _lp_write(root, {"test_x.py": "import time\n\ndef test_a():\n    time.sleep(3.0)\n"})
+    result, output = _xa_run(
+        root, ["-p", "no:randomly", "test_x.py"], budget=_budget(mode), timeout=7,
+        lock_root=tmp_path / "locks",
+    )
+    assert len(_advisories(output)) == 1
+    assert result.outcome == "passed", output
+    # The target never receives more than the chosen watchdog.
+    assert result.attempted_timeout_seconds == 7
+    assert result.elapsed_seconds < 7
+
+
+def test_advisory_arrives_before_host_admission_and_leaves_the_launch_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_SHARING", "on")
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS", "5")
+    events = []
+
+    def contended(self, requested, capacity, *, wait_seconds, notify, wait_notify=None, **_kwargs):
+        events.append(("admission", None))
+        time.sleep(1.0)
+        return HostWaitResult(1, 1.0, True, False, False)
+
+    monkeypatch.setattr(WorkerBudgetLock, "wait_for_host_workers", contended)
+    root = _xa_project(tmp_path / "project")
+    env = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+
+    def run(disable):
+        lines = []
+
+        def collect(text):
+            events.append(("output", text))
+            lines.append(text)
+
+        context = pytest.MonkeyPatch.context() if disable else contextlib.nullcontext()
+        with context as patched:
+            if disable:
+                patched.setattr(runner_module, "_xdist_advisory", lambda *a, **k: None)
+            result = run_foreground_test(
+                [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_x.py"],
+                cwd=root, timeout_seconds=60, echo_output=False, classify_pre_collection=True,
+                env={**os.environ, **env}, worker_budget=_budget("clamp"),
+                output_callback=collect, worker_lock_root=tmp_path / "locks",
+            )
+        return result, "".join(lines)
+
+    result, output = run(False)
+    advisory_at = next(i for i, (kind, text) in enumerate(events) if kind == "output" and text.startswith(_XA_PREFIX))
+    admission_at = events.index(("admission", None))
+    assert advisory_at < admission_at
+    events.clear()
+    baseline, baseline_output = run(True)
+    assert _advisories(baseline_output) == []
+    assert (result.args, result.outcome, result.returncode, result.pre_collection_launch_failure) == (
+        baseline.args, baseline.outcome, baseline.returncode, baseline.pre_collection_launch_failure,
+    )
+
+
+# --- pre-launch foreground-budget notice and timeout advisory (#1343) --------
+
+
+def _clean_client_env(**extra):
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith(("AGENT_LOOP_", "BASH_", "PYTEST_"))
+    }
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [_SRC, os.environ.get("PYTHONPATH")]))
+    env.update(extra)
+    return env
+
+
+def test_budget_function_sums_watchdog_wait_overhead_and_headroom():
+    off = runtime.run_tests_foreground_budget_seconds(600, {"AGENT_LOOP_TEST_WORKER_HOST_SHARING": "off"})
+    assert off == 600 + 142 + 300
+    on = runtime.run_tests_foreground_budget_seconds(
+        1800, {"AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS": "1200"},
+    )
+    assert on == 1800 + 1200 + 142 + 360
+
+
+def test_notice_names_the_whole_budget_and_is_suppressed_only_by_a_covering_cap():
+    env = {"AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS": "1200"}
+    budget = runtime.run_tests_foreground_budget_seconds(300, env)
+    notice = runtime.prelaunch_notice(300, 1800, env)
+    assert notice.startswith(f"{_NOTICE_PREFIX} {budget}s")
+    assert "1200s waiting for shared test capacity" in notice
+    assert "300s target watchdog under a 1800s ceiling" in notice
+    assert "reported as not run, never as passed" in notice
+    assert "not test evidence" in notice
+    assert "$AGENT_LOOP_TEST_PYTHON" not in notice
+    with_python = runtime.prelaunch_notice(300, 1800, {**env, runtime.ENV_TEST_PYTHON: "/v/bin/python"})
+    assert "Prefer $AGENT_LOOP_TEST_PYTHON with parallel workers" in with_python
+    off = runtime.prelaunch_notice(300, 1800, {"AGENT_LOOP_TEST_WORKER_HOST_SHARING": "off"})
+    assert "waiting for shared test capacity" not in off
+    # Suppressed only when the orchestrator-authored cap covers the whole budget.
+    assert runtime.prelaunch_notice(300, 1800, {**env, "AGENT_LOOP_SHELL_CAP_MS": str(budget * 1000)}) is None
+    for cap in (300 * 1000, (300 + 142) * 1000, budget * 1000 - 1, "unknown", "garbage", "-5"):
+        assert runtime.prelaunch_notice(300, 1800, {**env, "AGENT_LOOP_SHELL_CAP_MS": str(cap)}) is not None
+    # BASH_MAX_TIMEOUT_MS alone is never trusted.
+    huge = str(10 ** 12)
+    for cap in (None, "unknown", "120000"):
+        values = {**env, "BASH_MAX_TIMEOUT_MS": huge}
+        if cap is not None:
+            values["AGENT_LOOP_SHELL_CAP_MS"] = cap
+        assert runtime.prelaunch_notice(300, 1800, values) is not None
+
+
+def _run_until_notice(argv, env, cwd, *, dispatched):
+    """Start the client, wait for the flushed notice *and* a dispatch event, then SIGKILL it.
+
+    ``dispatched`` returns True once the client has demonstrably moved past
+    dispatch (the broker received its request, or the local run entered the
+    host-capacity wait); the kill therefore lands after dispatch, exactly where
+    a backend shell limit would cut the client short.
+    """
+    proc = subprocess.Popen(
+        argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, text=True,
+    )
+    lines = []
+    seen = threading.Event()
+
+    def read():
+        for line in proc.stderr:
+            lines.append(line)
+            if line.startswith(_NOTICE_PREFIX):
+                seen.set()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        assert seen.wait(60), "".join(lines)
+        deadline = time.monotonic() + 60
+        while not dispatched() and time.monotonic() < deadline:
+            assert proc.poll() is None, "".join(lines)
+            time.sleep(0.05)
+        assert dispatched(), "the client never reached dispatch: " + "".join(lines)
+        assert proc.poll() is None, "the client must still be in flight when the shell kills it"
+        proc.kill()
+        assert proc.wait(10) == -signal.SIGKILL
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(10)
+        reader.join(10)
+    return "".join(lines)
+
+
+def _notice_line(stderr):
+    (line,) = [line for line in stderr.splitlines() if line.startswith(_NOTICE_PREFIX)]
+    return line
+
+
+@pytest.fixture
+def silent_broker(tmp_path):
+    """A broker endpoint that records each dispatched request and never answers."""
+    import socket
+
+    from coding_review_agent_loop.local_test_evidence import _recv_frame
+
+    path = tmp_path / "broker.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen(4)
+    stop = threading.Event()
+    held = []
+    requests = []
+
+    def serve():
+        server.settimeout(0.2)
+        while not stop.is_set():
+            try:
+                connection, _ = server.accept()
+            except OSError:
+                continue
+            held.append(connection)
+            try:
+                connection.settimeout(30)
+                requests.append(_recv_frame(connection))  # received; never answered
+            except Exception:
+                pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield {
+            "env": {
+                "AGENT_LOOP_TEST_BROKER_ENDPOINT": str(path),
+                "AGENT_LOOP_TEST_BROKER_CAPABILITY": "capability",
+                "AGENT_LOOP_TEST_BROKER_PROTOCOL": "local-test-broker-v1",
+                "AGENT_LOOP_INVOCATION_ID": "turn-1",
+            },
+            "requests": requests,
+        }
+    finally:
+        stop.set()
+        thread.join(5)
+        for connection in held:
+            connection.close()
+        server.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="UNIX-socket broker")
+@pytest.mark.parametrize("shape", ["prefixed", "console-script"])
+def test_notice_is_flushed_before_a_silent_broker_and_survives_a_client_kill(tmp_path, silent_broker, shape):
+    if shape == "prefixed":
+        inner = ["/usr/bin/env", "FOO=1", sys.executable, "-m", "pytest", "-q"]
+    else:
+        inner = [str(_write_console_script(tmp_path / "venv" / "bin" / "pytest")), "-q"]
+    env = _clean_client_env(**silent_broker["env"])
+    stderr = _run_until_notice(
+        [sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests", "--timeout-seconds", "600", "--", *inner],
+        env, tmp_path, dispatched=lambda: bool(silent_broker["requests"]),
+    )
+    # The broker received exactly this dispatched command before the kill.
+    (request,) = silent_broker["requests"]
+    assert request["argv"] == inner and request["timeout_seconds"] == 600
+    notice = _notice_line(stderr)
+    budget = runtime.run_tests_foreground_budget_seconds(600, env)
+    assert notice.startswith(f"{_NOTICE_PREFIX} {budget}s")
+    assert "600s target watchdog under a 1800s ceiling" in notice
+    assert "reported as not run, never as passed" in notice
+
+
+_BLOCKED_ADMISSION_LAUNCHER = """\
+import pathlib, sys, time
+from coding_review_agent_loop.test_workers import WorkerBudgetLock
+
+marker = pathlib.Path(sys.argv[1])
+
+
+def blocked(self, *args, **kwargs):
+    # A fake host-capacity wait: record entry, then block like a contended pool.
+    marker.write_text("waiting", encoding="utf-8")
+    time.sleep(600)
+
+
+WorkerBudgetLock.wait_for_host_workers = blocked
+from coding_review_agent_loop.cli import main
+
+raise SystemExit(main(sys.argv[2:]))
+"""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup")
+def test_local_fallback_client_killed_during_host_admission_already_printed_the_full_budget(tmp_path):
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(_BLOCKED_ADMISSION_LAUNCHER, encoding="utf-8")
+    marker = tmp_path / "admission-entered"
+    pid_file = tmp_path / "target.pid"
+    target = "import os, time; open(%r, 'w').write(str(os.getpid())); time.sleep(60)" % str(pid_file)
+    env = _clean_client_env(
+        AGENT_LOOP_TEST_WORKER_HOST_SHARING="on", AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS="1200",
+    )
+    stderr = _run_until_notice(
+        [
+            sys.executable, str(launcher), str(marker), "run-tests",
+            "--timeout-seconds", "300", "--containment-mode", "off",
+            "--test-workers", "2", "--test-worker-enforcement", "clamp", "--",
+            sys.executable, "-c", target,
+        ],
+        env, tmp_path, dispatched=marker.exists,
+    )
+    # Killed while blocked in host admission: the target never launched.
+    assert not pid_file.exists()
+    notice = _notice_line(stderr)
+    budget = runtime.run_tests_foreground_budget_seconds(300, env)
+    assert budget == 300 + 1200 + 142 + 300
+    assert notice.startswith(f"{_NOTICE_PREFIX} {budget}s in the foreground")
+    assert "(1200s waiting for shared test capacity, a 300s target watchdog under a 1800s ceiling, plus parent overhead)" in notice
+    assert "the shell can kill this client first" in notice
+    assert "reported as not run, never as passed" in notice
+
+
+@pytest.mark.skipif(os.name != "posix", reason="UNIX-socket broker")
+def test_codex_agent_env_overrides_an_inherited_cap_so_the_notice_still_prints(tmp_path, silent_broker):
+    huge = str(10 ** 12)
+    ambient = _clean_client_env(**silent_broker["env"], BASH_MAX_TIMEOUT_MS=huge, AGENT_LOOP_SHELL_CAP_MS=huge)
+    config = make_config(tmp_path)
+    # Merged exactly like Runner.run_with_log: the agent env wins.
+    agent_env = {**ambient, **runtime.agent_shell_environment(config, "codex", "coder", ambient=ambient)}
+    assert agent_env["AGENT_LOOP_SHELL_CAP_MS"] == "unknown"
+    assert agent_env["BASH_MAX_TIMEOUT_MS"] == huge
+    inner = ["/usr/bin/env", "FOO=1", sys.executable, "-c", "pass"]
+    stderr = _run_until_notice(
+        [sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests", "--timeout-seconds", "600", "--", *inner],
+        agent_env, tmp_path, dispatched=lambda: bool(silent_broker["requests"]),
+    )
+    (request,) = silent_broker["requests"]
+    assert request["argv"] == inner
+    assert _notice_line(stderr)
+
+
+_KILLED_CLIENT_CODER = """\
+import os, pathlib, signal, subprocess, sys, time
+
+pid_file = pathlib.Path(sys.argv[1])
+target = "import os, time; open(%r, 'w').write(str(os.getpid())); time.sleep(60)" % str(pid_file)
+client = subprocess.Popen(
+    [sys.executable, "-m", "coding_review_agent_loop.cli", "run-tests", "--timeout-seconds", "3",
+     "--", sys.executable, "-c", target],
+    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+)
+notice = ""
+for line in client.stderr:
+    if line.startswith("agent-loop: notice:"):
+        notice = line.strip()
+        break
+deadline = time.monotonic() + 60
+while not pid_file.exists() and time.monotonic() < deadline:
+    time.sleep(0.05)
+# The backend shell cuts the client short while the broker-run target is live.
+os.kill(client.pid, signal.SIGKILL)
+client.wait()
+print("NOTICE=" + notice, flush=True)
+print("CLIENT-RC=%s" % client.returncode, flush=True)
+# Keep the coder turn alive past the target's watchdog.
+time.sleep(10)
+"""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process-group cleanup")
+def test_broker_owned_target_survives_a_client_kill_and_is_journaled_at_its_watchdog(tmp_path):
+    from coding_review_agent_loop.containment import default_policy
+    from coding_review_agent_loop.runner import Runner
+
+    for args in (
+        ["init", "-q"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "T"],
+    ):
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True)
+    (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "initial"], check=True)
+    coder = tmp_path.parent / f"{tmp_path.name}-coder.py"
+    coder.write_text(_KILLED_CLIENT_CODER, encoding="utf-8")
+    pid_file = tmp_path.parent / f"{tmp_path.name}-target.pid"
+    runner = Runner(containment_policy=default_policy(mode="off", cache_dir=tmp_path.parent / f"{tmp_path.name}-rt"))
+    runner.test_workers = 2
+    runner.test_worker_enforcement = "clamp"
+    log_path = tmp_path.parent / f"{tmp_path.name}-coder.log"
+    existing = os.environ.get("PYTHONPATH")
+    result = runner.run_with_log(
+        [sys.executable, str(coder), str(pid_file)], cwd=tmp_path, log_path=log_path,
+        label="coder", progress_interval_seconds=1,
+        env={"PYTHONPATH": _SRC + (os.pathsep + existing if existing else "")},
+    )
+    log = log_path.read_text(encoding="utf-8")
+    assert result.returncode == 0, log
+    assert "NOTICE=agent-loop: notice: this command may run for up to" in log
+    assert "CLIENT-RC=-9" in log
+    # The parent kept observing the broker-run target to its own watchdog.
+    _assert_process_not_active(int(pid_file.read_text(encoding="utf-8")))
+    observations = runner.local_test_observations()
+    assert [observation.outcome for observation in observations] == ["timed_out"], observations
+    assert observations[0].provenance == "parent-observed"
+
+
+def test_client_suppresses_the_notice_for_a_covering_orchestrator_cap(tmp_path, monkeypatch, capsys):
+    cli_module, _calls = _lp_cli_fixtures(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: None)
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_SHARING", "off")
+    budget = runtime.run_tests_foreground_budget_seconds(60, os.environ)
+    command = ["run-tests", "--timeout-seconds", "60", "--containment-mode", "off", "--", sys.executable, "-c", "pass"]
+    monkeypatch.setenv("AGENT_LOOP_SHELL_CAP_MS", str(budget * 1000))
+    assert main(command) == 0
+    assert _NOTICE_PREFIX not in capsys.readouterr().err
+    monkeypatch.setenv("AGENT_LOOP_SHELL_CAP_MS", "120000")
+    monkeypatch.setenv("BASH_MAX_TIMEOUT_MS", str(10 ** 12))
+    assert main(command) == 0
+    assert _NOTICE_PREFIX in capsys.readouterr().err
+
+
+_TIMEOUT_ADVISORY = "agent-loop: advisory: this command reached its"
+
+
+@pytest.mark.parametrize("shape", ["bare", "prefixed", "non-pytest"])
+def test_local_timeout_prints_one_advisory_and_keeps_the_exit_code(tmp_path, monkeypatch, capsys, shape):
+    cli_module, _calls = _lp_cli_fixtures(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: None)
+    sleeper = [sys.executable, "-c", "import time; time.sleep(30)"]
+    inner = {"bare": sleeper, "prefixed": ["/usr/bin/env", "FOO=1", *sleeper], "non-pytest": ["sleep", "30"]}[shape]
+    code = main(["run-tests", "--timeout-seconds", "1", "--containment-mode", "off", "--", *inner])
+    err = capsys.readouterr().err
+    assert err.count(_TIMEOUT_ADVISORY) == 1
+    assert "reached its 1s watchdog (the policy ceiling is 1800s)" in err
+    assert "must be reported as not run" in err
+    monkeypatch.setattr(cli_module, "timeout_advisory", lambda *a: "")
+    assert main(["run-tests", "--timeout-seconds", "1", "--containment-mode", "off", "--", *inner]) == code
+    assert main(["run-tests", "--timeout-seconds", "30", "--containment-mode", "off", "--", sys.executable, "-c", "pass"]) == 0
+    assert _TIMEOUT_ADVISORY not in capsys.readouterr().err
+
+
+def test_broker_timeout_prints_one_advisory_and_other_outcomes_print_nothing_new(tmp_path, monkeypatch, capsys):
+    from coding_review_agent_loop.local_test_evidence import BrokerRunResult
+
+    cli_module, _calls = _lp_cli_fixtures(tmp_path, monkeypatch)
+    outcome = {"value": "timed_out"}
+
+    class FakeBroker:
+        def run(self, *args, **kwargs):
+            return BrokerRunResult(
+                receipt_id="r", execution_ref="e", outcome=outcome["value"],
+                returncode=124 if outcome["value"] == "timed_out" else 0, elapsed_seconds=5.0,
+                wrapper_bootstrap="verified", inner_exec="started", suite_start="unknown",
+            )
+
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker())
+    command = ["run-tests", "--timeout-seconds", "5", "--", sys.executable, "-m", "pytest"]
+    assert main(command) == 124
+    assert capsys.readouterr().err.count(_TIMEOUT_ADVISORY) == 1
+    outcome["value"] = "passed"
+    assert main(command) == 0
+    assert _TIMEOUT_ADVISORY not in capsys.readouterr().err
+
+
+# --- Claude shell limits and backend cap facts (#1343) -----------------------
+
+
+def test_claude_coder_limits_cover_the_whole_lifetime_and_keep_larger_operator_values(tmp_path):
+    config = make_config(tmp_path, coder_test_command_timeout_seconds=600)
+    ambient = {"AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS": "1200"}
+    budget_ms = runtime.run_tests_foreground_budget_seconds(600, ambient) * 1000
+    env = runtime.agent_shell_environment(config, "claude", "coder", ambient=ambient)
+    assert env["BASH_DEFAULT_TIMEOUT_MS"] == env["BASH_MAX_TIMEOUT_MS"] == str(budget_ms)
+    assert env["AGENT_LOOP_SHELL_CAP_MS"] == env["BASH_DEFAULT_TIMEOUT_MS"]
+    assert budget_ms >= (600 + 1200) * 1000
+    larger_default = runtime.agent_shell_environment(
+        config, "claude", "coder", ambient={**ambient, "BASH_DEFAULT_TIMEOUT_MS": str(budget_ms * 2)},
+    )
+    assert larger_default["BASH_DEFAULT_TIMEOUT_MS"] == str(budget_ms * 2)
+    assert larger_default["BASH_MAX_TIMEOUT_MS"] == str(budget_ms * 2)  # never below the default
+    assert larger_default["AGENT_LOOP_SHELL_CAP_MS"] == str(budget_ms * 2)
+    larger_max = runtime.agent_shell_environment(
+        config, "claude", "coder", ambient={**ambient, "BASH_MAX_TIMEOUT_MS": str(budget_ms * 3)},
+    )
+    assert larger_max["BASH_MAX_TIMEOUT_MS"] == str(budget_ms * 3)
+    # The cap fact is the default call limit, never the requestable maximum.
+    assert larger_max["AGENT_LOOP_SHELL_CAP_MS"] == str(budget_ms)
+    smaller = runtime.agent_shell_environment(
+        config, "claude", "coder",
+        ambient={**ambient, "BASH_DEFAULT_TIMEOUT_MS": "120000", "BASH_MAX_TIMEOUT_MS": "600000"},
+    )
+    assert smaller["BASH_DEFAULT_TIMEOUT_MS"] == smaller["BASH_MAX_TIMEOUT_MS"] == str(budget_ms)
+    # The run-tests watchdog ceiling itself is unchanged.
+    assert runtime.inherited_timeout_ceiling({"AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": "600"}) == 600
+
+
+@pytest.mark.parametrize("role", ["reviewer", "repair", "planner", None, "Coder"])
+def test_read_only_claude_roles_keep_bash_limits_unchanged(tmp_path, role):
+    config = make_config(tmp_path)
+    ambient = {"BASH_MAX_TIMEOUT_MS": str(10 ** 12), "AGENT_LOOP_SHELL_CAP_MS": str(10 ** 12)}
+    env = runtime.agent_shell_environment(config, "claude", role, ambient=ambient)
+    assert env == {"AGENT_LOOP_SHELL_CAP_MS": "unknown"}
+
+
+@pytest.mark.parametrize("provider", ["codex", "gemini", "antigravity"])
+@pytest.mark.parametrize("role", ["coder", "reviewer", None])
+def test_non_claude_backends_carry_an_unknown_cap_and_no_bash_limits(tmp_path, provider, role):
+    config = make_config(tmp_path)
+    ambient = {"BASH_MAX_TIMEOUT_MS": str(10 ** 12), "AGENT_LOOP_SHELL_CAP_MS": str(10 ** 12)}
+    env = runtime.agent_shell_environment(config, provider, role, ambient=ambient)
+    assert env == {"AGENT_LOOP_SHELL_CAP_MS": "unknown"}
+    merged = {**ambient, **env}
+    assert runtime.prelaunch_notice(600, 1800, merged) is not None
+
+
+def _env_runner(**outputs):
+    from agent_loop_helpers import FakeRunner
+
+    class EnvRunner(FakeRunner):
+        def __init__(self):
+            super().__init__(**outputs)
+            self.agent_envs = []
+
+        def run_with_log(self, *args, **kwargs):
+            self.agent_envs.append(dict(kwargs.get("env") or {}))
+            return super().run_with_log(*args, **kwargs)
+
+    return EnvRunner()
+
+
+def test_backend_invocation_environments_carry_the_cap_facts(tmp_path, monkeypatch):
+    from coding_review_agent_loop.agents.claude import BACKEND as CLAUDE
+    from coding_review_agent_loop.agents.codex import BACKEND as CODEX
+    from coding_review_agent_loop.agents.gemini import BACKEND as GEMINI
+
+    monkeypatch.setenv("BASH_MAX_TIMEOUT_MS", str(10 ** 12))
+    monkeypatch.setenv("AGENT_LOOP_SHELL_CAP_MS", str(10 ** 12))
+    monkeypatch.delenv("BASH_DEFAULT_TIMEOUT_MS", raising=False)
+    fake = tmp_path / "venv" / "bin" / "python"
+    fake.parent.mkdir(parents=True)
+    fake.symlink_to(sys.executable)
+    config = make_config(tmp_path, test_python=str(fake))
+    runner = _env_runner(claude_outputs=['{"result":"ok"}', '{"result":"ok"}'])
+    CLAUDE.run(runner, config, "Implement", run_id="r", role="coder")
+    coder_env = runner.agent_envs[-1]
+    budget_ms = runtime.run_tests_foreground_budget_seconds(config.coder_test_command_timeout_seconds) * 1000
+    assert coder_env["BASH_DEFAULT_TIMEOUT_MS"] == str(budget_ms)
+    assert coder_env["AGENT_LOOP_SHELL_CAP_MS"] == coder_env["BASH_DEFAULT_TIMEOUT_MS"]
+    assert coder_env["AGENT_LOOP_TEST_PYTHON"] == str(fake)
+    CLAUDE.run(runner, config, "Review", run_id="r", role="reviewer")
+    reviewer_env = runner.agent_envs[-1]
+    assert "BASH_DEFAULT_TIMEOUT_MS" not in reviewer_env and "BASH_MAX_TIMEOUT_MS" not in reviewer_env
+    assert reviewer_env["AGENT_LOOP_SHELL_CAP_MS"] == "unknown"
+    runner = _env_runner(codex_outputs=[{"public_response": "ok", "stdout": "", "returncode": 0}])
+    CODEX.run(runner, config, "Implement", run_id="r", role="coder")
+    assert runner.agent_envs[-1]["AGENT_LOOP_SHELL_CAP_MS"] == "unknown"
+    assert runner.agent_envs[-1]["AGENT_LOOP_TEST_PYTHON"] == str(fake)
+    assert "BASH_DEFAULT_TIMEOUT_MS" not in runner.agent_envs[-1]
+    runner = _env_runner(gemini_outputs=['{"response":"ok"}'])
+    GEMINI.run(runner, config, "Review", run_id="r", role="reviewer")
+    assert runner.agent_envs[-1]["AGENT_LOOP_SHELL_CAP_MS"] == "unknown"
+
+
+@pytest.mark.parametrize("role", ["coder", "reviewer", None])
+def test_antigravity_invocations_carry_the_unknown_cap_fact(tmp_path, monkeypatch, role):
+    from coding_review_agent_loop.agents.antigravity import AntigravityBackend
+
+    huge = str(10 ** 12)
+    monkeypatch.setenv("BASH_MAX_TIMEOUT_MS", huge)
+    monkeypatch.setenv("AGENT_LOOP_SHELL_CAP_MS", huge)
+    monkeypatch.delenv("BASH_DEFAULT_TIMEOUT_MS", raising=False)
+    fake = tmp_path / "venv" / "bin" / "python"
+    fake.parent.mkdir(parents=True)
+    fake.symlink_to(sys.executable)
+    agy_dir = tmp_path / "antigravity"
+    agy_dir.mkdir(parents=True, exist_ok=True)
+    config = make_config(tmp_path, antigravity_dir=agy_dir, test_python=str(fake))
+    runner = _env_runner(antigravity_outputs=[("ok", 0)], antigravity_catalog_outputs=[("Gemini 3.1 Pro (High)", 0)])
+    AntigravityBackend().run(runner, config, "Implement", run_id="r", role=role)
+    AntigravityBackend().discover_models(runner, config, timeout_seconds=30)
+    assert len(runner.agent_envs) == 2  # the main turn and the model-catalog query
+    for env in runner.agent_envs:
+        # The orchestrator-authored fact overrides the ambient cap once
+        # run_with_log merges this env over os.environ.
+        merged = {**os.environ, **env}
+        assert merged["AGENT_LOOP_SHELL_CAP_MS"] == "unknown"
+        assert merged["AGENT_LOOP_TEST_PYTHON"] == str(fake)
+        assert "BASH_DEFAULT_TIMEOUT_MS" not in env and "BASH_MAX_TIMEOUT_MS" not in env
+        assert runtime.prelaunch_notice(600, 1800, merged) is not None
+
+
+def test_format_repair_never_reaches_the_claude_backend():
+    import inspect
+
+    from coding_review_agent_loop.agents import format_repair
+
+    source = inspect.getsource(format_repair)
+    assert "agent_shell_environment" not in source and "BASH_" not in source
+    assert "agents.claude" not in source and "ClaudeBackend" not in source
+
+
+def test_contended_claude_launch_survives_admission_plus_target_time(tmp_path, monkeypatch):
+    # A target that nearly reaches its watchdog after a host-capacity wait
+    # still passes (admission is not counted against the target), and the
+    # whole foreground lifetime fits the Claude default call limit.
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_SHARING", "on")
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_WAIT_SECONDS", "2")
+
+    def contended(self, requested, capacity, *, wait_seconds, notify, wait_notify=None, **_kwargs):
+        time.sleep(2.0)
+        return HostWaitResult(requested, 2.0, False, False, False)
+
+    monkeypatch.setattr(WorkerBudgetLock, "wait_for_host_workers", contended)
+    started = time.monotonic()
+    result = run_foreground_test(
+        [sys.executable, "-c", "import time; time.sleep(2.5)"], cwd=tmp_path, timeout_seconds=3.5,
+        echo_output=False, worker_budget=_budget("clamp"), worker_lock_root=tmp_path / "locks",
+    )
+    total = time.monotonic() - started
+    assert result.outcome == "passed"
+    assert total > 3.5  # admission plus target exceeded the target watchdog
+    config = make_config(tmp_path, coder_test_command_timeout_seconds=4)
+    env = runtime.agent_shell_environment(config, "claude", "coder", ambient=dict(os.environ))
+    assert int(env["BASH_DEFAULT_TIMEOUT_MS"]) >= total * 1000
+    assert int(env["BASH_DEFAULT_TIMEOUT_MS"]) >= (4 + 2) * 1000
+
+
+# --- no-advisory cases through the real runner path (#1343 review item-3) ----
+
+_VOLATILE_SPAWN_KEYS = ("SPEC", "RESERVATION")
+
+
+def _normalized_spawns(spawns):
+    """Spawned argv/env with only per-run random report locations removed."""
+    normalized = []
+    for argv, env in spawns:
+        stable = {key: value for key, value in env.items() if not key.endswith(_VOLATILE_SPAWN_KEYS)}
+        normalized.append((list(argv), stable))
+    return normalized
+
+
+_RUNNER_EXCLUDED_SHAPES = [*(f"serial:{' '.join(extra)}" for extra in _SERIAL_ARGS),
+                           "console-script", "env-prefix", "timeout-prefix", "isolated-flag", "non-pytest",
+                           "undeclared"]
+_RUNNER_CHECKED_SHAPES = ["pythonpath-importable", "unknown", "raises"]
+
+
+def _no_advisory_case(tmp_path, monkeypatch, shape):
+    """Return (argv, env overlay, check_patch) for one no-advisory shape."""
+    from coding_review_agent_loop import lifecycle_probe
+
+    root = _xa_project(tmp_path / "project", declares=shape != "undeclared", broken_xdist=shape != "pythonpath-importable")
+    if shape == "console-script":
+        # A console script's sys.path[0] is its script directory; a -c check
+        # here could only produce a false advisory.
+        (root / "xdist.py").write_text("raise ImportError('shadow')\n", encoding="utf-8")
+    module = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    env = {"PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"}
+    if shape.startswith("serial:"):
+        argv = [*module, *shape.split(":", 1)[1].split(" "), "test_x.py"]
+    elif shape == "console-script":
+        argv = [str(_write_console_script(root / "venv" / "bin" / "pytest")), "-q", "-p", "no:cacheprovider", "test_x.py"]
+    elif shape == "env-prefix":
+        argv = ["/usr/bin/env", "FOO=1", *module, "test_x.py"]
+    elif shape == "timeout-prefix":
+        argv = ["timeout", "100", *module, "test_x.py"]
+    elif shape == "isolated-flag":
+        argv = [sys.executable, "-I", "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_x.py"]
+    elif shape == "non-pytest":
+        argv = [sys.executable, "-c", "pass"]
+    else:
+        argv = [*module, "test_x.py"]
+    if shape == "pythonpath-importable":
+        extra = tmp_path / "extra-path"
+        _lp_write(extra, {"xdist/__init__.py": "", "xdist/plugin.py": ""})
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(extra), os.environ.get("PYTHONPATH")]))
+    elif shape == "unknown":
+        monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", lambda *a, **k: None)
+    elif shape == "raises":
+        def boom(*_a, **_k):
+            raise RuntimeError("probe exploded")
+        monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", boom)
+    return root, argv, env
+
+
+@pytest.mark.parametrize("mode", [None, "off", "clamp", "refuse"])
+@pytest.mark.parametrize("shape", _RUNNER_EXCLUDED_SHAPES + _RUNNER_CHECKED_SHAPES)
+def test_no_advisory_cases_through_the_runner_leave_the_launch_unchanged(tmp_path, monkeypatch, mode, shape):
+    from coding_review_agent_loop import lifecycle_probe
+
+    monkeypatch.setenv("AGENT_LOOP_TEST_WORKER_HOST_SHARING", "off")
+    root, argv, env = _no_advisory_case(tmp_path, monkeypatch, shape)
+    checks = []
+    probes = []
+    inner_check = lifecycle_probe.module_launch_xdist_check
+    real_probe = runtime.run_exit_code_probe
+
+    def spy_check(*args, **kwargs):
+        checks.append(args[1])
+        return inner_check(*args, **kwargs)
+
+    def spy_probe(probe_argv, **kwargs):
+        if any("xdist.plugin" in str(item) for item in probe_argv):
+            probes.append(list(probe_argv))
+        return real_probe(probe_argv, **kwargs)
+
+    monkeypatch.setattr(lifecycle_probe, "module_launch_xdist_check", spy_check)
+    monkeypatch.setattr(runtime, "run_exit_code_probe", spy_probe)
+
+    def run(disable):
+        lines = []
+        with contextlib.ExitStack() as stack:
+            if disable:
+                patched = stack.enter_context(pytest.MonkeyPatch.context())
+                patched.setattr(runner_module, "_xdist_advisory", lambda *a, **k: None)
+            spawns = stack.enter_context(_lp_spawns())
+            result = run_foreground_test(
+                argv, cwd=root, timeout_seconds=120, echo_output=False, classify_pre_collection=True,
+                env={**os.environ, **env}, worker_budget=_budget(mode), output_callback=lines.append,
+                worker_lock_root=tmp_path / "locks",
+            )
+        return result, "".join(lines), _normalized_spawns(spawns)
+
+    result, output, spawns = run(False)
+    assert _advisories(output) == []
+    if shape in _RUNNER_EXCLUDED_SHAPES:
+        # Statically excluded: no xdist check of any interpreter, wrapper or prefix.
+        assert checks == [] and probes == []
+    elif shape == "pythonpath-importable":
+        # The check ran in the real launch context (caller's PYTHONPATH) and found xdist.
+        assert len(checks) == 1 and len(probes) == 1
+    else:
+        assert len(checks) == 1
+    checks.clear()
+    probes.clear()
+    baseline, baseline_output, baseline_spawns = run(True)
+    assert checks == [] and probes == [] and _advisories(baseline_output) == []
+    # Identical launch: worker policy, launch context and dispatch are unchanged.
+    assert spawns and spawns == baseline_spawns
+    assert (result.args, result.outcome, result.returncode, result.pre_collection_launch_failure, result.workers_cohort) == (
+        baseline.args, baseline.outcome, baseline.returncode, baseline.pre_collection_launch_failure, baseline.workers_cohort,
+    )
