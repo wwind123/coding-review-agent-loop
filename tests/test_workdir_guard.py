@@ -1451,6 +1451,7 @@ def test_managed_run_tests_with_worker_flags_keeps_wrapper_contract(tmp_path):
     "grep -E '/codex([^[:alnum:]_-]|$)' tests/test_workdir_guard.py",
     "grep -e '/codex([^[:alnum:]_-]|$)' -e '/tmp/also-a-pattern' tests/",
     "grep -e '/codex' -- tests/test_workdir_guard.py",
+    "grep -- '/codex' tests/test_workdir_guard.py",
 ])
 def test_grep_patterns_are_not_outside_checkout_paths(tmp_path, command):
     validate_test_commands_within_workdir([command], assigned_workdir=tmp_path)
@@ -1468,6 +1469,7 @@ def test_grep_patterns_are_not_outside_checkout_paths(tmp_path, command):
     "git -C /outside grep '/codex'",
     "grep -f /outside/patterns tests/",
     "grep -f tests/patterns /outside/tests",
+    "grep -- -e /outside/file",
 ])
 def test_grep_file_operands_and_workdirs_still_reject_outside_paths(tmp_path, command):
     with pytest.raises(AgentLoopError, match="outside the assigned checkout"):

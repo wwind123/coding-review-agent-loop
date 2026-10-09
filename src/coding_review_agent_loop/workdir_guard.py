@@ -807,12 +807,11 @@ def _grep_pattern_indices(tokens: Sequence[str], head: int | None) -> set[int]:
     while index < len(tokens):
         token = tokens[index]
         if token == "--":
-            # Once a pattern is present, operands after -- are file/pathspec
-            # arguments, never regexes.
-            if has_pattern:
-                break
-            index += 1
-            continue
+            # Options end here. If no option supplied a pattern, the next
+            # positional token is the pattern; later tokens are file operands.
+            if not has_pattern and index + 1 < len(tokens):
+                patterns.add(index + 1)
+            break
         if token in {"-e", "--regexp"}:
             if index + 1 >= len(tokens):
                 break
