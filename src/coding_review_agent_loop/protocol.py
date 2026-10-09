@@ -2525,6 +2525,11 @@ def _claims_value(
     return tuple(claims)
 
 
+PREDECESSOR_HEAD_UNMOVED_MESSAGE = (
+    "The follow-up reports code changes but the PR head did not move from the predecessor head."
+)
+
+
 def derive_risk_test_matrix_evidence(
     *,
     matrix: RiskTestMatrix | Mapping[str, object],
@@ -2537,6 +2542,7 @@ def derive_risk_test_matrix_evidence(
     authenticated_checkout_head: str | None = None,
     authenticated_tree_clean: bool | None = None,
     predecessor_head: str | None = None,
+    head_change_expected: bool = False,
     expected_identity: str | None = None,
     execution_owner: str | None = None,
 ) -> DerivedRiskEvidenceResult:
@@ -2546,6 +2552,13 @@ def derive_risk_test_matrix_evidence(
     canonical rows, statuses, ordering, and mappings are all produced here.
     Any post-authentication mismatch produces complete non-verified evidence
     and a bounded diagnostic, preserving the authenticated handoff.
+
+    ``predecessor_head`` together with ``head_change_expected`` guards a
+    follow-up that claims code changes but left the PR head unmoved (#1338).
+    An evidence-only follow-up at an unchanged head passes
+    ``head_change_expected=False`` and authenticates against the current head
+    alone; unpushed commits and dirty trees are still caught by the checkout
+    head, clean-tree, and tree-digest proofs.
     """
     parsed_matrix = parse_risk_test_matrix(matrix)  # shape-check: fatal:orchestrator-authored
     identity = expected_identity or risk_test_matrix_identity(parsed_matrix)  # shape-check: fatal:authentication-or-forgery
@@ -2607,11 +2620,18 @@ def derive_risk_test_matrix_evidence(
     # these parameters optional for historical/unit callers, but never let an
     # omitted authentication proof upgrade a selected receipt to ``verified``.
     # Matching the receipt's recorded tree is insufficient when the assigned
-    # checkout is on another commit.
+    # checkout is on another commit.  Unpushed commits make the checkout head
+    # differ from the fetched PR head, and uncommitted edits fail the
+    # clean-tree and tree-digest proofs, so the predecessor clause only guards
+    # a follow-up that claimed code changes but did not move the head (#1338).
     checkout_head_mismatch = (
         current_head is None
         or authenticated_checkout_head != current_head
-        or (predecessor_head is not None and authenticated_checkout_head == predecessor_head)
+    )
+    predecessor_head_unmoved = (
+        head_change_expected
+        and predecessor_head is not None
+        and current_head == predecessor_head
     )
     checkout_tree_unavailable = authenticated_tree_clean is not True
     unsuperseded_failures = [
@@ -2768,6 +2788,13 @@ def derive_risk_test_matrix_evidence(
                     diagnostics.append(PostAuthClaimDiagnostic(
                         row.row_id, "checkout-head-mismatch",
                         "The assigned checkout was not authenticated at the exact current PR head.",
+                    ))
+                elif predecessor_head_unmoved:
+                    valid_selected = False
+                    selected_observation_valid = False
+                    diagnostics.append(PostAuthClaimDiagnostic(
+                        row.row_id, "checkout-head-mismatch",
+                        PREDECESSOR_HEAD_UNMOVED_MESSAGE,
                     ))
                 if checkout_tree_unavailable:
                     valid_selected = False
