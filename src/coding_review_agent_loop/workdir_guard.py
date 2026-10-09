@@ -831,6 +831,16 @@ def _grep_pattern_indices(tokens: Sequence[str], head: int | None) -> set[int]:
             has_pattern = True
             index += 1
             continue
+        if token in {
+            "-m", "--max-count", "-A", "--after-context", "-B", "--before-context",
+            "-C", "--context", "-D", "--devices", "-d", "--directories",
+            "--binary-files", "--exclude", "--exclude-dir",
+            "--include", "--label", "--group-separator", "--threads",
+        }:
+            # These options consume the next token, which cannot be the
+            # positional pattern. Keep that token subject to path checks.
+            index += 2
+            continue
         if token.startswith("-"):
             index += 1
             continue
