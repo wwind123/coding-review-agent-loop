@@ -823,3 +823,28 @@ def test_canonical_assembly_fails_closed_on_a_degraded_status() -> None:
         structured_plan_revision_to_payload(plan), round_number=4
     )
     assert reauthenticated.plan.architecture_impact == plan.architecture_impact
+
+
+def test_assembled_record_after_tool_owned_key_patch_carries_tool_source_1333() -> None:
+    """#1333: the assembled plan re-serializes the parsed recommendation only."""
+    from agent_loop_helpers import structured_v1_plan_state
+    from coding_review_agent_loop.comment_rendering import render_execution_recommendation_section
+    from coding_review_agent_loop.protocol import EXECUTION_TOPOLOGY_SOURCE, validate_structured_plan_state
+
+    plan_text = structured_v1_plan_state()
+    state = AuthenticatedPlanState.from_plan(validate_structured_plan_state(plan_text), round_number=1)
+    recommendation = json.loads(plan_text.partition("\n")[0])["execution_recommendation"]
+    recommendation["rationale"] = "The revised scope is one coherent delivery."
+    recommendation["topology_source"] = "model"
+    patch = _patch(state, [{"op": "replace", "field": "execution_recommendation", "value": recommendation}])
+
+    assembled, sidecar = assemble_authenticated_plan_revision(state, patch, result_round_number=2)
+
+    payload = structured_plan_revision_to_payload(assembled)
+    assert "topology_source" not in payload["execution_recommendation"]
+    assert payload["execution_recommendation"]["rationale"] == "The revised scope is one coherent delivery."
+    assert "topology_source" not in json.dumps(sidecar.raw_patch)
+    assert sidecar.raw_patch == parse_plan_revision_patch(patch).to_payload()
+    section = render_execution_recommendation_section(assembled.execution_recommendation)
+    assert f"- `topology_source`: `{EXECUTION_TOPOLOGY_SOURCE}`" in section
+    assert "`model`" not in section

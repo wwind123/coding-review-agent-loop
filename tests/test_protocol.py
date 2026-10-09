@@ -7230,3 +7230,211 @@ def test_flattened_assessment_is_stored_as_plain_strings_1330():
     assert sanitized["affected_components"] == ["area: x; change: y"]
     reparsed = _parse_impact_1330(sanitized, architecture_status_mode="legacy")
     assert reparsed == parsed.architecture_impact
+
+
+# --- #1333: tool-owned execution_recommendation keys are dropped before validation ---
+
+import logging as _logging_1333  # noqa: E402
+
+from agent_loop_helpers import structured_v1_plan_state as _plan_state_text_1333  # noqa: E402
+from coding_review_agent_loop.plan_assembly import (  # noqa: E402
+    AuthenticatedPlanState as _AuthenticatedPlanState_1333,
+)
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    TOOL_OWNED_EXECUTION_RECOMMENDATION_KEYS as _TOOL_OWNED_1333,
+    parse_plan_revision_patch as _parse_patch_1333,
+    validate_structured_plan_revision as _validate_plan_revision_1333,
+    validate_structured_plan_state as _validate_plan_state_1333,
+)
+
+_LOGGER_1333 = "coding_review_agent_loop.protocol"
+_DROPPED_1333 = "dropped tool-owned key"
+_PLAN_FOOTER_1333 = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _dropped_lines_1333(caplog):
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == _LOGGER_1333 and _DROPPED_1333 in r.getMessage()
+    ]
+
+
+def _plan_payload_1333(**recommendation_extra):
+    payload = json.loads(_plan_state_text_1333().partition("\n")[0])
+    payload["execution_recommendation"].update(recommendation_extra)
+    return payload
+
+
+def _plan_text_1333(payload):
+    return json.dumps(payload) + _PLAN_FOOTER_1333
+
+
+def _patch_1333(*, recommendation_extra=None, nested=None):
+    """A semantic patch replacing execution_recommendation on the fixture plan."""
+    base = _AuthenticatedPlanState_1333.from_plan(
+        _validate_plan_state_1333(_plan_state_text_1333()), round_number=1
+    )
+    recommendation = _plan_payload_1333()["execution_recommendation"]
+    recommendation["rationale"] = "The revised scope is one coherent delivery."
+    recommendation.update(recommendation_extra or {})
+    if nested is not None:
+        recommendation.update(nested)
+    return {
+        "schema_version": 1, "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1, "state": "blocking",
+        "summary": "Patch.", "prior_plan_item_dispositions": [],
+        "base_round_number": 1, "base_state_identity": base.state_identity,
+        "operations": [
+            {"op": "replace", "field": "summary", "value": "Revised summary."},
+            {"op": "replace", "field": "execution_recommendation", "value": recommendation},
+        ],
+    }
+
+
+def test_tool_owned_key_constant_is_the_audited_set_1333():
+    assert _TOOL_OWNED_1333 == frozenset({
+        "topology_source", "recommendation_digest", "execution_strategy_contract_version",
+    })
+
+
+def test_patch_replace_with_topology_source_parses_and_logs_1333(caplog):
+    with_key = _patch_1333(recommendation_extra={"topology_source": "model"})
+    without_key = _patch_1333()
+    with caplog.at_level(_logging_1333.WARNING, logger=_LOGGER_1333):
+        parsed = _parse_patch_1333(with_key)
+    assert parsed == _parse_patch_1333(without_key)
+    recommendation = parsed.operations[1].value
+    assert "topology_source" not in recommendation.to_payload()
+    assert _dropped_lines_1333(caplog) == [
+        "plan_revision_patch.operations[1].value: dropped tool-owned key "
+        "`topology_source` before validation",
+    ]
+
+
+def test_patch_replace_drops_every_tool_owned_key_with_one_line_each_1333(caplog):
+    with_keys = _patch_1333(recommendation_extra={
+        "topology_source": "approved-plan-v1",
+        "recommendation_digest": "0" * 64,
+        "execution_strategy_contract_version": 1,
+    })
+    with caplog.at_level(_logging_1333.WARNING, logger=_LOGGER_1333):
+        parsed = _parse_patch_1333(with_keys)
+    assert parsed == _parse_patch_1333(_patch_1333())
+    lines = _dropped_lines_1333(caplog)
+    assert len(lines) == 3
+    for key in ("topology_source", "recommendation_digest", "execution_strategy_contract_version"):
+        assert (
+            f"plan_revision_patch.operations[1].value: dropped tool-owned key `{key}` "
+            "before validation"
+        ) in lines
+
+
+def test_patch_replace_with_non_tool_unknown_key_is_still_rejected_1333(caplog):
+    patch = _patch_1333(recommendation_extra={"topology_source": "model", "extra_note": "x"})
+    with caplog.at_level(_logging_1333.WARNING, logger=_LOGGER_1333):
+        with pytest.raises(AgentLoopError, match=r"has unknown field\(s\): extra_note"):
+            _parse_patch_1333(_patch_1333(recommendation_extra={"extra_note": "x"}))
+    assert _dropped_lines_1333(caplog) == []
+    # A tool-owned key beside a non-tool key does not rescue the rejection.
+    with pytest.raises(AgentLoopError, match=r"has unknown field\(s\): extra_note"):
+        _parse_patch_1333(patch)
+
+
+@pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
+def test_fresh_plan_with_tool_owned_key_parses_identically_and_logs_1333(kind, caplog):
+    def validate(text):
+        if kind == "plan_state":
+            return _validate_plan_state_1333(text)
+        return _validate_plan_revision_1333(text)
+
+    def payload(**extra):
+        plan = _plan_payload_1333(**extra)
+        if kind == "plan_revision":
+            plan["kind"] = "plan_revision"
+            plan["prior_plan_item_dispositions"] = []
+        return plan
+
+    with caplog.at_level(_logging_1333.WARNING, logger=_LOGGER_1333):
+        parsed = validate(_plan_text_1333(payload(topology_source="model")))
+    assert parsed == validate(_plan_text_1333(payload()))
+    assert "topology_source" not in parsed.execution_recommendation.to_payload()
+    assert _dropped_lines_1333(caplog) == [
+        f"{kind}.execution_recommendation: dropped tool-owned key `topology_source` "
+        "before validation",
+    ]
+
+
+def test_fresh_plan_with_non_tool_unknown_key_is_still_rejected_1333(caplog):
+    with caplog.at_level(_logging_1333.WARNING, logger=_LOGGER_1333):
+        with pytest.raises(AgentLoopError, match=r"has unknown field\(s\): extra_note"):
+            _validate_plan_state_1333(_plan_text_1333(_plan_payload_1333(extra_note="x")))
+    assert _dropped_lines_1333(caplog) == []
+
+
+def _staged_recommendation_1333():
+    return {
+        "strategy": "staged",
+        "rationale": "Two stages.",
+        "staging_feasibility": "safe",
+        "scope_items": [
+            {"scope_item_id": "scope-1", "requirement": "First.", "acceptance_criteria": ["Done."]},
+            {"scope_item_id": "scope-2", "requirement": "Second.", "acceptance_criteria": ["Done."]},
+        ],
+        "coupling_constraints": [],
+        "child_stages": [
+            {
+                "stage_id": "stage-1", "position": 1, "title": "First", "summary": "First stage.",
+                "deliverables": ["A."], "non_goals": [], "acceptance_criteria": ["Done."],
+                "depends_on_stage_ids": [], "dependency_notes": "None.",
+                "automation": "agent-pr", "rollout_risk": "low",
+                "compatibility_constraints": [], "covered_scope_item_ids": ["scope-1"],
+                "execution_disposition": {
+                    "disposition": "requires-child-planning",
+                    "rationale": "Child planning follows.",
+                    "unresolved_design_decisions": [],
+                },
+            },
+            {
+                "stage_id": "stage-2", "position": 2, "title": "Second", "summary": "Second stage.",
+                "deliverables": ["B."], "non_goals": [], "acceptance_criteria": ["Done."],
+                "depends_on_stage_ids": ["stage-1"], "dependency_notes": "After one.",
+                "automation": "agent-pr", "rollout_risk": "low",
+                "compatibility_constraints": [], "covered_scope_item_ids": ["scope-2"],
+                "execution_disposition": {
+                    "disposition": "requires-child-planning",
+                    "rationale": "Child planning follows.",
+                    "unresolved_design_decisions": [],
+                },
+            },
+        ],
+        "retained_parent_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "final_integration_work": {
+            "status": "none", "deliverables": [], "acceptance_criteria": [],
+            "covered_scope_item_ids": [],
+        },
+        "caveats": [],
+    }
+
+
+@pytest.mark.parametrize("nested_path", ["child_stages[0]", "retained_parent_work", "scope_items[0]"])
+def test_nested_tool_owned_key_is_still_rejected_1333(nested_path, caplog):
+    recommendation = _staged_recommendation_1333()
+    payload = json.loads(_plan_state_text_1333().partition("\n")[0])
+    payload["execution_recommendation"] = recommendation
+    assert _validate_plan_state_1333(_plan_text_1333(payload)).execution_recommendation.strategy == "staged"
+    if nested_path == "child_stages[0]":
+        recommendation["child_stages"][0]["topology_source"] = "model"
+    elif nested_path == "retained_parent_work":
+        recommendation["retained_parent_work"]["topology_source"] = "model"
+    else:
+        recommendation["scope_items"][0]["topology_source"] = "model"
+    with caplog.at_level(_logging_1333.WARNING, logger=_LOGGER_1333):
+        with pytest.raises(AgentLoopError) as error:
+            _validate_plan_state_1333(_plan_text_1333(payload))
+    message = str(error.value)
+    assert "has unknown field(s): topology_source" in message
+    assert f"plan_state.execution_recommendation.{nested_path}" in message
+    assert _dropped_lines_1333(caplog) == []

@@ -2616,3 +2616,41 @@ def test_schema_valid_architecture_field_pins_renderable_objects_1330():
     assert field("affected_components", [{}, {"a": {"b": "c"}}, {"n": 1}, "", 7]) is False
     assert _rp._schema_valid_architecture_entry(_OBJECT_1330) is True
     assert _rp._schema_valid_architecture_entry({"n": 1}) is False
+
+
+def test_semantic_patch_with_tool_owned_key_passes_envelope_only_repair_1333():
+    """#1333: a patch carrying topology_source is recoverable and byte-pinned."""
+    from coding_review_agent_loop.plan_assembly import AuthenticatedPlanState
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
+    from coding_review_agent_loop.repair_preservation import require_recoverable_semantic_patch
+
+    plan_text = structured_v1_plan_state()
+    base = AuthenticatedPlanState.from_plan(validate_structured_plan_state(plan_text), round_number=1)
+    recommendation = json.loads(plan_text.partition("\n")[0])["execution_recommendation"]
+    recommendation["rationale"] = "The revised scope is one coherent delivery."
+    recommendation["topology_source"] = "model"
+    patch = {
+        "schema_version": 1, "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1, "state": "blocking",
+        "summary": "Patch.", "prior_plan_item_dispositions": [],
+        "base_round_number": 1, "base_state_identity": base.state_identity,
+        "operations": [
+            {"op": "replace", "field": "execution_recommendation", "value": recommendation},
+        ],
+    }
+    payload_text = json.dumps(patch)
+    # Only the envelope is defective: the footer and signature are missing.
+    original = payload_text
+    repaired = payload_text + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+
+    require_recoverable_semantic_patch(original)
+    validate_repair_preservation(original, repaired)
+
+    # The payload bytes stay pinned: a repair that strips the key itself is vetoed.
+    stripped = deepcopy(patch)
+    del stripped["operations"][0]["value"]["topology_source"]
+    with pytest.raises(AgentLoopError, match="must be preserved exactly"):
+        validate_repair_preservation(
+            original,
+            json.dumps(stripped) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+        )

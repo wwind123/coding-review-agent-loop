@@ -4508,3 +4508,77 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
         assert message == legacy + sentence + route
     else:
         assert message == legacy + route
+
+
+# --- #1333: a tool-owned recommendation key in a patch does not route to replan ---
+
+
+def _m1333_patch(base_plan_text, *, recommendation_extra):
+    recommendation = json.loads(base_plan_text.split("\n", 1)[0])["execution_recommendation"]
+    recommendation["rationale"] = "The revised scope is one coherent delivery."
+    recommendation.update(recommendation_extra)
+    return _m979_patch_with(base_plan_text, extra_operations=[
+        {"op": "replace", "field": "execution_recommendation", "value": recommendation},
+    ])
+
+
+def test_m1333_patch_with_tool_owned_key_validates_without_replan_routing(caplog):
+    """#1333: the seam accepts a tool-owned key and only an envelope defect reaches repair."""
+    fresh = _m976_full_plan_state()
+    carried = (_m979_carried_item(),)
+    accepted = _m1333_patch(fresh, recommendation_extra={"topology_source": "model"})
+
+    with caplog.at_level("WARNING", logger="coding_review_agent_loop.protocol"):
+        parsed = orchestrator._validate_plan_revision_patch_response(
+            accepted, unresolved_items=carried
+        )
+    assert "topology_source" not in parsed.operations[-1].value.to_payload()
+    assert [
+        r.getMessage() for r in caplog.records
+        if "dropped tool-owned key" in r.getMessage()
+    ] == [
+        f"plan_revision_patch.operations[{len(parsed.operations) - 1}].value: "
+        "dropped tool-owned key `topology_source` before validation"
+    ]
+
+    # Only the envelope is defective: the classifier returns None, so the
+    # candidate goes to envelope repair rather than the bounded replan.
+    missing_footer = accepted.split("\n<!--", 1)[0]
+    with pytest.raises(AgentLoopError) as error:
+        orchestrator._validate_plan_revision_patch_response(
+            missing_footer, unresolved_items=carried
+        )
+    assert orchestrator._semantic_patch_payload_rejection(
+        error.value,
+        text=missing_footer,
+        normalized=None,
+        payload_validator=lambda payload: orchestrator._validate_plan_revision_patch_payload(
+            payload, unresolved_items=carried
+        ),
+    ) is None
+
+
+def test_m1333_patch_with_non_tool_unknown_key_still_routes_to_replan(caplog):
+    """#1333: a non-tool unknown key keeps the payload rejection and replan routing."""
+    fresh = _m976_full_plan_state()
+    carried = (_m979_carried_item(),)
+    rejected = _m1333_patch(fresh, recommendation_extra={"extra_note": "x"})
+    with caplog.at_level("WARNING", logger="coding_review_agent_loop.protocol"):
+        with pytest.raises(AgentLoopError) as error:
+            orchestrator._validate_plan_revision_patch_response(
+                rejected, unresolved_items=carried
+            )
+    assert "has unknown field(s): extra_note" in str(error.value)
+    assert not [r for r in caplog.records if "dropped tool-owned key" in r.getMessage()]
+    rejection = orchestrator._semantic_patch_payload_rejection(
+        error.value,
+        text=rejected,
+        normalized=None,
+        payload_validator=lambda payload: orchestrator._validate_plan_revision_patch_payload(
+            payload, unresolved_items=carried
+        ),
+    )
+    assert rejection is not None
+    candidate, diagnostic = rejection
+    assert candidate == rejected
+    assert "has unknown field(s): extra_note" in diagnostic
