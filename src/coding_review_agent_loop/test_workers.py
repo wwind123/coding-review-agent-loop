@@ -2300,8 +2300,88 @@ ENFORCEMENT_SENTENCES = {
 }
 
 
-def render_worker_guidance(budget: WorkerBudget, *, parallel_supported: bool, preliminary: bool = True) -> str:
-    """Coder/repair prompt block for the parallel test-worker budget."""
+@dataclass(frozen=True)
+class InterpreterGuidance:
+    """What the parent's import check established about ``--test-python`` (#1343).
+
+    ``path`` is ``None`` when no interpreter is configured.  ``state`` is the
+    import check's exit (0 importable, 3 pytest missing, 4 xdist missing) or
+    ``None`` when unknown.  In sandboxed mode ``invocation`` is the granted
+    test invocation and ``recommend`` is False when ``--test-command`` takes
+    precedence.
+    """
+
+    path: str | None
+    state: int | None
+    invocation: str | None = None
+    recommend: bool = True
+
+
+LONG_SUITE_GUIDANCE = (
+    "For long or full suites: `agent-loop run-tests` prints a foreground-budget notice before "
+    "it starts and, for `<python> -m pytest` in a repository that declares pytest-xdist, an "
+    "advisory when that interpreter cannot import xdist; never install packages into a system or "
+    "externally managed interpreter (PEP 668); a required suite that cannot finish within the "
+    "watchdog or your shell's own per-command limit must be reported as not run, never as passed."
+)
+
+
+def render_interpreter_guidance(guidance: InterpreterGuidance) -> str:
+    """State only what the import check established; never claim the suite fits the caps."""
+    path = guidance.path
+    if path is None:
+        return LONG_SUITE_GUIDANCE
+    if guidance.state == 0 and guidance.recommend:
+        if guidance.invocation is not None:
+            use = (
+                f"your granted test invocation `{guidance.invocation}` uses it; use that invocation "
+                "for broad and full-suite runs"
+            )
+        else:
+            use = (
+                "use it (also `$AGENT_LOOP_TEST_PYTHON`) for broad and full-suite runs through "
+                f"`agent-loop run-tests`, for example `agent-loop run-tests -- {path} -m pytest`"
+            )
+        sentence = (
+            "Configured test interpreter: the parent's import check found pytest and pytest-xdist "
+            f"importable by `{path}`; {use}, and use the same interpreter consistently because "
+            "supersession compares exact commands."
+        )
+    elif guidance.state == 0:
+        sentence = (
+            "A test interpreter is configured, but your granted test invocation does not use it; "
+            "run only the granted invocation."
+        )
+    elif guidance.state == 3:
+        sentence = (
+            f"Configured test interpreter `{path}`: the parent's import check could not import "
+            "pytest, so it is not recommended for test runs."
+        )
+    elif guidance.state == 4:
+        sentence = (
+            f"Configured test interpreter `{path}`: the parent's import check imported pytest but "
+            "could not import pytest-xdist (`xdist.plugin`), so it is not recommended for broad or "
+            "full-suite runs."
+        )
+    else:
+        sentence = (
+            f"Configured test interpreter `{path}`: the parent's import check was inconclusive, so "
+            "it is not recommended."
+        )
+    return f"{sentence} {LONG_SUITE_GUIDANCE}"
+
+
+def render_worker_guidance(
+    budget: WorkerBudget,
+    *,
+    parallel_supported: bool,
+    preliminary: bool = True,
+    test_interpreter: InterpreterGuidance | None = None,
+) -> str:
+    """Coder/repair prompt block for the parallel test-worker budget.
+
+    ``test_interpreter`` ``None`` renders the pre-#1343 text unchanged.
+    """
     estimate = "preliminary pre-admission estimate" if preliminary else "resolved budget"
     lines = [
         "Parallel test workers: `$AGENT_LOOP_TEST_WORKERS` in your environment is the "
@@ -2335,6 +2415,8 @@ def render_worker_guidance(budget: WorkerBudget, *, parallel_supported: bool, pr
         "it starts and, after a bounded wait, may run with fewer workers; neither is a failure "
         "to fix."
     )
+    if test_interpreter is not None:
+        lines.append(render_interpreter_guidance(test_interpreter))
     return " ".join(lines) + "\n"
 
 

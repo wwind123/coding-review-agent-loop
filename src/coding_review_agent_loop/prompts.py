@@ -5,9 +5,11 @@ from __future__ import annotations
 import functools
 import inspect
 import json
+import os
 import re
 import shlex
 from dataclasses import dataclass, replace as dataclass_replace
+from pathlib import Path
 from textwrap import indent
 from typing import TYPE_CHECKING, Sequence
 
@@ -551,13 +553,16 @@ def _coder_local_test_scope_guidance(
         else 1800
     )
     headroom = max(300, int(ceiling * 0.20))
-    backend_guidance = (
-        f" For Antigravity, the configured print timeout is "
-        f"{config.antigravity_print_timeout_seconds}s; it should exceed the selected "
-        f"whole-command watchdog plus headroom of max(300s, 20%) ({headroom}s)."
-        if config is not None and config.coder == "antigravity"
-        else " The backend whole-turn/invocation timeout must exceed the selected command watchdog with enough headroom for analysis, edits, and reporting."
-    )
+    if config is not None and config.coder == "antigravity":
+        backend_guidance = (
+            f" For Antigravity, the configured print timeout is "
+            f"{config.antigravity_print_timeout_seconds}s; it should exceed the selected "
+            f"whole-command watchdog plus headroom of max(300s, 20%) ({headroom}s)."
+        )
+    elif config is not None and config.coder == "claude":
+        backend_guidance = _claude_shell_limit_guidance(config)
+    else:
+        backend_guidance = " The backend whole-turn/invocation timeout must exceed the selected command watchdog with enough headroom for analysis, edits, and reporting."
     return (
         "Keep three limits separate: a framework per-test timeout, the wrapper's "
         "whole-command watchdog, and the backend's whole-turn timeout. "
@@ -598,6 +603,25 @@ def _coder_local_test_scope_guidance(
     )
 
 
+def _claude_shell_limit_guidance(config: AgentLoopConfig) -> str:
+    """Claude coder Bash-limit sentence (#1343), sized like agents/claude.py."""
+    from .test_runtime import (
+        CLAUDE_BASH_DEFAULT_ENV,
+        agent_shell_environment,
+        run_tests_foreground_budget_seconds,
+    )
+
+    budget = run_tests_foreground_budget_seconds(config.coder_test_command_timeout_seconds, os.environ)
+    default_ms = int(agent_shell_environment(config, "claude", "coder")[CLAUDE_BASH_DEFAULT_ENV])
+    return (
+        f" For Claude, every Bash call in this turn defaults to a {default_ms // 1000}s limit, which "
+        "covers the run-tests watchdog, the shared-capacity wait and parent overhead. Run "
+        "agent-loop run-tests in the foreground and either omit the Bash timeout parameter or pass "
+        f"at least {budget * 1000} ms; never pass a smaller timeout for a test command. The "
+        "whole-turn timeout must still exceed this."
+    )
+
+
 def preliminary_worker_budget(config: AgentLoopConfig):
     """The pre-admission worker-budget estimate shown in coder/repair prompts.
 
@@ -631,9 +655,44 @@ def parallel_test_worker_guidance(config: AgentLoopConfig | None) -> str:
 
         budget = preliminary_worker_budget(config)
         supported = detect_parallel_support(repository_root(agent_workdir(config, config.coder)))
-        return render_worker_guidance(budget, parallel_supported=supported)
+        return render_worker_guidance(
+            budget, parallel_supported=supported, test_interpreter=configured_interpreter_guidance(config),
+        )
     except Exception:  # pragma: no cover - guidance must never block a prompt
         return ""
+
+
+def configured_interpreter_guidance(config: AgentLoopConfig):
+    """What the parent established about ``--test-python`` for this render (#1343).
+
+    The import check runs once per render, with no cross-render cache.  Any
+    exception returns ``None``, which renders today's text.
+    """
+    from .test_workers import InterpreterGuidance
+
+    try:
+        test_python = getattr(config, "test_python", None)
+        if not test_python:
+            return InterpreterGuidance(path=None, state=None)
+        from .lifecycle_probe import xdist_import_check
+
+        checkout = Path(agent_workdir(config, config.coder))
+        state = xdist_import_check((str(test_python),), os.environ, checkout)
+        invocation: str | None = None
+        recommend = True
+        if is_sandboxed(config):
+            # The grant and the guidance share one byte-identical invocation;
+            # an explicit --test-command keeps its precedence.
+            from .agent_permissions import coder_test_invocation
+
+            configured = tuple(getattr(config, "test_command", None) or ())
+            invocation = coder_test_invocation(config, config.coder)
+            recommend = invocation is not None and (not configured or configured[0] == str(test_python))
+        return InterpreterGuidance(
+            path=str(test_python), state=state, invocation=invocation, recommend=recommend,
+        )
+    except Exception:
+        return None
 
 
 def containment_prompt_guidance(config: AgentLoopConfig | None) -> str:

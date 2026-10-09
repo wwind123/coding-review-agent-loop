@@ -354,6 +354,108 @@ def _cancelled_result(cmd, cwd, timeout_seconds, wrapper_bootstrap, health_prove
 _UNRESOLVED_PACKAGE_SCRIPT: Any = object()
 
 
+_SERIAL_WORKER_VALUES = frozenset({"0"})
+_NO_XDIST_PLUGIN_VALUES = frozenset({"no:xdist", "no:xdist.plugin"})
+
+
+def _argv_requests_serial_or_no_xdist(argv: Sequence[str]) -> bool:
+    """True when a direct-pytest argv explicitly asks for no workers or no xdist.
+
+    Scans only the pytest arguments (up to ``--``).  Used only to skip the
+    xdist advisory (#1343); cohort labels keep their own semantics.
+    """
+    from .test_workers import classify_command
+
+    tokens = [str(item) for item in argv]
+    shape = classify_command(tokens)
+    if shape.command_class != "direct-pytest" or shape.pytest_args_start is None:
+        return False
+    index = shape.pytest_args_start
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        following = tokens[index + 1] if index + 1 < len(tokens) else None
+        if token in {"-n", "--numprocesses"} and following in _SERIAL_WORKER_VALUES:
+            return True
+        if token.startswith("--numprocesses=") and token.split("=", 1)[1] in _SERIAL_WORKER_VALUES:
+            return True
+        if token.startswith("-n") and not token.startswith("--") and len(token) > 2 and token[2:].lstrip("=") in _SERIAL_WORKER_VALUES:
+            return True
+        if token == "-p" and following in _NO_XDIST_PLUGIN_VALUES:
+            return True
+        if token.startswith("-p") and not token.startswith("--") and len(token) > 2 and token[2:].lstrip("=") in _NO_XDIST_PLUGIN_VALUES:
+            return True
+        if token == "--dist" and following == "no":
+            return True
+        if token == "--dist=no":
+            return True
+        index += 1
+    return False
+
+
+def xdist_advisory_text(interpreter: str, timeout_seconds: float, env: Mapping[str, str]) -> str:
+    """The non-authoritative missing-xdist advisory (#1343); predicts no single outcome."""
+    from .test_runtime import ENV_TEST_PYTHON
+
+    remedy = (
+        "Use $AGENT_LOOP_TEST_PYTHON or ask the operator to configure --test-python"
+        if str(env.get(ENV_TEST_PYTHON) or "").strip()
+        else "Ask the operator to configure --test-python"
+    )
+    return (
+        f"agent-loop: advisory: pytest-xdist could not be imported by {interpreter} in this "
+        "command's launch context although the repository declares it. Depending on this "
+        "command's arguments and its pytest configuration (argv, PYTEST_ADDOPTS, ini addopts), "
+        f"pytest may run serially and exceed your shell limit or the {timeout_seconds:g}s "
+        "watchdog, reject worker options such as -n, --dist or --tx with a usage error, or fail "
+        f"while loading the xdist plugin. {remedy}; do not install into a system interpreter. "
+        "This advisory is not test evidence."
+    )
+
+
+def _xdist_advisory(
+    cmd: Sequence[str],
+    spawn_environment: Mapping[str, str] | None,
+    cwd: Path,
+    timeout_seconds: float,
+    *,
+    worker_budget: WorkerBudget | None,
+) -> str | None:
+    """Return the advisory for a module launch whose context cannot import xdist.
+
+    Only ``<python> [validated flags] -m pytest`` in an xdist-declaring
+    repository is checked, and never an argv that explicitly asks for serial
+    execution or disables xdist.  Never mutates its inputs; any doubt or
+    exception means no advisory.
+    """
+    from .lifecycle_probe import XDIST_MISSING, launch_eligibility_for, module_launch_xdist_check
+    from .test_workers import COHORT_SERIAL, detect_parallel_support, expected_workers_label, repository_root
+
+    try:
+        if _argv_requests_serial_or_no_xdist(cmd):
+            return None
+        eligibility = launch_eligibility_for(cmd, spawn_environment, cwd)
+        if eligibility is None or eligibility.shape != "module":
+            return None
+        if not detect_parallel_support(repository_root(cwd)):
+            return None
+        label = expected_workers_label(
+            cmd,
+            budget=worker_budget.workers if worker_budget is not None else None,
+            mode=worker_budget.enforcement if worker_budget is not None else None,
+            parallel_default=True,
+        )
+        if label == COHORT_SERIAL:
+            return None
+        if module_launch_xdist_check(eligibility, cmd, spawn_environment, cwd) != XDIST_MISSING:
+            return None
+        values = spawn_environment if spawn_environment is not None else os.environ
+        return xdist_advisory_text(" ".join(eligibility.invocation), timeout_seconds, values)
+    except Exception:
+        return None
+
+
 def run_foreground_test(
     args: Sequence[str],
     *,
@@ -539,6 +641,16 @@ def _run_foreground_test_body(
             wrapper_bootstrap, "not-attempted", "not-started", OVERLAP_REJECTED_MESSAGE,
             health_provenance,
         )
+    if classify_pre_collection and package_script is None:
+        # Issue #1343: a non-authoritative xdist advisory, delivered before
+        # host admission.  Its time never consumes the target's watchdog.
+        check_started = time.monotonic()
+        advisory = _xdist_advisory(
+            cmd, spawn_environment, cwd, timeout_seconds, worker_budget=worker_budget,
+        )
+        started += time.monotonic() - check_started
+        if advisory is not None:
+            (host_wait_notify or notify)(advisory)
     tel.begin(worker_budget.workers if worker_budget is not None else None)
     if worker_budget is not None and worker_budget.enforcing:
         worker_lock, lock_problem = WorkerBudgetLock.acquire(

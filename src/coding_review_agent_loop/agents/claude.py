@@ -18,6 +18,7 @@ from .base import (
 )
 from ..logging import agent_log_path, log
 from ..runner import CommandResult, Runner, executable_identity_changed
+from ..test_runtime import agent_shell_environment
 from ..usage import UsageMetadata, coerce_int, first_present
 from ..workdir_guard import (
     WorkdirReplayEvidence,
@@ -287,6 +288,9 @@ class ClaudeBackend:
                     config.coder_test_command_timeout_seconds
                 ),
                 "CLAUDE_CODE_EFFORT_LEVEL": invocation.resolved_effort,
+                # Coder turns: Bash limits sized to the whole run-tests
+                # foreground lifetime; every role: the shell-cap fact (#1343).
+                **agent_shell_environment(config, "claude", role),
                 **role_permission_env(config, "claude", role),
             },
             input_text=input_text,

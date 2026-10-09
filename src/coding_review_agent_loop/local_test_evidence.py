@@ -127,6 +127,13 @@ ENVIRONMENT_EXCLUSIONS = frozenset(
         "AGENT_LOOP_TEST_BROKER_PROTOCOL",
         "AGENT_LOOP_INVOCATION_ID",
         "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS",
+        # Orchestrator-authored shell facts (#1343): the configured test
+        # interpreter is already in the argv, and a backend-specific shell cap
+        # must never split identity between a Claude coder and other backends.
+        "AGENT_LOOP_TEST_PYTHON",
+        "AGENT_LOOP_SHELL_CAP_MS",
+        "BASH_DEFAULT_TIMEOUT_MS",
+        "BASH_MAX_TIMEOUT_MS",
         # Worker-budget control values and wrapper-private plugin state.
         "AGENT_LOOP_TEST_WORKERS",
         "AGENT_LOOP_TEST_WORKER_ENFORCEMENT",

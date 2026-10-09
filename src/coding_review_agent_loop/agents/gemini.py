@@ -21,6 +21,7 @@ from .replacement import classify_provider_executable_replacement_interruption
 from ..logging import agent_log_path, log
 from ..protocol import CLARIFY_RE, PLAN_STATE_RE, PUBLIC_RESPONSE_MARKER, STATE_RE
 from ..runner import CommandResult, Runner
+from ..test_runtime import agent_shell_environment
 from ..usage import UsageMetadata, coerce_int, first_present
 from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
 
@@ -314,6 +315,7 @@ class GeminiBackend:
                 "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
                     config.coder_test_command_timeout_seconds
                 ),
+                **agent_shell_environment(config, "gemini", role),
             },
             timeout_seconds=timeout_seconds,
             input_text=rendered_prompt if oversized_prompt else None,

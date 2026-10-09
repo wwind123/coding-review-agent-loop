@@ -1089,3 +1089,38 @@ def test_local_agent_loop_doc_states_the_obsolete_tree_failure_rule():
     assert "It fails closed" in flat
     assert "Base-reproduction rows" in flat
     assert "re-derived on every reconcile and never trusted as input" in flat
+
+
+def test_long_suite_attainability_is_documented():
+    """Issue #1343: the option, advisories, notice, cap sizing and deferral are documented."""
+    heading = "Running a long or full suite"
+    doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    assert f"### {heading}" in doc
+    section = doc.split(f"### {heading}\n", 1)[1].split("\n### ", 1)[0]
+    for phrase in (
+        "`--test-python PATH`",
+        "`AGENT_LOOP_TEST_PYTHON`",
+        "PEP 668",
+        "Missing-xdist advisory",
+        "Pre-launch foreground-budget notice",
+        "`AGENT_LOOP_SHELL_CAP_MS`",
+        "`BASH_MAX_TIMEOUT_MS` is never trusted",
+        "Timeout advisory",
+        "`BASH_DEFAULT_TIMEOUT_MS`",
+        "reported as not run, never as passed",
+        "Broker-owned detached runs",
+        "deferred",
+        "Nothing is ever installed",
+    ):
+        assert phrase in section, phrase
+    anchor = f"docs/local_agent_loop.md#{_github_anchor(heading)}"
+    readme = README.read_text(encoding="utf-8")
+    assert "`--test-python PATH`" in readme and anchor in readme
+    architecture = ARCHITECTURE.read_text(encoding="utf-8")
+    assert "`--test-python`" in architecture and "AGENT_LOOP_SHELL_CAP_MS" in architecture
+    assert "--test-python" in build_parser().format_help() or any(
+        "--test-python" in action.option_strings
+        for subparsers in build_parser()._subparsers._group_actions
+        for parser in subparsers.choices.values()
+        for action in parser._actions
+    )

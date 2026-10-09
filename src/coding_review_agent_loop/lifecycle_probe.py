@@ -22,7 +22,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -246,16 +245,74 @@ def _child_env(env: Mapping[str, str]) -> dict[str, str]:
 def _run_check(
     invocation: Sequence[str], code: str, env: Mapping[str, str], cwd: Path, timeout: float,
 ) -> int | None:
+    # Process-tree bounded on every exit path (#1343): a check that exits
+    # while a descendant still holds inherited descriptors leaves nothing live.
+    from .test_runtime import run_exit_code_probe
+
+    return run_exit_code_probe(
+        [*invocation, "-c", code], env=dict(env), cwd=cwd, timeout_seconds=timeout,
+    )
+
+
+def launch_eligibility_for(
+    argv: Sequence[str], env: Mapping[str, str] | None, cwd: Path,
+) -> LaunchEligibility | None:
+    """The validated launcher for ``argv`` without injecting anything; never raises."""
+    base = dict(os.environ) if env is None else {str(k): str(v) for k, v in env.items()}
     try:
-        completed = subprocess.run(
-            [*invocation, "-c", code],
-            cwd=str(cwd), env=dict(env), stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=timeout, check=False,
-        )
-    except (OSError, subprocess.SubprocessError, ValueError):
+        eligible = _launch_eligibility(argv, base, cwd)
+    except Exception:
         return None
-    return completed.returncode
+    return eligible[0] if eligible is not None else None
+
+
+# ---------------------------------------------------------------------------
+# pytest-xdist importability (#1343) -- advisory only, never evidence
+# ---------------------------------------------------------------------------
+
+XDIST_IMPORTABLE = 0
+XDIST_PYTEST_MISSING = 3
+XDIST_MISSING = 4
+_XDIST_CHECK_CODE = (
+    "import sys\n"
+    "try:\n    import pytest\n"
+    "except Exception:\n    sys.exit(3)\n"
+    "try:\n    import xdist.plugin\n"
+    "except Exception:\n    sys.exit(4)\n"
+    "sys.exit(0)\n"
+)
+
+
+def xdist_import_check(
+    invocation: Sequence[str], env: Mapping[str, str] | None, cwd: Path,
+) -> int | None:
+    """Really import pytest, then ``xdist.plugin``: 0, 3 (pytest), 4 (xdist) or ``None``.
+
+    Any other exit code, a timeout or a launch error is unknown (``None``).
+    """
+    base = dict(os.environ) if env is None else {str(k): str(v) for k, v in env.items()}
+    try:
+        code = _run_check(invocation, _XDIST_CHECK_CODE, base, cwd, IMPORT_CHECK_TIMEOUT_SECONDS)
+    except Exception:
+        return None
+    return code if code in {XDIST_IMPORTABLE, XDIST_PYTEST_MISSING, XDIST_MISSING} else None
+
+
+def module_launch_xdist_check(
+    eligibility: LaunchEligibility, argv: Sequence[str], env: Mapping[str, str] | None, cwd: Path,
+) -> int | None:
+    """``xdist_import_check`` for a validated module launch, re-validating its interpreter."""
+    if eligibility.shape != "module" or not argv:
+        return None
+    base = dict(os.environ) if env is None else {str(k): str(v) for k, v in env.items()}
+    try:
+        resolved = _resolve_executable(str(argv[0]), base, cwd)
+        validated = _interpreter_identity(resolved) if resolved else None
+    except Exception:
+        return None
+    if validated != (eligibility.interpreter_path, eligibility.identity):
+        return None
+    return xdist_import_check(eligibility.invocation, base, cwd)
 
 
 def prepare_lifecycle_probe(

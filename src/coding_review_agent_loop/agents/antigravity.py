@@ -50,6 +50,7 @@ from ..errors import AgentLoopError, CheckoutVerificationError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
 from ..runner import CommandResult, Runner, strip_ansi
+from ..test_runtime import agent_shell_environment
 from .. import workdir_claims
 from ..scratch import make_private_dirs, scratch_root
 from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
@@ -969,6 +970,7 @@ class AntigravityBackend:
                         "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
                             config.coder_test_command_timeout_seconds
                         ),
+                        **agent_shell_environment(config, "antigravity", None),
                     },
                     use_pty=True,
                     timeout_seconds=timeout_seconds,
@@ -1159,6 +1161,7 @@ class AntigravityBackend:
                             "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
                                 config.coder_test_command_timeout_seconds
                             ),
+                            **agent_shell_environment(config, "antigravity", role),
                         },
                         use_pty=True,
                         timeout_seconds=(

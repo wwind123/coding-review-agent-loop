@@ -96,9 +96,11 @@ from .test_runtime import (
     inherited_timeout_ceiling,
     launch_integrity_state,
     launch_state_fields,
+    prelaunch_notice,
     record_launcher_health,
     record_test_observation,
     resolve_timeout_seconds,
+    timeout_advisory,
 )
 from .local_test_evidence import broker_client_from_environment
 from .review_evaluation import (
@@ -518,6 +520,17 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "Optional command to run as a local test gate. By default it runs after "
                 "coder changes before review and again after reviewer approval before auto-merge."
+            ),
+        )
+        subparser.add_argument(
+            "--test-python",
+            default=None,
+            metavar="PATH",
+            help=(
+                "Absolute path of a Python interpreter with the repository's dev extras "
+                "(pytest, pytest-xdist). It is exported to coder turns as "
+                "AGENT_LOOP_TEST_PYTHON and recommended for broad and full-suite runs after a "
+                "parent-side import check; nothing is ever installed into it."
             ),
         )
         subparser.add_argument(
@@ -1784,6 +1797,12 @@ def _run_tests_command(args: argparse.Namespace) -> int:
         if refusal is not None:
             print(refusal, file=sys.stderr, flush=True)
             return WORKER_BUDGET_REFUSED_EXIT_CODE
+        # Issue #1343: flushed before dispatch, so it reaches the coder even
+        # when its shell kills this client during admission or before the
+        # watchdog.  Advisory only; never evidence.
+        notice = prelaunch_notice(chosen, policy, os.environ)
+        if notice is not None:
+            print(notice, file=sys.stderr, flush=True)
         if broker is not None:
             try:
                 # Neither the command lane nor the worker-budget lock is taken
@@ -1816,6 +1835,8 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                     flush=True,
                 )
+                if broker_result.outcome == "timed_out":
+                    print(timeout_advisory(chosen, policy), file=sys.stderr, flush=True)
                 if _broker_frame_is_pre_collection(broker_result):
                     # Issue #1182: no test ran; neither timing nor launcher
                     # health describes the suite or the launcher.
@@ -1912,6 +1933,8 @@ def _run_tests_command(args: argparse.Namespace) -> int:
             worker_budget_resizer=(None if worker_resolution.inherited else resize),
             classify_pre_collection=True,
         )
+        if result.outcome == "timed_out":
+            print(timeout_advisory(chosen, policy), file=sys.stderr, flush=True)
         if result.pre_collection_launch_failure and result.outcome == "failed":
             _announce_pre_collection(result.pre_collection_launch_failure)
             return int(result.returncode if result.returncode is not None else 1)

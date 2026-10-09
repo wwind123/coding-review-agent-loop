@@ -2157,6 +2157,178 @@ def _run_bounded_probe(
     return result
 
 
+def run_exit_code_probe(
+    argv: Sequence[str],
+    *,
+    env: Mapping[str, str] | None,
+    cwd: Path,
+    timeout_seconds: float,
+) -> int | None:
+    """Run an interpreter probe for its exit code only; never raises (#1343).
+
+    stdin, stdout and stderr are all ``DEVNULL``, so nothing is captured or
+    buffered.  The probe gets its own process group (a Job Object on Windows)
+    and the whole tree is terminated and reaped on *every* exit path -- a
+    normal exit too, because a direct child that exits 0 can still leave a
+    descendant running.  Returns the exit code, or ``None`` on a timeout, a
+    launch error or unavailable containment.
+    """
+    popen_kwargs: dict[str, object] = {
+        "cwd": str(cwd),
+        "env": None if env is None else dict(env),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "start_new_session": os.name == "posix",
+    }
+    windows_job: _WindowsProbeJob | None = None
+    process: subprocess.Popen | None = None
+    try:
+        if os.name == "nt":
+            popen_kwargs.pop("start_new_session", None)
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
+                subprocess, "CREATE_SUSPENDED", 0x00000004
+            )
+            windows_job = _WindowsProbeJob()
+        process = subprocess.Popen([str(item) for item in argv], **popen_kwargs)
+        if windows_job is not None:
+            try:
+                windows_job.assign(process)
+            except Exception:
+                _terminate_unassigned_windows_probe(process)
+                process = None
+                return None
+            windows_job.resume(process)
+        try:
+            return process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            return None
+    except Exception:
+        return None
+    finally:
+        if process is not None:
+            try:
+                _terminate_probe_tree(process, windows_job=windows_job)
+            except Exception:
+                pass
+        if windows_job is not None:
+            try:
+                windows_job.close()
+            except Exception:
+                pass
+
+
+# --------------------------------------------------- foreground budget (#1343)
+
+ENV_TEST_PYTHON = "AGENT_LOOP_TEST_PYTHON"
+ENV_SHELL_CAP_MS = "AGENT_LOOP_SHELL_CAP_MS"
+SHELL_CAP_UNKNOWN = "unknown"
+CLAUDE_BASH_DEFAULT_ENV = "BASH_DEFAULT_TIMEOUT_MS"
+CLAUDE_BASH_MAX_ENV = "BASH_MAX_TIMEOUT_MS"
+
+
+def run_tests_foreground_budget_seconds(ceiling: float, env: Mapping[str, str] | None = None) -> int:
+    """The whole foreground lifetime of one ``agent-loop run-tests`` invocation.
+
+    Target watchdog plus the host-capacity admission wait bound (when host
+    sharing is on), fixed parent overhead (snapshots, import checks, the
+    broker's terminal send) and headroom of max(300 s, 20%).  Every
+    shell-facing bound -- the Claude coder's Bash limits, the pre-launch notice
+    and its suppression -- uses this one function.
+    """
+    from .lifecycle_probe import IMPORT_CHECK_TIMEOUT_SECONDS
+    from .local_test_evidence import BROKER_TERMINAL_SEND_GRACE_SECONDS, MAX_SNAPSHOT_SECONDS
+    from .test_workers import host_sharing_enabled, host_wait_seconds
+
+    values = os.environ if env is None else env
+    wait = host_wait_seconds(values)[0] if host_sharing_enabled(values) else 0.0
+    overhead = 4 * MAX_SNAPSHOT_SECONDS + 2 * IMPORT_CHECK_TIMEOUT_SECONDS + BROKER_TERMINAL_SEND_GRACE_SECONDS
+    headroom = max(300, int(float(ceiling) * 0.20))
+    return int(math.ceil(float(ceiling) + wait + overhead + headroom))
+
+
+def _positive_int_env(value: object) -> int | None:
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def agent_shell_environment(
+    config: object,
+    provider: str,
+    role: str | None,
+    *,
+    ambient: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Orchestrator-authored shell facts for one agent invocation (#1343).
+
+    Every backend exports ``AGENT_LOOP_TEST_PYTHON`` when it is configured and
+    an explicit ``AGENT_LOOP_SHELL_CAP_MS`` that overrides any ambient value.
+    Only a Claude ``coder`` turn gets a numeric cap: its default and maximum
+    Bash limits are raised to the whole run-tests foreground budget (keeping a
+    larger operator value), and the cap fact is the effective *default* -- the
+    limit of a Bash call made without a timeout.  Every other backend and
+    every read-only Claude role carries ``unknown``.
+    """
+    from .agent_permissions import PERMISSION_CLASS_READ_ONLY, permission_class_for_role
+
+    values = os.environ if ambient is None else ambient
+    environment: dict[str, str] = {}
+    test_python = getattr(config, "test_python", None)
+    if test_python:
+        environment[ENV_TEST_PYTHON] = str(test_python)
+    if provider != "claude" or permission_class_for_role(role) == PERMISSION_CLASS_READ_ONLY:
+        environment[ENV_SHELL_CAP_MS] = SHELL_CAP_UNKNOWN
+        return environment
+    ceiling = getattr(config, "coder_test_command_timeout_seconds", DEFAULT_TEST_TIMEOUT_SECONDS)
+    budget_ms = run_tests_foreground_budget_seconds(ceiling, values) * 1000
+    default_ms = max(budget_ms, _positive_int_env(values.get(CLAUDE_BASH_DEFAULT_ENV)) or 0)
+    maximum_ms = max(budget_ms, default_ms, _positive_int_env(values.get(CLAUDE_BASH_MAX_ENV)) or 0)
+    environment[CLAUDE_BASH_DEFAULT_ENV] = str(default_ms)
+    environment[CLAUDE_BASH_MAX_ENV] = str(maximum_ms)
+    environment[ENV_SHELL_CAP_MS] = str(default_ms)
+    return environment
+
+
+def prelaunch_notice(chosen: float, policy: float, env: Mapping[str, str] | None = None) -> str | None:
+    """The pre-dispatch foreground-budget notice, or ``None`` when suppressed.
+
+    Suppressed only by an orchestrator-authored ``AGENT_LOOP_SHELL_CAP_MS``
+    that covers the whole budget; ``BASH_MAX_TIMEOUT_MS`` is never trusted.
+    """
+    from .test_workers import host_sharing_enabled, host_wait_seconds
+
+    values = os.environ if env is None else env
+    budget = run_tests_foreground_budget_seconds(chosen, values)
+    cap = _positive_int_env(values.get(ENV_SHELL_CAP_MS))
+    if cap is not None and cap >= budget * 1000:
+        return None
+    wait = f"{host_wait_seconds(values)[0]:g}s waiting for shared test capacity, " if host_sharing_enabled(values) else ""
+    remedy = (
+        "Prefer $AGENT_LOOP_TEST_PYTHON with parallel workers, or narrower commands."
+        if str(values.get(ENV_TEST_PYTHON) or "").strip()
+        else "Prefer narrower commands, or ask the operator to configure --test-python with parallel workers."
+    )
+    return (
+        f"agent-loop: notice: this command may run for up to {budget}s in the foreground "
+        f"({wait}a {chosen:g}s target watchdog under a {policy:g}s ceiling, plus parent overhead). "
+        "If your shell tool's per-command limit is shorter, the shell can kill this client first "
+        "and no result will reach you; a required broad or full suite stopped that way must be "
+        f"reported as not run, never as passed. {remedy} "
+        "This notice is not test evidence."
+    )
+
+
+def timeout_advisory(chosen: float, policy: float) -> str:
+    return (
+        f"agent-loop: advisory: this command reached its {chosen:g}s watchdog (the policy ceiling "
+        f"is {policy:g}s) and was stopped. A required broad or full suite that cannot finish within "
+        "the watchdog must be reported as not run, never as passed. This advisory is not test evidence."
+    )
+
+
 def preflight_wrapper_candidates(
     *,
     cwd: Path | None = None,
@@ -2262,7 +2434,7 @@ def verified_wrapper_prefix(**kwargs: object) -> tuple[str, ...] | None:
     return None
 
 
-_CODER_TEST_INVOCATIONS: dict[tuple[str, str], str | None] = {}
+_CODER_TEST_INVOCATIONS: dict[tuple[str, str, str], str | None] = {}
 _CODER_TEST_INVOCATIONS_LOCK = threading.Lock()
 
 
@@ -2309,8 +2481,8 @@ def resolve_coder_test_invocation(
 ) -> str | None:
     """The single sandboxed coder test invocation, shared by the grant and the prompt.
 
-    The command is ``--test-command`` or else the first verified profile
-    command; the wrapper is the preflight-verified, virtualenv-preserving
+    The command is ``--test-command``, else ``<--test-python> -m pytest``,
+    else the first verified profile command; the wrapper is the preflight-verified, virtualenv-preserving
     prefix (never ``resolve_wrapper_prefix()``, which resolves the virtualenv
     interpreter away).  ``agent`` names the provider whose coder turn uses the
     grant (for example the Claude implementation coder of a Codex-planned
@@ -2322,7 +2494,8 @@ def resolve_coder_test_invocation(
 
     selected = agent or config.coder  # type: ignore[attr-defined]
     root = Path(cwd or agent_workdir(config, selected)).resolve()  # type: ignore[arg-type]
-    key = (str(root), str(getattr(config, "repo", "")))
+    test_python = getattr(config, "test_python", None)
+    key = (str(root), str(getattr(config, "repo", "")), str(test_python or ""))
     with _CODER_TEST_INVOCATIONS_LOCK:
         if key in _CODER_TEST_INVOCATIONS:
             return _CODER_TEST_INVOCATIONS[key]
@@ -2330,9 +2503,15 @@ def resolve_coder_test_invocation(
     if memory_dir is None and getattr(config, "agent_memory", False):
         memory_dir = getattr(config, "agent_memory_dir", None)
     configured = getattr(config, "test_command", None)
-    command = tuple(configured) if configured else verified_profile_test_command(memory_dir)
+    if configured:
+        command = tuple(configured)
+    elif test_python:
+        # The lexical configured interpreter (#1343): never resolved away.
+        command = (str(test_python), "-m", "pytest")
+    else:
+        command = verified_profile_test_command(memory_dir)
     invocation: str | None = None
-    reason = "no --test-command or verified profile command"
+    reason = "no --test-command, --test-python or verified profile command"
     if command:
         prefix = verified_wrapper_prefix(
             cwd=root, memory_dir=memory_dir, repository=getattr(config, "repo", None)
