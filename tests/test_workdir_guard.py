@@ -1442,6 +1442,42 @@ def test_managed_run_tests_with_worker_flags_keeps_wrapper_contract(tmp_path):
 
 # Issue #991: a reported run outside the assigned checkout (for example a
 # baseline on a clean copy of the base branch) is context, not evidence.
+
+
+@pytest.mark.parametrize("command", [
+    "git grep -nE '/codex([^[:alnum:]_-]|$)'",
+    "git grep -e '/codex([^[:alnum:]_-]|$)' -- tests/",
+    "git grep --regexp='/codex([^[:alnum:]_-]|$)' -- tests/",
+    "grep -E '/codex([^[:alnum:]_-]|$)' tests/test_workdir_guard.py",
+    "grep -e '/codex([^[:alnum:]_-]|$)' -e '/tmp/also-a-pattern' tests/",
+    "grep -e '/codex' -- tests/test_workdir_guard.py",
+])
+def test_grep_patterns_are_not_outside_checkout_paths(tmp_path, command):
+    validate_test_commands_within_workdir([command], assigned_workdir=tmp_path)
+    partition = workdir_guard.partition_reported_tests_by_workdir(
+        [command], assigned_workdir=tmp_path,
+    )
+    assert partition.in_checkout == (command,)
+    assert partition.out_of_checkout == ()
+
+
+@pytest.mark.parametrize("command", [
+    "git grep -e '/codex' -- /outside/tests",
+    "grep -e '/codex' -- /outside/tests",
+    "grep -E '/codex' /outside/tests",
+    "git -C /outside grep '/codex'",
+    "grep -f /outside/patterns tests/",
+    "grep -f tests/patterns /outside/tests",
+])
+def test_grep_file_operands_and_workdirs_still_reject_outside_paths(tmp_path, command):
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        validate_test_commands_within_workdir([command], assigned_workdir=tmp_path)
+    with pytest.raises(AgentLoopError, match="outside the assigned checkout"):
+        workdir_guard.partition_reported_tests_by_workdir(
+            [command], assigned_workdir=tmp_path,
+        )
+
+
 _BASELINE_991 = (
     "PYTHONPATH=/tmp/scratch-main-1176 timeout 900 /usr/bin/python3 -m pytest "
     "/tmp/scratch-main-1176/tests/ -q -n 4"

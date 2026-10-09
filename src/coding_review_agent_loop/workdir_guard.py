@@ -780,10 +780,73 @@ def _expand_shell_clause(clause: _Clause, depth: int = 0) -> list[_Clause]:
 # ---------------------------------------------------------------------------
 
 
+def _grep_pattern_indices(tokens: Sequence[str], head: int | None) -> set[int]:
+    """Find grep patterns so a slash in a regex is not mistaken for a path."""
+    if head is None:
+        return set()
+    program = _program_basename(tokens[head])
+    start = head + 1
+    if program == "git":
+        while start < len(tokens):
+            token = tokens[start]
+            if token in {"-C", "-c", "--git-dir", "--work-tree"}:
+                start += 2
+            elif token.startswith("-"):
+                start += 1
+            else:
+                break
+        if start >= len(tokens) or tokens[start] != "grep":
+            return set()
+        start += 1
+    elif program not in {"grep", "egrep", "fgrep"}:
+        return set()
+
+    patterns: set[int] = set()
+    has_pattern = False
+    index = start
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            # Once a pattern is present, operands after -- are file/pathspec
+            # arguments, never regexes.
+            if has_pattern:
+                break
+            index += 1
+            continue
+        if token in {"-e", "--regexp"}:
+            if index + 1 >= len(tokens):
+                break
+            patterns.add(index + 1)
+            has_pattern = True
+            index += 2
+            continue
+        if token.startswith("--regexp=") or re.match(r"^-[A-Za-z]*e.+", token):
+            has_pattern = True
+            index += 1
+            continue
+        if token in {"-f", "--file"}:
+            has_pattern = True
+            index += 2
+            continue
+        if token.startswith("--file=") or re.match(r"^-[A-Za-z]*f.+", token):
+            has_pattern = True
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        if not has_pattern:
+            patterns.add(index)
+            has_pattern = True
+        index += 1
+    return patterns
+
+
 def _path_roles(clause: _Clause) -> list[tuple[str, str]]:
     tokens = clause.tokens
     n = len(tokens)
-    program_positions, _ = _program_position_indices(tokens)
+    program_positions, head = _program_position_indices(tokens)
+    grep_patterns = _grep_pattern_indices(tokens, head)
 
     first_path_idx = next((i for i, t in enumerate(tokens) if _is_path_shaped(t)), None)
     promoted_idx: int | None = None
@@ -797,6 +860,9 @@ def _path_roles(clause: _Clause) -> list[tuple[str, str]]:
     idx = 0
     while idx < n:
         token = tokens[idx]
+        if idx in grep_patterns:
+            idx += 1
+            continue
 
         matched_prefix = False
         for prefix in WORKDIR_FLAG_PREFIXES:
@@ -1239,7 +1305,8 @@ _CWD_FLAG_PREFIXES = ("--directory=", "--chdir=", "--cwd=")
 # because its -c script is expanded into separate clauses.
 _NON_TEST_HEADS = frozenset({
     "pwd", "echo", "printf", "true", "false", "ls", "cat", "export", "set",
-    "source", ".", "mkdir", "rm", "cp", "mv", "which", "git",
+    "source", ".", "mkdir", "rm", "cp", "mv", "which", "git", "grep",
+    "egrep", "fgrep",
     "sh", "bash", "zsh",
 })
 
