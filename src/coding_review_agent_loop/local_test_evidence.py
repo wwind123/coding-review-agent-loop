@@ -74,6 +74,18 @@ MAX_PRIVATE_OBSERVATIONS = 64
 # authoritative failure and never in need of supersession.  The caveat grants
 # nothing on any other outcome.
 PRE_COLLECTION_LAUNCH_FAILURE_PREFIX = "pre-collection launch failure; not evidence"
+# Issue #1329: the reserved ``superseded_by`` value for a parent-observed
+# failure stably attributed to a tracked tree other than the positively known
+# current one.  It is history, not an outstanding obligation.  The hyphenated
+# form cannot collide with the broker's hex receipt IDs.  The label is derived
+# by each reconcile only: it is cleared from every input row and never trusted
+# as reconciliation input.
+TREE_CHANGE_SUPERSESSION = "superseded-by-tree-change"
+# Attached only to failures.  It deliberately avoids the words the protocol's
+# receipt-pass checks look for, so it never affects pass authority.
+TREE_CHANGE_CAVEAT = (
+    "failure recorded at an obsolete tracked tree; historical, not an outstanding obligation"
+)
 MAX_PRIVATE_DIAGNOSTIC_BYTES = 8 * 1024
 MAX_PRIVATE_TOTAL_BYTES = 128 * 1024
 MAX_ROUND_OBSERVATIONS = 32
@@ -771,6 +783,88 @@ class LocalTestEvidence:
         return self.to_dict()
 
 
+def _clear_tree_change_label(observation: LocalTestObservation) -> LocalTestObservation:
+    """Drop an earlier reconcile's tree-change label and caveat; keep genuine receipts.
+
+    The caveat is stripped even when the label is already gone: mapping
+    coercion and the default bounded decode drop ``superseded_by`` but keep
+    caveats, and a stale caveat must never decorate a blocking failure.
+    """
+    label = (
+        None if observation.superseded_by == TREE_CHANGE_SUPERSESSION
+        else observation.superseded_by
+    )
+    caveats = tuple(item for item in observation.caveats if item != TREE_CHANGE_CAVEAT)
+    if label == observation.superseded_by and caveats == observation.caveats:
+        return observation
+    return replace(observation, superseded_by=label, caveats=caveats)
+
+
+@dataclass(frozen=True)
+class _TreeChangeEntryFacts:
+    base_reproduction: bool
+    stable: bool | None
+    tracked_digest: str | None
+
+    @classmethod
+    def of(cls, row: LocalTestObservation) -> "_TreeChangeEntryFacts":
+        return cls(
+            base_reproduction=(
+                row.attribution.state == "base-reproduction"
+                or row.claim == "base-reproduction"
+            ),
+            stable=row.attribution.stable,
+            tracked_digest=row.attribution.tracked_digest,
+        )
+
+
+def _classify_tree_change_failures(
+    rows: list[LocalTestObservation],
+    entry_facts: Sequence[_TreeChangeEntryFacts],
+    *,
+    current_snapshot: "TrackedTreeSnapshot | None",
+    snapshot_head_matches: bool,
+) -> None:
+    """Label failures recorded at an obsolete tracked tree as history (#1329).
+
+    Runs only against a positively known current digest: a complete, stable,
+    clean, head-matched snapshot.  Every uncertain case leaves the failure
+    blocking.  Attribution is never rewritten, and base-reproduction rows (as
+    recorded at entry) are never labelled.
+    """
+    if len(entry_facts) != len(rows):
+        raise AgentLoopError("tree-change entry facts lost their row association")
+    if (
+        current_snapshot is None
+        or not current_snapshot.complete
+        or current_snapshot.stable is not True
+        or current_snapshot.status_clean is not True
+        or not current_snapshot.tracked_digest
+        or not snapshot_head_matches
+    ):
+        return
+    current_digest = current_snapshot.tracked_digest
+    for index, row in enumerate(rows):
+        facts = entry_facts[index]
+        if (
+            not row.is_failure
+            or row.provenance != "parent-observed"
+            or row.superseded_by
+            or row.is_out_of_checkout_context
+            or row.is_non_evidence_launch_failure
+            or facts.base_reproduction
+            or facts.stable is not True
+            or not facts.tracked_digest
+            or facts.tracked_digest == current_digest
+        ):
+            continue
+        rows[index] = replace(
+            row,
+            superseded_by=TREE_CHANGE_SUPERSESSION,
+            caveats=(*row.caveats, TREE_CHANGE_CAVEAT),
+        )
+
+
 def reconcile_test_observations(
     observations: Iterable[LocalTestObservation | Mapping[str, object]],
     *,
@@ -789,9 +883,13 @@ def reconcile_test_observations(
     rows: list[LocalTestObservation] = []
     for index, item in enumerate(observations):
         if isinstance(item, LocalTestObservation):
-            rows.append(item)
+            rows.append(_clear_tree_change_label(item))
         elif isinstance(item, Mapping):
-            rows.append(observation_from_mapping(item, cwd=cwd, registry=registry))
+            rows.append(
+                _clear_tree_change_label(
+                    observation_from_mapping(item, cwd=cwd, registry=registry)
+                )
+            )
         else:
             raise AgentLoopError(f"local test observation {index} is not an object")
     legacy_rows: list[LocalTestObservation] = []
@@ -822,6 +920,12 @@ def reconcile_test_observations(
             seen_receipts[row.receipt_id] = row
         filtered.append(row)
     rows = filtered
+    # Entry facts for the tree-change pass (#1329), captured once the rows
+    # have their final order and before any loop rewrites attribution.  From
+    # here on rows are never reordered, inserted or removed: every later loop
+    # assigns ``rows[index]`` in place, so ``entry_facts[index]`` stays bound
+    # to its observation.
+    entry_facts = [_TreeChangeEntryFacts.of(row) for row in rows]
 
     # Make live comparisons visible without persisting the environment bytes.
     # A first observation has no comparison partner; later observations with
@@ -951,6 +1055,13 @@ def reconcile_test_observations(
                 caveats=(*updated.caveats, "restored observation has identity-unknown environment"),
             )
         rows[index] = updated
+
+    _classify_tree_change_failures(
+        rows,
+        entry_facts,
+        current_snapshot=current_snapshot,
+        snapshot_head_matches=snapshot_head_matches,
+    )
 
     authoritative_failures = tuple(
         row.receipt_id or f"observation-{index}"
@@ -1194,13 +1305,29 @@ def _row_has_evidence_downgrade(caveats: object) -> bool:
     )
 
 
+def _with_bounded_classification(
+    detail: dict[str, object], source: Mapping[str, object]
+) -> dict[str, object]:
+    """Carry the source row's supersession label into the transported detail.
+
+    The label is display data only (#1329): retention and display consumers
+    read it, while reconciliation input decodes without it.
+    """
+    label = source.get("superseded_by")
+    if isinstance(label, str) and label:
+        detail["superseded_by"] = _safe_text(label, MAX_SAFE_IDENTIFIER_BYTES)
+    return detail
+
+
 def bounded_evidence_for_round(evidence: LocalTestEvidence | Mapping[str, object]) -> str:
     """Encode a bounded canonical metadata field, degrading before transport."""
     source = evidence.to_dict() if isinstance(evidence, LocalTestEvidence) else dict(evidence)
     raw_rows = source.get("observations")
     rows = list(raw_rows) if isinstance(raw_rows, list) else []
     all_details = [
-        redact_observation(observation_from_mapping(row)).to_dict()
+        _with_bounded_classification(
+            redact_observation(observation_from_mapping(row)).to_dict(), row
+        )
         for row in rows
         if isinstance(row, Mapping) and row.get("outcome") in OUTCOMES
     ]
@@ -1318,12 +1445,21 @@ def canonicalize_bounded_evidence(value: object) -> str | None:
     if isinstance(value, Mapping):
         return bounded_evidence_for_round(value)
     if isinstance(value, str):
-        parsed = decode_bounded_evidence(value)
+        parsed = decode_bounded_evidence(value, restore_classification=True)
         return bounded_evidence_for_round(parsed) if parsed is not None else None
     return None
 
 
-def decode_bounded_evidence(value: object) -> LocalTestEvidence | None:
+def decode_bounded_evidence(
+    value: object, *, restore_classification: bool = False
+) -> LocalTestEvidence | None:
+    """Decode bounded round evidence.
+
+    By default supersession labels are dropped, so a persisted label can
+    never act as reconciliation input.  ``restore_classification=True`` is a
+    display-only mode for comment rendering, the unchanged-head stop sentence
+    and canonicalization (#1329).
+    """
     if not isinstance(value, str):
         return None
     try:
@@ -1344,6 +1480,13 @@ def decode_bounded_evidence(value: object) -> LocalTestEvidence | None:
             # Execution selectors are invocation-local and must never become
             # durable receipt authority after a restart.
             execution_ref=None,
+            superseded_by=(
+                _safe_text(row["superseded_by"], MAX_SAFE_IDENTIFIER_BYTES)
+                if restore_classification
+                and isinstance(row.get("superseded_by"), str)
+                and row["superseded_by"]
+                else None
+            ),
         )
         for row in rows
         if isinstance(row, Mapping)
@@ -3014,7 +3157,7 @@ def unsuperseded_receipts_sentence(value: object) -> str:
     the only open item is evidence bookkeeping is not read as the coder
     failing to act.  Empty when there are no such receipts.
     """
-    evidence = decode_bounded_evidence(value) if value else None
+    evidence = decode_bounded_evidence(value, restore_classification=True) if value else None
     if evidence is None:
         return ""
     failing = [

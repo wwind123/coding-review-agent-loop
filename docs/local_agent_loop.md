@@ -1363,6 +1363,40 @@ the loop stops because the head stayed unchanged while unsuperseded failure
 receipts remain, the stop message names them so it is not read as the coder
 failing to act.
 
+#### Failures at an obsolete tracked tree
+
+A failure recorded at an earlier tracked tree is history, not an outstanding
+obligation (issue #1329). Its environment identity is process-scoped, so once
+the tree changes or the process restarts no same-environment pass could ever
+supersede it. Every reconcile therefore labels such a failure with
+`superseded_by` = `superseded-by-tree-change`; the row stays visible in the
+journal and renders in PR comments as `historical failure at an obsolete tree
+(not an outstanding obligation)`. Only a failure at the current tracked digest
+needs a later parent-observed passing rerun of the same command; reviewers
+must not require supersession of historical receipts, but may still require
+current-tree evidence on the merits.
+
+The label is applied only to a parent-observed failure (not a pre-collection
+launch failure or out-of-checkout context run) that was stably attributed to a
+non-empty tracked digest different from the current one, and only when the
+current tracked digest is positively known from a complete, stable, clean
+snapshot whose head matches the authenticated PR head. It fails closed: an
+unknown, incomplete, unstable or dirty snapshot, a head mismatch, a failure
+without a stable tracked digest, or equal digests leave the failure blocking.
+Base-reproduction rows, recognised at entry by attribution state or claim, are
+never labelled, and the existing attribution loops are unchanged. Live and
+restored rows are treated alike, so a restored failure without environment
+identity at an obsolete digest is historical too; a restart at an unchanged
+digest is deliberately not loosened.
+
+The label is re-derived on every reconcile and never trusted as input: each
+reconcile clears an earlier tree-change label (genuine receipt supersession is
+kept), and the default decode of bounded round evidence drops labels. Bounded
+round evidence carries `superseded_by` so that retention evicts superseded and
+historical rows before unresolved failures, and only display consumers (PR
+comment rendering, the unchanged-head stop sentence and canonicalization)
+restore it.
+
 Durable metadata contains only bounded, sanitized projections: at most 32
 detailed observations and 16 KiB, with unresolved failures retained longest.
 Paths, credentials, DSNs, environment-assignment values, unknown positional

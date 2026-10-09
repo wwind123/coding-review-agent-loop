@@ -89,7 +89,11 @@ from .test_runtime import (
     parse_managed_test_invocation,
     resolve_timeout_seconds,
 )
-from .local_test_evidence import decode_bounded_evidence, redact_test_command
+from .local_test_evidence import (
+    TREE_CHANGE_SUPERSESSION,
+    decode_bounded_evidence,
+    redact_test_command,
+)
 
 if TYPE_CHECKING:
     from .agents.base import AgentName
@@ -188,7 +192,11 @@ def _render_test_observation_citations(
     current_test_turn_id: str | None = None,
 ) -> str:
     """Correlate receipt claims with the sanitized parent journal."""
-    evidence = decode_bounded_evidence(local_test_evidence) if local_test_evidence else None
+    evidence = (
+        decode_bounded_evidence(local_test_evidence, restore_classification=True)
+        if local_test_evidence
+        else None
+    )
     by_receipt = {
         item.receipt_id: item
         for item in (evidence.observations if evidence is not None else ())
@@ -231,6 +239,16 @@ def _render_test_observation_citations(
         if observed is not None and observed.is_non_evidence_launch_failure:
             # A citation never turns a non-evidence launch failure into evidence.
             reason = "pre-collection launch failure (not evidence)"
+        elif (
+            observed is not None
+            and observed.is_failure
+            and observed.superseded_by == TREE_CHANGE_SUPERSESSION
+        ):
+            # Issue #1329: a cited failure keeps its historical classification.
+            reason = (
+                "historical failure at an obsolete tree (not an outstanding "
+                f"obligation) `{observed.outcome}`"
+            )
         if supported:
             cited.add(receipt_id)
         lines.append(
@@ -238,6 +256,21 @@ def _render_test_observation_citations(
         )
     if evidence is not None:
         for item in evidence.observations:
+            if (
+                item.receipt_id
+                and item.receipt_id not in cited
+                and item.is_failure
+                and item.provenance == "parent-observed"
+                and item.superseded_by == TREE_CHANGE_SUPERSESSION
+            ):
+                # Issue #1329: visible history, never an outstanding obligation.
+                safe_command, _identifiers, _caveats = redact_test_command(item.command)
+                lines.append(
+                    f"- `{safe_command}` — receipt `{item.receipt_id[:256]}` — "
+                    "historical failure at an obsolete tree (not an outstanding "
+                    f"obligation) `{item.outcome}`"
+                )
+                continue
             if (
                 item.receipt_id
                 and item.receipt_id not in cited

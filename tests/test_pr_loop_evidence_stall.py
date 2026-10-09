@@ -1159,3 +1159,192 @@ def test_code_claim_followup_at_unchanged_head_is_rejected(tmp_path, monkeypatch
     assert not _codes(coder_records[3], "inadmissible-execution")
     assert not _codes(coder_records[3], "head-mismatch")
     assert all(d["message"] == PREDECESSOR_HEAD_UNMOVED_MESSAGE for d in mismatches)
+
+
+# --- #1329: historical obsolete-tree failures through display transport ----------
+
+import sys
+from dataclasses import replace as _dc_replace
+from pathlib import Path
+
+from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+from coding_review_agent_loop.local_test_evidence import (
+    MAX_ROUND_OBSERVATIONS,
+    TREE_CHANGE_SUPERSESSION,
+    EnvironmentIdentityRegistry,
+    EvidenceScope,
+    LocalTestObservation,
+    TrackedTreeSnapshot,
+    TreeAttribution,
+    canonicalize_bounded_evidence,
+    decode_bounded_evidence,
+)
+from coding_review_agent_loop.pr_loop import unchanged_head_stop_message
+from coding_review_agent_loop.runner import Runner
+
+_HISTORICAL_LINE = "historical failure at an obsolete tree (not an outstanding obligation)"
+
+
+def _evidence_row(registry, *, receipt, outcome, digest, head, minute, test_path):
+    return LocalTestObservation(
+        command=(sys.executable, "-m", "pytest", test_path, "-q"),
+        outcome=outcome,
+        provenance="parent-observed",
+        scope=EvidenceScope("suite", (test_path,)),
+        receipt_id=receipt,
+        turn_id="turn-1329",
+        timestamp=f"2026-10-09T10:{minute:02d}:00+00:00",
+        cwd="/checkout",
+        normalized_command=f"python -m pytest {test_path} -q",
+        returncode=0 if outcome == "passed" else 1,
+        attribution=TreeAttribution(
+            state="current-head", head=head, tracked_digest=digest, stable=True,
+        ),
+        environment_state="not-compared",
+        environment_identity=registry.capture({"PATH": "/usr/bin"}),
+    )
+
+
+def _render_with_snapshot(monkeypatch, tmp_path, rows, registry):
+    snapshot = TrackedTreeSnapshot(
+        root=str(tmp_path), head="head-b", digest="all", tracked_digest="tree-b",
+        status_clean=True, complete=True, stable=True,
+    )
+    monkeypatch.setattr(
+        "coding_review_agent_loop.local_test_evidence.stable_tracked_tree_snapshot",
+        lambda _cwd: snapshot,
+    )
+    runner = Runner()
+    runner._environment_registry = registry
+    runner._local_test_observations.extend(rows)
+    rendered = runner.render_local_test_evidence(current_head="head-b", cwd=tmp_path)
+    return canonicalize_bounded_evidence(rendered)
+
+
+def _stop_text(evidence):
+    return unchanged_head_stop_message(
+        pr=1342, coder_name="Claude", previous_head="head-b", turns=2,
+        round_number=3, evidence=evidence, route="",
+    )
+
+
+def _comment(evidence):
+    return _render_test_observation_citations(
+        [], local_test_evidence=evidence, current_test_turn_id="turn-1329"
+    )
+
+
+def test_retained_historical_row_renders_as_history_and_is_not_a_stop_obligation(
+    monkeypatch, tmp_path
+):
+    registry = EnvironmentIdentityRegistry()
+    rows = [
+        _evidence_row(registry, receipt="fail-a", outcome="failed", digest="tree-a",
+                      head="head-a", minute=0, test_path="tests/test_protocol.py"),
+        _evidence_row(registry, receipt="pass-b", outcome="passed", digest="tree-b",
+                      head="head-b", minute=5, test_path="tests/test_protocol.py"),
+    ]
+
+    canonical = _render_with_snapshot(monkeypatch, tmp_path, rows, registry)
+
+    by_receipt = {row["receipt_id"]: row for row in json.loads(canonical)["observations"]}
+    assert by_receipt["fail-a"]["superseded_by"] == TREE_CHANGE_SUPERSESSION
+    # Canonicalization is idempotent for the label.
+    assert canonicalize_bounded_evidence(canonical) == canonical
+    # Reconciliation input still decodes without the label.
+    default = {row.receipt_id: row for row in decode_bounded_evidence(canonical).observations}
+    assert default["fail-a"].superseded_by is None
+
+    comment = _comment(canonical)
+    assert "receipt `fail-a`" in comment
+    assert _HISTORICAL_LINE in comment
+    assert "uncited authoritative" not in comment
+    assert "unsuperseded failure receipts" not in _stop_text(canonical)
+
+
+def test_historical_rows_are_evicted_first_under_count_pressure(monkeypatch, tmp_path):
+    registry = EnvironmentIdentityRegistry()
+    unresolved = [
+        _evidence_row(registry, receipt=f"fail-b-{index:02d}", outcome="failed",
+                      digest="tree-b", head="head-b", minute=index,
+                      test_path=f"tests/test_unresolved_{index:02d}.py")
+        for index in range(MAX_ROUND_OBSERVATIONS)
+    ]
+    # The newest row is historical, so recency alone would keep it.
+    historical = _evidence_row(registry, receipt="fail-a-history", outcome="failed",
+                               digest="tree-a", head="head-a", minute=59,
+                               test_path="tests/test_historical.py")
+
+    canonical = _render_with_snapshot(monkeypatch, tmp_path, [*unresolved, historical], registry)
+
+    kept = [row["receipt_id"] for row in json.loads(canonical)["observations"]]
+    assert "fail-a-history" not in kept
+    # Only unresolved failures remain; any further eviction under the byte cap
+    # drops the oldest unresolved rows, never a newer one.
+    order = [row.receipt_id for row in unresolved]
+    assert kept and kept == order[len(order) - len(kept):]
+    stop = _stop_text(canonical)
+    assert "unsuperseded failure receipts" in stop
+    assert "test_historical" not in stop
+    assert "test_historical" not in _comment(canonical)
+
+
+def test_historical_rows_are_evicted_first_under_byte_pressure(monkeypatch, tmp_path):
+    registry = EnvironmentIdentityRegistry()
+    padding = "p" * 150
+    rows = []
+    for index in range(24):
+        historical = index % 2 == 0
+        rows.append(_evidence_row(
+            registry,
+            receipt=f"{'hist' if historical else 'open'}-{index:02d}",
+            outcome="failed",
+            digest="tree-a" if historical else "tree-b",
+            head="head-a" if historical else "head-b",
+            minute=index,
+            test_path=f"tests/test_{'historical' if historical else 'open'}_{index:02d}_{padding}.py",
+        ))
+    unresolved = {row.receipt_id for row in rows if row.receipt_id.startswith("open")}
+
+    canonical = _render_with_snapshot(monkeypatch, tmp_path, rows, registry)
+
+    payload = json.loads(canonical)
+    kept = {row["receipt_id"] for row in payload["observations"]}
+    assert len(kept) < len(rows)  # the byte cap, not the count cap, applied
+    assert payload["capture_incomplete"] is True
+    if any(receipt.startswith("hist") for receipt in kept):
+        assert unresolved <= kept
+    assert kept & unresolved
+    stop = _stop_text(canonical)
+    assert "unsuperseded failure receipts" in stop
+    assert "test_historical" not in stop
+
+
+def test_cited_historical_failure_keeps_its_historical_label(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    registry = EnvironmentIdentityRegistry()
+    rows = [
+        _evidence_row(registry, receipt="fail-a", outcome="failed", digest="tree-a",
+                      head="head-a", minute=0, test_path="tests/test_protocol.py"),
+        _evidence_row(registry, receipt="pass-b", outcome="passed", digest="tree-b",
+                      head="head-b", minute=5, test_path="tests/test_protocol.py"),
+    ]
+    canonical = _render_with_snapshot(monkeypatch, tmp_path, rows, registry)
+    command = f"{sys.executable} -m pytest tests/test_protocol.py -q"
+    citations = [
+        SimpleNamespace(receipt_id="fail-a", command=command, claim="current-result"),
+        SimpleNamespace(receipt_id="pass-b", command=command, claim="current-result"),
+    ]
+
+    comment = _render_test_observation_citations(
+        citations, local_test_evidence=canonical, current_test_turn_id="turn-1329"
+    )
+
+    (fail_line,) = [line for line in comment.splitlines() if "receipt `fail-a`" in line]
+    assert _HISTORICAL_LINE in fail_line
+    assert "`failed`" in fail_line
+    assert comment.count(_HISTORICAL_LINE) == 1
+    (pass_line,) = [line for line in comment.splitlines() if "receipt `pass-b`" in line]
+    assert _HISTORICAL_LINE not in pass_line
+    assert "uncited authoritative" not in comment
