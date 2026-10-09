@@ -2164,7 +2164,7 @@ def test_parse_structured_plan_review_accepts_text_finding_object_in_every_bucke
 @pytest.mark.parametrize(
     ("item", "message"),
     [
-        ({"title": "x", "severity": "high"}, "unsupported finding key"),
+        ({"title": "x", "severity": {"level": "high"}}, "unsupported finding key"),
         ({"item_id": "only-an-id"}, "no text field"),
         ({"title": 3}, r"at index 0\.title"),
         ({"title": "  "}, r"at index 0\.title"),
@@ -2218,8 +2218,8 @@ def test_plan_review_finding_alias_collision_rejected_unchanged_1169():
     with pytest.raises(AgentLoopError) as excinfo:
         parse_structured_plan_review(_plan_review_with_blocking([item]), reviewer="OpenAI Codex")
     assert str(excinfo.value).endswith(
-        "at index 0 has unsupported finding key(s) requested_change; "
-        f"use a string or an object with only: {_ALLOWED_KEYS_1169}."
+        "at index 0.requested_change collides with a protocol or disposition field "
+        "and cannot be used as a finding key."
     )
 
 
@@ -2239,12 +2239,13 @@ def test_plan_review_finding_unknown_key_unchanged_1169(key, caplog):
     with caplog.at_level("WARNING", logger=_ALIAS_LOGGER_1169):
         with pytest.raises(AgentLoopError) as excinfo:
             parse_structured_plan_review(
-                _plan_review_with_blocking([{"title": "x", key: "y"}]),
+                _plan_review_with_blocking([{"title": "x", key: 3}]),
                 reviewer="OpenAI Codex",
             )
     assert str(excinfo.value).endswith(
         f"has unsupported finding key(s) {key}; "
-        f"use a string or an object with only: {_ALLOWED_KEYS_1169}."
+        f"use a string or an object with only: {_ALLOWED_KEYS_1169}; unknown keys with a "
+        "non-empty string or string-list value are folded into the text."
     )
     assert not [r for r in caplog.records if "alias" in r.getMessage()]
 
@@ -6730,7 +6731,7 @@ def test_plan_review_followup_finding_reference_folded_1230():
         ({"finding": "x", "stage_ids": {"a": "b"}}, r"stage_ids must be a non-empty"),
         ({"finding": "x", "row_id": " "}, r"row_id"),
         ({"scope_item_ids": ["scope-1"]}, "no text field"),
-        ({"finding": "x", "depends_on_stage_ids": ["a"]}, "unsupported finding key"),
+        ({"finding": "x", "depends_on_stage_ids": ["a"]}, "depends_on_stage_ids collides with a protocol"),
     ],
 )
 def test_plan_review_finding_reference_rejections_1230(item, message):
@@ -7438,3 +7439,188 @@ def test_nested_tool_owned_key_is_still_rejected_1333(nested_path, caplog):
     assert "has unknown field(s): topology_source" in message
     assert f"plan_state.execution_recommendation.{nested_path}" in message
     assert _dropped_lines_1333(caplog) == []
+
+
+# --- unknown finding keys folded into finding text (#1328) -------------------
+
+_FOLD_LOGGER_1328 = "coding_review_agent_loop.protocol"
+_COLLISION_1328 = "collides with a protocol or disposition field"
+
+
+def _fold_warnings_1328(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _FOLD_LOGGER_1328 and "folded unknown finding key" in r.getMessage()
+    ]
+
+
+def _parse_pr_1328(**lists):
+    from coding_review_agent_loop.protocol import parse_structured_pr_review
+
+    return parse_structured_pr_review(_tagged_review(**lists), reviewer="Codex")
+
+
+def _parse_plan_1328(item):
+    return parse_structured_plan_review(_plan_review_with_blocking([item]), reviewer="OpenAI Codex")
+
+
+def test_plan_review_unknown_string_list_key_folds_1328(caplog):
+    with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
+        parsed = _parse_plan_1328({"finding": "Gap.", "evidence_row_ids": ["row-1"]})
+    assert [item.text for item in parsed.items.blocking] == ["Gap. evidence_row_ids: row-1"]
+    warnings = _fold_warnings_1328(caplog)
+    assert len(warnings) == 1
+    assert "evidence_row_ids" in warnings[0] and "row-1" not in warnings[0]
+
+
+def test_plan_review_folded_keys_order_1328(caplog):
+    item = {
+        "zeta_notes": "last word",
+        "finding": "Gap.",
+        "sub_items": ["one", "two"],
+        "alpha_refs": ["a", "b"],
+        "scope_item_ids": ["scope-1"],
+    }
+    with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
+        parsed = _parse_plan_1328(item)
+    assert [i.text for i in parsed.items.blocking] == [
+        "Gap. Scope items: scope-1 zeta_notes: last word alpha_refs: a, b "
+        "Sub-items: (1) one (2) two"
+    ]
+    warnings = _fold_warnings_1328(caplog)
+    assert len(warnings) == 1 and "zeta_notes, alpha_refs" in warnings[0]
+
+
+def test_plan_review_only_folded_extras_has_no_text_field_1328():
+    with pytest.raises(AgentLoopError, match="no text field"):
+        _parse_plan_1328({"evidence_refs": ["row-1"], "notes": "x"})
+
+
+@pytest.mark.parametrize("key", ["item_id", "id"])
+def test_plan_review_identifier_labels_still_dropped_1328(key, caplog):
+    with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
+        parsed = _parse_plan_1328({key: "label-1", "finding": "Gap."})
+    assert [i.text for i in parsed.items.blocking] == ["Gap."]
+    assert _fold_warnings_1328(caplog) == []
+
+
+@pytest.mark.parametrize("field", ["blocking", "same_pr"])
+def test_pr_review_unknown_string_list_key_folds_1328(field, caplog):
+    with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
+        parsed = _parse_pr_1328(**{field: [{"text": "Gap.", "evidence_refs": ["row-1"]}]})
+    items = parsed.blocking_items if field == "blocking" else parsed.followups.same_pr
+    assert [item.text for item in items] == ["Gap. evidence_refs: row-1"]
+    assert [item.fix_scope for item in items] == [None]
+    assert [item.sub_items for item in items] == [()]
+    assert [item.evidence_row_ids for item in items] == [()]
+    warnings = _fold_warnings_1328(caplog)
+    assert len(warnings) == 1
+    assert "evidence_refs" in warnings[0] and "row-1" not in warnings[0]
+
+
+def test_pr_review_evidence_row_ids_stays_typed_1328(caplog):
+    with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
+        parsed = _parse_pr_1328(blocking=[{"text": "Gap.", "evidence_row_ids": ["row-1"]}])
+    assert [item.text for item in parsed.blocking_items] == ["Gap."]
+    assert [item.evidence_row_ids for item in parsed.blocking_items] == [("row-1",)]
+    assert _fold_warnings_1328(caplog) == []
+    with pytest.raises(AgentLoopError, match="accepted only on `blocking_items`"):
+        _parse_pr_1328(same_pr=[{"text": "Gap.", "evidence_row_ids": ["row-1"]}])
+
+
+def test_pr_review_fix_scope_keeps_typed_handling_1328(caplog):
+    with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
+        parsed = _parse_pr_1328(blocking=[{"text": "Gap.", "fix_scope": ["src/a.py"]}])
+    assert [item.text for item in parsed.blocking_items] == ["Gap."]
+    assert parsed.blocking_items[0].fix_scope == ("src/a.py",)
+    assert _fold_warnings_1328(caplog) == []
+    with pytest.raises(AgentLoopError, match="fix_scope is invalid"):
+        _parse_pr_1328(blocking=[{"text": "Gap.", "fix_scope": "src/a.py"}])
+
+
+_NON_FOLDABLE_1328 = [{"a": "b"}, 3, 1.5, True, None, "", "   ", [], [""], ["a", 3], [["a"]]]
+
+
+@pytest.mark.parametrize("value", _NON_FOLDABLE_1328)
+def test_non_foldable_unknown_values_rejected_1328(value, caplog):
+    with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
+        with pytest.raises(AgentLoopError, match="unsupported finding key\\(s\\) extra"):
+            _parse_plan_1328({"finding": "Gap.", "folded": "ok", "extra": value})
+        with pytest.raises(AgentLoopError, match="has unknown field\\(s\\): extra"):
+            _parse_pr_1328(blocking=[{"text": "Gap.", "folded": "ok", "extra": value}])
+    assert _fold_warnings_1328(caplog) == []
+
+
+@pytest.mark.parametrize("key", ["disposition", "state", "kind", "schema_version", "note"])
+def test_reserved_keys_collide_on_both_parsers_1328(key, caplog):
+    with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
+        with pytest.raises(AgentLoopError, match=f"index 0.{key} {_COLLISION_1328}"):
+            _parse_plan_1328({"finding": "Gap.", "folded": "ok", key: "resolved"})
+        with pytest.raises(AgentLoopError, match=f"index 0.{key} {_COLLISION_1328}"):
+            _parse_pr_1328(blocking=[{"text": "Gap.", "folded": "ok", key: "resolved"}])
+    assert _fold_warnings_1328(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"finding": "Gap.", "depends_on_stage_ids": ["stage-1"]},
+        {"finding": "Gap.", "fix_scope": "current"},
+        {"finding": "Gap.", "requested_change": "a", "required_change": "b"},
+    ],
+)
+def test_plan_only_reserved_keys_collide_1328(item):
+    with pytest.raises(AgentLoopError, match=_COLLISION_1328):
+        _parse_plan_1328(item)
+
+
+@pytest.mark.parametrize("key", ["item_id", "id"])
+def test_pr_identifier_keys_collide_1328(key):
+    with pytest.raises(AgentLoopError, match=f"{key} {_COLLISION_1328}"):
+        _parse_pr_1328(blocking=[{"text": "Gap.", key: "label-1"}])
+
+
+def _oversized_items_1328():
+    many = {"text": "Gap.", **{f"k{i}": "v" for i in range(17)}}
+    return [
+        (many, "more than 16 unknown finding keys"),
+        ({"text": "Gap.", "refs": [f"r{i}" for i in range(33)]}, "32-entry bound"),
+        ({"text": "Gap.", "refs": "x" * 2001}, "2000-character value bound"),
+        ({"text": "Gap.", "refs": ["ok", "x" * 2001]}, "2000-character value bound"),
+        ({"text": "Gap.", "k" * 65: "v"}, "64-character key bound"),
+    ]
+
+
+@pytest.mark.parametrize(("item", "message"), _oversized_items_1328())
+def test_oversized_extras_rejected_on_both_parsers_1328(item, message, caplog):
+    plan_item = {("finding" if k == "text" else k): v for k, v in item.items()}
+    with caplog.at_level("WARNING", logger=_FOLD_LOGGER_1328):
+        with pytest.raises(AgentLoopError, match=message):
+            _parse_plan_1328(plan_item)
+        with pytest.raises(AgentLoopError, match=message):
+            _parse_pr_1328(blocking=[item])
+    assert _fold_warnings_1328(caplog) == []
+
+
+def test_fold_bounds_at_limit_accepted_1328():
+    item = {"text": "Gap.", **{f"k{i}": "v" for i in range(14)}, "refs": ["x" * 2000] * 32}
+    item["k" * 64] = "v"
+    parsed = _parse_pr_1328(blocking=[item])
+    assert parsed.blocking_items[0].text.startswith("Gap. k0: v")
+
+
+def test_fold_helper_reuses_flat_object_helpers_1328():
+    import inspect
+
+    from coding_review_agent_loop.protocol import _fold_unknown_finding_keys
+    from coding_review_agent_loop.shape_check_audit import SHAPE_CHECK_AUDIT
+
+    source = inspect.getsource(_fold_unknown_finding_keys)
+    assert "_flat_object_defect(" in source and "_render_flat_object(" in source
+    for name in (
+        "_fold_unknown_finding_keys",
+        "_flatten_plan_review_finding",
+        "_expect_review_finding_list",
+    ):
+        assert "payload-bound" in SHAPE_CHECK_AUDIT[name].clauses

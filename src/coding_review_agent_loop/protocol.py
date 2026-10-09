@@ -5276,7 +5276,13 @@ def _expect_optional_string_list(
 # are the exception: the plan renderer shows scope/stage/constraint/row IDs to
 # reviewers, and they name which plan requirement a finding concerns, so they
 # are folded into the text as labelled lines instead of dropped.  Unknown keys
-# and non-string values are still rejected.
+# (#1328) whose value is a non-empty string or a non-empty list of non-empty
+# strings are folded too, as `key: value` parts in the reviewer's own key
+# order, after the reference lines and before `Sub-items:`: a reviewer may copy
+# any field name from the PR or plan under review, so no allow-list can
+# anticipate them.  Unknown keys with any other value, keys in
+# REVIEW_FINDING_RESERVED_KEYS, and extras beyond the fold bounds are still
+# rejected.  Repair-side handling of folded extras is unchanged (#1337).
 PLAN_REVIEW_FINDING_TEXT_FIELDS: tuple[tuple[str, str], ...] = (
     ("title", ""),
     ("text", ""),
@@ -5318,6 +5324,39 @@ PLAN_REVIEW_FINDING_EXCLUDED_RENDERED_KEYS = frozenset(
 PLAN_REVIEW_FINDING_KEY_ALIASES: Mapping[str, str] = MappingProxyType(
     {"requested_change": "required_change"}
 )
+# Keys never folded into a finding's text (#1328): review envelope fields,
+# disposition fields, the scheduler field `fix_scope`, alias spellings and
+# rendered identifiers deliberately excluded from findings.  Folding one would
+# turn protocol meaning into prose, so it is rejected as a collision instead.
+# A parser's own accepted keys are skipped before this check, so the PR parser
+# keeps its typed `fix_scope` handling.  `summary` is deliberately absent: it
+# is a documented plan-finding text field.  Add future envelope or disposition
+# keys here.
+REVIEW_FINDING_RESERVED_KEYS: frozenset[str] = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "state",
+        "blocking_items",
+        "same_pr_followups",
+        "future_followups",
+        "blocking_plan_issues",
+        "same_plan_followups",
+        "prior_item_dispositions",
+        "prior_plan_item_dispositions",
+        "human_requirement_dispositions",
+        "architecture_impact",
+        "exact_head_evidence_requests",
+    }
+    | {"disposition", "note", "sub_item_dispositions", "requirement_id", "requirement_label"}
+    | {"fix_scope"}
+    | set(PLAN_REVIEW_FINDING_KEY_ALIASES)
+    | PLAN_REVIEW_FINDING_EXCLUDED_RENDERED_KEYS
+)
+REVIEW_FINDING_FOLD_MAX_KEYS = 16
+REVIEW_FINDING_FOLD_MAX_KEY_CHARS = 64
+REVIEW_FINDING_FOLD_MAX_ENTRIES = 32
+REVIEW_FINDING_FOLD_MAX_VALUE_CHARS = 2000
 
 
 # #1241: plan reviewers sometimes key a disposition `requirement_label`.  The
@@ -5344,6 +5383,71 @@ def _normalize_plan_review_finding_key_aliases(raw: dict, *, item_context: str) 
     return normalized
 
 
+def _fold_unknown_finding_keys(
+    raw: Mapping[str, object],
+    *,
+    accepted: frozenset[str],
+    reserved: frozenset[str],
+    item_context: str,
+) -> tuple[list[str], list[str], list[str]]:
+    """Fold string-valued unknown finding keys into labelled text (#1328).
+
+    Returns ``(folded_parts, folded_keys, remaining_unknown)`` in the object's
+    own key order.  Foldability and rendering reuse #1330's flat-object
+    helpers on a singleton mapping, so a key folds exactly when its value is a
+    non-empty string or a non-empty list of non-empty strings.  A reserved key
+    raises a collision; a non-foldable key is returned for the caller's own
+    unknown-key error.  Nothing is logged here.
+    """
+    folded_parts: list[str] = []
+    folded_keys: list[str] = []
+    remaining_unknown: list[str] = []
+    for key, value in raw.items():
+        if key in accepted:
+            continue
+        if key in reserved:
+            raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                f"{item_context}.{key} collides with a protocol or disposition field "
+                "and cannot be used as a finding key."
+            )
+        single = {key: value}
+        if _flat_object_defect(single) is not None:
+            remaining_unknown.append(str(key))
+            continue
+        if len(key) > REVIEW_FINDING_FOLD_MAX_KEY_CHARS:
+            raise AgentLoopError(  # shape-check: fatal:payload-bound
+                f"{item_context} finding key {key[:REVIEW_FINDING_FOLD_MAX_KEY_CHARS]!r}... "
+                f"exceeds the {REVIEW_FINDING_FOLD_MAX_KEY_CHARS}-character key bound."
+            )
+        entries = [value] if isinstance(value, str) else value
+        if len(entries) > REVIEW_FINDING_FOLD_MAX_ENTRIES:
+            raise AgentLoopError(  # shape-check: fatal:payload-bound
+                f"{item_context}.{key} exceeds the {REVIEW_FINDING_FOLD_MAX_ENTRIES}-entry bound."
+            )
+        if any(len(entry) > REVIEW_FINDING_FOLD_MAX_VALUE_CHARS for entry in entries):
+            raise AgentLoopError(  # shape-check: fatal:payload-bound
+                f"{item_context}.{key} exceeds the "
+                f"{REVIEW_FINDING_FOLD_MAX_VALUE_CHARS}-character value bound."
+            )
+        folded_keys.append(key)
+        if len(folded_keys) > REVIEW_FINDING_FOLD_MAX_KEYS:
+            raise AgentLoopError(  # shape-check: fatal:payload-bound
+                f"{item_context} has more than {REVIEW_FINDING_FOLD_MAX_KEYS} "
+                f"unknown finding keys to fold; {key} exceeds the bound."
+            )
+        folded_parts.append(_render_flat_object(single))
+    return folded_parts, folded_keys, remaining_unknown
+
+
+def _log_folded_finding_keys(item_context: str, keys: list[str]) -> None:
+    if keys:
+        _logger.warning(
+            "%s: folded unknown finding key(s) %s into the finding text",
+            item_context,
+            ", ".join(keys),
+        )
+
+
 def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
     if isinstance(raw, str):
         return _expect_non_empty_string(raw, context=item_context)  # shape-check: fatal:no-conservative-reading
@@ -5353,12 +5457,18 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
     text_fields = {name for name, _label in PLAN_REVIEW_FINDING_TEXT_FIELDS}
     reference_fields = {name for name, _label in PLAN_REVIEW_FINDING_REFERENCE_FIELDS}
     accepted = text_fields | reference_fields | PLAN_REVIEW_FINDING_ID_FIELDS | {"sub_items"}
-    unknown = sorted(set(raw) - accepted)
+    folded_parts, folded_keys, unknown = _fold_unknown_finding_keys(  # shape-check: fatal:payload-bound
+        raw,
+        accepted=frozenset(accepted),
+        reserved=REVIEW_FINDING_RESERVED_KEYS,
+        item_context=item_context,
+    )
     if unknown:
         allowed = ", ".join(sorted(accepted))
         raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
-            f"{item_context} has unsupported finding key(s) {', '.join(unknown)}; "
-            f"use a string or an object with only: {allowed}."
+            f"{item_context} has unsupported finding key(s) {', '.join(sorted(unknown))}; "
+            f"use a string or an object with only: {allowed}; unknown keys with a "
+            "non-empty string or string-list value are folded into the text."
         )
     for name in sorted(PLAN_REVIEW_FINDING_ID_FIELDS & set(raw)):
         if not isinstance(raw[name], str):
@@ -5385,6 +5495,7 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
         else:
             raise AgentLoopError(f"{item_context}.{name} must be a non-empty string or a non-empty JSON array of strings.")  # shape-check: fatal:no-conservative-reading
         parts.append(f"{label}: {', '.join(references)}")
+    parts.extend(folded_parts)
     if "sub_items" in raw:
         # Plan reviews get no ledger structure (#958): well-formed statements
         # are flattened into the finding text with nothing lost.
@@ -5399,6 +5510,7 @@ def _flatten_plan_review_finding(raw: object, *, item_context: str) -> str:
             "Sub-items: "
             + " ".join(f"({number}) {statement}" for number, statement in enumerate(statements, 1))
         )
+    _log_folded_finding_keys(item_context, folded_keys)
     return " ".join(parts)
 
 
@@ -5452,6 +5564,9 @@ def _degradable_sub_items(
     )
 
 
+REVIEW_FINDING_PR_ACCEPTED_KEYS = frozenset({"text", "fix_scope", "sub_items", "evidence_row_ids"})
+
+
 def _expect_review_finding_list(
     payload: dict[str, object],
     field_name: str,
@@ -5476,12 +5591,18 @@ def _expect_review_finding_list(
             scope = None
         else:
             item = _expect_object(raw, context=item_context)  # shape-check: fatal:no-conservative-reading
-            _expect_exact_keys(  # shape-check: fatal:no-conservative-reading
+            if "text" not in item:
+                raise AgentLoopError(f"{item_context} is missing required field(s): text")  # shape-check: fatal:no-conservative-reading
+            folded_parts, folded_keys, unknown = _fold_unknown_finding_keys(  # shape-check: fatal:payload-bound
                 item,
-                context=item_context,
-                required={"text"},
-                optional={"fix_scope", "sub_items", "evidence_row_ids"},
+                accepted=REVIEW_FINDING_PR_ACCEPTED_KEYS,
+                reserved=REVIEW_FINDING_RESERVED_KEYS | PLAN_REVIEW_FINDING_ID_FIELDS,
+                item_context=item_context,
             )
+            if unknown:
+                raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
+                    f"{item_context} has unknown field(s): {', '.join(sorted(unknown))}"
+                )
             if "evidence_row_ids" in item:
                 if not allow_evidence_row_ids:
                     raise AgentLoopError(  # shape-check: fatal:no-conservative-reading
@@ -5491,6 +5612,8 @@ def _expect_review_finding_list(
                     item["evidence_row_ids"], context=f"{item_context}.evidence_row_ids"
                 )
             text = _expect_non_empty_string(item["text"], context=f"{item_context}.text")  # shape-check: fatal:no-conservative-reading
+            if folded_parts:
+                text = " ".join([text, *folded_parts])
             try:
                 scope = normalize_fix_scope(item.get("fix_scope")) if "fix_scope" in item else None  # shape-check: fatal:no-conservative-reading
             except AgentLoopError as exc:
@@ -5510,6 +5633,7 @@ def _expect_review_finding_list(
                     )
                 if record is not None and degradations is not None:
                     degradations.append(record)
+            _log_folded_finding_keys(item_context, folded_keys)
         findings.append(
             ApprovedFollowup(
                 reviewer=reviewer,

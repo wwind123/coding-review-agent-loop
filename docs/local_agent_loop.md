@@ -584,6 +584,9 @@ are advisory claims that the next reviewer verifies; only reviewer
 dispositions change sub-item status. A finding without `sub_items` behaves
 exactly as before, and malformed `sub_items` degrade to a plain finding with a
 visible record instead of rejecting the review.
+A PR finding object accepts `text`, `fix_scope`, `sub_items` and, on
+`blocking_items`, `evidence_row_ids`; any other key follows the
+[unknown finding key rule](#unknown-finding-keys-1328).
 
 While any sub-item is open, keep the item-level `blocking`/`same-pr` with the
 usual actionable note. When the last open sub-item is resolved, send item-level
@@ -6160,8 +6163,9 @@ labels `item_id`/`id` (#957). The parser flattens such an object mechanically,
 in that fixed key order, into one finding string that keeps every prose value
 verbatim (labelled values such as `Evidence:` and `Required change:` keep their
 label); the local labels are dropped. No repair model runs for this shape, so a
-container-type mismatch can no longer discard a well-grounded review. Unknown
-keys and non-string values are still rejected.
+container-type mismatch can no longer discard a well-grounded review.
+Non-string values of these keys are still rejected; unknown keys follow the
+fold rule below.
 
 A finding object may also cite the plan IDs the plan renderer shows reviewers
 (#1230): `scope_item_ids`/`scope_item_id` (label `Scope items`),
@@ -6174,6 +6178,50 @@ after the text fields and before `Sub-items:`, as lines such as
 so unknown IDs never fail. A finding with only reference keys still has no text
 field and is rejected. `depends_on_stage_ids` is deliberately not accepted
 (it is a stage-to-stage relation; use `stage_ids`).
+
+#### Unknown finding keys (#1328)
+
+A reviewer may copy a field name from the PR or plan under review into its
+finding object, so no allow-list can anticipate every key. Both the plan-review
+finding parser and the PR-review finding parser (`blocking_items`,
+`same_pr_followups`, `future_followups`) therefore fold an unknown key whose
+value is a non-empty string or a non-empty array of non-empty strings into the
+finding text as a labelled part such as `evidence_refs: row-1, row-7`, in the
+reviewer's own key order, and log one warning that names the folded keys (never
+their values). No repair model runs. On a plan finding the folded parts follow
+the text fields and reference lines and precede `Sub-items:`; on a PR finding
+they are appended to `text`. Folded parts never count as a text field, so an
+object with only extras is still rejected with `no text field`.
+
+The fold is deliberately narrow:
+
+- An unknown key with any other value (object, number, boolean, null, empty
+  string, empty array, or an array with a non-string or empty entry) is
+  rejected with the parser's existing unknown-key error.
+- Keys that carry protocol meaning are reserved and rejected as a collision
+  (`collides with a protocol or disposition field`): review envelope keys
+  (`schema_version`, `kind`, `state`, the finding and disposition list names,
+  `architecture_impact`, `exact_head_evidence_requests`), disposition keys
+  (`disposition`, `note`, `sub_item_dispositions`, `requirement_id`,
+  `requirement_label`), the scheduler field `fix_scope`, alias spellings such
+  as `requested_change` (when `required_change` is also present), and
+  `depends_on_stage_ids`. `summary` is not reserved: it is a plan-finding text
+  field. A parser's own documented keys keep their typed handling, so PR
+  `fix_scope` is still validated as a path list.
+- Identifier labels: plan findings still accept and drop `item_id`/`id`
+  (#957); PR findings reject both as collisions.
+- `evidence_row_ids` stays the typed, strictly validated #1324 tag on PR
+  `blocking_items` and is still rejected on the other PR lists; it is never
+  folded on PR reviews. On plan findings it is an ordinary unknown key and
+  folds.
+- Bounds: at most 16 folded keys per finding, keys of at most 64 characters,
+  at most 32 array entries, and at most 2000 characters per string or entry.
+  Exceeding any bound rejects the finding; nothing is truncated.
+
+Repair-side handling of folded extras is unchanged and tracked in #1337: a PR
+repair can drop a folded extra without rejection, and a plan repair can drop a
+folded extra named like finding metadata (for example `severity`, `category`,
+`verdict`), whose value the preservation check skips.
 
 When a structured response is recognized but fails schema validation, the
 terminal error leads with the validation reason and reports `Failure category:
