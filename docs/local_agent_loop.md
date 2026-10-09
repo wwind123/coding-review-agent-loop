@@ -3447,6 +3447,25 @@ round-limit exit wins. The tag is reviewer-declared: the orchestrator verifies t
 named rows are unsatisfied at the head, but cannot prove that a reviewer did not fold a
 code concern into a tagged item.
 
+**Unchanged-head follow-ups.** A follow-up that leaves the PR head where it was can still
+produce verified citations. The orchestrator decides whether the head was expected to
+move from state it fixed before the coder turn, never from agent prose. It reads the
+reconciled item ledger and the unsatisfied-row set of that round's `evidence_stall`
+snapshot, bound to the predecessor head. An addressed item, or the parent of an addressed
+sub-item, is citation-only when it is a `human-exact-head-evidence` machine obligation or a
+reviewer finding whose non-empty tag names only unsatisfied rows. When at least one item
+is addressed and every addressed item is citation-only, the follow-up is authenticated
+against the current head alone. The clean-tree, tree-digest, and turn-catalog proofs
+still apply. When the follow-up addresses any untagged finding, a finding tagged with a
+satisfied or unknown row, a non-evidence machine obligation, or an id missing from the
+ledger, the head was expected to move. The same applies when it addresses nothing or the
+row set is unavailable, for example on the first round with no bound evidence or on a
+merge-conflict round. An unmoved head then rejects every selected receipt with
+`checkout-head-mismatch` and the message "The follow-up reports code changes but the PR
+head did not move from the predecessor head." Unpushed commits and dirty trees are
+rejected in either case by the checkout-head and clean-tree proofs. The unchanged-head
+coder-turn limit still applies unchanged.
+
 #### Qualified panel evidence
 
 A qualified panel opening is derived from comment order: an operator-sourced
