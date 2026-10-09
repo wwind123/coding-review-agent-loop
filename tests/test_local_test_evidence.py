@@ -4347,3 +4347,378 @@ def test_citing_a_non_evidence_receipt_keeps_the_non_evidence_label(tmp_path):
     assert "pre-collection launch failure (not evidence)" in line
     assert "verified against the parent journal" not in line
     assert "uncited authoritative" not in public
+
+
+# --- #1329: failures at an obsolete tracked tree are history ---------------------
+
+from dataclasses import replace as _dc_replace
+
+from coding_review_agent_loop.local_test_evidence import (
+    TREE_CHANGE_CAVEAT,
+    TREE_CHANGE_SUPERSESSION,
+    TrackedTreeSnapshot,
+    unsuperseded_receipts_sentence,
+)
+
+
+def _tree_snapshot(digest="tree-b", head="head-b", **overrides):
+    values = dict(
+        root="/checkout", head=head, digest="all", tracked_digest=digest,
+        status_clean=True, complete=True, stable=True,
+    )
+    values.update(overrides)
+    return TrackedTreeSnapshot(**values)
+
+
+def _at(row, *, digest, head, state="current-head"):
+    return _dc_replace(
+        row,
+        attribution=_dc_replace(
+            row.attribution, tracked_digest=digest, head=head, state=state
+        ),
+    )
+
+
+def _by_receipt(evidence):
+    return {row.receipt_id: row for row in evidence.observations}
+
+
+def _obsolete_and_new(registry):
+    failure = _at(
+        _observation(outcome="failed", timestamp="2026-10-09T10:00:00+00:00",
+                     receipt_id="fail-a", registry=registry),
+        digest="tree-a", head="head-a",
+    )
+    passing = _at(
+        _observation(outcome="passed", timestamp="2026-10-09T10:05:00+00:00",
+                     receipt_id="pass-b", registry=registry),
+        digest="tree-b", head="head-b",
+    )
+    return failure, passing
+
+
+def test_obsolete_tree_failure_is_historical_after_a_pass_at_the_new_digest():
+    registry = EnvironmentIdentityRegistry()
+    failure, passing = _obsolete_and_new(registry)
+
+    evidence = reconcile_test_observations(
+        [failure, passing], current_head="head-b",
+        current_snapshot=_tree_snapshot(), registry=registry,
+    )
+
+    rows = _by_receipt(evidence)
+    assert set(rows) == {"fail-a", "pass-b"}  # A's failure stays in the journal
+    assert rows["fail-a"].superseded_by == TREE_CHANGE_SUPERSESSION
+    assert TREE_CHANGE_CAVEAT in rows["fail-a"].caveats
+    assert rows["pass-b"].superseded_by is None
+    assert evidence.authoritative_failures == ()
+    assert unsuperseded_receipts_sentence(bounded_evidence_for_round(evidence)) == ""
+
+
+@pytest.mark.parametrize("variant", ["no-pass", "other-scope", "equivalent-pass"])
+def test_failure_at_the_current_digest_keeps_strict_supersession(variant):
+    registry = EnvironmentIdentityRegistry()
+    failure = _at(
+        _observation(outcome="failed", timestamp="2026-10-09T10:00:00+00:00",
+                     receipt_id="fail-b", registry=registry),
+        digest="tree-b", head="head-b",
+    )
+    rows = [failure]
+    if variant != "no-pass":
+        scope = (
+            EvidenceScope("suite", ("tests/test_other.py",))
+            if variant == "other-scope" else None
+        )
+        rows.append(_at(
+            _observation(outcome="passed", timestamp="2026-10-09T10:05:00+00:00",
+                         receipt_id="pass-b", registry=registry, scope=scope),
+            digest="tree-b", head="head-b",
+        ))
+
+    evidence = reconcile_test_observations(
+        rows, current_head="head-b", current_snapshot=_tree_snapshot(), registry=registry,
+    )
+
+    result = _by_receipt(evidence)["fail-b"]
+    if variant == "equivalent-pass":
+        assert result.superseded_by == "pass-b"
+        assert evidence.authoritative_failures == ()
+    else:
+        assert result.superseded_by is None
+        assert evidence.authoritative_failures == ("fail-b",)
+    assert TREE_CHANGE_CAVEAT not in result.caveats
+
+
+def _patch_snapshot(monkeypatch, snapshot):
+    import coding_review_agent_loop.runner as runner_module
+
+    monkeypatch.setattr(
+        runner_module, "stable_tracked_tree_snapshot", lambda _cwd: snapshot, raising=False
+    )
+    monkeypatch.setattr(
+        "coding_review_agent_loop.local_test_evidence.stable_tracked_tree_snapshot",
+        lambda _cwd: snapshot,
+    )
+
+
+def _prior_failure_payload(*, digest, head, superseded_by=None):
+    row = {
+        "command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"],
+        "outcome": "failed",
+        "provenance": "parent-observed",
+        "receipt_id": "prior-failure",
+        "turn_id": "prior-turn",
+        "environment": "equivalent",
+        "attribution": {
+            "state": "current-head", "head": head, "stable": True,
+            "tracked_digest": digest,
+        },
+    }
+    if superseded_by is not None:
+        row["superseded_by"] = superseded_by
+    return json.dumps({"observations": [row], "authoritative_failures": []})
+
+
+def test_restored_obsolete_failure_without_identity_is_historical(monkeypatch, tmp_path):
+    _patch_snapshot(monkeypatch, _tree_snapshot(root=str(tmp_path)))
+    prior = canonicalize_bounded_evidence(
+        _prior_failure_payload(digest="tree-a", head="head-a")
+    )
+
+    merged = Runner().render_local_test_evidence(
+        current_head="head-b", cwd=tmp_path, prior_local_test_evidence=prior,
+    )
+
+    payload = json.loads(merged)
+    assert payload["authoritative_failures"] == []
+    (row,) = payload["observations"]
+    assert row["superseded_by"] == TREE_CHANGE_SUPERSESSION
+    restored = decode_bounded_evidence(merged, restore_classification=True)
+    assert restored.observations[0].environment_state == "identity-unknown"
+    assert restored.observations[0].superseded_by == TREE_CHANGE_SUPERSESSION
+
+
+def test_forged_tree_change_label_at_the_current_digest_is_not_trusted(monkeypatch, tmp_path):
+    _patch_snapshot(monkeypatch, _tree_snapshot(digest="tree-a", head="head-a", root=str(tmp_path)))
+    forged = _prior_failure_payload(
+        digest="tree-a", head="head-a", superseded_by=TREE_CHANGE_SUPERSESSION
+    )
+    # The display-only decode keeps the label, so the forged payload is real.
+    assert (
+        decode_bounded_evidence(forged, restore_classification=True)
+        .observations[0].superseded_by == TREE_CHANGE_SUPERSESSION
+    )
+    # The default decode used for reconciliation input drops it.
+    assert decode_bounded_evidence(forged).observations[0].superseded_by is None
+
+    merged = Runner().render_local_test_evidence(
+        current_head="head-a", cwd=tmp_path, prior_local_test_evidence=forged,
+    )
+
+    payload = json.loads(merged)
+    assert payload["authoritative_failures"] == ["prior-failure"]
+    assert payload["observations"][0]["superseded_by"] is None
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        None,
+        _tree_snapshot(stable=False),
+        _tree_snapshot(stable=None),
+        _tree_snapshot(status_clean=False),
+        _tree_snapshot(complete=False),
+        _tree_snapshot(tracked_digest=None),
+        _tree_snapshot(head="head-other"),
+    ],
+    ids=["missing", "unstable", "stability-unknown", "dirty", "incomplete", "no-digest", "head-mismatch"],
+)
+def test_untrustworthy_current_snapshot_leaves_obsolete_failure_blocking(snapshot):
+    registry = EnvironmentIdentityRegistry()
+    failure, passing = _obsolete_and_new(registry)
+
+    evidence = reconcile_test_observations(
+        [failure, passing], current_head="head-b", current_snapshot=snapshot, registry=registry,
+    )
+
+    assert _by_receipt(evidence)["fail-a"].superseded_by is None
+    assert evidence.authoritative_failures == ("fail-a",)
+
+
+@pytest.mark.parametrize("attribution", [
+    {"stable": False}, {"stable": None}, {"tracked_digest": None}, {"tracked_digest": ""},
+])
+def test_failure_without_a_stable_tracked_digest_stays_blocking(attribution):
+    registry = EnvironmentIdentityRegistry()
+    failure, _passing = _obsolete_and_new(registry)
+    failure = _dc_replace(failure, attribution=_dc_replace(failure.attribution, **attribution))
+
+    evidence = reconcile_test_observations(
+        [failure], current_head="head-b", current_snapshot=_tree_snapshot(), registry=registry,
+    )
+
+    assert evidence.authoritative_failures == ("fail-a",)
+
+
+def _reconcile_without_tree_change(monkeypatch, *args, **kwargs):
+    """Today's behaviour: the same reconcile with the classification pass disabled."""
+    with monkeypatch.context() as patch:
+        patch.setattr(evidence_module, "_classify_tree_change_failures", lambda *a, **k: None)
+        return reconcile_test_observations(*args, **kwargs)
+
+
+def _base_rows(registry):
+    live_state = _at(
+        _observation(outcome="failed", timestamp="2026-10-09T09:00:00+00:00",
+                     receipt_id="base-live-state", registry=registry),
+        digest="tree-a", head="head-a", state="base-reproduction",
+    )
+    live_claim = _dc_replace(
+        _at(
+            _observation(outcome="failed", timestamp="2026-10-09T09:01:00+00:00",
+                         receipt_id="base-live-claim", registry=registry),
+            digest="tree-a", head="head-a",
+        ),
+        claim="base-reproduction",
+    )
+    live_pass = _at(
+        _observation(outcome="passed", timestamp="2026-10-09T09:02:00+00:00",
+                     receipt_id="base-live-pass", registry=registry),
+        digest="tree-a", head="head-a", state="base-reproduction",
+    )
+    current_digest_base = _at(
+        _observation(outcome="failed", timestamp="2026-10-09T09:03:00+00:00",
+                     receipt_id="base-current-digest", registry=registry),
+        digest="tree-b", head="head-a", state="base-reproduction",
+    )
+
+    def restored(receipt, **extra):
+        row = {
+            "command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"],
+            "outcome": "failed", "provenance": "parent-observed", "receipt_id": receipt,
+            "timestamp": "2026-10-09T09:04:00+00:00",
+            "attribution": {"state": "current-head", "head": "head-a", "stable": True,
+                            "tracked_digest": "tree-a"},
+        }
+        row.update(extra)
+        return row
+
+    restored_state = restored("base-restored-state", attribution={
+        "state": "base-reproduction", "head": "head-a", "stable": True, "tracked_digest": "tree-a",
+    })
+    restored_claim = restored("base-restored-claim", claim="base-reproduction")
+    return [live_state, live_claim, live_pass, current_digest_base, restored_state, restored_claim]
+
+
+def test_base_reproduction_rows_get_no_label_and_unchanged_attribution(monkeypatch):
+    registry = EnvironmentIdentityRegistry()
+    rows = _base_rows(registry)
+    kwargs = dict(current_head="head-b", current_snapshot=_tree_snapshot(), registry=registry)
+
+    evidence = reconcile_test_observations(rows, **kwargs)
+    today = _reconcile_without_tree_change(monkeypatch, rows, **kwargs)
+
+    assert all(row.superseded_by != TREE_CHANGE_SUPERSESSION for row in evidence.observations)
+    assert evidence.observations == today.observations
+    assert evidence.authoritative_failures == today.authoritative_failures
+
+
+def test_tree_change_labels_are_rederived_on_every_reconcile():
+    registry = EnvironmentIdentityRegistry()
+    failure, passing = _obsolete_and_new(registry)
+    other_scope = EvidenceScope("suite", ("tests/test_other.py",))
+    genuine_fail = _at(
+        _observation(outcome="failed", timestamp="2026-10-09T10:06:00+00:00",
+                     receipt_id="fail-b", registry=registry, scope=other_scope),
+        digest="tree-b", head="head-b",
+    )
+    genuine_pass = _at(
+        _observation(outcome="passed", timestamp="2026-10-09T10:07:00+00:00",
+                     receipt_id="pass-b2", registry=registry, scope=other_scope),
+        digest="tree-b", head="head-b",
+    )
+    at_b = reconcile_test_observations(
+        [failure, passing, genuine_fail, genuine_pass], current_head="head-b",
+        current_snapshot=_tree_snapshot(), registry=registry,
+    )
+    assert _by_receipt(at_b)["fail-a"].superseded_by == TREE_CHANGE_SUPERSESSION
+    assert _by_receipt(at_b)["fail-b"].superseded_by == "pass-b2"
+
+    later_snapshots = [
+        ("head-a", _tree_snapshot(digest="tree-a", head="head-a")),
+        ("head-b", None),
+        ("head-b", _tree_snapshot(status_clean=False)),
+        ("head-b", _tree_snapshot(stable=False)),
+        ("head-b", _tree_snapshot(head="head-other")),
+    ]
+    for head, snapshot in later_snapshots:
+        again = reconcile_test_observations(
+            at_b.observations, current_head=head, current_snapshot=snapshot, registry=registry,
+        )
+        rows = _by_receipt(again)
+        assert rows["fail-a"].superseded_by is None
+        assert TREE_CHANGE_CAVEAT not in rows["fail-a"].caveats
+        assert "fail-a" in again.authoritative_failures
+        assert rows["fail-b"].superseded_by == "pass-b2"
+
+
+def test_entry_facts_stay_with_their_rows_through_sort_and_dedup(monkeypatch):
+    import itertools
+
+    registry = EnvironmentIdentityRegistry()
+    current_b = _at(
+        _observation(outcome="failed", timestamp="2026-10-09T10:05:00+00:00",
+                     receipt_id="fail-current-b", registry=registry),
+        digest="tree-b", head="head-b",
+    )
+    obsolete_a = _at(
+        _observation(outcome="failed", timestamp="2026-10-09T10:04:00+00:00",
+                     receipt_id="fail-obsolete-a", registry=registry),
+        digest="tree-a", head="head-a",
+    )
+    base_a = _at(
+        _observation(outcome="failed", timestamp="2026-10-09T10:03:00+00:00",
+                     receipt_id="fail-base-a", registry=registry),
+        digest="tree-a", head="head-a", state="base-reproduction",
+    )
+    conflict_first = _at(
+        _observation(outcome="passed", timestamp="2026-10-09T10:01:00+00:00",
+                     receipt_id="conflict", registry=registry),
+        digest="tree-b", head="head-b",
+    )
+    conflict_second = _at(
+        _observation(outcome="failed", timestamp="2026-10-09T10:02:00+00:00",
+                     receipt_id="conflict", registry=registry),
+        digest="tree-a", head="head-a",
+    )
+    # Newest first, plus an idempotent duplicate of the obsolete failure.
+    ordered = [current_b, obsolete_a, base_a, obsolete_a, conflict_second, conflict_first]
+    kwargs = dict(
+        current_head="head-b", current_snapshot=_tree_snapshot(), registry=registry,
+        legacy_tests_run=["python -m pytest tests/test_protocol.py -q"], cwd=Path("/checkout"),
+    )
+
+    def classify(evidence):
+        return sorted(
+            (row.receipt_id or "", row.outcome, row.provenance, row.superseded_by or "")
+            for row in evidence.observations
+        )
+
+    expected = None
+    for permutation in itertools.permutations(ordered):
+        evidence = reconcile_test_observations(list(permutation), **kwargs)
+        labelled = [
+            row.receipt_id for row in evidence.observations
+            if row.superseded_by == TREE_CHANGE_SUPERSESSION
+        ]
+        assert labelled == ["fail-obsolete-a"]
+        assert "fail-current-b" in evidence.authoritative_failures
+        if expected is None:
+            expected = classify(evidence)
+        assert classify(evidence) == expected
+
+    evidence = reconcile_test_observations(ordered, **kwargs)
+    today = _reconcile_without_tree_change(monkeypatch, ordered, **kwargs)
+    base_now = _by_receipt(evidence)["fail-base-a"]
+    assert base_now == _by_receipt(today)["fail-base-a"]
+    assert base_now.superseded_by is None

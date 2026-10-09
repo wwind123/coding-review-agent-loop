@@ -484,12 +484,18 @@ PRE_COLLECTION_REVIEWER_GUIDANCE = (
     "interpreter without pytest). It says nothing about the change, so it needs no "
     "supersession and must not be held open as an unresolved failure. Every other failed "
     "receipt keeps the existing rule: only a later parent-observed pass of the same command "
-    "supersedes it."
+    "supersedes it. A failure recorded at an earlier tracked tree and labelled "
+    "`historical failure at an obsolete tree (not an outstanding obligation)` is history, not "
+    "an outstanding obligation: only a failure at the current tracked digest needs a later "
+    "parent-observed passing rerun of the same command. Do not require supersession of "
+    "historical receipts; you may still require current-tree evidence on the merits."
 )
 PRE_COLLECTION_CODER_GUIDANCE = (
     "If `agent-loop run-tests` reports a pre-collection launch failure (no test ran, so the run "
     "is not evidence), fix the interpreter or flags and rerun; do not argue the receipt. A "
-    "genuine test failure is still cleared only by a passing rerun of the same command."
+    "genuine test failure is still cleared only by a passing rerun of the same command. Only a "
+    "failure at the current tracked digest needs that rerun; a failure recorded at an earlier "
+    "tracked tree is labelled historical and is not an outstanding obligation."
 )
 
 

@@ -5791,6 +5791,25 @@ def test_prompts_describe_pre_collection_launch_failures_as_non_evidence(tmp_pat
         assert "cleared only by a passing rerun of the same command" in coder_prompt
 
 
+def test_prompts_state_the_current_digest_only_rerun_rule(tmp_path):
+    """Issue #1329: obsolete-tree failures are history, not obligations."""
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    for compact in (False, True):
+        review = build_review_prompt(
+            77, 1, config, reviewer="codex", compact_context=compact,
+        )
+        assert "historical failure at an obsolete tree (not an outstanding obligation)" in review
+        assert "only a failure at the current tracked digest needs a later" in review
+        assert "Do not require supersession of historical receipts" in review
+        assert "current-tree evidence on the merits" in review
+    for coder_prompt in (
+        build_issue_implementation_prompt(56, "1. Fix it.", config),
+        prompts_module.build_followup_prompt(77, 1, "Fix it.", config),
+    ):
+        assert "Only a failure at the current tracked digest needs that rerun" in coder_prompt
+        assert "labelled historical and is not an outstanding obligation" in coder_prompt
+
+
 # --- #1324: evidence-only row tag guidance -------------------------------------
 
 def test_pr_review_prompts_carry_evidence_row_tag_guidance_only_with_an_applicable_matrix(tmp_path):

@@ -1076,3 +1076,16 @@ def test_split_routed_matrix_example_cells_equal_expected_set():
     }
     assert {e["needs_key"] for e in expected} <= set(jobs["publish"]["needs"])
     assert "redis-admission" in {e["attestation_id"] for e in expected}
+
+
+def test_local_agent_loop_doc_states_the_obsolete_tree_failure_rule():
+    """Issue #1329: only failures at the current tracked digest need a rerun."""
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    section = text.split("#### Failures at an obsolete tracked tree\n", 1)[1].split("\n#", 1)[0]
+    flat = " ".join(section.split())
+    assert "`superseded-by-tree-change`" in flat
+    assert "Only a failure at the current tracked digest needs a later parent-observed passing rerun of the same command" in flat
+    assert "must not require supersession of historical receipts" in flat
+    assert "It fails closed" in flat
+    assert "Base-reproduction rows" in flat
+    assert "re-derived on every reconcile and never trusted as input" in flat
