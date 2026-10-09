@@ -4631,9 +4631,13 @@ time.sleep(10)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group cleanup")
-def test_broker_owned_target_survives_a_client_kill_and_is_journaled_at_its_watchdog(tmp_path):
+def test_broker_owned_target_survives_a_client_kill_and_is_journaled_at_its_watchdog(tmp_path, monkeypatch):
     from coding_review_agent_loop.containment import default_policy
     from coding_review_agent_loop.runner import Runner
+
+    # An ambient orchestrator shell cap (set when this suite itself runs inside
+    # an agent turn) covers the client's 3s budget and suppresses the notice.
+    monkeypatch.delenv("AGENT_LOOP_SHELL_CAP_MS", raising=False)
 
     for args in (
         ["init", "-q"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "T"],
