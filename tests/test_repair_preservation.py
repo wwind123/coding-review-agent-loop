@@ -2654,3 +2654,16 @@ def test_semantic_patch_with_tool_owned_key_passes_envelope_only_repair_1333():
             original,
             json.dumps(stripped) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
         )
+
+
+# --- #1328: folded unknown plan-finding keys and repair preservation ---------
+
+def test_plan_review_repair_keeps_or_drops_folded_extra_1328():
+    finding = {"finding": "Gap.", "evidence_refs": ["row-1"]}
+    source = _plan_review(blocking_plan_issues=[finding])
+    check(source, _plan_review(blocking_plan_issues=[dict(finding)]))
+    rejects(
+        source,
+        _plan_review(blocking_plan_issues=[{"finding": "Gap."}]),
+        match="blocking_plan_issues",
+    )

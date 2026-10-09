@@ -669,13 +669,26 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
     ),
     "_expect_review_finding_list": ShapeCheckClassification(
         "mixed",
-        frozenset({"authentication-or-forgery", "no-conservative-reading"}),
+        frozenset({"authentication-or-forgery", "no-conservative-reading", "payload-bound"}),
         (
             "A dropped finding changes a verdict non-monotonically; the rewrapped "
             "normalize_fix_scope call and its re-raise both propagate. Fatal sites: "
             "no-conservative-reading: removing the element would weaken an obligation, "
             "finding, disposition, approved topology or discussion answer rather than a "
-            "claim."
+            "claim; payload-bound: the #1328 unknown-key fold call enforces the fold "
+            "bounds (it also raises reserved-key collisions)."
+        ),
+    ),
+    "_fold_unknown_finding_keys": ShapeCheckClassification(
+        "fatal",
+        frozenset({"no-conservative-reading", "payload-bound"}),
+        (
+            "Folding a reserved protocol or disposition key into prose would change "
+            "its meaning, so the finding is rejected for bounded repair (#1328). Fatal "
+            "sites: no-conservative-reading: removing the element would weaken an "
+            "obligation, finding, disposition, approved topology or discussion answer "
+            "rather than a claim; payload-bound: the folded key, entry, value and "
+            "key-count bounds keep an accepted finding bounded."
         ),
     ),
     "_degradable_sub_item_claims": ShapeCheckClassification(
@@ -872,11 +885,12 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
     ),
     "_flatten_plan_review_finding": ShapeCheckClassification(
         "fatal",
-        frozenset({"no-conservative-reading"}),
+        frozenset({"no-conservative-reading", "payload-bound"}),
         (
             "Fatal sites: no-conservative-reading: removing the element would weaken an "
             "obligation, finding, disposition, approved topology or discussion answer "
-            "rather than a claim."
+            "rather than a claim; payload-bound: the #1328 unknown-key fold call "
+            "enforces the fold bounds (it also raises reserved-key collisions)."
         ),
     ),
     "_hard_capped_claim_string": ShapeCheckClassification(
