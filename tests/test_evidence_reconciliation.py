@@ -406,3 +406,91 @@ def test_validation_seam_base_reproduction_status_is_unchanged(monkeypatch, tmp_
     assert set(now_journal.authoritative_failures) == {
         "base-live-state", "base-live-claim", "base-restored-state", "base-restored-claim",
     }
+
+
+def _restored_base_pass(receipt, *, digest, head):
+    return {
+        "command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"],
+        "normalized_command": "python -m pytest tests/test_protocol.py -q",
+        "outcome": "passed", "provenance": "parent-observed", "receipt_id": receipt,
+        "turn_id": "turn-current", "timestamp": "2026-10-09T09:58:00+00:00",
+        "claim": "base-reproduction",
+        "wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "verified",
+        "attribution": {"state": "base-reproduction", "head": head, "stable": True,
+                        "tracked_digest": digest},
+    }
+
+
+def _base_citation_outcome(observations, receipt, status):
+    """Validate a ``base-reproduction`` citation the way published evidence is checked."""
+    from coding_review_agent_loop.protocol import parse_risk_test_matrix_evidence
+
+    matrix = _matrix()
+    payload = {
+        "matrix_identity": risk_test_matrix_identity(matrix),
+        "rows": [{
+            "row_id": "row-gate",
+            "status": status,
+            "test_identifiers": ["tests/test_protocol.py::test_gate"],
+            "test_locations": ["tests/test_protocol.py"],
+            "workflow_path_claim": "Base reproduction ran.",
+            "outcome_assertions": ["The base reproduction passed."],
+            "forbidden_effect_assertions": ["No failure was hidden."],
+            "evidence_citations": [{
+                "command": "python -m pytest tests/test_protocol.py -q",
+                "receipt_id": receipt,
+                "claim": "base-reproduction",
+            }],
+        }],
+    }
+    try:
+        parsed = parse_risk_test_matrix_evidence(
+            payload, matrix=matrix, authoritative_test_observations=observations,
+        )
+    except Exception as exc:  # the rejection text is the citation outcome
+        return ("rejected", str(exc))
+    return ("accepted", parsed.rows[0].status, parsed.rows[0].caveats)
+
+
+_BASE_PASSES = ("live-base-other-head", "live-base-current-digest",
+                "restored-base-other-head", "restored-base-current-digest")
+
+
+def test_validation_seam_base_reproduction_citations_are_unchanged(monkeypatch, tmp_path):
+    registry = EnvironmentIdentityRegistry()
+    journal = [
+        _seam_row(registry, tmp_path, receipt="live-base-other-head", outcome="passed",
+                  digest="tree-a", head="head-a", minute=0, state="base-reproduction",
+                  claim="base-reproduction"),
+        _seam_row(registry, tmp_path, receipt="live-base-current-digest", outcome="passed",
+                  digest="tree-b", head="head-b", minute=1, state="base-reproduction",
+                  claim="base-reproduction"),
+        _restored_base_pass("restored-base-other-head", digest="tree-a", head="head-a"),
+        _restored_base_pass("restored-base-current-digest", digest="tree-b", head="head-b"),
+        _seam_row(registry, tmp_path, receipt="base-live-claim", outcome="failed",
+                  digest="tree-a", head="head-a", minute=3, claim="base-reproduction"),
+        _restored_failure("base-restored-state", state="base-reproduction"),
+    ]
+
+    _row, _codes, now_journal = _validate_at_seam(
+        monkeypatch, tmp_path, journal, selected=["live-base-other-head"]
+    )
+    _row, _codes, today_journal = _validate_at_seam(
+        monkeypatch, tmp_path, journal, selected=["live-base-other-head"],
+        disable_classification=True,
+    )
+
+    assert {row.receipt_id for row in now_journal.observations} >= set(_BASE_PASSES)
+    assert not any(row.superseded_by for row in now_journal.observations)
+    assert set(now_journal.authoritative_failures) == {"base-live-claim", "base-restored-state"}
+    for receipt in _BASE_PASSES:
+        for status in ("verified", "stale/unverified"):
+            now = _base_citation_outcome(now_journal.observations, receipt, status)
+            today = _base_citation_outcome(today_journal.observations, receipt, status)
+            assert now == today, (receipt, status)
+        # The citation genuinely matches its receipt (not a vacuous rejection).
+        assert _base_citation_outcome(
+            now_journal.observations, receipt, "stale/unverified"
+        )[:2] == ("accepted", "stale/unverified")
+        # No base pass becomes verified at an obsolete or rewritten attribution.
+        assert _base_citation_outcome(now_journal.observations, receipt, "verified")[0] == "rejected"
