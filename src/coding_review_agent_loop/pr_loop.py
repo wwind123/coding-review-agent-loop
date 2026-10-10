@@ -497,26 +497,84 @@ def _enforce_pr_board_floor(
     )
 
 
-def _known_plan_floor_inputs(
+def _entry_plan_handoff_board(
     runner: Runner,
     *,
     config: AgentLoopConfig,
-    issue_contexts: Sequence[IssueContext | None],
-) -> tuple[AgentLoopConfig, tuple[object, ...]]:
-    """Best-effort plan board for a floor check before the handoff seam.
+    pr_context: PullRequestReviewContext,
+    pr_number: int,
+    issue_context: IssueContext | None,
+    parent_issue_context: IssueContext | None,
+    approved_plan_context: ApprovedPlanContext | None,
+    managed_ci_issue_number: int | None,
+) -> PlanHandoffBoard | None:
+    """Read-only handoff board of the exact approved plan bound to this PR.
 
-    Reads only the issues already known at PR entry; the seam repeats the
-    exact check once the approved plan is resolved.
+    Runs before the first PR write, so it uses only authoritative scope: the
+    caller's issue, else an explicit managed-CI issue scope, else the PR-side
+    contract's primary issue.  The plan identity comes from the caller's
+    approved plan or the issue-side handoff that names this PR, and the board
+    is taken from the issue (child, else staged parent) holding exactly that
+    plan, the same selection the handoff seam applies.  ``None`` means no
+    plan is bound, so no plan authorization applies.
     """
-    for known in issue_contexts:
-        if known is None:
-            continue
-        fresh = get_issue_context(runner, config=config, issue_number=known.number)
-        plan = derive_plan_verification_context(fresh.comments, issue_number=fresh.number)
-        if plan is not None:
-            handoff = resolve_plan_handoff_board(config, plan)
-            return handoff.config, handoff.signed_authorizations
-    return config, ()
+    owning_number = issue_context.number if issue_context is not None else None
+    if owning_number is None:
+        owning_number = managed_ci_issue_number or config.managed_ci_issue_number
+    if owning_number is None:
+        recorded = find_latest_pr_contract(
+            pr_context.comments, repository=config.repo, pr_number=pr_number,
+        )
+        if recorded is not None:
+            owning_number = recorded.primary_issue_number
+    if owning_number is None:
+        return None
+    owning = get_issue_context(runner, config=config, issue_number=owning_number)
+    if approved_plan_context is not None:
+        plan_hash: str | None = approved_plan_context.plan_hash
+        plan_subject = approved_plan_context.plan_subject
+    else:
+        handoff = find_latest_issue_pr_handoff(
+            owning.comments, issue_number=owning.number, repo=config.repo,
+        )
+        if (
+            handoff is None
+            or handoff.pr_number != pr_number
+            or handoff.flow != "approved-plan-implementation"
+        ):
+            return None
+        if not handoff.plan_hash:
+            raise AgentLoopError(
+                f"Approved-plan handoff for issue #{owning.number} has no plan hash."
+            )
+        plan_hash, plan_subject = handoff.plan_hash, None
+    parent_number = (
+        parent_issue_context.number
+        if parent_issue_context is not None
+        else _infer_staged_parent_issue(owning)
+    )
+    candidates: list[int] = [owning.number]
+    if parent_number is not None and parent_number != owning.number:
+        candidates.append(parent_number)
+    for number in candidates:
+        source = (
+            owning if number == owning.number
+            else get_issue_context(runner, config=config, issue_number=number)
+        )
+        recovered = recover_approved_plan_context(
+            source.comments, expected_hash=plan_hash, expected_subject=plan_subject,
+        )
+        if recovered.is_available:
+            if (
+                approved_plan_context is not None
+                and recovered.canonical_text != approved_plan_context.canonical_text
+            ):
+                raise AgentLoopError("Named issue-to-PR handoff plan identity changed during recovery.")
+            plan = derive_plan_verification_context(source.comments, issue_number=source.number)
+            return resolve_plan_handoff_board(config, plan) if plan is not None else None
+        if recovered.has_matching_candidate:
+            return None
+    return None
 
 
 def _signed_pr_board_preflight(
@@ -537,14 +595,9 @@ def _signed_pr_board_preflight(
 
     validate_pr_backend_outage_amendments(amendments, config)
     capabilities = policy_capabilities(config.pr_review_policy)
-    try:
-        records = _extract_round_metadata_records(pr_context.comments, flow="pr")
-    except AgentLoopError:
-        if capabilities.requires_primary:
-            # The staged startup path posts its own pre-panel diagnostic and
-            # stops; this run cannot reach a review.
-            return config, None
-        raise
+    # Malformed history propagates for every policy: a signed amendment must
+    # never be applied, or authorize a floor exception, over it.
+    records = _extract_round_metadata_records(pr_context.comments, flow="pr")
     configured = reviewers(config)
     contract = make_contract(
         tuple(agent_display_name(reviewer) for reviewer in configured),
@@ -692,22 +745,39 @@ def run_pr_loop(
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
-        # The label release below is a PR write: with a floor configured, a
-        # below-floor board is refused first (#1378 review item-6).  Only the
-        # issues already known here supply a plan authorization; the seam
-        # repeats the exact check.
-        if board_floor_enabled(config) and retained_managed_label_present(
-            runner, config=config, pr_number=pr_number, cwd=bootstrap_cwd,
+        # The label release below is the first PR write.  Whenever signed PR
+        # amendments exist, or a floor is configured and the label would be
+        # released, resolve the authoritative plan board and the complete
+        # signed PR lineage read-only first, so malformed history or a
+        # below-floor board is refused with nothing written (#1378 review
+        # items 3, 6, 7).  The handoff seam repeats the exact check.
+        entry_amendments = collect_reviewer_board_amendments(
+            initial_pr_context.comments, flow="pr", pr_number=pr_number, ignored_sink=[],
+        )
+        if entry_amendments or (
+            board_floor_enabled(config)
+            and retained_managed_label_present(
+                runner, config=config, pr_number=pr_number, cwd=bootstrap_cwd,
+            )
         ):
-            entry_floor_config, entry_authorizations = _known_plan_floor_inputs(
-                runner, config=config, issue_contexts=(issue_context, parent_issue_context),
+            entry_board = _entry_plan_handoff_board(
+                runner,
+                config=config,
+                pr_context=initial_pr_context,
+                pr_number=pr_number,
+                issue_context=issue_context,
+                parent_issue_context=parent_issue_context,
+                approved_plan_context=approved_plan_context,
+                managed_ci_issue_number=managed_ci_issue_number,
             )
             _enforce_pr_board_floor(
                 runner,
-                config=entry_floor_config,
+                config=entry_board.config if entry_board is not None else config,
                 pr_context=initial_pr_context,
                 pr_number=pr_number,
-                handoff_authorizations=entry_authorizations,
+                handoff_authorizations=(
+                    entry_board.signed_authorizations if entry_board is not None else ()
+                ),
             )
         # A successful manual qualification retains the managed label on the
         # ready PR.  Release it before any managed-CI authentication so every

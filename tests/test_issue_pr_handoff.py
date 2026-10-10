@@ -292,7 +292,7 @@ def _named_config(tmp_path, seats, **overrides):
     return make_config(tmp_path, reviewer=tuple(seats), reviewer_seats=tuple(seats), **overrides)
 
 
-def _named_plan_comments(approved, plan_config, *, removed=(), restored=False):
+def _named_plan_comments(approved, plan_config, *, removed=(), restored=False, issue=56):
     """An approved named plan: candidate, round-1 checkpoint, signed board links."""
     from types import SimpleNamespace
     from coding_review_agent_loop.agents.registry import agent_display_name
@@ -316,7 +316,7 @@ def _named_plan_comments(approved, plan_config, *, removed=(), restored=False):
 
     def signed(text):
         (amendment,) = collect_reviewer_board_amendments(
-            [SimpleNamespace(body=text)], flow="plan", issue_number=56,
+            [SimpleNamespace(body=text)], flow="plan", issue_number=issue,
         )
         return amendment.digest
 
@@ -330,14 +330,14 @@ def _named_plan_comments(approved, plan_config, *, removed=(), restored=False):
     if removed:
         reduced = tuple(name for name in board if name not in removed)
         removal = format_reviewer_board_amendment_comment(
-            flow="plan", issue=56, pr_number=None, original_required_reviewers=board,
+            flow="plan", issue=issue, pr_number=None, original_required_reviewers=board,
             policy="all-reviewers", primary_reviewer=None, removed_reviewers=tuple(removed),
             effective_from_round=2, rationale="Backend quota exhausted.",
         )
         bodies += [removal, checkpoint(2, reduced, signed(removal))]
         if restored:
             restoration = format_reviewer_board_amendment_comment(
-                flow="plan", issue=56, pr_number=None, original_required_reviewers=reduced,
+                flow="plan", issue=issue, pr_number=None, original_required_reviewers=reduced,
                 policy="all-reviewers", primary_reviewer=None, removed_reviewers=(),
                 restored_reviewers=tuple(removed), effective_from_round=3,
                 rationale="Backend quota recovered.",

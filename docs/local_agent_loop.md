@@ -623,7 +623,8 @@ backend count as one provider. The floor is checked after history is read and
 before any workdir setup, managed-CI activation, agent run, or comment post. That
 covers issue start, `managed-pr` (before its branch and draft PR exist), and PR
 start or handoff. It also runs before a retained managed label is removed from a
-ready PR. A board below the floor is refused unless a validated signed
+ready PR. That check uses the board of the exact approved plan bound to the PR,
+including for a standalone `agent-loop pr` run. A board below the floor is refused unless a validated signed
 reviewer-board amendment lowered that measure. The amended board's own counts
 and recorded bindings bound that exception. An unamended plan board, a
 reconfigured board, or a backend swap on an inherited seat set gets no

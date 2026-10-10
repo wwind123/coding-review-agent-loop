@@ -370,3 +370,198 @@ def test_retained_managed_label_is_released_only_after_the_floor(tmp_path, monke
         with pytest.raises(_Reached):
             orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
         assert len(_managed_label_deletes(runner)) == 1
+
+
+# --- Retained-label release waits for the authoritative board (#1378 round 3) ---
+
+
+def _watch_retained_label(monkeypatch, *, proceed=_Reached):
+    """A ready PR that retains the managed label; record any release attempt."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+    import coding_review_agent_loop.pr_loop as pr_loop
+
+    releases = []
+
+    def release(*_a, **_k):
+        releases.append(True)
+        raise proceed
+
+    monkeypatch.setattr(pr_loop, "retained_managed_label_present", lambda *a, **k: True)
+    monkeypatch.setattr(pr_loop, "release_retained_managed_label", release)
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci",
+        lambda *a, **k: pytest.fail("managed-CI activation ran before the board was resolved"),
+    )
+    return releases
+
+
+@pytest.mark.parametrize(
+    ("amendment", "refusal"),
+    [
+        ({"reason": "backend-unavailable"}, "must remove every active seat"),
+        ({"effective_round": 5}, "Human decision required"),
+    ],
+    ids=["incomplete-backend-outage", "wrong-activation-round"],
+)
+def test_invalid_signed_pr_lineage_keeps_the_retained_label_without_a_floor(
+    tmp_path, monkeypatch, amendment, refusal
+):
+    """item-3: lineage validation precedes the label release even with no floor."""
+    runner, board, run_pr_loop = _amended_named_pr(tmp_path, monkeypatch, **amendment)
+    comments_before = len(runner.comments)
+    commands_before = len(runner.commands)
+    releases = _watch_retained_label(monkeypatch)
+    with pytest.raises(AgentLoopError, match=refusal):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, **board), workdirs_ready=True)
+    assert releases == []
+    assert len(runner.comments) == comments_before
+    assert not [c for c, _ in runner.commands[commands_before:] if c[0] in _AGENT_COMMANDS]
+
+
+@pytest.mark.parametrize("floor", [{}, {"min_reviewers": 2}], ids=["no-floor", "floor"])
+def test_staged_malformed_history_with_a_signed_amendment_writes_nothing(
+    tmp_path, monkeypatch, floor
+):
+    """item-3: a primary-then-panel PR never swallows undecodable history."""
+    import base64
+    import os
+
+    import coding_review_agent_loop.round_transport as transport
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from test_orchestrator_pr import (
+        _m943_amendment_from_error, _m943_append, _m943_partial_pr_round, _staged_config,
+    )
+
+    runner = _m943_partial_pr_round(tmp_path)
+    reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), **floor)
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
+    # An anchor whose spilled sidecar is missing cannot be decoded.
+    anchor = transport.prepare_round_comment(_attach_round_metadata("Visible review", PostedRoundMetadata(
+        flow="pr", role="reviewer", agent="codex", round_number=1, subject="abc123",
+        phase="provisional", canonical_reviewer_response=base64.urlsafe_b64encode(os.urandom(46_000)).decode(),
+    )))[-1]
+    _m943_append(runner, anchor, login="bot")
+    comments_before = len(runner.comments)
+    commands_before = len(runner.commands)
+    releases = _watch_retained_label(monkeypatch)
+    with pytest.raises(AgentLoopError, match="Incomplete round metadata"):
+        run_pr_loop(runner, pr_number=77, config=reduced)
+    assert releases == []
+    assert len(runner.comments) == comments_before
+    assert not [c for c, _ in runner.commands[commands_before:] if c[0] in _AGENT_COMMANDS]
+
+
+def _child_with_unrelated_signed_plan(tmp_path):
+    """Child #56 holds its own signed 3->2 plan; parent #55 approved the PR's plan on 3."""
+    from test_issue_pr_handoff import _named_config, _named_plan_comments, _three_provider_plan
+    from coding_review_agent_loop.round_state import make_approved_plan_context
+
+    seats, parent_plan = _three_provider_plan(tmp_path)
+    child_plan = make_approved_plan_context("An unrelated child plan.")
+    plan_config = _named_config(tmp_path, seats)
+    runner = FakeRunner(
+        issue_payloads_by_number={
+            55: {"number": 55},
+            56: {"number": 56, "body": "Child phase issue for parent #55."},
+        },
+        issue_comments_by_number={
+            55: _named_plan_comments(parent_plan, plan_config, issue=55),
+            56: _named_plan_comments(child_plan, plan_config, removed=("c",)),
+        },
+    )
+    return seats, parent_plan, runner
+
+
+def test_entry_floor_uses_the_parent_board_of_the_exact_plan(tmp_path, monkeypatch):
+    """item-6: an unrelated signed child plan never authorizes the label release."""
+    from coding_review_agent_loop.cli import run_pr_loop
+    from test_issue_pr_handoff import _named_config
+
+    seats, parent_plan, runner = _child_with_unrelated_signed_plan(tmp_path)
+    releases = _watch_retained_label(monkeypatch)
+    with pytest.raises(AgentLoopError, match="2 reviewer\\(s\\) is below the floor of 3"):
+        run_pr_loop(
+            runner, pr_number=77, config=_named_config(tmp_path, seats[:2], min_reviewers=3),
+            issue_context=IssueContext(56, "OWNER/REPO", "Child", "Body", None, ()),
+            parent_issue_context=IssueContext(55, "OWNER/REPO", "Parent", "Body", None, ()),
+            approved_plan_context=parent_plan, workdirs_ready=True,
+        )
+    assert releases == []
+    assert runner.comments == []
+    assert _agent_commands(runner) == []
+
+
+def _standalone_plan_pr(tmp_path, *, plan_reduction, scope):
+    """Issue #56 hands PR #77 off for an approved plan; the PR run has no issue context."""
+    from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
+    from coding_review_agent_loop.pr_contract import format_pr_contract_comment, make_pr_contract
+    from coding_review_agent_loop.round_state import make_approved_plan_context
+    from test_issue_pr_handoff import _named_config, _named_plan_comments, _three_provider_plan
+
+    seats, approved = _three_provider_plan(tmp_path)
+    plan_config = _named_config(tmp_path, seats)
+    if plan_reduction == "signed":
+        comments = _named_plan_comments(approved, plan_config, removed=("c",))
+        handed_off = approved
+    elif plan_reduction == "unsigned":
+        comments = _named_plan_comments(approved, plan_config)
+        handed_off = approved
+    else:
+        # The issue's signed reduction belongs to a different plan than the
+        # one the handoff names.
+        comments = _named_plan_comments(approved, plan_config, removed=("c",))
+        handed_off = make_approved_plan_context("A different approved plan.")
+    comments.append({
+        "author": {"login": "bot"}, "createdAt": "2026-05-23T00:01:00Z", "id": 99,
+        "body": format_issue_pr_handoff_comment(
+            issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
+            pr_head_sha="abc123", flow="approved-plan-implementation",
+            plan_hash=handed_off.plan_hash,
+        ),
+    })
+    runner = FakeRunner(
+        issue_payloads_by_number={56: {"number": 56}},
+        issue_comments_by_number={56: comments},
+    )
+    kwargs = {}
+    if scope == "explicit-scope":
+        kwargs["managed_ci_issue_number"] = 56
+    else:
+        runner.pr_payload.setdefault("comments", []).append({
+            "author": {"login": "bot"}, "createdAt": "2026-05-23T00:00:00Z",
+            "body": format_pr_contract_comment(make_pr_contract(
+                repository="OWNER/REPO", pr_number=77,
+                origin_flow="approved-plan-implementation",
+                expected_closing_issue_ids=(56,), primary_issue_number=56,
+            )),
+        })
+    return seats, runner, kwargs
+
+
+@pytest.mark.parametrize("scope", ["explicit-scope", "ordinary-recovery"])
+@pytest.mark.parametrize("plan_reduction", ["signed", "unsigned", "unrelated-plan"])
+def test_standalone_pr_entry_floor_resolves_the_bound_plan(
+    tmp_path, monkeypatch, scope, plan_reduction
+):
+    """item-7: a standalone PR resolves its owning issue and plan before the release."""
+    from coding_review_agent_loop.cli import run_pr_loop
+    from test_issue_pr_handoff import _named_config
+
+    seats, runner, kwargs = _standalone_plan_pr(
+        tmp_path, plan_reduction=plan_reduction, scope=scope,
+    )
+    releases = _watch_retained_label(monkeypatch)
+    config = _named_config(tmp_path, seats[:2], min_reviewers=3)
+    if plan_reduction == "signed":
+        with pytest.raises(_Reached):
+            run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True, **kwargs)
+        assert releases == [True]
+    else:
+        with pytest.raises(AgentLoopError, match="2 reviewer\\(s\\) is below the floor of 3"):
+            run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True, **kwargs)
+        assert releases == []
+    assert runner.comments == []
+    assert _agent_commands(runner) == []

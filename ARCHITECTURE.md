@@ -1948,10 +1948,17 @@ supplies a floor exception. At handoff that requires an inherited seat set. On
 the PR, the signed PR amendment lineage is resolved read-only at the same early
 point. That includes the backend-outage completeness check and the activation
 round of pending amendments, so malformed or not-yet-activatable amendment
-history also fails before any write and never supplies a floor exception. When
-a ready PR still carries the retained managed label, the floor is checked
-before the label is released, using the plan of any issue already known at
-entry. The handoff seam repeats the check once the approved plan is resolved. The
+history also fails before any write and never supplies a floor exception.
+Malformed round history fails closed under every review policy. The first PR
+write is the release of a retained managed label on a ready PR. Whenever signed
+PR amendments exist, or a floor is set and that label would be released, the
+complete lineage and the floor are resolved first, even without floor flags.
+That resolution uses the authoritative approved plan. The owning issue is the
+caller's issue, an explicit managed-CI issue scope, or the PR-side contract's
+primary issue. The plan identity comes from the caller's approved plan or from
+the issue-side handoff that names this PR. The board then comes from the issue
+holding exactly that plan, either the child or its staged parent. This is the
+same selection the handoff seam applies, and the seam repeats the check. The
 exception covers only the measures the chain
 lowered from C0 to Cn, and never goes below the signed board's own counts with
 its recorded bindings. A binding swap therefore cannot inherit a provider
