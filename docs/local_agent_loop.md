@@ -4108,9 +4108,10 @@ by repo and agent:
 ```
 
 The tool prints the selected default workdirs. If a default checkout does not
-exist, it runs `gh repo clone OWNER/REPO <path>`. If it already exists and is a
-clean checkout for the requested repo, it fetches origin and fast-forwards the
-resolved base branch. In `pr` mode the base defaults to the PR's base branch,
+exist, it initializes an empty checkout with the operator-selected origin.
+It privately fetches the resolved base commit, imports its pack, verifies the
+object, and fast-forwards the local branch under a checkout lock. An existing
+clean checkout follows the same sync path. In `pr` mode the base defaults to the PR's base branch,
 then the repository default branch; in `issue` and `task` modes it defaults to
 the repository default branch. An explicit `--base` overrides these defaults.
 Default checkouts are tool-owned and disposable; if one
@@ -4122,6 +4123,31 @@ local work.
 Explicit workdirs remain conservative. A dirty explicit git checkout fails
 clearly, and an explicit checkout whose origin does not match `--repo` is
 rejected.
+
+The exact GitHub HTTPS or SSH destination is derived from `--repo`; checkout
+URL rewrites and origin suffix matches are not accepted. An operator using a
+local fixture or offline origin must pass `--trusted-local-origin` with an
+absolute path, which must match the checkout origin after resolution. Private
+HTTPS fetches use a token from trusted `gh auth token` context only in the
+private transport process; missing authentication fails in bounded time.
+Checkout-side Git never fetches or pulls. The private transport exports the
+fetched commit's reachable objects as a pack; the confined checkout imports
+and verifies them before a compare-and-swap tracking-ref update. Default
+linked worktrees hold `store_lock` during that import and ref move. Creation
+writes the minimal detached administrative link under the lock, then populates
+it with a separate confined `reset --hard`; only a verified, clean worktree
+is recorded as ready. This sequence avoids a child Git process that current
+Git versions start even for `worktree add --no-checkout`.
+
+Every agent-loop-owned local Git process has a closed environment, pinned
+executable, command settings that neutralize executable Git features, and
+command-time denial of child execution and network access. Linux verifies a
+preload/seccomp guard; macOS verifies a preload/Seatbelt guard, including a
+same-path Git relaunch canary; Windows verifies a suspended-process Job Object
+with a one-process limit. If the host lacks a verified backend, the first
+checkout Git probe fails before reading checkout state. Filters or helpers
+required by hostile checkout configuration may make a sync fail; they do not
+run under agent-loop's privileges.
 
 Coder prompts name the active assigned checkout as an absolute path and set
 `AGENT_LOOP_WORKDIR` to that same path for the agent subprocess. Implementation,
@@ -6004,11 +6030,17 @@ its role (implemented in `agent_permissions.py`):
   The deny rules are declared before the allow rules so neither variadic option
   absorbs the other, and they do not cover the inspector prefix. See the
   README's [inspector reference](../README.md#sandboxed-role-permissions).
-- Every sandboxed invocation also has the inherited `GIT_TRACE*` variables,
-  `GIT_CONFIG_COUNT` and `GIT_EXTERNAL_DIFF` neutralized on the agent process
-  itself. `inspect` has an environment allowlist, but the CLI that calls it
-  does not, so an inherited `GIT_TRACE2_EVENT` otherwise reaches the CLI's own
-  git calls and writes `trace2.json` into the checkout.
+- Agent-loop-owned Git uses a closed child environment in every permission
+  mode. Inherited `GIT_TRACE*`, `GIT_CONFIG_COUNT`, `GIT_EXTERNAL_DIFF`,
+  alternate repository variables, and executable lookup paths do not reach
+  those commands. The caller's environment is unchanged.
+  Guard source files and the Windows launcher must match identities already
+  loaded by the controller; changed helper bytes are refused before use.
+  A fresh default checkout uses HTTPS unless the operator selects
+  `--trusted-origin-protocol ssh`; that setting chooses the pinned SSH origin
+  before any fetch and requires the operator's SSH identity. The pinned SSH
+  client ignores the user's SSH config, including proxy commands; it can use
+  default identity files and `SSH_AUTH_SOCK`.
 - A Codex non-coder gets `--sandbox read-only` and `approval_policy="never"`,
   and `--output-last-message` points at the pre-created public response file,
   so failed-exit salvage reads it as usual. It has no network.

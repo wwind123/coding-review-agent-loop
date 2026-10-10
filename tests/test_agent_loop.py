@@ -2857,7 +2857,7 @@ def test_auto_created_agent_dir_is_cloned_before_use(tmp_path):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert ["gh", "repo", "clone", "OWNER/REPO", str(codex_dir)] in [
+    assert ["git", "init", "-q", "-b", "main"] in [
         cmd for cmd, _cwd in runner.commands
     ]
     assert codex_dir.is_dir()
@@ -2884,7 +2884,7 @@ def test_clean_existing_auto_agent_dir_is_synced(tmp_path):
     commands = [cmd for cmd, _cwd in runner.commands]
     assert ["git", "fetch", "origin"] in commands
     assert ["git", "switch", "main"] in commands
-    assert ["git", "pull", "--ff-only", "origin", "main"] in commands
+    assert ["git", "reset", "--hard", runner.git_head] in commands
 
 
 @pytest.mark.parametrize("mode", ["issue", "task"])
@@ -2986,7 +2986,7 @@ def test_reviewer_checkout_is_refreshed_to_pr_head_before_review(tmp_path):
     )
     checkout_index = command_index(
         runner.commands,
-        ["git", "checkout", "--detach", "refs/remotes/origin/pr/77"],
+        ["git", "checkout", "--detach", runner.pr_payload["headRefOid"]],
     )
     head_index = command_index(runner.commands, ["git", "rev-parse", "HEAD"], start=checkout_index)
 
@@ -3085,7 +3085,7 @@ def test_dirty_existing_auto_agent_dir_is_cleaned_before_sync(tmp_path, capsys):
     commands = [cmd for cmd, _cwd in runner.commands]
     assert ["git", "reset", "--hard"] in commands
     assert ["git", "clean", "-fd"] in commands
-    assert ["git", "pull", "--ff-only", "origin", "main"] in commands
+    assert ["git", "reset", "--hard", runner.git_head] in commands
     captured = capsys.readouterr()
     assert f"Cleaning dirty default codex workdir: {codex_dir}" in captured.err
 
@@ -3151,7 +3151,7 @@ def test_explicit_agent_dir_must_match_requested_repo(tmp_path):
     )
     config.gemini_dir.mkdir(parents=True)
 
-    with pytest.raises(AgentLoopError, match="not 'OWNER/REPO'"):
+    with pytest.raises(AgentLoopError, match="operator-trusted endpoint"):
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
@@ -3198,8 +3198,8 @@ def test_stale_default_workdir_only_logs_is_recreated(tmp_path, capsys):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    clone_cmds = [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "repo", "clone"]]
-    assert any(cmd[4] == str(codex_dir) for cmd in clone_cmds), "Expected fresh clone of stale workdir"
+    init_cmds = [(cmd, cwd) for cmd, cwd in runner.commands if cmd[:2] == ["git", "init"]]
+    assert any(cwd == codex_dir for _, cwd in init_cmds), "Expected fresh init of stale workdir"
 
     captured = capsys.readouterr()
     assert "Stale default codex workdir detected" in captured.err
@@ -3250,8 +3250,8 @@ def test_stale_default_workdir_empty_is_recreated(tmp_path, capsys):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    clone_cmds = [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "repo", "clone"]]
-    assert any(cmd[4] == str(codex_dir) for cmd in clone_cmds), "Expected fresh clone of empty stale workdir"
+    init_cmds = [(cmd, cwd) for cmd, cwd in runner.commands if cmd[:2] == ["git", "init"]]
+    assert any(cwd == codex_dir for _, cwd in init_cmds), "Expected fresh init of empty stale workdir"
 
     captured = capsys.readouterr()
     assert "Stale default codex workdir detected" in captured.err
@@ -3280,8 +3280,8 @@ def test_stale_default_workdir_git_only_is_recreated(tmp_path, capsys):
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    clone_cmds = [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "repo", "clone"]]
-    assert any(cmd[4] == str(codex_dir) for cmd in clone_cmds), "Expected fresh clone of git-only stale workdir"
+    init_cmds = [(cmd, cwd) for cmd, cwd in runner.commands if cmd[:2] == ["git", "init"]]
+    assert any(cwd == codex_dir for _, cwd in init_cmds), "Expected fresh init of git-only stale workdir"
 
     captured = capsys.readouterr()
     assert "Stale default codex workdir detected" in captured.err
@@ -3323,7 +3323,7 @@ def test_existing_auto_agent_dir_must_match_requested_repo(tmp_path):
     config.claude_dir.mkdir(parents=True)
     config.gemini_dir.mkdir(parents=True)
 
-    with pytest.raises(AgentLoopError, match="not 'OWNER/REPO'"):
+    with pytest.raises(AgentLoopError, match="operator-trusted endpoint"):
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert not any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)

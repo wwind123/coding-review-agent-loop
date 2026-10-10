@@ -1,0 +1,266 @@
+"""Real Git transport regressions against a local TLS Git HTTP backend."""
+
+from __future__ import annotations
+
+import base64
+import getpass
+import os
+import socket
+import ssl
+import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+from coding_review_agent_loop import git_transport
+from coding_review_agent_loop.errors import AgentLoopError
+from coding_review_agent_loop.runner import Runner
+
+
+def _git(path: Path, *args: str) -> str:
+    return subprocess.check_output(("git", "-C", str(path), *args), text=True).strip()
+
+
+@pytest.fixture
+def https_git(tmp_path, monkeypatch):
+    bare = tmp_path / "OWNER" / "REPO.git"
+    bare.parent.mkdir()
+    seed = tmp_path / "seed"
+    checkout = tmp_path / "checkout"
+    subprocess.run(("git", "init", "-q", "--bare", "-b", "main", str(bare)), check=True)
+    subprocess.run(("git", "init", "-q", "-b", "main", str(seed)), check=True)
+    (seed / "file.txt").write_text("transport fixture\n")
+    _git(seed, "add", "file.txt")
+    _git(seed, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "fixture")
+    _git(seed, "push", "-q", str(bare), "main")
+    subprocess.run(("git", "clone", "-q", str(bare), str(checkout)), check=True)
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", str(key), "-out", str(cert), "-days", "1",
+                    "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"),
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    requests: list[tuple[str, str | None]] = []
+    redirected_requests: list[str | None] = []
+    required_auth = {"value": None}
+    redirect = {"value": "", "enabled": False}
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            redirected_requests.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        do_POST = do_GET
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            self.serve_git()
+
+        def do_POST(self):
+            self.serve_git()
+
+        def serve_git(self):
+            auth = self.headers.get("Authorization")
+            requests.append((self.path, auth))
+            if redirect["enabled"]:
+                self.send_response(302)
+                self.send_header("Location", redirect["value"])
+                self.end_headers()
+                return
+            if required_auth["value"] and (not auth or auth.lower() != required_auth["value"].lower()):
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="Git"')
+                self.end_headers()
+                return
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            path, _, query = self.path.partition("?")
+            env = dict(os.environ)
+            env.update({"GIT_PROJECT_ROOT": str(tmp_path), "GIT_HTTP_EXPORT_ALL": "1",
+                        "PATH_INFO": path, "QUERY_STRING": query,
+                        "REQUEST_METHOD": self.command,
+                        "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+                        "CONTENT_LENGTH": str(len(body))})
+            result = subprocess.run(("git", "http-backend"), input=body, env=env,
+                                    capture_output=True, check=True)
+            header, payload = result.stdout.split(b"\r\n\r\n", 1)
+            lines = header.decode("latin1").split("\r\n")
+            status = 200
+            for line in lines:
+                if line.lower().startswith("status:"):
+                    status = int(line.split(":", 1)[1].strip().split()[0])
+            self.send_response(status)
+            for line in lines:
+                if ":" in line and not line.lower().startswith("status:"):
+                    name, value = line.split(":", 1)
+                    self.send_header(name, value.strip())
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    redirected_server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    redirected_server.socket = context.wrap_socket(redirected_server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    redirected_thread = threading.Thread(target=redirected_server.serve_forever, daemon=True)
+    thread.start()
+    redirected_thread.start()
+    redirect["value"] = f"https://localhost:{redirected_server.server_port}/redirected"
+    url = f"https://localhost:{server.server_port}/OWNER/REPO.git"
+    repo = f"localhost:{server.server_port}/OWNER/REPO"
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+    original_env = git_transport._transport_env
+
+    def fixture_env(endpoint, gh_cmd):
+        env = original_env(endpoint, gh_cmd)
+        env["GIT_SSL_CAINFO"] = str(cert)
+        return env
+
+    monkeypatch.setattr(git_transport, "_transport_env", fixture_env)
+    _git(checkout, "config", "remote.origin.url", url)
+    try:
+        yield checkout, url, repo, requests, redirected_requests, required_auth, redirect
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        redirected_server.shutdown()
+        redirected_server.server_close()
+        redirected_thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("mode", ["public", "private", "redirect", "rewrite"])
+def test_real_https_transport_policy(https_git, monkeypatch, tmp_path, mode):
+    checkout, url, repo, requests, redirected_requests, required_auth, redirect = https_git
+    marker = tmp_path / "helper-ran"
+    _git(checkout, "config", "credential.helper", f"!touch {marker}; echo password=planted")
+    if mode == "rewrite":
+        _git(checkout, "config", "url.https://127.0.0.1:1/.insteadOf", url)
+    if mode in {"private", "redirect"}:
+        token = "fixture-secret-token"
+        required_auth["value"] = "Basic " + base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        monkeypatch.setattr(git_transport, "_token_from_gh", lambda *_args: token)
+    if mode == "redirect":
+        redirect["enabled"] = True
+    kwargs = {"repo": repo, "runner": Runner(), "gh_cmd": "gh" if mode in {"private", "redirect"} else None}
+    if mode == "redirect":
+        with pytest.raises(AgentLoopError, match="Trusted Git transport failed"):
+            git_transport.import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main", **kwargs)
+        assert all(path != "/redirected" for path, _ in requests)
+        assert all(path.startswith("/OWNER/REPO.git/") for path, _ in requests)
+        assert any(auth and auth.lower() == required_auth["value"].lower() for _, auth in requests)
+        assert redirected_requests == []
+    else:
+        sha = git_transport.import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main", **kwargs)
+        assert sha == _git(checkout, "rev-parse", "HEAD")
+        assert _git(checkout, "cat-file", "-t", sha) == "commit"
+        assert requests
+        if mode == "private":
+            assert any(auth and auth.lower() == required_auth["value"].lower() for _, auth in requests)
+            assert all(path.startswith("/OWNER/REPO.git/") for path, _ in requests)
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(os.name != "posix" or not Path("/usr/sbin/sshd").exists(),
+                    reason="local OpenSSH server is unavailable")
+def test_real_pinned_ssh_fetch(tmp_path, monkeypatch):
+    bare = tmp_path / "OWNER" / "REPO.git"
+    bare.parent.mkdir()
+    seed = tmp_path / "seed"
+    checkout = tmp_path / "checkout"
+    subprocess.run(("git", "init", "-q", "--bare", "-b", "main", str(bare)), check=True)
+    subprocess.run(("git", "init", "-q", "-b", "main", str(seed)), check=True)
+    (seed / "file.txt").write_text("ssh fixture\n")
+    _git(seed, "add", "file.txt")
+    _git(seed, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "fixture")
+    _git(seed, "push", "-q", str(bare), "main")
+    subprocess.run(("git", "clone", "-q", str(bare), str(checkout)), check=True)
+    key = tmp_path / "client_key"
+    host_key = tmp_path / "host_key"
+    for path in (key, host_key):
+        subprocess.run(("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(path)), check=True)
+    forced_command = tmp_path / "serve_git.sh"
+    forced_command.write_text(f"#!/bin/sh\nexec /usr/bin/git-upload-pack {bare}\n")
+    forced_command.chmod(0o700)
+    authorized = tmp_path / "authorized_keys"
+    authorized.write_text(f'command="{forced_command}" ' + key.with_suffix(".pub").read_text())
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    server_config = tmp_path / "sshd_config"
+    server_config.write_text(f"Port {port}\nListenAddress 127.0.0.1\nHostKey {host_key}\n"
+                             f"AuthorizedKeysFile {authorized}\nStrictModes no\nUsePAM no\n"
+                             "PasswordAuthentication no\nPubkeyAuthentication yes\n"
+                             "PermitRootLogin no\nLogLevel QUIET\n")
+    server = subprocess.Popen(("/usr/sbin/sshd", "-D", "-e", "-f", str(server_config)),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        import time
+        for _ in range(50):
+            if server.poll() is not None:
+                pytest.skip("local sshd could not start")
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    break
+            except OSError:
+                time.sleep(0.02)
+        else:
+            pytest.skip("local sshd did not accept connections")
+        repo = f"localhost:{port}/OWNER/REPO"
+        from coding_review_agent_loop.git_transport import default_origin
+        from coding_review_agent_loop.config import ensure_temp_checkout
+        from agent_loop_helpers import make_config
+
+        url = default_origin(repo, protocol="ssh")
+        config = make_config(tmp_path, create_dirs=False, repo=repo, claude_dir=checkout,
+                             trusted_origin_protocol="ssh")
+        # A hostile user config must not be consulted by the pinned client.
+        home = tmp_path / "home"
+        (home / ".ssh").mkdir(parents=True)
+        marker = tmp_path / "proxy-ran"
+        (home / ".ssh" / "config").write_text(f"Host *\n  ProxyCommand touch {marker}\n")
+        monkeypatch.setenv("HOME", str(home))
+        original_env = git_transport._transport_env
+
+        def fixture_env(endpoint, gh_cmd):
+            env = original_env(endpoint, gh_cmd)
+            assert env["GIT_SSH_COMMAND"].startswith("/usr/bin/ssh -F /dev/null ")
+            env["GIT_SSH_COMMAND"] += (
+                f" -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
+                f" -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -l {getpass.getuser()}"
+            )
+            return env
+
+        monkeypatch.setattr(git_transport, "_transport_env", fixture_env)
+        checkout.rename(tmp_path / "fixture-clone")
+        checkout_marker = tmp_path / "checkout-helper-ran"
+
+        class PlantCheckoutConfig(Runner):
+            def run(self, args, *, cwd, **kwargs):
+                result = super().run(args, cwd=cwd, **kwargs)
+                if tuple(args[:4]) == ("git", "remote", "add", "origin"):
+                    _git(checkout, "config", "core.sshCommand", f"touch {checkout_marker}")
+                    _git(checkout, "config", "url.ssh://evil.example/.insteadOf", url)
+                return result
+
+        ensure_temp_checkout(checkout, agent="claude", config=config,
+                             runner=PlantCheckoutConfig())
+        sha = _git(checkout, "rev-parse", "HEAD")
+        assert _git(checkout, "config", "--local", "--get", "remote.origin.url") == url
+        assert sha == _git(bare, "rev-parse", "refs/heads/main")
+        assert _git(checkout, "cat-file", "-t", sha) == "commit"
+        assert (checkout / "file.txt").read_text() == "ssh fixture\n"
+        assert not marker.exists() and not checkout_marker.exists()
+    finally:
+        server.terminate()
+        server.communicate(timeout=5)

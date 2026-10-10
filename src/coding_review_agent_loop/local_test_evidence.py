@@ -1569,11 +1569,16 @@ def _snapshot_checkpoint(started: float, timeout_seconds: float, cancel: Event |
 def _run_git(
     root: Path, args: Sequence[str], *, timeout: float = 10.0, cancel: Event | None = None
 ) -> bytes:
-    command = ("git", "-C", str(root), *args)
+    from .secure_git import local_command
+
+    command, env, pass_fds = local_command(args, checkout=root)
     if cancel is None:
         try:
             result = subprocess.run(
                 command,
+                cwd=root,
+                env=env,
+                pass_fds=pass_fds,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
@@ -1589,7 +1594,8 @@ def _run_git(
         raise SnapshotCancelled()
     try:
         process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+            command, cwd=root, env=env, pass_fds=pass_fds,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
         )
     except OSError as exc:
         raise AgentLoopError(f"git snapshot failed: {type(exc).__name__}") from exc
@@ -1675,6 +1681,53 @@ def _dirty_gitlink_paths(
             if index >= len(records) or not records[index]:
                 raise AgentLoopError("git snapshot contained malformed rename status")
             index += 1
+    return tuple(sorted(dirty))
+
+
+def _dirty_populated_gitlinks(
+    root: Path, index_entries: Mapping[str, tuple[str, str]], *,
+    timeout_seconds: float, cancel: Event | None, started: float,
+    depth: int = 0, budget: list[int] | None = None,
+) -> tuple[str, ...]:
+    """Inspect populated submodules through separate confined Git processes."""
+    dirty: list[str] = []
+    if budget is None:
+        budget = [128]
+    gitlinks = [(relative, object_id) for relative, (mode, object_id) in index_entries.items()
+                if mode == "160000"]
+    if len(gitlinks) > budget[0] or (depth >= 8 and gitlinks):
+        raise AgentLoopError("gitlink inspection limit exceeded")
+    for relative, object_id in gitlinks:
+        budget[0] -= 1
+        _snapshot_checkpoint(started, timeout_seconds, cancel)
+        path = root / relative
+        if not path.exists():
+            dirty.append(relative)
+            continue
+        if path.is_symlink() or not path.is_dir():
+            raise AgentLoopError("gitlink worktree has an unsafe path")
+        sub_root = path.resolve(strict=True)
+        if os.path.commonpath((str(root), str(sub_root))) != str(root):
+            raise AgentLoopError("gitlink worktree escapes snapshot root")
+        def probe(args: tuple[str, ...]) -> bytes:
+            _snapshot_checkpoint(started, timeout_seconds, cancel)
+            remaining = max(0.1, timeout_seconds - (time.monotonic() - started))
+            return _run_git(sub_root, args, timeout=remaining, cancel=cancel)
+
+        top = probe(("rev-parse", "--show-toplevel"))
+        if Path(top.decode("utf-8", "strict").strip()).resolve(strict=True) != sub_root:
+            raise AgentLoopError("gitlink worktree does not have its own Git root")
+        head = probe(("rev-parse", "HEAD"))
+        status = probe(("status", "--porcelain=v1", "-z", "--untracked-files=normal"))
+        nested_entries = _git_index_entries(
+            probe(("ls-files", "-s", "-z"))
+        )
+        nested_dirty = _dirty_populated_gitlinks(
+            sub_root, nested_entries, timeout_seconds=timeout_seconds, cancel=cancel,
+            started=started, depth=depth + 1, budget=budget,
+        )
+        if head.decode("ascii", "strict").strip() != object_id or status.strip() or nested_dirty:
+            dirty.append(relative)
     return tuple(sorted(dirty))
 
 
@@ -1913,7 +1966,12 @@ def capture_tracked_tree_snapshot(
             timeout=timeout_seconds,
             cancel=cancel,
         )
-        dirty_gitlinks = _dirty_gitlink_paths(tracked_status, index_entries)
+        dirty_gitlinks = tuple(sorted(set(
+            _dirty_gitlink_paths(tracked_status, index_entries)
+        ) | set(_dirty_populated_gitlinks(
+            canonical_root, index_entries, timeout_seconds=timeout_seconds,
+            cancel=cancel, started=started,
+        ))))
         # A gitlink object ID does not describe the checked-out submodule
         # worktree, so dirty gitlinks cannot be compared with an eventual tree.
         tracked_digest = (
@@ -1927,7 +1985,7 @@ def capture_tracked_tree_snapshot(
             head=head,
             digest=digest,
             tracked_digest=tracked_digest,
-            status_clean=not bool(tracked_status.strip()),
+            status_clean=not bool(tracked_status.strip()) and not dirty_gitlinks,
             complete=True,
             stable=True,
             untracked_paths=tuple(sorted(untracked)),

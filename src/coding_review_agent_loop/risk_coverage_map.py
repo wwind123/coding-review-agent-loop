@@ -134,9 +134,14 @@ class CommittedTree:
         if not revision_spec or not isinstance(revision_spec, str) or revision_spec.startswith("-"):
             return cls(workdir, None)
         try:
+            from .secure_git import local_command
+
+            command, env, pass_fds = local_command(("rev-parse", "--verify", "--quiet", f"{revision_spec}^{{commit}}"), checkout=workdir)
             result = subprocess.run(
-                ["git", "rev-parse", "--verify", "--quiet", f"{revision_spec}^{{commit}}"],
+                command,
                 cwd=workdir,
+                env=env,
+                pass_fds=pass_fds,
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -156,9 +161,14 @@ class CommittedTree:
             return self._memo[path]
         exists = False
         try:
+            from .secure_git import local_command
+
+            command, env, pass_fds = local_command(("--literal-pathspecs", "ls-tree", "-z", self.revision, "--", path), checkout=self.workdir)
             result = subprocess.run(
-                ["git", "--literal-pathspecs", "ls-tree", "-z", self.revision, "--", path],
+                command,
                 cwd=self.workdir,
+                env=env,
+                pass_fds=pass_fds,
                 capture_output=True,
                 timeout=30,
                 check=False,

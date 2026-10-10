@@ -884,9 +884,14 @@ def _repository_slug(cwd: Path, repository: str | None = None) -> str:
     if repository and re.fullmatch(r"[^/\s]+/[^/\s]+", repository):
         return repository
     try:
+        from .secure_git import local_command
+
+        command, git_env, pass_fds = local_command(("config", "--local", "--no-includes", "--get", "remote.origin.url"), checkout=cwd)
         remote = subprocess.run(
-            ("git", "config", "--get", "remote.origin.url"),
+            command,
             cwd=cwd,
+            env=git_env,
+            pass_fds=pass_fds,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -3286,7 +3291,12 @@ def probe_inner_launcher(
 
 def _git_commit(cwd: Path) -> str | None:
     try:
-        result = subprocess.run(("git", "rev-parse", "HEAD"), cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=2)
+        from .secure_git import local_command
+
+        command, env, pass_fds = local_command(("rev-parse", "HEAD"), checkout=cwd)
+        result = subprocess.run(command, cwd=cwd, env=env, pass_fds=pass_fds,
+                                text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, check=False, timeout=2)
     except OSError:
         return None
     value = result.stdout.strip()

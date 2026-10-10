@@ -1606,8 +1606,13 @@ class FakeRunner(Runner):
                 self._checkout_branch[cwd_path] = branch
         if cmd[:3] == ["git", "checkout", "--detach"]:
             self._checkout_branch[cwd_path] = "HEAD"
-            if len(cmd) > 3 and cmd[3].startswith("refs/remotes/origin/pr/"):
-                self._move_head(self.pr_payload.get("headRefOid", self.git_head), cwd=cwd_path)
+            if len(cmd) > 3:
+                target = cmd[3]
+                self._move_head(
+                    self.pr_payload.get("headRefOid", self.git_head)
+                    if target.startswith("refs/remotes/origin/pr/") else target,
+                    cwd=cwd_path,
+                )
             return CommandResult(cmd, cwd_path, "", "", 0)
 
         if cmd[:2] == ["git", "ls-files"]:
@@ -1635,6 +1640,9 @@ class FakeRunner(Runner):
             return CommandResult(cmd, cwd_path, stdout, self.diff_stderr, self.diff_returncode)
 
         if cmd[:4] == ["git", "remote", "get-url", "origin"]:
+            return CommandResult(cmd, cwd_path, f"{self.git_remote}\n", "", 0)
+
+        if cmd[:4] == ["git", "config", "--local", "--no-includes"] and cmd[-1] == "remote.origin.url":
             return CommandResult(cmd, cwd_path, f"{self.git_remote}\n", "", 0)
 
         if cmd[:3] == ["git", "status", "--porcelain"]:

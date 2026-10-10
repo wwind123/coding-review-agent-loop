@@ -62,13 +62,14 @@ flowchart LR
 - `agent-loop inspect` (`inspect_tool.py`, standard library only) is the
   read-only git/gh boundary for Claude non-coders. Its argument allowlist,
   forced git config, closed environment allowlist with a `PATH` built from the
-  startup-pinned git and gh directories, and repository-config gate stop
+  startup-pinned git and gh directories, and repository-config compatibility gate stop
   inherited environment, `PATH` entries, coder-controlled git config
   (filters, diff drivers, gpg programs, includes, aliases, hooks, trace
   targets), and `.gitattributes` from making an inspection run a program or
   write a file. Submodule recursion is forced off (`--ignore-submodules=all`
   plus `-c` overrides), because a populated submodule's own local config lies
-  outside the gate. agent-loop's own workdir snapshot around a sandboxed
+  outside the gate. The Git child also enters the command-time execution
+  boundary below. agent-loop's own workdir snapshot around a sandboxed
   Claude turn uses the same pinned, gated, hardened git, so it cannot run
   coder-planted config either. Its interpreter (`-I`), package files, and the pinned git and
   gh are fingerprinted at startup and re-verified before each read-only Claude
@@ -1443,23 +1444,69 @@ stages even when they use the same CLI.
 Named seats with no explicit `--seat-dir` use the same per-run worktree lifecycle,
 with a separate shared store and finalizer keyed by each seat ID.
 
-**Per-run worktrees (`run_worktrees.py`).** Store mutations (clone, fetch+pin,
-local-base fast-forward, worktree add, prune, remove) run under a short,
+**Per-run worktrees (`run_worktrees.py`).** Store mutations (initialization,
+private fetch and pack import, local-base fast-forward, administrative link
+creation, prune, remove) run under a short,
 non-reentrant host `flock` (`<lock root>/workdir-stores/`) that is never held
 across an agent turn; a nested acquisition fails fast. A probe of the store
 path's own run claim (`workdir_claims.probe_free_claim`) interlocks with an
 explicit-dir or older-version run that checked out a branch in the store: while
 it is held the store's HEAD, branch, index and tree are untouched and the run
-only fetches. Every worktree has a durable owner record (`<store-key>/<token>.json`,
+only imports objects and updates tracking refs. Every worktree has a durable owner record (`<store-key>/<token>.json`,
 pending then ready, with the root and admin-dir identities) under the lock
 root. Base and PR syncs check out an immutable SHA pinned under the store lock,
 so a concurrent fetch cannot move another run's checkout; the PR path still
 compares the pin with the advertised head. The local `<base>` ref moves only by
-a guarded `git branch -f` fast-forward, skipped when `<base>` is checked out in
+a guarded compare-and-swap `git update-ref` fast-forward, skipped when `<base>` is checked out in
 any worktree. The outermost `workdir_claim_scope` runs registered finalizers
 (identity-verified worktree removal) before releasing claims, on success and
 failure. At startup a run prunes worktrees whose owner record matches and whose
 claim lock is free; unrecognized entries are logged and left untouched.
+
+**Agent-loop-owned Git boundary (`secure_git.py`, `git_transport.py`).** Every
+local text, binary, and cancellable Git call that can read an agent checkout
+uses the pinned executable, a closed child environment, and command-scoped
+neutralizers. Linux loads a sealed preload library whose constructor installs
+no-new-privileges and an inherited seccomp filter denying exec and network;
+macOS loads a private library whose constructor applies Seatbelt before Git
+main, denying process exec, fork, and network without a pinned-Git exception;
+Windows starts Git suspended, assigns a kill-on-close one-process Job Object,
+then resumes it. Each backend performs a real canary before the first checkout
+probe and fails closed if confinement cannot be verified. Existing process
+group containment is not an execution boundary. The isolated inspector keeps
+its standard-library-only main process and delegates Git through verified
+helper bytes executed by an isolated interpreter using the same local boundary.
+Guard C source and the Windows launcher are checked against hashes held by the
+already loaded controller before use. The compiler receives verified C bytes
+through stdin, and Windows passes verified launcher code directly to a trusted
+Python executable, leaving no helper file to replace between check and launch.
+Each local Git invocation also binds `--work-tree` and `core.worktree` to its
+assigned checkout, so repository config cannot redirect status or cleanup to
+another directory. Repository initialization has no existing worktree to bind.
+
+Fetches run only in a fresh private transport repository, with clean Git
+configuration and an exact operator-selected GitHub HTTPS or SSH URL. An
+explicit `--trusted-local-origin` is required for local paths. Private HTTPS
+may obtain a token from an operator-owned GitHub CLI installation resolved
+independently of inherited `PATH`, passed only as an in-memory scoped
+header to that private fetch. On POSIX hosts, both pinned executable paths,
+including their parent directories, must be root-owned so an unrestricted
+same-user agent cannot replace them before launch.
+The `--trusted-origin-protocol` setting selects HTTPS or SSH when creating a
+new default checkout; the pinned SSH client is validated before transport.
+Its command ignores user SSH configuration and executable proxy options while
+retaining default keys and `SSH_AUTH_SOCK`; a trusted host with a port uses an
+`ssh://` origin.
+The complete reachable pack for a pinned commit
+is streamed to confined `index-pack --stdin`; the destination verifies the
+commit, then compare-and-swaps the tracking ref while its checkout or store
+lock is held. Base ancestry and advertised PR head are checked before cleaning
+or checkout. Git 2.43 spawns `update-ref` even for `worktree add --no-checkout`;
+fresh linked worktrees therefore create only the administrative link under
+`store_lock`, run a separate confined `reset --hard` at the pinned SHA, and
+publish a ready owner record only after administrative identity, HEAD, and
+clean status verify. Any setup failure removes only the recorded root and
+administrative inode identities; incomplete cleanup is reported as an error.
 
 **Pre-turn checkout verification.** A claim protects against another
 agent-loop run, not against an operator, editor or stray script writing to the

@@ -276,6 +276,8 @@ class AgentLoopConfig:
     default_checkout_stores: tuple[tuple[AgentName, Path], ...] = ()
     run_token: str | None = None
     worktree_links: tuple[str, ...] = ()
+    trusted_local_origin: Path | None = None
+    trusted_origin_protocol: str = "https"
     # Optional plan-first override: use the main coder for planning/revision,
     # then switch only the approved implementation and PR follow-up coder/model.
     implementation_coder: AgentName | None = None
@@ -1337,9 +1339,15 @@ def _validate_repo_remote(
     config: AgentLoopConfig,
     runner: Runner,
 ) -> None:
-    remote = _run_git(runner, path, ("remote", "get-url", "origin")).stdout.strip()
-    if not _looks_like_repo_remote(remote, config.repo):
-        raise AgentLoopError(f"{label} at {path} uses origin {remote!r}, not {config.repo!r}.")
+    from .git_transport import trusted_url
+
+    remote = _run_git(runner, path, (
+        "config", "--local", "--no-includes", "--get", "remote.origin.url"
+    )).stdout.strip()
+    try:
+        trusted_url(config.repo, remote, local_origin=config.trusted_local_origin)
+    except AgentLoopError as exc:
+        raise AgentLoopError(f"{label} at {path}: {exc}") from exc
 
 
 def _clean_or_reject_checkout(
@@ -1432,16 +1440,29 @@ def _sync_base_branch(
         _run_git(runner, path, ("checkout", "--detach", sha))
         refresh_after_sync(config, runner, path)
         return
-    _run_git(runner, path, ("fetch", "origin"))
-    switch = _run_git(runner, path, ("switch", config.base), check=False)
-    if switch.returncode != 0:
-        if not default_owned:
+    from .git_transport import import_ref
+    from .run_worktrees import store_lock
+
+    with store_lock(path):
+        sha = import_ref(
+            path, f"refs/heads/{config.base}", f"refs/remotes/origin/{config.base}",
+            repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
+            local_origin=config.trusted_local_origin,
+        )
+        current = _run_git(runner, path, ("rev-parse", "--verify", f"refs/heads/{config.base}"), check=False)
+        if current.returncode == 0:
+            ancestor = _run_git(runner, path, ("merge-base", "--is-ancestor", current.stdout.strip(), sha), check=False)
+            if ancestor.returncode != 0:
+                raise AgentLoopError(f"Local {config.base} has diverged from the trusted origin.")
+            _run_git(runner, path, ("switch", config.base))
+        elif default_owned:
+            _run_git(runner, path, ("switch", "-C", config.base, sha))
+        else:
             raise AgentLoopError(
                 f"{label} could not switch to base branch {config.base!r}. "
                 "Create the branch locally or use a clean checkout on the base branch."
             )
-        _run_git(runner, path, ("switch", "-C", config.base, f"origin/{config.base}"))
-    _run_git(runner, path, ("pull", "--ff-only", "origin", config.base))
+        _run_git(runner, path, ("reset", "--hard", sha))
     refresh_after_sync(config, runner, path)
 
 
@@ -1517,9 +1538,16 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
             make_private_dirs(path.parent)
         except OSError as exc:
             raise AgentLoopError(f"Could not create parent directory for {agent} checkout at {path}: {exc}") from exc
-        runner.run((config.gh_cmd, "repo", "clone", config.repo, str(path)), cwd=path.parent)
         if runner.dry_run:
+            runner.run((config.gh_cmd, "repo", "clone", config.repo, str(path)), cwd=path.parent)
             return
+        from .git_transport import default_origin
+
+        origin = default_origin(config.repo, protocol=config.trusted_origin_protocol,
+                                local_origin=config.trusted_local_origin)
+        path.mkdir(mode=0o700)
+        _run_git(runner, path, ("init", "-q", "-b", config.base or "main"))
+        _run_git(runner, path, ("remote", "add", "origin", origin))
         from .agent_permissions import register_checkout
 
         # An intentional (re-)creation is re-registered so the sandboxed
@@ -1660,28 +1688,55 @@ def sync_checkout_to_pr(
 
     verify_before_sync(config, runner, path=path, label=label)
     _validate_repo_remote(path, label=label, config=config, runner=runner)
-    _clean_or_reject_checkout(
-        path,
-        label=label,
-        default_owned=default_owned,
-        config=config,
-        runner=runner,
-    )
-
     store = run_worktree_store(config, path)
+    advertised_head = (pr_metadata.head_sha or "").strip()
+
+    def require_advertised_head(pinned: str) -> None:
+        if advertised_head and pinned != advertised_head:
+            raise AgentLoopError(
+                f"{label} at {path}: fetched PR #{pr_number} head {pinned} "
+                f"differs from metadata that advertises head SHA {advertised_head}."
+            )
+
+    if not default_owned:
+        _clean_or_reject_checkout(
+            path, label=label, default_owned=False, config=config, runner=runner,
+        )
     if store is not None:
         from . import run_worktrees
 
         # Check out the SHA pinned under the store lock, never the shared mutable ref.
         pinned = run_worktrees.pin_pr_head(store, pr_number, config=config, runner=runner)
+        require_advertised_head(pinned)
+        if default_owned:
+            _clean_or_reject_checkout(
+                path, label=label, default_owned=True, config=config, runner=runner,
+            )
         _run_git(runner, path, ("checkout", "--detach", pinned))
     else:
-        _run_git(runner, path, ("fetch", "origin"))
-        _run_git(runner, path, ("fetch", "origin", pr_fetch_refspec))
-        _run_git(runner, path, ("checkout", "--detach", pr_ref))
+        from .git_transport import import_ref
+        from .run_worktrees import store_lock
+
+        with store_lock(path):
+            if config.base:
+                import_ref(
+                    path, f"refs/heads/{config.base}", f"refs/remotes/origin/{config.base}",
+                    repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
+                    local_origin=config.trusted_local_origin,
+                )
+            pinned = import_ref(
+                path, f"refs/pull/{pr_number}/head", pr_ref,
+                repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
+                local_origin=config.trusted_local_origin,
+            )
+            require_advertised_head(pinned)
+            if default_owned:
+                _clean_or_reject_checkout(
+                    path, label=label, default_owned=True, config=config, runner=runner,
+                )
+            _run_git(runner, path, ("checkout", "--detach", pinned))
     local_head = _run_git(runner, path, ("rev-parse", "HEAD")).stdout.strip()
     branch_state = _run_git(runner, path, ("status", "--short", "--branch")).stdout.strip()
-    advertised_head = (pr_metadata.head_sha or "").strip()
     if advertised_head and local_head != advertised_head:
         raise AgentLoopError(
             f"{label} at {path} is at {local_head or '(unknown)'}, "
@@ -1946,6 +2001,12 @@ def config_from_args(
 ) -> AgentLoopConfig:
     from .reviewer_seats import SeatAgent, resolve_reviewer_seats, seat_backend
 
+    local_origin = getattr(args, "trusted_local_origin", None)
+    if local_origin is not None and not local_origin.is_absolute():
+        raise AgentLoopError("--trusted-local-origin must be an absolute path.")
+    if local_origin is not None and getattr(args, "trusted_origin_protocol", "https") != "https":
+        raise AgentLoopError("--trusted-origin-protocol cannot be combined with --trusted-local-origin.")
+
     named_seats = resolve_reviewer_seats(args)
     legacy_reviewers = tuple(args.reviewer or (["codex"] if not named_seats else ()))
     configured_reviewers = legacy_reviewers
@@ -2085,6 +2146,8 @@ def config_from_args(
         codex_cmd=args.codex_cmd,
         gemini_cmd=args.gemini_cmd,
         gh_cmd=args.gh_cmd,
+        trusted_local_origin=getattr(args, "trusted_local_origin", None),
+        trusted_origin_protocol=getattr(args, "trusted_origin_protocol", "https"),
         claude_args=static_args("claude", args.claude_arg),
         codex_args=static_args("codex", args.codex_arg),
         gemini_args=static_args("gemini", args.gemini_arg),

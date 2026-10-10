@@ -4906,6 +4906,21 @@ def test_recovery_renderer_skips_the_plan_primary_stall_rounds_value(tmp_path):
     assert args.plan_primary_stall_rounds == 3
 
 
+@pytest.mark.parametrize("protocol", ["https", "ssh"])
+def test_recovery_renderer_keeps_trusted_origin_protocol_value(tmp_path, protocol):
+    parser = build_parser()
+    config = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "issue", "--trusted-origin-protocol", protocol, "643",
+        ),
+    )
+    rendered = render_managed_ci_resume_command(config, pr_number=7, managed_ci=True)
+    args = parser.parse_args(shlex.split(rendered)[1:])
+    assert args.issue_number == 643
+    assert args.trusted_origin_protocol == protocol
+
+
 def test_recovery_value_option_table_covers_all_recovery_subparsers():
     parser = build_parser()
     subparsers = next(action for action in parser._actions if action.dest == "command")
@@ -13131,9 +13146,8 @@ def test_run_pr_loop_resume_with_missing_default_checkout_clones_it(tmp_path, mo
     assert all(cwd.is_dir() and cwd != default_checkout for cwd in pull_reads)
     assert any(cwd == github_api_cwd() for cwd in pull_reads)
     assert any(
-        command[:4] == ["gh", "repo", "clone", "OWNER/REPO"]
-        and command[4] == str(default_checkout)
-        for command, _cwd in runner.commands
+        command[:2] == ["git", "init"] and cwd == default_checkout
+        for command, cwd in runner.commands
     )
     assert default_checkout.is_dir()
     # No GitHub write may precede checkout setup on an ordinary resume.
