@@ -199,8 +199,18 @@ def _subprocess_executor(
     if command and os.path.basename(command[0]) == "git":
         # The inspect interpreter still imports only this stdlib-only module.
         # A pinned isolated helper applies the shared local Git boundary.
-        helper = os.path.join(os.path.dirname(__file__), "inspect_git_subprocess.py")
-        command = [sys.executable, "-I", "-S", helper, *command]
+        import hashlib
+        from pathlib import Path
+
+        helper = Path(__file__).with_name("inspect_git_subprocess.py")
+        try:
+            source = helper.read_bytes()
+        except OSError as exc:
+            raise InspectRejected("Pinned Git inspection helper is unavailable.") from exc
+        if hashlib.sha256(source).hexdigest() != "c26a6dfc36da89e05cd22e9c633a236c6bd50efea71c8c31eae4a6a48e8efa96":
+            raise InspectRejected("Pinned Git inspection helper identity changed.")
+        command = [sys.executable, "-I", "-S", "-c", source.decode("utf-8"),
+                   str(helper.parent.parent), *command]
     completed = subprocess.run(
         command,
         env=dict(env),

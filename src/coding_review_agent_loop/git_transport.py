@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -43,7 +44,8 @@ def default_origin(repo: str, *, protocol: str = "https",
         if protocol == "https":
             origin = f"https://{host}/{owner}/{name}.git"
         elif protocol == "ssh":
-            origin = f"git@{host}:{owner}/{name}.git"
+            origin = (f"ssh://git@{host}/{owner}/{name}.git" if ":" in host else
+                      f"git@{host}:{owner}/{name}.git")
         else:
             raise AgentLoopError(f"Unsupported trusted origin protocol: {protocol}.")
     return trusted_url(repo, origin, local_origin=local_origin)
@@ -98,9 +100,17 @@ def _transport_env(url: str, gh_cmd: str | None) -> dict[str, str]:
         if not os.path.isfile(ssh):
             raise AgentLoopError("Trusted SSH transport requires an operator-owned SSH client.")
         try:
-            env["GIT_SSH_COMMAND"] = _trusted_executable(ssh)
+            trusted_ssh = _trusted_executable(ssh)
         except (OSError, AgentLoopError) as exc:
             raise AgentLoopError("Trusted SSH transport requires an agent-inaccessible SSH client.") from exc
+        # Git interprets this value through a shell. An explicit empty config
+        # preserves agent/default-key authentication without user ProxyCommand,
+        # LocalCommand, Match exec, or Include directives.
+        quoted_ssh = f'"{trusted_ssh}"' if sys.platform == "win32" else shlex.quote(trusted_ssh)
+        env["GIT_SSH_COMMAND"] = (
+            f"{quoted_ssh} -F {os.devnull} -o ProxyCommand=none "
+            "-o PermitLocalCommand=no -o ClearAllForwardings=yes"
+        )
     if url.startswith("https://") and gh_cmd:
         # Public repositories need no token.  A private-repository retry below
         # obtains one from the trusted GitHub CLI context only when necessary.

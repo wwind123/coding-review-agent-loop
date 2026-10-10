@@ -174,7 +174,8 @@ def test_real_https_transport_policy(https_git, monkeypatch, tmp_path, mode):
 @pytest.mark.skipif(os.name != "posix" or not Path("/usr/sbin/sshd").exists(),
                     reason="local OpenSSH server is unavailable")
 def test_real_pinned_ssh_fetch(tmp_path, monkeypatch):
-    bare = tmp_path / "repo.git"
+    bare = tmp_path / "OWNER" / "REPO.git"
+    bare.parent.mkdir()
     seed = tmp_path / "seed"
     checkout = tmp_path / "checkout"
     subprocess.run(("git", "init", "-q", "--bare", "-b", "main", str(bare)), check=True)
@@ -188,8 +189,11 @@ def test_real_pinned_ssh_fetch(tmp_path, monkeypatch):
     host_key = tmp_path / "host_key"
     for path in (key, host_key):
         subprocess.run(("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(path)), check=True)
+    forced_command = tmp_path / "serve_git.sh"
+    forced_command.write_text(f"#!/bin/sh\nexec /usr/bin/git-upload-pack {bare}\n")
+    forced_command.chmod(0o700)
     authorized = tmp_path / "authorized_keys"
-    authorized.write_bytes(key.with_suffix(".pub").read_bytes())
+    authorized.write_text(f'command="{forced_command}" ' + key.with_suffix(".pub").read_text())
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -198,11 +202,6 @@ def test_real_pinned_ssh_fetch(tmp_path, monkeypatch):
                              f"AuthorizedKeysFile {authorized}\nStrictModes no\nUsePAM no\n"
                              "PasswordAuthentication no\nPubkeyAuthentication yes\n"
                              "PermitRootLogin no\nLogLevel QUIET\n")
-    client_config = tmp_path / "ssh_config"
-    client_config.write_text(f"Host localhost\n  IdentityFile {key}\n  IdentitiesOnly yes\n"
-                             "  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n"
-                             "  LogLevel ERROR\n")
-    client_config.chmod(0o600)
     server = subprocess.Popen(("/usr/sbin/sshd", "-D", "-e", "-f", str(server_config)),
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
@@ -217,21 +216,51 @@ def test_real_pinned_ssh_fetch(tmp_path, monkeypatch):
                 time.sleep(0.02)
         else:
             pytest.skip("local sshd did not accept connections")
-        url = f"ssh://{getpass.getuser()}@localhost:{port}{bare}"
-        _git(checkout, "config", "remote.origin.url", url)
+        repo = f"localhost:{port}/OWNER/REPO"
+        from coding_review_agent_loop.git_transport import default_origin
+        from coding_review_agent_loop.config import ensure_temp_checkout
+        from agent_loop_helpers import make_config
+
+        url = default_origin(repo, protocol="ssh")
+        config = make_config(tmp_path, create_dirs=False, repo=repo, claude_dir=checkout,
+                             trusted_origin_protocol="ssh")
+        # A hostile user config must not be consulted by the pinned client.
+        home = tmp_path / "home"
+        (home / ".ssh").mkdir(parents=True)
+        marker = tmp_path / "proxy-ran"
+        (home / ".ssh" / "config").write_text(f"Host *\n  ProxyCommand touch {marker}\n")
+        monkeypatch.setenv("HOME", str(home))
         original_env = git_transport._transport_env
 
         def fixture_env(endpoint, gh_cmd):
             env = original_env(endpoint, gh_cmd)
-            assert env["GIT_SSH_COMMAND"] == "/usr/bin/ssh"
-            env["GIT_SSH_COMMAND"] += f" -F {client_config}"
+            assert env["GIT_SSH_COMMAND"].startswith("/usr/bin/ssh -F /dev/null ")
+            env["GIT_SSH_COMMAND"] += (
+                f" -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=no"
+                f" -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -l {getpass.getuser()}"
+            )
             return env
 
         monkeypatch.setattr(git_transport, "_transport_env", fixture_env)
-        monkeypatch.setattr(git_transport, "trusted_url", lambda _repo, observed, **_kw: observed if observed == url else (_ for _ in ()).throw(AgentLoopError("endpoint mismatch")))
-        sha = git_transport.import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main",
-                                       repo="OWNER/REPO", runner=Runner())
-        assert sha == _git(checkout, "rev-parse", "HEAD")
+        checkout.rename(tmp_path / "fixture-clone")
+        checkout_marker = tmp_path / "checkout-helper-ran"
+
+        class PlantCheckoutConfig(Runner):
+            def run(self, args, *, cwd, **kwargs):
+                result = super().run(args, cwd=cwd, **kwargs)
+                if tuple(args[:4]) == ("git", "remote", "add", "origin"):
+                    _git(checkout, "config", "core.sshCommand", f"touch {checkout_marker}")
+                    _git(checkout, "config", "url.ssh://evil.example/.insteadOf", url)
+                return result
+
+        ensure_temp_checkout(checkout, agent="claude", config=config,
+                             runner=PlantCheckoutConfig())
+        sha = _git(checkout, "rev-parse", "HEAD")
+        assert _git(checkout, "config", "--local", "--get", "remote.origin.url") == url
+        assert sha == _git(bare, "rev-parse", "refs/heads/main")
+        assert _git(checkout, "cat-file", "-t", sha) == "commit"
+        assert (checkout / "file.txt").read_text() == "ssh fixture\n"
+        assert not marker.exists() and not checkout_marker.exists()
     finally:
         server.terminate()
         server.communicate(timeout=5)

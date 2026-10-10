@@ -1460,8 +1460,8 @@ Windows starts Git suspended, assigns a kill-on-close one-process Job Object,
 then resumes it. Each backend performs a real canary before the first checkout
 probe and fails closed if confinement cannot be verified. Existing process
 group containment is not an execution boundary. The isolated inspector keeps
-its standard-library-only main process and delegates Git to a pinned helper
-using the same local boundary.
+its standard-library-only main process and delegates Git through verified
+helper bytes executed by an isolated interpreter using the same local boundary.
 Guard C source and the Windows launcher are checked against hashes held by the
 already loaded controller before use. The compiler receives verified C bytes
 through stdin, and Windows passes verified launcher code directly to a trusted
@@ -1480,6 +1480,9 @@ including their parent directories, must be root-owned so an unrestricted
 same-user agent cannot replace them before launch.
 The `--trusted-origin-protocol` setting selects HTTPS or SSH when creating a
 new default checkout; the pinned SSH client is validated before transport.
+Its command ignores user SSH configuration and executable proxy options while
+retaining default keys and `SSH_AUTH_SOCK`; a trusted host with a port uses an
+`ssh://` origin.
 The complete reachable pack for a pinned commit
 is streamed to confined `index-pack --stdin`; the destination verifies the
 commit, then compare-and-swaps the tracking ref while its checkout or store

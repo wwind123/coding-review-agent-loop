@@ -656,7 +656,10 @@ pass `--trusted-local-origin /absolute/path/to/origin`; the checkout origin
 must match that resolved path exactly.
 New checkouts use HTTPS by default. Pass `--trusted-origin-protocol ssh` when
 the operator has configured SSH authentication; agent-loop creates the exact
-`git@host:owner/repo.git` origin before its private fetch. This option cannot
+`git@host:owner/repo.git` origin before its private fetch (or an `ssh://` URL
+when the trusted host includes a port). The pinned SSH client ignores the
+user's SSH config; default identity files and `SSH_AUTH_SOCK` remain available.
+This option cannot
 be combined with `--trusted-local-origin`.
 
 Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming it) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep it ignored with `/.venv` (a dir-only `.venv/` rule does not match a symlink). `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it.

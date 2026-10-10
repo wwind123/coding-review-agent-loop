@@ -171,6 +171,18 @@ def test_fresh_checkout_origin_uses_operator_protocol(protocol, expected):
     assert default_origin("OWNER/REPO", protocol=protocol) == expected
 
 
+def test_windows_ssh_command_quotes_pinned_path(monkeypatch):
+    from coding_review_agent_loop import git_transport
+
+    monkeypatch.setattr(git_transport.sys, "platform", "win32")
+    monkeypatch.setattr(git_transport.os.path, "isfile", lambda _path: True)
+    monkeypatch.setattr(git_transport, "_git_path", lambda: r"C:\Program Files\Git\bin\git.exe")
+    monkeypatch.setattr(git_transport, "_trusted_executable", lambda path: path)
+    command = git_transport._transport_env("git@github.com:OWNER/REPO.git", None)["GIT_SSH_COMMAND"]
+    assert command.startswith('"C:\\Program Files\\Git\\usr\\bin\\ssh.exe" -F ')
+    assert "ProxyCommand=none" in command
+
+
 def test_fresh_default_checkout_initializes_pinned_ssh_origin(tmp_path, monkeypatch):
     from agent_loop_helpers import make_config
     from coding_review_agent_loop import config as config_module

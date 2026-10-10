@@ -29,6 +29,18 @@ GIT = shutil.which("git")
 pytestmark = pytest.mark.skipif(GIT is None, reason="git is required")
 
 
+def test_replaced_inspection_helper_is_rejected_before_python_launch(tmp_path, monkeypatch):
+    package = tmp_path / "coding_review_agent_loop"
+    package.mkdir()
+    (package / "inspect_tool.py").write_text("# installed controller\n")
+    marker = tmp_path / "launched"
+    (package / "inspect_git_subprocess.py").write_text(f"open({str(marker)!r}, 'w').close()\n")
+    monkeypatch.setattr(inspect_tool, "__file__", str(package / "inspect_tool.py"))
+    with pytest.raises(InspectRejected, match="helper identity changed"):
+        inspect_tool._subprocess_executor((GIT, "status"), {}, str(tmp_path), True)
+    assert not marker.exists()
+
+
 def _executable(path: Path, body: str) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body, encoding="utf-8")
@@ -548,8 +560,13 @@ def test_real_process_checkout_local_git_and_gh_never_run(repo, tmp_path):
 
 def test_module_entry_point_loads_only_inspect_tool(repo, tmp_path):
     """`python -I -m coding_review_agent_loop.cli inspect` must not import the rest."""
+    source_root = str(Path(__file__).resolve().parents[1] / "src")
+    # An isolated interpreter ignores pytest's PYTHONPATH; bootstrap the
+    # checkout source path while retaining -I for the inspected entry point.
+    bootstrap = (f"import sys, runpy; sys.path.insert(0, {source_root!r}); "
+                 "runpy.run_module('coding_review_agent_loop.cli', run_name='__main__')")
     completed = subprocess.run(
-        [sys.executable, "-I", "-X", "importtime", "-m", "coding_review_agent_loop.cli",
+        [sys.executable, "-I", "-X", "importtime", "-c", bootstrap,
          "inspect", f"--git={GIT}", "git", "rev-parse", "HEAD"],
         cwd=repo, capture_output=True, text=True, timeout=60,
         env={"HOME": str(tmp_path), "PATH": os.environ.get("PATH", "")},

@@ -6003,7 +6003,9 @@ its role (implemented in `agent_permissions.py`):
   loaded by the controller; changed helper bytes are refused before use.
   A fresh default checkout uses HTTPS unless the operator selects
   `--trusted-origin-protocol ssh`; that setting chooses the pinned SSH origin
-  before any fetch and requires the operator's SSH identity.
+  before any fetch and requires the operator's SSH identity. The pinned SSH
+  client ignores the user's SSH config, including proxy commands; it can use
+  default identity files and `SSH_AUTH_SOCK`.
 - A Codex non-coder gets `--sandbox read-only` and `approval_policy="never"`,
   and `--output-last-message` points at the pre-created public response file,
   so failed-exit salvage reads it as usual. It has no network.
