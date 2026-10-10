@@ -330,8 +330,8 @@ def _amendment_record_problem(payload: dict[str, object]) -> str | None:
         return f"reason must be one of {sorted(REVIEWER_BOARD_AMENDMENT_REASONS)}"
     if reason == REVIEWER_SEAT_REMOVAL_REASON and flow != "pr":
         return "seat-unavailable is supported only for pr amendments"
-    if reason == REVIEWER_SEAT_REMOVAL_REASON and len(removed) != 1:
-        return "seat-unavailable must remove exactly one reviewer seat"
+    if reason == REVIEWER_SEAT_REMOVAL_REASON and not removed:
+        return "seat-unavailable must remove at least one reviewer seat"
     if not restored and reason not in {REVIEWER_BOARD_REMOVAL_REASON, REVIEWER_SEAT_REMOVAL_REASON}:
         return "a removal-only record must give a removal reason"
     if not removed and reason != REVIEWER_BOARD_RESTORATION_REASON:

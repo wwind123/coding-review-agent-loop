@@ -323,6 +323,95 @@ def test_named_pr_seat_local_amendment_reason_is_signed_and_recoverable():
     validate_pr_backend_outage_amendments((suggested,), config)
 
 
+def test_named_pr_two_local_failures_advisory_parses_and_resumes():
+    from coding_review_agent_loop.review_rounds import _unavailable_reviewer_amendment_advisory
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,
+    )
+
+    board = ("primary", "flash", "opus", "other")
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=tuple(
+            SeatAgent(ReviewerSeat(name, backend, (model,)), Path("/tmp") / name)
+            for name, backend, model in (
+                ("primary", "codex", "gpt-6-sol"),
+                ("flash", "antigravity", "gemini-flash"),
+                ("opus", "antigravity", "claude-opus"),
+                ("other", "antigravity", "gemini-pro"),
+            )
+        ),
+    )
+    original = make_contract(board, "primary-then-panel", None, "primary")
+    lineage = SimpleNamespace(contracts=(original,), removed_reviewers=())
+    outcome, round_number, template = _unavailable_reviewer_amendment_advisory(
+        pr_number=77, contract=original, lineage=lineage,
+        removed=("flash", "opus"), fetch_start_round=lambda: 2,
+        seat_local_failure=True,
+    )
+    assert (outcome, round_number) == ("validated", 2)
+    assert template is not None
+    (suggested,) = collect_reviewer_board_amendments(
+        [_comment(template)], flow="pr", pr_number=77,
+    )
+    assert suggested.reason == "seat-unavailable"
+    assert suggested.removed_reviewers == ("flash", "opus")
+    validate_pr_backend_outage_amendments((suggested,), config)
+    reduced = amend_contract(original, suggested, base_board=board)
+    assert reduced.required_reviewers == ("primary", "other")
+
+
+def test_named_pr_two_local_failures_template_recovers_on_original_board(tmp_path):
+    from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+    unavailable = json.dumps({
+        "schema_version": 1, "kind": "agent_unavailable", "retryable": False,
+        "category": "environment", "summary": "This model is unavailable.",
+        "suggested_action": "Restore this model.",
+    }) + "\n<!-- AGENT_UNAVAILABLE -->\n-- Google Antigravity"
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review() for _ in range(3)],
+        gemini_outputs=[structured_pr_review(reviewer="Google Gemini") for _ in range(3)],
+        antigravity_outputs=[
+            (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+            (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+            (unavailable, 0), (unavailable, 0),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", flash, opus),
+        reviewer_seats=(flash, opus), pr_review_policy="selective-intermediate",
+        pre_review_tests=False, agent_max_retries=0,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    runner.pr_payload["headRefOid"] = "def456"
+    with pytest.raises(AgentLoopError, match="missing required input") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(excinfo.value)
+    assert "flash" in message and "opus" in message
+    template = message[message.index("Reviewer board amendment:"):].replace(
+        "<why the removed reviewer cannot be reached>",
+        "Both named seats exhausted their own model chains.",
+    )
+    (record,) = collect_reviewer_board_amendments(
+        [_comment(template)], flow="pr", pr_number=77,
+    )
+    assert record.removed_reviewers == ("flash", "opus")
+    comment_index = len(runner.pr_payload["comments"])
+    runner.pr_payload["comments"].append({
+        "body": template, "author": {"login": "operator", "id": 81},
+        "createdAt": f"2026-05-23T00:00:{comment_index:02d}Z", "id": 991,
+    })
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(runner.antigravity_outputs) == 0
+
+
 def test_named_pr_signed_outage_removal_and_explicit_restoration():
     from coding_review_agent_loop.reviewer_seats import (
         ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,

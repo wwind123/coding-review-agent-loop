@@ -408,6 +408,9 @@ def _unavailable_reviewer_amendment_advisory(
             )
         except AgentLoopError:
             return "rejected", round_number, None
+        # A seat-local failure can affect several independent seats in one
+        # round. The signed record must accept the same complete removal set
+        # that the advisory validated above.
         template = _board_amendment_template(
             flow="pr",
             issue_number=None,

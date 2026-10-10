@@ -496,9 +496,9 @@ Reviewer board amendment:
 reviewer through the optional `restored_reviewers` key (a non-empty list of
 unique names). A restoration-only record has an empty `removed_reviewers` list
 and `reason` `backend-recovered`; a removal-only record keeps `reason`
-`backend-unavailable` for a shared outage. A PR removal of one named seat
-whose model chain alone is unavailable uses `seat-unavailable`; other seats on
-the same backend remain required. A shared outage must remove all active seats
+`backend-unavailable` for a shared outage. A PR removal of one or more named
+seats whose model chains independently fail uses `seat-unavailable`; other seats
+on their backends remain required. A shared outage must remove all active seats
 on that backend in one record. A record that does both may use either backend
 reason. A name may not be
 both removed and restored. Records without `restored_reviewers` keep the exact

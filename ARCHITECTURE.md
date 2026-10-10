@@ -546,7 +546,7 @@ require a full review. The scheduler contract is immutable across a resume,
 with one audited exception (#943). A signed human `reviewer-board-amendment`
 record may remove unavailable non-primary reviewers. It is read from the same
 comment surface as the round records it amends: the issue for planning, the PR
-for PR review. Named PR seat-local removal uses the signed `seat-unavailable` reason;
+for PR review. Named PR seat-local removal of one or more independently failed seats uses the signed `seat-unavailable` reason;
 shared `backend-unavailable` removal must cover every active seat on that
 backend. Evidence freeze, release, and qualification summaries persist the
 same seat binding as review records so startup can authenticate their board.
