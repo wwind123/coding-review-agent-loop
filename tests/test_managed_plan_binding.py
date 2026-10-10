@@ -454,3 +454,153 @@ def test_strict_qualification_checks_the_plan_against_the_supplied_board_not_the
     assert seen == [("codex", "claude", "gemini")]
     # The returned config keeps the amended PR board for scheduling.
     assert tuple(returned.reviewer) == ("codex", "claude")
+
+
+# --- Rejected-coder recovery chains (#1367) -----------------------------------
+
+from coding_review_agent_loop.managed_ci import UNPROTECTED_OVERRIDE_TRAILER  # noqa: E402
+from coding_review_agent_loop.round_state import RecoveryRoundBudget  # noqa: E402
+
+
+class RecoveryRunner:
+    """Serve PR comments, the PR body and the actor-owned label history."""
+
+    def __init__(self, comments, *, events_available=True, opening_nonce="root"):
+        self.comments = comments
+        self.events_available = events_available
+        self.opening_nonce = opening_nonce
+        self.commands = []
+
+    def run(self, args, *, cwd=None, check=True, **_kwargs):
+        self.commands.append(list(args))
+        if "repos/OWNER/REPO/issues/7/comments?per_page=100" in args:
+            payload = json.dumps(self.comments)
+        elif "repos/OWNER/REPO/issues/7/events?per_page=100" in args:
+            if not self.events_available:
+                return CommandResult(list(args), Path(cwd or "."), "", "unavailable", 1)
+            payload = json.dumps([{
+                "id": 101, "event": "labeled", "label": {"name": "agent-loop-managed"},
+                "actor": {"login": "agent-loop", "id": 1},
+            }])
+        elif "repos/OWNER/REPO/pulls/7" in args:
+            payload = json.dumps({
+                "body": f"Fixes #959\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={self.opening_nonce}",
+            })
+        else:
+            raise AssertionError(f"unexpected command: {args}")
+        return CommandResult(list(args), Path(cwd or "."), payload, "", 0)
+
+
+def _recovery_meta(comment_id, **fields):
+    values = dict(flow="pr", agent="agent-loop", state="blocking")
+    values.update(fields)
+    return {
+        "id": comment_id,
+        "user": {"login": "agent-loop", "id": 1},
+        "body": _attach_round_metadata("record", PostedRoundMetadata(**values)),
+    }
+
+
+def _recovery_chain(root=None, fresh=None):
+    budget = RecoveryRoundBudget(5, False, False)
+    return [
+        _auth_comment(41, root or _root()),
+        _recovery_meta(50, role="reviewer", subject="head-0", round_number=1),
+        _recovery_meta(
+            52, role="summary", subject="head-1", round_number=1,
+            phase="coder-followup-rejected", dispatch_round=1, dispatch_head="head-0",
+            dispatch_attempt=1, recovery_dispatch=False,
+            rejected_coder_followup_reason="evidence rejected",
+            rejected_coder_followup_from_head="head-0", recovery_round_budget=budget,
+        ),
+        _auth_comment(60, fresh or _root(
+            kind="fresh", head_sha="head-1", nonce="fresh", predecessor_head="head-0",
+            predecessor_comment_id=41,
+        )),
+        _recovery_meta(
+            61, role="summary", subject="head-1", round_number=2, phase="coder-dispatch",
+            dispatch_round=1, dispatch_head="head-1", dispatch_attempt=2,
+            recovery_dispatch=True, recovery_round_budget=budget,
+        ),
+        _recovery_meta(62, role="coder", subject="head-2", round_number=2, state=None),
+        _auth_comment(70, _root(
+            kind="continuity", head_sha="head-2", nonce="continuity",
+            predecessor_head="head-1", predecessor_comment_id=60,
+            round_comment_ids=(50, 52, 61, 62),
+        )),
+    ]
+
+
+def _verify_recovery(tmp_path, comments, *, runner=None, **config_overrides):
+    config_overrides.setdefault("allow_unprotected_managed_ci", True)
+    verify_managed_pr_plan_binding(
+        runner or RecoveryRunner(comments), config=_config(tmp_path, **config_overrides),
+        pr_number=7, issue_number=959, live_head="head-2", approved_plan_hash=PLAN,
+    )
+
+
+def test_m1367_recovery_chain_binds_the_plan_through_the_original_authorization(tmp_path):
+    """Rows recovery-chain-accepted / recovery-resume-reauth (plan-binding walker)."""
+    _verify_recovery(tmp_path, _recovery_chain())
+
+
+@pytest.mark.parametrize("case", [
+    "fresh-label-outside-history", "root-label-outside-history", "root-inconsistent-waiver",
+    "root-protection-differs-from-fresh", "fresh-wrong-plan", "root-wrong-plan",
+    "root-replaced-nonce", "protection-not-waivable", "label-history-unavailable",
+    "body-unreadable-nonce", "root-missing", "bound-record-missing",
+])
+def test_m1367_recovery_chain_provenance_fails_closed(tmp_path, case):
+    """Row recovery-ancestor-inadmissible (plan-binding walker)."""
+    root, fresh = _root(), None
+    fresh_record = _root(
+        kind="fresh", head_sha="head-1", nonce="fresh", predecessor_head="head-0",
+        predecessor_comment_id=41,
+    )
+    runner_kwargs = {}
+    config_overrides = {}
+    if case == "fresh-label-outside-history":
+        fresh = replace(fresh_record, label_event_id=999)
+    elif case == "root-label-outside-history":
+        root = _root(label_event_id=999)
+    elif case == "root-inconsistent-waiver":
+        root = _root(waiver="allow-unreadable-protection")
+    elif case == "root-protection-differs-from-fresh":
+        root = _root(protection="plan_limited")
+    elif case == "fresh-wrong-plan":
+        fresh = replace(fresh_record, approved_plan_hash="other")
+    elif case == "root-wrong-plan":
+        root = _root(approved_plan_hash="other")
+    elif case == "root-replaced-nonce":
+        root = _root(nonce="replaced")
+    elif case == "protection-not-waivable":
+        config_overrides["allow_unprotected_managed_ci"] = False
+    elif case == "label-history-unavailable":
+        runner_kwargs["events_available"] = False
+    elif case == "body-unreadable-nonce":
+        runner_kwargs["opening_nonce"] = "other"
+    comments = _recovery_chain(root=root, fresh=fresh)
+    if case == "root-missing":
+        comments = [comment for comment in comments if comment["id"] != 41]
+    elif case == "bound-record-missing":
+        comments = [comment for comment in comments if comment["id"] != 52]
+    # The record parser already refuses a waiver inconsistent with its protection.
+    reason = (
+        "an authorization record is malformed" if case == "root-inconsistent-waiver"
+        else "no authenticated chain reaches the live head"
+    )
+    with pytest.raises(AgentLoopError, match=reason):
+        _verify_recovery(
+            tmp_path, comments, runner=RecoveryRunner(comments, **runner_kwargs),
+            **config_overrides,
+        )
+
+
+def test_m1367_non_recovery_chain_keeps_todays_plan_binding_result(tmp_path):
+    """Row ordinary-shapes-unchanged: no label history is loaded or required."""
+    # The same label defect on an ordinary chain binds exactly as before, and
+    # CommentsRunner fails the test on any extra (label-history) request.
+    _verify(tmp_path, [
+        _auth_comment(41, _root(label_event_id=999)),
+        *_chain()[1:],
+    ])

@@ -5344,6 +5344,36 @@ re-review, qualification, and merge in one invocation instead of stopping for a
 PR-mode resume (#1024). An older binary resuming such a chain cannot
 reauthenticate the link and stops rather than granting anything.
 
+A rejected-coder recovery across a fresh grant is the third exception, and it
+keeps a real reviewer (#1367). When a coder follow-up for round R pushes a
+stranded head and its response is rejected, a PR-mode resume needs
+`--managed-ci-fresh`, which mints a fresh grant at the stranded head after the
+blocking review. The fresh grant records an immutable link to the original
+authorization at the reviewed head. The predecessor cutoff is not relaxed:
+continuity binds the round-R blocking review of the original head only when it
+is newer than that original authorization. The chain must be, in strict
+comment order: the seat-bound blocking reviews of the original head; exactly one
+rejected-follow-up record (attempt 1, from the original head, observed at the
+stranded head); the fresh grant; exactly one attempt-2 recovery coder-dispatch
+record on the stranded head for round R+1; and exactly one round R+1 coder
+record for the new head. Both recovery records must pass their structural
+checks, including a valid round budget and rejection reason. The heads must be
+exact: the review and the rejected record's origin are the original
+authorization's head, the fresh grant and both recovery records name the
+stranded head, and the new head differs from both. Under a named reviewer board
+every bound review must carry that board's seat binding; otherwise all bound
+reviews must carry one identical binding. Every authorization on the chain,
+including the original authorization's whole ancestry, must pass the same
+per-record and per-link authentication on the current approved plan only:
+actor, repository/issue/PR/base scope, waiver, protection waivable under this
+invocation, and an actor-owned managed-label event. A recovery across a signed
+plan rebind is therefore refused and needs an operator re-review. Publication,
+resume and plan binding re-authenticate the identical chain, and any missing,
+foreign, malformed, reordered, duplicated, unbound or mismatched link still
+fails closed: the PR stays draft and unmerged and no approval is synthesized. A
+fresh grant that superseded earlier records has no predecessor link and stays
+fail-closed. An older binary cannot re-authenticate such a chain and stops.
+
 A correlated, successful exact-head qualification also retires a carried
 ordinary `github-pr-checks` obligation at the qualified head (#1117). The
 managed workflow requalifies the head and may skip the ordinary job, so the

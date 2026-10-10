@@ -1243,9 +1243,23 @@ orchestrator mints the obligation and advances its lifecycle and heads; an agent
 response cannot introduce it or set those fields. Resume reauthenticates the
 same shape, bound to both heads of the transition.
 
+A rejected-coder recovery across a fresh grant (#1367) is a third shape, with a
+real reviewer. A coder follow-up pushes a stranded head and is rejected, an
+operator fresh grant is then minted at that head, and the recovery dispatch
+pushes a new head. The fresh grant's immutable predecessor link names the
+original authorization, so continuity binds the blocking review of the original
+head (newer than that original authorization, never merely older than the fresh
+grant), the rejected-follow-up record, the attempt-2 recovery dispatch record
+and the one coder record, in that strict order. Correlation, publication, resume
+and plan binding share one chain authentication (`_authenticate_authorization_chain`):
+a recovery-shaped chain is walked through the fresh grant to the original
+authorization's root, and every record on it must pass the same actor, scope,
+waiver, config-aware protection and label-event checks on the current approved
+plan only.
+
 A head advance carrying none of an ordered blocking-review/coder pair, the
-merge-conflict obligation, or a CI obligation bound to exactly that transition
-still fails closed, and every reviewer must still approve the exact final head
+merge-conflict obligation, a CI obligation bound to exactly that transition, or
+the exact rejected-coder recovery chain still fails closed, and every reviewer must still approve the exact final head
 before qualification or merge.
 
 ## State and Recovery

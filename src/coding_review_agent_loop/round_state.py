@@ -2508,6 +2508,16 @@ def _recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
     return tuple(problems)
 
 
+def recovery_record_problems(metadata: PostedRoundMetadata) -> tuple[str, ...]:
+    """Public view of the per-phase recovery-record validation (#1367)."""
+    return _recovery_record_problems(metadata)
+
+
+def decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
+    """Decode one hydrated round-metadata payload with the canonical decoder."""
+    return _decode_round_metadata_mapping(payload)
+
+
 def _decode_recovery_fields(payload: Mapping[str, object]) -> dict[str, object]:
     """Decode the optional #1292 recovery fields; a malformed one is absent."""
     fields: dict[str, object] = {}

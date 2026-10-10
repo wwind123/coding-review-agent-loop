@@ -125,6 +125,7 @@ from .managed_ci import (
     find_actor_round_metadata_comment_ids,
     publish_issue_created_continuity_authorization,
     publish_manual_v2_qualification,
+    rejected_recovery_correlation_inputs,
     prepare_v2_merge,
     publish_round_readiness,
     release_adopted_managed_ci,
@@ -7892,6 +7893,12 @@ def run_pr_loop(
                         round_number=round_number,
                         after_comment_id=(
                             managed_ci_handoff.authorization_comment_id or 0
+                        ),
+                        # A fresh grant may sit on the stranded head of a
+                        # rejected coder follow-up; let correlation verify
+                        # that exact recovery chain (#1367).
+                        **rejected_recovery_correlation_inputs(
+                            runner, config=config, handoff=managed_ci_handoff
                         ),
                     )
                     managed_ci_handoff = publish_issue_created_continuity_authorization(
