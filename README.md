@@ -603,6 +603,9 @@ and `--seat-dir ID=PATH`. `--primary-reviewer-seat` and
 primary policy. Named review execution is currently gated until seat identity
 is carried through durable review state. Existing `--reviewer agy` with
 `--antigravity-models` remains one reviewer with an ordered fallback chain.
+When a legacy Codex, Claude, or Gemini reviewer shares a backend with a named
+seat, select its model explicitly so preflight can check for overlap. Backend
+model and effort flags apply only to an active coder or legacy reviewer.
 
 ```bash
 agent-loop pr 456 \

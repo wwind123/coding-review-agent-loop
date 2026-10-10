@@ -577,10 +577,14 @@ checkout. Seat IDs use lowercase ASCII letters, digits, and hyphens and cannot
 impersonate backend or orchestrator identities. Model overlap on one backend
 and checkout collisions are rejected before dispatch. Named Antigravity and
 Gemini seats are refused under sandboxed permissions because those providers
-have no read-only grant. Named review execution remains gated until durable PR
-and plan review state supports seat IDs. Legacy `--reviewer agy` and
-`--antigravity-models` still describe one fallback reviewer, sharing the usual
-Antigravity quota and settings lock.
+have no read-only grant. A legacy Codex, Claude, or Gemini reviewer sharing a
+backend with a named seat needs an explicit reviewer model, since its implicit
+CLI default cannot be checked for overlap. Backend-wide model and effort flags
+require an active coder or explicit legacy reviewer for that backend; use
+`--seat-model` and `--seat-effort` for named seats. Named review execution
+remains gated until durable PR and plan review state supports seat IDs. Legacy
+`--reviewer agy` and `--antigravity-models` still describe one fallback
+reviewer, sharing the usual Antigravity quota and settings lock.
 
 ### Sub-items for conjunctive review findings
 

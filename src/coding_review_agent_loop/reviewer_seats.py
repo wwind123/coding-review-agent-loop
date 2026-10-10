@@ -112,8 +112,8 @@ def resolve_reviewer_seats(args: object) -> tuple[ReviewerSeat, ...]:
         coder = getattr(args, "coder", "claude")
         for backend, flags in {
             "antigravity": ("antigravity_model", "antigravity_models"),
-            "codex": ("codex_model",),
-            "claude": ("claude_model",),
+            "codex": ("codex_model", "codex_reasoning_effort"),
+            "claude": ("claude_model", "claude_effort"),
             "gemini": ("gemini_model",),
         }.items():
             if backend not in legacy_backends and backend != coder:
@@ -138,6 +138,11 @@ def resolve_reviewer_seats(args: object) -> tuple[ReviewerSeat, ...]:
             else:
                 chain = (getattr(args, f"reviewer_{legacy}_model", None) or getattr(args, f"{legacy}_model", None),)
             for model in chain:
+                if not model and any(seat.backend == legacy for seat in seats):
+                    raise AgentLoopError(
+                        f"Legacy {legacy} reviewer has an implicit model; set an explicit legacy reviewer model "
+                        "before adding a named seat on the same backend."
+                    )
                 if model and (legacy, canonical_model_identity(model)) in by_model:
                     raise AgentLoopError(f"Named reviewer model {model!r} overlaps the legacy {legacy} reviewer.")
         coder_dir = getattr(args, f"{getattr(args, 'coder', 'claude')}_dir", None)

@@ -3539,6 +3539,42 @@ def test_named_seat_rejects_legacy_implicit_model_and_coder_workdir(tmp_path, ca
     assert not checkout.exists()
 
 
+@pytest.mark.parametrize("backend", ["codex", "claude", "gemini"])
+def test_named_seat_rejects_unbound_legacy_model_before_dispatch(
+    tmp_path, monkeypatch, capsys, backend,
+):
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    checkout = tmp_path / "seat-checkout"
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--reviewer", backend,
+        "--reviewer-seat", f"alternate={backend}", "--seat-model", "alternate=Model A",
+        "--seat-dir", f"alternate={checkout}",
+    ]) == 1
+    assert f"Legacy {backend} reviewer has an implicit model" in capsys.readouterr().err
+    assert not checkout.exists()
+
+
+@pytest.mark.parametrize("backend,effort_flag", [
+    ("codex", "--codex-reasoning-effort"),
+    ("claude", "--claude-effort"),
+])
+def test_named_seat_rejects_unowned_backend_effort_before_dispatch(
+    tmp_path, monkeypatch, capsys, backend, effort_flag,
+):
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    checkout = tmp_path / "seat-checkout"
+    coder = "claude" if backend == "codex" else "codex"
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--coder", coder,
+        "--reviewer-seat", f"alternate={backend}", "--seat-model", "alternate=Model A",
+        "--seat-dir", f"alternate={checkout}", effort_flag, "high",
+    ]) == 1
+    error = capsys.readouterr().err
+    assert effort_flag in error
+    assert "configures a coder or legacy default reviewer" in error
+    assert not checkout.exists()
+
+
 def test_named_seat_rejects_legacy_explicit_reviewer_workdir(tmp_path, capsys):
     checkout = tmp_path / "reviewer-checkout"
     assert cli_module.main([

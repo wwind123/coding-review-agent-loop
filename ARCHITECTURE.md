@@ -1853,7 +1853,10 @@ The CLI validates named seats before command lookup, repository detection,
 workdir claims, and agent invocation. Validation covers reserved identities,
 model overlap within one backend, and explicit checkout collisions. Sandboxed
 permission checks use the seat's resolved backend and identify the rejected
-seat. During phase 1 the review loops still key durable state by backend, so
-named-seat execution stops at this preflight boundary. Legacy default seats
-continue through the existing backend-keyed paths with their historical
-signatures, metadata, quota behavior, and Antigravity settings lock.
+seat. A same-backend legacy reviewer with an unknown implicit CLI model is
+rejected until its model is explicit; backend model and effort options require
+an active coder or legacy reviewer to own them. During phase 1 the review loops
+still key durable state by backend, so named-seat execution stops at this
+preflight boundary. Legacy default seats continue through the existing
+backend-keyed paths with their historical signatures, metadata, quota behavior,
+and Antigravity settings lock.
