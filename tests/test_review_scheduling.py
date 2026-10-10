@@ -78,7 +78,7 @@ def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
         )
 
     monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
-    original_post = orchestrator.post_pr_comment
+    original_invoke = orchestrator._run_validated_agent
     interrupted = False
 
     def records():
@@ -87,20 +87,19 @@ def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
             flow="pr",
         )
 
-    def interrupt_after_first_new_head_approval(*args, **kwargs):
+    def interrupt_before_second_new_head_review(*args, **kwargs):
         nonlocal interrupted
-        result = original_post(*args, **kwargs)
-        approvals = [
-            record.metadata for record in records()
-            if record.metadata.role == "reviewer" and record.metadata.state == "approved"
-        ]
-        if not interrupted and len(approvals) == 3:
+        if (
+            not interrupted and kwargs.get("role") == "reviewer"
+            and str(kwargs.get("agent")) == "opus"
+            and runner.pr_payload["headRefOid"] != "abc123"
+        ):
             interrupted = True
             raise KeyboardInterrupt
-        return result
+        return original_invoke(*args, **kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(orchestrator, "post_pr_comment", interrupt_after_first_new_head_approval)
+        patch.setattr(orchestrator, "_run_validated_agent", interrupt_before_second_new_head_review)
         with pytest.raises(KeyboardInterrupt):
             orchestrator.run_pr_loop(runner, pr_number=77, config=config)
 
