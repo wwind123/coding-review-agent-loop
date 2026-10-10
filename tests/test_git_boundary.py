@@ -304,6 +304,34 @@ def test_modified_guard_helper_is_rejected_before_launch(tmp_path, monkeypatch, 
         secure_git._trusted_helper(helper)
 
 
+@pytest.mark.skipif(os.name != "posix" or not hasattr(os, "memfd_create"),
+                    reason="Linux anonymous guard output is unavailable")
+def test_guard_compiler_output_has_no_replaceable_path(monkeypatch):
+    import fcntl
+
+    monkeypatch.setattr(secure_git, "_GUARD_FD", None)
+    original_run = secure_git.subprocess.run
+    output_paths = []
+
+    def checked_run(args, *positional, **kwargs):
+        if "-o" in args:
+            output = args[args.index("-o") + 1]
+            output_paths.append(output)
+            assert output.startswith("/proc/self/fd/")
+            assert kwargs["pass_fds"] == (int(output.rsplit("/", 1)[1]),)
+        return original_run(args, *positional, **kwargs)
+
+    monkeypatch.setattr(secure_git.subprocess, "run", checked_run)
+    fd = secure_git._guard_fd()
+    try:
+        assert output_paths
+        seals = fcntl.fcntl(fd, fcntl.F_GET_SEALS)
+        assert seals & fcntl.F_SEAL_WRITE
+    finally:
+        os.close(fd)
+        monkeypatch.setattr(secure_git, "_GUARD_FD", None)
+
+
 def test_filter_changed_at_launch_cannot_execute(repositories, monkeypatch, tmp_path):
     _, seed, checkout = repositories
     marker = tmp_path / "filter-planted"

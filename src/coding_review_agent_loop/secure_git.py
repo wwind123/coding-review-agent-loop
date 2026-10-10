@@ -142,26 +142,34 @@ def _guard_fd() -> int:
             raise AgentLoopError("Unsupported Git confinement: guard source identity could not be verified.") from exc
         try:
             with tempfile.TemporaryDirectory(prefix="agent-loop-git-guard-") as directory:
-                library = Path(directory) / ("guard.dylib" if sys.platform == "darwin" else "guard.so")
                 compiler = next((item for item in ("/usr/bin/cc", "/usr/bin/clang")
                                  if os.path.isfile(item)), None)
                 if not compiler:
                     raise OSError("C compiler unavailable")
                 compiler = _trusted_executable(compiler)
-                built = subprocess.run(
-                    (compiler, *( ("-dynamiclib",) if sys.platform == "darwin" else ("-shared", "-fPIC") ),
-                    "-O2", "-x", "c", "-", "-o", str(library)),
-                    input=source, capture_output=True, timeout=30, check=False,
-                )
-                if built.returncode:
-                    raise OSError("execution guard could not be built")
-                if sys.platform == "darwin":
-                    fd = os.open(library, os.O_RDONLY)
-                else:
+                # Keep the linker output on a descriptor that has no directory
+                # entry. Another process under this UID can replace a named
+                # temporary file between compilation and sealing.
+                if sys.platform == "linux":
                     import fcntl
 
                     fd = os.memfd_create("agent-loop-git-guard", os.MFD_ALLOW_SEALING)
-                    os.write(fd, library.read_bytes())
+                    output = f"/proc/self/fd/{fd}"
+                else:
+                    library = Path(directory) / "guard.dylib"
+                    fd = os.open(library,
+                                 os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                    os.unlink(library)
+                    output = f"/dev/fd/{fd}"
+                built = subprocess.run(
+                    (compiler, *( ("-dynamiclib",) if sys.platform == "darwin" else ("-shared", "-fPIC") ),
+                    "-O2", "-x", "c", "-", "-o", output),
+                    input=source, capture_output=True, timeout=30, check=False,
+                    pass_fds=(fd,),
+                )
+                if built.returncode:
+                    raise OSError("execution guard could not be built")
+                if sys.platform == "linux":
                     fcntl.fcntl(fd, fcntl.F_ADD_SEALS,
                                 fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW |
                                 fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
