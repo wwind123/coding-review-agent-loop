@@ -277,6 +277,7 @@ class AgentLoopConfig:
     run_token: str | None = None
     worktree_links: tuple[str, ...] = ()
     trusted_local_origin: Path | None = None
+    trusted_origin_protocol: str = "https"
     # Optional plan-first override: use the main coder for planning/revision,
     # then switch only the approved implementation and PR follow-up coder/model.
     implementation_coder: AgentName | None = None
@@ -1540,15 +1541,10 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
         if runner.dry_run:
             runner.run((config.gh_cmd, "repo", "clone", config.repo, str(path)), cwd=path.parent)
             return
-        from .git_transport import trusted_url
+        from .git_transport import default_origin
 
-        if config.trusted_local_origin is not None:
-            origin = str(config.trusted_local_origin.resolve(strict=True))
-        else:
-            parts = config.repo.split("/")
-            host, owner, name = ("github.com", *parts) if len(parts) == 2 else parts
-            origin = f"https://{host}/{owner}/{name}.git"
-        trusted_url(config.repo, origin, local_origin=config.trusted_local_origin)
+        origin = default_origin(config.repo, protocol=config.trusted_origin_protocol,
+                                local_origin=config.trusted_local_origin)
         path.mkdir(mode=0o700)
         _run_git(runner, path, ("init", "-q", "-b", config.base or "main"))
         _run_git(runner, path, ("remote", "add", "origin", origin))
@@ -2008,6 +2004,8 @@ def config_from_args(
     local_origin = getattr(args, "trusted_local_origin", None)
     if local_origin is not None and not local_origin.is_absolute():
         raise AgentLoopError("--trusted-local-origin must be an absolute path.")
+    if local_origin is not None and getattr(args, "trusted_origin_protocol", "https") != "https":
+        raise AgentLoopError("--trusted-origin-protocol cannot be combined with --trusted-local-origin.")
 
     named_seats = resolve_reviewer_seats(args)
     legacy_reviewers = tuple(args.reviewer or (["codex"] if not named_seats else ()))
@@ -2149,6 +2147,7 @@ def config_from_args(
         gemini_cmd=args.gemini_cmd,
         gh_cmd=args.gh_cmd,
         trusted_local_origin=getattr(args, "trusted_local_origin", None),
+        trusted_origin_protocol=getattr(args, "trusted_origin_protocol", "https"),
         claude_args=static_args("claude", args.claude_arg),
         codex_args=static_args("codex", args.codex_arg),
         gemini_args=static_args("gemini", args.gemini_arg),

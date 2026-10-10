@@ -351,6 +351,62 @@ def test_fresh_worktree_failure_cleans_recorded_identities(tmp_path, monkeypatch
         assert not path.exists() and not admin.exists()
 
 
+@pytest.mark.parametrize("failure", ["write", "fsync"])
+def test_partial_gitfile_failure_cleans_recorded_link(tmp_path, monkeypatch, failure):
+    env = Env(tmp_path, monkeypatch)
+    config = env.config()
+    store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+    sha = run_worktrees.prepare_store(store, config=config, runner=Runner())
+    path = config.claude_dir
+    admin = store / ".git" / "worktrees" / path.name
+    original_open = run_worktrees.os.open
+    original_fdopen = run_worktrees.os.fdopen
+    original_fsync = run_worktrees.os.fsync
+    target_fd = None
+
+    def tracked_open(target, *args, **kwargs):
+        nonlocal target_fd
+        fd = original_open(target, *args, **kwargs)
+        if Path(target) == path / ".git":
+            target_fd = fd
+        return fd
+
+    class BrokenWrite:
+        def __init__(self, handle):
+            self.handle = handle
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def write(self, _value):
+            raise OSError("injected gitfile write failure")
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+    def tracked_fdopen(fd, *args, **kwargs):
+        handle = original_fdopen(fd, *args, **kwargs)
+        return BrokenWrite(handle) if failure == "write" and fd == target_fd else handle
+
+    def tracked_fsync(fd):
+        if failure == "fsync" and fd == target_fd:
+            raise OSError("injected gitfile fsync failure")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(run_worktrees.os, "open", tracked_open)
+    monkeypatch.setattr(run_worktrees.os, "fdopen", tracked_fdopen)
+    monkeypatch.setattr(run_worktrees.os, "fsync", tracked_fsync)
+    with run_worktrees.store_lock(store):
+        with pytest.raises(OSError, match="injected gitfile"):
+            run_worktrees.add_run_worktree(store, path, sha, config=config, runner=Runner())
+        assert run_worktrees._read_record(store, path.name)["state"] == "pending"
+        assert not path.exists() and not admin.exists()
+
+
 def test_fresh_worktree_cleanup_failure_is_reported(tmp_path, monkeypatch):
     env = Env(tmp_path, monkeypatch)
     config = env.config()

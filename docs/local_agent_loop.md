@@ -5999,6 +5999,11 @@ its role (implemented in `agent_permissions.py`):
   mode. Inherited `GIT_TRACE*`, `GIT_CONFIG_COUNT`, `GIT_EXTERNAL_DIFF`,
   alternate repository variables, and executable lookup paths do not reach
   those commands. The caller's environment is unchanged.
+  Guard source files and the Windows launcher must match identities already
+  loaded by the controller; changed helper bytes are refused before use.
+  A fresh default checkout uses HTTPS unless the operator selects
+  `--trusted-origin-protocol ssh`; that setting chooses the pinned SSH origin
+  before any fetch and requires the operator's SSH identity.
 - A Codex non-coder gets `--sandbox read-only` and `approval_policy="never"`,
   and `--output-last-message` points at the pre-created public response file,
   so failed-exit salvage reads it as usual. It has no network.

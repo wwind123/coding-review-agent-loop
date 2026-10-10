@@ -23,6 +23,32 @@ _SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 
 
+def default_origin(repo: str, *, protocol: str = "https",
+                   local_origin: Path | None = None) -> str:
+    """Choose a new checkout's endpoint solely from operator configuration."""
+    if local_origin is not None:
+        origin = str(local_origin.resolve(strict=True))
+    else:
+        parts = repo.split("/")
+        if len(parts) == 2:
+            host, owner, name = "github.com", *parts
+        elif len(parts) == 3:
+            host, owner, name = parts
+        else:
+            raise AgentLoopError(f"Invalid operator repository identity: {repo!r}.")
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+(?::[0-9]{1,5})?", host) or not all(
+            re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in (owner, name)
+        ):
+            raise AgentLoopError(f"Invalid operator repository identity: {repo!r}.")
+        if protocol == "https":
+            origin = f"https://{host}/{owner}/{name}.git"
+        elif protocol == "ssh":
+            origin = f"git@{host}:{owner}/{name}.git"
+        else:
+            raise AgentLoopError(f"Unsupported trusted origin protocol: {protocol}.")
+    return trusted_url(repo, origin, local_origin=local_origin)
+
+
 def trusted_url(repo: str, observed: str, *, local_origin: Path | None = None) -> str:
     """Compare an unexpanded origin with the exact operator-selected endpoint."""
     parts = repo.split("/")
@@ -32,7 +58,9 @@ def trusted_url(repo: str, observed: str, *, local_origin: Path | None = None) -
         host, owner, name = parts
     else:
         raise AgentLoopError(f"Invalid operator repository identity: {repo!r}.")
-    if not all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in (host, owner, name)):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+(?::[0-9]{1,5})?", host) or not all(
+        re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in (owner, name)
+    ):
         raise AgentLoopError(f"Invalid operator repository identity: {repo!r}.")
     suffix = f"{owner}/{name}"
     allowed = {
@@ -69,7 +97,10 @@ def _transport_env(url: str, gh_cmd: str | None) -> dict[str, str]:
             ssh = "/usr/bin/ssh"
         if not os.path.isfile(ssh):
             raise AgentLoopError("Trusted SSH transport requires an operator-owned SSH client.")
-        env["GIT_SSH_COMMAND"] = ssh
+        try:
+            env["GIT_SSH_COMMAND"] = _trusted_executable(ssh)
+        except (OSError, AgentLoopError) as exc:
+            raise AgentLoopError("Trusted SSH transport requires an agent-inaccessible SSH client.") from exc
     if url.startswith("https://") and gh_cmd:
         # Public repositories need no token.  A private-repository retry below
         # obtains one from the trusted GitHub CLI context only when necessary.

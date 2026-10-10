@@ -13,7 +13,7 @@ import pytest
 
 from coding_review_agent_loop import secure_git
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.git_transport import import_ref, trusted_url
+from coding_review_agent_loop.git_transport import default_origin, import_ref, trusted_url
 from coding_review_agent_loop.local_test_evidence import SnapshotCancelled, _run_git
 from coding_review_agent_loop.runner import Runner
 
@@ -163,6 +163,28 @@ def test_wrong_origin_is_rejected_before_private_fetch(repositories, monkeypatch
     assert trusted_url("OWNER/REPO", "https://github.com/OWNER/REPO.git") == "https://github.com/OWNER/REPO.git"
 
 
+@pytest.mark.parametrize("protocol,expected", [
+    ("https", "https://github.com/OWNER/REPO.git"),
+    ("ssh", "git@github.com:OWNER/REPO.git"),
+])
+def test_fresh_checkout_origin_uses_operator_protocol(protocol, expected):
+    assert default_origin("OWNER/REPO", protocol=protocol) == expected
+
+
+def test_fresh_default_checkout_initializes_pinned_ssh_origin(tmp_path, monkeypatch):
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop import config as config_module
+
+    checkout = tmp_path / "fresh"
+    config = make_config(tmp_path, create_dirs=False, claude_dir=checkout,
+                         trusted_origin_protocol="ssh")
+    monkeypatch.setattr(config_module, "_sync_base_branch", lambda *_args, **_kwargs: None)
+    config_module.ensure_temp_checkout(checkout, agent="claude", config=config, runner=Runner())
+    assert git(checkout, "config", "--local", "--get", "remote.origin.url") == (
+        "git@github.com:OWNER/REPO.git"
+    )
+
+
 def test_private_https_retry_scopes_token_without_exposing_it(repositories, monkeypatch):
     from coding_review_agent_loop import git_transport
 
@@ -255,6 +277,19 @@ def test_same_user_private_installation_is_not_trusted(repositories, tmp_path, m
         with pytest.raises(AgentLoopError, match="trusted installation"):
             secure_git._git_path()
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("helper", ["git_exec_guard.c", "git_exec_guard_macos.c", "git_windows_launcher.py"])
+def test_modified_guard_helper_is_rejected_before_launch(tmp_path, monkeypatch, helper):
+    package = tmp_path / "package"
+    package.mkdir(mode=0o700)
+    module = package / "secure_git.py"
+    module.write_text("# simulated installed module\n")
+    planted = package / helper
+    planted.write_text("# planted helper\n")
+    monkeypatch.setattr(secure_git, "__file__", str(module))
+    with pytest.raises(AgentLoopError, match="helper identity changed"):
+        secure_git._trusted_helper(helper)
 
 
 def test_filter_changed_at_launch_cannot_execute(repositories, monkeypatch, tmp_path):

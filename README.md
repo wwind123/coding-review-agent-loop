@@ -640,7 +640,10 @@ external filters or helpers may make the operation fail; the planted program
 does not run.
 On POSIX hosts the pinned Git binary and every component of its installation
 path must be root-owned. Private HTTPS authentication uses the same rule for
-the GitHub CLI; a same-user writable installation is rejected before launch.
+the GitHub CLI and SSH client. Guard source and the Windows launcher are
+checked against identities held in the loaded controller before use; the C
+compiler reads verified source bytes from stdin, and Windows runs the verified
+launcher bytes directly.
 
 Base and PR commits are fetched into a private transport repository from the
 exact GitHub HTTPS or SSH origin selected by `--repo`, using trusted GitHub CLI
@@ -651,6 +654,10 @@ checkout origin with a different host, URL rewrite, or untrusted local path
 is refused before transport. For an explicitly trusted offline repository,
 pass `--trusted-local-origin /absolute/path/to/origin`; the checkout origin
 must match that resolved path exactly.
+New checkouts use HTTPS by default. Pass `--trusted-origin-protocol ssh` when
+the operator has configured SSH authentication; agent-loop creates the exact
+`git@host:owner/repo.git` origin before its private fetch. This option cannot
+be combined with `--trusted-local-origin`.
 
 Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming it) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep it ignored with `/.venv` (a dir-only `.venv/` rule does not match a symlink). `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it.
 

@@ -25,7 +25,8 @@ def _git(path: Path, *args: str) -> str:
 
 @pytest.fixture
 def https_git(tmp_path, monkeypatch):
-    bare = tmp_path / "repo.git"
+    bare = tmp_path / "OWNER" / "REPO.git"
+    bare.parent.mkdir()
     seed = tmp_path / "seed"
     checkout = tmp_path / "checkout"
     subprocess.run(("git", "init", "-q", "--bare", "-b", "main", str(bare)), check=True)
@@ -98,7 +99,8 @@ def https_git(tmp_path, monkeypatch):
     server.socket = context.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    url = f"https://localhost:{server.server_port}/repo.git"
+    url = f"https://localhost:{server.server_port}/OWNER/REPO.git"
+    repo = f"localhost:{server.server_port}/OWNER/REPO"
     monkeypatch.setenv("SSL_CERT_FILE", str(cert))
     original_env = git_transport._transport_env
 
@@ -108,10 +110,9 @@ def https_git(tmp_path, monkeypatch):
         return env
 
     monkeypatch.setattr(git_transport, "_transport_env", fixture_env)
-    monkeypatch.setattr(git_transport, "trusted_url", lambda _repo, observed, **_kw: observed if observed == url else (_ for _ in ()).throw(AgentLoopError("endpoint mismatch")))
     _git(checkout, "config", "remote.origin.url", url)
     try:
-        yield checkout, url, requests, required_auth, redirect
+        yield checkout, url, repo, requests, required_auth, redirect
     finally:
         server.shutdown()
         server.server_close()
@@ -120,23 +121,24 @@ def https_git(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("mode", ["public", "private", "redirect", "rewrite"])
 def test_real_https_transport_policy(https_git, monkeypatch, tmp_path, mode):
-    checkout, url, requests, required_auth, redirect = https_git
+    checkout, url, repo, requests, required_auth, redirect = https_git
     marker = tmp_path / "helper-ran"
     _git(checkout, "config", "credential.helper", f"!touch {marker}; echo password=planted")
     if mode == "rewrite":
         _git(checkout, "config", "url.https://127.0.0.1:1/.insteadOf", url)
-    if mode == "private":
+    if mode in {"private", "redirect"}:
         token = "fixture-secret-token"
         required_auth["value"] = "Basic " + base64.b64encode(f"x-access-token:{token}".encode()).decode()
         monkeypatch.setattr(git_transport, "_token_from_gh", lambda *_args: token)
     if mode == "redirect":
         redirect["value"] = True
-    kwargs = {"repo": "OWNER/REPO", "runner": Runner(), "gh_cmd": "gh" if mode == "private" else None}
+    kwargs = {"repo": repo, "runner": Runner(), "gh_cmd": "gh" if mode in {"private", "redirect"} else None}
     if mode == "redirect":
         with pytest.raises(AgentLoopError, match="Trusted Git transport failed"):
             git_transport.import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main", **kwargs)
         assert all(path != "/redirected" for path, _ in requests)
-        assert all(auth is None for _, auth in requests)
+        assert all(path.startswith("/OWNER/REPO.git/") for path, _ in requests)
+        assert any(auth and auth.lower() == required_auth["value"].lower() for _, auth in requests)
     else:
         sha = git_transport.import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main", **kwargs)
         assert sha == _git(checkout, "rev-parse", "HEAD")
@@ -144,7 +146,7 @@ def test_real_https_transport_policy(https_git, monkeypatch, tmp_path, mode):
         assert requests
         if mode == "private":
             assert any(auth and auth.lower() == required_auth["value"].lower() for _, auth in requests)
-            assert all(path.startswith("/repo.git/") for path, _ in requests)
+            assert all(path.startswith("/OWNER/REPO.git/") for path, _ in requests)
     assert not marker.exists()
 
 

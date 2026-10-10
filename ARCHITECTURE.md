@@ -1462,6 +1462,10 @@ probe and fails closed if confinement cannot be verified. Existing process
 group containment is not an execution boundary. The isolated inspector keeps
 its standard-library-only main process and delegates Git to a pinned helper
 using the same local boundary.
+Guard C source and the Windows launcher are checked against hashes held by the
+already loaded controller before use. The compiler receives verified C bytes
+through stdin, and Windows passes verified launcher code directly to a trusted
+Python executable, leaving no helper file to replace between check and launch.
 Each local Git invocation also binds `--work-tree` and `core.worktree` to its
 assigned checkout, so repository config cannot redirect status or cleanup to
 another directory. Repository initialization has no existing worktree to bind.
@@ -1473,8 +1477,10 @@ may obtain a token from an operator-owned GitHub CLI installation resolved
 independently of inherited `PATH`, passed only as an in-memory scoped
 header to that private fetch. On POSIX hosts, both pinned executable paths,
 including their parent directories, must be root-owned so an unrestricted
-same-user agent cannot
-replace them before launch. The complete reachable pack for a pinned commit
+same-user agent cannot replace them before launch.
+The `--trusted-origin-protocol` setting selects HTTPS or SSH when creating a
+new default checkout; the pinned SSH client is validated before transport.
+The complete reachable pack for a pinned commit
 is streamed to confined `index-pack --stdin`; the destination verifies the
 commit, then compare-and-swaps the tracking ref while its checkout or store
 lock is held. Base ancestry and advertised PR head are checked before cleaning

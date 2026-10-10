@@ -206,11 +206,16 @@ def _create_detached_link(store: Path, path: Path, sha: str) -> tuple[Path, list
     path.mkdir(mode=0o700)
     path_identity = _identity(path)
     admin_identity = None
+    gitfile_identity = None
     try:
         admin.mkdir(mode=0o700)
         admin_identity = _identity(admin)
         def exclusive(target: Path, value: str) -> None:
+            nonlocal gitfile_identity
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            if target == path / ".git":
+                info = os.fstat(fd)
+                gitfile_identity = [info.st_dev, info.st_ino]
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(value)
                 handle.flush()
@@ -220,11 +225,22 @@ def _create_detached_link(store: Path, path: Path, sha: str) -> tuple[Path, list
         exclusive(admin / "commondir", "../..\n")
         exclusive(admin / "gitdir", str(path / ".git") + "\n")
         exclusive(path / ".git", f"gitdir: {admin}\n")
-    except Exception:
-        if admin_identity is not None and _identity(admin) == admin_identity and not admin.is_symlink():
-            shutil.rmtree(admin)
-        if _identity(path) == path_identity and path.is_dir() and not path.is_symlink():
+    except Exception as original:
+        try:
+            if admin_identity is not None:
+                if _identity(admin) != admin_identity or admin.is_symlink():
+                    raise AgentLoopError(f"Fresh linked worktree cleanup refused changed identity at {admin}.")
+                shutil.rmtree(admin)
+            if _identity(path) != path_identity or not path.is_dir() or path.is_symlink():
+                raise AgentLoopError(f"Fresh linked worktree cleanup refused changed identity at {path}.")
+            gitfile = path / ".git"
+            if gitfile_identity is not None:
+                if _identity(gitfile) != gitfile_identity or not gitfile.is_file() or gitfile.is_symlink():
+                    raise AgentLoopError(f"Fresh linked worktree cleanup refused changed identity at {gitfile}.")
+                gitfile.unlink()
             path.rmdir()
+        except OSError as exc:
+            raise AgentLoopError(f"Fresh linked worktree cleanup failed at {path}: {exc}.") from original
         raise
     assert admin_identity is not None
     return admin, path_identity, admin_identity
@@ -439,15 +455,10 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
             make_private_dirs(store.parent)
         except OSError as exc:
             raise AgentLoopError(f"Could not create parent directory for store at {store}: {exc}") from exc
-        from .git_transport import trusted_url
+        from .git_transport import default_origin
 
-        if config.trusted_local_origin is not None:
-            origin = str(config.trusted_local_origin.resolve(strict=True))
-        else:
-            parts = config.repo.split("/")
-            host, owner, name = ("github.com", *parts) if len(parts) == 2 else parts
-            origin = f"https://{host}/{owner}/{name}.git"
-        trusted_url(config.repo, origin, local_origin=config.trusted_local_origin)
+        origin = default_origin(config.repo, protocol=config.trusted_origin_protocol,
+                                local_origin=config.trusted_local_origin)
         store.mkdir(mode=0o700)
         _git(runner, store, "init", "-q", "-b", config.base or "main")
         _git(runner, store, "remote", "add", "origin", origin)

@@ -468,6 +468,10 @@ def build_parser() -> argparse.ArgumentParser:
             help="Explicit operator-trusted local Git origin for offline repositories; its exact resolved path must match origin.",
         )
         subparser.add_argument(
+            "--trusted-origin-protocol", choices=("https", "ssh"), default="https",
+            help="Protocol for a newly created GitHub checkout origin (default: https). Choose ssh for an operator-configured SSH identity.",
+        )
+        subparser.add_argument(
             "--reviewer-codex-model", default="",
             help="Codex reviewer model, overriding --codex-model for plan/PR reviews and discussion turns only.",
         )

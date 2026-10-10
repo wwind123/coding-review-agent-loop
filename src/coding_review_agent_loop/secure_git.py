@@ -24,6 +24,11 @@ _PINNED_GIT: str | None = None
 _PINNED_GIT_HASH: bytes | None = None
 _GUARD_FD: int | None = None
 _WINDOWS_VERIFIED = False
+_HELPER_HASHES = {
+    "git_exec_guard.c": "09286e7b31740b482a2a3f867723bcc3716d27601c9bd1cbbe4ff8bcd533980c",
+    "git_exec_guard_macos.c": "2890ee03e52bb997023b5ba1cadbdf555d78f72249a4fab9cdbc56d0ef0f0b46",
+    "git_windows_launcher.py": "49a10e4312dfa420f6abe540e7dca3e282def3377219ae5b705d9928149631d7",
+}
 
 _CONFIG = (
     "core.hooksPath=/dev/null", "core.fsmonitor=false", "core.pager=cat",
@@ -40,7 +45,7 @@ _ENV_KEYS = frozenset({
 })
 
 
-def _trusted_executable(path: str) -> str:
+def _trusted_path(path: str, *, executable: bool) -> str:
     """Require an installation that a same-user unrestricted agent cannot replace."""
     if not os.path.isabs(path):
         raise AgentLoopError("Trusted executable must have an absolute path.")
@@ -53,7 +58,7 @@ def _trusted_executable(path: str) -> str:
         if not any(os.path.commonpath((candidate, resolved)).casefold() == candidate.casefold()
                    for candidate in protected):
             raise AgentLoopError("Trusted executable must be in a system installation.")
-        if not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
+        if not os.path.isfile(resolved) or (executable and not os.access(resolved, os.X_OK)):
             raise AgentLoopError("Trusted executable is unavailable.")
         return resolved
     for name in (path, resolved):
@@ -66,9 +71,27 @@ def _trusted_executable(path: str) -> str:
                 break
             current = current.parent
     info = os.stat(resolved)
-    if not stat.S_ISREG(info.st_mode) or not os.access(resolved, os.X_OK):
+    if not stat.S_ISREG(info.st_mode) or (executable and not os.access(resolved, os.X_OK)):
         raise AgentLoopError("Trusted executable is unavailable.")
     return resolved
+
+
+def _trusted_executable(path: str) -> str:
+    return _trusted_path(path, executable=True)
+
+
+def _trusted_helper(name: str) -> bytes:
+    """Read a helper only when it matches the digest in loaded controller code."""
+    expected = _HELPER_HASHES.get(name)
+    if expected is None:
+        raise AgentLoopError("Unsupported Git confinement: unknown helper.")
+    try:
+        source = Path(__file__).with_name(name).read_bytes()
+    except OSError as exc:
+        raise AgentLoopError("Unsupported Git confinement: helper is unavailable.") from exc
+    if hashlib.sha256(source).hexdigest() != expected:
+        raise AgentLoopError("Unsupported Git confinement: helper identity changed.")
+    return source
 
 
 def _git_path() -> str:
@@ -111,9 +134,12 @@ def _guard_fd() -> int:
             raise AgentLoopError(
                 "Unsupported Git confinement: no verified command-time execution-denial backend."
             )
-        source = Path(__file__).with_name(
-            "git_exec_guard_macos.c" if sys.platform == "darwin" else "git_exec_guard.c"
-        )
+        try:
+            source = _trusted_helper(
+                "git_exec_guard_macos.c" if sys.platform == "darwin" else "git_exec_guard.c"
+            )
+        except (OSError, AgentLoopError) as exc:
+            raise AgentLoopError("Unsupported Git confinement: guard source identity could not be verified.") from exc
         try:
             with tempfile.TemporaryDirectory(prefix="agent-loop-git-guard-") as directory:
                 library = Path(directory) / ("guard.dylib" if sys.platform == "darwin" else "guard.so")
@@ -121,10 +147,11 @@ def _guard_fd() -> int:
                                  if os.path.isfile(item)), None)
                 if not compiler:
                     raise OSError("C compiler unavailable")
+                compiler = _trusted_executable(compiler)
                 built = subprocess.run(
                     (compiler, *( ("-dynamiclib",) if sys.platform == "darwin" else ("-shared", "-fPIC") ),
-                     "-O2", "-o", str(library), str(source)),
-                    capture_output=True, timeout=30, check=False,
+                    "-O2", "-x", "c", "-", "-o", str(library)),
+                    input=source, capture_output=True, timeout=30, check=False,
                 )
                 if built.returncode:
                     raise OSError("execution guard could not be built")
@@ -224,10 +251,11 @@ def _verify_windows() -> None:
     with _LOCK:
         if _WINDOWS_VERIFIED:
             return
-        launcher = Path(__file__).with_name("git_windows_launcher.py")
-        if not launcher.is_file() or not os.path.isfile(sys.executable):
+        launcher = _trusted_helper("git_windows_launcher.py").decode("utf-8")
+        if not os.path.isfile(sys.executable):
             raise AgentLoopError("Unsupported Git confinement: Windows launcher is unavailable.")
-        prefix = (sys.executable, "-I", "-S", str(launcher), _git_path())
+        python = _trusted_executable(sys.executable)
+        prefix = (python, "-I", "-S", "-c", launcher, _git_path())
         env = _closed_env(os.environ, -1)
         try:
             version = subprocess.run((*prefix, "--version"), env=env,
@@ -294,7 +322,7 @@ def local_command(
         rest.insert(1, "--ignore-submodules=all")
     command.extend(rest)
     if sys.platform == "win32":
-        launcher = Path(__file__).with_name("git_windows_launcher.py")
-        command = [sys.executable, "-I", "-S", str(launcher), *command]
+        launcher = _trusted_helper("git_windows_launcher.py").decode("utf-8")
+        command = [_trusted_executable(sys.executable), "-I", "-S", "-c", launcher, *command]
         return command, _closed_env(values, fd), ()
     return command, _closed_env(values, fd), (fd,)
