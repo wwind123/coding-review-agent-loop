@@ -3475,6 +3475,182 @@ def test_config_rejects_duplicate_reviewers(tmp_path):
         config_from_args(args, FakeRunner())
 
 
+@pytest.mark.parametrize("seat_flags,expected", [
+    (["--reviewer-seat", "agy=agy", "--seat-model", "agy=Model"], "reserved"),
+    (["--reviewer-seat", "Antigravity=agy", "--seat-model", "Antigravity=Model"], "reserved"),
+    (["--reviewer-seat", "OpenAI Codex=codex", "--seat-model", "OpenAI Codex=Model"], "reserved"),
+    (["--reviewer-seat", "Orchestrator=codex", "--seat-model", "Orchestrator=m"], "reserved"),
+    (["--reviewer-seat", "a=agy", "--reviewer-seat", "a=agy", "--seat-model", "a=Model"], "Duplicate"),
+    (["--reviewer-seat", "a=agy", "--reviewer-seat", "A=agy", "--seat-model", "a=Model"], "lowercase ASCII"),
+    (["--reviewer-seat", "a=agy"], "requires --seat-model"),
+    (["--reviewer-seat", "a=codex", "--seat-model", "a=one", "--seat-model", "a=two"], "fallback"),
+    (["--reviewer-seat", "a=agy", "--seat-model", "a=one", "--seat-effort", "a=high"], "unsupported"),
+    (["--reviewer-seat", "a=agy", "--seat-model", "a=Gemini 3.8 Flash (High)",
+      "--reviewer-seat", "b=agy", "--seat-model", "b=gemini-3.8-flash-high"], "overlap"),
+    (["--reviewer-seat", "a=agy", "--seat-model", "a=Claude Opus 5.5 (Medium)",
+      "--reviewer-seat", "b=agy", "--seat-model", "b=claude-opus-5-5"], "overlap"),
+    (["--reviewer-seat", "a=agy", "--seat-model", "a=Claude Opus 5.5",
+      "--reviewer-seat", "b=agy", "--seat-model", "b=claude-opus-5-5-medium"], "overlap"),
+    (["--reviewer-seat", "a=agy", "--seat-model", "a=Model A",
+      "--antigravity-models", "Model B"], "not named antigravity seats"),
+    (["--reviewer-seat", "a=codex", "--seat-model", "a=Model A",
+      "--reviewer-codex-model", "Model B"], "requires an explicit legacy"),
+])
+def test_named_seat_validation_precedes_dispatch(tmp_path, monkeypatch, capsys, seat_flags, expected):
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    code = cli_module.main(["pr", "77", "--repo", "OWNER/REPO", *seat_flags])
+    assert code == 1
+    assert expected in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_valid_named_seats_are_gated_before_dispatch(monkeypatch, capsys):
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    code = cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "gemini-seat=agy",
+        "--seat-model", "gemini-seat=Gemini 3.8 Flash (High)",
+        "--reviewer-seat", "claude-seat=agy", "--seat-model", "claude-seat=Claude Opus 5.5 (Medium)",
+    ])
+    assert code == 1
+    assert "execution is unavailable in phase 1" in capsys.readouterr().err
+
+
+def test_discuss_rejects_named_seats(capsys):
+    code = cli_module.main([
+        "discuss", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "model-a=claude",
+        "--seat-model", "model-a=Model A",
+    ])
+    assert code == 1
+    assert "discuss does not support named" in capsys.readouterr().err
+
+
+def test_named_seat_rejects_legacy_implicit_model_and_coder_workdir(tmp_path, capsys):
+    common = ["pr", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "model-a=agy",
+              "--seat-model", "model-a=Gemini 3.8 Flash (High)"]
+    assert cli_module.main([*common, "--reviewer", "agy"]) == 1
+    assert "overlaps the legacy" in capsys.readouterr().err
+    checkout = tmp_path / "checkout"
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--coder", "claude",
+        "--claude-dir", str(checkout), "--reviewer-seat", "model-a=codex",
+        "--seat-model", "model-a=Model A", "--seat-dir", f"model-a={checkout}",
+    ]) == 1
+    assert "workdir collides with coder" in capsys.readouterr().err
+    assert not checkout.exists()
+
+
+@pytest.mark.parametrize("backend", ["codex", "claude", "gemini"])
+def test_named_seat_rejects_unbound_legacy_model_before_dispatch(
+    tmp_path, monkeypatch, capsys, backend,
+):
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    checkout = tmp_path / "seat-checkout"
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--reviewer", backend,
+        "--reviewer-seat", f"alternate={backend}", "--seat-model", "alternate=Model A",
+        "--seat-dir", f"alternate={checkout}",
+    ]) == 1
+    assert f"Legacy {backend} reviewer has an implicit model" in capsys.readouterr().err
+    assert not checkout.exists()
+
+
+@pytest.mark.parametrize("backend,effort_flag", [
+    ("codex", "--codex-reasoning-effort"),
+    ("claude", "--claude-effort"),
+])
+def test_named_seat_rejects_unowned_backend_effort_before_dispatch(
+    tmp_path, monkeypatch, capsys, backend, effort_flag,
+):
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    checkout = tmp_path / "seat-checkout"
+    coder = "claude" if backend == "codex" else "codex"
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--coder", coder,
+        "--reviewer-seat", f"alternate={backend}", "--seat-model", "alternate=Model A",
+        "--seat-dir", f"alternate={checkout}", effort_flag, "high",
+    ]) == 1
+    error = capsys.readouterr().err
+    assert effort_flag in error
+    assert "configures a coder or legacy default reviewer" in error
+    assert not checkout.exists()
+
+
+def test_named_seat_preserves_implementation_coder_model_and_effort_before_phase_gate(
+    tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(cli_module, "run_issue_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    checkout = tmp_path / "seat-checkout"
+    assert cli_module.main([
+        "issue", "77", "--repo", "OWNER/REPO", "--plan-first", "--coder", "codex",
+        "--implementation-coder", "claude", "--claude-model", "claude-fable-5",
+        "--claude-effort", "high", "--reviewer-seat", "alternate=claude",
+        "--seat-model", "alternate=claude-sonnet-5", "--seat-dir", f"alternate={checkout}",
+    ]) == 1
+    error = capsys.readouterr().err
+    assert "execution is unavailable in phase 1" in error
+    assert "--claude-model" not in error
+    assert "--claude-effort" not in error
+    assert not checkout.exists()
+
+
+def test_named_seat_rejects_legacy_explicit_reviewer_workdir(tmp_path, capsys):
+    checkout = tmp_path / "reviewer-checkout"
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--coder", "claude",
+        "--codex-dir", str(checkout), "--reviewer", "codex",
+        "--reviewer-seat", "other=claude", "--seat-model", "other=Model A",
+        "--seat-dir", f"other={checkout}",
+    ]) == 1
+    assert "workdir collides with legacy codex reviewer" in capsys.readouterr().err
+    assert not checkout.exists()
+
+
+@pytest.mark.parametrize("legacy_reviewers", [
+    ("agy", "agy"),
+    ("agy", "antigravity"),
+])
+@pytest.mark.parametrize("primary", [False, True])
+def test_named_seat_rejects_duplicate_legacy_reviewers_before_phase_gate(
+    tmp_path, monkeypatch, capsys, legacy_reviewers, primary,
+):
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    checkout = tmp_path / "seat-checkout"
+    flags = ["--pr-review-policy", "primary-then-panel", "--primary-reviewer-seat", "model-a"] if primary else []
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "model-a=codex",
+        "--seat-model", "model-a=Model A", "--seat-dir", f"model-a={checkout}",
+        "--reviewer", legacy_reviewers[0],
+        "--reviewer", legacy_reviewers[1], *flags,
+    ]) == 1
+    assert "--reviewer cannot include the same agent more than once" in capsys.readouterr().err
+    assert not checkout.exists()
+
+
+def test_named_seat_rejects_implementation_coder_workdir_before_phase_gate(tmp_path, monkeypatch, capsys):
+    checkout = tmp_path / "implementation-checkout"
+    monkeypatch.setattr(cli_module, "run_issue_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    assert cli_module.main([
+        "issue", "77", "--repo", "OWNER/REPO", "--plan-first", "--coder", "codex",
+        "--implementation-coder", "claude", "--claude-dir", str(checkout),
+        "--reviewer-seat", "model-a=agy", "--seat-model", "model-a=Model A",
+        "--seat-dir", f"model-a={checkout}",
+    ]) == 1
+    assert "workdir collides with implementation coder" in capsys.readouterr().err
+    assert not checkout.exists()
+
+
+@pytest.mark.parametrize("policy,primary", [
+    ("--pr-review-policy", "--primary-reviewer-seat"),
+    ("--plan-review-policy", "--primary-plan-reviewer-seat"),
+])
+def test_named_primary_requires_secondary_before_phase_gate(capsys, policy, primary):
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "only=codex",
+        "--seat-model", "only=Model A", policy, "primary-then-panel", primary, "only",
+    ]) == 1
+    assert "requires at least one secondary reviewer" in capsys.readouterr().err
+
+
 def test_config_rejects_alias_and_canonical_duplicate_reviewers(tmp_path):
     parser = build_parser()
     args = parser.parse_args([

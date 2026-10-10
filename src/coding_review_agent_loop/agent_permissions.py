@@ -158,6 +158,11 @@ def configured_agent_selections(config: AgentLoopConfig) -> tuple[AgentSelection
         )
     for reviewer in config.reviewer:
         selections.append(AgentSelection("reviewer", reviewer, "--reviewer claude|codex"))
+    for seat in getattr(config, "reviewer_seats", ()):
+        selections.append(AgentSelection(
+            f"reviewer seat {seat.seat_id!r}", seat.backend,
+            f"--reviewer-seat {seat.seat_id}=claude|codex",
+        ))
     if config.primary_reviewer is not None:
         selections.append(
             AgentSelection("primary_reviewer", config.primary_reviewer, "--primary-reviewer claude|codex")
@@ -221,6 +226,7 @@ def validate_sandboxed_selections(config: AgentLoopConfig) -> None:
                 " A sandboxed review board is therefore limited to Claude and Codex "
                 "reviewers; to keep this reviewer, run without sandboxed permissions."
                 if selection.field in {"reviewer", "primary_reviewer", "primary_plan_reviewer"}
+                or selection.field.startswith("reviewer seat ")
                 else ""
             )
             raise AgentLoopError(

@@ -103,6 +103,35 @@ def test_antigravity_attempt_state_retries_then_falls_back(tmp_path):
         assert state.next_after_failure(retryable=True, provider_capacity=True) == expected
     assert models == [("ModelA",), ("ModelA",), ("ModelA",), ("ModelB",), ("ModelC",)]
 
+
+def test_legacy_cli_pr_fallback_counts_one_exact_head_approval(tmp_path):
+    from coding_review_agent_loop.cli import build_parser, config_from_args, run_pr_loop
+
+    claude_dir = tmp_path / "claude"
+    agy_dir = tmp_path / "antigravity"
+    claude_dir.mkdir()
+    agy_dir.mkdir()
+    args = build_parser().parse_args([
+        "pr", "77", "--repo", "OWNER/REPO", "--reviewer", "agy",
+        "--antigravity-models", "ModelA", "ModelB",
+        "--claude-dir", str(claude_dir), "--antigravity-dir", str(agy_dir),
+        "--agent-max-retries", "0", "--no-pre-review-tests",
+    ])
+    runner = FakeRunner(antigravity_outputs=[
+        ("quota exceeded", 1),
+        (structured_pr_review(state="approved", summary="Approved.", reviewer="Google Antigravity"), 0),
+    ])
+    config = config_from_args(args, runner)
+    assert config.reviewer == ("antigravity",)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
+              if cmd and cmd[0] == "agy" and "--model" in cmd]
+    assert models == ["ModelA", "ModelB"]
+    reviews = [comment for comment in runner.comments if "**Review verdict:**" in comment]
+    assert len(reviews) == 1
+    assert "Approved" in reviews[0]
+    assert "abc123" == runner.pr_payload["headRefOid"]
+
 def test_antigravity_backend_stops_on_other_errors(tmp_path):
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
     agy_dir = tmp_path / "antigravity"

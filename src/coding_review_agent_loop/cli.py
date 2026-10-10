@@ -19,6 +19,7 @@ if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "inspect":
     raise SystemExit(run_inspect(sys.argv[2:]))
 
 from .agents.base import normalize_agent_name
+from .reviewer_seats import resolve_reviewer_seats
 from .agents.registry import (
     agent_display_name,
     agent_signature,
@@ -44,7 +45,9 @@ from .config import (
     ensure_distinct_workdirs,
     ensure_workdir,
     resolve_base_branch,
+    resolve_agent_permissions_mode,
     reviewers,
+    validate_sandboxed_args,
 )
 from .errors import AgentLoopError, HumanDecisionRequiredError, QuotaResetExceededError
 from .managed_ci import (
@@ -221,6 +224,30 @@ def build_parser() -> argparse.ArgumentParser:
                 "Agent that reviews the PR and gates approval. Repeat for multiple "
                 "reviewers; all must approve (default: codex)."
             ),
+        )
+        subparser.add_argument(
+            "--reviewer-seat", action="append", default=None, metavar="SEAT=BACKEND",
+            help="Declare a named reviewer seat (claude, codex, gemini, or agy). Named review execution is gated in this phase.",
+        )
+        subparser.add_argument(
+            "--seat-model", action="append", default=None, metavar="SEAT=MODEL",
+            help="Select a seat model; repeat only for an Antigravity fallback chain.",
+        )
+        subparser.add_argument(
+            "--seat-effort", action="append", default=None, metavar="SEAT=EFFORT",
+            help="Select a Codex or Claude seat effort.",
+        )
+        subparser.add_argument(
+            "--seat-dir", action="append", default=None, metavar="SEAT=PATH",
+            help="Select a reviewer seat checkout.",
+        )
+        subparser.add_argument(
+            "--primary-reviewer-seat", default=None, metavar="SEAT",
+            help="Select a named PR primary seat when named review is enabled.",
+        )
+        subparser.add_argument(
+            "--primary-plan-reviewer-seat", default=None, metavar="SEAT",
+            help="Select a named plan primary seat when named review is enabled.",
         )
         subparser.add_argument(
             "--allow-shared-dir",
@@ -2068,6 +2095,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError("--managed-ci is only supported with issue, pr, or managed-pr.")
             if not (args.managed_ci_trusted_actor or "").strip():
                 raise AgentLoopError("--managed-ci requires --managed-ci-trusted-actor.")
+        named_seats = resolve_reviewer_seats(args)
+        if named_seats:
+            if args.command == "discuss":
+                raise AgentLoopError("discuss does not support named reviewer seats.")
+            for option, primary, policy in (
+                ("--primary-reviewer-seat", args.primary_reviewer_seat, args.pr_review_policy),
+                ("--primary-plan-reviewer-seat", args.primary_plan_reviewer_seat, args.plan_review_policy),
+            ):
+                if primary is not None and primary not in {seat.seat_id for seat in named_seats}:
+                    raise AgentLoopError(f"{option} must name a configured reviewer seat.")
+                if primary is not None and policy != "primary-then-panel":
+                    raise AgentLoopError(f"{option} requires primary-then-panel scheduling.")
+            if args.primary_reviewer is not None and args.primary_reviewer_seat is not None:
+                raise AgentLoopError("Select either --primary-reviewer or --primary-reviewer-seat.")
+            if args.primary_plan_reviewer is not None and args.primary_plan_reviewer_seat is not None:
+                raise AgentLoopError("Select either --primary-plan-reviewer or --primary-plan-reviewer-seat.")
+            if args.primary_reviewer is not None and args.primary_reviewer not in (args.reviewer or ()):
+                raise AgentLoopError("--primary-reviewer must select an explicit legacy --reviewer when named seats are declared.")
+            if args.primary_plan_reviewer is not None and args.primary_plan_reviewer not in (args.reviewer or ()):
+                raise AgentLoopError("--primary-plan-reviewer must select an explicit legacy --reviewer when named seats are declared.")
+            if args.pr_review_policy == "primary-then-panel" and not (args.primary_reviewer_seat or args.primary_reviewer):
+                raise AgentLoopError("primary-then-panel requires --primary-reviewer-seat or --primary-reviewer.")
+            if args.plan_review_policy == "primary-then-panel" and not (args.primary_plan_reviewer_seat or args.primary_plan_reviewer):
+                raise AgentLoopError("plan primary-then-panel requires --primary-plan-reviewer-seat or --primary-plan-reviewer.")
+            board_size = len(named_seats) + len(args.reviewer or ())
+            if args.pr_review_policy == "primary-then-panel" and board_size < 2:
+                raise AgentLoopError("--pr-review-policy primary-then-panel requires at least one secondary reviewer.")
+            if args.plan_review_policy == "primary-then-panel" and board_size < 2:
+                raise AgentLoopError("--plan-review-policy primary-then-panel requires at least one secondary reviewer.")
+            validate_sandboxed_args(args, tuple(args.reviewer or ()), named_seats=named_seats)
+            raise AgentLoopError(
+                "Named reviewer seats are validated but review execution is unavailable in phase 1; "
+                "use legacy --reviewer until durable seat identity is enabled."
+            )
+        if args.primary_reviewer_seat is not None or args.primary_plan_reviewer_seat is not None:
+            raise AgentLoopError("A named primary requires --reviewer-seat.")
         config = config_from_args(args, runner, invocation_argv=invocation)
         if args.command in {"issue", "task", "pr", "discuss", "managed-pr"}:
             # Before claims, sandbox setup and base-branch resolution (#1111).

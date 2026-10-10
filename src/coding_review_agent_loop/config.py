@@ -1874,15 +1874,13 @@ def parse_antigravity_quota_group_overrides(values) -> tuple[tuple[str, str], ..
     return tuple(parsed)
 
 
-def config_from_args(
+def validate_sandboxed_args(
     args: argparse.Namespace,
-    runner: Runner,
+    configured_reviewers: tuple[str, ...],
     *,
-    invocation_argv: tuple[str, ...] = (),
-) -> AgentLoopConfig:
-    configured_reviewers = tuple(args.reviewer or ["codex"])
-    if len(set(configured_reviewers)) != len(configured_reviewers):
-        raise AgentLoopError("--reviewer cannot include the same agent more than once.")
+    named_seats: tuple[object, ...] = (),
+) -> None:
+    """Check every selected provider before command lookup or checkout setup."""
     if resolve_agent_permissions_mode(args) == "sandboxed":
         # Name the unsupported selection before command preflight would
         # report a missing default helper CLI such as agy.
@@ -1895,6 +1893,7 @@ def config_from_args(
                 coder=args.coder,
                 implementation_coder=getattr(args, "implementation_coder", None),
                 reviewer=configured_reviewers,
+                reviewer_seats=named_seats,
                 primary_reviewer=getattr(args, "primary_reviewer", None),
                 primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
                 discuss_analyzer=getattr(args, "discuss_analyzer", None),
@@ -1905,6 +1904,25 @@ def config_from_args(
                 ),
             )
         )
+
+
+def config_from_args(
+    args: argparse.Namespace,
+    runner: Runner,
+    *,
+    invocation_argv: tuple[str, ...] = (),
+) -> AgentLoopConfig:
+    from .reviewer_seats import resolve_reviewer_seats
+
+    if resolve_reviewer_seats(args):
+        raise AgentLoopError(
+            "Named reviewer seats are validated but review execution is unavailable in phase 1; "
+            "use legacy --reviewer until durable seat identity is enabled."
+        )
+    configured_reviewers = tuple(args.reviewer or ["codex"])
+    if len(set(configured_reviewers)) != len(configured_reviewers):
+        raise AgentLoopError("--reviewer cannot include the same agent more than once.")
+    validate_sandboxed_args(args, configured_reviewers)
     preflight_agent_commands(args, runner, configured_reviewers)
 
     detect_dir = args.codex_dir.resolve() if args.codex_dir is not None else Path.cwd().resolve()
