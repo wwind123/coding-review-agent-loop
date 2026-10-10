@@ -565,3 +565,100 @@ def test_standalone_pr_entry_floor_resolves_the_bound_plan(
         assert releases == []
     assert runner.comments == []
     assert _agent_commands(runner) == []
+
+
+def _no_handoff_plan_pr(tmp_path, *, plan_state, scope):
+    """Issue #56 holds an approved plan but no handoff record; the PR run has no issue context."""
+    from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+    from test_issue_pr_handoff import _named_config, _named_plan_comments, _three_provider_plan
+
+    seats, approved = _three_provider_plan(tmp_path)
+    plan_config = _named_config(tmp_path, seats)
+    binding = reviewer_seat_binding(plan_config)
+    if plan_state == "unsigned":
+        comments = _named_plan_comments(approved, plan_config)
+        approvals = ((1, "a"), (1, "b"), (1, "c"))
+    else:
+        comments = _named_plan_comments(approved, plan_config, removed=("c",))
+        # An incomplete plan lacks b's approval on the signed two-seat board.
+        approvals = ((2, "a"), (2, "b")) if plan_state == "signed" else ((2, "a"),)
+    for index, (round_number, agent) in enumerate(approvals):
+        comments.append({
+            "author": {"login": "bot"}, "createdAt": f"2026-05-23T00:02:{index:02d}Z",
+            "id": 60 + index,
+            "body": _attach_round_metadata("Approved.", PostedRoundMetadata(
+                flow="plan", role="reviewer", agent=agent, round_number=round_number,
+                subject="plan", state="approved", seat_binding=binding,
+            )),
+        })
+    runner = FakeRunner(
+        issue_payloads_by_number={56: {"number": 56}},
+        issue_comments_by_number={56: comments},
+    )
+    kwargs = {}
+    overrides = {}
+    if scope == "explicit-scope":
+        # Managed-CI fresh authorization with an explicit issue scope.
+        kwargs["managed_ci_issue_number"] = 56
+    else:
+        # Ordinary managed-CI recovery binds the issue named by the managed branch.
+        runner.pr_payload["headRefName"] = "agent-loop/managed-56"
+        overrides["managed_ci_pr_mode"] = True
+    return seats, runner, kwargs, overrides
+
+
+@pytest.mark.parametrize("scope", ["explicit-scope", "managed-branch"])
+@pytest.mark.parametrize("plan_state", ["signed", "unsigned", "incomplete"])
+def test_no_handoff_pr_entry_floor_verifies_the_canonical_plan(
+    tmp_path, monkeypatch, scope, plan_state
+):
+    """item-7: without a handoff record the entry floor uses the verified canonical plan."""
+    from coding_review_agent_loop.cli import run_pr_loop
+    from test_issue_pr_handoff import _named_config
+
+    seats, runner, kwargs, overrides = _no_handoff_plan_pr(
+        tmp_path, plan_state=plan_state, scope=scope,
+    )
+    releases = _watch_retained_label(monkeypatch)
+    config = _named_config(tmp_path, seats[:2], min_reviewers=3, **overrides)
+    if plan_state == "signed":
+        with pytest.raises(_Reached):
+            run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True, **kwargs)
+        assert releases == [True]
+    else:
+        refusal = (
+            "2 reviewer\\(s\\) is below the floor of 3" if plan_state == "unsigned"
+            else "without a complete canonical reviewer approval"
+        )
+        with pytest.raises(AgentLoopError, match=refusal):
+            run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True, **kwargs)
+        assert releases == []
+    assert runner.comments == []
+    assert _agent_commands(runner) == []
+
+
+def test_persisted_seat_binding_drift_never_authorizes_the_floor_or_writes(tmp_path, monkeypatch):
+    """item-8: an activated signed removal plus a backend change on a remaining seat."""
+    runner, board, run_pr_loop = _amended_named_pr(tmp_path, monkeypatch)
+    # Activate the signed removal of flash with a complete round on the new head.
+    runner.codex_outputs.append(structured_pr_review())
+    runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini"))
+    runner.antigravity_outputs.append(
+        (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0)
+    )
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, **board)) == 0
+    assert any("Reviewer board amendment applied." in comment for comment in runner.comments)
+    # opus stays a seat ID but moves from Antigravity to Codex.
+    opus = _seat(tmp_path, "opus", "codex", "gpt-b")
+    drifted = dict(board, reviewer=("codex", "gemini", board["reviewer"][2], opus),
+                   reviewer_seats=(board["reviewer_seats"][0], opus))
+    comments_before = len(runner.comments)
+    commands_before = len(runner.commands)
+    releases = _watch_retained_label(monkeypatch)
+    with pytest.raises(AgentLoopError, match="backend"):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, **drifted, min_reviewers=4),
+                    workdirs_ready=True)
+    assert releases == []
+    assert len(runner.comments) == comments_before
+    assert not [c for c, _ in runner.commands[commands_before:] if c[0] in _AGENT_COMMANDS]

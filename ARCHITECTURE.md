@@ -1954,10 +1954,16 @@ write is the release of a retained managed label on a ready PR. Whenever signed
 PR amendments exist, or a floor is set and that label would be released, the
 complete lineage and the floor are resolved first, even without floor flags.
 That resolution uses the authoritative approved plan. The owning issue is the
-caller's issue, an explicit managed-CI issue scope, or the PR-side contract's
-primary issue. The plan identity comes from the caller's approved plan or from
+caller's issue, an explicit managed-CI issue scope, the PR-side contract's
+primary issue, or, for ordinary managed-CI recovery, the issue named by the
+managed branch. The plan identity comes from the caller's approved plan or from
 the issue-side handoff that names this PR. The board then comes from the issue
-holding exactly that plan, either the child or its staged parent. This is the
+holding exactly that plan, either the child or its staged parent. With no
+handoff record, the owning issue's completely approved canonical plan is
+verified by the same helper the recovery paths use, and that issue's board is
+used. The read-only PR preflight also validates persisted PR seat bindings
+before it grants a signed floor exception, so a backend change on a remaining
+seat fails before any write. This is the
 same selection the handoff seam applies, and the seam repeats the check. The
 exception covers only the measures the chain
 lowered from C0 to Cn, and never goes below the signed board's own counts with

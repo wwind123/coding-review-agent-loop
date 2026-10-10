@@ -7,6 +7,7 @@ orchestrator re-exports every name defined here.
 from __future__ import annotations
 
 import hashlib
+import re
 import shlex
 import sys
 import time
@@ -497,6 +498,39 @@ def _enforce_pr_board_floor(
     )
 
 
+def _canonical_plan_without_handoff(
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+    *,
+    source_locator: str,
+    error_message: str,
+) -> ApprovedPlanContext | None:
+    """The completely approved canonical plan of an issue with no handoff record.
+
+    Approval is verified against the approving plan board, never the PR
+    invocation's board (#1373).  ``None`` means the issue has no plan round;
+    incomplete approval raises ``error_message``.
+    """
+    plan_config, plan_comments = plan_verification_inputs(
+        config, issue_context.comments, issue_number=issue_context.number,
+    )
+    resumed_plan = _resume_plan_round(plan_comments, configured_reviewers=reviewers(plan_config))
+    if resumed_plan is None:
+        return None
+    plan_text, resumed_plan_round = resumed_plan
+    _require_complete_canonical_plan_approval(
+        plan_comments,
+        config=plan_config,
+        plan_text=plan_text,
+        plan_round=resumed_plan_round,
+        human_requirements=issue_context.human_requirements,
+        error_message=error_message,
+    )
+    return make_approved_plan_context(
+        plan_text, source_locator=source_locator, expected_hash=approved_plan_hash(plan_text),
+    )
+
+
 def _entry_plan_handoff_board(
     runner: Runner,
     *,
@@ -527,6 +561,14 @@ def _entry_plan_handoff_board(
         )
         if recorded is not None:
             owning_number = recorded.primary_issue_number
+    if owning_number is None and config.managed_ci_pr_mode:
+        # Ordinary managed-CI recovery binds the issue named by the managed
+        # branch, exactly as recover_issue_created_handoff does.
+        branch = re.fullmatch(
+            r"agent-loop/managed-([1-9]\d*)", pr_context.metadata.head_branch or "",
+        )
+        if branch is not None:
+            owning_number = int(branch.group(1))
     if owning_number is None:
         return None
     owning = get_issue_context(runner, config=config, issue_number=owning_number)
@@ -537,17 +579,31 @@ def _entry_plan_handoff_board(
         handoff = find_latest_issue_pr_handoff(
             owning.comments, issue_number=owning.number, repo=config.repo,
         )
-        if (
-            handoff is None
-            or handoff.pr_number != pr_number
-            or handoff.flow != "approved-plan-implementation"
-        ):
+        if handoff is None:
+            # No handoff record: the recovery paths bind the issue's completely
+            # approved canonical plan, verified the same way here.
+            canonical = _canonical_plan_without_handoff(
+                config,
+                owning,
+                source_locator=f"issue #{owning.number} canonical approved plan",
+                error_message=(
+                    f"Issue #{owning.number} has planning state without a complete "
+                    "canonical reviewer approval; no PR write was made."
+                ),
+            )
+            if canonical is None:
+                return None
+            # That plan was verified on this issue, which therefore owns its board.
+            plan = derive_plan_verification_context(owning.comments, issue_number=owning.number)
+            return resolve_plan_handoff_board(config, plan) if plan is not None else None
+        elif handoff.pr_number != pr_number or handoff.flow != "approved-plan-implementation":
             return None
-        if not handoff.plan_hash:
+        elif not handoff.plan_hash:
             raise AgentLoopError(
                 f"Approved-plan handoff for issue #{owning.number} has no plan hash."
             )
-        plan_hash, plan_subject = handoff.plan_hash, None
+        else:
+            plan_hash, plan_subject = handoff.plan_hash, None
     parent_number = (
         parent_issue_context.number
         if parent_issue_context is not None
@@ -591,13 +647,20 @@ def _signed_pr_board_preflight(
     chain, its signed authorization.  The same drift error the startup block
     raises fails closed here, before any write.
     """
-    from .reviewer_seats import reviewer_seat_binding, validate_pr_backend_outage_amendments
+    from .reviewer_seats import (
+        reviewer_seat_binding,
+        validate_pr_backend_outage_amendments,
+        validate_pr_seat_bindings,
+    )
 
     validate_pr_backend_outage_amendments(amendments, config)
     capabilities = policy_capabilities(config.pr_review_policy)
     # Malformed history propagates for every policy: a signed amendment must
     # never be applied, or authorize a floor exception, over it.
     records = _extract_round_metadata_records(pr_context.comments, flow="pr")
+    # Persisted seat bindings are validated before any authorization: a
+    # backend change on a remaining seat fails here, before any write.
+    validate_pr_seat_bindings(records, config)
     configured = reviewers(config)
     contract = make_contract(
         tuple(agent_display_name(reviewer) for reviewer in configured),
@@ -894,38 +957,21 @@ def run_pr_loop(
             else:
                 # Plan approval is verified against the approving plan board,
                 # never this PR invocation's board (#1373).
-                plan_config, plan_comments = plan_verification_inputs(
-                    config, issue_context.comments, issue_number=issue_context.number,
+                recovered_plan_context = _canonical_plan_without_handoff(
+                    config,
+                    issue_context,
+                    source_locator=f"issue #{fresh_issue_number} canonical approved plan",
+                    error_message=(
+                        "Managed-CI fresh authorization found planning state without "
+                        "a complete canonical reviewer approval."
+                        + _pr_amendment_plan_board_hint(
+                            initial_pr_context.comments,
+                            pr_number=pr_number,
+                            supplied_reviewers=reviewers(config),
+                        )
+                    ),
                 )
-                resumed_plan = _resume_plan_round(
-                    plan_comments,
-                    configured_reviewers=reviewers(plan_config),
-                )
-                if resumed_plan is not None:
-                    plan_text, resumed_plan_round = resumed_plan
-                    _require_complete_canonical_plan_approval(
-                        plan_comments,
-                        config=plan_config,
-                        plan_text=plan_text,
-                        plan_round=resumed_plan_round,
-                        human_requirements=issue_context.human_requirements,
-                        error_message=(
-                            "Managed-CI fresh authorization found planning state without "
-                            "a complete canonical reviewer approval."
-                            + _pr_amendment_plan_board_hint(
-                                initial_pr_context.comments,
-                                pr_number=pr_number,
-                                supplied_reviewers=reviewers(config),
-                            )
-                        ),
-                    )
-                    recovered_plan_context = make_approved_plan_context(
-                        plan_text,
-                        source_locator=(
-                            f"issue #{fresh_issue_number} canonical approved plan"
-                        ),
-                        expected_hash=approved_plan_hash(plan_text),
-                    )
+                if recovered_plan_context is not None:
                     if (
                         approved_plan_context is not None
                         and approved_plan_context.plan_hash
@@ -1043,38 +1089,22 @@ def run_pr_loop(
                             )
                         recovered_scope = candidate_scope
                     elif canonical_handoff is None:
-                        plan_config, plan_comments = plan_verification_inputs(
-                            config, issue_context.comments, issue_number=issue_context.number,
+                        recovered_scope = _canonical_plan_without_handoff(
+                            config,
+                            issue_context,
+                            source_locator=(
+                                f"issue #{managed_ci_handoff.issue_number} canonical approved plan"
+                            ),
+                            error_message=(
+                                "Managed-CI ordinary resume found incomplete canonical "
+                                "plan approval."
+                                + _pr_amendment_plan_board_hint(
+                                    initial_pr_context.comments,
+                                    pr_number=pr_number,
+                                    supplied_reviewers=reviewers(config),
+                                )
+                            ),
                         )
-                        resumed_plan = _resume_plan_round(
-                            plan_comments,
-                            configured_reviewers=reviewers(plan_config),
-                        )
-                        if resumed_plan is not None:
-                            plan_text, resumed_plan_round = resumed_plan
-                            _require_complete_canonical_plan_approval(
-                                plan_comments,
-                                config=plan_config,
-                                plan_text=plan_text,
-                                plan_round=resumed_plan_round,
-                                human_requirements=issue_context.human_requirements,
-                                error_message=(
-                                    "Managed-CI ordinary resume found incomplete canonical "
-                                    "plan approval."
-                                    + _pr_amendment_plan_board_hint(
-                                        initial_pr_context.comments,
-                                        pr_number=pr_number,
-                                        supplied_reviewers=reviewers(config),
-                                    )
-                                ),
-                            )
-                            recovered_scope = make_approved_plan_context(
-                                plan_text,
-                                source_locator=(
-                                    f"issue #{managed_ci_handoff.issue_number} canonical approved plan"
-                                ),
-                                expected_hash=approved_plan_hash(plan_text),
-                            )
                     if recovered_scope is not None:
                         if (
                             approved_plan_context is not None
