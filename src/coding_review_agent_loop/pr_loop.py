@@ -3697,6 +3697,9 @@ def run_pr_loop(
                 )
             }
             shared_reviewer_pr_checks: PullRequestChecks | None = None
+            reviewer_agents_by_name = {
+                agent_display_name(reviewer): reviewer for reviewer in configured_reviewers
+            }
 
             def _post_pr_reviewer_comment(
                 reviewer_name: str,
@@ -3726,7 +3729,8 @@ def run_pr_loop(
                     runner, config=config, pr_number=pr_number, **publication_hook,
                     body=_attach_round_metadata(
                         render_public_agent_comment(
-                            kind="pr_review", parsed=parsed, agent=reviewer_name,
+                            kind="pr_review", parsed=parsed,
+                            agent=reviewer_agents_by_name[reviewer_name],
                             human_requirements_resolved_flag=human_requirements_resolved(review_output),
                             prior_items=prior_unresolved_items, dispositions=parsed.dispositions,
                             config=config, model_used=model_used,

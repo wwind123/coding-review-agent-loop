@@ -145,6 +145,8 @@ def test_named_pr_lock_wait_resume_keeps_seats_incomplete(tmp_path, monkeypatch)
     assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 2
     reviews = [c["body"] for c in runner.pr_payload["comments"] if "**Review verdict:**" in c["body"]]
     assert len(reviews) == 2
+    assert any(body.endswith("-- flash (Google Antigravity: Model A)") for body in reviews)
+    assert any(body.endswith("-- opus (Google Antigravity: Model B)") for body in reviews)
 
 
 def _initial_plan() -> str:

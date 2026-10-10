@@ -32,6 +32,13 @@ def test_named_seat_fallback_stays_local_and_usage_is_separate(tmp_path):
         agent_max_retries=0, pre_review_tests=False,
     )
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    reviews = [
+        comment["body"] for comment in runner.pr_payload["comments"]
+        if "**Review verdict:**" in comment["body"]
+    ]
+    assert len(reviews) == 2
+    assert any(body.endswith("-- flash (Google Antigravity: Model B)") for body in reviews)
+    assert any(body.endswith("-- opus (Google Antigravity: Model C)") for body in reviews)
     models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
               if cmd and cmd[0] == "agy" and "--model" in cmd]
     assert models == ["Model A", "Model B", "Model C"]

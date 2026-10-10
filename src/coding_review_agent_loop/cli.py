@@ -227,7 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         subparser.add_argument(
             "--reviewer-seat", action="append", default=None, metavar="SEAT=BACKEND",
-            help="Declare a named reviewer seat (claude, codex, gemini, or agy). Named review execution is gated in this phase.",
+            help="Declare a named PR reviewer seat (claude, codex, gemini, or agy); plan-first review remains unavailable.",
         )
         subparser.add_argument(
             "--seat-model", action="append", default=None, metavar="SEAT=MODEL",
