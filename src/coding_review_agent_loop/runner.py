@@ -135,13 +135,20 @@ def run_binary_capture(
     if timeout_seconds <= 0:
         raise AgentLoopError("Binary command timeout must be positive.")
     cmd = [str(value) for value in args]
+    pass_fds: tuple[int, ...] = ()
+    protected_git = bool(cmd and cmd[0] == "git")
+    if protected_git:
+        from .secure_git import local_command
+
+        cmd, env, pass_fds = local_command(cmd[1:], environ=env, checkout=cwd)
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=({**os.environ, **env} if env is not None else None),
+        env=(env if protected_git else ({**os.environ, **env} if env is not None else None)),
+        pass_fds=pass_fds,
     )
     assert proc.stdout is not None
     assert proc.stderr is not None
@@ -2032,6 +2039,12 @@ class Runner:
                 "Runner is shutting down after an interrupt; refusing to start new commands."
             )
 
+        pass_fds: tuple[int, ...] = ()
+        protected_git = bool(cmd and cmd[0] == "git")
+        if protected_git:
+            from .secure_git import local_command
+
+            cmd, env, pass_fds = local_command(cmd[1:], environ=env, checkout=cwd)
         proc = subprocess.run(
             cmd,
             cwd=cwd,
@@ -2040,7 +2053,8 @@ class Runner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            env=({**os.environ, **env} if env is not None else None),
+            env=(env if protected_git else ({**os.environ, **env} if env is not None else None)),
+            pass_fds=pass_fds,
         )
         result = CommandResult(cmd, cwd, proc.stdout, proc.stderr, proc.returncode)
         if check and proc.returncode != 0:

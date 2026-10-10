@@ -3,6 +3,7 @@
 import fcntl
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -363,7 +364,10 @@ def synced(tmp_path):
     git(origin, "commit", "-q", "-m", "init")
     checkout = tmp_path / "work"
     git(tmp_path, "clone", "-q", str(origin), str(checkout))
-    cfg = make_config(tmp_path, codex_dir=checkout, create_dirs=False)
+    cfg = replace(
+        make_config(tmp_path, codex_dir=checkout, create_dirs=False),
+        trusted_local_origin=origin,
+    )
     runner = Runner()
     return config_module, cfg, runner, checkout
 
@@ -653,9 +657,12 @@ def test_legacy_oversized_injection_is_reported_not_stripped(harness):
 def test_filesystem_errors_during_capture_fail_closed_and_poison(harness, monkeypatch):
     (harness.repo / "link").symlink_to("a.py")
     cv.record_checkout_baseline(harness.config, harness.runner, harness.repo, source="test")
+    real_readlink = cv.os.readlink
 
     def vanished(*args, **kwargs):
-        raise FileNotFoundError("link vanished between lstat and readlink")
+        if os.path.basename(os.fsdecode(args[0])) == "link":
+            raise FileNotFoundError("link vanished between lstat and readlink")
+        return real_readlink(*args, **kwargs)
 
     monkeypatch.setattr(cv.os, "readlink", vanished)
     refused(harness, "could not be read while fingerprinting")
@@ -786,6 +793,37 @@ def sync_pr(pr_synced):
         cfg, runner, path=checkout, label="Default codex workdir", default_owned=True,
         pr_number=7, pr_metadata=meta,
     )
+
+
+def test_plain_checkout_base_and_pr_sync_ignore_planted_git_execution(pr_synced, tmp_path):
+    config_module, cfg, runner, checkout, meta = pr_synced
+    marker = tmp_path / "planted-hook"
+    hook = checkout / ".git" / "hooks" / "post-checkout"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    hook.chmod(0o755)
+    git(checkout, "config", "core.fsmonitor", f"touch {marker}")
+    config_module._sync_base_branch(
+        checkout, label="Default codex workdir", default_owned=True, config=cfg, runner=runner
+    )
+    sync_pr(pr_synced)
+    assert (checkout / "feature.txt").exists()
+    assert not marker.exists()
+
+
+def test_sandboxed_inspection_refuses_planted_config_and_sync_stays_safe(pr_synced, tmp_path):
+    from coding_review_agent_loop import inspect_tool
+    from coding_review_agent_loop.secure_git import _git_path
+
+    config_module, cfg, runner, checkout, meta = pr_synced
+    marker = tmp_path / "planted-filter"
+    git(checkout, "config", "filter.planted.clean", f"touch {marker}")
+    with pytest.raises(inspect_tool.InspectRejected, match="filter.planted.clean"):
+        inspect_tool.run_hardened_git(_git_path(), "status", (), cwd=str(checkout))
+    config_module._sync_base_branch(
+        checkout, label="Default codex workdir", default_owned=True, config=cfg, runner=runner
+    )
+    sync_pr(pr_synced)
+    assert not marker.exists()
 
 
 def test_pr_sync_verifies_first_then_refreshes_the_baseline(pr_synced):

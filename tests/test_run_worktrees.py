@@ -47,7 +47,7 @@ from coding_review_agent_loop.config import config_from_args, ensure_agent_workd
 from coding_review_agent_loop.runner import Runner
 args = build_parser().parse_args([
     "task", "x", "--repo", "OWNER/REPO", "--coder", coder, "--reviewer", reviewer,
-    "--base", "main", "--gh-cmd", gh, "--claude-cmd", "/bin/true",
+    "--base", "main", "--gh-cmd", gh, "--trusted-local-origin", bare, "--claude-cmd", "/bin/true",
     "--codex-cmd", "/bin/true", "--antigravity-cmd", "/bin/true", "--quiet",
     *sys.argv[9:],
 ])
@@ -128,7 +128,7 @@ class Env:
     def config(self, *, coder="claude", reviewer="codex", extra=()):
         args = build_parser().parse_args([
             "task", "x", "--repo", "OWNER/REPO", "--coder", coder, "--reviewer", reviewer,
-            "--base", "main", "--gh-cmd", str(self.gh), "--claude-cmd", "/bin/true",
+            "--base", "main", "--gh-cmd", str(self.gh), "--trusted-local-origin", str(self.bare), "--claude-cmd", "/bin/true",
             "--codex-cmd", "/bin/true", "--antigravity-cmd", "/bin/true", "--quiet", *extra,
         ])
         return config_from_args(args, Runner())
@@ -268,6 +268,58 @@ def test_concurrent_default_runs_use_distinct_worktrees(tmp_path, monkeypatch):
     finally:
         stop(proc_a)
     assert not a_path.exists()
+
+
+def test_linked_store_sync_ignores_planted_execution(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    config = env.config()
+    with workdir_claim_scope(command="task"):
+        claim_agent_workdirs(config)
+        ensure_agent_workdirs(config, Runner())
+        store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+        marker = tmp_path / "shared-store-marker"
+        hook = store / ".git" / "hooks" / "post-checkout"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        git(store, "config", "core.fsmonitor", f"touch {marker}")
+        sha = env.commit("a.txt", "new base")
+        sync_coder_base_before_implementation(config, Runner())
+        assert git(config.claude_dir, "rev-parse", "HEAD") == sha
+        env.set_pr_head(7, sha)
+        assert run_worktrees.pin_pr_head(store, 7, config=config, runner=Runner()) == sha
+        assert not marker.exists()
+
+
+def test_failed_fresh_materialization_keeps_pending_record_only(tmp_path, monkeypatch):
+    env = Env(tmp_path, monkeypatch)
+    config = env.config()
+    store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+    sha = run_worktrees.prepare_store(store, config=config, runner=Runner())
+    path = config.claude_dir
+
+    class FailReset(RecordingRunner):
+        def run(self, args, *, cwd, **kwargs):
+            if tuple(args[:2]) == ("git", "reset"):
+                raise AgentLoopError("forced reset failure")
+            return super().run(args, cwd=cwd, **kwargs)
+
+    with run_worktrees.store_lock(store):
+        with pytest.raises(AgentLoopError, match="forced reset failure"):
+            run_worktrees.add_run_worktree(store, path, sha, config=config, runner=FailReset())
+        record = run_worktrees._read_record(store, path.name)
+        assert record is not None and record["state"] == "pending"
+        assert not path.exists()
+        assert not (store / ".git" / "worktrees" / path.name).exists()
+        from coding_review_agent_loop import agent_permissions
+
+        def refuse_registration(_config, _path):
+            raise AgentLoopError("forced registration failure")
+
+        monkeypatch.setattr(agent_permissions, "register_checkout", refuse_registration)
+        with pytest.raises(AgentLoopError, match="forced registration failure"):
+            run_worktrees.add_run_worktree(store, path, sha, config=config, runner=Runner())
+        assert run_worktrees._read_record(store, path.name)["state"] == "pending"
+        assert not path.exists()
 
 
 def test_run_end_removes_worktree(tmp_path, monkeypatch):

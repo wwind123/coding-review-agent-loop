@@ -195,8 +195,14 @@ Executor = Callable[[Sequence[str], Mapping[str, str], str, bool], ExecResult]
 def _subprocess_executor(
     argv: Sequence[str], env: Mapping[str, str], cwd: str, capture: bool
 ) -> ExecResult:
+    command = list(argv)
+    if command and os.path.basename(command[0]) == "git":
+        # The inspect interpreter still imports only this stdlib-only module.
+        # A pinned isolated helper applies the shared local Git boundary.
+        helper = os.path.join(os.path.dirname(__file__), "inspect_git_subprocess.py")
+        command = [sys.executable, "-I", "-S", helper, *command]
     completed = subprocess.run(
-        list(argv),
+        command,
         env=dict(env),
         cwd=cwd,
         shell=False,

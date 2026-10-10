@@ -1,12 +1,12 @@
 """Per-run linked worktrees over one shared clone per repository and agent (#1162).
 
-The repo-scoped clone ``<scratch>/OWNER-REPO/<agent>/repo`` is the shared
-*store*: it owns the object store and is cloned and fetched as before.  Each
+The repo-scoped checkout ``<scratch>/OWNER-REPO/<agent>/repo`` is the shared
+*store*: it owns the object store and receives verified pack imports.  Each
 CLI run with an omitted ``--<agent>-dir`` gets its own detached
 ``git worktree`` under ``<scratch>/OWNER-REPO/<agent>/runs/<run-token>``,
 protected by the usual #1127 run claim and removed when the run ends.
 
-Store mutations (clone, fetch+pin, local-base fast-forward, worktree add, prune
+Store mutations (initialization, import+pin, local-base fast-forward, link creation, prune
 and remove) are serialized by a short, **non-reentrant** host flock that is
 never held across an agent turn.  Every worktree created here has a durable
 owner record under the private host lock root; removal and pruning delete only
@@ -187,6 +187,48 @@ def _git(runner: Any, store: Path, *args: str, check: bool = True):
     return runner.run(("git", *args), cwd=store, check=check)
 
 
+def _create_detached_link(store: Path, path: Path, sha: str) -> Path:
+    """Create only Git's administrative link; reset populates it separately.
+
+    Git 2.43 execs ``update-ref`` even for ``worktree add --no-checkout``.
+    Creating the three administrative files directly keeps child execution
+    denied for the entire setup on that Git version and later versions.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", sha):
+        raise AgentLoopError("Invalid pinned commit for linked worktree.")
+    worktrees = store / ".git" / "worktrees"
+    if not (store / ".git").is_dir() or (store / ".git").is_symlink():
+        raise AgentLoopError(f"Shared store {store} has an unsafe Git directory.")
+    worktrees.mkdir(mode=0o700, exist_ok=True)
+    if worktrees.is_symlink():
+        raise AgentLoopError(f"Shared store {store} has an unsafe worktree directory.")
+    admin = worktrees / path.name
+    path.mkdir(mode=0o700)
+    path_identity = _identity(path)
+    admin_identity = None
+    try:
+        admin.mkdir(mode=0o700)
+        admin_identity = _identity(admin)
+        def exclusive(target: Path, value: str) -> None:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(value)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+        exclusive(admin / "HEAD", sha + "\n")
+        exclusive(admin / "commondir", "../..\n")
+        exclusive(admin / "gitdir", str(path / ".git") + "\n")
+        exclusive(path / ".git", f"gitdir: {admin}\n")
+    except Exception:
+        if admin_identity is not None and _identity(admin) == admin_identity and not admin.is_symlink():
+            shutil.rmtree(admin)
+        if _identity(path) == path_identity and path.is_dir() and not path.is_symlink():
+            path.rmdir()
+        raise
+    return admin
+
+
 def add_run_worktree(
     store: Path, path: Path, sha: str, *, config: Any, runner: Any
 ) -> None:
@@ -200,18 +242,35 @@ def add_run_worktree(
     record_file = _record_path(store, token)
     base = {"version": 1, "run_token": token, "path": str(path), "store": str(store)}
     _write_reservation(record_file, {**base, "state": "pending"})
-    _git(runner, store, "worktree", "add", "--detach", str(path), sha)
-    admin = _admin_dir_of(store, path)
-    if admin is None:
+    admin = _create_detached_link(store, path, sha)
+    if _admin_dir_of(store, path) != admin:
         raise AgentLoopError(f"git worktree add did not produce a linked worktree at {path}.")
-    _write_reservation(
-        record_file,
-        {**base, "state": "ready", "admin_name": admin.name,
-         "root": _identity(path), "admin": _identity(admin)},
-    )
+    try:
+        result = runner.run(("git", "reset", "--hard", sha), cwd=path)
+        head = runner.run(("git", "rev-parse", "HEAD"), cwd=path).stdout.strip()
+        status = runner.run(("git", "status", "--porcelain"), cwd=path).stdout.strip()
+        if result.returncode or head != sha or status or _admin_dir_of(store, path) != admin:
+            raise AgentLoopError(f"Fresh linked worktree {path} did not materialize cleanly.")
+    except Exception:
+        # Only a matching administrative link may be removed.  A failed
+        # materialization is never made ready or registered.
+        if _admin_dir_of(store, path) == admin:
+            _git(runner, store, "worktree", "remove", "--force", str(path), check=False)
+        raise
     from .agent_permissions import register_checkout
 
-    register_checkout(config, path)
+    try:
+        register_checkout(config, path)
+        _write_reservation(
+            record_file,
+            {**base, "state": "ready", "admin_name": admin.name,
+             "root": _identity(path), "admin": _identity(admin)},
+        )
+    except Exception:
+        if _admin_dir_of(store, path) == admin:
+            _git(runner, store, "worktree", "remove", "--force", str(path), check=False)
+        forget_checkout(path)
+        raise
 
 
 def check_link_sources(store: Path, links: Any) -> None:
@@ -373,7 +432,18 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
             make_private_dirs(store.parent)
         except OSError as exc:
             raise AgentLoopError(f"Could not create parent directory for store at {store}: {exc}") from exc
-        runner.run((config.gh_cmd, "repo", "clone", config.repo, str(store)), cwd=store.parent)
+        from .git_transport import trusted_url
+
+        if config.trusted_local_origin is not None:
+            origin = str(config.trusted_local_origin.resolve(strict=True))
+        else:
+            parts = config.repo.split("/")
+            host, owner, name = ("github.com", *parts) if len(parts) == 2 else parts
+            origin = f"https://{host}/{owner}/{name}.git"
+        trusted_url(config.repo, origin, local_origin=config.trusted_local_origin)
+        store.mkdir(mode=0o700)
+        _git(runner, store, "init", "-q", "-b", config.base or "main")
+        _git(runner, store, "remote", "add", "origin", origin)
     git_check = _git(runner, store, "rev-parse", "--is-inside-work-tree", check=False)
     if git_check.returncode != 0 or git_check.stdout.strip() != "true":
         raise AgentLoopError(
@@ -407,12 +477,18 @@ def _fast_forward_base(store: Path, base: str, sha: str, *, config: Any, runner:
             raise AgentLoopError(
                 f"Local {base} in {store} has diverged from origin/{base}; cannot fast-forward it."
             )
-    _git(runner, store, "branch", "-f", base, sha)
+    old = exists.stdout.strip() if exists.returncode == 0 else "0" * len(sha)
+    _git(runner, store, "update-ref", ref, sha, old)
 
 
 def _fetch_and_pin(store: Path, base: str, *, config: Any, runner: Any, free: bool) -> str:
-    _git(runner, store, "fetch", "origin")
-    sha = _git(runner, store, "rev-parse", f"refs/remotes/origin/{base}^{{commit}}").stdout.strip()
+    from .git_transport import import_ref
+
+    sha = import_ref(
+        store, f"refs/heads/{base}", f"refs/remotes/origin/{base}",
+        repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
+        local_origin=config.trusted_local_origin,
+    )
     if free:
         _fast_forward_base(store, base, sha, config=config, runner=runner)
     return sha
@@ -434,9 +510,15 @@ def pin_pr_head(store: Path, pr_number: int, *, config: Any, runner: Any) -> str
     """Fetch the PR head under the lock and return its SHA (not the mutable ref)."""
     pr_ref = f"refs/remotes/origin/pr/{pr_number}"
     with store_lock(store):
-        _git(runner, store, "fetch", "origin")
-        _git(runner, store, "fetch", "origin", f"+pull/{pr_number}/head:{pr_ref}")
-        return _git(runner, store, "rev-parse", f"{pr_ref}^{{commit}}").stdout.strip()
+        from .git_transport import import_ref
+
+        if config.base:
+            _fetch_and_pin(store, config.base, config=config, runner=runner, free=False)
+        return import_ref(
+            store, f"refs/pull/{pr_number}/head", pr_ref,
+            repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
+            local_origin=config.trusted_local_origin,
+        )
 
 
 # --- pruning ---------------------------------------------------------------

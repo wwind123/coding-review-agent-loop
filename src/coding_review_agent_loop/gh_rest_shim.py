@@ -376,8 +376,12 @@ def resolve_repo(explicit: str | None, env: Mapping[str, str], cwd: Path | None 
         raise UsageError(f"GH_HOST={host} is not supported in REST mode")
     repo = explicit or env.get("GH_REPO")
     if not repo:
+        from .secure_git import local_command
+
+        command, git_env, pass_fds = local_command(("config", "--local", "--no-includes", "--get", "remote.origin.url"), checkout=cwd)
         result = subprocess.run(
-            ["git", "remote", "get-url", "origin"], cwd=cwd, capture_output=True, text=True, check=False
+            command, cwd=cwd, env=git_env, pass_fds=pass_fds,
+            capture_output=True, text=True, check=False
         )
         match = _REMOTE_RE.search((result.stdout or "").strip()) if result.returncode == 0 else None
         if not match:
@@ -405,6 +409,15 @@ def _read_body(body: str | None, body_file: str | None, stdin: Callable[[], str]
 # ------------------------------------------------------------- commands ---
 
 
+def _context_git(args, **kwargs):
+    if len(args) > 1 and args[0] == "git" and args[1] == "rev-parse":
+        from .secure_git import local_command
+
+        command, env, pass_fds = local_command(args[1:], checkout=kwargs.get("cwd"))
+        return subprocess.run(command, env=env, pass_fds=pass_fds, **kwargs)
+    return subprocess.run(args, **kwargs)
+
+
 @dataclass
 class Context:
     api: GhApi
@@ -413,7 +426,7 @@ class Context:
     err: Callable[[str], None]
     stdin: Callable[[], str]
     cwd: Path | None = None
-    git: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run
+    git: Callable[..., subprocess.CompletedProcess[str]] = _context_git
 
     def repo(self, explicit: str | None) -> str:
         return resolve_repo(explicit, self.env, self.cwd)
@@ -1052,7 +1065,7 @@ def run(
             err=write_err,
             stdin=stdin or sys.stdin.read,
             cwd=cwd,
-            git=git or subprocess.run,
+            git=git or _context_git,
         )
         return handler(ctx, list(argv[2:]))
     except TransportConfigError as exc:
