@@ -461,7 +461,6 @@ def unchanged_head_stop_message(
     )
 
 
-@claimed_run("pr", "pr_number")
 def _signed_pr_board_preflight(
     runner: Runner,
     *,
@@ -535,6 +534,7 @@ def _signed_pr_board_preflight(
     )
 
 
+@claimed_run("pr", "pr_number")
 def run_pr_loop(
     runner: Runner,
     *,
