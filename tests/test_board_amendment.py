@@ -383,7 +383,7 @@ def test_named_plan_resume_applies_signed_shared_outage_before_panel(tmp_path, p
     revised_flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model C",)), tmp_path / "flash")
     restored_config = replace(
         config, reviewer=("codex", "gemini", revised_flash, opus),
-        reviewer_seats=(revised_flash, opus),
+        reviewer_seats=(revised_flash, opus), review_parallel=False,
     )
     restoration = format_reviewer_board_amendment_comment(
         flow="plan", issue=56, pr_number=None,
@@ -399,15 +399,25 @@ def test_named_plan_resume_applies_signed_shared_outage_before_panel(tmp_path, p
     })
     runner.antigravity_outputs.extend([
         structured_plan_review(reviewer="flash (Google Antigravity: Model C)"),
-        structured_plan_review(reviewer="opus (Google Antigravity: Model B)"),
+        unavailable,
     ])
     runner.codex_outputs.append(structured_plan_review())
     runner.gemini_outputs.append(structured_plan_review(reviewer="Google Gemini"))
     before = len(runner.commands)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=restored_config, plan_first=True)
+    incomplete_reviews = _extract_round_metadata_records(
+        [_comment(entry["body"]) for entry in runner.issue_comments], flow="plan"
+    )
+    assert not any(record.metadata.agent == "opus" and record.metadata.state == "approved"
+                   for record in incomplete_reviews)
+    runner.antigravity_outputs.append(
+        structured_plan_review(reviewer="opus (Google Antigravity: Model B)")
+    )
     assert run_issue_loop(runner, issue_number=56, config=restored_config, plan_first=True) == 0
     models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands[before:]
               if cmd[0] == "agy" and "--model" in cmd]
-    assert len(models) == 2 and set(models) == {"Model C", "Model B"}
+    assert models == ["Model C", "Model B", "Model B"]
     restored_reviews = [
         record.metadata for record in _extract_round_metadata_records(
             [_comment(entry["body"]) for entry in runner.issue_comments], flow="plan"
