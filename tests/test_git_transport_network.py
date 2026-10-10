@@ -42,8 +42,20 @@ def https_git(tmp_path, monkeypatch):
                     "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost"),
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     requests: list[tuple[str, str | None]] = []
+    redirected_requests: list[str | None] = []
     required_auth = {"value": None}
-    redirect = {"value": False}
+    redirect = {"value": "", "enabled": False}
+
+    class RedirectHandler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_GET(self):
+            redirected_requests.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+
+        do_POST = do_GET
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
@@ -58,9 +70,9 @@ def https_git(tmp_path, monkeypatch):
         def serve_git(self):
             auth = self.headers.get("Authorization")
             requests.append((self.path, auth))
-            if redirect["value"]:
+            if redirect["enabled"]:
                 self.send_response(302)
-                self.send_header("Location", "https://127.0.0.1:1/redirected")
+                self.send_header("Location", redirect["value"])
                 self.end_headers()
                 return
             if required_auth["value"] and (not auth or auth.lower() != required_auth["value"].lower()):
@@ -94,11 +106,16 @@ def https_git(tmp_path, monkeypatch):
             self.wfile.write(payload)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    redirected_server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
     server.socket = context.wrap_socket(server.socket, server_side=True)
+    redirected_server.socket = context.wrap_socket(redirected_server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
+    redirected_thread = threading.Thread(target=redirected_server.serve_forever, daemon=True)
     thread.start()
+    redirected_thread.start()
+    redirect["value"] = f"https://localhost:{redirected_server.server_port}/redirected"
     url = f"https://localhost:{server.server_port}/OWNER/REPO.git"
     repo = f"localhost:{server.server_port}/OWNER/REPO"
     monkeypatch.setenv("SSL_CERT_FILE", str(cert))
@@ -112,16 +129,19 @@ def https_git(tmp_path, monkeypatch):
     monkeypatch.setattr(git_transport, "_transport_env", fixture_env)
     _git(checkout, "config", "remote.origin.url", url)
     try:
-        yield checkout, url, repo, requests, required_auth, redirect
+        yield checkout, url, repo, requests, redirected_requests, required_auth, redirect
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+        redirected_server.shutdown()
+        redirected_server.server_close()
+        redirected_thread.join(timeout=5)
 
 
 @pytest.mark.parametrize("mode", ["public", "private", "redirect", "rewrite"])
 def test_real_https_transport_policy(https_git, monkeypatch, tmp_path, mode):
-    checkout, url, repo, requests, required_auth, redirect = https_git
+    checkout, url, repo, requests, redirected_requests, required_auth, redirect = https_git
     marker = tmp_path / "helper-ran"
     _git(checkout, "config", "credential.helper", f"!touch {marker}; echo password=planted")
     if mode == "rewrite":
@@ -131,7 +151,7 @@ def test_real_https_transport_policy(https_git, monkeypatch, tmp_path, mode):
         required_auth["value"] = "Basic " + base64.b64encode(f"x-access-token:{token}".encode()).decode()
         monkeypatch.setattr(git_transport, "_token_from_gh", lambda *_args: token)
     if mode == "redirect":
-        redirect["value"] = True
+        redirect["enabled"] = True
     kwargs = {"repo": repo, "runner": Runner(), "gh_cmd": "gh" if mode in {"private", "redirect"} else None}
     if mode == "redirect":
         with pytest.raises(AgentLoopError, match="Trusted Git transport failed"):
@@ -139,6 +159,7 @@ def test_real_https_transport_policy(https_git, monkeypatch, tmp_path, mode):
         assert all(path != "/redirected" for path, _ in requests)
         assert all(path.startswith("/OWNER/REPO.git/") for path, _ in requests)
         assert any(auth and auth.lower() == required_auth["value"].lower() for _, auth in requests)
+        assert redirected_requests == []
     else:
         sha = git_transport.import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main", **kwargs)
         assert sha == _git(checkout, "rev-parse", "HEAD")
