@@ -1829,19 +1829,29 @@ def run_pr_loop(
         plan_handoff_comments = issue_context.comments if issue_context is not None else ()
         plan_handoff_issue_number = issue_context.number if issue_context is not None else None
         if issue_context is not None and approved_plan_context is not None and config.reviewer_seats:
-            # A direct staged child can contain only its implementation handoff.
-            # Its approved plan and reviewer board then live on the parent issue.
-            child_plan_records = _extract_round_metadata_records(
-                issue_context.comments, flow="plan"
+            # Select the board from the issue that supplied this exact approved
+            # plan. Unrelated child plan rounds must not replace a parent board.
+            child_plan = recover_approved_plan_context(
+                issue_context.comments,
+                expected_hash=approved_plan_context.plan_hash,
+                expected_subject=approved_plan_context.plan_subject,
             )
-            if not child_plan_records and parent_issue_context is not None:
+            if child_plan.is_available:
+                if child_plan.canonical_text != approved_plan_context.canonical_text:
+                    raise AgentLoopError("Named issue-to-PR handoff plan identity changed during recovery.")
+            elif not child_plan.has_matching_candidate and parent_issue_context is not None:
                 parent_plan = recover_approved_plan_context(
                     parent_issue_context.comments,
                     expected_hash=approved_plan_context.plan_hash,
+                    expected_subject=approved_plan_context.plan_subject,
                 )
-                if parent_plan.is_available:
+                if parent_plan.is_available and parent_plan.canonical_text == approved_plan_context.canonical_text:
                     plan_handoff_comments = parent_issue_context.comments
                     plan_handoff_issue_number = parent_issue_context.number
+                else:
+                    raise AgentLoopError("Named issue-to-PR handoff has no matching parent plan reviewer board.")
+            else:
+                raise AgentLoopError("Named issue-to-PR handoff has no verifiable approved plan reviewer board.")
             plan_records = _extract_round_metadata_records(
                 plan_handoff_comments, flow="plan"
             )

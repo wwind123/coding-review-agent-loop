@@ -1202,8 +1202,11 @@ def test_managed_ci_resume_recovers_staged_parent_held_plan(tmp_path, monkeypatc
     assert_no_agent_process(runner)
 
 
-def test_staged_child_pr_rejects_divergent_parent_plan_seat_board(tmp_path, monkeypatch):
-    """A handoff-only child must validate the parent plan's bound board."""
+@pytest.mark.parametrize("unrelated_child_plan", [False, True])
+def test_staged_child_pr_rejects_divergent_parent_plan_seat_board(
+    tmp_path, monkeypatch, unrelated_child_plan,
+):
+    """Unrelated child rounds cannot replace the parent plan's bound board."""
     from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
     from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent, reviewer_seat_binding
 
@@ -1226,7 +1229,17 @@ def test_staged_child_pr_rejects_divergent_parent_plan_seat_board(tmp_path, monk
     parent = dataclasses.replace(
         parent, comments=(comment(bound_record),) + parent.comments[1:],
     )
-    assert not orchestrator._extract_round_metadata_records(child.comments, flow="plan")
+    if unrelated_child_plan:
+        other_plan = "Unrelated child plan with its own reviewer board."
+        child_record = _attach_round_metadata(other_plan, PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=1,
+            subject=_plan_subject(other_plan), canonical_plan=other_plan,
+            seat_binding=reviewer_seat_binding(make_config(
+                tmp_path, reviewer=(flash, opus, extra),
+                reviewer_seats=(flash, opus, extra),
+            )),
+        ))
+        child = dataclasses.replace(child, comments=(comment(child_record),) + child.comments)
     monkeypatch.setattr(
         orchestrator, "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,

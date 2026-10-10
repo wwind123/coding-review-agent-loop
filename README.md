@@ -947,6 +947,9 @@ Reviewer board amendment:
   use `mixed-unavailable`. Its rationale must start with
   `shared_outage_backends=backend1,backend2` on its own line. Every active seat
   of each listed backend must be removed; other removed seats remain local failures.
+- **Named plan seats.** The default `all-reviewers` plan policy persists its
+  required seat board. A shared backend outage can remove all affected seats
+  through a signed plan amendment; restoration requires a later signed record.
 - **Choosing `effective_from_round`.** Use the round number the drift error
   prints. That is the round the resume re-enters, whether the round is only
   partly recorded or already reconciled, and it is not always the latest

@@ -272,7 +272,8 @@ def test_named_pr_backend_outage_requires_one_complete_removal():
         validate_pr_backend_outage_amendments((amendment(("unbound",)),), config)
 
 
-def test_named_plan_signed_outage_requires_complete_removal_and_explicit_restore(tmp_path):
+@pytest.mark.parametrize("policy", ["primary-then-panel", "all-reviewers"])
+def test_named_plan_signed_outage_requires_complete_removal_and_explicit_restore(tmp_path, policy):
     from coding_review_agent_loop.reviewer_seats import (
         ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,
     )
@@ -290,13 +291,14 @@ def test_named_plan_signed_outage_requires_complete_removal_and_explicit_restore
             )
         ),
     )
-    original = make_plan_contract(board, "primary-then-panel", "primary")
+    primary = "primary" if policy == "primary-then-panel" else None
+    original = make_plan_contract(board, policy, primary)
 
     def signed(original_board, removed, restored, round_number):
         return format_reviewer_board_amendment_comment(
             flow="plan", issue=942, pr_number=None,
             original_required_reviewers=original_board,
-            policy="primary-then-panel", primary_reviewer="primary",
+            policy=policy, primary_reviewer=primary,
             removed_reviewers=removed, restored_reviewers=restored,
             effective_from_round=round_number,
             rationale="Shared backend outage or recovery.",
@@ -318,12 +320,14 @@ def test_named_plan_signed_outage_requires_complete_removal_and_explicit_restore
     partial = _plan_amendments([_comment(signed(board, ("flash",), (), 2))])
     with pytest.raises(AgentLoopError, match="must remove every active seat"):
         validate_pr_backend_outage_amendments(partial, config)
-    removes_primary = _plan_amendments([_comment(signed(board, ("primary",), (), 2))])
-    with pytest.raises(AgentLoopError, match="primary reviewer"):
-        amend_contract(original, removes_primary[0], base_board=board)
+    if primary is not None:
+        removes_primary = _plan_amendments([_comment(signed(board, ("primary",), (), 2))])
+        with pytest.raises(AgentLoopError, match="primary reviewer"):
+            amend_contract(original, removes_primary[0], base_board=board)
 
 
-def test_named_plan_resume_applies_signed_shared_outage_before_panel(tmp_path):
+@pytest.mark.parametrize("policy", ["primary-then-panel", "all-reviewers"])
+def test_named_plan_resume_applies_signed_shared_outage_before_panel(tmp_path, policy):
     from agent_loop_helpers import FakeRunner, make_config, structured_plan_review, structured_v1_plan_state
     from coding_review_agent_loop.cli import run_issue_loop
     from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
@@ -344,17 +348,27 @@ def test_named_plan_resume_applies_signed_shared_outage_before_panel(tmp_path):
     config = make_config(
         tmp_path, reviewer=("codex", "gemini", flash, opus),
         reviewer_seats=(flash, opus), review_parallel=True,
-        plan_review_policy="primary-then-panel", primary_plan_reviewer="codex",
+        plan_review_policy=policy,
+        primary_plan_reviewer="codex" if policy == "primary-then-panel" else None,
         plan_execution_mode="plan-only", agent_max_retries=0, max_rounds=4,
     )
-    with pytest.raises(AgentLoopError):
+    with pytest.raises(AgentLoopError) as initial_error:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert runner.issue_comments, str(initial_error.value)
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    initial_records = _extract_round_metadata_records(
+        [_comment(entry["body"]) for entry in runner.issue_comments], flow="plan"
+    )
+    assert any(record.metadata.scheduler_contract for record in initial_records), str(
+        initial_error.value
+    )
     before = len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"])
     body = format_reviewer_board_amendment_comment(
         flow="plan", issue=56, pr_number=None,
         original_required_reviewers=("Codex", "Gemini", "flash", "opus"),
-        policy="primary-then-panel", primary_reviewer="Codex",
-        removed_reviewers=("flash", "opus"), effective_from_round=2,
+        policy=policy, primary_reviewer="Codex" if policy == "primary-then-panel" else None,
+        removed_reviewers=("flash", "opus"),
+        effective_from_round=2 if policy == "primary-then-panel" else 1,
         rationale="The shared Antigravity account is unavailable.",
     )
     runner.issue_comments.append({

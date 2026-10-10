@@ -462,6 +462,9 @@ Reviewer board amendment:
   records after an amendment comment it could not read, those records are never
   reinterpreted. The drift error then tells you to delete the unread amendment
   comment and post a fresh signed record with the printed `effective_from_round`.
+- **Named plan boards.** Under `all-reviewers`, named plan rounds persist the
+  bound board even though they do not schedule a subset. Signed plan amendments
+  can remove every seat on an unavailable backend and restore them in a later round.
 - **Retroactive use.** The record rescues runs whose contract was persisted
   before this feature existed. Earlier rounds are never rewritten. Inside the
   re-entered round, reviews already posted by the remaining reviewers are

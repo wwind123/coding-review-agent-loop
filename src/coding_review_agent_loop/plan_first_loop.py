@@ -783,6 +783,11 @@ def _run_plan_first_loop(
     seat_binding = reviewer_seat_binding(config)
 
     def bound_plan_metadata(**fields: object) -> PostedRoundMetadata:
+        if seat_binding is not None and not staged_planning:
+            # Named all-reviewers plans need the same durable board lineage as
+            # scheduled plans, beginning with the first coder round record.
+            fields.setdefault("scheduler_contract", plan_scheduler_contract.as_dict())
+            fields.setdefault("reviewer_board_amendment_digest", plan_amendment_digest)
         metadata = PostedRoundMetadata(**fields)
         return (
             dataclasses_replace(metadata, seat_binding=seat_binding)
@@ -803,7 +808,7 @@ def _run_plan_first_loop(
                 else None
             ),
         )
-        if staged_planning
+        if staged_planning or seat_binding is not None
         else None
     )
     plan_primary_name = (

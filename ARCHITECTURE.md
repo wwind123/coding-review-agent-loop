@@ -552,7 +552,9 @@ backend. A signed PR `mixed-unavailable` removal records the shared outage
 backends in the rationale and validates complete removal for those backends;
 independent seat failures remain local. Evidence freeze, release, and qualification summaries persist the
 same seat binding as review records so startup can authenticate their board.
-`board_amendment.resolve_contract_lineage` is the single resolver used at plan
+Named `all-reviewers` plan rounds persist a bound board contract without
+scheduler selection state, so signed removals and later restorations use the
+same lineage. `board_amendment.resolve_contract_lineage` is the single resolver used at plan
 resume, PR startup, and the PR qualification gate. Only
 contract-bearing scheduler records take part. The base contract comes from the
 earliest persisted record, and each record is judged by exactly one
@@ -1879,7 +1881,7 @@ writes the same versioned seat binding into coder, reviewer, and scheduling
 round records. Resume validates the binding before reading
 approvals or amendments; a model-chain change starts a fresh review round
 while preserving verifiable seat-owned findings. The issue-to-PR handoff checks
-the plan board and binding before PR review begins. For a staged child with no
-plan records, it reads the parent issue that supplied the approved plan and
+the plan board and binding before PR review begins. For a staged child whose
+plan records do not match the handoff plan, it reads the parent issue that supplied the approved plan and
 verifies that issue's seat binding and amendment lineage. A named handoff
 without verifiable plan review records stops before reviewer invocation.
