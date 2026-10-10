@@ -109,14 +109,14 @@ def resolve_reviewer_seats(args: object) -> tuple[ReviewerSeat, ...]:
         if len(set(legacy_reviewers)) != len(legacy_reviewers):
             raise AgentLoopError("--reviewer cannot include the same agent more than once.")
         legacy_backends = set(legacy_reviewers)
-        coder = getattr(args, "coder", "claude")
+        coder_backends = {getattr(args, "coder", "claude"), getattr(args, "implementation_coder", None)}
         for backend, flags in {
             "antigravity": ("antigravity_model", "antigravity_models"),
             "codex": ("codex_model", "codex_reasoning_effort"),
             "claude": ("claude_model", "claude_effort"),
             "gemini": ("gemini_model",),
         }.items():
-            if backend not in legacy_backends and backend != coder:
+            if backend not in legacy_backends and backend not in coder_backends:
                 for flag in flags:
                     if getattr(args, flag, None):
                         raise AgentLoopError(

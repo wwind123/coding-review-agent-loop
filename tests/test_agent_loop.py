@@ -3575,6 +3575,24 @@ def test_named_seat_rejects_unowned_backend_effort_before_dispatch(
     assert not checkout.exists()
 
 
+def test_named_seat_preserves_implementation_coder_model_and_effort_before_phase_gate(
+    tmp_path, monkeypatch, capsys,
+):
+    monkeypatch.setattr(cli_module, "run_issue_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    checkout = tmp_path / "seat-checkout"
+    assert cli_module.main([
+        "issue", "77", "--repo", "OWNER/REPO", "--plan-first", "--coder", "codex",
+        "--implementation-coder", "claude", "--claude-model", "claude-fable-5",
+        "--claude-effort", "high", "--reviewer-seat", "alternate=claude",
+        "--seat-model", "alternate=claude-sonnet-5", "--seat-dir", f"alternate={checkout}",
+    ]) == 1
+    error = capsys.readouterr().err
+    assert "execution is unavailable in phase 1" in error
+    assert "--claude-model" not in error
+    assert "--claude-effort" not in error
+    assert not checkout.exists()
+
+
 def test_named_seat_rejects_legacy_explicit_reviewer_workdir(tmp_path, capsys):
     checkout = tmp_path / "reviewer-checkout"
     assert cli_module.main([
