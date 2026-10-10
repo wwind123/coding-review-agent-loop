@@ -4487,6 +4487,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--architecture-aggregate-max-chars", "--managed-context-max-chars",
     "--coder", "--reviewer", "--reviewer-seat", "--seat-model", "--seat-effort", "--seat-dir",
     "--primary-reviewer-seat", "--primary-plan-reviewer-seat",
+    "--min-reviewers", "--min-distinct-providers",
     "--max-rounds", "--sub-item-stall-rounds", "--managed-ci-trusted-actor", "--managed-ci-issue",
     "--human-reviewer-trusted-actor",
     "--managed-ci-issue-number",

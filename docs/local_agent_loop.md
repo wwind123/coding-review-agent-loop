@@ -599,8 +599,30 @@ seat IDs for scheduling, response validation, artifacts, approval, and resume.
 Saved plan and PR records bind seat IDs to backends and model chains. Changing a
 chain invalidates old approvals and response checkpoints, preserves verified open
 seat-owned findings, and starts a fresh review round. A backend change is
-refused. A plan-to-PR handoff checks the required seat board and binding before
-PR approvals can be reused. `discuss` continues to reject named seats.
+refused. `discuss` continues to reject named seats.
+
+The PR board is chosen per invocation. A plan approved by one board can be
+reviewed as a PR by another: plain `--reviewer` flags or different named seats,
+backends, or models. The approved plan stays verified against the board that
+approved it, including on managed-CI recovery and strict qualification. If the
+PR command repeats the plan's original or signed-amended seat set, the PR board
+is the plan's amended board, so a signed plan removal carries over. Any other
+board is an operator reconfiguration. When the PR board differs from the plan's
+effective board, the orchestrator posts one board-change audit record on the PR
+before round 1 and continues without a signature. The record lists the old and
+new seats with their backends and models, effective round 1, and the reason
+`operator-reconfigured`. Reruns do not repeat it. Every PR reviewer must approve
+the PR's exact head; plan approvals never count as PR approvals.
+
+`--min-reviewers N` and `--min-distinct-providers N` (on `issue`, `pr`, and
+`managed-pr`) set an optional floor for the effective board. Two seats on one
+backend count as one provider. The floor is checked after history is read and
+before any agent runs or comment is posted, at issue start and at PR start or
+handoff. A board below the floor is refused unless a validated signed
+reviewer-board amendment lowered that measure. The amended board's own counts
+and recorded bindings bound that exception. An unamended plan board, a
+reconfigured board, or a backend swap on an inherited seat set gets no
+exception. Without these flags nothing changes.
 Legacy `--reviewer agy` and `--antigravity-models` still describe one fallback
 reviewer. Same-account Antigravity seats share quota state and take turns under
 the host settings lock; lock waits are visible and bounded separately from the

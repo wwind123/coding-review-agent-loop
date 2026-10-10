@@ -209,6 +209,9 @@ def run_issue_loop(
         log(config, f"Validating issue #{issue_number}")
         validate_open_issue(runner, config=config, issue_number=issue_number)
         issue_context = get_issue_context(runner, config=config, issue_number=issue_number)
+        # Reviewer-board floor (#1373): read-only, before any agent or post.
+        from .plan_verification import enforce_issue_board_floor
+        enforce_issue_board_floor(config, issue_context.comments, issue_number=issue_number)
         # Before any routing (including the staged direct-child dispatch): an
         # interrupted closure after a confirmed merge into an integration base
         # is finished here, without a coder, review or merge replay.

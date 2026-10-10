@@ -211,6 +211,12 @@ class AgentLoopConfig:
     reviewer_seats: tuple[object, ...] = ()
     active_reviewer_seat_id: str | None = None
     pr_seat_binding_override: dict | None = None
+    # Per-invocation reviewer-board floor (#1373).  ``None`` means no floor.
+    # Only the option values are validated here; the board itself is checked
+    # by ``reviewer_floor.check_reviewer_floor`` after read-only history
+    # resolution, never on construction or ``dataclasses.replace``.
+    min_reviewers: int | None = None
+    min_distinct_providers: int | None = None
     approved_followups: str = "ignore"
     # Approved-follow-up semantic reuse is deliberately bounded and can be
     # disabled for offline/reproducibility-sensitive invocations.
@@ -655,6 +661,16 @@ class AgentLoopConfig:
                 "--pr-review-policy must be 'all-reviewers', 'selective-intermediate', "
                 "or 'primary-then-panel'."
             )
+        for option_name, floor_value in (
+            ("--min-reviewers", self.min_reviewers),
+            ("--min-distinct-providers", self.min_distinct_providers),
+        ):
+            if floor_value is not None and (
+                isinstance(floor_value, bool)
+                or not isinstance(floor_value, int)
+                or floor_value < 1
+            ):
+                raise AgentLoopError(f"{option_name} must be a positive integer.")
         configured_reviewers = tuple(self.reviewer)
         if not configured_reviewers or len(set(configured_reviewers)) != len(configured_reviewers):
             raise AgentLoopError("Reviewer configuration must be a unique, non-empty board.")
@@ -2245,6 +2261,8 @@ def config_from_args(
             else DEFAULT_BROAD_RULES
         ),
         pr_review_force_full=bool(getattr(args, "pr_review_force_full", False)),
+        min_reviewers=getattr(args, "min_reviewers", None),
+        min_distinct_providers=getattr(args, "min_distinct_providers", None),
         plan_review_policy=getattr(args, "plan_review_policy", None) or "all-reviewers",
         primary_plan_reviewer=(
             next((seat for seat in seat_agents if seat == args.primary_plan_reviewer_seat), None)

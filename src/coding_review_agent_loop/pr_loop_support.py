@@ -2967,16 +2967,26 @@ def _verify_strict_managed_plan_binding(
 
     if metadata.head_branch != f"agent-loop/managed-{issue_context.number}" or not metadata.head_sha:
         raise fail(f"the PR is not the reserved managed branch for issue #{issue_context.number}")
+    # The approving plan board comes from the issue's own history, never the
+    # PR board (#1373).  Without plan records there is nothing to derive.
+    from .plan_verification import plan_verification_config
+
+    try:
+        plan_config = plan_verification_config(
+            config, issue_context.comments, issue_number=issue_context.number,
+        )
+    except AgentLoopError as exc:
+        raise fail(f"the approving plan board cannot be verified: {exc}") from exc
     resumed_plan = _resume_plan_round(
         issue_context.comments,
-        configured_reviewers=reviewers(config),
+        configured_reviewers=reviewers(plan_config),
     )
     if resumed_plan is None:
         raise fail("the issue carries no canonical approved plan")
     plan_text, plan_round = resumed_plan
     _require_complete_canonical_plan_approval(
         issue_context.comments,
-        config=config,
+        config=plan_config,
         plan_text=plan_text,
         plan_round=plan_round,
         human_requirements=issue_context.human_requirements,

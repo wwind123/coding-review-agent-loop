@@ -1894,8 +1894,50 @@ default seats keep historical signatures and metadata bytes. Issue-plan review
 writes the same versioned seat binding into coder, reviewer, and scheduling
 round records. Resume validates the binding before reading
 approvals or amendments; a model-chain change starts a fresh review round
-while preserving verifiable seat-owned findings. The issue-to-PR handoff checks
-the plan board and binding before PR review begins. For a staged child whose
-plan records do not match the handoff plan, it reads the parent issue that supplied the approved plan and
-verifies that issue's seat binding and amendment lineage. A named handoff
-without verifiable plan review records stops before reviewer invocation.
+while preserving verifiable seat-owned findings.
+
+### Per-invocation PR boards and the reviewer floor (#1373)
+
+The PR reviewer board is a per-invocation choice. A plan approved by board A
+can hand off to PR review by board B, so the handoff no longer requires the
+plan's named seats, seat set, or seat models. `plan_verification.py` derives one
+plan verification context from the plan's owning issue: the persisted plan
+contract and its signed plan amendment lineage (C0 to Cn), the plan seat
+binding, and the planning policy and primary. Plain all-reviewers plans persist
+neither, so their board is every reviewer that reviewed the plan. Every
+plan-approval reader uses this context and never reads the PR invocation's
+board: managed-CI fresh authorization, ordinary resume without an issue-side
+handoff, the handoff seam, and strict managed-CI qualification. For a staged
+child whose plan records do not match the handoff plan, the seam reads the
+parent issue that supplied the approved plan.
+
+`reviewer_seats.resolve_plan_handoff_board` applies the handoff board rule. If
+the invocation's seat-ID set equals the plan's C0 or Cn, the PR board is
+restricted to Cn, so a signed plan removal stays removed and a signed
+restoration is included. Any other seat set is an operator reconfiguration, and
+the PR board is exactly the invocation's board. When the derived PR board
+differs from Cn in membership, backend, model chain, or effort, the PR loop
+posts one plain-text board-change audit record on the PR before round 1. The
+record lists the old and new boards, effective round 1, and reason
+`operator-reconfigured`. A digest over that content identifies it, so a rerun
+posts nothing new. It carries no protocol marker or signature grammar and
+cannot be read as a signed amendment or human requirement. An unchanged board
+posts nothing. Plan approvals never count as PR approvals: every PR board
+reviewer must approve the PR's exact head.
+
+`--min-reviewers` and `--min-distinct-providers` set an optional
+per-invocation floor. Config validates only that the values are positive
+integers. `AgentLoopConfig` construction and `dataclasses.replace` never compare
+the board with the floor, so amendment rebinding cannot trip it.
+`reviewer_floor.check_reviewer_floor` checks the effective board after
+read-only history and lineage resolution. It runs before any workdir setup,
+PR-side write, or agent invocation, at issue-run start and at PR start or
+handoff. Providers are counted by seat backend. Only a validated, non-empty
+signed amendment chain supplies a floor exception. At handoff that requires an
+inherited seat set; on the PR it requires a signed PR amendment, and that check
+waits for the PR lineage. The exception covers only the measures the chain
+lowered from C0 to Cn, and never goes below the signed board's own counts with
+its recorded bindings. A binding swap therefore cannot inherit a provider
+exception. Recording unsigned in-run PR and plan board changes is later work
+(stages 2 and 3 of #1373). Until then, a persisted PR or plan scheduler contract
+is still immutable apart from signed amendments.
