@@ -14359,6 +14359,16 @@ def _mutate_1367(chain, case):
         ))
     elif case == "dispatch-precedes-fresh":
         chain["dispatch"] = meta(59, _dispatch_meta_1367())
+    elif case == "extra-dispatch-before-fresh":
+        # A second, otherwise valid attempt-2 dispatch before the grant must
+        # be counted, not filtered out by position.
+        chain["early-dispatch"] = meta(59, _dispatch_meta_1367())
+    elif case == "extra-dispatch-before-root":
+        chain["early-dispatch"] = meta(40, _dispatch_meta_1367())
+    elif case == "original-dispatch-after-rejected":
+        chain["late-original"] = meta(53, _dispatch_meta_1367(attempt=1, head=_H0_1367))
+    elif case == "extra-coder-before-root":
+        chain["early-coder"] = meta(40, _coder_meta_1367())
     elif case == "two-coders":
         chain["second-coder"] = meta(63, _coder_meta_1367())
     elif case == "coder-wrong-head":
@@ -14414,7 +14424,9 @@ _NEGATIVE_CASES_1367 = [
     "dispatch-missing", "dispatch-wrong-attempt", "dispatch-wrong-recovery-flag",
     "dispatch-wrong-head", "dispatch-wrong-round", "dispatch-wrong-round-number",
     "dispatch-invalid-budget",
-    "dispatch-precedes-fresh", "two-coders", "coder-wrong-head",
+    "dispatch-precedes-fresh", "extra-dispatch-before-fresh", "extra-dispatch-before-root",
+    "original-dispatch-after-rejected", "extra-coder-before-root", "two-coders",
+    "coder-wrong-head",
     "fresh-without-link", "fresh-wrong-head", "fresh-label-outside-history",
     "fresh-wrong-plan",
     "root-missing", "root-foreign", "root-wrong-head", "root-out-of-scope",
@@ -14579,6 +14591,10 @@ def test_m1367_named_board_requires_the_exact_reviewer_seat_binding(tmp_path, bi
     config = _config_1367(tmp_path, pr_seat_binding_override=_SEATS_1367)
     handoff = _fresh_handoff_1367()
     runner = _runner_1367(chain)
+    # A record published over the same review, or one whose review binding
+    # was removed or changed after publication, must re-authenticate against
+    # the configured board on both later walkers exactly as publication did.
+    published = _runner_1367(_published_chain_1367(chain))
     if binding == "matching":
         assert _correlate_1367(runner, config, handoff) == _RECOVERY_IDS_1367
         publish_issue_created_continuity_authorization(
@@ -14586,6 +14602,9 @@ def test_m1367_named_board_requires_the_exact_reviewer_seat_binding(tmp_path, bi
             new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
         )
         assert _authorization_posts_1367(runner) == 1
+        audit = _resume_audit_1367(published, config, _continuity_handoff_1367())
+        assert audit is not None and audit[0] == 70
+        _plan_binding_1367(published, config)
         return
     with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
         _correlate_1367(runner, config, handoff)
@@ -14595,6 +14614,9 @@ def test_m1367_named_board_requires_the_exact_reviewer_seat_binding(tmp_path, bi
             new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
         )
     assert _authorization_posts_1367(runner) == 0
+    assert _resume_audit_1367(published, config, _continuity_handoff_1367()) is None
+    with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
+        _plan_binding_1367(published, config)
 
 
 def test_m1367_identical_stranded_and_original_heads_never_open_recovery():

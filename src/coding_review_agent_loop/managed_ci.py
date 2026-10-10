@@ -2759,6 +2759,7 @@ def _rejected_recovery_round_ids(
     reviewers: list[tuple[int, Mapping[str, object]]] = []
     rejected: list[tuple[int, Mapping[str, object]]] = []
     dispatches: list[tuple[int, Mapping[str, object]]] = []
+    original_dispatches: list[int] = []
     coders: list[tuple[int, Mapping[str, object]]] = []
     for index, comment in enumerate(comments):
         metadata = by_index.get(index)
@@ -2785,10 +2786,25 @@ def _rejected_recovery_round_ids(
             if metadata["round_number"] == round_number:
                 rejected.append((comment_id, metadata))
         elif role == "summary" and phase == _CONTINUITY_DISPATCH_PHASE:
-            if metadata["round_number"] == round_number + 1 and comment_id > fresh_comment_id:
-                dispatches.append((comment_id, metadata))
+            # Count every round R+1 dispatch wherever it sits, so the strict
+            # ordering check below rejects a misordered or duplicate recovery
+            # dispatch instead of a position filter hiding it.  Only the
+            # original attempt-1 dispatch of the root head is not a candidate;
+            # the ordering check still requires it to precede the rejection.
+            if metadata["round_number"] == round_number + 1:
+                record = metadata.get("recovery")
+                if (
+                    record is not None
+                    and getattr(record, "dispatch_attempt", None) == 1
+                    and getattr(record, "recovery_dispatch", None) is False
+                    and getattr(record, "dispatch_round", None) == round_number
+                    and getattr(record, "dispatch_head", None) == root_head
+                ):
+                    original_dispatches.append(comment_id)
+                else:
+                    dispatches.append((comment_id, metadata))
         elif role == "coder":
-            if metadata["round_number"] == round_number + 1 and comment_id > root_comment_id:
+            if metadata["round_number"] == round_number + 1:
                 coders.append((comment_id, metadata))
     if not reviewers or len(rejected) != 1 or len(dispatches) != 1 or len(coders) != 1:
         return None
@@ -2823,7 +2839,7 @@ def _rejected_recovery_round_ids(
     reviewer_ids = [comment_id for comment_id, _metadata in reviewers]
     if not (
         max(reviewer_ids) < rejected_id < fresh_comment_id < dispatch_id < coder_id
-    ):
+    ) or any(comment_id > rejected_id for comment_id in original_dispatches):
         return None
     if any(not metadata.get("seat_binding_valid", False) for _id, metadata in reviewers):
         return None
@@ -5866,6 +5882,11 @@ def verify_managed_pr_plan_binding(
         valid_label_event_ids=valid_label_event_ids,
         opening_override_nonce=opening_override_nonce,
     )
+    from .reviewer_seats import reviewer_seat_binding
+
+    # Recovery links bind seat-bound reviews; re-check them against this
+    # run's configured board exactly as publication did.
+    expected_seat_binding = reviewer_seat_binding(config)
     bound_terminals: set[ManagedCiIssueAuthorization] = set()
     for terminal_comment_id, terminal in records:
         if terminal.head_sha != live_head:
@@ -5876,6 +5897,7 @@ def verify_managed_pr_plan_binding(
             comments_by_id,
             comments,
             chain_context,
+            expected_seat_binding=expected_seat_binding,
         )
         if authenticated is None:
             continue
@@ -6306,6 +6328,9 @@ def _find_resume_audit(
             handoff=expected_handoff,
         )
         comments_by_id = _comments_by_id(comments)
+        from .reviewer_seats import reviewer_seat_binding
+
+        expected_seat_binding = reviewer_seat_binding(config)
         valid_terminals: list[tuple[int, ManagedCiIssueAuthorization]] = []
         for terminal_comment_id, terminal_record in terminal:
             if _authenticate_authorization_chain(
@@ -6314,6 +6339,7 @@ def _find_resume_audit(
                 comments_by_id,
                 comments,
                 chain_context,
+                expected_seat_binding=expected_seat_binding,
             ) is not None:
                 valid_terminals.append((terminal_comment_id, terminal_record))
         if expected_handoff is not None and expected_handoff.active_label_event_id is not None:
