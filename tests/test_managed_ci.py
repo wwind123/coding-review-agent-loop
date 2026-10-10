@@ -14365,6 +14365,19 @@ def _mutate_1367(chain, case):
         chain["early-dispatch"] = meta(59, _dispatch_meta_1367())
     elif case == "extra-dispatch-before-root":
         chain["early-dispatch"] = meta(40, _dispatch_meta_1367())
+    elif case == "extra-rejected-next-round-number":
+        # Same dispatch (dispatch_round R) but round_number R+1: still counted.
+        chain["extra-rejected"] = meta(53, _rejected_meta_1367(round_number=2, dispatch_round=1))
+    elif case == "extra-rejected-malformed":
+        chain["extra-rejected"] = meta(53, _rejected_meta_1367(
+            recovery_round_budget=_Budget1367.invalid(),
+        ))
+    elif case == "extra-dispatch-other-round-number":
+        chain["extra-dispatch"] = meta(64, _dispatch_meta_1367(2, dispatch_round=1))
+    elif case == "extra-dispatch-malformed":
+        chain["extra-dispatch"] = meta(64, _dispatch_meta_1367(
+            recovery_round_budget=_Budget1367.invalid(),
+        ))
     elif case == "original-dispatch-after-rejected":
         chain["late-original"] = meta(53, _dispatch_meta_1367(attempt=1, head=_H0_1367))
     elif case == "extra-coder-before-root":
@@ -14425,6 +14438,8 @@ _NEGATIVE_CASES_1367 = [
     "dispatch-wrong-head", "dispatch-wrong-round", "dispatch-wrong-round-number",
     "dispatch-invalid-budget",
     "dispatch-precedes-fresh", "extra-dispatch-before-fresh", "extra-dispatch-before-root",
+    "extra-rejected-next-round-number", "extra-rejected-malformed",
+    "extra-dispatch-other-round-number", "extra-dispatch-malformed",
     "original-dispatch-after-rejected", "extra-coder-before-root", "two-coders",
     "coder-wrong-head",
     "fresh-without-link", "fresh-wrong-head", "fresh-label-outside-history",
@@ -14617,6 +14632,26 @@ def test_m1367_named_board_requires_the_exact_reviewer_seat_binding(tmp_path, bi
     assert _resume_audit_1367(published, config, _continuity_handoff_1367()) is None
     with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
         _plan_binding_1367(published, config)
+
+
+def test_m1367_earlier_dispatch_records_are_not_recovery_candidates(tmp_path):
+    """Row recovery-link-mismatch: only this dispatch's records are counted.
+
+    Rejected and dispatch records of an earlier dispatch (dispatch_round R-1)
+    are history, not duplicates, so they never block a valid recovery chain.
+    """
+    chain, _round = _recovery_chain_1367()
+    chain["earlier-dispatch"] = _meta_comment_1367(
+        35, _dispatch_meta_1367(0, attempt=1, head=_H0_1367)
+    )
+    chain["earlier-rejected"] = _meta_comment_1367(36, _rejected_meta_1367(round_number=0))
+    config = _config_1367(tmp_path)
+    runner = _runner_1367(chain)
+    assert _correlate_1367(runner, config, _fresh_handoff_1367()) == _RECOVERY_IDS_1367
+    published = _runner_1367(_published_chain_1367(chain))
+    audit = _resume_audit_1367(published, config, _continuity_handoff_1367())
+    assert audit is not None and audit[0] == 70
+    _plan_binding_1367(published, config)
 
 
 def test_m1367_identical_stranded_and_original_heads_never_open_recovery():

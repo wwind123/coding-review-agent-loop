@@ -5356,10 +5356,11 @@ comment order: the seat-bound blocking reviews of the original head; exactly one
 rejected-follow-up record (attempt 1, from the original head, observed at the
 stranded head); the fresh grant; exactly one attempt-2 recovery coder-dispatch
 record on the stranded head for round R+1; and exactly one round R+1 coder
-record for the new head. Every round R+1 dispatch and coder record counts toward
-"exactly one" wherever it sits, so an extra or misplaced one fails the ordering
-check rather than being skipped; only the original attempt-1 dispatch of the
-original head is exempt, and it must precede the rejected record. Both recovery
+record for the new head. Every rejected or dispatch record of the round-R
+dispatch (or for round R or R+1), and every round R+1 coder record, counts toward
+"exactly one" wherever it sits and whatever its fields, so an extra, misplaced or
+malformed one fails closed rather than being skipped; only the original attempt-1
+dispatch of the original head is exempt, and it must precede the rejected record. Both recovery
 records must pass their structural checks, including a valid round budget and
 rejection reason. The heads must be
 exact: the review and the rejected record's origin are the original

@@ -2075,12 +2075,22 @@ def _continuity_round_records(
             continue
         phase = payload.get("phase")
         seat_binding = payload.get("seat_binding")
+        raw_dispatch_round = payload.get("dispatch_round")
         result[index] = {
             "role": payload["role"],
             "state": payload.get("state"),
             "subject": payload["subject"],
             "round_number": payload["round_number"],
             "phase": phase if isinstance(phase, str) else None,
+            # The raw dispatch round, kept even when the recovery record fails
+            # validation, so a malformed record of the same dispatch is still
+            # counted as a recovery candidate (#1367).
+            "dispatch_round": (
+                raw_dispatch_round
+                if isinstance(raw_dispatch_round, int)
+                and not isinstance(raw_dispatch_round, bool)
+                else None
+            ),
             # Strictly a dict or None; any other stored value marks the record
             # unusable as a seat-bound review (#1367).
             "seat_binding": seat_binding if isinstance(seat_binding, dict) else None,
@@ -2783,21 +2793,32 @@ def _rejected_recovery_round_ids(
             ):
                 reviewers.append((comment_id, metadata))
         elif role == "summary" and phase == _CONTINUITY_REJECTED_PHASE:
-            if metadata["round_number"] == round_number:
+            # Candidates are every record of this dispatch (raw dispatch round
+            # R) or this round, counted before any field or position check so
+            # an extra malformed or misplaced record fails closed.
+            if (
+                metadata["round_number"] == round_number
+                or metadata.get("dispatch_round") == round_number
+            ):
                 rejected.append((comment_id, metadata))
         elif role == "summary" and phase == _CONTINUITY_DISPATCH_PHASE:
-            # Count every round R+1 dispatch wherever it sits, so the strict
-            # ordering check below rejects a misordered or duplicate recovery
-            # dispatch instead of a position filter hiding it.  Only the
-            # original attempt-1 dispatch of the root head is not a candidate;
-            # the ordering check still requires it to precede the rejection.
-            if metadata["round_number"] == round_number + 1:
+            # Count every dispatch of round R (or for round R+1) wherever it
+            # sits and whatever its fields, so the checks below reject a
+            # misordered, duplicate or malformed recovery dispatch instead of
+            # a filter hiding it.  Only the valid original attempt-1 dispatch
+            # of the root head is not a candidate; the ordering check still
+            # requires it to precede the rejection.
+            if (
+                metadata["round_number"] == round_number + 1
+                or metadata.get("dispatch_round") == round_number
+            ):
                 record = metadata.get("recovery")
                 if (
                     record is not None
                     and getattr(record, "dispatch_attempt", None) == 1
                     and getattr(record, "recovery_dispatch", None) is False
                     and getattr(record, "dispatch_round", None) == round_number
+                    and getattr(record, "round_number", None) == round_number + 1
                     and getattr(record, "dispatch_head", None) == root_head
                 ):
                     original_dispatches.append(comment_id)
