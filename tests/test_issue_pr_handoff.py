@@ -238,6 +238,61 @@ def test_named_staged_handoff_uses_parent_board_when_child_has_unrelated_plan(tm
     assert len([command for command, _ in runner.commands if command[0] == "agy"]) == 2
 
 
+@pytest.mark.parametrize("staged", [False, True])
+def test_fresh_pr_refuses_omitted_named_plan_seats_before_review(tmp_path, staged):
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent, reviewer_seat_binding
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata, _attach_round_metadata, make_approved_plan_context,
+    )
+
+    seats = tuple(
+        SeatAgent(ReviewerSeat(name, "antigravity", (model,)), tmp_path / name)
+        for name, model in (("flash", "Model A"), ("opus", "Model B"))
+    )
+    plan_config = make_config(tmp_path, reviewer=seats, reviewer_seats=seats)
+    approved = make_approved_plan_context("Approved named plan.")
+    binding = reviewer_seat_binding(plan_config)
+    candidate = _attach_round_metadata(approved.canonical_text, PostedRoundMetadata(
+        flow="plan", role="coder", agent="Claude", round_number=1,
+        subject="plan", canonical_plan=approved.canonical_text,
+        seat_binding=binding,
+    ))
+    checkpoint = _attach_round_metadata("Plan scheduling checkpoint.", PostedRoundMetadata(
+        flow="plan", role="summary", agent="Orchestrator", round_number=1,
+        subject="plan", seat_binding=binding,
+        scheduler_contract=make_plan_contract(
+            ("flash", "opus"), "all-reviewers", None,
+        ).as_dict(),
+    ))
+    comments = [
+        {"body": body, "author": {"login": "bot"},
+         "createdAt": f"2026-05-23T00:00:0{index}Z", "id": index}
+        for index, body in enumerate((candidate, checkpoint), start=1)
+    ]
+    issue_comments = {56: [] if staged else comments}
+    if staged:
+        issue_comments[55] = comments
+    runner = FakeRunner(
+        issue_payloads_by_number={number: {"number": number} for number in issue_comments},
+        issue_comments_by_number=issue_comments,
+    )
+    fresh_pr_config = make_config(tmp_path, reviewer=("codex",), pre_review_tests=False)
+    issue = IssueContext(56, fresh_pr_config.repo, "Issue", "Body", None, ())
+    parent = IssueContext(55, fresh_pr_config.repo, "Parent", "Body", None, ()) if staged else None
+
+    with pytest.raises(AgentLoopError, match="requires the named reviewer seats"):
+        run_pr_loop(
+            runner, pr_number=77, config=fresh_pr_config,
+            issue_context=issue, parent_issue_context=parent,
+            approved_plan_context=approved,
+        )
+    assert not any(
+        command[0] in {"codex", "claude", "agy"} for command, _ in runner.commands
+    )
+
+
 def _comment(body: str) -> IssueComment:
     return IssueComment(author="bot", created_at="2026-05-23T00:00:00Z", body=body)
 
