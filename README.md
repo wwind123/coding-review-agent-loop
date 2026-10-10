@@ -936,6 +936,11 @@ Reviewer board amendment:
   null) on the PR itself, including standalone `agent-loop pr` runs. A record
   on the wrong surface, a record naming another issue or PR, and a `pr` record
   on the owning issue all stop for a human decision.
+- **Named PR seats.** Use `reason` `seat-unavailable` when only one named seat's
+  model chain is unavailable; the other seats on its backend remain required.
+  Use `backend-unavailable` for a shared backend outage and remove every active
+  seat on that backend in the same amendment. The signed record still binds
+  the original board and takes effect only after the normal resume checks.
 - **Choosing `effective_from_round`.** Use the round number the drift error
   prints. That is the round the resume re-enters, whether the round is only
   partly recorded or already reconciled, and it is not always the latest

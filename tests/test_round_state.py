@@ -110,6 +110,37 @@ def test_named_pr_prelaunch_binding_is_checked_before_first_reviewer(tmp_path):
         validate_pr_seat_bindings((PostedRoundRecord(0, _checkpoint(), ""),), config)
 
 
+def test_named_pr_evidence_and_qualification_summaries_resume_with_binding(tmp_path, monkeypatch):
+    import coding_review_agent_loop.pr_loop_support as support
+
+    seat = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    config = make_config(tmp_path, reviewer=(seat,), reviewer_seats=(seat,))
+    bodies = []
+    monkeypatch.setattr(support, "post_pr_comment", lambda *args, **kwargs: bodies.append(kwargs["body"]))
+    common = dict(runner=None, config=config, pr_number=77, round_number=1, head_sha="head")
+    support._publish_evidence_freeze(
+        **common, items=(), signed_requirement_ids=(), allowed_rounds=3,
+        watch_failure_extension_used=False, watch_head_extension_used=False,
+    )
+    support._publish_evidence_release(
+        **common, items=(), reason="evidence-cleared", surfaced_requirement_ids=(),
+        allowed_rounds=3, watch_failure_extension_used=False,
+        watch_head_extension_used=False,
+    )
+    support._persist_qualification_checkpoint(
+        **common, unresolved_items=(), checkpoint=_legacy_checkpoint(), message="Checkpoint.",
+    )
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=body) for body in bodies], flow="pr",
+    )
+    assert [record.metadata.phase for record in records] == [
+        "evidence-freeze", "evidence-release", "qualification-checkpoint",
+    ]
+    assert all(record.metadata.seat_binding == reviewer_seat_binding(config) for record in records)
+    assert validate_pr_seat_bindings(records, config) == set()
+
+
 def test_named_pr_resume_refuses_rebound_prelaunch_before_review(tmp_path, monkeypatch):
     import coding_review_agent_loop.orchestrator as orchestrator
     from agent_loop_helpers import FakeRunner

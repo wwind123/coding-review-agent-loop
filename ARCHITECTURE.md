@@ -546,8 +546,12 @@ require a full review. The scheduler contract is immutable across a resume,
 with one audited exception (#943). A signed human `reviewer-board-amendment`
 record may remove unavailable non-primary reviewers. It is read from the same
 comment surface as the round records it amends: the issue for planning, the PR
-for PR review. `board_amendment.resolve_contract_lineage` is the single
-resolver used at plan resume, PR startup, and the PR qualification gate. Only
+for PR review. Named PR seat-local removal uses the signed `seat-unavailable` reason;
+shared `backend-unavailable` removal must cover every active seat on that
+backend. Evidence freeze, release, and qualification summaries persist the
+same seat binding as review records so startup can authenticate their board.
+`board_amendment.resolve_contract_lineage` is the single resolver used at plan
+resume, PR startup, and the PR qualification gate. Only
 contract-bearing scheduler records take part. The base contract comes from the
 earliest persisted record, and each record is judged by exactly one
 amendment-chain link. Every post-amendment scheduler record must carry the

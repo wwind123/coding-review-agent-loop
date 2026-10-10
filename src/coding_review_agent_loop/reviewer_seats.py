@@ -158,7 +158,8 @@ def validate_pr_seat_bindings(records: object, config: object) -> set[str]:
 
 
 def validate_pr_backend_outage_amendments(amendments: object, config: object) -> None:
-    """A named backend outage must remove all its active nonprimary seats."""
+    """A named shared-backend outage must remove all its active seats."""
+    from .board_amendment import REVIEWER_BOARD_REMOVAL_REASON, REVIEWER_SEAT_REMOVAL_REASON
     binding = reviewer_seat_binding(config)
     if binding is None:
         return
@@ -173,6 +174,10 @@ def validate_pr_backend_outage_amendments(amendments: object, config: object) ->
                 "Named PR board amendment has no verified backend binding for "
                 + ", ".join(sorted(unknown))
             )
+        if amendment.reason == REVIEWER_SEAT_REMOVAL_REASON:
+            continue
+        if amendment.reason != REVIEWER_BOARD_REMOVAL_REASON:
+            continue
         affected = {backends[name] for name in removed}
         required = set(amendment.original_required_reviewers)
         for backend in affected:

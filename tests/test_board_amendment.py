@@ -250,15 +250,17 @@ def test_named_pr_backend_outage_requires_one_complete_removal():
         ),
     )
     board = ("primary", "flash", "opus")
-    def amendment(removed):
+    def amendment(removed, reason="backend-unavailable"):
         return SimpleNamespace(
             original_required_reviewers=board,
             removed_reviewers=removed,
+            reason=reason,
         )
 
     with pytest.raises(AgentLoopError, match="must remove every active seat"):
         validate_pr_backend_outage_amendments((amendment(("flash",)),), config)
     validate_pr_backend_outage_amendments((amendment(("flash", "opus")),), config)
+    validate_pr_backend_outage_amendments((amendment(("flash",), "seat-unavailable"),), config)
     original_binding = reviewer_seat_binding(config)
     amended_view = SimpleNamespace(
         reviewer_seats=config.reviewer_seats,
@@ -268,6 +270,57 @@ def test_named_pr_backend_outage_requires_one_complete_removal():
     assert reviewer_seat_binding(amended_view) == original_binding
     with pytest.raises(AgentLoopError, match="no verified backend binding"):
         validate_pr_backend_outage_amendments((amendment(("unbound",)),), config)
+
+
+def test_named_pr_seat_local_amendment_reason_is_signed_and_recoverable():
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,
+    )
+
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=tuple(
+            SeatAgent(ReviewerSeat(name, backend, (model,)), Path("/tmp") / name)
+            for name, backend, model in (
+                ("primary", "codex", "gpt-6-sol"),
+                ("flash", "antigravity", "gemini-flash"),
+                ("opus", "antigravity", "claude-opus"),
+            )
+        ),
+    )
+    board = ("primary", "flash", "opus")
+    body = format_reviewer_board_amendment_comment(
+        flow="pr", issue=None, pr_number=77, original_required_reviewers=board,
+        policy="primary-then-panel", primary_reviewer="primary",
+        removed_reviewers=("flash",), effective_from_round=2,
+        reason="seat-unavailable", rationale="Only the flash model is unavailable.",
+    )
+    (record,) = collect_reviewer_board_amendments([_comment(body)], flow="pr", pr_number=77)
+    validate_pr_backend_outage_amendments((record,), config)
+    reduced = amend_contract(make_contract(board, "primary-then-panel", None, "primary"), record, base_board=board)
+    assert reduced.required_reviewers == ("primary", "opus")
+    shared_body = format_reviewer_board_amendment_comment(
+        flow="pr", issue=None, pr_number=77, original_required_reviewers=board,
+        policy="primary-then-panel", primary_reviewer="primary",
+        removed_reviewers=("flash",), effective_from_round=2,
+        rationale="The Antigravity account is unavailable.",
+    )
+    (shared,) = collect_reviewer_board_amendments([_comment(shared_body)], flow="pr", pr_number=77)
+    with pytest.raises(AgentLoopError, match="must remove every active seat"):
+        validate_pr_backend_outage_amendments((shared,), config)
+
+    from coding_review_agent_loop.review_rounds import _unavailable_reviewer_amendment_advisory
+    original = make_contract(board, "primary-then-panel", None, "primary")
+    lineage = SimpleNamespace(contracts=(original,), removed_reviewers=())
+    outcome, round_number, template = _unavailable_reviewer_amendment_advisory(
+        pr_number=77, contract=original, lineage=lineage, removed=("flash",),
+        fetch_start_round=lambda: 2, seat_local_failure=True,
+    )
+    assert (outcome, round_number) == ("validated", 2)
+    assert template is not None
+    (suggested,) = collect_reviewer_board_amendments([_comment(template)], flow="pr", pr_number=77)
+    assert suggested.reason == "seat-unavailable"
+    validate_pr_backend_outage_amendments((suggested,), config)
 
 
 def test_named_pr_signed_outage_removal_and_explicit_restoration():

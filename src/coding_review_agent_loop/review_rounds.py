@@ -15,7 +15,7 @@ from pathlib import Path
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, get_backend
 from .config import AgentLoopConfig, reviewers
-from .board_amendment import ReviewerBoardAmendment, amend_contract
+from .board_amendment import ReviewerBoardAmendment, amend_contract, REVIEWER_SEAT_REMOVAL_REASON
 from .errors import AgentInvocationError, AgentLoopError, QuotaResetExceededError
 from .github import PullRequestChecks
 from .logging import log
@@ -375,6 +375,7 @@ def _unavailable_reviewer_amendment_advisory(
     lineage: object,
     removed: Sequence[str],
     fetch_start_round: Callable[[], int],
+    seat_local_failure: bool = False,
 ) -> tuple[str, int | None, str | None]:
     """Validate an amendment removing ``removed`` before it is advertised (#1129).
 
@@ -414,6 +415,7 @@ def _unavailable_reviewer_amendment_advisory(
             persisted=contract,
             removed=removed,
             start_round_number=round_number,
+            reason=REVIEWER_SEAT_REMOVAL_REASON if seat_local_failure else None,
         )
         return "validated", round_number, template
     except Exception:  # noqa: BLE001 - advisory text only; the stop stays authoritative

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Literal
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
+from .reviewer_seats import reviewer_seat_binding
 from .config import (
     AgentLoopConfig,
     reviewers,
@@ -1681,6 +1682,7 @@ def _publish_evidence_freeze(
                 flow="pr",
                 role="summary",
                 agent="Orchestrator",
+                seat_binding=reviewer_seat_binding(config),
                 round_number=round_number,
                 subject=head_sha,
                 prior_items=tuple(frozen),
@@ -1737,6 +1739,7 @@ def _publish_evidence_release(
                 flow="pr",
                 role="summary",
                 agent="Orchestrator",
+                seat_binding=reviewer_seat_binding(config),
                 round_number=round_number,
                 subject=head_sha,
                 prior_items=tuple(released),
@@ -2148,6 +2151,7 @@ def _persist_qualification_checkpoint(
                 flow="pr",
                 role="summary",
                 agent="Orchestrator",
+                seat_binding=reviewer_seat_binding(config),
                 round_number=round_number,
                 subject=str(head_sha or "unknown"),
                 prior_items=tuple(unresolved_items),
