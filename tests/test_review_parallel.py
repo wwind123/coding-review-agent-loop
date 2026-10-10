@@ -61,6 +61,36 @@ def test_named_plan_parallel_seats_publish_distinct_bound_reviews(tmp_path):
     assert len([command for command, _ in runner.commands if command[0] == "agy"]) == 2
 
 
+def test_named_plan_fallback_counts_one_approval_for_its_seat(tmp_path):
+    flash = SeatAgent(
+        ReviewerSeat("flash", "antigravity", ("Model A", "Model B")), tmp_path / "flash",
+    )
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model C",)), tmp_path / "opus")
+    runner = FakeRunner(
+        claude_outputs=[_initial_plan()],
+        antigravity_outputs=[
+            ("quota exceeded", 1),
+            structured_plan_review(reviewer="flash (Google Antigravity: Model B)"),
+            structured_plan_review(reviewer="opus (Google Antigravity: Model C)"),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        plan_execution_mode="plan-only", agent_max_retries=0,
+    )
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands if cmd[0] == "agy"]
+    assert models == ["Model A", "Model B", "Model C"]
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from types import SimpleNamespace
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.issue_comments], flow="plan",
+    )
+    assert [record.metadata.agent for record in records if record.metadata.role == "reviewer"] == [
+        "flash", "opus",
+    ]
+
+
 def test_named_plan_primary_seat_gates_other_same_backend_seat(tmp_path):
     from agent_loop_helpers import structured_v1_plan_state
 
