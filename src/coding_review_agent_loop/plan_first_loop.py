@@ -1105,7 +1105,13 @@ def _run_plan_first_loop(
         that into the class-D diagnostic stop.
         """
         if staged_planning:
-            return plan_history_records()
+            # Binding validation must see the complete history.  The filtered
+            # view is only suitable for current-binding approval selection.
+            try:
+                return _extract_round_metadata_records(issue_context.comments, flow="plan")
+            except AgentLoopError as exc:
+                stop_plan_pre_panel(plan_undecodable_history_message(exc))
+                raise
         try:
             return _extract_round_metadata_records(issue_context.comments, flow="plan")
         except AgentLoopError:

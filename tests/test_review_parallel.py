@@ -154,6 +154,10 @@ def test_named_plan_model_change_keeps_blocker_and_requires_fresh_review(tmp_pat
     runner.antigravity_outputs.append(structured_plan_review(
         state="blocking", reviewer="opus (Google Antigravity: Model C)",
         blocking_plan_issues=["Name the rollout owner."],
+        prior_plan_item_dispositions=[{
+            "item_id": "item-1", "disposition": "blocking",
+            "note": "The rollout owner is still missing.",
+        }],
     ))
     runner.claude_outputs.append(("planner unavailable", 1))
     with pytest.raises(AgentLoopError) as changed_error:
@@ -161,7 +165,8 @@ def test_named_plan_model_change_keeps_blocker_and_requires_fresh_review(tmp_pat
     records = _extract_round_metadata_records(
         [SimpleNamespace(body=comment["body"]) for comment in runner.issue_comments], flow="plan",
     )
-    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == original_turns
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == original_turns + 1
+    assert [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands if cmd[0] == "agy"][-1] == "Model C"
     assert "Claude failed" in str(changed_error.value)
     assert "Name the rollout owner." in [
         cmd[-1] for cmd, _ in runner.commands if cmd[0] == "claude"
@@ -230,6 +235,32 @@ def test_named_plan_resume_refuses_unamended_board_shrink(tmp_path):
     with pytest.raises(AgentLoopError, match="board changed during resume"):
         run_issue_loop(runner, issue_number=56, config=reduced, plan_first=True)
     assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == calls
+
+
+def test_named_plan_resume_refuses_backend_rebinding_before_reviewer_turn(tmp_path):
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    runner = FakeRunner(
+        claude_outputs=[_initial_plan()],
+        antigravity_outputs=[
+            structured_plan_review(reviewer="flash (Google Antigravity: Model A)"),
+            ("opus unavailable", 1),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        plan_execution_mode="plan-only", agent_max_retries=0,
+    )
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    calls = len([cmd for cmd, _ in runner.commands if cmd[0] in {"agy", "codex"}])
+    rebound = SeatAgent(ReviewerSeat("flash", "codex", ("gpt-6-sol",)), tmp_path / "flash")
+    changed = dataclasses.replace(
+        config, reviewer=(rebound, opus), reviewer_seats=(rebound, opus),
+    )
+    with pytest.raises(AgentLoopError, match="changed backend"):
+        run_issue_loop(runner, issue_number=56, config=changed, plan_first=True)
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] in {"agy", "codex"}]) == calls
 
 
 def test_named_agy_seats_serialize_host_settings_and_bound_wait(tmp_path, monkeypatch):

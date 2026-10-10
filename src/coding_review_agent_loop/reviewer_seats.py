@@ -16,6 +16,19 @@ _CODEX_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 _CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 
 
+def _persisted_plan_contract(metadata: object) -> object | None:
+    """Read a plan contract without importing the later panel-evidence layer."""
+    from .plan_review_scheduling import PlanReviewSchedulingContract
+
+    payload = getattr(metadata, "scheduler_contract", None)
+    if payload is None:
+        return None
+    try:
+        return PlanReviewSchedulingContract.from_mapping(payload)
+    except AgentLoopError:
+        return None
+
+
 @dataclass(frozen=True)
 class ReviewerSeat:
     seat_id: str
@@ -165,7 +178,6 @@ def validate_pr_seat_bindings(records: object, config: object) -> set[str]:
 def validate_plan_handoff_seats(records: object, config: object) -> None:
     """Require the implementation PR to retain the approved plan's seat board."""
     from .agents.registry import agent_display_name
-    from .panel_evidence import _plan_contract_or_none
 
     records = tuple(records)
     if not records:
@@ -178,7 +190,7 @@ def validate_plan_handoff_seats(records: object, config: object) -> None:
         )
     contract = next(
         (contract for record in reversed(records)
-         if (contract := _plan_contract_or_none(record.metadata)) is not None),
+         if (contract := _persisted_plan_contract(record.metadata)) is not None),
         None,
     )
     if contract is not None and set(contract.required_reviewers) != {
@@ -206,8 +218,6 @@ def reconcile_plan_handoff_board(config: object, comments: object, issue_number:
     from .board_amendment import (
         collect_reviewer_board_amendments, resolve_contract_lineage,
     )
-    from .panel_evidence import _plan_contract_or_none
-    from .plan_review_scheduling import make_plan_contract
     from .round_state import _extract_round_metadata_records
 
     records = _extract_round_metadata_records(comments, flow="plan")
@@ -224,24 +234,28 @@ def reconcile_plan_handoff_board(config: object, comments: object, issue_number:
         comments, flow="plan", issue_number=issue_number,
     )
     validate_pr_backend_outage_amendments(amendments, config)
-    if config.plan_review_policy != "primary-then-panel":
+    # A PR invocation has no obligation to repeat the issue command's plan
+    # scheduling flags.  Derive the contract from the durable plan record.
+    configured = next(
+        (contract for record in records
+         if (contract := _persisted_plan_contract(record.metadata)) is not None),
+        None,
+    )
+    if configured is None:
         validate_plan_handoff_seats(records, config)
         return config
-    configured = make_plan_contract(
-        tuple(agent_display_name(reviewer) for reviewer in config.reviewer),
-        config.plan_review_policy,
-        agent_display_name(config.primary_plan_reviewer)
-        if config.primary_plan_reviewer is not None else None,
-    )
     lineage = resolve_contract_lineage(
         records, amendments, configured, accept_base_configured=True,
-        contract_from_metadata=_plan_contract_or_none,
+        contract_from_metadata=_persisted_plan_contract,
         drift_error=lambda persisted, detail: AgentLoopError(
             f"Issue-to-PR plan board changed without a valid signed amendment: {detail}"
         ),
     )
     effective = lineage.contracts[-1]
     required = set(effective.required_reviewers)
+    configured_names = frozenset(agent_display_name(reviewer) for reviewer in config.reviewer)
+    if configured_names not in {frozenset(configured.required_reviewers), frozenset(required)}:
+        raise AgentLoopError("Issue-to-PR handoff changed the required reviewer seat board.")
     result = replace(
         config,
         reviewer=tuple(

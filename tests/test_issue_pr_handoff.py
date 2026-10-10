@@ -87,6 +87,7 @@ def test_named_plan_handoff_refuses_changed_models_or_required_board(tmp_path):
 
 
 def test_named_plan_handoff_applies_signed_outage_and_restoration(tmp_path):
+    from dataclasses import replace
     from types import SimpleNamespace
     from coding_review_agent_loop.board_amendment import (
         collect_reviewer_board_amendments, format_reviewer_board_amendment_comment,
@@ -154,6 +155,12 @@ def test_named_plan_handoff_applies_signed_outage_and_restoration(tmp_path):
     reduced = reconcile_plan_handoff_board(config, comments, 56)
     assert tuple(str(seat) for seat in reduced.reviewer) == ("primary", "other")
     assert reviewer_seat_binding(reduced) == binding
+    # A direct PR invocation uses its default plan flags, even when the
+    # approved issue plan selected a named primary.
+    direct_pr = replace(config, plan_review_policy="all-reviewers", primary_plan_reviewer=None)
+    reduced_from_pr = reconcile_plan_handoff_board(direct_pr, comments, 56)
+    assert tuple(str(seat) for seat in reduced_from_pr.reviewer) == ("primary", "other")
+    assert reviewer_seat_binding(reduced_from_pr) == binding
 
     restoration = format_reviewer_board_amendment_comment(
         flow="plan", issue=56, pr_number=None,

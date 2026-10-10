@@ -1826,6 +1826,11 @@ def run_pr_loop(
             log(config, f"PR #{pr_number}: managed-CI adoption provenance changed; using ordinary CI")
             managed_ci = None
             return False
+        if issue_context is not None and approved_plan_context is not None and config.reviewer_seats:
+            from .reviewer_seats import reconcile_plan_handoff_board
+            config = reconcile_plan_handoff_board(
+                config, issue_context.comments, issue_context.number,
+            )
         memory = prepare_agent_memory(runner, config)
         from .reviewer_seats import reviewer_seat_binding, validate_pr_seat_bindings
         seat_binding = reviewer_seat_binding(config)
