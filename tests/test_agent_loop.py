@@ -3648,22 +3648,39 @@ def test_named_seat_rejects_unowned_backend_effort_before_dispatch(
     assert not checkout.exists()
 
 
-def test_named_seat_preserves_implementation_coder_model_and_effort_before_phase_gate(
-    tmp_path, monkeypatch, capsys,
+def test_named_plan_seat_preserves_implementation_coder_model_and_effort(
+    tmp_path, monkeypatch,
 ):
-    monkeypatch.setattr(cli_module, "run_issue_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    captured = {}
+    monkeypatch.setattr(cli_module, "run_issue_loop", lambda *a, **k: captured.update(k) or 0)
     checkout = tmp_path / "seat-checkout"
     assert cli_module.main([
         "issue", "77", "--repo", "OWNER/REPO", "--plan-first", "--coder", "codex",
         "--implementation-coder", "claude", "--claude-model", "claude-fable-5",
         "--claude-effort", "high", "--reviewer-seat", "alternate=claude",
         "--seat-model", "alternate=claude-sonnet-5", "--seat-dir", f"alternate={checkout}",
-    ]) == 1
-    error = capsys.readouterr().err
-    assert "issue --plan-first does not support named reviewer seats" in error
-    assert "--claude-model" not in error
-    assert "--claude-effort" not in error
-    assert not checkout.exists()
+    ]) == 0
+    assert captured["plan_first"] is True
+    assert captured["config"].implementation_coder == "claude"
+    assert len(captured["config"].reviewer_seats) == 1
+
+
+def test_named_plan_primary_cli_selects_seat_before_dispatch(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(cli_module, "run_issue_loop", lambda *a, **k: captured.update(k) or 0)
+    assert cli_module.main([
+        "issue", "77", "--repo", "OWNER/REPO", "--plan-first",
+        "--reviewer-seat", "first=codex", "--seat-model", "first=Model A",
+        "--reviewer-seat", "second=claude", "--seat-model", "second=Model B",
+        "--plan-review-policy", "primary-then-panel",
+        "--primary-plan-reviewer-seat", "second",
+        "--seat-dir", f"first={tmp_path / 'first'}",
+        "--seat-dir", f"second={tmp_path / 'second'}",
+    ]) == 0
+    config = captured["config"]
+    assert tuple(str(seat) for seat in config.reviewer) == ("first", "second")
+    assert str(config.primary_plan_reviewer) == "second"
+    assert config.primary_plan_reviewer.backend == "claude"
 
 
 def test_named_seat_rejects_legacy_explicit_reviewer_workdir(tmp_path, capsys):
@@ -3714,7 +3731,7 @@ def test_named_seat_rejects_implementation_coder_workdir_before_phase_gate(tmp_p
 
 @pytest.mark.parametrize("policy,primary,expected", [
     ("--pr-review-policy", "--primary-reviewer-seat", "requires at least one secondary reviewer"),
-    ("--plan-review-policy", "--primary-plan-reviewer-seat", "Named primary plan review is unavailable"),
+    ("--plan-review-policy", "--primary-plan-reviewer-seat", "requires at least one secondary reviewer"),
 ])
 def test_named_primary_requires_secondary_before_phase_gate(capsys, policy, primary, expected):
     assert cli_module.main([

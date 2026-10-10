@@ -546,6 +546,11 @@ def run_pr_loop(
                 runner, config=config, issue_number=issue_context.number
             )
             issue_context_refreshed = True
+            if approved_plan_context is not None and config.reviewer_seats:
+                from .reviewer_seats import reconcile_plan_handoff_board
+                config = reconcile_plan_handoff_board(
+                    config, issue_context.comments, issue_context.number,
+                )
         if parent_issue_context is not None:
             parent_issue_context = get_issue_context(
                 runner, config=config, issue_number=parent_issue_context.number
@@ -1824,6 +1829,10 @@ def run_pr_loop(
         memory = prepare_agent_memory(runner, config)
         from .reviewer_seats import reviewer_seat_binding, validate_pr_seat_bindings
         seat_binding = reviewer_seat_binding(config)
+        if issue_context is not None and approved_plan_context is not None and seat_binding is not None:
+            from .reviewer_seats import validate_plan_handoff_seats
+            plan_records = _extract_round_metadata_records(issue_context.comments, flow="plan")
+            validate_plan_handoff_seats(plan_records, config)
 
         def bound_pr_metadata(**fields: object) -> PostedRoundMetadata:
             metadata = PostedRoundMetadata(**fields)

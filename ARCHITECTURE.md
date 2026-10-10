@@ -1874,5 +1874,9 @@ coder recovery records, stores a versioned board binding. Recovery verifies
 the binding before using any recorded checkpoint; a changed
 model chain starts a fresh round, retaining reconciled open findings but
 invalidating prior approvals and unpublished response checkpoints. Legacy
-default seats keep historical signatures and metadata bytes. Plan-first named
-review remains gated until the plan review loop supports bound seat identity.
+default seats keep historical signatures and metadata bytes. Issue-plan review
+writes the same versioned seat binding into coder, reviewer, and scheduling
+round records. Resume validates the binding before reading
+approvals or amendments; a model-chain change starts a fresh review round
+while preserving verifiable seat-owned findings. The issue-to-PR handoff checks
+the plan board and binding before PR review begins.

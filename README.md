@@ -596,16 +596,17 @@ returned, so no reviewer can read a peer's findings mid-turn. A reviewer that
 must be retried, or a round interrupted mid-publication, is resumed from a
 private local spool rather than re-run against peers' posted reviews:
 
-PR review accepts named reviewer seats:
+PR and issue-plan review accept named reviewer seats:
 `--reviewer-seat ID=BACKEND`, `--seat-model ID=MODEL`, `--seat-effort ID=EFFORT`,
 and `--seat-dir ID=PATH`. A named-only board has no implicit Codex reviewer;
 an explicit `--reviewer` adds one legacy default seat. Use
-`--primary-reviewer-seat ID` with PR `primary-then-panel` scheduling to select
-one named seat as primary. Named seats work with `pr`, `task`, `managed-pr`, and
-plain issue PR review. Issue `--plan-first` and `discuss` still reject them.
+`--primary-reviewer-seat ID` with PR `primary-then-panel` scheduling, or
+`--primary-plan-reviewer-seat ID` with plan `primary-then-panel` scheduling, to
+select a named primary. Named seats work with `pr`, `task`, `managed-pr`, plain
+issue PR review, and issue `--plan-first`. `discuss` rejects them.
 Each seat has its own checkout, response file, logs, signature, approval, and
-saved PR binding. A changed model chain requires fresh review while verified
-open findings stay attributed to their original seat. Antigravity fallback
+saved plan and PR bindings. A changed model chain requires fresh review while
+verified open findings stay attributed to their original seat. Antigravity fallback
 stays inside one seat; seats share account quota and serialize turns through a
 bounded host settings lock. Existing `--reviewer agy` with
 `--antigravity-models` remains one reviewer with an ordered fallback chain.

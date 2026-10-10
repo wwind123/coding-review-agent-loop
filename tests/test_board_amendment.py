@@ -272,6 +272,99 @@ def test_named_pr_backend_outage_requires_one_complete_removal():
         validate_pr_backend_outage_amendments((amendment(("unbound",)),), config)
 
 
+def test_named_plan_signed_outage_requires_complete_removal_and_explicit_restore(tmp_path):
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,
+    )
+
+    board = ("primary", "flash", "opus", "other")
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=tuple(
+            SeatAgent(ReviewerSeat(name, backend, (model,)), tmp_path / name)
+            for name, backend, model in (
+                ("primary", "codex", "gpt-6-sol"),
+                ("flash", "antigravity", "gemini-flash"),
+                ("opus", "antigravity", "claude-opus"),
+                ("other", "claude", "claude-sonnet"),
+            )
+        ),
+    )
+    original = make_plan_contract(board, "primary-then-panel", "primary")
+
+    def signed(original_board, removed, restored, round_number):
+        return format_reviewer_board_amendment_comment(
+            flow="plan", issue=942, pr_number=None,
+            original_required_reviewers=original_board,
+            policy="primary-then-panel", primary_reviewer="primary",
+            removed_reviewers=removed, restored_reviewers=restored,
+            effective_from_round=round_number,
+            rationale="Shared backend outage or recovery.",
+        )
+
+    comments = [
+        _comment(signed(board, ("flash", "opus"), (), 2)),
+        _comment(signed(("primary", "other"), (), ("flash", "opus"), 3)),
+    ]
+    amendments = _plan_amendments(comments)
+    validate_pr_backend_outage_amendments(amendments, config)
+    lineage = resolve_contract_lineage(
+        [_checkpoint(0, 1, original)], amendments, original,
+        accept_base_configured=True,
+        contract_from_metadata=_plan_contract, drift_error=_drift,
+    )
+    assert lineage.contracts[1].required_reviewers == ("primary", "other")
+    assert lineage.contracts[-1].required_reviewers == board
+    partial = _plan_amendments([_comment(signed(board, ("flash",), (), 2))])
+    with pytest.raises(AgentLoopError, match="must remove every active seat"):
+        validate_pr_backend_outage_amendments(partial, config)
+    removes_primary = _plan_amendments([_comment(signed(board, ("primary",), (), 2))])
+    with pytest.raises(AgentLoopError, match="primary reviewer"):
+        amend_contract(original, removes_primary[0], base_board=board)
+
+
+def test_named_plan_resume_applies_signed_shared_outage_before_panel(tmp_path):
+    from agent_loop_helpers import FakeRunner, make_config, structured_plan_review, structured_v1_plan_state
+    from coding_review_agent_loop.cli import run_issue_loop
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    unavailable = json.dumps({
+        "schema_version": 1, "kind": "agent_unavailable", "retryable": False,
+        "category": "provider", "summary": "Shared account unavailable.",
+        "suggested_action": "Restore the account.",
+    }) + "\n<!-- AGENT_UNAVAILABLE -->\n-- Google Antigravity"
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review()],
+        gemini_outputs=[structured_plan_review(reviewer="Google Gemini")],
+        antigravity_outputs=[unavailable, unavailable],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", flash, opus),
+        reviewer_seats=(flash, opus), review_parallel=True,
+        plan_review_policy="primary-then-panel", primary_plan_reviewer="codex",
+        plan_execution_mode="plan-only", agent_max_retries=0, max_rounds=4,
+    )
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    before = len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"])
+    body = format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("Codex", "Gemini", "flash", "opus"),
+        policy="primary-then-panel", primary_reviewer="Codex",
+        removed_reviewers=("flash", "opus"), effective_from_round=2,
+        rationale="The shared Antigravity account is unavailable.",
+    )
+    runner.issue_comments.append({
+        "body": body, "author": {"login": "operator", "id": 81},
+        "createdAt": "2026-05-23T00:00:59Z", "id": 995,
+    })
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == before
+
+
 def test_named_pr_seat_local_amendment_reason_is_signed_and_recoverable():
     from coding_review_agent_loop.reviewer_seats import (
         ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,

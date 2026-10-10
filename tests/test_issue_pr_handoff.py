@@ -27,6 +27,152 @@ from coding_review_agent_loop.issue_pr_handoff import (
 from agent_loop_helpers import FakeRunner, make_config
 
 
+def test_named_plan_handoff_refuses_changed_models_or_required_board(tmp_path):
+    from dataclasses import replace
+    from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, reviewer_seat_binding, validate_plan_handoff_seats,
+    )
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, PostedRoundRecord
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        plan_review_policy="primary-then-panel", primary_plan_reviewer=opus,
+    )
+    record = PostedRoundRecord(
+        index=0, body="",
+        metadata=PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", round_number=1,
+            subject="plan", seat_binding=reviewer_seat_binding(config),
+            scheduler_contract=make_plan_contract(
+                ("flash", "opus"), "primary-then-panel", "opus",
+            ).as_dict(),
+        ),
+    )
+    validate_plan_handoff_seats((record,), config)
+    changed_opus = SeatAgent(
+        ReviewerSeat("opus", "antigravity", ("Model C",)), tmp_path / "opus",
+    )
+    changed_model = replace(
+        config, reviewer=(flash, changed_opus), reviewer_seats=(flash, changed_opus),
+        primary_plan_reviewer=changed_opus,
+    )
+    with pytest.raises(AgentLoopError, match="changed plan reviewer models"):
+        validate_plan_handoff_seats((record,), changed_model)
+    other = SeatAgent(
+        ReviewerSeat("other", "antigravity", ("Model D",)), tmp_path / "other",
+    )
+    with pytest.raises(AgentLoopError, match="required reviewer seat board"):
+        validate_plan_handoff_seats(
+            (record,), replace(
+                config, reviewer=(flash, opus, other),
+                reviewer_seats=(flash, opus, other),
+            ),
+        )
+    unbound = replace(record, metadata=replace(record.metadata, seat_binding=None))
+    with pytest.raises(AgentLoopError, match="unbound historical recovery record"):
+        validate_plan_handoff_seats((unbound,), config)
+    default_policy = replace(
+        config, plan_review_policy="all-reviewers", primary_plan_reviewer=None,
+    )
+    no_contract = replace(
+        record, metadata=replace(record.metadata, scheduler_contract=None),
+    )
+    with pytest.raises(AgentLoopError, match="required reviewer seat board"):
+        validate_plan_handoff_seats(
+            (no_contract,), replace(default_policy, reviewer=(opus,)),
+        )
+
+
+def test_named_plan_handoff_applies_signed_outage_and_restoration(tmp_path):
+    from types import SimpleNamespace
+    from coding_review_agent_loop.board_amendment import (
+        collect_reviewer_board_amendments, format_reviewer_board_amendment_comment,
+    )
+    from coding_review_agent_loop.plan_review_scheduling import PlanCandidateKey, make_plan_contract
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, reconcile_plan_handoff_board, reviewer_seat_binding,
+    )
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+
+    seats = tuple(
+        SeatAgent(ReviewerSeat(name, backend, (model,)), tmp_path / name)
+        for name, backend, model in (
+            ("primary", "codex", "gpt-6-sol"),
+            ("flash", "antigravity", "Model A"),
+            ("opus", "antigravity", "Model B"),
+            ("other", "claude", "claude-sonnet"),
+        )
+    )
+    config = make_config(
+        tmp_path, reviewer=seats, reviewer_seats=seats,
+        plan_review_policy="primary-then-panel", primary_plan_reviewer=seats[0],
+    )
+    board = tuple(str(seat) for seat in seats)
+    binding = reviewer_seat_binding(config)
+
+    def checkpoint(round_number, names, digest=None):
+        return _attach_round_metadata("Plan scheduling checkpoint.", PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", round_number=round_number,
+            subject="plan", seat_binding=binding, phase="scheduler-prelaunch",
+            scheduler_contract=make_plan_contract(
+                names, "primary-then-panel", "primary",
+            ).as_dict(),
+            scheduler_obligation_digest="0" * 16,
+            scheduler_selected_reviewers=("primary",),
+            scheduler_paused_reviewers=tuple((name, "panel") for name in names if name != "primary"),
+            scheduler_reasons=("primary gate",),
+            scheduler_final_sweep=False,
+            scheduler_force_full=False,
+            scheduler_calls_avoided=0,
+            scheduler_phase="primary",
+            scheduler_primary_reviewer="primary",
+            plan_candidate_key=PlanCandidateKey(
+                subject="plan", aggregate_plan_identity="aggregate",
+                execution_strategy_identity="strategy", risk_test_matrix_identity="matrix",
+                surfaced_requirement_id_digest="requirements",
+            ).as_dict(),
+            reviewer_board_amendment_digest=digest,
+        ))
+
+    removal = format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=board, policy="primary-then-panel",
+        primary_reviewer="primary", removed_reviewers=("flash", "opus"),
+        effective_from_round=2, rationale="Shared account outage.",
+    )
+    (removed,) = collect_reviewer_board_amendments(
+        [SimpleNamespace(body=removal)], flow="plan", issue_number=56,
+    )
+    comments = [
+        SimpleNamespace(body=checkpoint(1, board)),
+        SimpleNamespace(body=removal),
+        SimpleNamespace(body=checkpoint(2, ("primary", "other"), removed.digest)),
+    ]
+    reduced = reconcile_plan_handoff_board(config, comments, 56)
+    assert tuple(str(seat) for seat in reduced.reviewer) == ("primary", "other")
+    assert reviewer_seat_binding(reduced) == binding
+
+    restoration = format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("primary", "other"),
+        policy="primary-then-panel", primary_reviewer="primary",
+        removed_reviewers=(), restored_reviewers=("flash", "opus"),
+        effective_from_round=3, rationale="Shared account recovered.",
+    )
+    (restored,) = collect_reviewer_board_amendments(
+        [SimpleNamespace(body=restoration)], flow="plan", issue_number=56,
+    )
+    comments.extend([
+        SimpleNamespace(body=restoration),
+        SimpleNamespace(body=checkpoint(3, board, restored.digest)),
+    ])
+    full = reconcile_plan_handoff_board(config, comments, 56)
+    assert tuple(str(seat) for seat in full.reviewer) == board
+
+
 def _comment(body: str) -> IssueComment:
     return IssueComment(author="bot", created_at="2026-05-23T00:00:00Z", body=body)
 

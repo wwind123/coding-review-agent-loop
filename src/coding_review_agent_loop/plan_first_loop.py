@@ -774,6 +774,20 @@ def _run_plan_first_loop(
     )
     coder_name = agent_display_name(config.coder)
     configured_reviewers = reviewers(config)
+    from .reviewer_seats import (
+        reviewer_seat_binding,
+        validate_pr_seat_bindings,
+        validate_pr_backend_outage_amendments,
+    )
+
+    seat_binding = reviewer_seat_binding(config)
+
+    def bound_plan_metadata(**fields: object) -> PostedRoundMetadata:
+        metadata = PostedRoundMetadata(**fields)
+        return (
+            dataclasses_replace(metadata, seat_binding=seat_binding)
+            if seat_binding is not None else metadata
+        )
 
     # --- Staged planning scheduling (#905, from #841) -------------------
     plan_reviewer_names = tuple(agent_display_name(name) for name in configured_reviewers)
@@ -1065,7 +1079,15 @@ def _run_plan_first_loop(
                 runner, config=config, issue_number=issue_number
             ).comments
         try:
-            return _extract_round_metadata_records(comments, flow="plan")
+            records = _extract_round_metadata_records(comments, flow="plan")
+            if seat_binding is not None:
+                last_changed = max(
+                    (record.index for record in records
+                     if record.metadata.seat_binding != seat_binding),
+                    default=-1,
+                )
+                return tuple(record for record in records if record.index > last_changed)
+            return records
         except AgentLoopError as exc:
             stop_plan_pre_panel(
                 plan_undecodable_history_message(exc), round_number=round_number
@@ -1087,6 +1109,8 @@ def _run_plan_first_loop(
         try:
             return _extract_round_metadata_records(issue_context.comments, flow="plan")
         except AgentLoopError:
+            if config.reviewer_seats:
+                raise
             return ()
 
     def plan_contract_drift_error(
@@ -1135,13 +1159,40 @@ def _run_plan_first_loop(
     for diagnostic in plan_amendment_diagnostics:
         log(config, f"Planning issue #{issue_number}: {diagnostic}")
     plan_drift_records = planning_contract_drift_records()
+    changed_seat_models = validate_pr_seat_bindings(plan_drift_records, config)
+    if seat_binding is not None and not staged_planning and plan_drift_records:
+        recorded = plan_drift_records[-1].metadata.seat_binding
+        if recorded is not None and {entry["id"] for entry in recorded["seats"]} != set(plan_reviewer_names):
+            raise AgentLoopError(
+                "Named plan reviewer board changed during resume; all required seats must remain configured."
+            )
+    validate_pr_backend_outage_amendments(plan_board_amendments, config)
+    if changed_seat_models:
+        log(config, "Plan reviewer model-chain reconfiguration requires fresh review: "
+            + ", ".join(sorted(changed_seat_models)))
     plan_contract_lineage: ContractLineage = resolve_contract_lineage(
         plan_drift_records,
         plan_board_amendments,
         plan_scheduler_contract,
+        accept_base_configured=bool(config.reviewer_seats),
         contract_from_metadata=_plan_contract_or_none,
         drift_error=plan_contract_drift_error,
     )
+    if plan_scheduler_contract is not None:
+        effective_contract = plan_contract_lineage.contracts[-1]
+        if effective_contract != plan_scheduler_contract:
+            effective_names = set(effective_contract.required_reviewers)
+            configured_reviewers = tuple(
+                reviewer for reviewer in configured_reviewers
+                if agent_display_name(reviewer) in effective_names
+            )
+            config = dataclasses_replace(
+                config,
+                reviewer=configured_reviewers,
+                pr_seat_binding_override=seat_binding,
+            )
+            plan_reviewer_names = tuple(agent_display_name(name) for name in configured_reviewers)
+            plan_scheduler_contract = effective_contract
     plan_amendment_digest = plan_contract_lineage.active_digest
     for record in plan_drift_records:
         metadata = record.metadata
@@ -1182,6 +1233,36 @@ def _run_plan_first_loop(
     # run does for every item the resumed round carried.
     plan_accounted_item_ids: set[str] = set()
     resume_state = _resume_plan_round(issue_context.comments, configured_reviewers=configured_reviewers)
+    if changed_seat_models and resume_state is not None:
+        current_text, old_round = resume_state
+        carried_by_id = {item.item_id: item for item in old_round.prior_items}
+        for record in old_round.completed_reviews:
+            for item in record.metadata.new_items:
+                if item.reviewer != record.metadata.agent:
+                    raise AgentLoopError(
+                        "Plan seat reconfiguration cannot verify the owner of a carried finding."
+                    )
+                existing = carried_by_id.get(item.item_id)
+                if existing is not None and existing != item:
+                    raise AgentLoopError(
+                        "Plan seat reconfiguration found conflicting finding provenance."
+                    )
+                carried_by_id[item.item_id] = item
+        for item in old_round.current_round_new_items:
+            existing = carried_by_id.get(item.item_id)
+            if existing is not None and existing != item:
+                raise AgentLoopError(
+                    "Plan seat reconfiguration found conflicting reconciliation provenance."
+                )
+            carried_by_id[item.item_id] = item
+        resume_state = (current_text, dataclasses_replace(
+            old_round,
+            round_number=old_round.round_number + 1,
+            prior_items=tuple(carried_by_id.values()),
+            completed_reviews=(),
+            current_round_new_items=(),
+            reconciled=False,
+        ))
     # Amendment activation (#943) runs right after resume reconstruction and
     # before any agent invocation or comment post: an amendment no
     # digest-bound record has used must start at the round this resume
@@ -1463,7 +1544,7 @@ def _run_plan_first_loop(
             )
             current_response_form = "fresh-plan-state"
         try:
-            plan_round_metadata = PostedRoundMetadata(
+            plan_round_metadata = bound_plan_metadata(
                     flow="plan",
                     role="coder",
                     plan_execution_mode=config.plan_execution_mode,
@@ -1895,7 +1976,10 @@ def _run_plan_first_loop(
                 required_reviewers=plan_reviewer_names,
             )
             plan_qualifying_approvals = _carried_plan_approvals(
-                plan_records,
+                tuple(
+                    record for record in plan_records
+                    if seat_binding is None or record.metadata.seat_binding == seat_binding
+                ),
                 current_key=current_plan_key,
                 required_reviewers=plan_reviewer_names,
                 surfaced_requirement_ids=plan_hr_ids,
@@ -1909,6 +1993,11 @@ def _run_plan_first_loop(
             latest_scheduler_record = plan_history.latest_scheduler_record
             plan_previous_key = plan_history.previous_key
             plan_history_class = plan_history.history_class
+            if changed_seat_models and round_number == start_round_number:
+                plan_panel_evidence = PlanPanelEvidence()
+                plan_qualifying_approvals = ()
+                latest_scheduler_record = None
+                plan_previous_key = None
             step_back_history_intact = plan_history_class == PLAN_HISTORY_INTACT
             step_back_history_class = str(plan_history_class)
             if config.plan_step_back_rounds > 0 and plan_primary_name is not None:
@@ -2144,7 +2233,7 @@ def _run_plan_first_loop(
                 + (f"; {plan_amendment_note}" if plan_amendment_note else ""),
             )
             _plan_spool_preflight()
-            plan_posted_checkpoint = PostedRoundMetadata(
+            plan_posted_checkpoint = bound_plan_metadata(
                 flow="plan",
                 role="summary",
                 agent="Orchestrator",
@@ -2418,7 +2507,7 @@ def _run_plan_first_loop(
                         human_requirements_resolved_flag=human_requirements_resolved(review_output),
                         config=config, model_used=model_used,
                     ),
-                    PostedRoundMetadata(
+                    bound_plan_metadata(
                         flow="plan", role="reviewer", agent=reviewer_name,
                         round_number=round_number, subject=_plan_subject(current_plan),
                         plan_execution_mode=config.plan_execution_mode,
@@ -2901,7 +2990,7 @@ def _run_plan_first_loop(
                     f"Plan review round {round_number} reconciliation: settled reviewers: {settled or 'none'}. "
                     f"Finalization {'stops' if plan_fatal_errors else 'continues'} after reconciliation."
                     + (f" {same_model_note}." if same_model_note else ""),
-                    PostedRoundMetadata(
+                    bound_plan_metadata(
                         flow="plan", role="summary", agent="Orchestrator", round_number=round_number,
                         subject=_plan_subject(current_plan), prior_items=prior_unresolved_items,
                         dispositions=tuple(
@@ -4061,7 +4150,7 @@ def _run_plan_first_loop(
                         missing_reviewers=plan_missing_approvals,
                         phase=plan_outstanding_phase or "secondary-audit",
                     ),
-                    PostedRoundMetadata(
+                    bound_plan_metadata(
                         flow="plan",
                         role="summary",
                         agent="Orchestrator",
@@ -4514,7 +4603,7 @@ def _run_plan_first_loop(
             step_back_directed=step_back_context is not None,
         )
         try:
-            plan_round_metadata = PostedRoundMetadata(
+            plan_round_metadata = bound_plan_metadata(
                     flow="plan",
                     role="coder",
                     plan_execution_mode=config.plan_execution_mode,
