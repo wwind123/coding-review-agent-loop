@@ -548,7 +548,9 @@ record may remove unavailable non-primary reviewers. It is read from the same
 comment surface as the round records it amends: the issue for planning, the PR
 for PR review. Named PR seat-local removal of one or more independently failed seats uses the signed `seat-unavailable` reason;
 shared `backend-unavailable` removal must cover every active seat on that
-backend. Evidence freeze, release, and qualification summaries persist the
+backend. A signed PR `mixed-unavailable` removal records the shared outage
+backends in the rationale and validates complete removal for those backends;
+independent seat failures remain local. Evidence freeze, release, and qualification summaries persist the
 same seat binding as review records so startup can authenticate their board.
 `board_amendment.resolve_contract_lineage` is the single resolver used at plan
 resume, PR startup, and the PR qualification gate. Only

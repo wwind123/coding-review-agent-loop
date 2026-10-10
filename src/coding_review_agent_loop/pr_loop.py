@@ -5023,7 +5023,12 @@ def run_pr_loop(
                             contract=pr_effective_contract,
                             lineage=pr_contract_lineage,
                             removed=unavailable_names,
-                            seat_local_failure=not outage_backends,
+                            seat_local_failure=any(
+                                seat_backend(reviewer) not in outage_backends
+                                for reviewer in unavailable_reviewer_failures
+                            ),
+                            shared_outage_backends=frozenset(outage_backends),
+                            seat_binding_config=config,
                             fetch_start_round=lambda: _pr_amendment_start_round(
                                 get_pr_review_context(runner, config=config, pr_number=pr_number),
                                 configured_reviewers,

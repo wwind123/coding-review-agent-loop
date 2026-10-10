@@ -159,9 +159,14 @@ def validate_pr_seat_bindings(records: object, config: object) -> set[str]:
 
 def validate_pr_backend_outage_amendments(amendments: object, config: object) -> None:
     """A named shared-backend outage must remove all its active seats."""
-    from .board_amendment import REVIEWER_BOARD_REMOVAL_REASON, REVIEWER_SEAT_REMOVAL_REASON
+    from .board_amendment import (
+        REVIEWER_BOARD_REMOVAL_REASON, REVIEWER_SEAT_REMOVAL_REASON,
+        REVIEWER_MIXED_REMOVAL_REASON,
+    )
     binding = reviewer_seat_binding(config)
     if binding is None:
+        if any(amendment.reason == REVIEWER_MIXED_REMOVAL_REASON for amendment in amendments):
+            raise AgentLoopError("Mixed PR amendment requires a verified named seat binding.")
         return
     backends = {entry["id"]: entry["backend"] for entry in binding["seats"]}
     for amendment in amendments:
@@ -176,9 +181,25 @@ def validate_pr_backend_outage_amendments(amendments: object, config: object) ->
             )
         if amendment.reason == REVIEWER_SEAT_REMOVAL_REASON:
             continue
-        if amendment.reason != REVIEWER_BOARD_REMOVAL_REASON:
+        if amendment.reason == REVIEWER_MIXED_REMOVAL_REASON:
+            first_line = amendment.rationale.split("\n", 1)[0]
+            prefix = "shared_outage_backends="
+            if not first_line.startswith(prefix):
+                raise AgentLoopError("Mixed PR amendment must identify shared outage backends.")
+            listed = first_line[len(prefix):].split(",")
+            if (not listed or any(name not in _BACKENDS for name in listed)
+                    or len(set(listed)) != len(listed)):
+                raise AgentLoopError("Mixed PR amendment has invalid shared outage backends.")
+            affected = set(listed)
+            removed_backends = {backends[name] for name in removed}
+            if not affected <= removed_backends:
+                raise AgentLoopError("Mixed PR amendment names an outage backend without a removed seat.")
+            if affected == removed_backends:
+                raise AgentLoopError("Mixed PR amendment requires a separate seat-local failure.")
+        elif amendment.reason == REVIEWER_BOARD_REMOVAL_REASON:
+            affected = {backends[name] for name in removed}
+        else:
             continue
-        affected = {backends[name] for name in removed}
         required = set(amendment.original_required_reviewers)
         for backend in affected:
             active = {name for name in required if backends.get(name) == backend}

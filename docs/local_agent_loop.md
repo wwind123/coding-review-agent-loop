@@ -499,8 +499,10 @@ and `reason` `backend-recovered`; a removal-only record keeps `reason`
 `backend-unavailable` for a shared outage. A PR removal of one or more named
 seats whose model chains independently fail uses `seat-unavailable`; other seats
 on their backends remain required. A shared outage must remove all active seats
-on that backend in one record. A record that does both may use either backend
-reason. A name may not be
+on that backend in one record. For mixed shared outages and independent seat
+failures, use `mixed-unavailable` and start the rationale with a line such as
+`shared_outage_backends=antigravity`. Resume validates that every active seat
+of each listed backend was removed. A name may not be
 both removed and restored. Records without `restored_reviewers` keep the exact
 #943 key set and digest. When a rerun's configured board adds reviewers back to
 the persisted board, the drift error prints a filled-in restoration template.

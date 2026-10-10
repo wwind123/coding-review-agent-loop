@@ -942,6 +942,10 @@ Reviewer board amendment:
   Use `backend-unavailable` for a shared backend outage and remove every active
   seat on that backend in the same amendment. The signed record still binds
   the original board and takes effect only after the normal resume checks.
+  When shared backend outages and independent seat failures happen together,
+  use `mixed-unavailable`. Its rationale must start with
+  `shared_outage_backends=backend1,backend2` on its own line. Every active seat
+  of each listed backend must be removed; other removed seats remain local failures.
 - **Choosing `effective_from_round`.** Use the round number the drift error
   prints. That is the round the resume re-enters, whether the round is only
   partly recorded or already reconciled, and it is not always the latest
