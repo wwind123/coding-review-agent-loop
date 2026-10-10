@@ -2073,7 +2073,11 @@ def _continuity_round_records(
             raise AgentLoopError("Managed-CI continuity round metadata is malformed.")
         if payload["flow"] != "pr":
             continue
-        phase = payload.get("phase")
+        # Payloads are arbitrary JSON from any commenter and are decoded before
+        # author filtering, so every raw field is type-checked before it is
+        # compared or hashed (#1367).
+        raw_phase = payload.get("phase")
+        phase = raw_phase if isinstance(raw_phase, str) else None
         seat_binding = payload.get("seat_binding")
         raw_dispatch_round = payload.get("dispatch_round")
         result[index] = {
@@ -2081,7 +2085,7 @@ def _continuity_round_records(
             "state": payload.get("state"),
             "subject": payload["subject"],
             "round_number": payload["round_number"],
-            "phase": phase if isinstance(phase, str) else None,
+            "phase": phase,
             # The raw dispatch round, kept even when the recovery record fails
             # validation, so a malformed record of the same dispatch is still
             # counted as a recovery candidate (#1367).

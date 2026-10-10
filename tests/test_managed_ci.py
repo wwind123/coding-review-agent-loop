@@ -14654,6 +14654,53 @@ def test_m1367_earlier_dispatch_records_are_not_recovery_candidates(tmp_path):
     _plan_binding_1367(published, config)
 
 
+@pytest.mark.parametrize("author", ["foreign", "actor"])
+@pytest.mark.parametrize("field,value", [
+    ("phase", []), ("phase", {}), ("phase", 7),
+    ("dispatch_round", []), ("dispatch_round", True), ("seat_binding", [1]),
+])
+def test_m1367_wrongly_typed_round_fields_never_crash_continuity(
+    tmp_path, author, field, value,
+):
+    """A commenter-supplied round record with a wrongly typed raw field (for
+    example an unhashable phase) is decoded before author filtering; it must
+    never raise anything but the controlled refusal on any surface."""
+    from coding_review_agent_loop.round_transport import encode_mapping
+
+    payload = {
+        "flow": "pr", "role": "summary", "agent": "Orchestrator", "round_number": 1,
+        "subject": _H0_1367, "state": "blocking", "phase": "coder-dispatch",
+    }
+    payload[field] = value
+    login, user_id = ("mallory", 9) if author == "foreign" else ("agent-loop", 1)
+    chain, _round = _recovery_chain_1367()
+    chain["hostile"] = {
+        "id": 55,
+        "user": {"login": login, "id": user_id},
+        "body": f"hostile\n<!-- AGENT_LOOP_META: {encode_mapping(payload)} -->",
+    }
+    config = _config_1367(tmp_path)
+    handoff = _fresh_handoff_1367()
+    runner = _runner_1367(chain)
+    assert _correlate_1367(runner, config, handoff) == _RECOVERY_IDS_1367
+    publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+        new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+    )
+    assert _authorization_posts_1367(runner) == 1
+    published = _runner_1367(_published_chain_1367(chain))
+    audit = _resume_audit_1367(published, config, _continuity_handoff_1367())
+    assert audit is not None and audit[0] == 70
+    _plan_binding_1367(published, config)
+    # The ordinary cutoff path refuses with the controlled error, not a crash.
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+            predecessor_head=_H1_1367, new_head=_H2_1367, round_number=1,
+            after_comment_id=60,
+        )
+
+
 def test_m1367_identical_stranded_and_original_heads_never_open_recovery():
     """Edge case (13): the recovery shape requires H0 != H1 != H2."""
     chain, _round = _recovery_chain_1367()
