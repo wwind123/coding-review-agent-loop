@@ -677,7 +677,7 @@ def test_strict_qualification_verifies_the_plan_against_its_own_board(tmp_path):
 def test_plan_verification_context_keeps_a_primary_then_panel_plan_policy(tmp_path):
     """handoff-plan-verification-recovery: the plan's own policy and primary."""
     from types import SimpleNamespace
-    from coding_review_agent_loop.plan_verification import plan_verification_config
+    from coding_review_agent_loop.plan_verification import plan_verification_inputs
     from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
     from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
 
@@ -701,7 +701,7 @@ def test_plan_verification_context_keeps_a_primary_then_panel_plan_policy(tmp_pa
         tmp_path, reviewer=("claude", "gemini"), pr_review_policy="primary-then-panel",
         primary_reviewer="claude",
     )
-    verified = plan_verification_config(pr_config, comments, issue_number=56)
+    verified, _ = plan_verification_inputs(pr_config, comments, issue_number=56)
     assert tuple(str(reviewer) for reviewer in verified.reviewer) == ("primary", "panel")
     assert verified.plan_review_policy == "primary-then-panel"
     assert str(verified.primary_plan_reviewer) == "primary"
@@ -1969,3 +1969,358 @@ def test_v2_handoff_may_only_restate_or_widen_an_authenticated_v1_handoff():
         published={ENTRY_HANDOFF: 111, ENTRY_PR_CONTRACT: 112},
     )
     assert corrected.comment_id == 111 and corrected.handoff.flow == FLOW_APPROVED_PLAN
+
+
+# --- Review round 1 of #1378 ----------------------------------------------------
+
+
+def _real_staged_plan_comments(tmp_path, *, gemini_state="approved"):
+    """A real primary-then-panel plan approved by board A (Codex primary, Gemini panel)."""
+    from agent_loop_helpers import structured_plan_review
+    from coding_review_agent_loop.cli import run_issue_loop
+    from test_child_plan_provenance import (
+        _ChildPlanningRunner, _child_plan_state, _child_row, _plan_config,
+    )
+
+    plan_dir = tmp_path / "plan"
+    plan_dir.mkdir()
+    runner = _ChildPlanningRunner(
+        claude_outputs=[_child_plan_state(_child_row())],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state=gemini_state, reviewer="Google Gemini")],
+    )
+    config = _plan_config(
+        plan_dir, reviewer=("codex", "gemini"), plan_review_policy="primary-then-panel",
+        primary_plan_reviewer="codex",
+    )
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except AgentLoopError:
+        if gemini_state == "approved":
+            raise
+    return list(runner.issue_comments)
+
+
+def _strict_managed_pr_run(tmp_path, monkeypatch, issue_comments, *, entry, pr_outputs):
+    """A strictly protected managed PR resumed by board B, driven to the merge gate."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.managed_ci import (
+        AuthenticatedIssueCreatedHandoff, ManagedCiContract, ManagedCiOutcome,
+    )
+
+    handoff = AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha="abc123", branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
+        trusted_actor_id=1, protection_mode="strict", override_nonce=None,
+    )
+    monkeypatch.setattr(orchestrator, "recover_issue_created_handoff", lambda *a, **k: handoff)
+    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff)
+    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *a, **k: handoff)
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: ManagedCiContract())
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *a, **k: None)
+    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *a, **k: None)
+    monkeypatch.setattr(
+        orchestrator, "wait_for_final_qualification",
+        lambda *a, **k: ManagedCiOutcome(status="passed", head_sha="abc123"),
+    )
+    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *a, **k: None)
+    merges = []
+    monkeypatch.setattr(
+        orchestrator, "_merge_with_exact_head_proof", lambda *a, **k: merges.append(k),
+    )
+    runner = FakeRunner(
+        issue_comments=issue_comments,
+        issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
+        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/managed-56"},
+        **pr_outputs,
+    )
+    fresh = (
+        {"managed_ci_fresh_authorization": True, "managed_ci_issue_number": 56}
+        if entry == "fresh" else {}
+    )
+    config = make_config(
+        tmp_path, reviewer=("claude", "antigravity"), managed_ci=True,
+        managed_ci_trusted_actor="agent-loop", auto_merge=True, pre_review_tests=False,
+        **fresh,
+    )
+    return runner, config, merges, run_pr_loop
+
+
+def _board_b_outputs(config=None):
+    return {
+        "claude_outputs": [structured_board_review("Anthropic Claude")],
+        "antigravity_outputs": [structured_board_review("Google Antigravity")],
+    }
+
+
+def structured_board_review(reviewer):
+    from agent_loop_helpers import structured_pr_review
+
+    return structured_pr_review(reviewer=reviewer)
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_staged_plan_by_board_a_qualifies_strict_pr_reviewed_by_board_b(
+    tmp_path, monkeypatch, entry
+):
+    """handoff-plan-verification-recovery and handoff-plan-binding-preserved, to the merge."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+
+    plan_comments = _real_staged_plan_comments(tmp_path)
+    runner, config, merges, run_pr_loop = _strict_managed_pr_run(
+        tmp_path, monkeypatch, plan_comments, entry=entry, pr_outputs=_board_b_outputs(),
+    )
+    real_verify = orchestrator._verify_strict_managed_plan_binding
+    strict_checks = []
+
+    def spy(**kwargs):
+        strict_checks.append(tuple(kwargs["config"].reviewer))
+        return real_verify(**kwargs)
+
+    monkeypatch.setattr(orchestrator, "_verify_strict_managed_plan_binding", spy)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    # The real strict binding ran at qualification with the PR config; the
+    # plan board came from issue history, so board B never verified the plan.
+    assert strict_checks and set(strict_checks) == {("claude", "antigravity")}
+    # Board B reviewed the exact head; the plan board never ran on the PR.
+    agents = [command[0] for command, _cwd in runner.commands if command[0] in _AGENT_COMMANDS]
+    assert sorted(agents) == ["agy", "claude"]
+    reviews = [comment for comment in runner.comments if "**Review verdict:**" in comment]
+    assert len(reviews) == 2
+    # Strict qualification re-verified the board A plan and merged the exact head once.
+    assert [merge["proof"].head_sha for merge in merges] == ["abc123"]
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_strict_pr_without_board_b_exact_head_approval_does_not_merge(
+    tmp_path, monkeypatch, entry
+):
+    plan_comments = _real_staged_plan_comments(tmp_path)
+    runner, config, merges, run_pr_loop = _strict_managed_pr_run(
+        tmp_path, monkeypatch, plan_comments, entry=entry,
+        pr_outputs={"claude_outputs": [structured_board_review("Anthropic Claude")]},
+    )
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert merges == []
+
+
+@pytest.mark.parametrize("entry", ["ordinary", "fresh"])
+def test_strict_recovery_refuses_a_plan_board_a_did_not_fully_approve(
+    tmp_path, monkeypatch, entry
+):
+    plan_comments = _real_staged_plan_comments(tmp_path, gemini_state="blocking")
+    runner, config, merges, run_pr_loop = _strict_managed_pr_run(
+        tmp_path, monkeypatch, plan_comments, entry=entry, pr_outputs=_board_b_outputs(),
+    )
+    with pytest.raises(AgentLoopError, match="canonical"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert merges == []
+    assert _agent_commands(runner) == []
+
+
+def test_strict_qualification_refuses_a_changed_plan_identity(tmp_path, monkeypatch):
+    """A stale or mismatched plan identity is refused at the final gate."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+
+    plan_comments = _real_staged_plan_comments(tmp_path)
+    runner, config, merges, run_pr_loop = _strict_managed_pr_run(
+        tmp_path, monkeypatch, plan_comments, entry="ordinary", pr_outputs=_board_b_outputs(),
+    )
+    real_verify = orchestrator._verify_strict_managed_plan_binding
+
+    def stale_identity(**kwargs):
+        return real_verify(**{**kwargs, "expected_plan_hash": "0" * 16})
+
+    monkeypatch.setattr(orchestrator, "_verify_strict_managed_plan_binding", stale_identity)
+    with pytest.raises(AgentLoopError, match="canonical approved plan changed"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert merges == []
+
+
+def _bound_plan_history(tmp_path, *, mutate):
+    """A named all-reviewers plan approved in round 1, with one history defect."""
+    from types import SimpleNamespace
+    from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
+    from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata, _attach_round_metadata, _plan_subject,
+    )
+
+    seats = (
+        _seat(tmp_path, "a", "codex", "gpt-a", "medium"),
+        _seat(tmp_path, "b", "claude", "claude-b", "medium"),
+    )
+    binding = reviewer_seat_binding(_named_config(tmp_path, seats))
+    plan = "Approved bound plan.\n\n### Plan steps\n1. Keep bindings honest."
+    subject = _plan_subject(plan)
+    records = [
+        dict(role="coder", agent="Claude", canonical_plan=plan, raw_structured_coder_response=plan),
+        dict(role="summary", agent="Orchestrator", scheduler_contract=make_plan_contract(
+            ("a", "b"), "all-reviewers", None).as_dict()),
+        dict(role="reviewer", agent="a", state="approved"),
+        dict(role="reviewer", agent="b", state="approved"),
+    ]
+    for record in records:
+        record.setdefault("seat_binding", binding)
+    mutate(records, binding)
+    comments = [
+        SimpleNamespace(body=_attach_round_metadata("Round record.", PostedRoundMetadata(
+            flow="plan", round_number=1, subject=subject, **fields,
+        )))
+        for fields in records
+    ]
+    return plan, comments
+
+
+def _rebound(binding, seat_id, **changes):
+    import copy
+
+    result = copy.deepcopy(binding)
+    for entry in result["seats"]:
+        if entry["id"] == seat_id:
+            entry.update(changes)
+    return result
+
+
+def _no_defect(records, binding):
+    pass
+
+
+def _approval_on_superseded_model(records, binding):
+    # b approved on an older model; a later summary binds b to the current one.
+    records[3]["seat_binding"] = _rebound(binding, "b", model_chain=["claude-b-old"])
+    records.append(dict(role="summary", agent="Orchestrator", seat_binding=binding))
+
+
+def _backend_changed(records, binding):
+    records[2]["seat_binding"] = _rebound(binding, "a", backend="gemini")
+
+
+def _unbound_record(records, binding):
+    records[3]["seat_binding"] = None
+
+
+def _board_changed(records, binding):
+    import copy
+
+    shrunk = copy.deepcopy(binding)
+    shrunk["seats"] = [entry for entry in shrunk["seats"] if entry["id"] == "a"]
+    records[2]["seat_binding"] = shrunk
+
+
+def _reviewer_outside_binding(records, binding):
+    records[3]["agent"] = "c"
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (_approval_on_superseded_model, "not completely approved"),
+        (_backend_changed, "changed backend in plan history"),
+        (_unbound_record, "mixes bound and unbound round records"),
+        (_board_changed, "changed its recorded board"),
+        (_reviewer_outside_binding, "not represented in its seat binding"),
+    ],
+    ids=["superseded-model", "backend", "unbound", "board", "outside-binding"],
+)
+def test_plan_seat_binding_history_is_validated_before_verifying_approval(
+    tmp_path, mutate, message
+):
+    """Generalization of item-2: every plan binding defect fails closed."""
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.github import IssueContext as Issue
+    from coding_review_agent_loop.pr_loop_support import _verify_strict_managed_plan_binding
+    from types import SimpleNamespace
+
+    def verify(comments, plan):
+        _verify_strict_managed_plan_binding(
+            config=make_config(tmp_path, reviewer=("gemini",)),
+            pr_number=7,
+            issue_context=Issue(959, "OWNER/REPO", "t", "b", None, tuple(
+                IssueComment(author="agent-loop", created_at=None, body=c.body) for c in comments
+            )),
+            metadata=SimpleNamespace(head_branch="agent-loop/managed-959", head_sha="h"),
+            expected_plan_hash=approved_plan_hash(plan),
+        )
+
+    plan, comments = _bound_plan_history(tmp_path, mutate=_no_defect)
+    verify(comments, plan)
+    plan, comments = _bound_plan_history(tmp_path, mutate=mutate)
+    with pytest.raises(AgentLoopError, match=message):
+        verify(comments, plan)
+
+
+def test_malformed_staged_plan_history_is_never_downgraded_to_all_reviewers(tmp_path):
+    """item-1: an invalid staged checkpoint with full-board approvals fails closed."""
+    from types import SimpleNamespace
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.github import IssueContext as Issue
+    from coding_review_agent_loop.plan_verification import plan_verification_inputs
+    from coding_review_agent_loop.pr_loop_support import _verify_strict_managed_plan_binding
+    from coding_review_agent_loop.reviewer_seats import reviewer_seat_binding
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata, _attach_round_metadata, _extract_round_metadata_records,
+        _plan_subject,
+    )
+
+    seats = (
+        _seat(tmp_path, "primary", "codex", "gpt-a", "medium"),
+        _seat(tmp_path, "panel", "claude", "claude-b", "medium"),
+    )
+    binding = reviewer_seat_binding(_named_config(
+        tmp_path, seats, plan_review_policy="primary-then-panel", primary_plan_reviewer=seats[0],
+    ))
+    plan = "Staged plan.\n\n### Plan steps\n1. Verify the staged gate."
+    subject = _plan_subject(plan)
+    from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
+
+    # A staged checkpoint without its candidate key does not decode as a valid
+    # scheduler record, so its persisted policy is hidden.
+    invalid = _attach_round_metadata("Plan scheduling checkpoint.", PostedRoundMetadata(
+        flow="plan", role="summary", agent="Orchestrator", round_number=1,
+        subject=subject, seat_binding=binding, phase="scheduler-prelaunch",
+        scheduler_contract=make_plan_contract(
+            ("primary", "panel"), "primary-then-panel", "primary",
+        ).as_dict(),
+        scheduler_obligation_digest="0" * 16,
+        scheduler_selected_reviewers=("primary",),
+        scheduler_paused_reviewers=(("panel", "panel"),),
+        scheduler_reasons=("primary gate",),
+        scheduler_final_sweep=False,
+        scheduler_force_full=False,
+        scheduler_calls_avoided=0,
+        scheduler_phase="primary",
+        scheduler_primary_reviewer="primary",
+    ))
+    bodies = [
+        _attach_round_metadata(plan, PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=1, subject=subject,
+            canonical_plan=plan, raw_structured_coder_response=plan, seat_binding=binding,
+        )),
+        invalid,
+        *(
+            _attach_round_metadata("Approved.", PostedRoundMetadata(
+                flow="plan", role="reviewer", agent=name, round_number=1, subject=subject,
+                state="approved", seat_binding=binding,
+            ))
+            for name in ("primary", "panel")
+        ),
+    ]
+    comments = [SimpleNamespace(body=body) for body in bodies]
+    statuses = [r.metadata.scheduler_metadata_status
+                for r in _extract_round_metadata_records(comments, flow="plan")]
+    assert "invalid" in statuses
+    with pytest.raises(AgentLoopError, match="planning policy cannot be verified"):
+        plan_verification_inputs(make_config(tmp_path), comments, issue_number=959)
+    with pytest.raises(AgentLoopError, match="approving plan board cannot be verified"):
+        _verify_strict_managed_plan_binding(
+            config=make_config(tmp_path, reviewer=("gemini",)),
+            pr_number=7,
+            issue_context=Issue(959, "OWNER/REPO", "t", "b", None, tuple(
+                IssueComment(author="agent-loop", created_at=None, body=body) for body in bodies
+            )),
+            metadata=SimpleNamespace(head_branch="agent-loop/managed-959", head_sha="h"),
+            expected_plan_hash=approved_plan_hash(plan),
+        )

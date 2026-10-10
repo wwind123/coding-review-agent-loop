@@ -1904,7 +1904,13 @@ plan's named seats, seat set, or seat models. `plan_verification.py` derives one
 plan verification context from the plan's owning issue: the persisted plan
 contract and its signed plan amendment lineage (C0 to Cn), the plan seat
 binding, and the planning policy and primary. Plain all-reviewers plans persist
-neither, so their board is every reviewer that reviewed the plan. Every
+neither, so their board is every reviewer that reviewed the plan. The context
+validates the plan's complete seat-binding history. Mixed bound and unbound
+rounds, a changed backend, a changed recorded board, or a reviewer outside its
+own binding fail closed. Approvals bound to a model chain or effort that a
+later binding superseded never count. A malformed staged checkpoint that hides
+the persisted policy also fails closed; it is never downgraded to
+all-reviewers verification. Every
 plan-approval reader uses this context and never reads the PR invocation's
 board: managed-CI fresh authorization, ordinary resume without an issue-side
 handoff, the handoff seam, and strict managed-CI qualification. For a staged
@@ -1931,11 +1937,14 @@ integers. `AgentLoopConfig` construction and `dataclasses.replace` never compare
 the board with the floor, so amendment rebinding cannot trip it.
 `reviewer_floor.check_reviewer_floor` checks the effective board after
 read-only history and lineage resolution. It runs before any workdir setup,
-PR-side write, or agent invocation, at issue-run start and at PR start or
-handoff. Providers are counted by seat backend. Only a validated, non-empty
-signed amendment chain supplies a floor exception. At handoff that requires an
-inherited seat set; on the PR it requires a signed PR amendment, and that check
-waits for the PR lineage. The exception covers only the measures the chain
+managed-CI activation, PR-side write, or agent invocation. That covers
+issue-run start (before base resolution and workdir setup), `managed-pr` (before
+the branch and draft PR are created), and PR start or handoff. Providers are
+counted by seat backend. Only a validated, non-empty signed amendment chain
+supplies a floor exception. At handoff that requires an inherited seat set. On
+the PR, the signed PR amendment lineage is resolved read-only at the same early
+point, so malformed amendment history also fails before any write. The
+exception covers only the measures the chain
 lowered from C0 to Cn, and never goes below the signed board's own counts with
 its recorded bindings. A binding swap therefore cannot inherit a provider
 exception. Recording unsigned in-run PR and plan board changes is later work

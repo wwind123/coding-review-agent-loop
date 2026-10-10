@@ -2320,6 +2320,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 body = sys.stdin.read()
             else:
                 body = args.body_file.read_text(encoding="utf-8")
+            # A managed PR is created fresh, so no signed amendment can
+            # authorize a smaller board: refuse it before any setup or write.
+            from .reviewer_floor import enforce_configured_board_floor
+            enforce_configured_board_floor(config, context="managed-pr reviewer board")
             config = resolve_base_branch(config, runner)
             ensure_agent_workdirs(config, runner)
             handoff = create_managed_pr(

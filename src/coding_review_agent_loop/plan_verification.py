@@ -45,6 +45,21 @@ class PlanVerificationContext:
     primary_reviewer: str | None
     seat_binding: dict | None
     signed_amendment_count: int
+    # Comment positions of approvals bound to a superseded seat model; they
+    # never count towards the approving board (#1373 review item-2).
+    stale_approval_indices: frozenset[int] = frozenset()
+
+    def verification_comments(self, comments: Sequence[object]) -> tuple[object, ...]:
+        """``comments`` with superseded-model approvals neutralized in place.
+
+        Positions are kept so sidecar hydration and ordering are unchanged.
+        """
+        from types import SimpleNamespace
+
+        return tuple(
+            SimpleNamespace(body="") if index in self.stale_approval_indices else comment
+            for index, comment in enumerate(comments)
+        )
 
     @property
     def signed_authorization(self) -> SignedBoardAuthorization | None:
@@ -186,17 +201,21 @@ def derive_plan_verification_context(
     records = _extract_round_metadata_records(comments, flow="plan")
     if not records:
         return None
-    binding = next(
-        (record.metadata.seat_binding for record in reversed(records)
-         if record.metadata.seat_binding is not None),
-        None,
-    )
-    binding_entries = validated_binding_entries(binding) if binding is not None else {}
+    binding, binding_entries, stale = _validated_plan_binding_history(records)
     contract = next(
         (contract for record in records
          if (contract := _persisted_plan_contract(record.metadata)) is not None),
         None,
     )
+    if contract is None and any(
+        record.metadata.scheduler_metadata_status == "invalid" for record in records
+    ):
+        # A malformed planning checkpoint hides the persisted policy; never
+        # downgrade it to all-reviewers verification.
+        raise AgentLoopError(
+            "Approved plan scheduler history is malformed, so its planning policy "
+            "cannot be verified."
+        )
     amendment_count = 0
     if contract is not None:
         amendments = collect_reviewer_board_amendments(
@@ -240,26 +259,91 @@ def derive_plan_verification_context(
         primary_reviewer=primary,
         seat_binding=binding,
         signed_amendment_count=amendment_count,
+        stale_approval_indices=stale,
     )
 
 
-def plan_verification_config(
-    config: object, comments: Sequence[object], *, issue_number: int | None,
-) -> object:
-    """The config every plan-approval reader uses: the approving plan board.
+def _validated_plan_binding_history(
+    records: Sequence[object],
+) -> tuple[dict | None, dict[str, dict], frozenset[int]]:
+    """Validate every plan seat binding against the plan's own history.
 
-    Without a plan candidate there is nothing to verify, and every consumer
-    already fails closed on a missing canonical plan.
+    Returns the latest binding, its entries, and the positions of approvals
+    bound to a model chain or effort the latest binding superseded.  Mixed
+    bound/unbound rounds, changed backends, a changed recorded board, and a
+    reviewer outside its own binding fail closed.  The PR invocation board is
+    never consulted.
+    """
+    from .reviewer_seats import validated_binding_entries
+
+    bound = [record for record in records if record.metadata.seat_binding is not None]
+    if not bound:
+        return None, {}, frozenset()
+    latest = bound[-1].metadata.seat_binding
+    latest_entries = validated_binding_entries(latest)
+    board = set(latest_entries)
+    backends: dict[str, str] = {}
+    stale: set[int] = set()
+    for record in records:
+        metadata = record.metadata
+        recorded = metadata.seat_binding
+        if recorded is None:
+            if metadata.role in {"reviewer", "coder", "summary"}:
+                raise AgentLoopError(
+                    "Approved plan history mixes bound and unbound round records "
+                    f"({metadata.role}, round {metadata.round_number}); its approving "
+                    "board cannot be verified."
+                )
+            continue
+        entries = validated_binding_entries(recorded)
+        if set(entries) != board:
+            raise AgentLoopError(
+                "Approved plan seat binding changed its recorded board; its approving "
+                "board cannot be verified."
+            )
+        for seat_id, entry in entries.items():
+            if backends.setdefault(seat_id, entry["backend"]) != entry["backend"]:
+                raise AgentLoopError(
+                    f"Approved plan seat {seat_id!r} changed backend in plan history."
+                )
+        if metadata.role != "reviewer":
+            continue
+        own = entries.get(metadata.agent)
+        if own is None:
+            raise AgentLoopError(
+                "Approved plan reviewer record is not represented in its seat binding."
+            )
+        current = latest_entries[metadata.agent]
+        if metadata.state == "approved" and (
+            own["model_chain"] != current["model_chain"]
+            or own.get("effort") != current.get("effort")
+        ):
+            stale.add(record.index)
+    return latest, latest_entries, frozenset(stale)
+
+
+def plan_verification_inputs(
+    config: object, comments: Sequence[object], *, issue_number: int | None,
+) -> tuple[object, tuple[object, ...]]:
+    """The config and comments every plan-approval reader uses.
+
+    The config is re-pointed at the approving plan board; the comments have
+    approvals bound to a superseded seat model neutralized.  Without a plan
+    candidate there is nothing to verify, and every consumer already fails
+    closed on a missing canonical plan.
     """
     from .round_state import _extract_round_metadata_records
 
+    comments = tuple(comments)
     if not any(
         record.metadata.role == "coder"
         for record in _extract_round_metadata_records(comments, flow="plan")
     ):
-        return config
+        return config, comments
     context = derive_plan_verification_context(comments, issue_number=issue_number)
-    return config if context is None else context.config_for(config)
+    if context is None:
+        return config, comments
+    return context.config_for(config), context.verification_comments(comments)
 
 
 # --- Board-change audit record ------------------------------------------------

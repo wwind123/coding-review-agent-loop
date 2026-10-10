@@ -42,7 +42,7 @@ from .plan_verification import (
     board_change_digest,
     board_change_payload,
     derive_plan_verification_context,
-    plan_verification_config,
+    plan_verification_inputs,
     render_board_change_audit,
     signed_lineage_authorization,
 )
@@ -462,6 +462,79 @@ def unchanged_head_stop_message(
 
 
 @claimed_run("pr", "pr_number")
+def _signed_pr_board_preflight(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_context: PullRequestReviewContext,
+    pr_number: int,
+    amendments: Sequence[object],
+) -> tuple[AgentLoopConfig, object | None]:
+    """Read-only signed PR amendment lineage for the startup floor check.
+
+    Returns the effective PR board config and, for a validated non-empty
+    chain, its signed authorization.  The same drift error the startup block
+    raises fails closed here, before any write.
+    """
+    from .reviewer_seats import reviewer_seat_binding
+
+    capabilities = policy_capabilities(config.pr_review_policy)
+    try:
+        records = _extract_round_metadata_records(pr_context.comments, flow="pr")
+    except AgentLoopError:
+        if capabilities.requires_primary:
+            # The staged startup path posts its own pre-panel diagnostic and
+            # stops; this run cannot reach a review.
+            return config, None
+        raise
+    configured = reviewers(config)
+    contract = make_contract(
+        tuple(agent_display_name(reviewer) for reviewer in configured),
+        config.pr_review_policy,
+        config.pr_review_broad_rules,
+        (
+            agent_display_name(config.primary_reviewer)
+            if config.primary_reviewer is not None
+            else None
+        ),
+    )
+    lineage = resolve_contract_lineage(
+        records,
+        amendments,
+        contract,
+        accept_base_configured=True,
+        contract_from_metadata=_scheduler_contract_from_metadata,
+        drift_error=lambda persisted, detail: _pr_contract_drift_error(
+            persisted,
+            detail,
+            pr_number=pr_number,
+            configured=contract,
+            start_round_number=lambda: _pr_amendment_start_round(
+                pr_context, configured, capabilities, runner=runner, config=config,
+            ),
+            amendments_recognized=True,
+        ),
+    )
+    binding = reviewer_seat_binding(config)
+    effective = lineage.contracts[-1]
+    effective_config = config
+    if effective != contract:
+        names = set(effective.required_reviewers)
+        effective_config = dataclasses_replace(
+            config,
+            reviewer=tuple(r for r in configured if agent_display_name(r) in names),
+            pr_seat_binding_override=binding,
+        )
+    if not lineage.amendments:
+        return effective_config, None
+    return effective_config, signed_lineage_authorization(
+        lineage.contracts[0].required_reviewers,
+        effective_config=effective_config,
+        known_configs=(config,),
+        binding=binding,
+    )
+
+
 def run_pr_loop(
     runner: Runner,
     *,
@@ -648,17 +721,17 @@ def run_pr_loop(
             else:
                 # Plan approval is verified against the approving plan board,
                 # never this PR invocation's board (#1373).
-                plan_config = plan_verification_config(
+                plan_config, plan_comments = plan_verification_inputs(
                     config, issue_context.comments, issue_number=issue_context.number,
                 )
                 resumed_plan = _resume_plan_round(
-                    issue_context.comments,
+                    plan_comments,
                     configured_reviewers=reviewers(plan_config),
                 )
                 if resumed_plan is not None:
                     plan_text, resumed_plan_round = resumed_plan
                     _require_complete_canonical_plan_approval(
-                        issue_context.comments,
+                        plan_comments,
                         config=plan_config,
                         plan_text=plan_text,
                         plan_round=resumed_plan_round,
@@ -797,17 +870,17 @@ def run_pr_loop(
                             )
                         recovered_scope = candidate_scope
                     elif canonical_handoff is None:
-                        plan_config = plan_verification_config(
+                        plan_config, plan_comments = plan_verification_inputs(
                             config, issue_context.comments, issue_number=issue_context.number,
                         )
                         resumed_plan = _resume_plan_round(
-                            issue_context.comments,
+                            plan_comments,
                             configured_reviewers=reviewers(plan_config),
                         )
                         if resumed_plan is not None:
                             plan_text, resumed_plan_round = resumed_plan
                             _require_complete_canonical_plan_approval(
-                                issue_context.comments,
+                                plan_comments,
                                 config=plan_config,
                                 plan_text=plan_text,
                                 plan_round=resumed_plan_round,
@@ -1748,22 +1821,32 @@ def run_pr_loop(
             plan_handoff_board.signed_authorizations
             if plan_handoff_board is not None else ()
         )
-        # A signed PR amendment can authorize a reduced PR board; that floor
-        # check waits for the PR lineage below (stage 2 of #1373 records
-        # unsigned in-run PR board changes).
-        try:
-            pr_floor_deferred = bool(collect_reviewer_board_amendments(
-                initial_pr_context.comments, flow="pr", pr_number=pr_number,
-                ignored_sink=[],
-            ))
-        except AgentLoopError:
-            pr_floor_deferred = True
-        if not pr_floor_deferred:
-            enforce_configured_board_floor(
-                config,
-                authorizations=handoff_floor_authorizations,
-                context=f"PR #{pr_number} reviewer board",
+        # A signed PR amendment can authorize a reduced PR board.  Its lineage
+        # is resolved read-only here, so a malformed amendment history or a
+        # below-floor board is refused before managed-CI activation, any
+        # PR-side write, workdir setup, or agent invocation.  The later
+        # startup block resolves the same lineage again for scheduling.
+        pr_floor_amendments = collect_reviewer_board_amendments(
+            initial_pr_context.comments, flow="pr", pr_number=pr_number,
+            ignored_sink=[],
+        )
+        floor_config = config
+        floor_authorizations = list(handoff_floor_authorizations)
+        if pr_floor_amendments:
+            floor_config, pr_floor_authorization = _signed_pr_board_preflight(
+                runner,
+                config=config,
+                pr_context=initial_pr_context,
+                pr_number=pr_number,
+                amendments=pr_floor_amendments,
             )
+            if pr_floor_authorization is not None:
+                floor_authorizations.append(pr_floor_authorization)
+        enforce_configured_board_floor(
+            floor_config,
+            authorizations=floor_authorizations,
+            context=f"PR #{pr_number} reviewer board",
+        )
         if not workdirs_ready:
             ensure_agent_workdirs(config, runner)
         config = _freeze_prompt_architecture(
@@ -2073,20 +2156,6 @@ def run_pr_loop(
             }
         pr_amendment_digest = pr_contract_lineage.active_digest
         pr_amendment_checkpoint_pending = bool(pr_contract_lineage.pending_amendments)
-        if pr_floor_deferred:
-            pr_floor_authorizations = list(handoff_floor_authorizations)
-            if pr_contract_lineage.amendments:
-                pr_floor_authorizations.append(signed_lineage_authorization(
-                    pr_contract_lineage.contracts[0].required_reviewers,
-                    effective_config=config,
-                    known_configs=(dataclasses_replace(config, reviewer=operator_reviewers),),
-                    binding=seat_binding,
-                ))
-            enforce_configured_board_floor(
-                config,
-                authorizations=pr_floor_authorizations,
-                context=f"PR #{pr_number} reviewer board",
-            )
         if plan_handoff_board is not None and plan_handoff_board.changed:
             # One orchestrator-written audit record per derived board change,
             # before round 1; its digest makes every rerun a no-op.
