@@ -3551,6 +3551,40 @@ def test_named_seat_rejects_legacy_explicit_reviewer_workdir(tmp_path, capsys):
     assert not checkout.exists()
 
 
+@pytest.mark.parametrize("legacy_reviewers", [
+    ("agy", "agy"),
+    ("agy", "antigravity"),
+])
+@pytest.mark.parametrize("primary", [False, True])
+def test_named_seat_rejects_duplicate_legacy_reviewers_before_phase_gate(
+    tmp_path, monkeypatch, capsys, legacy_reviewers, primary,
+):
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    checkout = tmp_path / "seat-checkout"
+    flags = ["--pr-review-policy", "primary-then-panel", "--primary-reviewer-seat", "model-a"] if primary else []
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "model-a=codex",
+        "--seat-model", "model-a=Model A", "--seat-dir", f"model-a={checkout}",
+        "--reviewer", legacy_reviewers[0],
+        "--reviewer", legacy_reviewers[1], *flags,
+    ]) == 1
+    assert "--reviewer cannot include the same agent more than once" in capsys.readouterr().err
+    assert not checkout.exists()
+
+
+def test_named_seat_rejects_implementation_coder_workdir_before_phase_gate(tmp_path, monkeypatch, capsys):
+    checkout = tmp_path / "implementation-checkout"
+    monkeypatch.setattr(cli_module, "run_issue_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+    assert cli_module.main([
+        "issue", "77", "--repo", "OWNER/REPO", "--plan-first", "--coder", "codex",
+        "--implementation-coder", "claude", "--claude-dir", str(checkout),
+        "--reviewer-seat", "model-a=agy", "--seat-model", "model-a=Model A",
+        "--seat-dir", f"model-a={checkout}",
+    ]) == 1
+    assert "workdir collides with implementation coder" in capsys.readouterr().err
+    assert not checkout.exists()
+
+
 @pytest.mark.parametrize("policy,primary", [
     ("--pr-review-policy", "--primary-reviewer-seat"),
     ("--plan-review-policy", "--primary-plan-reviewer-seat"),

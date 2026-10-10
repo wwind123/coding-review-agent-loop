@@ -105,7 +105,10 @@ def resolve_reviewer_seats(args: object) -> tuple[ReviewerSeat, ...]:
     if seats:
         from .config import DEFAULT_ANTIGRAVITY_MODELS
 
-        legacy_backends = {normalize_agent_name(name) for name in getattr(args, "reviewer", None) or ()}
+        legacy_reviewers = tuple(normalize_agent_name(name) for name in getattr(args, "reviewer", None) or ())
+        if len(set(legacy_reviewers)) != len(legacy_reviewers):
+            raise AgentLoopError("--reviewer cannot include the same agent more than once.")
+        legacy_backends = set(legacy_reviewers)
         coder = getattr(args, "coder", "claude")
         for backend, flags in {
             "antigravity": ("antigravity_model", "antigravity_models"),
@@ -141,6 +144,11 @@ def resolve_reviewer_seats(args: object) -> tuple[ReviewerSeat, ...]:
         used_dirs: dict[Path, str] = {}
         if coder_dir is not None:
             used_dirs[Path(coder_dir).resolve()] = "coder"
+        implementation_coder = getattr(args, "implementation_coder", None)
+        if implementation_coder is not None:
+            implementation_dir = getattr(args, f"{implementation_coder}_dir", None)
+            if implementation_dir is not None:
+                used_dirs.setdefault(Path(implementation_dir).resolve(), "implementation coder")
         for backend in legacy_backends:
             reviewer_dir = getattr(args, f"{backend}_dir", None)
             if reviewer_dir is not None:
