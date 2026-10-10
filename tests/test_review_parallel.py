@@ -325,6 +325,10 @@ def test_named_agy_seats_serialize_host_settings_and_bound_wait(tmp_path, monkey
 
 def test_named_pr_lock_wait_resume_keeps_seats_incomplete(tmp_path, monkeypatch):
     import fcntl
+    import importlib
+
+    # Another test reloads the adapter after collection; patch the active backend.
+    agy_backend = importlib.import_module("coding_review_agent_loop.agents.antigravity")
 
     settings = tmp_path / "settings.json"
     settings.write_text("{}", encoding="utf-8")
