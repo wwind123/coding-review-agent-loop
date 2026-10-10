@@ -74,6 +74,9 @@ def trusted_url(repo: str, observed: str, *, local_origin: Path | None = None) -
         trusted = str(local_origin.resolve(strict=True))
         if observed == trusted:
             return trusted
+        raise AgentLoopError(
+            f"Checkout origin does not match the operator-trusted endpoint for {repo}; refusing transport."
+        )
     if observed not in allowed:
         raise AgentLoopError(
             f"Checkout origin does not match the operator-trusted endpoint for {repo}; refusing transport."

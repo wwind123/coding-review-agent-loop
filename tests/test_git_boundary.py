@@ -163,6 +163,27 @@ def test_wrong_origin_is_rejected_before_private_fetch(repositories, monkeypatch
     assert trusted_url("OWNER/REPO", "https://github.com/OWNER/REPO.git") == "https://github.com/OWNER/REPO.git"
 
 
+@pytest.mark.parametrize("observed", [
+    "https://github.com/OWNER/REPO.git",
+    "git@github.com:OWNER/REPO.git",
+    "ssh://git@github.com/OWNER/REPO.git",
+    "https://evil.example/OWNER/REPO.git",
+])
+def test_existing_local_checkout_rejects_every_other_origin_before_fetch(
+    repositories, monkeypatch, tmp_path, observed,
+):
+    origin, _, checkout = repositories
+    marker = tmp_path / "transport-started"
+    git(checkout, "config", "remote.origin.url", observed)
+    from coding_review_agent_loop import git_transport
+
+    monkeypatch.setattr(git_transport, "_private_git", lambda *a, **k: marker.touch())
+    with pytest.raises(AgentLoopError, match="operator-trusted endpoint"):
+        import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main",
+                   repo="OWNER/REPO", runner=Runner(), local_origin=origin)
+    assert not marker.exists()
+
+
 @pytest.mark.parametrize("protocol,expected", [
     ("https", "https://github.com/OWNER/REPO.git"),
     ("ssh", "git@github.com:OWNER/REPO.git"),
