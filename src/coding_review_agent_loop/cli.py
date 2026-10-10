@@ -2099,6 +2099,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if named_seats:
             if args.command == "discuss":
                 raise AgentLoopError("discuss does not support named reviewer seats.")
+            if args.command == "issue" and args.plan_first:
+                raise AgentLoopError("issue --plan-first does not support named reviewer seats until plan identity is enabled.")
+            if args.primary_plan_reviewer_seat is not None:
+                raise AgentLoopError("Named primary plan review is unavailable until plan identity is enabled.")
             for option, primary, policy in (
                 ("--primary-reviewer-seat", args.primary_reviewer_seat, args.pr_review_policy),
                 ("--primary-plan-reviewer-seat", args.primary_plan_reviewer_seat, args.plan_review_policy),
@@ -2125,10 +2129,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.plan_review_policy == "primary-then-panel" and board_size < 2:
                 raise AgentLoopError("--plan-review-policy primary-then-panel requires at least one secondary reviewer.")
             validate_sandboxed_args(args, tuple(args.reviewer or ()), named_seats=named_seats)
-            raise AgentLoopError(
-                "Named reviewer seats are validated but review execution is unavailable in phase 1; "
-                "use legacy --reviewer until durable seat identity is enabled."
-            )
         if args.primary_reviewer_seat is not None or args.primary_plan_reviewer_seat is not None:
             raise AgentLoopError("A named primary requires --reviewer-seat.")
         config = config_from_args(args, runner, invocation_argv=invocation)

@@ -1,6 +1,7 @@
 """Signed reviewer-board amendment records (#943): parser, chain, lineage, ledger."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -226,6 +227,98 @@ def test_pr_contract_amendment_keeps_policy_primary_and_broad_rules():
     assert amended.broad_rules == original.broad_rules
     assert amended.broad_rules_digest == original.broad_rules_digest
     assert amended.primary_reviewer == "Codex"
+
+
+def test_named_pr_backend_outage_requires_one_complete_removal():
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat,
+        SeatAgent,
+        reviewer_seat_binding,
+        validate_pr_backend_outage_amendments,
+    )
+
+    def seat(name, backend, model):
+        from pathlib import Path
+        return SeatAgent(ReviewerSeat(name, backend, (model,)), Path("/tmp") / name)
+
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=(
+            seat("primary", "codex", "gpt-6-sol"),
+            seat("flash", "antigravity", "gemini-flash"),
+            seat("opus", "antigravity", "claude-opus"),
+        ),
+    )
+    board = ("primary", "flash", "opus")
+    def amendment(removed):
+        return SimpleNamespace(
+            original_required_reviewers=board,
+            removed_reviewers=removed,
+        )
+
+    with pytest.raises(AgentLoopError, match="must remove every active seat"):
+        validate_pr_backend_outage_amendments((amendment(("flash",)),), config)
+    validate_pr_backend_outage_amendments((amendment(("flash", "opus")),), config)
+    original_binding = reviewer_seat_binding(config)
+    amended_view = SimpleNamespace(
+        reviewer_seats=config.reviewer_seats,
+        reviewer=config.reviewer[:1],
+        pr_seat_binding_override=original_binding,
+    )
+    assert reviewer_seat_binding(amended_view) == original_binding
+    with pytest.raises(AgentLoopError, match="no verified backend binding"):
+        validate_pr_backend_outage_amendments((amendment(("unbound",)),), config)
+
+
+def test_named_pr_signed_outage_removal_and_explicit_restoration():
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,
+    )
+
+    board = ("primary", "flash", "opus", "other")
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=tuple(
+            SeatAgent(ReviewerSeat(name, backend, (model,)), Path("/tmp") / name)
+            for name, backend, model in (
+                ("primary", "codex", "gpt-6-sol"),
+                ("flash", "antigravity", "gemini-flash"),
+                ("opus", "antigravity", "claude-opus"),
+                ("other", "claude", "claude-sonnet"),
+            )
+        ),
+    )
+    original = make_contract(board, "primary-then-panel", None, "primary")
+
+    def signed(original_board, removed, restored, round_number):
+        return format_reviewer_board_amendment_comment(
+            flow="pr", issue=None, pr_number=17,
+            original_required_reviewers=original_board,
+            policy="primary-then-panel", primary_reviewer="primary",
+            removed_reviewers=removed, restored_reviewers=restored,
+            effective_from_round=round_number,
+            rationale="Shared backend outage or recovery.",
+        )
+
+    comments = [
+        _comment(signed(board, ("flash", "opus"), (), 2)),
+        _comment(signed(("primary", "other"), (), ("flash", "opus"), 3)),
+    ]
+    amendments = collect_reviewer_board_amendments(comments, flow="pr", pr_number=17)
+    validate_pr_backend_outage_amendments(amendments, config)
+    reduced = amend_contract(original, amendments[0], base_board=board)
+    assert reduced.required_reviewers == ("primary", "other")
+    restored = amend_contract(
+        reduced, amendments[1], base_board=board,
+        previously_removed=("flash", "opus"),
+    )
+    assert restored.required_reviewers == board
+    with pytest.raises(AgentLoopError, match="primary reviewer"):
+        (bad,) = collect_reviewer_board_amendments(
+            [_comment(signed(board, ("primary",), (), 2))],
+            flow="pr", pr_number=17,
+        )
+        amend_contract(original, bad, base_board=board)
 
 
 # --- lineage (rows digest-binding, chain-link-interval, post-amend-old-board)

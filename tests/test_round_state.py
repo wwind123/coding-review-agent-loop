@@ -20,12 +20,75 @@ from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
     _decode_round_metadata,
     _encode_round_metadata,
+    _attach_round_metadata,
+    _latest_pr_approved_reviews_for_head,
+    PostedRoundRecord,
     encode_plan_validation_diagnostic_body,
     recover_plan_validation_diagnostic,
 )
 from coding_review_agent_loop.round_transport import decode_mapping, encode_mapping
 
 from agent_loop_helpers import make_config
+from coding_review_agent_loop.reviewer_seats import (
+    ReviewerSeat, SeatAgent, reviewer_seat_binding, validate_pr_seat_bindings,
+)
+
+
+def test_named_pr_seat_binding_and_exact_head_approval(tmp_path):
+    seats = (
+        SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash"),
+        SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus"),
+    )
+    config = make_config(tmp_path, reviewer=seats, reviewer_seats=seats)
+    binding = reviewer_seat_binding(config)
+
+    def record(index, seat, head):
+        metadata = PostedRoundMetadata(
+            flow="pr", role="reviewer", agent=str(seat), round_number=index,
+            subject=head, state="approved", provider="antigravity",
+            configured_model=seat.model_chain[0], seat_binding=binding,
+        )
+        decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+        assert decoded.seat_binding == binding
+        return PostedRoundRecord(index, decoded, _attach_round_metadata("Approved.", metadata))
+
+    first = record(0, seats[0], "H")
+    second = record(1, seats[1], "H")
+    moved = record(2, seats[0], "H2")
+    contract = {str(seat): (seat.model_chain[0], None, "antigravity") for seat in seats}
+    lookup = lambda records, head: _latest_pr_approved_reviews_for_head(
+        [SimpleNamespace(body=entry.body) for entry in records], head_sha=head,
+        configured_reviewers=seats, reviewer_acquisition_contract=contract,
+    )
+    assert set(lookup((first, second), "H")) == {"flash", "opus"}
+    assert set(lookup((first, second, moved), "H2")) == {"flash"}
+    assert validate_pr_seat_bindings((first, second), config) == set()
+    changed = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model C",)), seats[0].workdir)
+    changed_config = dataclasses.replace(config, reviewer=(changed, seats[1]), reviewer_seats=(changed, seats[1]))
+    assert validate_pr_seat_bindings((first, second), changed_config) == {"flash"}
+    rebound = SeatAgent(ReviewerSeat("flash", "codex", ("Model C",)), seats[0].workdir)
+    rebound_config = dataclasses.replace(config, reviewer=(rebound, seats[1]), reviewer_seats=(rebound, seats[1]))
+    with pytest.raises(AgentLoopError, match="changed backend"):
+        validate_pr_seat_bindings((first, second), rebound_config)
+
+
+def test_named_pr_binding_allows_legacy_implicit_model_on_other_backend(tmp_path):
+    seat = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    config = make_config(
+        tmp_path, reviewer=("codex", seat), reviewer_seats=(seat,),
+        codex_model=None, reviewer_codex_model=None,
+    )
+    binding = reviewer_seat_binding(config)
+    assert binding["seats"][0]["model_chain"] == [None]
+    record = PostedRoundRecord(
+        0,
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="flash", round_number=1,
+            subject="head", seat_binding=binding,
+        ),
+        "",
+    )
+    assert validate_pr_seat_bindings((record,), config) == set()
 
 
 def _checkpoint(**overrides):

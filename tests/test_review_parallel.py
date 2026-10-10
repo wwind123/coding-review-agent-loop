@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import pytest
@@ -26,6 +27,68 @@ from agent_loop_helpers import (
     structured_plan_state,
     structured_pr_review,
 )
+from coding_review_agent_loop.agents import antigravity as agy_backend
+from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+
+def test_named_agy_seats_serialize_host_settings_and_bound_wait(tmp_path, monkeypatch):
+    import fcntl
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(agy_backend, "_antigravity_settings_path", lambda: settings)
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+    base = make_config(tmp_path)
+    active = 0
+    peak = 0
+    gate = threading.Lock()
+
+    class DelayedRunner(FakeRunner):
+        def run_with_log(self, args, **kwargs):
+            nonlocal active, peak
+            if args and args[0] == "agy":
+                with gate:
+                    active += 1
+                    peak = max(peak, active)
+                time.sleep(0.05)
+                try:
+                    return super().run_with_log(args, **kwargs)
+                finally:
+                    with gate:
+                        active -= 1
+            return super().run_with_log(args, **kwargs)
+
+    def invoke(seat):
+        config = dataclasses.replace(
+            base, antigravity_dir=seat.workdir, antigravity_model=seat.model_chain[0],
+            antigravity_models=seat.model_chain, active_reviewer_seat_id=str(seat),
+        )
+        return agy_backend.AntigravityBackend().run(
+            DelayedRunner(antigravity_outputs=[("review", 0)]), config, "Review PR.", role="reviewer"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert all(result.text == "review" for result in pool.map(invoke, (flash, opus)))
+    assert peak == 1
+
+    lock_path = settings.with_suffix(".json.lock")
+    monkeypatch.setattr(agy_backend, "SETTINGS_LOCK_WAIT_SECONDS", 0.05)
+    runner = DelayedRunner(antigravity_outputs=[("review", 0)])
+    config = dataclasses.replace(
+        base, antigravity_dir=flash.workdir, antigravity_model="Model A",
+        antigravity_models=("Model A",), active_reviewer_seat_id="flash",
+    )
+    with lock_path.open("a+") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        try:
+            with pytest.raises(AgentLoopError, match="review is incomplete"):
+                agy_backend.AntigravityBackend().run(runner, config, "Review PR.", role="reviewer")
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN)
+    assert not any(command[0] == "agy" for command, _ in runner.commands)
 
 
 def _initial_plan() -> str:

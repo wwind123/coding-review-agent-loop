@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 import coding_review_agent_loop.orchestrator as orchestrator
+from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
 from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.unresolved_items import (
     MACHINE_AUTHORITY,
@@ -22,6 +23,103 @@ from coding_review_agent_loop.orchestrator import (
 CLAIM = "Skill-mode reviewers must receive the PR-bound approved plan."
 SUMMARY = "Recovery still picks the first loose issue reference and hides comment-read failures."
 NOTE = "helpers/skill_runner.py selects the first issue; use the primary-issue contract and test multiple references."
+
+
+def test_named_seat_blocker_and_owner_survive_pr_resume(tmp_path):
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+    runner = FakeRunner(antigravity_outputs=[
+        (structured_pr_review(
+            state="blocking", reviewer="flash (Google Antigravity: Model A)",
+            blocking_items=[{"text": "Fix the worker cleanup", "fix_scope": ["src/worker.py"]}],
+        ), 0),
+        (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+    ])
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        max_rounds=1, pre_review_tests=False, agent_max_retries=0,
+    )
+    with pytest.raises(AgentLoopError, match=r"flash \(item-1\)"):
+        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
+        flow="pr",
+    )
+    flash_record = next(record for record in records if record.metadata.agent == "flash")
+    assert flash_record.metadata.new_items[0].reviewer == "flash"
+    assert flash_record.metadata.new_items[0].resolution_owners == ("flash",)
+    assert any(record.metadata.agent == "opus" and record.metadata.state == "approved" for record in records)
+    runner.claude_outputs.append(structured_coder_followup(addressed_items=["item-1"]))
+    runner.antigravity_outputs.extend([
+        (structured_pr_review(
+            reviewer="flash (Google Antigravity: Model A)",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ), 0),
+        (structured_pr_review(
+            reviewer="opus (Google Antigravity: Model B)",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ), 0),
+    ])
+    resumed = dataclasses.replace(config, max_rounds=3)
+    assert orchestrator.run_pr_loop(runner, pr_number=77, config=resumed) == 0
+    reviewed = [comment for comment in runner.pr_payload["comments"] if "**Review verdict:**" in comment["body"]]
+    assert len(reviewed) >= 4
+    recovered_records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
+        flow="pr",
+    )
+    coder = next(record for record in recovered_records if record.metadata.role == "coder")
+    assert coder.metadata.prior_items[0].reviewer == "flash"
+    assert coder.metadata.prior_items[0].resolution_owners == ("flash",)
+    assert {record.metadata.agent for record in recovered_records
+            if record.metadata.role == "reviewer" and record.metadata.subject == runner.pr_payload["headRefOid"]} == {"flash", "opus"}
+
+
+def test_named_seat_model_change_keeps_open_blocker_until_fresh_disposition(tmp_path):
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+    runner = FakeRunner(antigravity_outputs=[
+        (structured_pr_review(
+            state="blocking", reviewer="flash (Google Antigravity: Model A)",
+            blocking_items=[{"text": "Fix worker cleanup", "fix_scope": ["src/worker.py"]}],
+        ), 0),
+        (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+    ])
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        max_rounds=1, pre_review_tests=False, agent_max_retries=0,
+    )
+    with pytest.raises(AgentLoopError, match="flash"):
+        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+    new_flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model C",)), flash.workdir)
+    changed = dataclasses.replace(
+        config, reviewer=(new_flash, opus), reviewer_seats=(new_flash, opus), max_rounds=3,
+    )
+    runner.antigravity_outputs.extend([
+        (structured_pr_review(
+            reviewer="flash (Google Antigravity: Model C)",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ), 0),
+        (structured_pr_review(
+            reviewer="opus (Google Antigravity: Model B)",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ), 0),
+    ])
+    assert orchestrator.run_pr_loop(runner, pr_number=77, config=changed) == 0
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
+        flow="pr",
+    )
+    fresh = [record for record in records if record.metadata.role == "reviewer" and record.metadata.round_number == 2]
+    assert {record.metadata.agent for record in fresh} == {"flash", "opus"}
+    assert all(record.metadata.prior_items[0].reviewer == "flash" for record in fresh)
+    assert all(record.metadata.prior_items[0].resolution_owners == ("flash",) for record in fresh)
 
 
 def carried_item():

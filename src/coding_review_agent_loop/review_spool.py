@@ -51,6 +51,7 @@ SPOOLED_RESPONSE_FIELDS: tuple[str, ...] = (
     "observation_provenance",
     "acquisition_outcome",
     "acquisition_returncode",
+    "seat_binding",
 )
 
 _UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")

@@ -13,6 +13,9 @@ if TYPE_CHECKING:
 
 
 def agent_workdir(config: AgentLoopConfig, agent: AgentName) -> Path:
+    from .reviewer_seats import SeatAgent
+    if isinstance(agent, SeatAgent):
+        return agent.workdir
     return {
         "claude": config.claude_dir,
         "codex": config.codex_dir,

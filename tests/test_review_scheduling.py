@@ -3,7 +3,83 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_loop_helpers import FakeRunner, make_config
+from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
+from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+
+def test_named_pr_primary_runs_before_same_backend_panel(tmp_path):
+    from coding_review_agent_loop.cli import run_pr_loop
+
+    first = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    primary = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    first.workdir.mkdir()
+    primary.workdir.mkdir()
+    runner = FakeRunner(antigravity_outputs=[
+        (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+        (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+    ])
+    config = make_config(
+        tmp_path, reviewer=(first, primary), reviewer_seats=(first, primary),
+        pr_review_policy="primary-then-panel", primary_reviewer=primary,
+        pre_review_tests=False, agent_max_retries=0,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
+              if cmd and cmd[0] == "agy" and "--model" in cmd]
+    assert models == ["Model B", "Model A"]
+
+
+def test_named_selective_pr_keeps_same_backend_seats_distinct(tmp_path, monkeypatch):
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from agent_loop_helpers import structured_coder_followup
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+    monkeypatch.setattr(
+        orchestrator, "_observe_pr_transition",
+        lambda *args, **kwargs: orchestrator.TransitionClassification("narrow", "worker-only fix"),
+    )
+    runner = FakeRunner(
+        antigravity_outputs=[
+            (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+            (structured_pr_review(
+                state="blocking", reviewer="opus (Google Antigravity: Model B)",
+                blocking_items=[{"text": "Fix worker", "fix_scope": ["src/worker.py"]}],
+            ), 0),
+            (structured_pr_review(
+                reviewer="opus (Google Antigravity: Model B)",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ), 0),
+            (structured_pr_review(
+                reviewer="flash (Google Antigravity: Model A)",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ), 0),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        pr_review_policy="selective-intermediate", pre_review_tests=False,
+        agent_max_retries=0, max_rounds=3,
+    )
+    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
+              if cmd and cmd[0] == "agy" and "--model" in cmd]
+    assert models[:2] == ["Model A", "Model B"]
+    assert models.count("Model B") >= 2
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
+        flow="pr",
+    )
+    assert any(
+        record.metadata.round_number == 2
+        and "opus" in record.metadata.scheduler_selected_reviewers
+        and any(name == "flash" for name, _reason in record.metadata.scheduler_paused_reviewers)
+        for record in records
+    )
 
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.cli import build_parser

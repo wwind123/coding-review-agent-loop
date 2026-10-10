@@ -1855,8 +1855,14 @@ model overlap within one backend, and explicit checkout collisions. Sandboxed
 permission checks use the seat's resolved backend and identify the rejected
 seat. A same-backend legacy reviewer with an unknown implicit CLI model is
 rejected until its model is explicit; backend model and effort options require
-an active coder or legacy reviewer to own them. During phase 1 the review loops
-still key durable state by backend, so named-seat execution stops at this
-preflight boundary. Legacy default seats continue through the existing
-backend-keyed paths with their historical signatures, metadata, quota behavior,
-and Antigravity settings lock.
+an active coder or legacy reviewer to own them. PR review uses a string-valued
+seat role key carrying backend, model chain, effort, and checkout. Common
+review scheduling and ledger code stores that seat ID in reviewer and agent
+fields. Backend adapters receive an immutable seat-specific invocation view;
+response files and logs use the seat ID while Antigravity quota state and the
+host settings lock remain shared. PR round metadata stores a versioned board
+binding. Recovery verifies backend identity before using history; a changed
+model chain starts a fresh round, retaining reconciled open findings but
+invalidating prior approvals and unpublished response checkpoints. Legacy
+default seats keep historical signatures and metadata bytes. Plan-first named
+review remains gated until the plan review loop supports bound seat identity.

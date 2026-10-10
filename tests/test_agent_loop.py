@@ -3504,15 +3504,44 @@ def test_named_seat_validation_precedes_dispatch(tmp_path, monkeypatch, capsys, 
     assert list(tmp_path.iterdir()) == []
 
 
-def test_valid_named_seats_are_gated_before_dispatch(monkeypatch, capsys):
-    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: pytest.fail("agent dispatched"))
+def test_valid_named_seats_reach_pr_loop_with_independent_identity(monkeypatch, capsys):
+    seen = []
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: seen.append(k["config"]) or 0)
     code = cli_module.main([
-        "pr", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "gemini-seat=agy",
+        "pr", "77", "--repo", "OWNER/REPO", "--dry-run", "--reviewer-seat", "gemini-seat=agy",
         "--seat-model", "gemini-seat=Gemini 3.8 Flash (High)",
         "--reviewer-seat", "claude-seat=agy", "--seat-model", "claude-seat=Claude Opus 5.5 (Medium)",
     ])
-    assert code == 1
-    assert "execution is unavailable in phase 1" in capsys.readouterr().err
+    assert code == 0
+    assert len(seen) == 1
+    assert tuple(map(str, seen[0].reviewer)) == ("gemini-seat", "claude-seat")
+    assert seen[0].reviewer[0].backend == seen[0].reviewer[1].backend == "antigravity"
+    assert seen[0].reviewer[0].workdir != seen[0].reviewer[1].workdir
+
+
+@pytest.mark.parametrize("entry", [
+    ["pr", "77"], ["issue", "77"], ["task", "Fix the bug"],
+    ["managed-pr", "--head", "feature", "--title", "Fix the bug"],
+])
+def test_named_seats_configure_each_pr_entry_path(entry):
+    args = build_parser().parse_args([
+        *entry, "--repo", "OWNER/REPO", "--dry-run",
+        "--reviewer-seat", "flash=agy", "--seat-model", "flash=Model A",
+        "--reviewer-seat", "opus=agy", "--seat-model", "opus=Model B",
+    ])
+    config = config_from_args(args, Runner(dry_run=True))
+    assert tuple(map(str, config.reviewer)) == ("flash", "opus")
+
+
+def test_named_primary_cli_selects_seat_identity():
+    args = build_parser().parse_args([
+        "pr", "77", "--repo", "OWNER/REPO", "--dry-run",
+        "--reviewer-seat", "flash=agy", "--seat-model", "flash=Model A",
+        "--reviewer-seat", "opus=agy", "--seat-model", "opus=Model B",
+        "--pr-review-policy", "primary-then-panel", "--primary-reviewer-seat", "opus",
+    ])
+    config = config_from_args(args, Runner(dry_run=True))
+    assert config.primary_reviewer is config.reviewer[1]
 
 
 def test_discuss_rejects_named_seats(capsys):
@@ -3587,7 +3616,7 @@ def test_named_seat_preserves_implementation_coder_model_and_effort_before_phase
         "--seat-model", "alternate=claude-sonnet-5", "--seat-dir", f"alternate={checkout}",
     ]) == 1
     error = capsys.readouterr().err
-    assert "execution is unavailable in phase 1" in error
+    assert "issue --plan-first does not support named reviewer seats" in error
     assert "--claude-model" not in error
     assert "--claude-effort" not in error
     assert not checkout.exists()
@@ -3639,16 +3668,16 @@ def test_named_seat_rejects_implementation_coder_workdir_before_phase_gate(tmp_p
     assert not checkout.exists()
 
 
-@pytest.mark.parametrize("policy,primary", [
-    ("--pr-review-policy", "--primary-reviewer-seat"),
-    ("--plan-review-policy", "--primary-plan-reviewer-seat"),
+@pytest.mark.parametrize("policy,primary,expected", [
+    ("--pr-review-policy", "--primary-reviewer-seat", "requires at least one secondary reviewer"),
+    ("--plan-review-policy", "--primary-plan-reviewer-seat", "Named primary plan review is unavailable"),
 ])
-def test_named_primary_requires_secondary_before_phase_gate(capsys, policy, primary):
+def test_named_primary_requires_secondary_before_phase_gate(capsys, policy, primary, expected):
     assert cli_module.main([
         "pr", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "only=codex",
         "--seat-model", "only=Model A", policy, "primary-then-panel", primary, "only",
     ]) == 1
-    assert "requires at least one secondary reviewer" in capsys.readouterr().err
+    assert expected in capsys.readouterr().err
 
 
 def test_config_rejects_alias_and_canonical_duplicate_reviewers(tmp_path):

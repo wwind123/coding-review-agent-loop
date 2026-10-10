@@ -1063,7 +1063,8 @@ def _resumed_pr_reviewer_matches_requirements(
             expected is not None
             and len(expected) >= 2
             and record.metadata.acquisition_outcome == "success"
-            and record.metadata.configured_model == expected[0]
+            and (record.metadata.configured_model in expected[0]
+                 if isinstance(expected[0], tuple) else record.metadata.configured_model == expected[0])
             and record.metadata.configured_effort == expected[1]
             and (len(expected) < 3 or record.metadata.provider == expected[2])
         )

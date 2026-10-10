@@ -1822,6 +1822,16 @@ def run_pr_loop(
             managed_ci = None
             return False
         memory = prepare_agent_memory(runner, config)
+        from .reviewer_seats import reviewer_seat_binding, validate_pr_seat_bindings
+        seat_binding = reviewer_seat_binding(config)
+
+        def bound_pr_metadata(**fields: object) -> PostedRoundMetadata:
+            metadata = PostedRoundMetadata(**fields)
+            return (
+                dataclasses_replace(metadata, seat_binding=seat_binding)
+                if seat_binding is not None and metadata.flow == "pr"
+                else metadata
+            )
         reviewer_session_ids: dict[AgentName, str | None] = {}
         unavailable_reviewer_failures: dict[AgentName, AgentInvocationError] = {}
         configured_reviewers = reviewers(config)
@@ -1840,12 +1850,13 @@ def run_pr_loop(
             ),
         )
         reviewer_acquisition_contract: dict[str, tuple[object, ...]] = {}
+        from .reviewer_seats import SeatAgent, seat_backend
         for reviewer in configured_reviewers:
             invocation = resolve_invocation(config, provider=reviewer, role="reviewer")
             reviewer_acquisition_contract[agent_display_name(reviewer)] = (
-                invocation.configured_model,
+                reviewer.model_chain if isinstance(reviewer, SeatAgent) else invocation.configured_model,
                 invocation.resolved_effort,
-                reviewer,
+                seat_backend(reviewer),
             )
         # Two separate full-board latches (#840).  The operator latch is the
         # explicit ``--pr-review-force-full`` authorization (or a persisted
@@ -1885,6 +1896,9 @@ def run_pr_loop(
             # no-reviewer diagnostic path as an in-round decode failure.
             stop_pre_panel(undecodable_history_message(exc), round_number=None)
             raise
+        changed_seat_models = validate_pr_seat_bindings(startup_records, config)
+        if changed_seat_models:
+            log(config, "PR reviewer model-chain reconfiguration requires fresh review: " + ", ".join(sorted(changed_seat_models)))
         # Advisory per-run finding history (#1273), seeded once from the records
         # just extracted through the authoritative path above.
         pr_finding_history = FindingHistoryLedger(
@@ -1916,6 +1930,8 @@ def run_pr_loop(
         )
         for diagnostic in pr_amendment_diagnostics:
             log(config, f"PR #{pr_number}: {diagnostic}")
+        from .reviewer_seats import validate_pr_backend_outage_amendments
+        validate_pr_backend_outage_amendments(pr_board_amendments, config)
         pr_contract_lineage: ContractLineage = resolve_contract_lineage(
             startup_records,
             pr_board_amendments,
@@ -1953,7 +1969,10 @@ def run_pr_loop(
                 "the signed amended board "
                 f"{', '.join(pr_effective_contract.required_reviewers)}; using the amended board.",
             )
-            config = dataclasses_replace(config, reviewer=effective_reviewers)
+            config = dataclasses_replace(
+                config, reviewer=effective_reviewers,
+                pr_seat_binding_override=seat_binding,
+            )
             configured_reviewers = reviewers(config)
             scheduler_contract = pr_effective_contract
             reviewer_acquisition_contract = {
@@ -2139,6 +2158,30 @@ def run_pr_loop(
             qualification_checkpoint = resumed_round.qualification_checkpoint
             next_unresolved_item_number = resumed_round.next_unresolved_item_number
             start_round_number = resumed_round.round_number
+            if changed_seat_models:
+                # A published peer cannot be re-invoked within its old
+                # parallel round. Begin a new round at the same head while
+                # carrying both the prior ledger and this round's verified
+                # new findings. The latter have not yet been reconciled into
+                # prior_items when a run stopped immediately after review.
+                carried_by_id = {item.item_id: item for item in unresolved_items}
+                for review_record in resumed_round.completed_reviews:
+                    for item in review_record.metadata.new_items:
+                        if item.reviewer != review_record.metadata.agent:
+                            raise AgentLoopError(
+                                "PR seat reconfiguration cannot verify the owner of a carried finding."
+                            )
+                        existing = carried_by_id.get(item.item_id)
+                        if existing is not None and existing != item:
+                            raise AgentLoopError(
+                                "PR seat reconfiguration found conflicting provenance for a carried finding."
+                            )
+                        carried_by_id[item.item_id] = item
+                unresolved_items = list(carried_by_id.values())
+                start_round_number += 1
+                qualification_checkpoint = None
+                resumed_round = None
+                final_sweep_pending = True
             log(config, f"PR #{pr_number}: resuming round {start_round_number}")
             if latest_coder_metadata is not None and any(
                 "external/unrecorded head advance" in reason
@@ -2848,9 +2891,10 @@ def run_pr_loop(
                     human_requirements,
                     approved_plan_context,
                     reviewer_acquisition_contract=(
-                        reviewer_acquisition_contract if selective_policy else None
+                        reviewer_acquisition_contract if selective_policy or config.reviewer_seats else None
                     ),
                 )
+                and (seat_binding is None or record.metadata.seat_binding == seat_binding)
             }
             # Staged-policy panel evidence (#840).  Derived from comment-ordered
             # history before any resume, approval, or scheduling decision uses
@@ -2948,9 +2992,14 @@ def run_pr_loop(
                 human_requirements=human_requirements,
                 require_architecture_contract=config.architecture_context_enabled,
                 reviewer_acquisition_contract=(
-                    reviewer_acquisition_contract if selective_policy else None
+                    reviewer_acquisition_contract if selective_policy or config.reviewer_seats else None
                 ),
             )
+            if seat_binding is not None:
+                unchanged_head_approvals = {
+                    name: record for name, record in unchanged_head_approvals.items()
+                    if record.metadata.seat_binding == seat_binding
+                }
             if panel_evidence is not None:
                 # Causal approval eligibility: a secondary approval counts only
                 # when recorded after the first qualified panel opening, so a
@@ -3096,6 +3145,20 @@ def run_pr_loop(
                 config, surface="pr", number=pr_number,
                 round_number=round_number, subject=current_pr_subject,
             )
+            if seat_binding is not None:
+                for reviewer in configured_reviewers:
+                    name = agent_display_name(reviewer)
+                    saved = pr_round_spool.load(name)
+                    if saved is None or saved.get("failure") is not None or saved.get("seat_binding") == seat_binding:
+                        continue
+                    state, _carrier = pr_round_spool.publication_state(name)
+                    if state == "fresh":
+                        pr_round_spool.remove(name)
+                        log(config, f"Discarded unpublished {name} response checkpoint after seat reconfiguration")
+                    else:
+                        raise AgentLoopError(
+                            f"{name} has a published or unprovable response checkpoint under another seat binding; refusing recovery."
+                        )
 
             def _pr_review_validators(reviewer_name: str) -> dict[str, object]:
                 return _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_review_response(
@@ -3118,6 +3181,7 @@ def run_pr_loop(
                     validation_context=publication_context_digest(
                         head=current_pr_subject,
                         surfaced=sorted(str(item) for item in surfaced_reviewer_requirement_ids),
+                        **({"seat_binding": seat_binding} if seat_binding is not None else {}),
                     ),
                 )
 
@@ -3564,7 +3628,7 @@ def run_pr_loop(
                     and evidence_pass is None
                 ):
                     pr_amendment_checkpoint_pending = False
-                    pr_posted_checkpoint = PostedRoundMetadata(
+                    pr_posted_checkpoint = bound_pr_metadata(
                         flow="pr", role="summary", agent="Orchestrator",
                         round_number=round_number, subject=current_pr_subject,
                         prior_items=prior_unresolved_items, phase="scheduler-prelaunch",
@@ -3667,7 +3731,7 @@ def run_pr_loop(
                             prior_items=prior_unresolved_items, dispositions=parsed.dispositions,
                             config=config, model_used=model_used,
                         ),
-                        PostedRoundMetadata(
+                        bound_pr_metadata(
                             flow="pr", role="reviewer", agent=reviewer_name,
                             round_number=round_number, subject=current_pr_subject,
                             prior_items=prior_unresolved_items, dispositions=parsed.dispositions,
@@ -4715,7 +4779,7 @@ def run_pr_loop(
                         f"force-full: {scheduler_recorded_force_full} "
                         f"(source: {scheduler_recorded_force_full_source or 'none'})."
                         + (f" {same_model_note}." if same_model_note else ""),
-                        PostedRoundMetadata(
+                        bound_pr_metadata(
                             flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
                             subject=current_pr_subject, prior_items=prior_unresolved_items,
                             dispositions=tuple(
@@ -4934,6 +4998,21 @@ def run_pr_loop(
                 unavailable_names = [
                     agent_display_name(reviewer) for reviewer in unavailable_reviewer_failures
                 ]
+                # A host/account outage affects every seat of that backend.
+                # Model access and one seat's fallback exhaustion remain local.
+                outage_backends = {
+                    seat_backend(reviewer)
+                    for reviewer, failure in unavailable_reviewer_failures.items()
+                    if any(phrase in str(failure).lower() for phrase in (
+                        "backend outage", "provider outage", "settings lock", "cli not found"
+                    ))
+                }
+                if outage_backends:
+                    unavailable_names = [
+                        agent_display_name(reviewer) for reviewer in configured_reviewers
+                        if reviewer in unavailable_reviewer_failures
+                        or seat_backend(reviewer) in outage_backends
+                    ]
                 pr_surface = f"PR #{pr_number}"
                 advisory_template: str | None = None
                 advisory_round: int | None = None
@@ -5588,7 +5667,7 @@ def run_pr_loop(
                             pr_number=pr_number,
                             body=_attach_round_metadata(
                                 f"PR #{pr_number} qualification checkpoint: full-board checks are being watched.",
-                                PostedRoundMetadata(
+                                bound_pr_metadata(
                                     flow="pr",
                                     role="summary",
                                     agent="Orchestrator",
@@ -6300,7 +6379,7 @@ def run_pr_loop(
                                             f"PR #{pr_number} qualification checkpoint: "
                                             "authoritative exact-head validation is in progress."
                                         ),
-                                        PostedRoundMetadata(
+                                        bound_pr_metadata(
                                             flow="pr",
                                             role="summary",
                                             agent="Orchestrator",
@@ -6362,7 +6441,7 @@ def run_pr_loop(
                                     body=_attach_round_metadata(
                                         f"PR #{pr_number} qualification checkpoint: attached attempt "
                                         f"{qualification_checkpoint.qualification_attempt_id}.",
-                                        PostedRoundMetadata(
+                                        bound_pr_metadata(
                                             flow="pr",
                                             role="summary",
                                             agent="Orchestrator",
@@ -7618,7 +7697,7 @@ def run_pr_loop(
                         _prior_item_ledger_signature(unresolved_items)
                     ),
                 )
-                latest_coder_metadata = PostedRoundMetadata(
+                latest_coder_metadata = bound_pr_metadata(
                     flow="pr",
                     role="coder",
                     agent=coder_name,

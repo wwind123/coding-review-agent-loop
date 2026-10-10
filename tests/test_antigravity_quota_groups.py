@@ -11,6 +11,62 @@ from coding_review_agent_loop.config import (
     parse_antigravity_quota_group_overrides,
 )
 from coding_review_agent_loop.errors import AgentInvocationError, QuotaResetExceededError
+from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+
+def test_named_seat_fallback_stays_local_and_usage_is_separate(tmp_path):
+    import json
+    from coding_review_agent_loop.cli import run_pr_loop
+
+    first = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A", "Model B")), tmp_path / "flash")
+    second = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model C",)), tmp_path / "opus")
+    first.workdir.mkdir()
+    second.workdir.mkdir()
+    runner = FakeRunner(antigravity_outputs=[
+        ("quota exceeded", 1),
+        (structured_pr_review(reviewer="flash (Google Antigravity: Model B)"), 0),
+        (structured_pr_review(reviewer="opus (Google Antigravity: Model C)"), 0),
+    ])
+    config = make_config(
+        tmp_path, reviewer=(first, second), reviewer_seats=(first, second),
+        agent_max_retries=0, pre_review_tests=False,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
+              if cmd and cmd[0] == "agy" and "--model" in cmd]
+    assert models == ["Model A", "Model B", "Model C"]
+    summary = json.loads(next(config.log_dir.glob("*-usage-summary.json")).read_text())
+    assert [call["agent"] for call in summary["calls"]] == ["flash", "flash", "opus"]
+    assert [call["backend"] for call in summary["calls"]] == ["antigravity"] * 3
+    assert sum(call["validation_status"] == "validated" for call in summary["calls"]) == 2
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([cmd for cmd, _ in runner.commands if cmd and cmd[0] == "agy" and "--model" in cmd]) == 3
+
+
+def test_named_seats_share_backend_quota_memory_without_model_substitution(tmp_path):
+    first = SeatAgent(ReviewerSeat("flash", "antigravity", (GEM1, OPUS)), tmp_path / "flash")
+    second = SeatAgent(ReviewerSeat("other", "antigravity", ("Gemini 3.7 Flash (High)",)), tmp_path / "other")
+    first.workdir.mkdir()
+    second.workdir.mkdir()
+    config = make_config(
+        tmp_path, reviewer=(first, second), reviewer_seats=(first, second),
+        agent_max_retries=0,
+    )
+    runner = FakeRunner(antigravity_outputs=[_fail(LIVE_SAMPLE), ("approved", 0)])
+    with workdir_claims.workdir_claim_scope():
+        response = validated_agent._run_validated_agent(
+            runner, agent=first, config=config, prompt="Review", marker_description="none",
+            validate=lambda text: text,
+        )
+        assert response.model_used == OPUS
+        with pytest.raises(AgentInvocationError, match="tried no models"):
+            validated_agent._run_validated_agent(
+                runner, agent=second, config=config, prompt="Review", marker_description="none",
+                validate=lambda text: text,
+            )
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
+              if cmd and cmd[0] == "agy" and "--model" in cmd]
+    assert models == [GEM1, OPUS]
 
 LIVE_SAMPLE = (
     "error: RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).\n"

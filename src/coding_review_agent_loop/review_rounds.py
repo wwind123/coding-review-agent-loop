@@ -1137,7 +1137,11 @@ def _launch_reviewer_turns(
                 failure_category=getattr(result.error, "failure_category", None),
             )
         elif result.response is not None:
-            spool.store(reviewer_name, _spooled_response_fields(result.response))
+            fields = _spooled_response_fields(result.response)
+            if config is not None and config.reviewer_seats:
+                from .reviewer_seats import reviewer_seat_binding
+                fields["seat_binding"] = reviewer_seat_binding(config)
+            spool.store(reviewer_name, fields)
     withheld = [
         reviewer for reviewer, result in results.items()
         if reviewer not in retry_errors and result.error is None and result.response is not None
@@ -1180,7 +1184,8 @@ def _ensure_parallel_reviewer_workdirs(
     """
     seen: dict[Path, AgentName] = {}
     for reviewer in reviewers(config):
-        path = get_backend(reviewer).workdir(config).resolve()
+        from .workdirs import agent_workdir
+        path = agent_workdir(config, reviewer).resolve()
         other = seen.get(path)
         if other is not None:
             raise AgentLoopError(

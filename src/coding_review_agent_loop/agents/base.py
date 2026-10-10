@@ -118,7 +118,7 @@ def public_response_path(
     base_dir = root if root is not None else response_root(config)
     path = (
         base_dir
-        / agent
+        / (config.active_reviewer_seat_id or agent)
         / f"{uuid.uuid4().hex}.md"
     )
     make_private_dirs(path.parent)

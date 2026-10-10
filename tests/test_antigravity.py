@@ -132,6 +132,71 @@ def test_legacy_cli_pr_fallback_counts_one_exact_head_approval(tmp_path):
     assert "Approved" in reviews[0]
     assert "abc123" == runner.pr_payload["headRefOid"]
 
+
+def test_two_named_antigravity_seats_approve_one_pr_head(tmp_path):
+    from coding_review_agent_loop.cli import build_parser, config_from_args, run_pr_loop
+    from coding_review_agent_loop.agents.registry import agent_signature
+
+    claude_dir = tmp_path / "claude"
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    for directory in (claude_dir, first_dir, second_dir):
+        directory.mkdir()
+    args = build_parser().parse_args([
+        "pr", "77", "--repo", "OWNER/REPO", "--review-parallel",
+        "--reviewer-seat", "flash=agy", "--seat-model", "flash=Gemini 3.8 Flash (High)",
+        "--seat-dir", f"flash={first_dir}",
+        "--reviewer-seat", "opus=agy", "--seat-model", "opus=Claude Opus 5.5 (Medium)",
+        "--seat-dir", f"opus={second_dir}",
+        "--claude-dir", str(claude_dir), "--agent-max-retries", "0",
+        "--no-pre-review-tests",
+    ])
+    runner = FakeRunner(antigravity_outputs=[
+        (structured_pr_review(reviewer="flash (Google Antigravity: Gemini 3.8 Flash (High))"), 0),
+        (structured_pr_review(reviewer="opus (Google Antigravity: Claude Opus 5.5 (Medium))"), 0),
+    ])
+    config = config_from_args(args, runner)
+    assert tuple(agent_signature(seat) for seat in config.reviewer) == (
+        "flash (Google Antigravity: Gemini 3.8 Flash (High))",
+        "opus (Google Antigravity: Claude Opus 5.5 (Medium))",
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
+              if cmd and cmd[0] == "agy" and "--model" in cmd]
+    assert sorted(models) == sorted(["Gemini 3.8 Flash (High)", "Claude Opus 5.5 (Medium)"])
+    reviews = [comment for comment in runner.comments if "**Review verdict:**" in comment]
+    assert len(reviews) == 2
+    assert any("flash" in comment for comment in reviews)
+    assert any("opus" in comment for comment in reviews)
+    import json
+    first_usage = json.loads(next(config.log_dir.glob("*-usage-summary.json")).read_text())
+    assert sorted((call["agent"], call["backend"]) for call in first_usage["calls"]) == [
+        ("flash", "antigravity"), ("opus", "antigravity")
+    ]
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([cmd for cmd, _ in runner.commands if cmd and cmd[0] == "agy" and "--model" in cmd]) == 2
+    from dataclasses import replace
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+    new_flash = SeatAgent(
+        ReviewerSeat("flash", "antigravity", ("Gemini 3.7 Flash (High)",)), first_dir
+    )
+    changed_config = replace(
+        config,
+        reviewer=(new_flash, config.reviewer[1]),
+        reviewer_seats=(new_flash, config.reviewer[1]),
+    )
+    runner.antigravity_outputs.extend([
+        (structured_pr_review(reviewer="flash (Google Antigravity: Gemini 3.7 Flash (High))"), 0),
+        (structured_pr_review(reviewer="opus (Google Antigravity: Claude Opus 5.5 (Medium))"), 0),
+    ])
+    assert run_pr_loop(runner, pr_number=77, config=changed_config) == 0
+    new_models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
+                  if cmd and cmd[0] == "agy" and "--model" in cmd]
+    assert len(new_models) == 4
+    assert new_models.count("Gemini 3.7 Flash (High)") == 1
+    assert run_pr_loop(runner, pr_number=77, config=changed_config) == 0
+    assert len([cmd for cmd, _ in runner.commands if cmd and cmd[0] == "agy" and "--model" in cmd]) == 4
+
 def test_antigravity_backend_stops_on_other_errors(tmp_path):
     from coding_review_agent_loop.agents.antigravity import AntigravityBackend
     agy_dir = tmp_path / "antigravity"
@@ -918,7 +983,7 @@ def test_antigravity_backend_lock_order_settings_outer_gemini_inner(tmp_path, mo
 
     relevant = [(label, op) for label, op in operations if label in ("settings", "gemini")]
     assert relevant == [
-        ("settings", fcntl_mod.LOCK_EX),
+        ("settings", fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB),
         ("gemini", fcntl_mod.LOCK_EX),
         ("gemini", fcntl_mod.LOCK_UN),
         ("settings", fcntl_mod.LOCK_UN),
@@ -1018,7 +1083,7 @@ def test_antigravity_settings_lock_serializes_reviewer_vs_coder_both_orders(
             if (
                 getattr(_is_contender, "value", False)
                 and _slp in str(getattr(fd, "name", ""))
-                and operation == fcntl_mod.LOCK_EX
+                and operation == fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB
                 and not getattr(_probe_done, "done", False)
             ):
                 _probe_done.done = True
@@ -1028,8 +1093,9 @@ def test_antigravity_settings_lock_serializes_reviewer_vs_coder_both_orders(
                     _nbr.append(None)
                 except BlockingIOError as exc:
                     _nbr.append(exc)
+                    _cpd.set()
+                    raise
                 _cpd.set()
-                real_flock(fd, fcntl_mod.LOCK_EX)
                 return
             real_flock(fd, operation)
 
