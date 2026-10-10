@@ -3477,8 +3477,11 @@ def test_config_rejects_duplicate_reviewers(tmp_path):
 
 @pytest.mark.parametrize("seat_flags,expected", [
     (["--reviewer-seat", "agy=agy", "--seat-model", "agy=Model"], "reserved"),
+    (["--reviewer-seat", "Antigravity=agy", "--seat-model", "Antigravity=Model"], "reserved"),
+    (["--reviewer-seat", "OpenAI Codex=codex", "--seat-model", "OpenAI Codex=Model"], "reserved"),
     (["--reviewer-seat", "Orchestrator=codex", "--seat-model", "Orchestrator=m"], "reserved"),
     (["--reviewer-seat", "a=agy", "--reviewer-seat", "a=agy", "--seat-model", "a=Model"], "Duplicate"),
+    (["--reviewer-seat", "a=agy", "--reviewer-seat", "A=agy", "--seat-model", "a=Model"], "lowercase ASCII"),
     (["--reviewer-seat", "a=agy"], "requires --seat-model"),
     (["--reviewer-seat", "a=codex", "--seat-model", "a=one", "--seat-model", "a=two"], "fallback"),
     (["--reviewer-seat", "a=agy", "--seat-model", "a=one", "--seat-effort", "a=high"], "unsupported"),

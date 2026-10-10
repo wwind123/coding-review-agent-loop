@@ -60,7 +60,9 @@ def resolve_reviewer_seats(args: object) -> tuple[ReviewerSeat, ...]:
         if not separator or not seat_id or not backend_name.strip():
             raise AgentLoopError("--reviewer-seat requires SEAT=BACKEND.")
         if seat_id.casefold() in _RESERVED or seat_id.casefold() in {
-            agent_display_name(backend).casefold() for backend in _BACKENDS
+            name.casefold()
+            for backend in _BACKENDS
+            for name in (agent_display_name(backend), agent_signature(backend))
         }:
             raise AgentLoopError(f"Reviewer seat {seat_id!r} is a reserved reviewer identity.")
         if not _ID.fullmatch(seat_id):
