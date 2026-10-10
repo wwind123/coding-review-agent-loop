@@ -9,7 +9,6 @@ from __future__ import annotations
 import base64
 import os
 import re
-import stat
 import subprocess
 import sys
 import tempfile
@@ -18,7 +17,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .errors import AgentLoopError
-from .secure_git import _git_path, local_command
+from .secure_git import _git_path, _trusted_executable, local_command
 
 _SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
@@ -106,21 +105,12 @@ def _token_from_gh(gh_cmd: str, destination: Path, host: str) -> str:
         candidate = next((path for path in candidates if os.path.isfile(path)), "")
     else:
         candidate = ""
-    resolved = os.path.realpath(candidate) if candidate else ""
-    if not resolved or not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
+    if not candidate:
         raise AgentLoopError("Trusted GitHub authentication is unavailable.")
-    if sys.platform != "win32":
-        # Every component must be owned by the operator or root and must not
-        # be writable by other users. This also rejects a sibling checkout on
-        # PATH and an explicit executable inside an agent-writable tree.
-        current = Path(resolved)
-        while True:
-            info = current.stat()
-            if info.st_uid not in {0, os.getuid()} or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                raise AgentLoopError("Trusted GitHub CLI must be in an operator-owned installation.")
-            if current.parent == current:
-                break
-            current = current.parent
+    try:
+        resolved = _trusted_executable(candidate)
+    except (OSError, AgentLoopError) as exc:
+        raise AgentLoopError("Trusted GitHub CLI must be in an agent-inaccessible installation.") from exc
     try:
         if os.path.commonpath((resolved, os.path.realpath(destination))) == os.path.realpath(destination):
             raise AgentLoopError("Trusted GitHub CLI must be outside the agent checkout.")

@@ -202,14 +202,14 @@ def test_token_cli_cannot_be_planted_in_checkout(repositories, tmp_path, monkeyp
     planted = checkout / "gh"
     planted.write_text(f"#!/bin/sh\ntouch {marker}\necho token\n")
     planted.chmod(0o755)
-    with pytest.raises(AgentLoopError, match="operator-owned installation"):
+    with pytest.raises(AgentLoopError, match="agent-inaccessible installation"):
         _token_from_gh(str(planted), checkout, "github.com")
     assert not marker.exists()
     trusted = tmp_path / "trusted-gh"
     argv = tmp_path / "trusted-argv"
     trusted.write_text(f"#!/bin/sh\nprintf '%s ' \"$@\" > {argv}\necho trusted-token\n")
     trusted.chmod(0o755)
-    with pytest.raises(AgentLoopError, match="operator-owned installation"):
+    with pytest.raises(AgentLoopError, match="agent-inaccessible installation"):
         _token_from_gh(str(trusted), checkout, "github.com")
     assert not argv.exists()
 
@@ -225,8 +225,35 @@ def test_token_cli_rejects_sibling_checkout_on_path(repositories, tmp_path, monk
     planted.write_text(f"#!/bin/sh\ntouch {marker}\necho planted-token\n")
     planted.chmod(0o755)
     monkeypatch.setenv("PATH", f"{sibling}:{os.environ.get('PATH', '')}")
-    with pytest.raises(AgentLoopError, match="operator-owned installation"):
+    with pytest.raises(AgentLoopError, match="agent-inaccessible installation"):
         _token_from_gh(str(planted), checkout, "github.com")
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("target", ["git", "gh"])
+def test_same_user_private_installation_is_not_trusted(repositories, tmp_path, monkeypatch, target):
+    """A 0700 sibling can still be replaced by an unrestricted same-user agent."""
+    from coding_review_agent_loop.git_transport import _token_from_gh
+
+    _, _, checkout = repositories
+    private = tmp_path / "private"
+    private.mkdir(mode=0o700)
+    planted = private / target
+    marker = tmp_path / "executed"
+    planted.write_text(f"#!/bin/sh\ntouch {marker}\necho token\n")
+    planted.chmod(0o700)
+    if target == "gh":
+        with pytest.raises(AgentLoopError, match="agent-inaccessible installation"):
+            _token_from_gh(str(planted), checkout, "github.com")
+    else:
+        monkeypatch.setattr(secure_git, "_PINNED_GIT", None)
+        monkeypatch.setattr(secure_git.sys, "platform", "darwin")
+        real_isfile = secure_git.os.path.isfile
+        monkeypatch.setattr(secure_git.os.path, "isfile", lambda name: name == "/opt/homebrew/bin/git" or real_isfile(name))
+        real_realpath = secure_git.os.path.realpath
+        monkeypatch.setattr(secure_git.os.path, "realpath", lambda name: str(planted) if name == "/opt/homebrew/bin/git" else real_realpath(name))
+        with pytest.raises(AgentLoopError, match="trusted installation"):
+            secure_git._git_path()
     assert not marker.exists()
 
 

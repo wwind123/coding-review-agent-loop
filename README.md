@@ -638,6 +638,9 @@ one-process Job Object before resume. A host without a verified boundary
 fails before its first checkout Git probe. Checkout settings that require
 external filters or helpers may make the operation fail; the planted program
 does not run.
+On POSIX hosts the pinned Git binary and every component of its installation
+path must be root-owned. Private HTTPS authentication uses the same rule for
+the GitHub CLI; a same-user writable installation is rejected before launch.
 
 Base and PR commits are fetched into a private transport repository from the
 exact GitHub HTTPS or SSH origin selected by `--repo`, using trusted GitHub CLI

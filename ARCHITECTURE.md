@@ -1471,7 +1471,10 @@ configuration and an exact operator-selected GitHub HTTPS or SSH URL. An
 explicit `--trusted-local-origin` is required for local paths. Private HTTPS
 may obtain a token from an operator-owned GitHub CLI installation resolved
 independently of inherited `PATH`, passed only as an in-memory scoped
-header to that private fetch. The complete reachable pack for a pinned commit
+header to that private fetch. On POSIX hosts, both pinned executable paths,
+including their parent directories, must be root-owned so an unrestricted
+same-user agent cannot
+replace them before launch. The complete reachable pack for a pinned commit
 is streamed to confined `index-pack --stdin`; the destination verifies the
 commit, then compare-and-swaps the tracking ref while its checkout or store
 lock is held. Base ancestry and advertised PR head are checked before cleaning

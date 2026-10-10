@@ -40,6 +40,37 @@ _ENV_KEYS = frozenset({
 })
 
 
+def _trusted_executable(path: str) -> str:
+    """Require an installation that a same-user unrestricted agent cannot replace."""
+    if not os.path.isabs(path):
+        raise AgentLoopError("Trusted executable must have an absolute path.")
+    resolved = os.path.realpath(path)
+    if sys.platform == "win32":
+        # POSIX ownership does not describe Windows ACLs. Restrict launch to
+        # the standard system installation roots, never a caller-supplied
+        # per-user path or a junction resolving outside those roots.
+        protected = (r"C:\Program Files", r"C:\Program Files (x86)")
+        if not any(os.path.commonpath((candidate, resolved)).casefold() == candidate.casefold()
+                   for candidate in protected):
+            raise AgentLoopError("Trusted executable must be in a system installation.")
+        if not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
+            raise AgentLoopError("Trusted executable is unavailable.")
+        return resolved
+    for name in (path, resolved):
+        current = Path(name)
+        while True:
+            info = current.lstat()
+            if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022):
+                raise AgentLoopError("Trusted executable must be in a root-owned installation.")
+            if current.parent == current:
+                break
+            current = current.parent
+    info = os.stat(resolved)
+    if not stat.S_ISREG(info.st_mode) or not os.access(resolved, os.X_OK):
+        raise AgentLoopError("Trusted executable is unavailable.")
+    return resolved
+
+
 def _git_path() -> str:
     global _PINNED_GIT, _PINNED_GIT_HASH
     if _PINNED_GIT is None:
@@ -60,12 +91,10 @@ def _git_path() -> str:
                               if os.path.isfile(item)), None)
         if not candidate:
             raise AgentLoopError("Unsupported Git confinement: no pinned Git executable.")
-        path = os.path.realpath(candidate)
-        if not os.path.isabs(path) or not os.access(path, os.X_OK):
-            raise AgentLoopError("Unsupported Git confinement: pinned Git is unavailable.")
-        info = os.stat(path)
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022:
-            raise AgentLoopError("Unsupported Git confinement: pinned Git is writable by other users.")
+        try:
+            path = _trusted_executable(candidate)
+        except (OSError, AgentLoopError) as exc:
+            raise AgentLoopError("Unsupported Git confinement: pinned Git is not in a trusted installation.") from exc
         _PINNED_GIT = path
         _PINNED_GIT_HASH = hashlib.sha256(Path(path).read_bytes()).digest()
     elif hashlib.sha256(Path(_PINNED_GIT).read_bytes()).digest() != _PINNED_GIT_HASH:
