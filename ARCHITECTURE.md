@@ -1462,20 +1462,25 @@ probe and fails closed if confinement cannot be verified. Existing process
 group containment is not an execution boundary. The isolated inspector keeps
 its standard-library-only main process and delegates Git to a pinned helper
 using the same local boundary.
+Each local Git invocation also binds `--work-tree` and `core.worktree` to its
+assigned checkout, so repository config cannot redirect status or cleanup to
+another directory. Repository initialization has no existing worktree to bind.
 
 Fetches run only in a fresh private transport repository, with clean Git
 configuration and an exact operator-selected GitHub HTTPS or SSH URL. An
 explicit `--trusted-local-origin` is required for local paths. Private HTTPS
-may obtain a trusted GitHub CLI token, passed only as an in-memory scoped
+may obtain a token from an operator-owned GitHub CLI installation resolved
+independently of inherited `PATH`, passed only as an in-memory scoped
 header to that private fetch. The complete reachable pack for a pinned commit
 is streamed to confined `index-pack --stdin`; the destination verifies the
 commit, then compare-and-swaps the tracking ref while its checkout or store
-lock is held. Base ancestry and advertised PR head are checked before
-checkout. Git 2.43 spawns `update-ref` even for `worktree add --no-checkout`;
+lock is held. Base ancestry and advertised PR head are checked before cleaning
+or checkout. Git 2.43 spawns `update-ref` even for `worktree add --no-checkout`;
 fresh linked worktrees therefore create only the administrative link under
 `store_lock`, run a separate confined `reset --hard` at the pinned SHA, and
 publish a ready owner record only after administrative identity, HEAD, and
-clean status verify.
+clean status verify. Any setup failure removes only the recorded root and
+administrative inode identities; incomplete cleanup is reported as an error.
 
 **Pre-turn checkout verification.** A claim protects against another
 agent-loop run, not against an operator, editor or stray script writing to the

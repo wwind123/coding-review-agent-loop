@@ -4691,6 +4691,7 @@ _TIMEOUT_ADVISORY = "agent-loop: advisory: this command reached its"
 @pytest.mark.parametrize("shape", ["bare", "prefixed", "non-pytest"])
 def test_local_timeout_prints_one_advisory_and_keeps_the_exit_code(tmp_path, monkeypatch, capsys, shape):
     cli_module, _calls = _lp_cli_fixtures(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS", "1800")
     monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: None)
     sleeper = [sys.executable, "-c", "import time; time.sleep(30)"]
     inner = {"bare": sleeper, "prefixed": ["/usr/bin/env", "FOO=1", *sleeper], "non-pytest": ["sleep", "30"]}[shape]

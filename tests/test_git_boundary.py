@@ -67,6 +67,41 @@ def test_planted_hook_fsmonitor_and_environment_do_not_execute(repositories, mon
     assert dict(os.environ) == before
 
 
+@pytest.mark.parametrize("operation", ["status", "reset", "clean"])
+def test_local_git_binds_worktree_despite_repo_config(repositories, tmp_path, operation):
+    _, _, checkout = repositories
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.txt").write_text("outside\n")
+    (outside / "untracked.txt").write_text("outside\n")
+    git(checkout, "config", "core.worktree", str(outside))
+    (checkout / "a.txt").write_text("dirty\n")
+    (checkout / "untracked.txt").write_text("checkout\n")
+    args = {"status": ("status", "--porcelain"), "reset": ("reset", "--hard"),
+            "clean": ("clean", "-fd")}[operation]
+    result = Runner().run(("git", *args), cwd=checkout)
+    if operation == "status":
+        assert "a.txt" in result.stdout and "untracked.txt" in result.stdout
+    elif operation == "reset":
+        assert (checkout / "a.txt").read_text() == "one\n"
+    else:
+        assert not (checkout / "untracked.txt").exists()
+    assert (outside / "a.txt").read_text() == "outside\n"
+    assert (outside / "untracked.txt").read_text() == "outside\n"
+
+
+def test_nested_git_probe_uses_checkout_root_despite_repo_config(repositories, tmp_path):
+    _, _, checkout = repositories
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    git(checkout, "config", "core.worktree", str(outside))
+    nested = checkout / "package" / "module"
+    nested.mkdir(parents=True)
+    (checkout / "a.txt").write_text("dirty\n")
+    result = Runner().run(("git", "status", "--porcelain"), cwd=nested)
+    assert "a.txt" in result.stdout
+
+
 def test_private_pack_import_and_ref_cas(repositories):
     origin, _, checkout = repositories
     runner = Runner()
@@ -75,6 +110,26 @@ def test_private_pack_import_and_ref_cas(repositories):
     assert sha == git(checkout, "rev-parse", "HEAD")
     assert runner.run(("git", "cat-file", "-t", sha), cwd=checkout).stdout.strip() == "commit"
     assert git(checkout, "rev-parse", "refs/remotes/origin/main") == sha
+
+
+def test_plain_pr_head_mismatch_keeps_checkout_head(repositories, tmp_path):
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.config import sync_checkout_to_pr
+
+    origin, seed, checkout = repositories
+    previous = git(checkout, "rev-parse", "HEAD")
+    (seed / "a.txt").write_text("moved\n")
+    git(seed, "add", "a.txt")
+    git(seed, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "moved")
+    git(seed, "push", "-q", str(origin), "HEAD:refs/pull/7/head")
+    config = make_config(tmp_path, claude_dir=checkout, trusted_local_origin=origin)
+    with pytest.raises(AgentLoopError, match="advertises head SHA"):
+        sync_checkout_to_pr(
+            config, Runner(), path=checkout, label="Default claude workdir",
+            default_owned=True, pr_number=7, pr_metadata=SimpleNamespace(head_sha=previous),
+        )
+    assert git(checkout, "rev-parse", "HEAD") == previous
+    assert (checkout / "a.txt").read_text() == "one\n"
 
 
 def test_private_import_rejects_tracking_ref_race(repositories):
@@ -139,7 +194,7 @@ def test_private_https_retry_scopes_token_without_exposing_it(repositories, monk
     )
 
 
-def test_token_cli_cannot_be_planted_in_checkout(repositories, tmp_path):
+def test_token_cli_cannot_be_planted_in_checkout(repositories, tmp_path, monkeypatch):
     from coding_review_agent_loop.git_transport import _token_from_gh
 
     _, _, checkout = repositories
@@ -147,15 +202,32 @@ def test_token_cli_cannot_be_planted_in_checkout(repositories, tmp_path):
     planted = checkout / "gh"
     planted.write_text(f"#!/bin/sh\ntouch {marker}\necho token\n")
     planted.chmod(0o755)
-    with pytest.raises(AgentLoopError, match="outside the agent checkout"):
+    with pytest.raises(AgentLoopError, match="operator-owned installation"):
         _token_from_gh(str(planted), checkout, "github.com")
     assert not marker.exists()
     trusted = tmp_path / "trusted-gh"
     argv = tmp_path / "trusted-argv"
     trusted.write_text(f"#!/bin/sh\nprintf '%s ' \"$@\" > {argv}\necho trusted-token\n")
     trusted.chmod(0o755)
-    assert _token_from_gh(str(trusted), checkout, "github.com") == "trusted-token"
-    assert argv.read_text() == "auth token --hostname github.com "
+    with pytest.raises(AgentLoopError, match="operator-owned installation"):
+        _token_from_gh(str(trusted), checkout, "github.com")
+    assert not argv.exists()
+
+
+def test_token_cli_rejects_sibling_checkout_on_path(repositories, tmp_path, monkeypatch):
+    from coding_review_agent_loop.git_transport import _token_from_gh
+
+    _, _, checkout = repositories
+    sibling = tmp_path / "sibling"
+    sibling.mkdir()
+    marker = tmp_path / "sibling-gh-ran"
+    planted = sibling / "gh"
+    planted.write_text(f"#!/bin/sh\ntouch {marker}\necho planted-token\n")
+    planted.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{sibling}:{os.environ.get('PATH', '')}")
+    with pytest.raises(AgentLoopError, match="operator-owned installation"):
+        _token_from_gh(str(planted), checkout, "github.com")
+    assert not marker.exists()
 
 
 def test_filter_changed_at_launch_cannot_execute(repositories, monkeypatch, tmp_path):

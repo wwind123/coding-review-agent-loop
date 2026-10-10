@@ -66,10 +66,10 @@ def test_task_loop_syncs_coder_base_before_first_implementation_attempt(tmp_path
     memory_index = command_index(commands, ["git", "diff", "--name-only"])
     fetch_index = command_index(commands, ["git", "fetch", "origin"])
     switch_index = command_index(commands, ["git", "switch", "main"])
-    pull_index = command_index(commands, ["git", "pull", "--ff-only", "origin", "main"])
+    reset_index = command_index(commands, ["git", "reset", "--hard", runner.git_head])
     coder_index = command_index(commands, ["claude", "--print"])
 
-    assert memory_index < fetch_index < switch_index < pull_index < coder_index
+    assert memory_index < fetch_index < switch_index < reset_index < coder_index
 
 def test_task_loop_picks_up_pr_url_when_marker_missing(tmp_path):
     runner = FakeRunner(

@@ -10198,7 +10198,7 @@ def test_pr_loop_resolves_pr_base_before_workdir_setup(tmp_path):
     pr_context_index = command_index(runner.commands, ["gh", "pr", "view"])
     switch_index = command_index(runner.commands, ["git", "switch", "develop"])
     assert pr_context_index < switch_index
-    assert ["git", "pull", "--ff-only", "origin", "develop"] in commands
+    assert ["git", "reset", "--hard", runner.git_head] in commands
     assert not any("origin/main" in arg for cmd in commands for arg in cmd)
 
 def test_pr_loop_explicit_base_overrides_pr_base_without_repo_default_query(tmp_path):

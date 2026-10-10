@@ -246,6 +246,17 @@ def local_command(
         elif option not in {"--literal-pathspecs", "--no-pager", "--no-optional-locks"}:
             raise AgentLoopError(f"Unsupported Git global option in local command: {option}.")
     command = [_git_path(), "--no-pager", *prefix]
+    if checkout is not None and rest and rest[0] not in {"init", "clone"}:
+        # A repository's core.worktree is agent writable. Bind both Git's
+        # work-tree option and the effective config to the checkout root.
+        # Some read callers start in a package directory inside that root.
+        worktree_path = Path(os.path.abspath(checkout))
+        for candidate in (worktree_path, *worktree_path.parents):
+            if os.path.lexists(candidate / ".git"):
+                worktree_path = candidate
+                break
+        worktree = str(worktree_path)
+        command.extend(("--work-tree", worktree, "-c", f"core.worktree={worktree}"))
     for item in _CONFIG:
         command.extend(("-c", item))
     if rest and rest[0] in {"diff", "show", "log"}:

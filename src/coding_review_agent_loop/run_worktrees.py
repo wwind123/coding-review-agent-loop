@@ -187,7 +187,7 @@ def _git(runner: Any, store: Path, *args: str, check: bool = True):
     return runner.run(("git", *args), cwd=store, check=check)
 
 
-def _create_detached_link(store: Path, path: Path, sha: str) -> Path:
+def _create_detached_link(store: Path, path: Path, sha: str) -> tuple[Path, list[int], list[int]]:
     """Create only Git's administrative link; reset populates it separately.
 
     Git 2.43 execs ``update-ref`` even for ``worktree add --no-checkout``.
@@ -226,7 +226,8 @@ def _create_detached_link(store: Path, path: Path, sha: str) -> Path:
         if _identity(path) == path_identity and path.is_dir() and not path.is_symlink():
             path.rmdir()
         raise
-    return admin
+    assert admin_identity is not None
+    return admin, path_identity, admin_identity
 
 
 def add_run_worktree(
@@ -242,34 +243,40 @@ def add_run_worktree(
     record_file = _record_path(store, token)
     base = {"version": 1, "run_token": token, "path": str(path), "store": str(store)}
     _write_reservation(record_file, {**base, "state": "pending"})
-    admin = _create_detached_link(store, path, sha)
-    if _admin_dir_of(store, path) != admin:
-        raise AgentLoopError(f"git worktree add did not produce a linked worktree at {path}.")
+    admin, root_identity, admin_identity = _create_detached_link(store, path, sha)
     try:
+        if _admin_dir_of(store, path) != admin:
+            raise AgentLoopError(f"git worktree add did not produce a linked worktree at {path}.")
         result = runner.run(("git", "reset", "--hard", sha), cwd=path)
         head = runner.run(("git", "rev-parse", "HEAD"), cwd=path).stdout.strip()
         status = runner.run(("git", "status", "--porcelain"), cwd=path).stdout.strip()
         if result.returncode or head != sha or status or _admin_dir_of(store, path) != admin:
             raise AgentLoopError(f"Fresh linked worktree {path} did not materialize cleanly.")
-    except Exception:
-        # Only a matching administrative link may be removed.  A failed
-        # materialization is never made ready or registered.
-        if _admin_dir_of(store, path) == admin:
-            _git(runner, store, "worktree", "remove", "--force", str(path), check=False)
-        raise
-    from .agent_permissions import register_checkout
+        from .agent_permissions import register_checkout
 
-    try:
         register_checkout(config, path)
         _write_reservation(
             record_file,
             {**base, "state": "ready", "admin_name": admin.name,
-             "root": _identity(path), "admin": _identity(admin)},
+             "root": root_identity, "admin": admin_identity},
         )
-    except Exception:
-        if _admin_dir_of(store, path) == admin:
-            _git(runner, store, "worktree", "remove", "--force", str(path), check=False)
+    except Exception as original:
         forget_checkout(path)
+        # Git may reject a malformed administrative link, so remove only the
+        # two directories whose inode identities this setup recorded.
+        for target, identity in ((path, root_identity), (admin, admin_identity)):
+            if _identity(target) != identity or target.is_symlink():
+                raise AgentLoopError(
+                    f"Fresh linked worktree cleanup refused changed identity at {target}."
+                ) from original
+            try:
+                shutil.rmtree(target)
+            except OSError as exc:
+                raise AgentLoopError(
+                    f"Fresh linked worktree cleanup failed at {target}: {exc}."
+                ) from original
+        if path.exists() or admin.exists():
+            raise AgentLoopError(f"Fresh linked worktree cleanup remained incomplete at {path}.") from original
         raise
 
 

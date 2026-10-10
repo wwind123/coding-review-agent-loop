@@ -75,6 +75,28 @@ def _reset_checkout_baselines():
     reset_checkout_baselines()
 
 
+@pytest.fixture(autouse=True)
+def _fake_runner_private_transport(monkeypatch):
+    """Keep orchestration fakes at their command seam; real Git tests use import_ref."""
+    from agent_loop_helpers import FakeRunner
+    from coding_review_agent_loop import git_transport
+
+    real_import = git_transport.import_ref
+
+    def import_for_fake(destination, source_ref, tracking_ref, *, runner, **kwargs):
+        if not isinstance(runner, FakeRunner):
+            return real_import(destination, source_ref, tracking_ref, runner=runner, **kwargs)
+        if source_ref.startswith("refs/pull/"):
+            number = source_ref.split("/")[2]
+            runner.run(("git", "fetch", "origin", f"+pull/{number}/head:{tracking_ref}"),
+                       cwd=destination)
+            return runner.pr_payload.get("headRefOid", runner.git_head)
+        runner.run(("git", "fetch", "origin"), cwd=destination)
+        return runner.git_head
+
+    monkeypatch.setattr(git_transport, "import_ref", import_for_fake)
+
+
 STUB_TOOL_PROVENANCE = {
     "package_path": "/stub/src/coding_review_agent_loop",
     "checkout_root": "/stub",

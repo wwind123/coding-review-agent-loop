@@ -9,7 +9,7 @@ from __future__ import annotations
 import base64
 import os
 import re
-import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -98,9 +98,29 @@ def _private_git(args: tuple[str, ...], *, cwd: Path, env: dict[str, str],
 
 
 def _token_from_gh(gh_cmd: str, destination: Path, host: str) -> str:
-    resolved = os.path.realpath(gh_cmd if os.path.isabs(gh_cmd) else (shutil.which(gh_cmd) or ""))
+    if os.path.isabs(gh_cmd):
+        candidate = gh_cmd
+    elif gh_cmd == "gh":
+        candidates = ([r"C:\Program Files\GitHub CLI\gh.exe"] if sys.platform == "win32"
+                      else ["/usr/bin/gh", "/usr/local/bin/gh", "/opt/homebrew/bin/gh"])
+        candidate = next((path for path in candidates if os.path.isfile(path)), "")
+    else:
+        candidate = ""
+    resolved = os.path.realpath(candidate) if candidate else ""
     if not resolved or not os.path.isfile(resolved) or not os.access(resolved, os.X_OK):
         raise AgentLoopError("Trusted GitHub authentication is unavailable.")
+    if sys.platform != "win32":
+        # Every component must be owned by the operator or root and must not
+        # be writable by other users. This also rejects a sibling checkout on
+        # PATH and an explicit executable inside an agent-writable tree.
+        current = Path(resolved)
+        while True:
+            info = current.stat()
+            if info.st_uid not in {0, os.getuid()} or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise AgentLoopError("Trusted GitHub CLI must be in an operator-owned installation.")
+            if current.parent == current:
+                break
+            current = current.parent
     try:
         if os.path.commonpath((resolved, os.path.realpath(destination))) == os.path.realpath(destination):
             raise AgentLoopError("Trusted GitHub CLI must be outside the agent checkout.")
@@ -110,7 +130,7 @@ def _token_from_gh(gh_cmd: str, destination: Path, host: str) -> str:
         result = subprocess.run((resolved, "auth", "token", "--hostname", host), cwd=tempfile.gettempdir(),
                                 env={key: value for key, value in os.environ.items()
                                      if key in {"HOME", "USER", "LOGNAME", "GH_HOST", "GH_CONFIG_DIR",
-                                                "GH_TOKEN", "GITHUB_TOKEN", "PATH"}},
+                                                "GH_TOKEN", "GITHUB_TOKEN"}},
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                 check=False, timeout=10)
     except (OSError, subprocess.TimeoutExpired) as exc:

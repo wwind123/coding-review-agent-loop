@@ -3066,7 +3066,7 @@ def test_stop_during_the_post_run_git_subprocess_completes_unattributed(tmp_path
 
     def slow_git(command, *args, **kwargs):
         # subprocess.run (pre-run capture) never sets start_new_session; the cancellable path does.
-        if command and command[0] == "git" and kwargs.get("start_new_session"):
+        if command and Path(command[0]).name == "git" and kwargs.get("start_new_session"):
             proc = real_popen(["sleep", "30"], *args, **kwargs)
             spawned.append(proc)
             entered.set()
@@ -3412,7 +3412,7 @@ def test_real_target_stopped_during_the_post_run_git_subprocess(tmp_path, monkey
     entered = threading.Event()
 
     def slow_git(command, *args, **kwargs):
-        if command and command[0] == "git" and kwargs.get("start_new_session"):
+        if command and Path(command[0]).name == "git" and kwargs.get("start_new_session"):
             proc = real_popen(["sleep", "30"], *args, **kwargs)
             spawned.append(proc)
             entered.set()

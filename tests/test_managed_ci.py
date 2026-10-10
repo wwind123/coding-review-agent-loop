@@ -13131,9 +13131,8 @@ def test_run_pr_loop_resume_with_missing_default_checkout_clones_it(tmp_path, mo
     assert all(cwd.is_dir() and cwd != default_checkout for cwd in pull_reads)
     assert any(cwd == github_api_cwd() for cwd in pull_reads)
     assert any(
-        command[:4] == ["gh", "repo", "clone", "OWNER/REPO"]
-        and command[4] == str(default_checkout)
-        for command, _cwd in runner.commands
+        command[:2] == ["git", "init"] and cwd == default_checkout
+        for command, cwd in runner.commands
     )
     assert default_checkout.is_dir()
     # No GitHub write may precede checkout setup on an ordinary resume.

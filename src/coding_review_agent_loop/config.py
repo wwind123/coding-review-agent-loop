@@ -1692,20 +1692,30 @@ def sync_checkout_to_pr(
 
     verify_before_sync(config, runner, path=path, label=label)
     _validate_repo_remote(path, label=label, config=config, runner=runner)
-    _clean_or_reject_checkout(
-        path,
-        label=label,
-        default_owned=default_owned,
-        config=config,
-        runner=runner,
-    )
-
     store = run_worktree_store(config, path)
+    advertised_head = (pr_metadata.head_sha or "").strip()
+
+    def require_advertised_head(pinned: str) -> None:
+        if advertised_head and pinned != advertised_head:
+            raise AgentLoopError(
+                f"{label} at {path}: fetched PR #{pr_number} head {pinned} "
+                f"differs from metadata that advertises head SHA {advertised_head}."
+            )
+
+    if not default_owned:
+        _clean_or_reject_checkout(
+            path, label=label, default_owned=False, config=config, runner=runner,
+        )
     if store is not None:
         from . import run_worktrees
 
         # Check out the SHA pinned under the store lock, never the shared mutable ref.
         pinned = run_worktrees.pin_pr_head(store, pr_number, config=config, runner=runner)
+        require_advertised_head(pinned)
+        if default_owned:
+            _clean_or_reject_checkout(
+                path, label=label, default_owned=True, config=config, runner=runner,
+            )
         _run_git(runner, path, ("checkout", "--detach", pinned))
     else:
         from .git_transport import import_ref
@@ -1723,10 +1733,14 @@ def sync_checkout_to_pr(
                 repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
                 local_origin=config.trusted_local_origin,
             )
+            require_advertised_head(pinned)
+            if default_owned:
+                _clean_or_reject_checkout(
+                    path, label=label, default_owned=True, config=config, runner=runner,
+                )
             _run_git(runner, path, ("checkout", "--detach", pinned))
     local_head = _run_git(runner, path, ("rev-parse", "HEAD")).stdout.strip()
     branch_state = _run_git(runner, path, ("status", "--short", "--branch")).stdout.strip()
-    advertised_head = (pr_metadata.head_sha or "").strip()
     if advertised_head and local_head != advertised_head:
         raise AgentLoopError(
             f"{label} at {path} is at {local_head or '(unknown)'}, "
