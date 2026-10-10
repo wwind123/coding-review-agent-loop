@@ -161,6 +161,30 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
 
+    def add_reviewer_floor(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument(
+            "--min-reviewers",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "Refuse to review with fewer than N reviewers on the effective board. "
+                "Checked after history is resolved and before any agent runs or comment is "
+                "posted; only a signed reviewer-board amendment can authorize a smaller "
+                "board (default: no floor)."
+            ),
+        )
+        subparser.add_argument(
+            "--min-distinct-providers",
+            type=int,
+            default=None,
+            metavar="N",
+            help=(
+                "Refuse to review with fewer than N distinct reviewer backends on the "
+                "effective board; two seats on one backend count once (default: no floor)."
+            ),
+        )
+
     def add_common(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("--repo", help="GitHub repo as owner/name. Defaults to gh repo view.")
         subparser.add_argument(
@@ -1188,6 +1212,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     add_common(issue)
+    add_reviewer_floor(issue)
     issue.add_argument(
         "--managed-ci",
         action="store_true",
@@ -1254,6 +1279,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicitly widen a recovered expected-closing contract with a proper superset.",
     )
     add_common(pr)
+    add_reviewer_floor(pr)
     pr.add_argument(
         "--managed-ci",
         action="store_true",
@@ -1330,6 +1356,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Complete expected-closing issue set for this managed PR; repeatable.",
     )
     add_common(managed_pr)
+    add_reviewer_floor(managed_pr)
     managed_pr.add_argument(
         "--managed-ci",
         action="store_true",
@@ -2293,6 +2320,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 body = sys.stdin.read()
             else:
                 body = args.body_file.read_text(encoding="utf-8")
+            # A managed PR is created fresh, so no signed amendment can
+            # authorize a smaller board: refuse it before any setup or write.
+            from .reviewer_floor import enforce_configured_board_floor
+            enforce_configured_board_floor(config, context="managed-pr reviewer board")
             config = resolve_base_branch(config, runner)
             ensure_agent_workdirs(config, runner)
             handoff = create_managed_pr(

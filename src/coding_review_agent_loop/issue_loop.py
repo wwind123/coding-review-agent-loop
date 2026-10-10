@@ -203,6 +203,13 @@ def run_issue_loop(
             # the one normalized requested policy.  The reviewed recommendation
             # is still resolved only at the approval boundary.
             config = dataclasses_replace(config, plan_execution_mode=requested_policy)
+        # Reviewer-board floor (#1373): a read-only issue fetch and plan
+        # lineage resolution, before any workdir setup, agent, or post.
+        from .plan_verification import enforce_issue_board_floor
+        from .reviewer_floor import board_floor_enabled
+        if board_floor_enabled(config):
+            floor_issue = get_issue_context(runner, config=config, issue_number=issue_number)
+            enforce_issue_board_floor(config, floor_issue.comments, issue_number=issue_number)
         config = resolve_base_branch(config, runner)
         ensure_agent_workdirs(config, runner)
         config = _freeze_prompt_architecture(runner, config)

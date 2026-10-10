@@ -1894,8 +1894,84 @@ default seats keep historical signatures and metadata bytes. Issue-plan review
 writes the same versioned seat binding into coder, reviewer, and scheduling
 round records. Resume validates the binding before reading
 approvals or amendments; a model-chain change starts a fresh review round
-while preserving verifiable seat-owned findings. The issue-to-PR handoff checks
-the plan board and binding before PR review begins. For a staged child whose
-plan records do not match the handoff plan, it reads the parent issue that supplied the approved plan and
-verifies that issue's seat binding and amendment lineage. A named handoff
-without verifiable plan review records stops before reviewer invocation.
+while preserving verifiable seat-owned findings.
+
+### Per-invocation PR boards and the reviewer floor (#1373)
+
+The PR reviewer board is a per-invocation choice. A plan approved by board A
+can hand off to PR review by board B, so the handoff no longer requires the
+plan's named seats, seat set, or seat models. `plan_verification.py` derives one
+plan verification context from the plan's owning issue: the persisted plan
+contract and its signed plan amendment lineage (C0 to Cn), the plan seat
+binding, and the planning policy and primary. Plain all-reviewers plans persist
+neither, so their board is every reviewer that reviewed the plan. The context
+validates the plan's complete seat-binding history. Mixed bound and unbound
+rounds, a changed backend, a changed recorded board, or a reviewer outside its
+own binding fail closed. A model chain or effort change between consecutive
+bound records is a binding transition. Every approval recorded before the
+latest transition is superseded, even when a later record returns to the
+earlier model (A to B to A). Approvals bound to a model the latest binding
+replaced never count either. A malformed staged checkpoint that hides
+the persisted policy also fails closed; it is never downgraded to
+all-reviewers verification. Every
+plan-approval reader uses this context and never reads the PR invocation's
+board: managed-CI fresh authorization, ordinary resume without an issue-side
+handoff, the handoff seam, and strict managed-CI qualification. For a staged
+child whose plan records do not match the handoff plan, the seam reads the
+parent issue that supplied the approved plan.
+
+`reviewer_seats.resolve_plan_handoff_board` applies the handoff board rule. If
+the invocation's seat-ID set equals the plan's C0 or Cn, the PR board is
+restricted to Cn, so a signed plan removal stays removed and a signed
+restoration is included. Any other seat set is an operator reconfiguration, and
+the PR board is exactly the invocation's board. When the derived PR board
+differs from Cn in membership, backend, model chain, or effort, the PR loop
+posts one plain-text board-change audit record on the PR before round 1. The
+record lists the old and new boards, effective round 1, and reason
+`operator-reconfigured`. A digest over that content identifies it, so a rerun
+posts nothing new. It carries no protocol marker or signature grammar and
+cannot be read as a signed amendment or human requirement. An unchanged board
+posts nothing. Plan approvals never count as PR approvals: every PR board
+reviewer must approve the PR's exact head.
+
+`--min-reviewers` and `--min-distinct-providers` set an optional
+per-invocation floor. Config validates only that the values are positive
+integers. `AgentLoopConfig` construction and `dataclasses.replace` never compare
+the board with the floor, so amendment rebinding cannot trip it.
+`reviewer_floor.check_reviewer_floor` checks the effective board after
+read-only history and lineage resolution. It runs before any workdir setup,
+managed-CI activation, PR-side write, or agent invocation. That covers
+issue-run start (before base resolution and workdir setup), `managed-pr` (before
+the branch and draft PR are created), and PR start or handoff. Providers are
+counted by seat backend. Only a validated, non-empty signed amendment chain
+supplies a floor exception. At handoff that requires an inherited seat set. On
+the PR, the signed PR amendment lineage is resolved read-only at the same early
+point. That includes the backend-outage completeness check and the activation
+round of pending amendments, so malformed or not-yet-activatable amendment
+history also fails before any write and never supplies a floor exception.
+Malformed round history fails closed under every review policy. The first PR
+write can be the release of a retained managed label on a ready PR or a
+managed-CI fresh authorization record. Whenever signed PR amendments exist, or a
+floor is set, the complete lineage and the floor are resolved at PR entry,
+before either write. Signed amendments are validated there even without floor
+flags. That resolution uses the authoritative approved plan. The owning issue is
+the caller's issue, an explicit managed-CI issue scope, the PR-side contract's
+primary issue, the issue named by the managed branch (ordinary managed-CI
+recovery), or the single issue the PR body links. The plan identity comes from the caller's approved plan or from
+the issue-side handoff that names this PR. The board then comes from the issue
+holding exactly that plan, either the child or its staged parent. With no
+handoff record, only the managed-CI recovery scopes (fresh authorization with
+an explicit issue, or ordinary resume from the managed branch) bind the owning
+issue's completely approved canonical plan. It is verified by the same helper
+those recovery paths use, and that issue's board is used. An ordinary PR whose
+linked issue has no handoff record naming it binds no plan, so unfinished
+planning on that issue is never consulted. The read-only PR preflight also validates persisted PR seat bindings
+before it grants a signed floor exception, so a backend change on a remaining
+seat fails before any write. This is the
+same selection the handoff seam applies, and the seam repeats the check. The
+exception covers only the measures the chain
+lowered from C0 to Cn, and never goes below the signed board's own counts with
+its recorded bindings. A binding swap therefore cannot inherit a provider
+exception. Recording unsigned in-run PR and plan board changes is later work
+(stages 2 and 3 of #1373). Until then, a persisted PR or plan scheduler contract
+is still immutable apart from signed amendments.

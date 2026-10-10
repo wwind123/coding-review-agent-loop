@@ -1203,10 +1203,16 @@ def test_managed_ci_resume_recovers_staged_parent_held_plan(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("unrelated_child_plan", [False, True])
-def test_staged_child_pr_rejects_divergent_parent_plan_seat_board(
+def test_staged_child_pr_audits_divergent_parent_plan_seat_board(
     tmp_path, monkeypatch, unrelated_child_plan,
 ):
-    """Unrelated child rounds cannot replace the parent plan's bound board."""
+    """Unrelated child rounds cannot replace the parent plan's bound board.
+
+    A PR board differing from the parent plan board is an operator
+    reconfiguration (#1373): it is audited against the parent's board, never
+    the unrelated child board that happens to equal the PR board.
+    """
+    from coding_review_agent_loop.plan_verification import BOARD_CHANGE_AUDIT_HEADING
     from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
     from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent, reviewer_seat_binding
 
@@ -1250,12 +1256,17 @@ def test_staged_child_pr_rejects_divergent_parent_plan_seat_board(
         reviewer_seats=(flash, opus, extra),
     )
 
-    with pytest.raises(AgentLoopError, match="required reviewer seat board"):
+    # No reviewer output is scripted: the run stops at the first reviewer,
+    # after the audit record was posted.
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
         orchestrator.run_pr_loop(
             runner, pr_number=77, config=config,
             issue_context=child, parent_issue_context=parent,
         )
-    assert_no_agent_process(runner)
+    (audit,) = [body for body in runner.comments if BOARD_CHANGE_AUDIT_HEADING in body]
+    assert "- Plan board: flash (antigravity: Model A); opus (antigravity: Model B)" in audit
+    assert "- Added reviewer(s): extra" in audit
+    assert "- Removed reviewer(s): none" in audit
 
 
 def test_managed_ci_resume_refreshes_stale_parent_snapshot_once(tmp_path, monkeypatch):

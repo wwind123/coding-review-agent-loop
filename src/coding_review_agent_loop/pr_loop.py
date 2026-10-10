@@ -7,6 +7,7 @@ orchestrator re-exports every name defined here.
 from __future__ import annotations
 
 import hashlib
+import re
 import shlex
 import sys
 import time
@@ -37,6 +38,17 @@ from .board_amendment import (
     require_amendment_activation,
     resolve_contract_lineage,
 )
+from .plan_verification import (
+    board_change_audit_already_posted,
+    board_change_digest,
+    board_change_payload,
+    derive_plan_verification_context,
+    plan_verification_inputs,
+    render_board_change_audit,
+    signed_lineage_authorization,
+)
+from .reviewer_floor import board_floor_enabled, enforce_configured_board_floor
+from .reviewer_seats import PlanHandoffBoard, resolve_plan_handoff_board
 from .decomposition import (
     _decode_json_payload,
     approved_plan_hash,
@@ -450,6 +462,302 @@ def unchanged_head_stop_message(
     )
 
 
+def _enforce_pr_board_floor(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_context: PullRequestReviewContext,
+    pr_number: int,
+    handoff_authorizations: Sequence[object] = (),
+) -> None:
+    """Resolve signed PR lineage read-only, then check the effective-board floor.
+
+    Malformed or not-yet-activatable amendment history fails closed here, so
+    every caller refuses before any write.
+    """
+    amendments = collect_reviewer_board_amendments(
+        pr_context.comments, flow="pr", pr_number=pr_number, ignored_sink=[],
+    )
+    floor_config = config
+    authorizations = list(handoff_authorizations)
+    if amendments:
+        floor_config, authorization = _signed_pr_board_preflight(
+            runner,
+            config=config,
+            pr_context=pr_context,
+            pr_number=pr_number,
+            amendments=amendments,
+        )
+        if authorization is not None:
+            authorizations.append(authorization)
+    enforce_configured_board_floor(
+        floor_config,
+        authorizations=authorizations,
+        context=f"PR #{pr_number} reviewer board",
+    )
+
+
+def _canonical_plan_without_handoff(
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+    *,
+    source_locator: str,
+    error_message: str,
+) -> ApprovedPlanContext | None:
+    """The completely approved canonical plan of an issue with no handoff record.
+
+    Approval is verified against the approving plan board, never the PR
+    invocation's board (#1373).  ``None`` means the issue has no plan round;
+    incomplete approval raises ``error_message``.
+    """
+    plan_config, plan_comments = plan_verification_inputs(
+        config, issue_context.comments, issue_number=issue_context.number,
+    )
+    resumed_plan = _resume_plan_round(plan_comments, configured_reviewers=reviewers(plan_config))
+    if resumed_plan is None:
+        return None
+    plan_text, resumed_plan_round = resumed_plan
+    _require_complete_canonical_plan_approval(
+        plan_comments,
+        config=plan_config,
+        plan_text=plan_text,
+        plan_round=resumed_plan_round,
+        human_requirements=issue_context.human_requirements,
+        error_message=error_message,
+    )
+    return make_approved_plan_context(
+        plan_text, source_locator=source_locator, expected_hash=approved_plan_hash(plan_text),
+    )
+
+
+def _entry_plan_handoff_board(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_context: PullRequestReviewContext,
+    pr_number: int,
+    issue_context: IssueContext | None,
+    parent_issue_context: IssueContext | None,
+    approved_plan_context: ApprovedPlanContext | None,
+    managed_ci_issue_number: int | None,
+) -> PlanHandoffBoard | None:
+    """Read-only handoff board of the exact approved plan bound to this PR.
+
+    Runs before the first PR write, so it uses only authoritative scope: the
+    caller's issue, else an explicit managed-CI issue scope, else the PR-side
+    contract's primary issue.  The plan identity comes from the caller's
+    approved plan or the issue-side handoff that names this PR, and the board
+    is taken from the issue (child, else staged parent) holding exactly that
+    plan, the same selection the handoff seam applies.  ``None`` means no
+    plan is bound, so no plan authorization applies.
+    """
+    owning_number = issue_context.number if issue_context is not None else None
+    # Only the managed-CI recovery paths bind an issue's canonical plan when
+    # no handoff record names this PR (#1378 review item-10).
+    canonical_recovery_scope = False
+    if owning_number is None:
+        owning_number = managed_ci_issue_number or config.managed_ci_issue_number
+        canonical_recovery_scope = (
+            owning_number is not None and config.managed_ci_fresh_authorization
+        )
+    if owning_number is None:
+        recorded = find_latest_pr_contract(
+            pr_context.comments, repository=config.repo, pr_number=pr_number,
+        )
+        if recorded is not None:
+            owning_number = recorded.primary_issue_number
+    if owning_number is None and config.managed_ci_pr_mode:
+        # Ordinary managed-CI recovery binds the issue named by the managed
+        # branch, exactly as recover_issue_created_handoff does.
+        branch = re.fullmatch(
+            r"agent-loop/managed-([1-9]\d*)", pr_context.metadata.head_branch or "",
+        )
+        if branch is not None:
+            owning_number = int(branch.group(1))
+            canonical_recovery_scope = True
+    if owning_number is None:
+        # The same single-linked-issue fallback the provenance block applies;
+        # its handoff record must still name this PR to bind a plan.
+        linked = parse_linked_issue_numbers(pr_context.metadata.body, repo=config.repo)
+        if len(linked) == 1:
+            owning_number = linked[0]
+    if owning_number is None:
+        return None
+    owning = get_issue_context(runner, config=config, issue_number=owning_number)
+    if approved_plan_context is not None:
+        plan_hash: str | None = approved_plan_context.plan_hash
+        plan_subject = approved_plan_context.plan_subject
+    else:
+        handoff = find_latest_issue_pr_handoff(
+            owning.comments, issue_number=owning.number, repo=config.repo,
+        )
+        if handoff is None and not canonical_recovery_scope:
+            # An ordinary PR binds a plan only through a handoff record that
+            # names it; unrelated or unfinished planning is not consulted.
+            return None
+        if handoff is None:
+            # No handoff record: managed-CI fresh authorization and ordinary
+            # managed-CI resume bind the issue's completely approved canonical
+            # plan, verified the same way here.
+            canonical = _canonical_plan_without_handoff(
+                config,
+                owning,
+                source_locator=f"issue #{owning.number} canonical approved plan",
+                error_message=(
+                    f"Issue #{owning.number} has planning state without a complete "
+                    "canonical reviewer approval; no PR write was made."
+                    + _pr_amendment_plan_board_hint(
+                        pr_context.comments,
+                        pr_number=pr_number,
+                        supplied_reviewers=reviewers(config),
+                    )
+                ),
+            )
+            if canonical is None:
+                return None
+            # That plan was verified on this issue, which therefore owns its board.
+            plan = derive_plan_verification_context(owning.comments, issue_number=owning.number)
+            return resolve_plan_handoff_board(config, plan) if plan is not None else None
+        elif handoff.pr_number != pr_number or handoff.flow != "approved-plan-implementation":
+            return None
+        elif not handoff.plan_hash:
+            raise AgentLoopError(
+                f"Approved-plan handoff for issue #{owning.number} has no plan hash."
+            )
+        else:
+            plan_hash, plan_subject = handoff.plan_hash, None
+    parent_number = (
+        parent_issue_context.number
+        if parent_issue_context is not None
+        else _infer_staged_parent_issue(owning)
+    )
+    candidates: list[int] = [owning.number]
+    if parent_number is not None and parent_number != owning.number:
+        candidates.append(parent_number)
+    for number in candidates:
+        source = (
+            owning if number == owning.number
+            else get_issue_context(runner, config=config, issue_number=number)
+        )
+        recovered = recover_approved_plan_context(
+            source.comments, expected_hash=plan_hash, expected_subject=plan_subject,
+        )
+        if recovered.is_available:
+            if (
+                approved_plan_context is not None
+                and recovered.canonical_text != approved_plan_context.canonical_text
+            ):
+                raise AgentLoopError("Named issue-to-PR handoff plan identity changed during recovery.")
+            plan = derive_plan_verification_context(source.comments, issue_number=source.number)
+            return resolve_plan_handoff_board(config, plan) if plan is not None else None
+        if recovered.has_matching_candidate:
+            return None
+    return None
+
+
+def _signed_pr_board_preflight(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_context: PullRequestReviewContext,
+    pr_number: int,
+    amendments: Sequence[object],
+) -> tuple[AgentLoopConfig, object | None]:
+    """Read-only signed PR amendment lineage for the startup floor check.
+
+    Returns the effective PR board config and, for a validated non-empty
+    chain, its signed authorization.  The same drift error the startup block
+    raises fails closed here, before any write.
+    """
+    from .reviewer_seats import (
+        reviewer_seat_binding,
+        validate_pr_backend_outage_amendments,
+        validate_pr_seat_bindings,
+    )
+
+    validate_pr_backend_outage_amendments(amendments, config)
+    capabilities = policy_capabilities(config.pr_review_policy)
+    # Malformed history propagates for every policy: a signed amendment must
+    # never be applied, or authorize a floor exception, over it.
+    records = _extract_round_metadata_records(pr_context.comments, flow="pr")
+    # Persisted seat bindings are validated before any authorization: a
+    # backend change on a remaining seat fails here, before any write.
+    validate_pr_seat_bindings(records, config)
+    configured = reviewers(config)
+    contract = make_contract(
+        tuple(agent_display_name(reviewer) for reviewer in configured),
+        config.pr_review_policy,
+        config.pr_review_broad_rules,
+        (
+            agent_display_name(config.primary_reviewer)
+            if config.primary_reviewer is not None
+            else None
+        ),
+    )
+    lineage = resolve_contract_lineage(
+        records,
+        amendments,
+        contract,
+        accept_base_configured=True,
+        contract_from_metadata=_scheduler_contract_from_metadata,
+        drift_error=lambda persisted, detail: _pr_contract_drift_error(
+            persisted,
+            detail,
+            pr_number=pr_number,
+            configured=contract,
+            start_round_number=lambda: _pr_amendment_start_round(
+                pr_context, configured, capabilities, runner=runner, config=config,
+            ),
+            amendments_recognized=True,
+        ),
+    )
+    binding = reviewer_seat_binding(config)
+    effective = lineage.contracts[-1]
+    effective_config = config
+    if effective != contract:
+        names = set(effective.required_reviewers)
+        effective_config = dataclasses_replace(
+            config,
+            reviewer=tuple(r for r in configured if agent_display_name(r) in names),
+            pr_seat_binding_override=binding,
+        )
+    if lineage.pending_amendments:
+        # The same activation rule startup applies: a pending amendment must
+        # take effect at the round this resume re-enters (read-only resume).
+        resumed = _resume_pr_round_admitted(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            comments=pr_context.comments,
+            head_sha=pr_context.metadata.head_sha,
+            configured_reviewers=reviewers(effective_config),
+            reconciliation_mode=(
+                "owner-scoped" if capabilities.owner_scoped_reconciliation else "aggregate"
+            ),
+        )
+        require_amendment_activation(
+            lineage,
+            start_round_number=resumed.round_number if resumed is not None else 1,
+            template=lambda amendment, round_number: _board_amendment_template(
+                flow="pr",
+                issue_number=None,
+                pr_number=pr_number,
+                persisted=lineage.contracts[lineage.amendments.index(amendment)],
+                removed=amendment.removed_reviewers,
+                restored=amendment.restored_reviewers,
+                start_round_number=round_number,
+            ),
+        )
+    if not lineage.amendments:
+        return effective_config, None
+    return effective_config, signed_lineage_authorization(
+        lineage.contracts[0].required_reviewers,
+        effective_config=effective_config,
+        known_configs=(config,),
+        binding=binding,
+    )
+
+
 @claimed_run("pr", "pr_number")
 def run_pr_loop(
     runner: Runner,
@@ -522,6 +830,36 @@ def run_pr_loop(
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
+        # The first PR write (the retained-label release, managed-CI fresh
+        # authorization, activation, or any post) follows this point.  Whenever
+        # signed PR amendments exist or a floor is configured, resolve the
+        # authoritative plan board and the complete signed PR lineage read-only
+        # first, so malformed history or a below-floor board is refused with
+        # nothing written (#1378 review items 3, 6, 7, 9).  The handoff seam
+        # repeats the exact check.
+        entry_amendments = collect_reviewer_board_amendments(
+            initial_pr_context.comments, flow="pr", pr_number=pr_number, ignored_sink=[],
+        )
+        if entry_amendments or board_floor_enabled(config):
+            entry_board = _entry_plan_handoff_board(
+                runner,
+                config=config,
+                pr_context=initial_pr_context,
+                pr_number=pr_number,
+                issue_context=issue_context,
+                parent_issue_context=parent_issue_context,
+                approved_plan_context=approved_plan_context,
+                managed_ci_issue_number=managed_ci_issue_number,
+            )
+            _enforce_pr_board_floor(
+                runner,
+                config=entry_board.config if entry_board is not None else config,
+                pr_context=initial_pr_context,
+                pr_number=pr_number,
+                handoff_authorizations=(
+                    entry_board.signed_authorizations if entry_board is not None else ()
+                ),
+            )
         # A successful manual qualification retains the managed label on the
         # ready PR.  Release it before any managed-CI authentication so every
         # downstream path sees the ready/unlabeled state it already handles.
@@ -635,35 +973,23 @@ def run_pr_loop(
                         parent_issue_context = fetched_parent_issue_context
                         parent_issue_context_refreshed = True
             else:
-                resumed_plan = _resume_plan_round(
-                    issue_context.comments,
-                    configured_reviewers=reviewers(config),
+                # Plan approval is verified against the approving plan board,
+                # never this PR invocation's board (#1373).
+                recovered_plan_context = _canonical_plan_without_handoff(
+                    config,
+                    issue_context,
+                    source_locator=f"issue #{fresh_issue_number} canonical approved plan",
+                    error_message=(
+                        "Managed-CI fresh authorization found planning state without "
+                        "a complete canonical reviewer approval."
+                        + _pr_amendment_plan_board_hint(
+                            initial_pr_context.comments,
+                            pr_number=pr_number,
+                            supplied_reviewers=reviewers(config),
+                        )
+                    ),
                 )
-                if resumed_plan is not None:
-                    plan_text, resumed_plan_round = resumed_plan
-                    _require_complete_canonical_plan_approval(
-                        issue_context.comments,
-                        config=config,
-                        plan_text=plan_text,
-                        plan_round=resumed_plan_round,
-                        human_requirements=issue_context.human_requirements,
-                        error_message=(
-                            "Managed-CI fresh authorization found planning state without "
-                            "a complete canonical reviewer approval."
-                            + _pr_amendment_plan_board_hint(
-                                initial_pr_context.comments,
-                                pr_number=pr_number,
-                                supplied_reviewers=reviewers(config),
-                            )
-                        ),
-                    )
-                    recovered_plan_context = make_approved_plan_context(
-                        plan_text,
-                        source_locator=(
-                            f"issue #{fresh_issue_number} canonical approved plan"
-                        ),
-                        expected_hash=approved_plan_hash(plan_text),
-                    )
+                if recovered_plan_context is not None:
                     if (
                         approved_plan_context is not None
                         and approved_plan_context.plan_hash
@@ -781,35 +1107,22 @@ def run_pr_loop(
                             )
                         recovered_scope = candidate_scope
                     elif canonical_handoff is None:
-                        resumed_plan = _resume_plan_round(
-                            issue_context.comments,
-                            configured_reviewers=reviewers(config),
+                        recovered_scope = _canonical_plan_without_handoff(
+                            config,
+                            issue_context,
+                            source_locator=(
+                                f"issue #{managed_ci_handoff.issue_number} canonical approved plan"
+                            ),
+                            error_message=(
+                                "Managed-CI ordinary resume found incomplete canonical "
+                                "plan approval."
+                                + _pr_amendment_plan_board_hint(
+                                    initial_pr_context.comments,
+                                    pr_number=pr_number,
+                                    supplied_reviewers=reviewers(config),
+                                )
+                            ),
                         )
-                        if resumed_plan is not None:
-                            plan_text, resumed_plan_round = resumed_plan
-                            _require_complete_canonical_plan_approval(
-                                issue_context.comments,
-                                config=config,
-                                plan_text=plan_text,
-                                plan_round=resumed_plan_round,
-                                human_requirements=issue_context.human_requirements,
-                                error_message=(
-                                    "Managed-CI ordinary resume found incomplete canonical "
-                                    "plan approval."
-                                    + _pr_amendment_plan_board_hint(
-                                        initial_pr_context.comments,
-                                        pr_number=pr_number,
-                                        supplied_reviewers=reviewers(config),
-                                    )
-                                ),
-                            )
-                            recovered_scope = make_approved_plan_context(
-                                plan_text,
-                                source_locator=(
-                                    f"issue #{managed_ci_handoff.issue_number} canonical approved plan"
-                                ),
-                                expected_hash=approved_plan_hash(plan_text),
-                            )
                     if recovered_scope is not None:
                         if (
                             approved_plan_context is not None
@@ -1674,6 +1987,73 @@ def run_pr_loop(
                 body=initial_pr_context.metadata.body,
                 reject_unexpected=True,
             )
+        # Issue-to-PR handoff board (#1373).  The PR board is this
+        # invocation's board; the approved plan stays verified against the
+        # board that approved it.  Derived read-only, before any workdir
+        # setup, PR-side write or agent invocation, so a below-floor board is
+        # refused with nothing posted.
+        plan_handoff_board: PlanHandoffBoard | None = None
+        if issue_context is not None and approved_plan_context is not None:
+            plan_handoff_comments: Sequence[object] = issue_context.comments
+            plan_handoff_issue_number: int | None = issue_context.number
+            # Select the board from the issue that supplied this exact approved
+            # plan. Unrelated child plan rounds must not replace a parent board.
+            child_plan = recover_approved_plan_context(
+                issue_context.comments,
+                expected_hash=approved_plan_context.plan_hash,
+                expected_subject=approved_plan_context.plan_subject,
+            )
+            if child_plan.is_available:
+                if child_plan.canonical_text != approved_plan_context.canonical_text:
+                    raise AgentLoopError("Named issue-to-PR handoff plan identity changed during recovery.")
+            elif not child_plan.has_matching_candidate and parent_issue_context is not None:
+                parent_plan = recover_approved_plan_context(
+                    parent_issue_context.comments,
+                    expected_hash=approved_plan_context.plan_hash,
+                    expected_subject=approved_plan_context.plan_subject,
+                )
+                if parent_plan.is_available and parent_plan.canonical_text == approved_plan_context.canonical_text:
+                    plan_handoff_comments = parent_issue_context.comments
+                    plan_handoff_issue_number = parent_issue_context.number
+                else:
+                    plan_handoff_comments = ()
+            else:
+                plan_handoff_comments = ()
+            plan_verification = (
+                derive_plan_verification_context(
+                    plan_handoff_comments, issue_number=plan_handoff_issue_number,
+                )
+                if plan_handoff_comments
+                else None
+            )
+            if plan_verification is not None:
+                plan_handoff_board = resolve_plan_handoff_board(config, plan_verification)
+                config = plan_handoff_board.config
+                if plan_handoff_board.changed:
+                    log(
+                        config,
+                        f"PR #{pr_number}: reviewer board "
+                        f"{', '.join(seat.seat_id for seat in plan_handoff_board.pr_seats)} differs from "
+                        "the approved plan board "
+                        f"{', '.join(plan_verification.effective_reviewers)}; "
+                        "recording an operator reconfiguration.",
+                    )
+        handoff_floor_authorizations = (
+            plan_handoff_board.signed_authorizations
+            if plan_handoff_board is not None else ()
+        )
+        # A signed PR amendment can authorize a reduced PR board.  Its lineage
+        # is resolved read-only here, so a malformed amendment history or a
+        # below-floor board is refused before managed-CI activation, any
+        # PR-side write, workdir setup, or agent invocation.  The later
+        # startup block resolves the same lineage again for scheduling.
+        _enforce_pr_board_floor(
+            runner,
+            config=config,
+            pr_context=initial_pr_context,
+            pr_number=pr_number,
+            handoff_authorizations=handoff_floor_authorizations,
+        )
         if not workdirs_ready:
             ensure_agent_workdirs(config, runner)
         config = _freeze_prompt_architecture(
@@ -1822,63 +2202,9 @@ def run_pr_loop(
             log(config, f"PR #{pr_number}: managed-CI adoption provenance changed; using ordinary CI")
             managed_ci = None
             return False
-        plan_handoff_comments = issue_context.comments if issue_context is not None else ()
-        plan_handoff_issue_number = issue_context.number if issue_context is not None else None
-        plan_records = ()
-        if issue_context is not None and approved_plan_context is not None:
-            # Select the board from the issue that supplied this exact approved
-            # plan. Unrelated child plan rounds must not replace a parent board.
-            child_plan = recover_approved_plan_context(
-                issue_context.comments,
-                expected_hash=approved_plan_context.plan_hash,
-                expected_subject=approved_plan_context.plan_subject,
-            )
-            if child_plan.is_available:
-                if child_plan.canonical_text != approved_plan_context.canonical_text:
-                    raise AgentLoopError("Named issue-to-PR handoff plan identity changed during recovery.")
-            elif not child_plan.has_matching_candidate and parent_issue_context is not None:
-                parent_plan = recover_approved_plan_context(
-                    parent_issue_context.comments,
-                    expected_hash=approved_plan_context.plan_hash,
-                    expected_subject=approved_plan_context.plan_subject,
-                )
-                if parent_plan.is_available and parent_plan.canonical_text == approved_plan_context.canonical_text:
-                    plan_handoff_comments = parent_issue_context.comments
-                    plan_handoff_issue_number = parent_issue_context.number
-                elif config.reviewer_seats:
-                    raise AgentLoopError("Named issue-to-PR handoff has no matching parent plan reviewer board.")
-                else:
-                    plan_handoff_comments = ()
-            elif config.reviewer_seats:
-                raise AgentLoopError("Named issue-to-PR handoff has no verifiable approved plan reviewer board.")
-            else:
-                plan_handoff_comments = ()
-            plan_records = _extract_round_metadata_records(
-                plan_handoff_comments, flow="plan"
-            )
-            named_plan_board = any(
-                record.metadata.seat_binding is not None for record in plan_records
-            )
-            if named_plan_board and not config.reviewer_seats:
-                raise AgentLoopError(
-                    "Issue-to-PR handoff requires the named reviewer seats from the approved plan; "
-                    "supply the plan's --reviewer-seat configuration before PR review."
-                )
-            if config.reviewer_seats and not plan_records:
-                raise AgentLoopError(
-                    "Named issue-to-PR handoff has no verifiable approved plan reviewer board."
-                )
-            if config.reviewer_seats:
-                from .reviewer_seats import reconcile_plan_handoff_board
-                config = reconcile_plan_handoff_board(
-                    config, plan_handoff_comments, plan_handoff_issue_number,
-                )
         memory = prepare_agent_memory(runner, config)
         from .reviewer_seats import reviewer_seat_binding, validate_pr_seat_bindings
         seat_binding = reviewer_seat_binding(config)
-        if issue_context is not None and approved_plan_context is not None and seat_binding is not None:
-            from .reviewer_seats import validate_plan_handoff_seats
-            validate_plan_handoff_seats(plan_records, config)
 
         def bound_pr_metadata(**fields: object) -> PostedRoundMetadata:
             metadata = PostedRoundMetadata(**fields)
@@ -2037,6 +2363,25 @@ def run_pr_loop(
             }
         pr_amendment_digest = pr_contract_lineage.active_digest
         pr_amendment_checkpoint_pending = bool(pr_contract_lineage.pending_amendments)
+        if plan_handoff_board is not None and plan_handoff_board.changed:
+            # One orchestrator-written audit record per derived board change,
+            # before round 1; its digest makes every rerun a no-op.
+            board_change = board_change_payload(
+                plan_handoff_board,
+                repo=config.repo,
+                pr_number=pr_number,
+                plan_hash=approved_plan_context.plan_hash if approved_plan_context is not None else None,
+            )
+            board_change_id = board_change_digest(board_change)
+            if not board_change_audit_already_posted(initial_pr_context.comments, board_change_id):
+                post_pr_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=render_board_change_audit(
+                        plan_handoff_board, board_change, board_change_id,
+                    ),
+                )
         for record in startup_records:
             if record.metadata.scheduler_force_full:
                 if record.metadata.scheduler_force_full_source == "operator":

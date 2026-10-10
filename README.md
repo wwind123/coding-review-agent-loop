@@ -605,7 +605,13 @@ an explicit `--reviewer` adds one legacy default seat. Use
 select a named primary. Named seats work with `pr`, `task`, `managed-pr`, plain
 issue PR review, and issue `--plan-first`. `discuss` rejects them.
 Each seat has its own checkout, response file, logs, signature, approval, and
-saved plan and PR bindings. A changed model chain requires fresh review while
+saved plan and PR bindings. The PR board is chosen per invocation: a plan
+approved by one board can be reviewed as a PR by another. The plan stays
+verified against its own board, and a differing PR board gets one board-change
+audit record on the PR. `--min-reviewers N` and `--min-distinct-providers N`
+set an optional floor for the effective board (providers count by backend). A
+board below the floor is refused before any agent runs unless a signed
+reviewer-board amendment authorized it. A changed model chain requires fresh review while
 verified open findings stay attributed to their original seat. Antigravity fallback
 stays inside one seat; seats share account quota and serialize turns through a
 bounded host settings lock. Existing `--reviewer agy` with

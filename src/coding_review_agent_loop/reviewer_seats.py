@@ -63,13 +63,12 @@ def seat_backend(agent: str) -> str:
     return agent.backend if isinstance(agent, SeatAgent) else agent
 
 
-def reviewer_seat_binding(config: object) -> dict[str, object] | None:
-    """Versioned board identity stored on named PR round records."""
-    override = getattr(config, "pr_seat_binding_override", None)
-    if override is not None:
-        return override
-    if not getattr(config, "reviewer_seats", ()):
-        return None
+def board_binding_entries(config: object) -> list[dict[str, object]]:
+    """Seat ID, backend, model chain and effort of every configured reviewer.
+
+    Computed for plain and named boards alike; ``reviewer_seat_binding``
+    persists it only for named boards.
+    """
     from .agents.registry import agent_display_name
     from .config import resolve_invocation
 
@@ -91,7 +90,51 @@ def reviewer_seat_binding(config: object) -> dict[str, object] | None:
             "model_chain": chain,
             "effort": effort,
         })
-    return {"version": 1, "seats": entries}
+    return entries
+
+
+def reviewer_seat_binding(config: object) -> dict[str, object] | None:
+    """Versioned board identity stored on named PR round records."""
+    override = getattr(config, "pr_seat_binding_override", None)
+    if override is not None:
+        return override
+    if not getattr(config, "reviewer_seats", ()):
+        return None
+    return {"version": 1, "seats": board_binding_entries(config)}
+
+
+def validated_binding_entries(binding: object) -> dict[str, dict]:
+    """Structurally validate one recorded seat binding and index it by seat ID."""
+    from .agents.registry import agent_display_name
+
+    if not isinstance(binding, dict) or binding.get("version") != 1:
+        raise AgentLoopError("Reviewer seat binding has an unsupported version.")
+    entries = binding.get("seats")
+    if not isinstance(entries, list) or not entries:
+        raise AgentLoopError("Reviewer seat binding is incomplete.")
+    result: dict[str, dict] = {}
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("id"), str)
+            or entry.get("backend") not in _BACKENDS
+            or not isinstance(entry.get("model_chain"), list)
+            or not entry["model_chain"]
+        ):
+            raise AgentLoopError("Reviewer seat binding has invalid seat fields.")
+        if (
+            any(
+                (model is None and entry["id"] != agent_display_name(entry["backend"]))
+                or (model is not None and (not isinstance(model, str) or not model.strip()))
+                for model in entry["model_chain"]
+            )
+            or entry.get("effort") is not None and not isinstance(entry["effort"], str)
+        ):
+            raise AgentLoopError("Reviewer seat binding has invalid model or effort fields.")
+        if entry["id"] in result:
+            raise AgentLoopError("Reviewer seat binding contains duplicate identities.")
+        result[entry["id"]] = entry
+    return result
 
 
 def validate_pr_seat_bindings(records: object, config: object) -> set[str]:
@@ -175,106 +218,114 @@ def validate_pr_seat_bindings(records: object, config: object) -> set[str]:
     return changed
 
 
-def validate_plan_handoff_seats(records: object, config: object) -> None:
-    """Require the implementation PR to retain the approved plan's seat board."""
-    from .agents.registry import agent_display_name
+@dataclass(frozen=True)
+class PlanHandoffBoard:
+    """The PR board derived at an issue-to-PR handoff (#1373).
 
-    records = tuple(records)
-    if not records:
-        return
-    changed = validate_pr_seat_bindings(records, config)
-    if changed:
-        raise AgentLoopError(
-            "Issue-to-PR handoff changed plan reviewer models; rerun plan review "
-            "before accepting PR approvals."
+    ``config`` carries the derived PR board.  ``inherited`` is true when the
+    invocation repeated the approved plan's original (C0) or signed-effective
+    (Cn) seat set; any other seat set is an operator reconfiguration.
+    """
+
+    config: object
+    plan: object  # PlanVerificationContext
+    inherited: bool
+    pr_seats: tuple[object, ...]
+    added: tuple[str, ...]
+    removed: tuple[str, ...]
+    binding_changes: tuple[tuple[object, object], ...]
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.added or self.removed or self.binding_changes)
+
+    @property
+    def signed_authorizations(self) -> tuple[object, ...]:
+        """The plan's signed board, only for an inherited seat set."""
+        authorization = self.plan.signed_authorization if self.inherited else None
+        return (authorization,) if authorization is not None else ()
+
+
+def resolve_plan_handoff_board(config: object, plan: object) -> PlanHandoffBoard:
+    """Apply the handoff board rule against one plan verification context.
+
+    The PR board is the invocation's board.  When its seat-ID set equals the
+    plan's original or signed-effective board it is restricted to the
+    effective board, so a signed plan removal stays removed and a signed
+    restoration is included.  Nothing here refuses a differing board: the
+    approved plan stays verified against its own board, and every PR reviewer
+    must still approve the PR's exact head.
+    """
+    from dataclasses import replace
+    from .agents.registry import agent_display_name
+    from .reviewer_floor import board_seats_from_config
+
+    invocation_names = frozenset(agent_display_name(reviewer) for reviewer in config.reviewer)
+    inherited = invocation_names in {
+        frozenset(plan.original_reviewers), frozenset(plan.effective_reviewers),
+    }
+    result = config
+    if inherited:
+        effective = set(plan.effective_reviewers)
+        restricted = tuple(
+            reviewer for reviewer in config.reviewer
+            if agent_display_name(reviewer) in effective
         )
-    contract = next(
-        (contract for record in reversed(records)
-         if (contract := _persisted_plan_contract(record.metadata)) is not None),
-        None,
-    )
-    if contract is not None and set(contract.required_reviewers) != {
-        agent_display_name(reviewer) for reviewer in config.reviewer
-    }:
-        raise AgentLoopError(
-            "Issue-to-PR handoff changed the required reviewer seat board."
-        )
-    if contract is None:
-        binding = records[-1].metadata.seat_binding
-        if binding is not None and {entry["id"] for entry in binding["seats"]} != {
-            agent_display_name(reviewer) for reviewer in config.reviewer
-        }:
-            raise AgentLoopError(
-                "Issue-to-PR handoff changed the required reviewer seat board."
+        binding = reviewer_seat_binding(config)
+        if restricted != tuple(config.reviewer) or binding is not None:
+            result = replace(
+                config, reviewer=restricted,
+                pr_seat_binding_override=binding,
             )
+    pr_seats = board_seats_from_config(result)
+    plan_by_id = {seat.seat_id: seat for seat in plan.effective_seats}
+    pr_by_id = {seat.seat_id: seat for seat in pr_seats}
+    binding_changes = []
+    for seat in pr_seats:
+        previous = plan_by_id.get(seat.seat_id)
+        if previous is None:
+            continue
+        if previous.backend != seat.backend or (
+            previous.binding_known
+            and (previous.model_chain != seat.model_chain or previous.effort != seat.effort)
+        ):
+            binding_changes.append((previous, seat))
+    return PlanHandoffBoard(
+        config=result,
+        plan=plan,
+        inherited=inherited,
+        pr_seats=pr_seats,
+        added=tuple(seat.seat_id for seat in pr_seats if seat.seat_id not in plan_by_id),
+        removed=tuple(
+            seat.seat_id for seat in plan.effective_seats if seat.seat_id not in pr_by_id
+        ),
+        binding_changes=tuple(binding_changes),
+    )
 
 
 def reconcile_plan_handoff_board(config: object, comments: object, issue_number: int) -> object:
-    """Apply a verified plan amendment before starting or resuming PR review."""
-    if reviewer_seat_binding(config) is None:
-        return config
-    from dataclasses import replace
-    from .agents.registry import agent_display_name
-    from .board_amendment import (
-        collect_reviewer_board_amendments, resolve_contract_lineage,
-    )
-    from .round_state import _extract_round_metadata_records
+    """Derive the PR board from the invocation and the approved plan's lineage."""
+    from .plan_verification import derive_plan_verification_context
 
-    records = _extract_round_metadata_records(comments, flow="plan")
-    if not records:
+    plan = derive_plan_verification_context(comments, issue_number=issue_number)
+    if plan is None:
         return config
-    binding = reviewer_seat_binding(config)
-    changed = validate_pr_seat_bindings(records, config)
-    if changed:
-        raise AgentLoopError(
-            "Issue-to-PR handoff changed plan reviewer models; rerun plan review "
-            "before accepting PR approvals."
-        )
-    amendments = collect_reviewer_board_amendments(
-        comments, flow="plan", issue_number=issue_number,
-    )
-    validate_pr_backend_outage_amendments(amendments, config)
-    # A PR invocation has no obligation to repeat the issue command's plan
-    # scheduling flags.  Derive the contract from the durable plan record.
-    configured = next(
-        (contract for record in records
-         if (contract := _persisted_plan_contract(record.metadata)) is not None),
-        None,
-    )
-    if configured is None:
-        validate_plan_handoff_seats(records, config)
-        return config
-    lineage = resolve_contract_lineage(
-        records, amendments, configured, accept_base_configured=True,
-        contract_from_metadata=_persisted_plan_contract,
-        drift_error=lambda persisted, detail: AgentLoopError(
-            f"Issue-to-PR plan board changed without a valid signed amendment: {detail}"
-        ),
-    )
-    effective = lineage.contracts[-1]
-    required = set(effective.required_reviewers)
-    configured_names = frozenset(agent_display_name(reviewer) for reviewer in config.reviewer)
-    if configured_names not in {frozenset(configured.required_reviewers), frozenset(required)}:
-        raise AgentLoopError("Issue-to-PR handoff changed the required reviewer seat board.")
-    result = replace(
-        config,
-        reviewer=tuple(
-            reviewer for reviewer in config.reviewer
-            if agent_display_name(reviewer) in required
-        ),
-        pr_seat_binding_override=binding,
-    )
-    validate_plan_handoff_seats(records, result)
-    return result
+    return resolve_plan_handoff_board(config, plan).config
 
 
 def validate_pr_backend_outage_amendments(amendments: object, config: object) -> None:
     """A named shared-backend outage must remove all its active seats."""
+    validate_backend_outage_amendments_for_binding(amendments, reviewer_seat_binding(config))
+
+
+def validate_backend_outage_amendments_for_binding(
+    amendments: object, binding: dict | None,
+) -> None:
+    """Check outage amendments against the binding of the board they amended."""
     from .board_amendment import (
         REVIEWER_BOARD_REMOVAL_REASON, REVIEWER_SEAT_REMOVAL_REASON,
         REVIEWER_MIXED_REMOVAL_REASON,
     )
-    binding = reviewer_seat_binding(config)
     if binding is None:
         if any(amendment.reason == REVIEWER_MIXED_REMOVAL_REASON for amendment in amendments):
             raise AgentLoopError("Mixed PR amendment requires a verified named seat binding.")
