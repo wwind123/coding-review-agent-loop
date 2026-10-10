@@ -501,6 +501,25 @@ def test_docs_describe_conflict_round_continuity_exception():
         assert "approve the exact final head before qualification or merge" in text
 
 
+def test_docs_describe_rejected_coder_recovery_continuity_exception():
+    # #1367: the rejected-coder recovery across a fresh grant is the third
+    # continuity exception, and its chain is authenticated end to end.
+    arch_text = " ".join(ARCHITECTURE.read_text(encoding="utf-8").split())
+    doc_text = " ".join(LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8").split())
+    assert "A rejected-coder recovery across a fresh grant is the third exception" in doc_text
+    assert "The predecessor cutoff is not relaxed" in doc_text
+    assert "exactly one attempt-2 recovery coder-dispatch record" in doc_text
+    assert "counts toward \"exactly one\" wherever it sits" in doc_text
+    assert "only the original attempt-1 dispatch of the original head is exempt" in doc_text
+    assert "must carry that board's seat binding" in doc_text
+    assert "on the current approved plan only" in doc_text
+    assert "A recovery across a signed plan rebind is therefore refused" in doc_text
+    assert "An older binary cannot re-authenticate such a chain and stops" in doc_text
+    assert "A rejected-coder recovery across a fresh grant (#1367) is a third shape" in arch_text
+    assert "the exact rejected-coder recovery chain still fails closed" in arch_text
+    assert "the PR stays draft and unmerged and no approval is synthesized" in doc_text
+
+
 def test_architecture_documents_the_planning_scheduler():
     """`scope-5` (#905, from #841): the canonical overview is updated."""
     import pathlib

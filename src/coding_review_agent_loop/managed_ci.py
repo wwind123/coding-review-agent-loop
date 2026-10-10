@@ -14,6 +14,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import Literal
 from urllib.parse import quote, urlparse
@@ -1941,8 +1942,20 @@ def find_actor_round_metadata_comment_ids(
     new_head: str,
     round_number: int,
     after_comment_id: int,
+    authorization_records: Collection[tuple[int, ManagedCiIssueAuthorization]] | None = None,
+    fresh_comment_id: int | None = None,
+    chain_context: "ChainAuthContext | None" = None,
+    expected_seat_binding: Mapping[str, object] | None = None,
 ) -> tuple[int, ...]:
-    """Return the exact blocking-review and coder records for one head transition."""
+    """Return the exact blocking-review and coder records for one head transition.
+
+    The optional keywords open the rejected-coder recovery shape (#1367): when
+    the handoff is a fresh grant whose immutable link names the original
+    authorization, the blocking review predating that grant is accepted only
+    through the exact authenticated chain checked by
+    ``_rejected_recovery_round_ids``.  The ``after_comment_id`` cutoff of the
+    ordinary shapes is never relaxed.
+    """
     comments, reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{pr_number}/comments?per_page=100"
     )
@@ -2004,9 +2017,31 @@ def find_actor_round_metadata_comment_ids(
         or len(coders) != 1
         or any(comment_id >= coders[0] for comment_id in reviewers)
     ):
-        raise AgentLoopError(
-            "Managed-CI head continuity requires correlated blocking-review and coder round metadata."
-        )
+        recovered = None
+        if (
+            authorization_records is not None
+            and fresh_comment_id is not None
+            and fresh_comment_id == after_comment_id
+            and chain_context is not None
+            and chain_context.actor_login == actor_login
+            and chain_context.actor_id == actor_id
+        ):
+            recovered = _correlate_rejected_recovery(
+                comments,
+                by_index,
+                records_by_id=dict(authorization_records),
+                context=chain_context,
+                fresh_comment_id=fresh_comment_id,
+                predecessor_head=predecessor_head,
+                new_head=new_head,
+                round_number=round_number,
+                expected_seat_binding=expected_seat_binding,
+            )
+        if recovered is None:
+            raise AgentLoopError(
+                "Managed-CI head continuity requires correlated blocking-review and coder round metadata."
+            )
+        return recovered
     return tuple(sorted(set((*reviewers, coders[0]))))
 
 
@@ -2038,11 +2073,40 @@ def _continuity_round_records(
             raise AgentLoopError("Managed-CI continuity round metadata is malformed.")
         if payload["flow"] != "pr":
             continue
+        # Payloads are arbitrary JSON from any commenter and are decoded before
+        # author filtering, so every raw field is type-checked before it is
+        # compared or hashed (#1367).
+        raw_phase = payload.get("phase")
+        phase = raw_phase if isinstance(raw_phase, str) else None
+        seat_binding = payload.get("seat_binding")
+        raw_dispatch_round = payload.get("dispatch_round")
         result[index] = {
             "role": payload["role"],
             "state": payload.get("state"),
             "subject": payload["subject"],
             "round_number": payload["round_number"],
+            "phase": phase,
+            # The raw dispatch round, kept even when the recovery record fails
+            # validation, so a malformed record of the same dispatch is still
+            # counted as a recovery candidate (#1367).
+            "dispatch_round": (
+                raw_dispatch_round
+                if isinstance(raw_dispatch_round, int)
+                and not isinstance(raw_dispatch_round, bool)
+                else None
+            ),
+            # Strictly a dict or None; any other stored value marks the record
+            # unusable as a seat-bound review (#1367).
+            "seat_binding": seat_binding if isinstance(seat_binding, dict) else None,
+            "seat_binding_valid": seat_binding is None or isinstance(seat_binding, dict),
+            # The decoded rejected-follow-up or coder-dispatch record, or None
+            # when the record is absent or fails per-phase validation (#1367).
+            "recovery": (
+                _decode_recovery_round_record(payload)
+                if payload["role"] == "summary"
+                and phase in _CONTINUITY_RECOVERY_PHASES
+                else None
+            ),
             # A conflict-resolution round is orchestrator-routed and skips
             # reviewers by construction (#829); the machine obligation on the
             # coder record is the durable evidence of that routing.
@@ -2105,6 +2169,76 @@ def _continuity_round_metadata_is_valid(
     comments: list[dict[str, object]],
     *,
     authorization: ManagedCiIssueAuthorization,
+    predecessor: ManagedCiIssueAuthorization | None = None,
+    records_by_id: Mapping[int, ManagedCiIssueAuthorization] | None = None,
+    comments_by_id: Mapping[int, Mapping[str, object]] | None = None,
+    chain_context: "ChainAuthContext | None" = None,
+    expected_seat_binding: Mapping[str, object] | None = None,
+) -> bool:
+    """Reauthenticate the exact round records referenced by a continuity grant.
+
+    Without a fresh predecessor this is the ordinary, merge-conflict and
+    CI-repair validation, unchanged.  With one, the rejected-coder recovery
+    shape (#1367) is re-authenticated in full when the ordinary shapes fail.
+    """
+    return _continuity_link_shape(
+        comments,
+        authorization=authorization,
+        predecessor=predecessor,
+        records_by_id=records_by_id,
+        comments_by_id=comments_by_id,
+        chain_context=chain_context,
+        expected_seat_binding=expected_seat_binding,
+    ) is not None
+
+
+def _continuity_link_shape(
+    comments: list[dict[str, object]],
+    *,
+    authorization: ManagedCiIssueAuthorization,
+    predecessor: ManagedCiIssueAuthorization | None = None,
+    records_by_id: Mapping[int, ManagedCiIssueAuthorization] | None = None,
+    comments_by_id: Mapping[int, Mapping[str, object]] | None = None,
+    chain_context: "ChainAuthContext | None" = None,
+    expected_seat_binding: Mapping[str, object] | None = None,
+) -> Literal["ordinary", "recovery"] | None:
+    """Classify a continuity link as ordinary, rejected-coder recovery, or invalid.
+
+    The two shapes are disjoint: the ordinary shapes bind only records newer
+    than the predecessor authorization, the recovery shape binds a review
+    older than the fresh predecessor grant.
+    """
+    if _ordinary_continuity_round_metadata_is_valid(comments, authorization=authorization):
+        return "ordinary"
+    if (
+        predecessor is None
+        or predecessor.kind != "fresh"
+        or records_by_id is None
+        or chain_context is None
+        or authorization.kind != "continuity"
+        or authorization.predecessor_comment_id is None
+        or records_by_id.get(authorization.predecessor_comment_id) != predecessor
+        or predecessor.head_sha != authorization.predecessor_head
+    ):
+        return None
+    if comments_by_id is None:
+        comments_by_id = _comments_by_id(comments)
+    if _recovery_continuity_is_valid(
+        comments,
+        authorization=authorization,
+        records_by_id=records_by_id,
+        comments_by_id=comments_by_id,
+        context=chain_context,
+        expected_seat_binding=expected_seat_binding,
+    ):
+        return "recovery"
+    return None
+
+
+def _ordinary_continuity_round_metadata_is_valid(
+    comments: list[dict[str, object]],
+    *,
+    authorization: ManagedCiIssueAuthorization,
 ) -> bool:
     """Reauthenticate the exact round records referenced by a continuity grant."""
     if authorization.kind != "continuity" or not authorization.round_comment_ids:
@@ -2164,6 +2298,687 @@ def _continuity_round_metadata_is_valid(
             in coder_metadata["ci_repair_transitions"]
         )
     return len(reviewers) + 1 == len(selected)
+
+
+# Summary-record phases of the rejected-coder recovery shape (#1367).  These
+# mirror round_state's CODER_FOLLOWUP_REJECTED_PHASE / CODER_DISPATCH_PHASE.
+_CONTINUITY_REJECTED_PHASE = "coder-followup-rejected"
+_CONTINUITY_DISPATCH_PHASE = "coder-dispatch"
+_CONTINUITY_RECOVERY_PHASES = frozenset(
+    {_CONTINUITY_REJECTED_PHASE, _CONTINUITY_DISPATCH_PHASE}
+)
+
+
+class PlanPolicy(Enum):
+    """Which approved plans an authorization chain may carry (#1367)."""
+
+    # Every record must name the current approved plan.
+    CURRENT_ONLY = "current-only"
+    # A verified-retired plan (#993) is also accepted.
+    ALLOW_RETIRED = "allow-retired"
+
+
+@dataclass(frozen=True)
+class ChainAuthContext:
+    """The authenticated scope every record on an authorization chain must match."""
+
+    config: AgentLoopConfig
+    actor_login: str
+    actor_id: int
+    repository: str
+    issue_number: int | None
+    pr_number: int
+    base_ref: str
+    approved_plan_hash: str | None
+    retired_plan_hashes: frozenset[str] = frozenset()
+    valid_label_event_ids: frozenset[int] | None = None
+    check_protection: str | None = None
+    handoff: AuthenticatedIssueCreatedHandoff | None = None
+    # The nonce of the authenticated PR-opening body, for surfaces without a
+    # handoff (plan binding).  A creation root on a recovery chain must carry it.
+    opening_override_nonce: str | None = None
+
+
+def chain_auth_context_for_handoff(
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+    valid_label_event_ids: Collection[int] | None,
+) -> ChainAuthContext:
+    """Build the strict chain context for an authenticated issue-created handoff."""
+    return ChainAuthContext(
+        config=config,
+        actor_login=handoff.trusted_actor_login,
+        actor_id=handoff.trusted_actor_id,
+        repository=handoff.repository,
+        issue_number=handoff.issue_number,
+        pr_number=handoff.pr_number,
+        base_ref=handoff.base_ref,
+        approved_plan_hash=handoff.approved_plan_hash,
+        retired_plan_hashes=frozenset(handoff.retired_plan_hashes),
+        valid_label_event_ids=(
+            frozenset(valid_label_event_ids) if valid_label_event_ids is not None else None
+        ),
+        check_protection=handoff.protection_mode,
+        handoff=handoff,
+    )
+
+
+def load_actor_authorization_records(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    actor_login: str,
+    actor_id: int,
+) -> tuple[tuple[int, ManagedCiIssueAuthorization], ...]:
+    """Return the actor's non-superseded authorization records by comment ID."""
+    return tuple(
+        _authorization_comment_records(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            actor_login=actor_login,
+            actor_id=actor_id,
+        )
+    )
+
+
+def load_actor_label_event_ids(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_number: int,
+    actor_login: str,
+    actor_id: int,
+) -> frozenset[int] | None:
+    """Return the actor-owned managed-label event IDs, or None when unreadable."""
+    events = _actor_owned_label_event_ids(
+        runner, config=config, pr_number=pr_number,
+        actor_login=actor_login, actor_id=actor_id,
+    )
+    return frozenset(events) if events is not None else None
+
+
+def rejected_recovery_correlation_inputs(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    handoff: AuthenticatedIssueCreatedHandoff,
+) -> dict[str, object]:
+    """Keyword inputs that let continuity correlation try the recovery shape (#1367).
+
+    Only a fresh-grant handoff can sit on the stranded head of a rejected
+    coder follow-up.  Any other handoff, or records that cannot be read,
+    yields no inputs, so correlation keeps its ordinary behaviour and fails
+    closed exactly as before.
+    """
+    if handoff.authorization_kind != "fresh" or handoff.authorization_comment_id is None:
+        return {}
+    try:
+        records = load_actor_authorization_records(
+            runner,
+            config=config,
+            pr_number=handoff.pr_number,
+            actor_login=handoff.trusted_actor_login,
+            actor_id=handoff.trusted_actor_id,
+        )
+    except AgentLoopError:
+        return {}
+    from .reviewer_seats import reviewer_seat_binding
+
+    return {
+        "authorization_records": records,
+        "fresh_comment_id": handoff.authorization_comment_id,
+        "chain_context": chain_auth_context_for_handoff(
+            config=config,
+            handoff=handoff,
+            valid_label_event_ids=load_actor_label_event_ids(
+                runner,
+                config=config,
+                pr_number=handoff.pr_number,
+                actor_login=handoff.trusted_actor_login,
+                actor_id=handoff.trusted_actor_id,
+            ),
+        ),
+        "expected_seat_binding": reviewer_seat_binding(config),
+    }
+
+
+def _comments_by_id(
+    comments: Iterable[Mapping[str, object]],
+) -> dict[int, Mapping[str, object]]:
+    return {
+        comment["id"]: comment
+        for comment in comments
+        if isinstance(comment.get("id"), int) and not isinstance(comment.get("id"), bool)
+    }
+
+
+def _chain_record_admissible(
+    comment: Mapping[str, object] | None,
+    record: ManagedCiIssueAuthorization,
+    context: ChainAuthContext,
+    *,
+    plan_policy: PlanPolicy,
+    require_provenance: bool,
+) -> bool:
+    """Shared per-record admission for every authorization-chain surface (#1367).
+
+    The actor and scope checks are the plan-binding walker's.  With a handoff
+    or ``require_provenance`` the record must also pass the resume audit's
+    predicate (actor, waiver, config-aware protection, label event).  Under
+    ``require_provenance`` a missing label history or protection fails closed
+    rather than skipping those checks.
+    """
+    if comment is None:
+        return False
+    user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+    login = user.get("login")
+    if (
+        not isinstance(comment.get("id"), int)
+        or not isinstance(login, str)
+        or login.casefold() != context.actor_login.casefold()
+        or user.get("id") != context.actor_id
+        or record.actor_login.casefold() != context.actor_login.casefold()
+        or record.actor_id != context.actor_id
+        or record.repository.casefold() != context.repository.casefold()
+        or record.pr_number != context.pr_number
+        or (context.issue_number is not None and record.issue_number != context.issue_number)
+        or record.base_ref != context.base_ref
+    ):
+        return False
+    if require_provenance:
+        if context.valid_label_event_ids is None or context.check_protection is None:
+            return False
+        if record.protection not in waivable_protection_states(context.config):
+            return False
+    if context.handoff is not None or require_provenance:
+        if not _authorization_record_valid_for_handoff(
+            record,
+            comment,
+            config=context.config,
+            handoff=context.handoff,
+            actor_login=context.actor_login,
+            actor_id=context.actor_id,
+            base_ref=context.base_ref,
+            pr_number=context.pr_number,
+            issue_number=context.issue_number,
+            valid_label_event_ids=(
+                set(context.valid_label_event_ids)
+                if context.valid_label_event_ids is not None else None
+            ),
+            check_protection=context.check_protection,
+            plan_scope_authenticated=True,
+        ):
+            return False
+    if (
+        require_provenance
+        and context.handoff is None
+        and record.kind == "creation"
+        and (
+            context.opening_override_nonce is None
+            or record.nonce != context.opening_override_nonce
+        )
+    ):
+        # Without a handoff the creation root is bound to the PR-opening body
+        # directly, as ``_authorization_matches`` does for resume.
+        return False
+    recorded = record.approved_plan_hash or None
+    if recorded == (context.approved_plan_hash or None):
+        return True
+    return (
+        plan_policy is PlanPolicy.ALLOW_RETIRED
+        and recorded is not None
+        and recorded in context.retired_plan_hashes
+    )
+
+
+def _pending_authorization_fields_admissible(
+    authorization: ManagedCiIssueAuthorization,
+    context: ChainAuthContext,
+    *,
+    predecessor: ManagedCiIssueAuthorization,
+) -> bool:
+    """Check every comment-independent field of an unpublished continuity record.
+
+    The record has no comment yet, so no comment identity or author is
+    fabricated; the posted comment's author is verified when it is written
+    and every later read authenticates it through ``_chain_record_admissible``.
+    """
+    handoff_protection = (
+        context.handoff.protection_mode if context.handoff is not None
+        else context.check_protection
+    )
+    return (
+        authorization.kind == "continuity"
+        and authorization.repository.casefold() == context.repository.casefold()
+        and (
+            context.issue_number is None
+            or authorization.issue_number == context.issue_number
+        )
+        and authorization.pr_number == context.pr_number
+        and authorization.base_ref == context.base_ref
+        and authorization.actor_login.casefold() == context.actor_login.casefold()
+        and authorization.actor_id == context.actor_id
+        and (authorization.approved_plan_hash or None) == (context.approved_plan_hash or None)
+        and authorization.protection == predecessor.protection
+        and authorization.waiver == _waiver_for_protection(authorization.protection)
+        and authorization.protection in waivable_protection_states(context.config)
+        and (handoff_protection is None or authorization.protection == handoff_protection)
+        and context.valid_label_event_ids is not None
+        and authorization.label_event_id in context.valid_label_event_ids
+    )
+
+
+def _recovery_context(
+    context: ChainAuthContext, fresh: ManagedCiIssueAuthorization
+) -> ChainAuthContext:
+    """Bind a recovery chain's protection to its fresh grant when none is given."""
+    if context.check_protection is None:
+        return replace(context, check_protection=fresh.protection)
+    return context
+
+
+def _authenticate_authorization_chain(
+    comment_id: int,
+    records_by_id: Mapping[int, ManagedCiIssueAuthorization],
+    comments_by_id: Mapping[int, Mapping[str, object]],
+    comments: list[dict[str, object]],
+    context: ChainAuthContext,
+    *,
+    plan_policy: PlanPolicy | None = None,
+    expected_seat_binding: Mapping[str, object] | None = None,
+) -> tuple[ManagedCiIssueAuthorization, ...] | None:
+    """Walk one terminal to its root and authenticate the whole chain.
+
+    Pass 1 follows each continuity link to a creation or fresh root,
+    re-authenticating every link's round metadata.  A rejected-coder recovery
+    link (#1367) continues through its fresh grant to the original
+    authorization instead of stopping there.  Pass 2 fixes one plan policy for
+    the whole chain: when the caller asks for ``CURRENT_ONLY`` or any link is
+    recovery-shaped, every record from the terminal to the root must pass
+    ``_chain_record_admissible`` on the current plan with full provenance.
+    Other chains keep each walker's own per-record checks unchanged.
+    """
+    current = records_by_id.get(comment_id)
+    if current is None:
+        return None
+    current_id = comment_id
+    chain: list[tuple[int, ManagedCiIssueAuthorization]] = []
+    seen: set[int] = set()
+    recovery_context: ChainAuthContext | None = None
+    while current.kind == "continuity":
+        if (
+            current_id in seen
+            or current.predecessor_comment_id is None
+            or current.predecessor_head is None
+        ):
+            return None
+        seen.add(current_id)
+        predecessor_id = current.predecessor_comment_id
+        predecessor = records_by_id.get(predecessor_id)
+        if predecessor is None or predecessor.head_sha != current.predecessor_head:
+            return None
+        shape = _continuity_link_shape(
+            comments,
+            authorization=current,
+            predecessor=predecessor,
+            records_by_id=records_by_id,
+            comments_by_id=comments_by_id,
+            chain_context=context,
+            expected_seat_binding=expected_seat_binding,
+        )
+        if shape is None:
+            return None
+        chain.append((current_id, current))
+        if shape == "recovery":
+            if recovery_context is None:
+                recovery_context = _recovery_context(context, predecessor)
+            if predecessor_id in seen or predecessor.predecessor_comment_id is None:
+                return None
+            seen.add(predecessor_id)
+            chain.append((predecessor_id, predecessor))
+            current_id = predecessor.predecessor_comment_id
+            next_record = records_by_id.get(current_id)
+            if next_record is None or next_record.head_sha != predecessor.predecessor_head:
+                return None
+            current = next_record
+            continue
+        current_id, current = predecessor_id, predecessor
+    if current.kind not in {"creation", "fresh"} or current_id in seen:
+        return None
+    chain.append((current_id, current))
+    if plan_policy is PlanPolicy.CURRENT_ONLY or recovery_context is not None:
+        strict_context = recovery_context or context
+        for record_id, record in chain:
+            if not _chain_record_admissible(
+                comments_by_id.get(record_id),
+                record,
+                strict_context,
+                plan_policy=PlanPolicy.CURRENT_ONLY,
+                require_provenance=True,
+            ):
+                return None
+    return tuple(record for _record_id, record in chain)
+
+
+def _authenticated_recovery_root(
+    records_by_id: Mapping[int, ManagedCiIssueAuthorization],
+    comments_by_id: Mapping[int, Mapping[str, object]],
+    comments: list[dict[str, object]],
+    context: ChainAuthContext,
+    *,
+    fresh_comment_id: int,
+    predecessor_head: str,
+    expected_seat_binding: Mapping[str, object] | None = None,
+) -> tuple[int, ManagedCiIssueAuthorization] | None:
+    """Resolve and authenticate the original authorization a fresh grant links to.
+
+    The fresh grant must sit at the stranded head and carry an immutable link
+    to an earlier, non-superseded authorization at a different head.  That
+    original authorization and its whole ancestry must authenticate on the
+    current approved plan with full provenance.
+    """
+    fresh = records_by_id.get(fresh_comment_id)
+    if fresh is None or fresh.kind != "fresh":
+        return None
+    context = _recovery_context(context, fresh)
+    if not _chain_record_admissible(
+        comments_by_id.get(fresh_comment_id),
+        fresh,
+        context,
+        plan_policy=PlanPolicy.CURRENT_ONLY,
+        require_provenance=True,
+    ):
+        return None
+    if (
+        fresh.head_sha != predecessor_head
+        or fresh.predecessor_head is None
+        or fresh.predecessor_comment_id is None
+        or fresh.predecessor_head == fresh.head_sha
+    ):
+        return None
+    root_id = fresh.predecessor_comment_id
+    root = records_by_id.get(root_id)
+    if (
+        root is None
+        or root_id >= fresh_comment_id
+        or root.head_sha != fresh.predecessor_head
+        or root.protection != fresh.protection
+        or root.waiver != fresh.waiver
+        or (root.approved_plan_hash or None) != (context.approved_plan_hash or None)
+    ):
+        return None
+    if _authenticate_authorization_chain(
+        root_id,
+        records_by_id,
+        comments_by_id,
+        comments,
+        context,
+        plan_policy=PlanPolicy.CURRENT_ONLY,
+        expected_seat_binding=expected_seat_binding,
+    ) is None:
+        return None
+    return root_id, root
+
+
+def _decode_recovery_round_record(payload: Mapping[str, object]) -> object | None:
+    """Decode a recovery summary record; None when it fails per-phase validation."""
+    from .round_state import decode_round_metadata_mapping, recovery_record_problems
+
+    try:
+        metadata = decode_round_metadata_mapping(payload)
+    except Exception:  # noqa: BLE001 - any decode failure leaves the record unusable
+        return None
+    if metadata.phase not in _CONTINUITY_RECOVERY_PHASES or recovery_record_problems(metadata):
+        return None
+    return metadata
+
+
+def _seat_binding_key(binding: Mapping[str, object] | None) -> str:
+    return json.dumps(binding, sort_keys=True, separators=(",", ":"))
+
+
+def _rejected_recovery_round_ids(
+    comments: list[dict[str, object]],
+    by_index: Mapping[int, Mapping[str, object]],
+    *,
+    actor_login: str,
+    actor_id: int,
+    root_comment_id: int,
+    root_head: str,
+    fresh_comment_id: int,
+    fresh_head: str,
+    predecessor_head: str,
+    new_head: str,
+    round_number: int,
+    expected_seat_binding: Mapping[str, object] | None,
+) -> tuple[int, ...] | None:
+    """Return the exact round records of one rejected-coder recovery transition.
+
+    The chain is: seat-bound blocking reviews of the original head for round
+    R (newer than the original authorization), one rejected attempt-1
+    follow-up from that head to the stranded head (older than the fresh
+    grant), one attempt-2 recovery dispatch on the stranded head (newer than
+    the fresh grant), and one round R+1 coder record at the new head.  Any
+    missing, extra, malformed, foreign or misordered link yields None.
+    """
+    if (
+        fresh_head != predecessor_head
+        or root_head == fresh_head
+        or new_head in {root_head, fresh_head}
+    ):
+        return None
+    reviewers: list[tuple[int, Mapping[str, object]]] = []
+    rejected: list[tuple[int, Mapping[str, object]]] = []
+    dispatches: list[tuple[int, Mapping[str, object]]] = []
+    original_dispatches: list[int] = []
+    coders: list[tuple[int, Mapping[str, object]]] = []
+    for index, comment in enumerate(comments):
+        metadata = by_index.get(index)
+        user = comment.get("user") if isinstance(comment.get("user"), dict) else {}
+        comment_id = comment.get("id")
+        if (
+            metadata is None
+            or user.get("login") != actor_login
+            or user.get("id") != actor_id
+            or not isinstance(comment_id, int)
+        ):
+            continue
+        role = metadata["role"]
+        phase = metadata.get("phase")
+        if role == "reviewer":
+            if (
+                metadata["state"] == "blocking"
+                and metadata["subject"] == root_head
+                and metadata["round_number"] == round_number
+                and comment_id > root_comment_id
+            ):
+                reviewers.append((comment_id, metadata))
+        elif role == "summary" and phase == _CONTINUITY_REJECTED_PHASE:
+            # Candidates are every record of this dispatch (raw dispatch round
+            # R) or this round, counted before any field or position check so
+            # an extra malformed or misplaced record fails closed.
+            if (
+                metadata["round_number"] == round_number
+                or metadata.get("dispatch_round") == round_number
+            ):
+                rejected.append((comment_id, metadata))
+        elif role == "summary" and phase == _CONTINUITY_DISPATCH_PHASE:
+            # Count every dispatch of round R (or for round R+1) wherever it
+            # sits and whatever its fields, so the checks below reject a
+            # misordered, duplicate or malformed recovery dispatch instead of
+            # a filter hiding it.  Only the valid original attempt-1 dispatch
+            # of the root head is not a candidate; the ordering check still
+            # requires it to precede the rejection.
+            if (
+                metadata["round_number"] == round_number + 1
+                or metadata.get("dispatch_round") == round_number
+            ):
+                record = metadata.get("recovery")
+                if (
+                    record is not None
+                    and getattr(record, "dispatch_attempt", None) == 1
+                    and getattr(record, "recovery_dispatch", None) is False
+                    and getattr(record, "dispatch_round", None) == round_number
+                    and getattr(record, "round_number", None) == round_number + 1
+                    and getattr(record, "dispatch_head", None) == root_head
+                ):
+                    original_dispatches.append(comment_id)
+                else:
+                    dispatches.append((comment_id, metadata))
+        elif role == "coder":
+            if metadata["round_number"] == round_number + 1:
+                coders.append((comment_id, metadata))
+    if not reviewers or len(rejected) != 1 or len(dispatches) != 1 or len(coders) != 1:
+        return None
+    rejected_id, rejected_metadata = rejected[0]
+    dispatch_id, dispatch_metadata = dispatches[0]
+    coder_id, coder_metadata = coders[0]
+    rejected_record = rejected_metadata.get("recovery")
+    dispatch_record = dispatch_metadata.get("recovery")
+    if rejected_record is None or dispatch_record is None:
+        return None
+    if not (
+        getattr(rejected_record, "dispatch_round", None) == round_number
+        and getattr(rejected_record, "round_number", None) == round_number
+        and getattr(rejected_record, "dispatch_head", None) == root_head
+        and getattr(rejected_record, "rejected_coder_followup_from_head", None) == root_head
+        and getattr(rejected_record, "subject", None) == fresh_head
+        and getattr(rejected_record, "dispatch_attempt", None) == 1
+        and getattr(rejected_record, "recovery_dispatch", None) is False
+    ):
+        return None
+    if not (
+        getattr(dispatch_record, "dispatch_round", None) == round_number
+        and getattr(dispatch_record, "round_number", None) == round_number + 1
+        and getattr(dispatch_record, "dispatch_head", None) == fresh_head
+        and getattr(dispatch_record, "subject", None) == fresh_head
+        and getattr(dispatch_record, "dispatch_attempt", None) == 2
+        and getattr(dispatch_record, "recovery_dispatch", None) is True
+    ):
+        return None
+    if coder_metadata["subject"] != new_head:
+        return None
+    reviewer_ids = [comment_id for comment_id, _metadata in reviewers]
+    if not (
+        max(reviewer_ids) < rejected_id < fresh_comment_id < dispatch_id < coder_id
+    ) or any(comment_id > rejected_id for comment_id in original_dispatches):
+        return None
+    if any(not metadata.get("seat_binding_valid", False) for _id, metadata in reviewers):
+        return None
+    bindings = {_seat_binding_key(metadata.get("seat_binding")) for _id, metadata in reviewers}
+    if expected_seat_binding is not None:
+        if bindings != {_seat_binding_key(expected_seat_binding)}:
+            return None
+    elif len(bindings) != 1:
+        return None
+    return tuple(sorted({*reviewer_ids, rejected_id, dispatch_id, coder_id}))
+
+
+def _correlate_rejected_recovery(
+    comments: list[dict[str, object]],
+    by_index: Mapping[int, Mapping[str, object]],
+    *,
+    records_by_id: Mapping[int, ManagedCiIssueAuthorization],
+    context: ChainAuthContext,
+    fresh_comment_id: int,
+    predecessor_head: str,
+    new_head: str,
+    round_number: int,
+    expected_seat_binding: Mapping[str, object] | None,
+) -> tuple[int, ...] | None:
+    """Correlate a recovery transition against its authenticated original authorization."""
+    comments_by_id = _comments_by_id(comments)
+    root = _authenticated_recovery_root(
+        records_by_id,
+        comments_by_id,
+        comments,
+        context,
+        fresh_comment_id=fresh_comment_id,
+        predecessor_head=predecessor_head,
+        expected_seat_binding=expected_seat_binding,
+    )
+    if root is None:
+        return None
+    root_id, root_record = root
+    fresh = records_by_id[fresh_comment_id]
+    return _rejected_recovery_round_ids(
+        comments,
+        by_index,
+        actor_login=context.actor_login,
+        actor_id=context.actor_id,
+        root_comment_id=root_id,
+        root_head=root_record.head_sha,
+        fresh_comment_id=fresh_comment_id,
+        fresh_head=fresh.head_sha,
+        predecessor_head=predecessor_head,
+        new_head=new_head,
+        round_number=round_number,
+        expected_seat_binding=expected_seat_binding,
+    )
+
+
+def _recovery_continuity_is_valid(
+    comments: list[dict[str, object]],
+    *,
+    authorization: ManagedCiIssueAuthorization,
+    records_by_id: Mapping[int, ManagedCiIssueAuthorization],
+    comments_by_id: Mapping[int, Mapping[str, object]],
+    context: ChainAuthContext,
+    expected_seat_binding: Mapping[str, object] | None,
+) -> bool:
+    """Re-authenticate a published or pending recovery continuity record."""
+    fresh_comment_id = authorization.predecessor_comment_id
+    if (
+        fresh_comment_id is None
+        or authorization.predecessor_head is None
+        or authorization.actor_login.casefold() != context.actor_login.casefold()
+        or authorization.actor_id != context.actor_id
+    ):
+        return False
+    try:
+        by_index = _continuity_round_records(comments)
+    except AgentLoopError:
+        return False
+    wanted = set(authorization.round_comment_ids)
+    if not wanted or len(wanted) != len(authorization.round_comment_ids):
+        return False
+    bound = [
+        (comment.get("id"), by_index.get(index))
+        for index, comment in enumerate(comments)
+        if comment.get("id") in wanted
+    ]
+    if any(metadata is None for _cid, metadata in bound):
+        return False
+    if any(
+        metadata["role"] == "reviewer" and metadata["subject"] == authorization.predecessor_head
+        for _cid, metadata in bound
+    ):
+        return False
+    coder_rounds = {
+        metadata["round_number"]
+        for _cid, metadata in bound
+        if metadata["role"] == "coder" and metadata["subject"] == authorization.head_sha
+    }
+    if len(coder_rounds) != 1:
+        return False
+    round_number = next(iter(coder_rounds)) - 1
+    if round_number < 1:
+        return False
+    expected = _correlate_rejected_recovery(
+        comments,
+        by_index,
+        records_by_id=records_by_id,
+        context=context,
+        fresh_comment_id=fresh_comment_id,
+        predecessor_head=authorization.predecessor_head,
+        new_head=authorization.head_sha,
+        round_number=round_number,
+        expected_seat_binding=expected_seat_binding,
+    )
+    return expected is not None and expected == tuple(sorted(wanted))
 
 
 @_surfaces_list_failures
@@ -2541,6 +3356,46 @@ def publish_issue_created_continuity_authorization(
             "Managed-CI head continuity found a forked predecessor authorization; refusing to proceed."
         )
     normalized_round_comment_ids = tuple(sorted(set(round_comment_ids)))
+    # A fresh predecessor may be the stranded head of a rejected coder
+    # follow-up (#1367).  Its recovery shape is authenticated through the
+    # original authorization with the same strict context every later reader
+    # uses; ordinary shapes never consult it.
+    records_by_id = dict(records)
+    recovery_context: ChainAuthContext | None = None
+    recovery_seat_binding: Mapping[str, object] | None = None
+    if predecessor.kind == "fresh":
+        from .reviewer_seats import reviewer_seat_binding
+
+        recovery_context = chain_auth_context_for_handoff(
+            config=config,
+            handoff=handoff,
+            valid_label_event_ids=load_actor_label_event_ids(
+                runner,
+                config=config,
+                pr_number=handoff.pr_number,
+                actor_login=handoff.trusted_actor_login,
+                actor_id=handoff.trusted_actor_id,
+            ),
+        )
+        recovery_seat_binding = reviewer_seat_binding(config)
+
+    def round_metadata_valid(
+        round_comments: list[dict[str, object]],
+        authorization: ManagedCiIssueAuthorization,
+    ) -> bool:
+        shape = _continuity_link_shape(
+            round_comments,
+            authorization=authorization,
+            predecessor=predecessor,
+            records_by_id=records_by_id,
+            chain_context=recovery_context,
+            expected_seat_binding=recovery_seat_binding,
+        )
+        if shape == "recovery":
+            return recovery_context is not None and _pending_authorization_fields_admissible(
+                authorization, recovery_context, predecessor=predecessor
+            )
+        return shape is not None
 
     def revalidate_before_publication(authorization: ManagedCiIssueAuthorization) -> None:
         """Reject a live tuple, label, round, or authorization race before writing."""
@@ -2565,8 +3420,8 @@ def publish_issue_created_continuity_authorization(
         current_round_comments, list_reason = _api_list_detailed(
             runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
         )
-        if current_round_comments is None or not _continuity_round_metadata_is_valid(
-            current_round_comments, authorization=authorization
+        if current_round_comments is None or not round_metadata_valid(
+            current_round_comments, authorization
         ):
             raise AgentLoopError(
                 _with_reason(
@@ -2650,9 +3505,7 @@ def publish_issue_created_continuity_authorization(
     round_comments, list_reason = _api_list_detailed(
         runner, config, f"repos/{config.repo}/issues/{handoff.pr_number}/comments?per_page=100"
     )
-    if round_comments is None or not _continuity_round_metadata_is_valid(
-        round_comments, authorization=authorization
-    ):
+    if round_comments is None or not round_metadata_valid(round_comments, authorization):
         raise AgentLoopError(
             _with_reason(
                 "Managed-CI head continuity requires authenticated, correlated round metadata.",
@@ -4997,27 +5850,83 @@ def verify_managed_pr_plan_binding(
                 children_by_predecessor.setdefault(predecessor, set()).add(authorization.head_sha)
     if any(len(heads) > 1 for heads in children_by_predecessor.values()):
         raise fail("the authorization chain forks")
+    comments_by_id = _comments_by_id(comments)
+    # Recovery-shaped chains (#1367) are admitted only with the same actor,
+    # waiver, config-aware protection and label-event provenance publication
+    # applies.  Load the actor-owned label history only when a continuity
+    # record extends a fresh grant, the one place that shape can occur; a
+    # missing history leaves it None, so such a chain fails closed.
+    actor_logins = {
+        str((comments_by_id.get(comment_id) or {}).get("user", {}).get("login"))
+        for comment_id, _authorization in records
+    }
+    actor_ids = {authorization.actor_id for _comment_id, authorization in records}
+    bases = {authorization.base_ref for _comment_id, authorization in records}
+    valid_label_event_ids: frozenset[int] | None = None
+    opening_override_nonce: str | None = None
+    if (
+        len(actor_logins) == 1
+        and len(actor_ids) == 1
+        and any(
+            authorization.kind == "continuity"
+            and (predecessor := by_comment_id.get(authorization.predecessor_comment_id or 0))
+            is not None
+            and predecessor.kind == "fresh"
+            for _comment_id, authorization in records
+        )
+    ):
+        valid_label_event_ids = load_actor_label_event_ids(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            actor_login=next(iter(actor_logins)),
+            actor_id=next(iter(actor_ids)),
+        )
+        try:
+            live_pr = _api_json(
+                runner, config, f"repos/{config.repo}/pulls/{pr_number}", quiet=True
+            )
+            opening_override_nonce = _opening_override_nonce(
+                live_pr.get("body") if isinstance(live_pr.get("body"), str) else None
+            )
+        except AgentLoopError:
+            # Unreadable: a recovery-shaped chain's creation root fails closed.
+            opening_override_nonce = None
+    chain_context = ChainAuthContext(
+        config=config,
+        actor_login=(
+            next(iter(actor_logins)) if len(actor_logins) == 1 else trusted_actor
+        ),
+        actor_id=next(iter(actor_ids)) if len(actor_ids) == 1 else -1,
+        repository=config.repo,
+        issue_number=issue_number,
+        pr_number=pr_number,
+        base_ref=config.base or (next(iter(bases)) if len(bases) == 1 else ""),
+        approved_plan_hash=approved_plan_hash,
+        retired_plan_hashes=retired,
+        valid_label_event_ids=valid_label_event_ids,
+        opening_override_nonce=opening_override_nonce,
+    )
+    from .reviewer_seats import reviewer_seat_binding
+
+    # Recovery links bind seat-bound reviews; re-check them against this
+    # run's configured board exactly as publication did.
+    expected_seat_binding = reviewer_seat_binding(config)
     bound_terminals: set[ManagedCiIssueAuthorization] = set()
-    for _comment_id, terminal in records:
+    for terminal_comment_id, terminal in records:
         if terminal.head_sha != live_head:
             continue
-        chain: list[ManagedCiIssueAuthorization] = []
-        current: ManagedCiIssueAuthorization | None = terminal
-        while current is not None and current.kind == "continuity":
-            if current in chain or not _continuity_round_metadata_is_valid(
-                comments, authorization=current
-            ):
-                current = None
-                break
-            chain.append(current)
-            predecessor = by_comment_id.get(current.predecessor_comment_id or 0)
-            if predecessor is None or predecessor.head_sha != current.predecessor_head:
-                current = None
-                break
-            current = predecessor
-        if current is None or current.kind not in {"creation", "fresh"}:
+        authenticated = _authenticate_authorization_chain(
+            terminal_comment_id,
+            by_comment_id,
+            comments_by_id,
+            comments,
+            chain_context,
+            expected_seat_binding=expected_seat_binding,
+        )
+        if authenticated is None:
             continue
-        chain.append(current)
+        chain = list(authenticated)
         if all(
             record.approved_plan_hash != approved_plan_hash
             and record.approved_plan_hash in retired
@@ -5421,25 +6330,43 @@ def _find_resume_audit(
         if any(len(heads) > 1 for heads in children_by_predecessor.values()):
             return None
         terminal = by_head.get(live_head, [])
+        chain_context = ChainAuthContext(
+            config=config,
+            actor_login=actor_login,
+            actor_id=actor_id,
+            repository=config.repo,
+            issue_number=issue_number,
+            pr_number=pr_number,
+            base_ref=base_ref,
+            approved_plan_hash=(
+                expected_handoff.approved_plan_hash if expected_handoff is not None else None
+            ),
+            retired_plan_hashes=(
+                frozenset(expected_handoff.retired_plan_hashes)
+                if expected_handoff is not None else frozenset()
+            ),
+            valid_label_event_ids=(
+                frozenset(valid_label_event_ids)
+                if valid_label_event_ids is not None else None
+            ),
+            check_protection=check_protection,
+            handoff=expected_handoff,
+        )
+        comments_by_id = _comments_by_id(comments)
+        from .reviewer_seats import reviewer_seat_binding
+
+        expected_seat_binding = reviewer_seat_binding(config)
         valid_terminals: list[tuple[int, ManagedCiIssueAuthorization]] = []
         for terminal_comment_id, terminal_record in terminal:
-            current = terminal_record
-            seen: set[ManagedCiIssueAuthorization] = set()
-            while current.kind == "continuity":
-                if current in seen or current.predecessor_comment_id is None or current.predecessor_head is None:
-                    break
-                if not _continuity_round_metadata_is_valid(
-                    comments, authorization=current
-                ):
-                    break
-                seen.add(current)
-                predecessor = by_comment_id.get(current.predecessor_comment_id)
-                if predecessor is None or predecessor.head_sha != current.predecessor_head:
-                    break
-                current = predecessor
-            else:
-                if current.kind in {"creation", "fresh"}:
-                    valid_terminals.append((terminal_comment_id, terminal_record))
+            if _authenticate_authorization_chain(
+                terminal_comment_id,
+                by_comment_id,
+                comments_by_id,
+                comments,
+                chain_context,
+                expected_seat_binding=expected_seat_binding,
+            ) is not None:
+                valid_terminals.append((terminal_comment_id, terminal_record))
         if expected_handoff is not None and expected_handoff.active_label_event_id is not None:
             # Only the terminal record must point at the active event.  Older
             # roots and continuity ancestors may legitimately reference prior

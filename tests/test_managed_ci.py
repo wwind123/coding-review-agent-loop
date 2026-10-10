@@ -14017,3 +14017,966 @@ def test_prepare_v2_merge_post_write_verification_still_refuses_a_later_head_cha
             hub, config=_lcfg(tmp_path), pr_number=7, expected_head_sha="a" * 40,
             contract=managed_ci.ManagedCiContract(protocol_version=2),
         )
+
+
+# --- Rejected-coder recovery continuity across a fresh grant (#1367) ---------
+
+from coding_review_agent_loop.round_state import (  # noqa: E402
+    RecoveryRoundBudget as _Budget1367,
+)
+
+_H0_1367, _H1_1367, _H2_1367 = "abc123", "stranded-head", "recovered-head"
+_ORIGIN_1367 = "origin-head"
+_PLAN_1367 = "plan-1367"
+_CORRELATED_1367 = "correlated blocking-review and coder round metadata"
+_SEATS_1367 = {"version": 1, "seats": [{"id": "sol", "backend": "codex"}]}
+
+
+def _auth_record_1367(**overrides):
+    fields = dict(
+        kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
+        base_ref="main", head_sha=_H0_1367, actor_login="agent-loop", actor_id=1,
+        protection="voluntary", waiver="allow-unprotected-managed-ci",
+        nonce="nonce-643", label_event_id=101, approved_plan_hash=_PLAN_1367,
+    )
+    fields.update(overrides)
+    return ManagedCiIssueAuthorization(**fields)
+
+
+def _fresh_record_1367(**overrides):
+    fields = dict(
+        kind="fresh", head_sha=_H1_1367, nonce="fresh-nonce",
+        predecessor_head=_H0_1367, predecessor_comment_id=41,
+    )
+    fields.update(overrides)
+    return _auth_record_1367(**fields)
+
+
+def _auth_comment_1367(comment_id, record, *, login="agent-loop", user_id=1):
+    return {
+        "id": comment_id,
+        "user": {"login": login, "id": user_id},
+        "body": str(format_issue_created_authorization_comment(record)),
+    }
+
+
+def _meta_comment_1367(comment_id, metadata, *, login="agent-loop", user_id=1):
+    return {
+        "id": comment_id,
+        "user": {"login": login, "id": user_id},
+        "body": _attach_round_metadata("round record", metadata),
+    }
+
+
+def _review_meta_1367(*, subject=_H0_1367, round_number=1, seat_binding=None, state="blocking"):
+    return PostedRoundMetadata(
+        flow="pr", role="reviewer", agent="sol", round_number=round_number,
+        subject=subject, state=state, seat_binding=seat_binding,
+    )
+
+
+def _rejected_meta_1367(round_number=1, **overrides):
+    fields = dict(
+        flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
+        subject=_H1_1367, state="blocking", phase="coder-followup-rejected",
+        dispatch_round=round_number, dispatch_head=_H0_1367, dispatch_attempt=1,
+        recovery_dispatch=False, rejected_coder_followup_reason="evidence rejected",
+        rejected_coder_followup_from_head=_H0_1367,
+        recovery_round_budget=_Budget1367(5, False, False),
+    )
+    fields.update(overrides)
+    return PostedRoundMetadata(**fields)
+
+
+def _dispatch_meta_1367(round_number=1, *, attempt=2, head=_H1_1367, **overrides):
+    fields = dict(
+        flow="pr", role="summary", agent="Orchestrator", round_number=round_number + 1,
+        subject=head, state="blocking", phase="coder-dispatch",
+        dispatch_round=round_number, dispatch_head=head, dispatch_attempt=attempt,
+        recovery_dispatch=attempt > 1, recovery_round_budget=_Budget1367(5, False, False),
+    )
+    fields.update(overrides)
+    return PostedRoundMetadata(**fields)
+
+
+def _coder_meta_1367(round_number=2, subject=_H2_1367):
+    return PostedRoundMetadata(
+        flow="pr", role="coder", agent="claude", round_number=round_number, subject=subject,
+    )
+
+
+def _recovery_chain_1367(*, continuity_root=False, seat_binding=None, root_plan=_PLAN_1367):
+    """Comments for A0 -> review -> rejected -> fresh F -> recovery dispatch -> coder."""
+    chain: dict[str, dict] = {}
+    round_number = 1
+    if continuity_root:
+        round_number = 2
+        chain["origin"] = _auth_comment_1367(
+            30, _auth_record_1367(head_sha=_ORIGIN_1367, approved_plan_hash=root_plan)
+        )
+        chain["origin-review"] = _meta_comment_1367(
+            31, _review_meta_1367(subject=_ORIGIN_1367, seat_binding=seat_binding)
+        )
+        chain["origin-coder"] = _meta_comment_1367(32, _coder_meta_1367(2, _H0_1367))
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(
+            kind="continuity", nonce="root-continuity", predecessor_head=_ORIGIN_1367,
+            predecessor_comment_id=30, round_comment_ids=(31, 32),
+        ))
+    else:
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(approved_plan_hash=root_plan))
+    chain["review"] = _meta_comment_1367(
+        50, _review_meta_1367(round_number=round_number, seat_binding=seat_binding)
+    )
+    chain["first-dispatch"] = _meta_comment_1367(
+        51, _dispatch_meta_1367(round_number, attempt=1, head=_H0_1367)
+    )
+    chain["rejected"] = _meta_comment_1367(52, _rejected_meta_1367(round_number))
+    chain["fresh"] = _auth_comment_1367(60, _fresh_record_1367())
+    chain["dispatch"] = _meta_comment_1367(61, _dispatch_meta_1367(round_number))
+    chain["coder"] = _meta_comment_1367(62, _coder_meta_1367(round_number + 1))
+    return chain, round_number
+
+
+_RECOVERY_IDS_1367 = (50, 52, 61, 62)
+
+
+def _fresh_handoff_1367(**overrides):
+    handoff = replace(
+        _authorization_handoff(head=_H1_1367),
+        override_nonce="fresh-nonce",
+        opening_override_nonce="nonce-643",
+        active_label_event_id=101,
+        authorization_kind="fresh",
+        authorization_comment_id=60,
+        approved_plan_hash=_PLAN_1367,
+    )
+    return replace(handoff, **overrides)
+
+
+def _config_1367(tmp_path, **overrides):
+    values = dict(
+        managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True,
+    )
+    values.update(overrides)
+    return make_config(tmp_path, **values)
+
+
+class _NoEventsRunner1367(AuthorizationCommentRunner):
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        endpoint = next(
+            (part for part in args if isinstance(part, str) and part.startswith("repos/")), ""
+        )
+        if endpoint.startswith("repos/OWNER/REPO/issues/7/events?"):
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, "", "events unavailable", 1)
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def _runner_1367(chain, *, runner_class=AuthorizationCommentRunner):
+    comments = sorted(chain.values(), key=lambda comment: comment["id"])
+    runner = runner_class(issue_events=[label_event()], intent_comments=comments)
+    runner.rest_pr["head"]["sha"] = _H2_1367
+    return runner
+
+
+def _correlate_1367(runner, config, handoff, *, round_number=1):
+    return managed_ci.find_actor_round_metadata_comment_ids(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        predecessor_head=_H1_1367, new_head=_H2_1367, round_number=round_number,
+        after_comment_id=handoff.authorization_comment_id,
+        **managed_ci.rejected_recovery_correlation_inputs(
+            runner, config=config, handoff=handoff
+        ),
+    )
+
+
+def _authorization_posts_1367(runner):
+    return sum(
+        "AGENT_MANAGED_CI_ISSUE_AUTHORIZATION_V1" in " ".join(command) and "POST" in command
+        for command, _cwd in runner.commands
+    )
+
+
+def _resume_audit_1367(runner, config, handoff, *, live_head=_H2_1367):
+    return _find_resume_audit(
+        runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+        base_ref="main", issue_number=643, live_head=live_head,
+        expected_handoff=handoff, expected_protection=handoff.protection_mode,
+        require_actor_owned_label_event=True,
+    )
+
+
+def _plan_binding_1367(runner, config, *, retired=()):
+    managed_ci.verify_managed_pr_plan_binding(
+        runner, config=config, pr_number=7, issue_number=643, live_head=_H2_1367,
+        approved_plan_hash=_PLAN_1367, retired_plan_hashes=retired,
+    )
+
+
+def _published_chain_1367(chain, *, round_ids=_RECOVERY_IDS_1367):
+    """Hand-build a published recovery continuity record over ``chain``."""
+    chain = dict(chain)
+    chain["continuity"] = _auth_comment_1367(70, _auth_record_1367(
+        kind="continuity", head_sha=_H2_1367, nonce="continuity-nonce",
+        predecessor_head=_H1_1367, predecessor_comment_id=60, round_comment_ids=round_ids,
+    ))
+    return chain
+
+
+def _continuity_handoff_1367(**overrides):
+    return _fresh_handoff_1367(
+        head_sha=_H2_1367, authorization_kind="continuity", authorization_comment_id=70,
+        override_nonce="continuity-nonce", **overrides,
+    )
+
+
+@pytest.mark.parametrize("continuity_root", [False, True])
+def test_m1367_recovery_chain_correlates_publishes_and_reauthenticates(
+    tmp_path, continuity_root,
+):
+    """Rows recovery-chain-accepted, publish-retry-idempotent, recovery-resume-reauth."""
+    chain, round_number = _recovery_chain_1367(continuity_root=continuity_root)
+    runner = _runner_1367(chain)
+    config = _config_1367(tmp_path)
+    handoff = _fresh_handoff_1367()
+
+    # The ordinary cutoff alone still refuses: the review predates the grant.
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+            predecessor_head=_H1_1367, new_head=_H2_1367, round_number=round_number,
+            after_comment_id=60,
+        )
+    ids = _correlate_1367(runner, config, handoff, round_number=round_number)
+    assert ids == _RECOVERY_IDS_1367
+
+    published = publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+        new_head=_H2_1367, round_comment_ids=ids,
+    )
+    retried = publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+        new_head=_H2_1367, round_comment_ids=ids,
+    )
+    assert _authorization_posts_1367(runner) == 1
+    assert retried.authorization_comment_id == published.authorization_comment_id
+    records = dict(_authorization_records(runner))
+    record = records[published.authorization_comment_id]
+    assert record.kind == "continuity"
+    assert (record.predecessor_head, record.head_sha) == (_H1_1367, _H2_1367)
+    assert record.predecessor_comment_id == 60
+    assert record.round_comment_ids == _RECOVERY_IDS_1367
+    assert published.authorization_kind == "continuity"
+
+    audit = _resume_audit_1367(runner, config, published)
+    assert audit is not None and audit[0] == published.authorization_comment_id
+    _plan_binding_1367(runner, config)
+
+    # Deleting any bound round record, the fresh grant, or the original
+    # authorization (or its ancestry) after publication rejects the chain.
+    ancestry_ids = (30, 31, 32) if continuity_root else ()
+    for bound_id in (*_RECOVERY_IDS_1367, 60, 41, *ancestry_ids):
+        tampered = _runner_1367(
+            {
+                name: comment for name, comment in
+                {
+                    **chain,
+                    "published": next(
+                        comment for comment in runner.intent_comments
+                        if comment["id"] == published.authorization_comment_id
+                    ),
+                }.items()
+                if comment["id"] != bound_id
+            }
+        )
+        assert _resume_audit_1367(tampered, config, published) is None
+        with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
+            _plan_binding_1367(tampered, config)
+
+
+def _mutate_1367(chain, case):
+    """Apply one negative recovery case to ``chain``; returns the handoff overrides."""
+    handoff = {}
+    meta = _meta_comment_1367
+    if case == "review-absent":
+        del chain["review"]
+    elif case == "review-foreign":
+        chain["review"] = meta(50, _review_meta_1367(), login="mallory", user_id=9)
+    elif case == "review-older-than-root":
+        chain["review"] = meta(40, _review_meta_1367())
+    elif case == "review-wrong-round":
+        chain["review"] = meta(50, _review_meta_1367(round_number=2))
+    elif case == "review-wrong-head":
+        chain["review"] = meta(50, _review_meta_1367(subject="other-head"))
+    elif case == "review-approved":
+        chain["review"] = meta(50, _review_meta_1367(state="approved"))
+    elif case == "reviewers-disagree":
+        chain["second-review"] = meta(
+            49, _review_meta_1367(seat_binding={"version": 1, "seats": []})
+        )
+    elif case == "rejected-wrong-round":
+        chain["rejected"] = meta(52, _rejected_meta_1367(round_number=2))
+    elif case == "rejected-wrong-dispatch-head":
+        chain["rejected"] = meta(52, _rejected_meta_1367(
+            dispatch_head="other-head", rejected_coder_followup_from_head="other-head",
+        ))
+    elif case == "rejected-from-head-mismatch":
+        chain["rejected"] = meta(52, _rejected_meta_1367(
+            rejected_coder_followup_from_head="other-head",
+        ))
+    elif case == "rejected-wrong-observed-head":
+        chain["rejected"] = meta(52, _rejected_meta_1367(subject="other-head"))
+    elif case == "rejected-missing-reason":
+        chain["rejected"] = meta(52, _rejected_meta_1367(rejected_coder_followup_reason=None))
+    elif case == "rejected-wrong-attempt":
+        chain["rejected"] = meta(52, _rejected_meta_1367(
+            dispatch_attempt=2, recovery_dispatch=True,
+        ))
+    elif case == "rejected-invalid-budget":
+        chain["rejected"] = meta(52, _rejected_meta_1367(
+            recovery_round_budget=_Budget1367.invalid(),
+        ))
+    elif case == "rejected-after-fresh":
+        chain["rejected"] = meta(65, _rejected_meta_1367())
+    elif case == "rejected-absent":
+        del chain["rejected"]
+    elif case == "dispatch-missing":
+        del chain["dispatch"]
+    elif case == "dispatch-wrong-attempt":
+        chain["dispatch"] = meta(61, _dispatch_meta_1367(attempt=1))
+    elif case == "dispatch-wrong-recovery-flag":
+        chain["dispatch"] = meta(61, _dispatch_meta_1367(recovery_dispatch=False))
+    elif case == "dispatch-wrong-head":
+        chain["dispatch"] = meta(61, _dispatch_meta_1367(head="other-head"))
+    elif case == "dispatch-wrong-round":
+        chain["dispatch"] = meta(61, _dispatch_meta_1367(dispatch_round=2))
+    elif case == "dispatch-wrong-round-number":
+        chain["dispatch"] = meta(61, _dispatch_meta_1367(dispatch_round=2, round_number=3))
+    elif case == "dispatch-invalid-budget":
+        chain["dispatch"] = meta(61, _dispatch_meta_1367(
+            recovery_round_budget=_Budget1367.invalid(),
+        ))
+    elif case == "dispatch-precedes-fresh":
+        chain["dispatch"] = meta(59, _dispatch_meta_1367())
+    elif case == "extra-dispatch-before-fresh":
+        # A second, otherwise valid attempt-2 dispatch before the grant must
+        # be counted, not filtered out by position.
+        chain["early-dispatch"] = meta(59, _dispatch_meta_1367())
+    elif case == "extra-dispatch-before-root":
+        chain["early-dispatch"] = meta(40, _dispatch_meta_1367())
+    elif case == "extra-rejected-next-round-number":
+        # Same dispatch (dispatch_round R) but round_number R+1: still counted.
+        chain["extra-rejected"] = meta(53, _rejected_meta_1367(round_number=2, dispatch_round=1))
+    elif case == "extra-rejected-malformed":
+        chain["extra-rejected"] = meta(53, _rejected_meta_1367(
+            recovery_round_budget=_Budget1367.invalid(),
+        ))
+    elif case == "extra-dispatch-other-round-number":
+        chain["extra-dispatch"] = meta(64, _dispatch_meta_1367(2, dispatch_round=1))
+    elif case == "extra-dispatch-malformed":
+        chain["extra-dispatch"] = meta(64, _dispatch_meta_1367(
+            recovery_round_budget=_Budget1367.invalid(),
+        ))
+    elif case == "original-dispatch-after-rejected":
+        chain["late-original"] = meta(53, _dispatch_meta_1367(attempt=1, head=_H0_1367))
+    elif case == "extra-coder-before-root":
+        chain["early-coder"] = meta(40, _coder_meta_1367())
+    elif case == "two-coders":
+        chain["second-coder"] = meta(63, _coder_meta_1367())
+    elif case == "coder-wrong-head":
+        chain["coder"] = meta(62, _coder_meta_1367(subject="other-head"))
+    elif case == "fresh-without-link":
+        chain["fresh"] = _auth_comment_1367(60, _fresh_record_1367(
+            predecessor_head=None, predecessor_comment_id=None,
+        ))
+    elif case == "fresh-wrong-head":
+        chain["fresh"] = _auth_comment_1367(60, _fresh_record_1367(head_sha="other-head"))
+    elif case == "fresh-label-outside-history":
+        chain["fresh"] = _auth_comment_1367(60, _fresh_record_1367(label_event_id=999))
+    elif case == "fresh-wrong-plan":
+        chain["fresh"] = _auth_comment_1367(60, _fresh_record_1367(approved_plan_hash="other"))
+        handoff["approved_plan_hash"] = "other"
+    elif case == "root-missing":
+        del chain["root"]
+    elif case == "root-foreign":
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(), login="mallory", user_id=9)
+    elif case == "root-wrong-head":
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(head_sha="other-head"))
+    elif case == "root-out-of-scope":
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(issue_number=999))
+    elif case == "root-different-protection":
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(protection="plan_limited"))
+    elif case == "root-inconsistent-waiver":
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(
+            waiver="allow-unreadable-protection",
+        ))
+    elif case == "root-label-outside-history":
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(label_event_id=999))
+    elif case == "root-replaced":
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(nonce="replaced-nonce"))
+    elif case == "root-superseded":
+        chain["superseder"] = _auth_comment_1367(45, _auth_record_1367(
+            kind="fresh", head_sha="unrelated-head", nonce="superseder",
+            superseded_comment_ids=(41,),
+        ))
+    elif case == "root-retired-plan":
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(approved_plan_hash="retired"))
+        handoff["retired_plan_hashes"] = frozenset({"retired"})
+    else:  # pragma: no cover - a typo in the parametrization
+        raise AssertionError(case)
+    return handoff
+
+
+_NEGATIVE_CASES_1367 = [
+    "review-absent", "review-foreign", "review-older-than-root", "review-wrong-round",
+    "review-wrong-head", "review-approved", "reviewers-disagree",
+    "rejected-wrong-round", "rejected-wrong-dispatch-head", "rejected-from-head-mismatch",
+    "rejected-wrong-observed-head", "rejected-missing-reason", "rejected-wrong-attempt",
+    "rejected-invalid-budget", "rejected-after-fresh", "rejected-absent",
+    "dispatch-missing", "dispatch-wrong-attempt", "dispatch-wrong-recovery-flag",
+    "dispatch-wrong-head", "dispatch-wrong-round", "dispatch-wrong-round-number",
+    "dispatch-invalid-budget",
+    "dispatch-precedes-fresh", "extra-dispatch-before-fresh", "extra-dispatch-before-root",
+    "extra-rejected-next-round-number", "extra-rejected-malformed",
+    "extra-dispatch-other-round-number", "extra-dispatch-malformed",
+    "original-dispatch-after-rejected", "extra-coder-before-root", "two-coders",
+    "coder-wrong-head",
+    "fresh-without-link", "fresh-wrong-head", "fresh-label-outside-history",
+    "fresh-wrong-plan",
+    "root-missing", "root-foreign", "root-wrong-head", "root-out-of-scope",
+    "root-different-protection", "root-inconsistent-waiver", "root-label-outside-history",
+    "root-replaced", "root-superseded", "root-retired-plan",
+]
+
+
+@pytest.mark.parametrize("case", _NEGATIVE_CASES_1367)
+def test_m1367_incomplete_recovery_chain_fails_closed_on_every_surface(tmp_path, case):
+    """Rows recovery-missing-review, recovery-link-mismatch, fresh-without-link,
+    recovery-head-mismatch, recovery-root-tampered, recovery-ancestor-inadmissible."""
+    chain, _round = _recovery_chain_1367()
+    overrides = _mutate_1367(chain, case)
+    config = _config_1367(tmp_path)
+    handoff = _fresh_handoff_1367(**overrides)
+
+    runner = _runner_1367(chain)
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        _correlate_1367(runner, config, handoff)
+    with pytest.raises(AgentLoopError):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+            new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+        )
+    assert _authorization_posts_1367(runner) == 0
+
+    # A hand-built recovery continuity record over the same records is refused
+    # by both later readers.
+    published = _runner_1367(_published_chain_1367(chain))
+    assert _resume_audit_1367(
+        published, config, _continuity_handoff_1367(**overrides)
+    ) is None
+    with pytest.raises(AgentLoopError, match="Approved-plan/handoff identity"):
+        _plan_binding_1367(
+            published, config, retired=overrides.get("retired_plan_hashes", ()),
+        )
+
+
+@pytest.mark.parametrize("ancestry", [
+    "origin-missing", "origin-wrong-head", "origin-coder-missing", "origin-retired-plan",
+    "origin-out-of-scope", "origin-label-outside-history",
+])
+def test_m1367_continuity_root_with_broken_ancestry_fails_closed(tmp_path, ancestry):
+    """Rows recovery-root-ancestry-broken, recovery-retired-plan-ancestry (b),
+    recovery-ancestor-inadmissible (ancestor of A0)."""
+    chain, round_number = _recovery_chain_1367(continuity_root=True)
+    handoff_overrides = {}
+    if ancestry == "origin-missing":
+        del chain["origin"]
+    elif ancestry == "origin-wrong-head":
+        chain["origin"] = _auth_comment_1367(30, _auth_record_1367(head_sha="other-head"))
+    elif ancestry == "origin-coder-missing":
+        del chain["origin-coder"]
+    elif ancestry == "origin-retired-plan":
+        chain["origin"] = _auth_comment_1367(
+            30, _auth_record_1367(head_sha=_ORIGIN_1367, approved_plan_hash="retired")
+        )
+        handoff_overrides["retired_plan_hashes"] = frozenset({"retired"})
+    elif ancestry == "origin-out-of-scope":
+        chain["origin"] = _auth_comment_1367(
+            30, _auth_record_1367(head_sha=_ORIGIN_1367, base_ref="other-base")
+        )
+    elif ancestry == "origin-label-outside-history":
+        chain["origin"] = _auth_comment_1367(
+            30, _auth_record_1367(head_sha=_ORIGIN_1367, label_event_id=999)
+        )
+    config = _config_1367(tmp_path)
+    handoff = _fresh_handoff_1367(**handoff_overrides)
+    runner = _runner_1367(chain)
+
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        _correlate_1367(runner, config, handoff, round_number=round_number)
+    with pytest.raises(AgentLoopError):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+            new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+        )
+    assert _authorization_posts_1367(runner) == 0
+    published = _runner_1367(_published_chain_1367(chain))
+    assert _resume_audit_1367(
+        published, config, _continuity_handoff_1367(**handoff_overrides)
+    ) is None
+    with pytest.raises(AgentLoopError, match="Approved-plan/handoff identity"):
+        _plan_binding_1367(
+            published, config, retired=handoff_overrides.get("retired_plan_hashes", ()),
+        )
+
+
+def test_m1367_retired_plan_ancestry_never_admitted_on_a_recovery_chain(tmp_path):
+    """Row recovery-retired-plan-ancestry: (a) A0 itself on a verified-retired plan."""
+    chain, _round = _recovery_chain_1367(root_plan="retired")
+    config = _config_1367(tmp_path)
+    handoff = _fresh_handoff_1367(retired_plan_hashes=frozenset({"retired"}))
+    runner = _runner_1367(chain)
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        _correlate_1367(runner, config, handoff)
+    with pytest.raises(AgentLoopError):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+            new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+        )
+    assert _authorization_posts_1367(runner) == 0
+    published = _runner_1367(_published_chain_1367(chain))
+    assert _resume_audit_1367(
+        published, config,
+        _continuity_handoff_1367(retired_plan_hashes=frozenset({"retired"})),
+    ) is None
+    with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
+        _plan_binding_1367(published, config, retired=("retired",))
+
+
+def test_m1367_unavailable_label_history_fails_closed_on_a_recovery_chain(tmp_path):
+    """Row recovery-ancestor-inadmissible: a missing label history never skips provenance."""
+    chain, _round = _recovery_chain_1367()
+    config = _config_1367(tmp_path)
+    handoff = _fresh_handoff_1367()
+    runner = _runner_1367(chain, runner_class=_NoEventsRunner1367)
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        _correlate_1367(runner, config, handoff)
+    with pytest.raises(AgentLoopError):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+            new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+        )
+    assert _authorization_posts_1367(runner) == 0
+    published = _runner_1367(_published_chain_1367(chain), runner_class=_NoEventsRunner1367)
+    assert _resume_audit_1367(published, config, _continuity_handoff_1367()) is None
+    with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
+        _plan_binding_1367(published, config)
+
+
+def test_m1367_config_without_a_waiver_refuses_the_recovery_chain_everywhere(tmp_path):
+    """Row pending-record-field-check: protection is judged through the context config."""
+    chain, _round = _recovery_chain_1367()
+    config = _config_1367(tmp_path, allow_unprotected_managed_ci=False)
+    handoff = _fresh_handoff_1367()
+    runner = _runner_1367(chain)
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        _correlate_1367(runner, config, handoff)
+    with pytest.raises(AgentLoopError):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+            new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+        )
+    assert _authorization_posts_1367(runner) == 0
+    published = _runner_1367(_published_chain_1367(chain))
+    assert _resume_audit_1367(published, config, _continuity_handoff_1367()) is None
+    with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
+        _plan_binding_1367(published, config)
+
+
+@pytest.mark.parametrize("binding", ["absent", "mismatched", "matching"])
+def test_m1367_named_board_requires_the_exact_reviewer_seat_binding(tmp_path, binding):
+    """Row recovery-link-mismatch: an unbound reviewer is never accepted under named seats."""
+    seat_binding = {
+        "absent": None,
+        "mismatched": {"version": 1, "seats": [{"id": "other"}]},
+        "matching": _SEATS_1367,
+    }[binding]
+    chain, _round = _recovery_chain_1367(seat_binding=seat_binding)
+    config = _config_1367(tmp_path, pr_seat_binding_override=_SEATS_1367)
+    handoff = _fresh_handoff_1367()
+    runner = _runner_1367(chain)
+    # A record published over the same review, or one whose review binding
+    # was removed or changed after publication, must re-authenticate against
+    # the configured board on both later walkers exactly as publication did.
+    published = _runner_1367(_published_chain_1367(chain))
+    if binding == "matching":
+        assert _correlate_1367(runner, config, handoff) == _RECOVERY_IDS_1367
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+            new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+        )
+        assert _authorization_posts_1367(runner) == 1
+        audit = _resume_audit_1367(published, config, _continuity_handoff_1367())
+        assert audit is not None and audit[0] == 70
+        _plan_binding_1367(published, config)
+        return
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        _correlate_1367(runner, config, handoff)
+    with pytest.raises(AgentLoopError, match="authenticated, correlated round metadata"):
+        publish_issue_created_continuity_authorization(
+            runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+            new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+        )
+    assert _authorization_posts_1367(runner) == 0
+    assert _resume_audit_1367(published, config, _continuity_handoff_1367()) is None
+    with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
+        _plan_binding_1367(published, config)
+
+
+def test_m1367_earlier_dispatch_records_are_not_recovery_candidates(tmp_path):
+    """Row recovery-link-mismatch: only this dispatch's records are counted.
+
+    Rejected and dispatch records of an earlier dispatch (dispatch_round R-1)
+    are history, not duplicates, so they never block a valid recovery chain.
+    """
+    chain, _round = _recovery_chain_1367()
+    chain["earlier-dispatch"] = _meta_comment_1367(
+        35, _dispatch_meta_1367(0, attempt=1, head=_H0_1367)
+    )
+    chain["earlier-rejected"] = _meta_comment_1367(36, _rejected_meta_1367(round_number=0))
+    config = _config_1367(tmp_path)
+    runner = _runner_1367(chain)
+    assert _correlate_1367(runner, config, _fresh_handoff_1367()) == _RECOVERY_IDS_1367
+    published = _runner_1367(_published_chain_1367(chain))
+    audit = _resume_audit_1367(published, config, _continuity_handoff_1367())
+    assert audit is not None and audit[0] == 70
+    _plan_binding_1367(published, config)
+
+
+@pytest.mark.parametrize("author", ["foreign", "actor"])
+@pytest.mark.parametrize("field,value", [
+    ("phase", []), ("phase", {}), ("phase", 7),
+    ("dispatch_round", []), ("dispatch_round", True), ("seat_binding", [1]),
+])
+def test_m1367_wrongly_typed_round_fields_never_crash_continuity(
+    tmp_path, author, field, value,
+):
+    """A commenter-supplied round record with a wrongly typed raw field (for
+    example an unhashable phase) is decoded before author filtering; it must
+    never raise anything but the controlled refusal on any surface."""
+    from coding_review_agent_loop.round_transport import encode_mapping
+
+    payload = {
+        "flow": "pr", "role": "summary", "agent": "Orchestrator", "round_number": 1,
+        "subject": _H0_1367, "state": "blocking", "phase": "coder-dispatch",
+    }
+    payload[field] = value
+    login, user_id = ("mallory", 9) if author == "foreign" else ("agent-loop", 1)
+    chain, _round = _recovery_chain_1367()
+    chain["hostile"] = {
+        "id": 55,
+        "user": {"login": login, "id": user_id},
+        "body": f"hostile\n<!-- AGENT_LOOP_META: {encode_mapping(payload)} -->",
+    }
+    config = _config_1367(tmp_path)
+    handoff = _fresh_handoff_1367()
+    runner = _runner_1367(chain)
+    assert _correlate_1367(runner, config, handoff) == _RECOVERY_IDS_1367
+    publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=handoff, predecessor_head=_H1_1367,
+        new_head=_H2_1367, round_comment_ids=_RECOVERY_IDS_1367,
+    )
+    assert _authorization_posts_1367(runner) == 1
+    published = _runner_1367(_published_chain_1367(chain))
+    audit = _resume_audit_1367(published, config, _continuity_handoff_1367())
+    assert audit is not None and audit[0] == 70
+    _plan_binding_1367(published, config)
+    # The ordinary cutoff path refuses with the controlled error, not a crash.
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        managed_ci.find_actor_round_metadata_comment_ids(
+            runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
+            predecessor_head=_H1_1367, new_head=_H2_1367, round_number=1,
+            after_comment_id=60,
+        )
+
+
+def test_m1367_identical_stranded_and_original_heads_never_open_recovery():
+    """Edge case (13): the recovery shape requires H0 != H1 != H2."""
+    chain, _round = _recovery_chain_1367()
+    comments = sorted(chain.values(), key=lambda comment: comment["id"])
+    by_index = managed_ci._continuity_round_records(comments)
+    common = dict(
+        actor_login="agent-loop", actor_id=1, root_comment_id=41, fresh_comment_id=60,
+        round_number=1, expected_seat_binding=None,
+    )
+    assert managed_ci._rejected_recovery_round_ids(
+        comments, by_index, root_head=_H0_1367, fresh_head=_H1_1367,
+        predecessor_head=_H1_1367, new_head=_H2_1367, **common,
+    ) == _RECOVERY_IDS_1367
+    assert managed_ci._rejected_recovery_round_ids(
+        comments, by_index, root_head=_H1_1367, fresh_head=_H1_1367,
+        predecessor_head=_H1_1367, new_head=_H2_1367, **common,
+    ) is None
+    assert managed_ci._rejected_recovery_round_ids(
+        comments, by_index, root_head=_H0_1367, fresh_head=_H1_1367,
+        predecessor_head=_H1_1367, new_head=_H0_1367, **common,
+    ) is None
+    assert managed_ci._rejected_recovery_round_ids(
+        comments, by_index, root_head=_H0_1367, fresh_head=_H1_1367,
+        predecessor_head="other-head", new_head=_H2_1367, **common,
+    ) is None
+
+
+@pytest.mark.parametrize("field", [
+    "kind", "repository", "issue", "pr", "base", "actor", "plan", "protection",
+    "waiver", "label", "config",
+])
+def test_m1367_pending_continuity_fields_are_checked_without_a_comment(tmp_path, field):
+    """Row pending-record-field-check."""
+    config = _config_1367(tmp_path)
+    context = managed_ci.chain_auth_context_for_handoff(
+        config=config, handoff=_fresh_handoff_1367(), valid_label_event_ids={101},
+    )
+    predecessor = _fresh_record_1367()
+    pending = _auth_record_1367(
+        kind="continuity", head_sha=_H2_1367, nonce="pending",
+        predecessor_head=_H1_1367, predecessor_comment_id=60,
+        round_comment_ids=_RECOVERY_IDS_1367,
+    )
+    assert managed_ci._pending_authorization_fields_admissible(
+        pending, context, predecessor=predecessor,
+    )
+    mutated = {
+        "kind": lambda: replace(pending, kind="fresh"),
+        "repository": lambda: replace(pending, repository="OTHER/REPO"),
+        "issue": lambda: replace(pending, issue_number=999),
+        "pr": lambda: replace(pending, pr_number=8),
+        "base": lambda: replace(pending, base_ref="other"),
+        "actor": lambda: replace(pending, actor_login="mallory", actor_id=9),
+        "plan": lambda: replace(pending, approved_plan_hash="other"),
+        "protection": lambda: replace(pending, protection="plan_limited"),
+        "waiver": lambda: replace(pending, waiver="allow-unreadable-protection"),
+        "label": lambda: replace(pending, label_event_id=999),
+        "config": lambda: pending,
+    }[field]()
+    if field == "config":
+        context = replace(
+            context, config=_config_1367(tmp_path, allow_unprotected_managed_ci=False),
+        )
+    assert not managed_ci._pending_authorization_fields_admissible(
+        mutated, context, predecessor=predecessor,
+    )
+
+
+def test_m1367_fresh_grant_without_a_rejected_record_keeps_the_strict_cutoff(tmp_path):
+    """Row ordinary-shapes-unchanged: a fresh grant alone never opens recovery."""
+    chain, _round = _recovery_chain_1367()
+    del chain["rejected"]
+    del chain["first-dispatch"]
+    config = _config_1367(tmp_path)
+    runner = _runner_1367(chain)
+    with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+        _correlate_1367(runner, config, _fresh_handoff_1367())
+    # The ordinary shape after a fresh grant still correlates and publishes.
+    runner.intent_comments = [
+        comment for comment in runner.intent_comments if comment["id"] not in {61, 62}
+    ] + [
+        _meta_comment_1367(63, _review_meta_1367(subject=_H1_1367, round_number=2)),
+        _meta_comment_1367(64, _coder_meta_1367(3)),
+    ]
+    assert _correlate_1367(
+        runner, config, _fresh_handoff_1367(), round_number=2,
+    ) == (63, 64)
+    publish_issue_created_continuity_authorization(
+        runner, config=config, handoff=_fresh_handoff_1367(), predecessor_head=_H1_1367,
+        new_head=_H2_1367, round_comment_ids=(63, 64),
+    )
+    assert _authorization_posts_1367(runner) == 1
+
+
+_LIVE_TARGET_FOLLOWUP_1367 = structured_coder_followup(
+    summary="Addressed the review.",
+    addressed_items=["item-1"],
+    tests_run=["pytest tests/test_foo.py https://live.example"],
+)
+_VALID_FOLLOWUP_1367 = structured_coder_followup(
+    summary="Addressed the review, in checkout.",
+    addressed_items=["item-1"],
+    tests_run=["pytest tests/test_foo.py"],
+)
+
+
+class _RecoveryRoundCommentRunner1367(_OrchestratorRoundCommentRunner):
+    """Also mirror ``created_at`` so recovery records authenticate on resume."""
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        before = len(self.intent_comments)
+        result = super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+        if [str(arg) for arg in args][:3] == ["gh", "pr", "comment"]:
+            for comment in self.intent_comments[before:]:
+                comment.setdefault("created_at", self.pr_payload["comments"][-1]["createdAt"])
+        return result
+
+
+def _pr_loop_stubs_1367(monkeypatch, handoff_box, events):
+    monkeypatch.setattr(
+        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_k: config,
+    )
+    monkeypatch.setattr(
+        orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff_box[0],
+    )
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci",
+        lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
+    )
+    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        orchestrator, "dispatch_final_qualification",
+        lambda *_a, **kwargs: events.append(("qualify", kwargs["expected_head_sha"])),
+    )
+    monkeypatch.setattr(
+        orchestrator, "merge_pr", lambda *_a, **kwargs: events.append(("merge", kwargs)),
+    )
+    real_post = orchestrator.post_pr_comment
+
+    def post_and_stop(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        if str(kwargs.get("body") or "").startswith("**Review verdict:") and handoff_box[1]:
+            raise _ReviewReached
+        return result
+
+    monkeypatch.setattr(orchestrator, "post_pr_comment", post_and_stop)
+
+
+@pytest.mark.parametrize("predecessor_review", ["real", "absent", "foreign"])
+def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh_grant(
+    tmp_path, monkeypatch, predecessor_review,
+):
+    """Rows recovery-chain-accepted and recovery-missing-review (issue #1364 sequence).
+
+    Round 1: a blocking review of H0, then a coder follow-up pushes H1 and its
+    evidence is rejected.  An operator fresh grant is minted at H1, chained to
+    the original authorization.  The recovery coder pushes H2; continuity
+    H1 -> H2 publishes only when the real predecessor review is correlated.
+    """
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, reviewer=("codex",), max_rounds=5,
+    )
+    runner = _RecoveryRoundCommentRunner1367(
+        issue_events=[label_event()], authenticated_actor=("agent-loop", 1),
+    )
+    runner.pr_payload.update({
+        "headRefName": "agent-loop/managed-643", "headRefOid": "abc123",
+        "baseRefName": "main", "body": runner.rest_pr["body"],
+    })
+    root = publish_issue_created_authorization(
+        runner, config=config,
+        handoff=replace(_authorization_handoff(), opening_override_nonce="nonce-643"),
+        metadata=metadata(),
+    )
+    events = []
+    handoff_box = [root, False]
+    _pr_loop_stubs_1367(monkeypatch, handoff_box, events)
+
+    # Run 1: blocking review at H0, then a pushed but rejected follow-up.
+    runner.codex_outputs = [
+        structured_pr_review(
+            state="blocking", summary="Needs a test.", blocking_items=["Add a regression test."],
+        )
+    ]
+    runner.claude_outputs = [_LIVE_TARGET_FOLLOWUP_1367]
+    with pytest.raises(AgentLoopError, match="live remote target"):
+        orchestrator.run_pr_loop(
+            runner, pr_number=7, config=config, managed_ci_handoff=root,
+            managed_ci_issue_number=643,
+        )
+    stranded = runner.pr_payload["headRefOid"]
+    assert stranded != "abc123"
+    runner.rest_pr["head"]["sha"] = stranded
+
+    # The operator `--managed-ci-fresh` grant at the stranded head links to A0.
+    runner.compare_payload = {
+        "status": "ahead",
+        "base_commit": {"sha": "abc123"},
+        "merge_base_commit": {"sha": "abc123"},
+    }
+    fresh = authorize_fresh_issue_created_resume(
+        runner, config=config, pr_number=7, issue_number=643,
+        metadata=replace(
+            metadata(), head_branch="agent-loop/managed-643", head_sha=stranded,
+            body=runner.rest_pr["body"],
+        ),
+    )
+    assert fresh.authorization_kind == "fresh"
+    fresh_record = dict(_authorization_records(runner))[fresh.authorization_comment_id]
+    assert fresh_record.predecessor_comment_id == root.authorization_comment_id
+    review_ids = [
+        comment["id"] for comment in runner.intent_comments
+        if (decoded := managed_ci._continuity_round_records([comment]).get(0)) is not None
+        and decoded["role"] == "reviewer"
+    ]
+    assert len(review_ids) == 1 and review_ids[0] < fresh.authorization_comment_id
+    if predecessor_review != "real":
+        (review,) = [
+            comment for comment in runner.intent_comments if comment["id"] == review_ids[0]
+        ]
+        runner.intent_comments.remove(review)
+        if predecessor_review == "foreign":
+            # The same review body, but authored by another account.
+            runner.intent_comments.append({
+                **review, "user": {"login": "mallory", "id": 9}, "created_at": None,
+            })
+            runner.intent_comments.sort(key=lambda comment: comment["id"])
+
+    # Run 2: PR-mode resume on the fresh grant; the recovery coder pushes H2.
+    handoff_box[:] = [fresh, True]
+    runner.codex_outputs = [
+        structured_pr_review(
+            state="approved", summary="Resolved.",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        )
+    ]
+    runner.claude_outputs = [_VALID_FOLLOWUP_1367]
+    if predecessor_review == "real":
+        with pytest.raises(_ReviewReached):
+            orchestrator.run_pr_loop(
+                runner, pr_number=7, config=config, managed_ci_handoff=fresh,
+                managed_ci_issue_number=643,
+            )
+    else:
+        with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
+            orchestrator.run_pr_loop(
+                runner, pr_number=7, config=config, managed_ci_handoff=fresh,
+                managed_ci_issue_number=643,
+            )
+
+    recovered = runner.pr_payload["headRefOid"]
+    assert recovered not in {"abc123", stranded}
+    dispatches = [
+        decoded["recovery"] for comment in runner.intent_comments
+        if (decoded := managed_ci._continuity_round_records([comment]).get(0)) is not None
+        and decoded["phase"] == "coder-dispatch"
+    ]
+    assert [record.dispatch_attempt for record in dispatches] == [1, 2]
+    records = _authorization_records(runner)
+    continuity = [record for _cid, record in records if record.kind == "continuity"]
+    if predecessor_review == "real":
+        assert len(continuity) == 1
+        (grant,) = continuity
+        assert (grant.predecessor_head, grant.head_sha) == (stranded, recovered)
+        assert grant.predecessor_comment_id == fresh.authorization_comment_id
+        assert len(grant.round_comment_ids) == 4 and review_ids[0] in grant.round_comment_ids
+        reviewer_prompts = [
+            " ".join(command) for command, _cwd in runner.commands
+            if command[:2] == ["codex", "exec"]
+        ]
+        assert recovered in reviewer_prompts[-1]
+    else:
+        assert continuity == []
+    # No synthetic approval, readiness transition or merge in either case.
+    assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
+    assert not any(kind == "merge" for kind, _payload in events)
+    assert runner.rest_pr["draft"] is True
