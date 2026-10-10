@@ -373,10 +373,51 @@ def test_named_plan_resume_applies_signed_shared_outage_before_panel(tmp_path, p
     )
     runner.issue_comments.append({
         "body": body, "author": {"login": "operator", "id": 81},
-        "createdAt": "2026-05-23T00:00:59Z", "id": 995,
+        "createdAt": f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z", "id": 995,
     })
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == before
+
+    restore_round = 3 if policy == "primary-then-panel" else 2
+    from dataclasses import replace
+    revised_flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model C",)), tmp_path / "flash")
+    restored_config = replace(
+        config, reviewer=("codex", "gemini", revised_flash, opus),
+        reviewer_seats=(revised_flash, opus),
+    )
+    restoration = format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("Codex", "Gemini"),
+        policy=policy, primary_reviewer="Codex" if policy == "primary-then-panel" else None,
+        removed_reviewers=(), restored_reviewers=("flash", "opus"),
+        effective_from_round=restore_round,
+        rationale="The shared Antigravity account has recovered.",
+    )
+    runner.issue_comments.append({
+        "body": restoration, "author": {"login": "operator", "id": 81},
+        "createdAt": f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z", "id": 996,
+    })
+    runner.antigravity_outputs.extend([
+        structured_plan_review(reviewer="flash (Google Antigravity: Model C)"),
+        structured_plan_review(reviewer="opus (Google Antigravity: Model B)"),
+    ])
+    runner.codex_outputs.append(structured_plan_review())
+    runner.gemini_outputs.append(structured_plan_review(reviewer="Google Gemini"))
+    before = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=restored_config, plan_first=True) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands[before:]
+              if cmd[0] == "agy" and "--model" in cmd]
+    assert len(models) == 2 and set(models) == {"Model C", "Model B"}
+    restored_reviews = [
+        record.metadata for record in _extract_round_metadata_records(
+            [_comment(entry["body"]) for entry in runner.issue_comments], flow="plan"
+        ) if record.metadata.role == "reviewer"
+        and record.metadata.agent in {"flash", "opus"}
+        and record.metadata.state == "approved"
+    ]
+    assert {review.agent for review in restored_reviews} == {"flash", "opus"}
+    assert len(restored_reviews) == 2
+    assert len({review.subject for review in restored_reviews}) == 1
 
 
 def test_named_pr_seat_local_amendment_reason_is_signed_and_recoverable():

@@ -5,6 +5,7 @@ import pytest
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import (
     IssueComment,
+    IssueContext,
     PullRequestMetadata,
     find_open_pr_closing_issue,
     read_pull_request_commit_metadata,
@@ -178,6 +179,63 @@ def test_named_plan_handoff_applies_signed_outage_and_restoration(tmp_path):
     ])
     full = reconcile_plan_handoff_board(config, comments, 56)
     assert tuple(str(seat) for seat in full.reviewer) == board
+
+
+def test_named_staged_handoff_uses_parent_board_when_child_has_unrelated_plan(tmp_path):
+    from agent_loop_helpers import structured_pr_review
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent, reviewer_seat_binding
+    from coding_review_agent_loop.round_state import (
+        PostedRoundMetadata, _attach_round_metadata, make_approved_plan_context,
+    )
+
+    seats = tuple(
+        SeatAgent(ReviewerSeat(name, "antigravity", (model,)), tmp_path / name)
+        for name, model in (("flash", "Model A"), ("opus", "Model B"))
+    )
+    config = make_config(
+        tmp_path, reviewer=seats, reviewer_seats=seats, pre_review_tests=False,
+    )
+    approved = make_approved_plan_context("Parent approved plan.")
+    binding = reviewer_seat_binding(config)
+
+    def plan_comments(plan, board, record_binding):
+        candidate = _attach_round_metadata(plan, PostedRoundMetadata(
+            flow="plan", role="coder", agent="Claude", round_number=1,
+            subject="plan", canonical_plan=plan, seat_binding=record_binding,
+        ))
+        checkpoint = _attach_round_metadata("Plan scheduling checkpoint.", PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", round_number=1,
+            subject="plan", seat_binding=record_binding,
+            scheduler_contract=make_plan_contract(board, "all-reviewers", None).as_dict(),
+        ))
+        return [
+            {"body": body, "author": {"login": "bot"},
+             "createdAt": f"2026-05-23T00:00:0{index}Z", "id": index}
+            for index, body in enumerate((candidate, checkpoint), start=1)
+        ]
+
+    parent_comments = plan_comments(approved.canonical_text, ("flash", "opus"), binding)
+    child_comments = plan_comments("Unrelated child plan.", ("other",), {
+        "version": 1, "seats": [{"id": "other", "backend": "codex",
+                                "model_chain": ["gpt-6-sol"], "effort": None}],
+    })
+    runner = FakeRunner(
+        issue_payloads_by_number={55: {"number": 55}, 56: {"number": 56}},
+        issue_comments_by_number={55: parent_comments, 56: child_comments},
+        antigravity_outputs=[
+            structured_pr_review(reviewer=f"{name} (Google Antigravity: {model})")
+            for name, model in (("flash", "Model A"), ("opus", "Model B"))
+        ],
+    )
+    child = IssueContext(56, config.repo, "Child", "Child body", None, ())
+    parent = IssueContext(55, config.repo, "Parent", "Parent body", None, ())
+    assert run_pr_loop(
+        runner, pr_number=77, config=config, issue_context=child,
+        parent_issue_context=parent, approved_plan_context=approved,
+    ) == 0
+    assert len([command for command, _ in runner.commands if command[0] == "agy"]) == 2
 
 
 def _comment(body: str) -> IssueComment:

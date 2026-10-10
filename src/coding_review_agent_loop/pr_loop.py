@@ -546,11 +546,6 @@ def run_pr_loop(
                 runner, config=config, issue_number=issue_context.number
             )
             issue_context_refreshed = True
-            if approved_plan_context is not None and config.reviewer_seats:
-                from .reviewer_seats import reconcile_plan_handoff_board
-                config = reconcile_plan_handoff_board(
-                    config, issue_context.comments, issue_context.number,
-                )
         if parent_issue_context is not None:
             parent_issue_context = get_issue_context(
                 runner, config=config, issue_number=parent_issue_context.number
