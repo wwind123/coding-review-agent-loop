@@ -4906,6 +4906,21 @@ def test_recovery_renderer_skips_the_plan_primary_stall_rounds_value(tmp_path):
     assert args.plan_primary_stall_rounds == 3
 
 
+@pytest.mark.parametrize("protocol", ["https", "ssh"])
+def test_recovery_renderer_keeps_trusted_origin_protocol_value(tmp_path, protocol):
+    parser = build_parser()
+    config = make_config(
+        tmp_path,
+        invocation_argv=(
+            "agent-loop", "issue", "--trusted-origin-protocol", protocol, "643",
+        ),
+    )
+    rendered = render_managed_ci_resume_command(config, pr_number=7, managed_ci=True)
+    args = parser.parse_args(shlex.split(rendered)[1:])
+    assert args.issue_number == 643
+    assert args.trusted_origin_protocol == protocol
+
+
 def test_recovery_value_option_table_covers_all_recovery_subparsers():
     parser = build_parser()
     subparsers = next(action for action in parser._actions if action.dest == "command")
