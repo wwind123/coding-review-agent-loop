@@ -236,6 +236,17 @@ def test_named_staged_handoff_uses_parent_board_when_child_has_unrelated_plan(tm
         parent_issue_context=parent, approved_plan_context=approved,
     ) == 0
     assert len([command for command, _ in runner.commands if command[0] == "agy"]) == 2
+    reviews = [comment for comment in runner.comments if "**Review verdict:**" in comment]
+    assert len(reviews) == 2
+    assert any("flash" in comment for comment in reviews)
+    assert any("opus" in comment for comment in reviews)
+
+    assert run_pr_loop(
+        runner, pr_number=77, config=config, issue_context=child,
+        parent_issue_context=parent, approved_plan_context=approved,
+    ) == 0
+    assert len([command for command, _ in runner.commands if command[0] == "agy"]) == 2
+    assert len([comment for comment in runner.comments if "**Review verdict:**" in comment]) == 2
 
 
 @pytest.mark.parametrize("staged", [False, True])
