@@ -8049,6 +8049,21 @@ def _publish_manual_v2_qualification(
     return expected_head_sha
 
 
+def retained_managed_label_present(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, cwd: Path,
+) -> bool:
+    """Read-only: would ``release_retained_managed_label`` remove the label?"""
+    pr = _read_pr_payload(runner, config=config, pr_number=pr_number, cwd=cwd)
+    labels = _label_names_or_none(pr)
+    return not (
+        pr is None
+        or labels is None
+        or pr.get("state") != "open"
+        or pr.get("draft") is not False
+        or MANAGED_LABEL not in labels
+    )
+
+
 def release_retained_managed_label(
     runner: Runner, *, config: AgentLoopConfig, pr_number: int, cwd: Path,
 ) -> bool:
@@ -8063,15 +8078,7 @@ def release_retained_managed_label(
     command runs in ``cwd`` because the coder checkout may not exist yet.
     Returns True only when the label was removed and its absence confirmed.
     """
-    pr = _read_pr_payload(runner, config=config, pr_number=pr_number, cwd=cwd)
-    labels = _label_names_or_none(pr)
-    if (
-        pr is None
-        or labels is None
-        or pr.get("state") != "open"
-        or pr.get("draft") is not False
-        or MANAGED_LABEL not in labels
-    ):
+    if not retained_managed_label_present(runner, config=config, pr_number=pr_number, cwd=cwd):
         return False
     failure = AgentLoopError(
         f"PR #{pr_number} is ready and still carries `{MANAGED_LABEL}`; it could not be removed, "

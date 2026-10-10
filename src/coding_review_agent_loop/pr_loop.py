@@ -46,7 +46,7 @@ from .plan_verification import (
     render_board_change_audit,
     signed_lineage_authorization,
 )
-from .reviewer_floor import enforce_configured_board_floor
+from .reviewer_floor import board_floor_enabled, enforce_configured_board_floor
 from .reviewer_seats import PlanHandoffBoard, resolve_plan_handoff_board
 from .decomposition import (
     _decode_json_payload,
@@ -141,6 +141,7 @@ from .managed_ci import (
     publish_round_readiness,
     release_adopted_managed_ci,
     release_retained_managed_label,
+    retained_managed_label_present,
     revalidate_adopted_managed_ci,
     revalidate_issue_created_handoff,
     recover_issue_created_handoff,
@@ -461,6 +462,63 @@ def unchanged_head_stop_message(
     )
 
 
+def _enforce_pr_board_floor(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    pr_context: PullRequestReviewContext,
+    pr_number: int,
+    handoff_authorizations: Sequence[object] = (),
+) -> None:
+    """Resolve signed PR lineage read-only, then check the effective-board floor.
+
+    Malformed or not-yet-activatable amendment history fails closed here, so
+    every caller refuses before any write.
+    """
+    amendments = collect_reviewer_board_amendments(
+        pr_context.comments, flow="pr", pr_number=pr_number, ignored_sink=[],
+    )
+    floor_config = config
+    authorizations = list(handoff_authorizations)
+    if amendments:
+        floor_config, authorization = _signed_pr_board_preflight(
+            runner,
+            config=config,
+            pr_context=pr_context,
+            pr_number=pr_number,
+            amendments=amendments,
+        )
+        if authorization is not None:
+            authorizations.append(authorization)
+    enforce_configured_board_floor(
+        floor_config,
+        authorizations=authorizations,
+        context=f"PR #{pr_number} reviewer board",
+    )
+
+
+def _known_plan_floor_inputs(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_contexts: Sequence[IssueContext | None],
+) -> tuple[AgentLoopConfig, tuple[object, ...]]:
+    """Best-effort plan board for a floor check before the handoff seam.
+
+    Reads only the issues already known at PR entry; the seam repeats the
+    exact check once the approved plan is resolved.
+    """
+    for known in issue_contexts:
+        if known is None:
+            continue
+        fresh = get_issue_context(runner, config=config, issue_number=known.number)
+        plan = derive_plan_verification_context(fresh.comments, issue_number=fresh.number)
+        if plan is not None:
+            handoff = resolve_plan_handoff_board(config, plan)
+            return handoff.config, handoff.signed_authorizations
+    return config, ()
+
+
 def _signed_pr_board_preflight(
     runner: Runner,
     *,
@@ -475,8 +533,9 @@ def _signed_pr_board_preflight(
     chain, its signed authorization.  The same drift error the startup block
     raises fails closed here, before any write.
     """
-    from .reviewer_seats import reviewer_seat_binding
+    from .reviewer_seats import reviewer_seat_binding, validate_pr_backend_outage_amendments
 
+    validate_pr_backend_outage_amendments(amendments, config)
     capabilities = policy_capabilities(config.pr_review_policy)
     try:
         records = _extract_round_metadata_records(pr_context.comments, flow="pr")
@@ -523,6 +582,33 @@ def _signed_pr_board_preflight(
             config,
             reviewer=tuple(r for r in configured if agent_display_name(r) in names),
             pr_seat_binding_override=binding,
+        )
+    if lineage.pending_amendments:
+        # The same activation rule startup applies: a pending amendment must
+        # take effect at the round this resume re-enters (read-only resume).
+        resumed = _resume_pr_round_admitted(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            comments=pr_context.comments,
+            head_sha=pr_context.metadata.head_sha,
+            configured_reviewers=reviewers(effective_config),
+            reconciliation_mode=(
+                "owner-scoped" if capabilities.owner_scoped_reconciliation else "aggregate"
+            ),
+        )
+        require_amendment_activation(
+            lineage,
+            start_round_number=resumed.round_number if resumed is not None else 1,
+            template=lambda amendment, round_number: _board_amendment_template(
+                flow="pr",
+                issue_number=None,
+                pr_number=pr_number,
+                persisted=lineage.contracts[lineage.amendments.index(amendment)],
+                removed=amendment.removed_reviewers,
+                restored=amendment.restored_reviewers,
+                start_round_number=round_number,
+            ),
         )
     if not lineage.amendments:
         return effective_config, None
@@ -606,6 +692,23 @@ def run_pr_loop(
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
+        # The label release below is a PR write: with a floor configured, a
+        # below-floor board is refused first (#1378 review item-6).  Only the
+        # issues already known here supply a plan authorization; the seam
+        # repeats the exact check.
+        if board_floor_enabled(config) and retained_managed_label_present(
+            runner, config=config, pr_number=pr_number, cwd=bootstrap_cwd,
+        ):
+            entry_floor_config, entry_authorizations = _known_plan_floor_inputs(
+                runner, config=config, issue_contexts=(issue_context, parent_issue_context),
+            )
+            _enforce_pr_board_floor(
+                runner,
+                config=entry_floor_config,
+                pr_context=initial_pr_context,
+                pr_number=pr_number,
+                handoff_authorizations=entry_authorizations,
+            )
         # A successful manual qualification retains the managed label on the
         # ready PR.  Release it before any managed-CI authentication so every
         # downstream path sees the ready/unlabeled state it already handles.
@@ -1826,26 +1929,12 @@ def run_pr_loop(
         # below-floor board is refused before managed-CI activation, any
         # PR-side write, workdir setup, or agent invocation.  The later
         # startup block resolves the same lineage again for scheduling.
-        pr_floor_amendments = collect_reviewer_board_amendments(
-            initial_pr_context.comments, flow="pr", pr_number=pr_number,
-            ignored_sink=[],
-        )
-        floor_config = config
-        floor_authorizations = list(handoff_floor_authorizations)
-        if pr_floor_amendments:
-            floor_config, pr_floor_authorization = _signed_pr_board_preflight(
-                runner,
-                config=config,
-                pr_context=initial_pr_context,
-                pr_number=pr_number,
-                amendments=pr_floor_amendments,
-            )
-            if pr_floor_authorization is not None:
-                floor_authorizations.append(pr_floor_authorization)
-        enforce_configured_board_floor(
-            floor_config,
-            authorizations=floor_authorizations,
-            context=f"PR #{pr_number} reviewer board",
+        _enforce_pr_board_floor(
+            runner,
+            config=config,
+            pr_context=initial_pr_context,
+            pr_number=pr_number,
+            handoff_authorizations=handoff_floor_authorizations,
         )
         if not workdirs_ready:
             ensure_agent_workdirs(config, runner)

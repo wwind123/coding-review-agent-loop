@@ -2214,6 +2214,14 @@ def _reviewer_outside_binding(records, binding):
     records[3]["agent"] = "c"
 
 
+def _model_round_trip(records, binding):
+    # Approved on the current model, then rebound away and back with no
+    # fresh reviews (A -> B -> A).
+    records.append(dict(role="summary", agent="Orchestrator",
+                        seat_binding=_rebound(binding, "b", model_chain=["claude-b-new"])))
+    records.append(dict(role="summary", agent="Orchestrator", seat_binding=binding))
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -2222,8 +2230,9 @@ def _reviewer_outside_binding(records, binding):
         (_unbound_record, "mixes bound and unbound round records"),
         (_board_changed, "changed its recorded board"),
         (_reviewer_outside_binding, "not represented in its seat binding"),
+        (_model_round_trip, "not completely approved"),
     ],
-    ids=["superseded-model", "backend", "unbound", "board", "outside-binding"],
+    ids=["superseded-model", "backend", "unbound", "board", "outside-binding", "model-round-trip"],
 )
 def test_plan_seat_binding_history_is_validated_before_verifying_approval(
     tmp_path, mutate, message
@@ -2324,3 +2333,125 @@ def test_malformed_staged_plan_history_is_never_downgraded_to_all_reviewers(tmp_
             metadata=SimpleNamespace(head_branch="agent-loop/managed-959", head_sha="h"),
             expected_plan_hash=approved_plan_hash(plan),
         )
+
+
+# --- Review round 2 of #1378: binding transitions supersede earlier approvals ---
+
+
+def _bound_staged_plan(tmp_path):
+    """A real seat-bound primary-then-panel plan approved on model A."""
+    from agent_loop_helpers import structured_plan_review
+    from coding_review_agent_loop.agents.registry import agent_signature
+    from coding_review_agent_loop.cli import run_issue_loop
+    from test_child_plan_provenance import (
+        _ChildPlanningRunner, _child_plan_state, _child_row, _plan_config,
+    )
+
+    plan_dir = tmp_path / "bound-plan"
+    plan_dir.mkdir()
+    seats = (
+        _seat(plan_dir, "primary", "codex", "gpt-a", "medium"),
+        _seat(plan_dir, "panel", "gemini", "gem-b"),
+    )
+    for seat in seats:
+        seat.workdir.mkdir()
+    runner = _ChildPlanningRunner(
+        claude_outputs=[_child_plan_state(_child_row())],
+        codex_outputs=[structured_plan_review(state="approved", reviewer=agent_signature(seats[0]))],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer=agent_signature(seats[1]))],
+    )
+    config = _plan_config(
+        plan_dir, reviewer=seats, reviewer_seats=seats,
+        plan_review_policy="primary-then-panel", primary_plan_reviewer=seats[0],
+    )
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    return list(runner.issue_comments)
+
+
+def _with_checkpoint_rebinds(comments, *models):
+    """Append prelaunch checkpoints rebinding the primary seat to each model."""
+    import copy
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from coding_review_agent_loop.round_state import (
+        _attach_round_metadata, _extract_round_metadata_records,
+    )
+
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in comments], flow="plan",
+    )
+    checkpoint = [r for r in records if r.metadata.phase == "scheduler-prelaunch"][-1].metadata
+    result = list(comments)
+    for offset, model in enumerate(models):
+        binding = copy.deepcopy(checkpoint.seat_binding)
+        for entry in binding["seats"]:
+            if entry["id"] == "primary":
+                entry["model_chain"] = [model]
+        result.append({
+            "author": {"login": "bot"}, "createdAt": f"2026-09-30T00:00:{offset:02d}Z",
+            "body": _attach_round_metadata(
+                "Plan scheduling checkpoint.", replace(checkpoint, seat_binding=binding),
+            ),
+        })
+    return result
+
+
+def _strict_verify_comments(tmp_path, comments):
+    from types import SimpleNamespace
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from coding_review_agent_loop.github import IssueContext as Issue
+    from coding_review_agent_loop.pr_loop_support import _verify_strict_managed_plan_binding
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records, _resume_plan_round,
+    )
+
+    issue = Issue(959, "OWNER/REPO", "t", "b", None, tuple(
+        IssueComment(author="agent-loop", created_at=c["createdAt"], body=c["body"])
+        for c in comments
+    ))
+    plan_text, _round = _resume_plan_round(issue.comments, configured_reviewers=())
+    _verify_strict_managed_plan_binding(
+        config=make_config(tmp_path, reviewer=("claude",)),
+        pr_number=7,
+        issue_context=issue,
+        metadata=SimpleNamespace(head_branch="agent-loop/managed-959", head_sha="h"),
+        expected_plan_hash=approved_plan_hash(plan_text),
+    )
+
+
+@pytest.mark.parametrize(
+    "models",
+    [("gpt-b",), ("gpt-b", "gpt-a")],
+    ids=["a-to-b", "a-to-b-to-a"],
+)
+def test_staged_approvals_before_a_model_transition_never_qualify(tmp_path, models):
+    """item-2: an interrupted A -> B (-> A) history needs fresh approvals."""
+    approved = _bound_staged_plan(tmp_path)
+    _strict_verify_comments(tmp_path, approved)
+    with pytest.raises(AgentLoopError, match="not completely approved"):
+        _strict_verify_comments(tmp_path, _with_checkpoint_rebinds(approved, *models))
+
+
+def test_recovery_refuses_approvals_superseded_by_a_model_round_trip(tmp_path, monkeypatch):
+    """item-2 on managed-CI fresh authorization: A -> B -> A without fresh reviews."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from coding_review_agent_loop.cli import run_pr_loop
+
+    history = _with_checkpoint_rebinds(_bound_staged_plan(tmp_path), "gpt-b", "gpt-a")
+    monkeypatch.setattr(
+        orchestrator, "authorize_fresh_issue_created_resume",
+        lambda *a, **k: pytest.fail("authorization must not run on superseded approvals"),
+    )
+    runner = FakeRunner(
+        issue_comments=history,
+        pr_payload={"headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+                    "baseRefName": "main", "body": "Fixes #56"},
+    )
+    with pytest.raises(AgentLoopError, match="complete canonical"):
+        run_pr_loop(runner, pr_number=77, config=make_config(
+            tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+            managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+            managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+            reviewer=("claude", "antigravity"),
+        ))
+    assert _agent_commands(runner) == []

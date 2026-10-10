@@ -1907,8 +1907,11 @@ binding, and the planning policy and primary. Plain all-reviewers plans persist
 neither, so their board is every reviewer that reviewed the plan. The context
 validates the plan's complete seat-binding history. Mixed bound and unbound
 rounds, a changed backend, a changed recorded board, or a reviewer outside its
-own binding fail closed. Approvals bound to a model chain or effort that a
-later binding superseded never count. A malformed staged checkpoint that hides
+own binding fail closed. A model chain or effort change between consecutive
+bound records is a binding transition. Every approval recorded before the
+latest transition is superseded, even when a later record returns to the
+earlier model (A to B to A). Approvals bound to a model the latest binding
+replaced never count either. A malformed staged checkpoint that hides
 the persisted policy also fails closed; it is never downgraded to
 all-reviewers verification. Every
 plan-approval reader uses this context and never reads the PR invocation's
@@ -1943,7 +1946,12 @@ the branch and draft PR are created), and PR start or handoff. Providers are
 counted by seat backend. Only a validated, non-empty signed amendment chain
 supplies a floor exception. At handoff that requires an inherited seat set. On
 the PR, the signed PR amendment lineage is resolved read-only at the same early
-point, so malformed amendment history also fails before any write. The
+point. That includes the backend-outage completeness check and the activation
+round of pending amendments, so malformed or not-yet-activatable amendment
+history also fails before any write and never supplies a floor exception. When
+a ready PR still carries the retained managed label, the floor is checked
+before the label is released, using the plan of any issue already known at
+entry. The handoff seam repeats the check once the approved plan is resolved. The
 exception covers only the measures the chain
 lowered from C0 to Cn, and never goes below the signed board's own counts with
 its recorded bindings. A binding swap therefore cannot inherit a provider

@@ -223,7 +223,9 @@ class _Reached(Exception):
     pass
 
 
-def _amended_named_pr(tmp_path, monkeypatch, *, amendment_pr=77):
+def _amended_named_pr(
+    tmp_path, monkeypatch, *, amendment_pr=77, reason="seat-unavailable", effective_round=1,
+):
     """A selective PR reviewed by codex, gemini, flash, opus; then a signed removal of flash."""
     from coding_review_agent_loop.board_amendment import format_reviewer_board_amendment_comment
     from coding_review_agent_loop.cli import run_pr_loop
@@ -250,7 +252,7 @@ def _amended_named_pr(tmp_path, monkeypatch, *, amendment_pr=77):
         flow="pr", issue=None, pr_number=amendment_pr,
         original_required_reviewers=("Codex", "Gemini", "flash", "opus"),
         policy="selective-intermediate", primary_reviewer=None, removed_reviewers=("flash",),
-        effective_from_round=1, reason="seat-unavailable", rationale="Seat quota exhausted.",
+        effective_from_round=effective_round, reason=reason, rationale="Seat quota exhausted.",
     )
     index = len(runner.pr_payload["comments"])
     runner.pr_payload["comments"].append({
@@ -309,3 +311,62 @@ def test_malformed_pr_amendment_history_is_refused_before_any_pr_write(tmp_path,
             workdirs_ready=True,
         )
     assert len(runner.comments) == comments_before
+
+
+@pytest.mark.parametrize(
+    ("amendment", "refusal"),
+    [
+        # A backend outage must remove every active seat on that backend:
+        # opus stays on Antigravity while flash is removed.
+        ({"reason": "backend-unavailable"}, "must remove every active seat"),
+        # A pending amendment must take effect at the round the resume
+        # re-enters, not a later one.
+        ({"effective_round": 5}, "Human decision required"),
+    ],
+    ids=["incomplete-backend-outage", "wrong-activation-round"],
+)
+def test_invalid_signed_pr_lineage_never_authorizes_the_floor_or_writes(
+    tmp_path, monkeypatch, amendment, refusal
+):
+    """item-3: every read-only amendment check runs before authorization and writes."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+
+    runner, board, run_pr_loop = _amended_named_pr(tmp_path, monkeypatch, **amendment)
+    comments_before = len(runner.comments)
+    commands_before = len(runner.commands)
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci",
+        lambda *a, **k: pytest.fail("managed-CI activation ran before amendment validation"),
+    )
+    with pytest.raises(AgentLoopError, match=refusal):
+        run_pr_loop(
+            runner, pr_number=77, config=make_config(tmp_path, **board, min_reviewers=4),
+            workdirs_ready=True,
+        )
+    assert len(runner.comments) == comments_before
+    assert not [c for c, _ in runner.commands[commands_before:] if c[0] in _AGENT_COMMANDS]
+
+
+@pytest.mark.parametrize("below_floor", [True, False])
+def test_retained_managed_label_is_released_only_after_the_floor(tmp_path, monkeypatch, below_floor):
+    """item-6: a below-floor board leaves the ready PR's retained label untouched."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from test_managed_ci import EntryNormalizationRunner, _live_pr, _managed_label_deletes
+
+    runner = EntryNormalizationRunner(_live_pr())
+    reviewers = ("codex",) if below_floor else ("codex", "claude")
+    config = make_config(tmp_path, reviewer=reviewers, min_reviewers=2, pre_review_tests=False)
+
+    def reached(*_a, **_k):
+        raise _Reached
+
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", reached)
+    if below_floor:
+        with pytest.raises(AgentLoopError, match="1 reviewer\\(s\\) is below the floor of 2"):
+            orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        assert _managed_label_deletes(runner) == []
+        assert runner.comments == []
+    else:
+        with pytest.raises(_Reached):
+            orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        assert len(_managed_label_deletes(runner)) == 1

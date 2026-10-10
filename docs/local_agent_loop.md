@@ -605,9 +605,9 @@ The PR board is chosen per invocation. A plan approved by one board can be
 reviewed as a PR by another: plain `--reviewer` flags or different named seats,
 backends, or models. The approved plan stays verified against the board that
 approved it, including on managed-CI recovery and strict qualification. That
-check validates the plan's whole seat-binding history. An approval given on a
-model the plan later replaced does not count, and malformed plan scheduling
-history fails closed. If the
+check validates the plan's whole seat-binding history. An approval recorded
+before a later seat model or effort change does not count, even if the model
+was later switched back. Malformed plan scheduling history fails closed. If the
 PR command repeats the plan's original or signed-amended seat set, the PR board
 is the plan's amended board, so a signed plan removal carries over. Any other
 board is an operator reconfiguration. When the PR board differs from the plan's
@@ -622,7 +622,8 @@ the PR's exact head; plan approvals never count as PR approvals.
 backend count as one provider. The floor is checked after history is read and
 before any workdir setup, managed-CI activation, agent run, or comment post. That
 covers issue start, `managed-pr` (before its branch and draft PR exist), and PR
-start or handoff. A board below the floor is refused unless a validated signed
+start or handoff. It also runs before a retained managed label is removed from a
+ready PR. A board below the floor is refused unless a validated signed
 reviewer-board amendment lowered that measure. The amended board's own counts
 and recorded bindings bound that exception. An unamended plan board, a
 reconfigured board, or a backend swap on an inherited seat set gets no

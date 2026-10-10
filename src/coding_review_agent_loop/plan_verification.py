@@ -269,7 +269,10 @@ def _validated_plan_binding_history(
     """Validate every plan seat binding against the plan's own history.
 
     Returns the latest binding, its entries, and the positions of approvals
-    bound to a model chain or effort the latest binding superseded.  Mixed
+    that a later model chain or effort reconfiguration superseded: any
+    approval recorded before the latest binding transition, including one
+    that returns to an earlier model, plus any approval bound differently
+    from the latest binding.  Mixed
     bound/unbound rounds, changed backends, a changed recorded board, and a
     reviewer outside its own binding fail closed.  The PR invocation board is
     never consulted.
@@ -284,7 +287,10 @@ def _validated_plan_binding_history(
     board = set(latest_entries)
     backends: dict[str, str] = {}
     stale: set[int] = set()
-    for record in records:
+    approvals: list[tuple[int, int]] = []  # (record index, comment index)
+    previous_models: dict[str, tuple[object, object]] | None = None
+    last_transition = -1
+    for position, record in enumerate(records):
         metadata = record.metadata
         recorded = metadata.seat_binding
         if recorded is None:
@@ -306,6 +312,17 @@ def _validated_plan_binding_history(
                 raise AgentLoopError(
                     f"Approved plan seat {seat_id!r} changed backend in plan history."
                 )
+        models = {
+            seat_id: (tuple(entry["model_chain"]), entry.get("effort"))
+            for seat_id, entry in entries.items()
+        }
+        if previous_models is not None and models != previous_models:
+            # A model chain or effort reconfiguration: the live plan loop
+            # clears approval and panel state here, so every approval recorded
+            # before it is superseded, even when a later record restores the
+            # earlier model (A -> B -> A).
+            last_transition = position
+        previous_models = models
         if metadata.role != "reviewer":
             continue
         own = entries.get(metadata.agent)
@@ -314,11 +331,14 @@ def _validated_plan_binding_history(
                 "Approved plan reviewer record is not represented in its seat binding."
             )
         current = latest_entries[metadata.agent]
-        if metadata.state == "approved" and (
-            own["model_chain"] != current["model_chain"]
-            or own.get("effort") != current.get("effort")
-        ):
-            stale.add(record.index)
+        if metadata.state == "approved":
+            approvals.append((position, record.index))
+            if (
+                own["model_chain"] != current["model_chain"]
+                or own.get("effort") != current.get("effort")
+            ):
+                stale.add(record.index)
+    stale.update(index for position, index in approvals if position < last_transition)
     return latest, latest_entries, frozenset(stale)
 
 
