@@ -374,7 +374,8 @@ def test_named_pr_signed_outage_removal_and_explicit_restoration():
         amend_contract(original, bad, base_board=board)
 
 
-def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_path, monkeypatch):
+@pytest.mark.parametrize("seat_local", [False, True])
+def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_path, monkeypatch, seat_local):
     import coding_review_agent_loop.orchestrator as orchestrator
 
     from agent_loop_helpers import FakeRunner, make_config, structured_coder_followup, structured_pr_review
@@ -413,6 +414,10 @@ def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_pat
     )
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     runner.pr_payload["headRefOid"] = "def456"
+    if seat_local:
+        runner.antigravity_outputs.append((
+            structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0,
+        ))
 
     def append_amendment(original_board, removed, restored, round_number):
         comment_index = len(runner.pr_payload["comments"])
@@ -422,6 +427,7 @@ def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_pat
             policy="selective-intermediate", primary_reviewer=None,
             removed_reviewers=removed, restored_reviewers=restored,
             effective_from_round=round_number,
+            reason="seat-unavailable" if seat_local and removed else None,
             rationale="Shared backend outage or recovery.",
         )
         runner.pr_payload["comments"].append({
@@ -431,7 +437,8 @@ def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_pat
             "id": 900 + round_number,
         })
 
-    append_amendment(board, ("flash", "opus"), (), 1)
+    removed_seats = ("flash",) if seat_local else ("flash", "opus")
+    append_amendment(board, removed_seats, (), 1)
     before = len(runner.commands)
     original_post = orchestrator.post_pr_comment
 
@@ -446,9 +453,9 @@ def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_pat
         patch.setattr(orchestrator, "post_pr_comment", interrupt_after_coder)
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
-    assert not any(cmd[0] == "agy" for cmd, _ in runner.commands[before:])
+    assert not any(cmd[0] == "agy" and "Model A" in cmd for cmd, _ in runner.commands[before:])
 
-    append_amendment(("Codex", "Gemini"), (), ("flash", "opus"), 2)
+    append_amendment(tuple(name for name in board if name not in removed_seats), (), removed_seats, 2)
     runner.antigravity_outputs.extend([
         (structured_pr_review(
             reviewer="flash (Google Antigravity: Model A)",
@@ -463,14 +470,16 @@ def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_pat
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands[before:]
               if cmd[0] == "agy" and "--model" in cmd]
-    assert models == ["Model A", "Model B"]
+    assert models == ["Model A", "Model B"] if not seat_local else ["Model A"]
     from coding_review_agent_loop.round_state import _extract_round_metadata_records
     checkpoints = [
         record.metadata for record in _extract_round_metadata_records(
             [_comment(comment["body"]) for comment in runner.pr_payload["comments"]], flow="pr"
         ) if record.metadata.phase == "scheduler-prelaunch"
     ]
-    assert any(checkpoint.scheduler_contract["required_reviewers"] == ["Codex", "Gemini"]
+    assert any(checkpoint.scheduler_contract["required_reviewers"] == [
+        name for name in board if name not in removed_seats
+    ]
                and checkpoint.reviewer_board_amendment_digest for checkpoint in checkpoints)
     assert any(checkpoint.scheduler_contract["required_reviewers"] == list(board)
                and checkpoint.reviewer_board_amendment_digest for checkpoint in checkpoints)
