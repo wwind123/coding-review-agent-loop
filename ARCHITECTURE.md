@@ -546,8 +546,14 @@ require a full review. The scheduler contract is immutable across a resume,
 with one audited exception (#943). A signed human `reviewer-board-amendment`
 record may remove unavailable non-primary reviewers. It is read from the same
 comment surface as the round records it amends: the issue for planning, the PR
-for PR review. `board_amendment.resolve_contract_lineage` is the single
-resolver used at plan resume, PR startup, and the PR qualification gate. Only
+for PR review. Named PR seat-local removal of one or more independently failed seats uses the signed `seat-unavailable` reason;
+shared `backend-unavailable` removal must cover every active seat on that
+backend. A signed PR `mixed-unavailable` removal records the shared outage
+backends in the rationale and validates complete removal for those backends;
+independent seat failures remain local. Evidence freeze, release, and qualification summaries persist the
+same seat binding as review records so startup can authenticate their board.
+`board_amendment.resolve_contract_lineage` is the single resolver used at plan
+resume, PR startup, and the PR qualification gate. Only
 contract-bearing scheduler records take part. The base contract comes from the
 earliest persisted record, and each record is judged by exactly one
 amendment-chain link. Every post-amendment scheduler record must carry the
@@ -1418,6 +1424,9 @@ reviewers within one invocation are supported; the orchestrator verifies
 distinct reviewer workdirs. Coder and reviewer turns are separate lifecycle
 stages even when they use the same CLI.
 
+Named seats with no explicit `--seat-dir` use the same per-run worktree lifecycle,
+with a separate shared store and finalizer keyed by each seat ID.
+
 **Per-run worktrees (`run_worktrees.py`).** Store mutations (clone, fetch+pin,
 local-base fast-forward, worktree add, prune, remove) run under a short,
 non-reentrant host `flock` (`<lock root>/workdir-stores/`) that is never held
@@ -1855,8 +1864,15 @@ model overlap within one backend, and explicit checkout collisions. Sandboxed
 permission checks use the seat's resolved backend and identify the rejected
 seat. A same-backend legacy reviewer with an unknown implicit CLI model is
 rejected until its model is explicit; backend model and effort options require
-an active coder or legacy reviewer to own them. During phase 1 the review loops
-still key durable state by backend, so named-seat execution stops at this
-preflight boundary. Legacy default seats continue through the existing
-backend-keyed paths with their historical signatures, metadata, quota behavior,
-and Antigravity settings lock.
+an active coder or legacy reviewer to own them. PR review uses a string-valued
+seat role key carrying backend, model chain, effort, and checkout. Common
+review scheduling and ledger code stores that seat ID in reviewer and agent
+fields. Backend adapters receive an immutable seat-specific invocation view;
+response files and logs use the seat ID while Antigravity quota state and the
+host settings lock remain shared. PR round metadata, including scheduler and
+coder recovery records, stores a versioned board binding. Recovery verifies
+the binding before using any recorded checkpoint; a changed
+model chain starts a fresh round, retaining reconciled open findings but
+invalidating prior approvals and unpublished response checkpoints. Legacy
+default seats keep historical signatures and metadata bytes. Plan-first named
+review remains gated until the plan review loop supports bound seat identity.

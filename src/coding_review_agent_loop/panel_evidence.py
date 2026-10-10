@@ -416,6 +416,8 @@ def _board_amendment_template(
     removed: Sequence[str],
     start_round_number: int | str,
     restored: Sequence[str] = (),
+    reason: str | None = None,
+    rationale: str | None = None,
 ) -> str:
     """Filled-in signed amendment template printed by fail-closed errors (#943, #984)."""
     return format_reviewer_board_amendment_comment(
@@ -428,6 +430,8 @@ def _board_amendment_template(
         removed_reviewers=tuple(removed),
         restored_reviewers=tuple(restored),
         effective_from_round=start_round_number,  # type: ignore[arg-type]
+        reason=reason,
+        rationale=rationale,
     )
 
 

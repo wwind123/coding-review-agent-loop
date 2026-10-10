@@ -26,13 +26,17 @@ BACKENDS: dict[AgentName, AgentBackend] = {
 
 
 def get_backend(agent: AgentName) -> AgentBackend:
+    from ..reviewer_seats import seat_backend
     try:
-        return BACKENDS[agent]
+        return BACKENDS[seat_backend(agent)]
     except KeyError as exc:
         raise AgentLoopError(f"Unsupported agent: {agent}") from exc
 
 
 def agent_display_name(agent: AgentName) -> str:
+    from ..reviewer_seats import SeatAgent
+    if isinstance(agent, SeatAgent):
+        return str(agent)
     return get_backend(agent).display_name
 
 
@@ -89,6 +93,13 @@ def agent_signature(
     model declared in config > the generic provider signature. When no model is
     known, returns the generic signature unchanged so existing output is stable.
     """
+    from ..reviewer_seats import SeatAgent
+    if isinstance(agent, SeatAgent):
+        label = model_used or agent.model_chain[0]
+        if agent.backend in {"codex", "claude"} and model_used is None:
+            from ..config import DEFAULT_REASONING_EFFORT
+            label = f"{label} ({agent.effort or DEFAULT_REASONING_EFFORT})"
+        return f"{agent} ({agent_signature(agent.backend, model_used=label)})"
     base = get_backend(agent).signature
     label = model_used or _configured_model_label(agent, config, role=role)
     if not label:
@@ -119,8 +130,44 @@ def run_agent_result(
     attempt_suffix: str | None = None,
 ) -> AgentResult:
     from ..agent_permissions import SANDBOXED_PROVIDERS, is_sandboxed
+    from ..reviewer_seats import SeatAgent, seat_backend
 
-    if is_sandboxed(config) and agent not in SANDBOXED_PROVIDERS:
+    backend_agent = seat_backend(agent)
+    if isinstance(agent, SeatAgent):
+        # Backend adapters read provider-specific fields. Give each seat an
+        # immutable invocation view so fallback and workdir never bleed across
+        # two seats of the same provider.
+        overrides: dict[str, object] = {
+            f"{backend_agent}_dir": agent.workdir,
+            "active_reviewer_seat_id": str(agent),
+        }
+        if backend_agent == "antigravity":
+            chain = (
+                config.antigravity_models
+                if config.active_reviewer_seat_id == agent else agent.model_chain
+            )
+            overrides.update(antigravity_models=chain, antigravity_model=None)
+        elif backend_agent == "codex":
+            from ..config import DEFAULT_REASONING_EFFORT
+            overrides.update(
+                reviewer_codex_model=agent.model_chain[0],
+                reviewer_codex_reasoning_effort=agent.effort or DEFAULT_REASONING_EFFORT,
+            )
+        elif backend_agent == "claude":
+            from ..config import DEFAULT_REASONING_EFFORT
+            overrides.update(
+                reviewer_claude_model=agent.model_chain[0],
+                reviewer_claude_effort=agent.effort or DEFAULT_REASONING_EFFORT,
+            )
+        else:
+            overrides.update(gemini_model=agent.model_chain[0])
+        config = replace(config, **overrides)
+    elif config.active_reviewer_seat_id is not None:
+        # A format-repair or recovery provider may be invoked while validating
+        # a seat response; it must keep its own artifact and log namespace.
+        config = replace(config, active_reviewer_seat_id=None)
+
+    if is_sandboxed(config) and backend_agent not in SANDBOXED_PROVIDERS:
         # Runtime backstop for config validation: an unsupported backend has
         # no role grant, so it must never be spawned in sandboxed mode.
         raise AgentLoopError(
@@ -139,7 +186,7 @@ def run_agent_result(
         set_role(role)
     from ..config import resolve_invocation
 
-    invocation = resolve_invocation(config, provider=agent, role=role)
+    invocation = resolve_invocation(config, provider=backend_agent, role=role)
     log(
         config,
         f"Resolved {agent} {role or 'turn'}: model={invocation.configured_model or 'unknown'} "
@@ -163,13 +210,13 @@ def run_agent_result(
     checked = not getattr(runner, "dry_run", False) and role not in (
         checkout_verification.TOOL_ISOLATED_ROLES
     )
-    checkout = get_backend(agent).workdir(config)
+    checkout = get_backend(backend_agent).workdir(config)
     if checked:
         checkout_verification.verify_checkout(
             config, runner, path=checkout, agent=agent, purpose=f"{role or 'agent'} turn"
         )
     try:
-        result = get_backend(agent).run(
+        result = get_backend(backend_agent).run(
             runner,
             config,
             prompt,
@@ -222,18 +269,18 @@ def run_agent_result(
             f"configured {invocation.configured_model!r}; retaining the completed turn.",
         )
     observed_model = result.observed_model
-    if agent == "antigravity" and observed_model is None and result.model_used:
+    if backend_agent == "antigravity" and observed_model is None and result.model_used:
         observed_model = result.model_used
     selected_model = observed_model or invocation.configured_model
     selected_effort = result.observed_effort or invocation.resolved_effort
     model_used = result.model_used
-    if agent in {"codex", "claude"} and selected_effort is not None:
+    if backend_agent in {"codex", "claude"} and selected_effort is not None:
         model_used = f"{selected_model or 'unknown model'} ({selected_effort})"
     elif observed_model:
         model_used = observed_model
     return replace(
         result,
-        provider=agent,
+        provider=backend_agent,
         role=role,
         configured_model=invocation.configured_model,
         configured_effort=invocation.resolved_effort,

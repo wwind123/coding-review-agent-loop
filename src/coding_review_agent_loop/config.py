@@ -208,6 +208,9 @@ class AgentLoopConfig:
     refresh_agent_memory: bool
     agent_memory_dir: Path
     refresh_test_profile: bool
+    reviewer_seats: tuple[object, ...] = ()
+    active_reviewer_seat_id: str | None = None
+    pr_seat_binding_override: dict | None = None
     approved_followups: str = "ignore"
     # Approved-follow-up semantic reuse is deliberately bounded and can be
     # disabled for offline/reproducibility-sensitive invocations.
@@ -961,7 +964,12 @@ def ensure_distinct_workdirs(config: AgentLoopConfig) -> None:
         "gemini": (config.gemini_dir, "--gemini-dir"),
         "antigravity": (config.antigravity_dir, "--antigravity-dir"),
     }
-    active = [(agent, *paths[agent]) for agent in required]
+    from .reviewer_seats import SeatAgent
+    active = [
+        (agent, agent.workdir, f"--seat-dir {agent}")
+        if isinstance(agent, SeatAgent) else (agent, *paths[agent])
+        for agent in required
+    ]
     for index, (_left_agent, left_path, left_option) in enumerate(active):
         for _right_agent, right_path, right_option in active[index + 1 :]:
             if left_path.resolve() == right_path.resolve():
@@ -998,6 +1006,9 @@ def _validate_effort_value(provider: AgentName | str, value: str, option: str) -
 def configured_model_for(
     config: AgentLoopConfig, provider: AgentName, *, role: str | None = None
 ) -> str | None:
+    from .reviewer_seats import SeatAgent
+    if isinstance(provider, SeatAgent):
+        return provider.model_chain[0]
     if role == "reviewer":
         if provider == "codex" and config.reviewer_codex_model:
             return config.reviewer_codex_model
@@ -1025,6 +1036,18 @@ def resolve_invocation(
     executing_provider = provider or (
         config.implementation_coder if implementation and config.implementation_coder else config.coder
     )
+    from .reviewer_seats import SeatAgent
+    if isinstance(executing_provider, SeatAgent):
+        seat_effort = executing_provider.effort
+        if seat_effort is None and executing_provider.backend in {"codex", "claude"}:
+            seat_effort = DEFAULT_REASONING_EFFORT
+        return ResolvedInvocation(
+            provider=executing_provider.backend,
+            role=role,
+            configured_model=executing_provider.model_chain[0],
+            resolved_effort=seat_effort,
+            effort_source="seat" if executing_provider.effort else "tool_default" if seat_effort else None,
+        )
     role_override = ""
     agent_effort = ""
     implementation_role_active = implementation or (
@@ -1560,7 +1583,8 @@ def sync_reviewer_pr_before_review(
 ) -> None:
     """Refresh a reviewer checkout to the current PR head before invoking the reviewer."""
     path = agent_workdir(config, reviewer)
-    option_name = _agent_dir_option(reviewer)
+    from .reviewer_seats import SeatAgent
+    option_name = f"--seat-dir {reviewer}" if isinstance(reviewer, SeatAgent) else _agent_dir_option(reviewer)
     default_owned = reviewer in set(config.auto_agent_dirs)
     label = f"Default {reviewer} workdir" if default_owned else option_name
     sync_checkout_to_pr(
@@ -1692,7 +1716,11 @@ def _prepare_agent_workdirs(config: AgentLoopConfig, runner: Runner) -> None:
     }
     auto_dirs = set(config.auto_agent_dirs)
     for agent in required:
-        path, option = paths[agent]
+        from .reviewer_seats import SeatAgent
+        path, option = (
+            (agent.workdir, f"--seat-dir {agent}")
+            if isinstance(agent, SeatAgent) else paths[agent]
+        )
         if agent in auto_dirs:
             log(config, f"Using default {agent} workdir: {path}")
             ensure_temp_checkout(path, agent=agent, config=config, runner=runner)
@@ -1758,11 +1786,12 @@ def preflight_agent_commands(
     }
     discuss_analyzer = getattr(args, "discuss_analyzer", None)
     implementation_coder = getattr(args, "implementation_coder", None)
+    from .reviewer_seats import seat_backend
     role_agents = dict.fromkeys(
         (
             args.coder,
             *((implementation_coder,) if implementation_coder is not None else ()),
-            *configured_reviewers,
+            *(seat_backend(reviewer) for reviewer in configured_reviewers),
             *((discuss_analyzer,) if discuss_analyzer is not None else ()),
         )
     )
@@ -1912,18 +1941,15 @@ def config_from_args(
     *,
     invocation_argv: tuple[str, ...] = (),
 ) -> AgentLoopConfig:
-    from .reviewer_seats import resolve_reviewer_seats
+    from .reviewer_seats import SeatAgent, resolve_reviewer_seats, seat_backend
 
-    if resolve_reviewer_seats(args):
-        raise AgentLoopError(
-            "Named reviewer seats are validated but review execution is unavailable in phase 1; "
-            "use legacy --reviewer until durable seat identity is enabled."
-        )
-    configured_reviewers = tuple(args.reviewer or ["codex"])
+    named_seats = resolve_reviewer_seats(args)
+    legacy_reviewers = tuple(args.reviewer or (["codex"] if not named_seats else ()))
+    configured_reviewers = legacy_reviewers
     if len(set(configured_reviewers)) != len(configured_reviewers):
         raise AgentLoopError("--reviewer cannot include the same agent more than once.")
-    validate_sandboxed_args(args, configured_reviewers)
-    preflight_agent_commands(args, runner, configured_reviewers)
+    validate_sandboxed_args(args, configured_reviewers, named_seats=named_seats)
+    preflight_agent_commands(args, runner, tuple((*configured_reviewers, *(seat.backend for seat in named_seats))))
 
     detect_dir = args.codex_dir.resolve() if args.codex_dir is not None else Path.cwd().resolve()
     repo = args.repo or detect_repo(runner, detect_dir, args.gh_cmd)
@@ -1938,6 +1964,14 @@ def config_from_args(
         if value is None
     )
     run_token = new_run_token()
+    seat_agents = tuple(
+        SeatAgent(
+            seat,
+            seat.workdir or default_run_worktree(repo, seat.seat_id, run_token).resolve(),
+        )
+        for seat in named_seats
+    )
+    configured_reviewers = (*legacy_reviewers, *seat_agents)
     store_by_agent: dict[AgentName, Path] = {}
     worktree_links = tuple(
         dict.fromkeys(
@@ -1955,8 +1989,14 @@ def config_from_args(
     codex_dir = resolve_agent_dir("codex", args.codex_dir)
     gemini_dir = resolve_agent_dir("gemini", args.gemini_dir)
     antigravity_dir = resolve_agent_dir("antigravity", args.antigravity_dir)
+    for seat in named_seats:
+        if seat.workdir is None:
+            store_by_agent[seat.seat_id] = default_agent_workdir(repo, seat.seat_id).resolve()
     default_checkout_stores = tuple(store_by_agent.items())
-    active_roles = {args.coder, *configured_reviewers}
+    active_roles = {
+        args.coder, *configured_reviewers,
+        *(seat_backend(reviewer) for reviewer in configured_reviewers),
+    }
     for extra_role in (getattr(args, "implementation_coder", None), getattr(args, "discuss_analyzer", None)):
         if extra_role is not None:
             active_roles.add(extra_role)
@@ -2031,6 +2071,7 @@ def config_from_args(
         gemini_dir=gemini_dir,
         coder=args.coder,
         reviewer=configured_reviewers,
+        reviewer_seats=seat_agents,
         base=getattr(args, "base", None),
         base_provenance="explicit" if getattr(args, "base", None) else None,
         max_rounds=args.max_rounds,
@@ -2190,7 +2231,11 @@ def config_from_args(
         architecture_aggregate_max_chars=getattr(args, "architecture_aggregate_max_chars", 24_000),
         managed_context_max_chars=getattr(args, "managed_context_max_chars", 80_000),
         pr_review_policy=getattr(args, "pr_review_policy", None) or "all-reviewers",
-        primary_reviewer=getattr(args, "primary_reviewer", None),
+        primary_reviewer=(
+            next((seat for seat in seat_agents if seat == args.primary_reviewer_seat), None)
+            if getattr(args, "primary_reviewer_seat", None)
+            else getattr(args, "primary_reviewer", None)
+        ),
         pr_review_broad_rules=tuple(
             getattr(args, "pr_review_broad_rules", None)
             if getattr(args, "pr_review_broad_rules", None) is not None
@@ -2228,7 +2273,7 @@ def config_from_args(
         sub_item_stall_rounds=_arg_or_default(
             args, "sub_item_stall_rounds", DEFAULT_SUB_ITEM_STALL_ROUNDS
         ),
-        auto_agent_dirs=auto_agent_dirs,
+        auto_agent_dirs=(*auto_agent_dirs, *(seat.seat_id for seat in named_seats if seat.workdir is None)),
         default_checkout_stores=default_checkout_stores,
         run_token=run_token if default_checkout_stores else None,
         worktree_links=worktree_links,

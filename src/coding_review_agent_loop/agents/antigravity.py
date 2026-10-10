@@ -55,6 +55,8 @@ from .. import workdir_claims
 from ..scratch import make_private_dirs, scratch_root
 from ..workdir_guard import WorkdirReplayEvidence, WorkdirSnapshot, capture_workdir_snapshot
 
+SETTINGS_LOCK_WAIT_SECONDS = 120
+
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
 
@@ -1081,7 +1083,27 @@ class AntigravityBackend:
         original_settings_text: str | None = None
         settings_restore_required = False
         try:
-            fcntl.flock(settings_lock, fcntl.LOCK_EX)
+            # The settings file is shared by every agy seat on this host. A
+            # bounded wait is distinct from the provider turn timeout; an
+            # interrupted wait leaves no completed reviewer response.
+            lock_wait_started = time.monotonic()
+            announced_wait = False
+            while True:
+                try:
+                    fcntl.flock(settings_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    elapsed = time.monotonic() - lock_wait_started
+                    if not announced_wait:
+                        log(config, f"{config.active_reviewer_seat_id or 'Antigravity'} waiting for shared agy settings lock")
+                        announced_wait = True
+                    if elapsed >= SETTINGS_LOCK_WAIT_SECONDS:
+                        raise AgentLoopError(
+                            f"{config.active_reviewer_seat_id or 'Antigravity'} waited {SETTINGS_LOCK_WAIT_SECONDS}s for the shared agy settings lock; review is incomplete"
+                        )
+                    time.sleep(min(0.25, SETTINGS_LOCK_WAIT_SECONDS - elapsed))
+            if announced_wait:
+                log(config, f"{config.active_reviewer_seat_id or 'Antigravity'} acquired shared agy settings lock after {time.monotonic() - lock_wait_started:.1f}s")
             existing_settings: dict[str, object] = {}
             if settings_was_injected:
                 try:

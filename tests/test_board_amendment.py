@@ -1,6 +1,7 @@
 """Signed reviewer-board amendment records (#943): parser, chain, lineage, ledger."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -226,6 +227,457 @@ def test_pr_contract_amendment_keeps_policy_primary_and_broad_rules():
     assert amended.broad_rules == original.broad_rules
     assert amended.broad_rules_digest == original.broad_rules_digest
     assert amended.primary_reviewer == "Codex"
+
+
+def test_named_pr_backend_outage_requires_one_complete_removal():
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat,
+        SeatAgent,
+        reviewer_seat_binding,
+        validate_pr_backend_outage_amendments,
+    )
+
+    def seat(name, backend, model):
+        from pathlib import Path
+        return SeatAgent(ReviewerSeat(name, backend, (model,)), Path("/tmp") / name)
+
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=(
+            seat("primary", "codex", "gpt-6-sol"),
+            seat("flash", "antigravity", "gemini-flash"),
+            seat("opus", "antigravity", "claude-opus"),
+        ),
+    )
+    board = ("primary", "flash", "opus")
+    def amendment(removed, reason="backend-unavailable"):
+        return SimpleNamespace(
+            original_required_reviewers=board,
+            removed_reviewers=removed,
+            reason=reason,
+        )
+
+    with pytest.raises(AgentLoopError, match="must remove every active seat"):
+        validate_pr_backend_outage_amendments((amendment(("flash",)),), config)
+    validate_pr_backend_outage_amendments((amendment(("flash", "opus")),), config)
+    validate_pr_backend_outage_amendments((amendment(("flash",), "seat-unavailable"),), config)
+    original_binding = reviewer_seat_binding(config)
+    amended_view = SimpleNamespace(
+        reviewer_seats=config.reviewer_seats,
+        reviewer=config.reviewer[:1],
+        pr_seat_binding_override=original_binding,
+    )
+    assert reviewer_seat_binding(amended_view) == original_binding
+    with pytest.raises(AgentLoopError, match="no verified backend binding"):
+        validate_pr_backend_outage_amendments((amendment(("unbound",)),), config)
+
+
+def test_named_pr_seat_local_amendment_reason_is_signed_and_recoverable():
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,
+    )
+
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=tuple(
+            SeatAgent(ReviewerSeat(name, backend, (model,)), Path("/tmp") / name)
+            for name, backend, model in (
+                ("primary", "codex", "gpt-6-sol"),
+                ("flash", "antigravity", "gemini-flash"),
+                ("opus", "antigravity", "claude-opus"),
+            )
+        ),
+    )
+    board = ("primary", "flash", "opus")
+    body = format_reviewer_board_amendment_comment(
+        flow="pr", issue=None, pr_number=77, original_required_reviewers=board,
+        policy="primary-then-panel", primary_reviewer="primary",
+        removed_reviewers=("flash",), effective_from_round=2,
+        reason="seat-unavailable", rationale="Only the flash model is unavailable.",
+    )
+    (record,) = collect_reviewer_board_amendments([_comment(body)], flow="pr", pr_number=77)
+    validate_pr_backend_outage_amendments((record,), config)
+    reduced = amend_contract(make_contract(board, "primary-then-panel", None, "primary"), record, base_board=board)
+    assert reduced.required_reviewers == ("primary", "opus")
+    shared_body = format_reviewer_board_amendment_comment(
+        flow="pr", issue=None, pr_number=77, original_required_reviewers=board,
+        policy="primary-then-panel", primary_reviewer="primary",
+        removed_reviewers=("flash",), effective_from_round=2,
+        rationale="The Antigravity account is unavailable.",
+    )
+    (shared,) = collect_reviewer_board_amendments([_comment(shared_body)], flow="pr", pr_number=77)
+    with pytest.raises(AgentLoopError, match="must remove every active seat"):
+        validate_pr_backend_outage_amendments((shared,), config)
+
+    from coding_review_agent_loop.review_rounds import _unavailable_reviewer_amendment_advisory
+    original = make_contract(board, "primary-then-panel", None, "primary")
+    lineage = SimpleNamespace(contracts=(original,), removed_reviewers=())
+    outcome, round_number, template = _unavailable_reviewer_amendment_advisory(
+        pr_number=77, contract=original, lineage=lineage, removed=("flash",),
+        fetch_start_round=lambda: 2, seat_local_failure=True,
+    )
+    assert (outcome, round_number) == ("validated", 2)
+    assert template is not None
+    (suggested,) = collect_reviewer_board_amendments([_comment(template)], flow="pr", pr_number=77)
+    assert suggested.reason == "seat-unavailable"
+    validate_pr_backend_outage_amendments((suggested,), config)
+
+
+def test_named_pr_two_local_failures_advisory_parses_and_resumes():
+    from coding_review_agent_loop.review_rounds import _unavailable_reviewer_amendment_advisory
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,
+    )
+
+    board = ("primary", "flash", "opus", "other")
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=tuple(
+            SeatAgent(ReviewerSeat(name, backend, (model,)), Path("/tmp") / name)
+            for name, backend, model in (
+                ("primary", "codex", "gpt-6-sol"),
+                ("flash", "antigravity", "gemini-flash"),
+                ("opus", "antigravity", "claude-opus"),
+                ("other", "antigravity", "gemini-pro"),
+            )
+        ),
+    )
+    original = make_contract(board, "primary-then-panel", None, "primary")
+    lineage = SimpleNamespace(contracts=(original,), removed_reviewers=())
+    outcome, round_number, template = _unavailable_reviewer_amendment_advisory(
+        pr_number=77, contract=original, lineage=lineage,
+        removed=("flash", "opus"), fetch_start_round=lambda: 2,
+        seat_local_failure=True,
+    )
+    assert (outcome, round_number) == ("validated", 2)
+    assert template is not None
+    (suggested,) = collect_reviewer_board_amendments(
+        [_comment(template)], flow="pr", pr_number=77,
+    )
+    assert suggested.reason == "seat-unavailable"
+    assert suggested.removed_reviewers == ("flash", "opus")
+    validate_pr_backend_outage_amendments((suggested,), config)
+    reduced = amend_contract(original, suggested, base_board=board)
+    assert reduced.required_reviewers == ("primary", "other")
+
+
+def test_named_pr_mixed_failure_advice_parses_and_validates_on_resume():
+    from coding_review_agent_loop.review_rounds import _unavailable_reviewer_amendment_advisory
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,
+    )
+
+    board = ("primary", "flash", "opus", "local-gemini", "healthy-gemini")
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=tuple(
+            SeatAgent(ReviewerSeat(name, backend, (model,)), Path("/tmp") / name)
+            for name, backend, model in (
+                ("primary", "codex", "gpt-6-sol"),
+                ("flash", "antigravity", "gemini-flash"),
+                ("opus", "antigravity", "claude-opus"),
+                ("local-gemini", "gemini", "gemini-pro"),
+                ("healthy-gemini", "gemini", "gemini-flash"),
+            )
+        ),
+    )
+    original = make_contract(board, "primary-then-panel", None, "primary")
+    lineage = SimpleNamespace(contracts=(original,), removed_reviewers=())
+    outcome, round_number, template = _unavailable_reviewer_amendment_advisory(
+        pr_number=77, contract=original, lineage=lineage,
+        removed=("flash", "opus", "local-gemini"), fetch_start_round=lambda: 2,
+        seat_local_failure=True, shared_outage_backends=frozenset({"antigravity"}),
+        seat_binding_config=config,
+    )
+    assert (outcome, round_number) == ("validated", 2)
+    assert template is not None
+    signed = template.replace(
+        "<why these backends and seats cannot be reached>",
+        "Antigravity account outage; one Gemini model unavailable.",
+    )
+    (record,) = collect_reviewer_board_amendments(
+        [_comment(signed)], flow="pr", pr_number=77,
+    )
+    assert record.reason == "mixed-unavailable"
+    validate_pr_backend_outage_amendments((record,), config)
+    assert amend_contract(original, record, base_board=board).required_reviewers == (
+        "primary", "healthy-gemini",
+    )
+    with pytest.raises(AgentLoopError, match="must remove every active seat"):
+        validate_pr_backend_outage_amendments(
+            (SimpleNamespace(**{**record.__dict__, "removed_reviewers": ("flash", "local-gemini")}),),
+            config,
+        )
+
+
+def test_named_pr_two_local_failures_template_recovers_on_original_board(tmp_path):
+    from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+    unavailable = json.dumps({
+        "schema_version": 1, "kind": "agent_unavailable", "retryable": False,
+        "category": "environment", "summary": "This model is unavailable.",
+        "suggested_action": "Restore this model.",
+    }) + "\n<!-- AGENT_UNAVAILABLE -->\n-- Google Antigravity"
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review() for _ in range(3)],
+        gemini_outputs=[structured_pr_review(reviewer="Google Gemini") for _ in range(3)],
+        antigravity_outputs=[
+            (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+            (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+            (unavailable, 0), (unavailable, 0),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", flash, opus),
+        reviewer_seats=(flash, opus), pr_review_policy="selective-intermediate",
+        pre_review_tests=False, agent_max_retries=0,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    runner.pr_payload["headRefOid"] = "def456"
+    with pytest.raises(AgentLoopError, match="missing required input") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(excinfo.value)
+    assert "flash" in message and "opus" in message
+    template = message[message.index("Reviewer board amendment:"):].replace(
+        "<why the removed reviewer cannot be reached>",
+        "Both named seats exhausted their own model chains.",
+    )
+    (record,) = collect_reviewer_board_amendments(
+        [_comment(template)], flow="pr", pr_number=77,
+    )
+    assert record.removed_reviewers == ("flash", "opus")
+    comment_index = len(runner.pr_payload["comments"])
+    runner.pr_payload["comments"].append({
+        "body": template, "author": {"login": "operator", "id": 81},
+        "createdAt": f"2026-05-23T00:00:{comment_index:02d}Z", "id": 991,
+    })
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len(runner.antigravity_outputs) == 0
+
+
+def test_named_pr_mixed_stop_template_recovers_on_original_board(tmp_path):
+    from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+
+    def unavailable(summary, signature):
+        return json.dumps({
+            "schema_version": 1, "kind": "agent_unavailable", "retryable": False,
+            "category": "environment", "summary": summary,
+            "suggested_action": "Restore access.",
+        }) + "\n<!-- AGENT_UNAVAILABLE -->\n-- " + signature
+
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review() for _ in range(3)],
+        gemini_outputs=[
+            structured_pr_review(reviewer="Google Gemini") for _ in range(3)
+        ] + [unavailable("Model access exhausted.", "Google Gemini")],
+        antigravity_outputs=[
+            (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+            (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+            (unavailable("Backend outage on the shared account.", "Google Antigravity"), 0),
+            (unavailable("Backend outage on the shared account.", "Google Antigravity"), 0),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", flash, opus),
+        reviewer_seats=(flash, opus), pr_review_policy="selective-intermediate",
+        pre_review_tests=False, agent_max_retries=0,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    runner.gemini_outputs = [unavailable("Model access exhausted.", "Google Gemini")]
+    runner.pr_payload["headRefOid"] = "def456"
+    with pytest.raises(AgentLoopError, match="missing required input") as excinfo:
+        run_pr_loop(runner, pr_number=77, config=config)
+    message = str(excinfo.value)
+    assert "mixed-unavailable" in message
+    template = message[message.index("Reviewer board amendment:"):].replace(
+        "<why these backends and seats cannot be reached>",
+        "Shared account outage and independent Gemini model failure.",
+    )
+    (record,) = collect_reviewer_board_amendments(
+        [_comment(template)], flow="pr", pr_number=77,
+    )
+    assert set(record.removed_reviewers) == {"Gemini", "flash", "opus"}
+    comment_index = len(runner.pr_payload["comments"])
+    runner.pr_payload["comments"].append({
+        "body": template, "author": {"login": "operator", "id": 81},
+        "createdAt": f"2026-05-23T00:00:{comment_index:02d}Z", "id": 991,
+    })
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+
+def test_named_pr_signed_outage_removal_and_explicit_restoration():
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,
+    )
+
+    board = ("primary", "flash", "opus", "other")
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=tuple(
+            SeatAgent(ReviewerSeat(name, backend, (model,)), Path("/tmp") / name)
+            for name, backend, model in (
+                ("primary", "codex", "gpt-6-sol"),
+                ("flash", "antigravity", "gemini-flash"),
+                ("opus", "antigravity", "claude-opus"),
+                ("other", "claude", "claude-sonnet"),
+            )
+        ),
+    )
+    original = make_contract(board, "primary-then-panel", None, "primary")
+
+    def signed(original_board, removed, restored, round_number):
+        return format_reviewer_board_amendment_comment(
+            flow="pr", issue=None, pr_number=17,
+            original_required_reviewers=original_board,
+            policy="primary-then-panel", primary_reviewer="primary",
+            removed_reviewers=removed, restored_reviewers=restored,
+            effective_from_round=round_number,
+            rationale="Shared backend outage or recovery.",
+        )
+
+    comments = [
+        _comment(signed(board, ("flash", "opus"), (), 2)),
+        _comment(signed(("primary", "other"), (), ("flash", "opus"), 3)),
+    ]
+    amendments = collect_reviewer_board_amendments(comments, flow="pr", pr_number=17)
+    validate_pr_backend_outage_amendments(amendments, config)
+    reduced = amend_contract(original, amendments[0], base_board=board)
+    assert reduced.required_reviewers == ("primary", "other")
+    restored = amend_contract(
+        reduced, amendments[1], base_board=board,
+        previously_removed=("flash", "opus"),
+    )
+    assert restored.required_reviewers == board
+    with pytest.raises(AgentLoopError, match="primary reviewer"):
+        (bad,) = collect_reviewer_board_amendments(
+            [_comment(signed(board, ("primary",), (), 2))],
+            flow="pr", pr_number=17,
+        )
+        amend_contract(original, bad, base_board=board)
+
+
+@pytest.mark.parametrize("seat_local", [False, True])
+def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_path, monkeypatch, seat_local):
+    import coding_review_agent_loop.orchestrator as orchestrator
+
+    from agent_loop_helpers import FakeRunner, make_config, structured_coder_followup, structured_pr_review
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+    board = ("Codex", "Gemini", "flash", "opus")
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(),
+            structured_pr_review(state="blocking", blocking_items=["Fix worker."], summary="Codex blocks."),
+            *[structured_pr_review(
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ) for _ in range(4)],
+        ],
+        gemini_outputs=[
+            structured_pr_review(reviewer="Google Gemini") for _ in range(2)
+        ] + [structured_pr_review(
+            reviewer="Google Gemini",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ) for _ in range(4)],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        antigravity_outputs=[
+            (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+            (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", flash, opus), reviewer_seats=(flash, opus),
+        pr_review_policy="selective-intermediate", max_rounds=4,
+        pre_review_tests=False, agent_max_retries=0,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    runner.pr_payload["headRefOid"] = "def456"
+    if seat_local:
+        runner.antigravity_outputs.append((
+            structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0,
+        ))
+
+    def append_amendment(original_board, removed, restored, round_number):
+        comment_index = len(runner.pr_payload["comments"])
+        body = format_reviewer_board_amendment_comment(
+            flow="pr", issue=None, pr_number=77,
+            original_required_reviewers=original_board,
+            policy="selective-intermediate", primary_reviewer=None,
+            removed_reviewers=removed, restored_reviewers=restored,
+            effective_from_round=round_number,
+            reason="seat-unavailable" if seat_local and removed else None,
+            rationale="Shared backend outage or recovery.",
+        )
+        runner.pr_payload["comments"].append({
+            "body": body,
+            "author": {"login": "human-reviewer", "id": 81},
+            "createdAt": f"2026-05-23T00:00:{comment_index:02d}Z",
+            "id": 900 + round_number,
+        })
+
+    removed_seats = ("flash",) if seat_local else ("flash", "opus")
+    append_amendment(board, removed_seats, (), 1)
+    before = len(runner.commands)
+    original_post = orchestrator.post_pr_comment
+
+    def interrupt_after_coder(*args, **kwargs):
+        result = original_post(*args, **kwargs)
+        match = orchestrator.ROUND_RESUME_MARKER_RE.search(kwargs["body"])
+        if match and orchestrator._decode_round_metadata(match["payload"]).role == "coder":
+            raise KeyboardInterrupt
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(orchestrator, "post_pr_comment", interrupt_after_coder)
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(cmd[0] == "agy" and "Model A" in cmd for cmd, _ in runner.commands[before:])
+
+    append_amendment(tuple(name for name in board if name not in removed_seats), (), removed_seats, 2)
+    runner.antigravity_outputs.extend([
+        (structured_pr_review(
+            reviewer="flash (Google Antigravity: Model A)",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ), 0),
+        (structured_pr_review(
+            reviewer="opus (Google Antigravity: Model B)",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ), 0),
+    ])
+    before = len(runner.commands)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands[before:]
+              if cmd[0] == "agy" and "--model" in cmd]
+    assert models == ["Model A", "Model B"] if not seat_local else ["Model A"]
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    checkpoints = [
+        record.metadata for record in _extract_round_metadata_records(
+            [_comment(comment["body"]) for comment in runner.pr_payload["comments"]], flow="pr"
+        ) if record.metadata.phase == "scheduler-prelaunch"
+    ]
+    assert any(checkpoint.scheduler_contract["required_reviewers"] == [
+        name for name in board if name not in removed_seats
+    ]
+               and checkpoint.reviewer_board_amendment_digest for checkpoint in checkpoints)
+    assert any(checkpoint.scheduler_contract["required_reviewers"] == list(board)
+               and checkpoint.reviewer_board_amendment_digest for checkpoint in checkpoints)
 
 
 # --- lineage (rows digest-binding, chain-link-interval, post-amend-old-board)

@@ -15,7 +15,10 @@ from pathlib import Path
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, get_backend
 from .config import AgentLoopConfig, reviewers
-from .board_amendment import ReviewerBoardAmendment, amend_contract
+from .board_amendment import (
+    ReviewerBoardAmendment, amend_contract, REVIEWER_SEAT_REMOVAL_REASON,
+    REVIEWER_MIXED_REMOVAL_REASON,
+)
 from .errors import AgentInvocationError, AgentLoopError, QuotaResetExceededError
 from .github import PullRequestChecks
 from .logging import log
@@ -375,6 +378,9 @@ def _unavailable_reviewer_amendment_advisory(
     lineage: object,
     removed: Sequence[str],
     fetch_start_round: Callable[[], int],
+    seat_local_failure: bool = False,
+    shared_outage_backends: frozenset[str] = frozenset(),
+    seat_binding_config: object | None = None,
 ) -> tuple[str, int | None, str | None]:
     """Validate an amendment removing ``removed`` before it is advertised (#1129).
 
@@ -407,6 +413,31 @@ def _unavailable_reviewer_amendment_advisory(
             )
         except AgentLoopError:
             return "rejected", round_number, None
+        # A seat-local failure can affect several independent seats in one
+        # round. The signed record must accept the same complete removal set
+        # that the advisory validated above.
+        mixed = bool(shared_outage_backends) and seat_local_failure
+        reason = (
+            REVIEWER_MIXED_REMOVAL_REASON if mixed
+            else REVIEWER_SEAT_REMOVAL_REASON if seat_local_failure
+            else None
+        )
+        rationale = (
+            "shared_outage_backends=" + ",".join(sorted(shared_outage_backends))
+            + "\n<why these backends and seats cannot be reached>"
+            if mixed else None
+        )
+        if mixed:
+            if seat_binding_config is None:
+                return "rejected", round_number, None
+            from .reviewer_seats import validate_pr_backend_outage_amendments
+            try:
+                validate_pr_backend_outage_amendments(
+                    (dataclasses_replace(amendment, reason=reason, rationale=rationale),),
+                    seat_binding_config,
+                )
+            except AgentLoopError:
+                return "rejected", round_number, None
         template = _board_amendment_template(
             flow="pr",
             issue_number=None,
@@ -414,6 +445,8 @@ def _unavailable_reviewer_amendment_advisory(
             persisted=contract,
             removed=removed,
             start_round_number=round_number,
+            reason=reason,
+            rationale=rationale,
         )
         return "validated", round_number, template
     except Exception:  # noqa: BLE001 - advisory text only; the stop stays authoritative
@@ -1137,7 +1170,11 @@ def _launch_reviewer_turns(
                 failure_category=getattr(result.error, "failure_category", None),
             )
         elif result.response is not None:
-            spool.store(reviewer_name, _spooled_response_fields(result.response))
+            fields = _spooled_response_fields(result.response)
+            if config is not None and config.reviewer_seats:
+                from .reviewer_seats import reviewer_seat_binding
+                fields["seat_binding"] = reviewer_seat_binding(config)
+            spool.store(reviewer_name, fields)
     withheld = [
         reviewer for reviewer, result in results.items()
         if reviewer not in retry_errors and result.error is None and result.response is not None
@@ -1180,7 +1217,8 @@ def _ensure_parallel_reviewer_workdirs(
     """
     seen: dict[Path, AgentName] = {}
     for reviewer in reviewers(config):
-        path = get_backend(reviewer).workdir(config).resolve()
+        from .workdirs import agent_workdir
+        path = agent_workdir(config, reviewer).resolve()
         other = seen.get(path)
         if other is not None:
             raise AgentLoopError(

@@ -123,6 +123,7 @@ class PostedRoundMetadata:
     usage: dict | None = None
     model_used: str | None = None
     provider: str | None = None
+    seat_binding: dict | None = None
     configured_model: str | None = None
     configured_effort: str | None = None
     effort_source: str | None = None
@@ -2586,6 +2587,8 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
             dict(item) for item in metadata.risk_test_matrix_diagnostics
         ],
     }
+    if metadata.seat_binding is not None:
+        payload["seat_binding"] = metadata.seat_binding
     semantic_values = {
         "response_form": metadata.response_form,
         "base_round_number": metadata.base_round_number,
@@ -2911,6 +2914,8 @@ def _decode_matrix_evidence_full_round(payload: Mapping[str, object]) -> dict[st
 
 def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRoundMetadata:
     try:
+        if "seat_binding" in payload and not isinstance(payload["seat_binding"], dict):
+            raise ValueError("seat_binding must be an object")
         for key in ("prior_items", "risk_test_matrix_evidence"):
             # A spill reference must be hydrated first; never read it as
             # review items or canonical matrix evidence (#953).
@@ -2949,6 +2954,11 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             flow=str(payload["flow"]),
             role=str(payload["role"]),
             agent=str(payload["agent"]),
+            seat_binding=(
+                payload["seat_binding"]
+                if isinstance(payload.get("seat_binding"), dict)
+                else None
+            ),
             round_number=int(payload["round_number"]),
             subject=str(payload["subject"]),
             prior_plan_subject=(
@@ -3612,7 +3622,8 @@ def _latest_pr_approved_reviews_for_head(
         if record.metadata.acquisition_outcome != "success":
             return False
         return (
-            record.metadata.configured_model == expected[0]
+            (record.metadata.configured_model in expected[0]
+             if isinstance(expected[0], tuple) else record.metadata.configured_model == expected[0])
             and record.metadata.configured_effort == expected[1]
             and (len(expected) < 3 or record.metadata.provider == expected[2])
         )

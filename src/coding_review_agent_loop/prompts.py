@@ -889,6 +889,7 @@ def _coder_workdir_guidance(
     config: AgentLoopConfig, *, implementation: bool = True, agent: AgentName | None = None
 ) -> str:
     active_agent = agent or config.coder
+    from .reviewer_seats import seat_backend
     workdir = agent_workdir(config, active_agent).resolve()
     repo_name = config.repo.rsplit("/", 1)[-1]
     scope = (
@@ -906,7 +907,7 @@ def _coder_workdir_guidance(
         "codex": config.codex_args,
         "gemini": config.gemini_args,
         "antigravity": config.antigravity_args,
-    }[active_agent]
+    }[seat_backend(active_agent)]
     dangerous_warning = ""
     if any(arg in dangerous_args for arg in active_args):
         dangerous_warning = (
@@ -934,7 +935,8 @@ def _sandboxed_permission_guidance(
         return ""
     if implementation:
         return coder_sandbox_guidance(config, agent)
-    if agent == "codex":
+    from .reviewer_seats import seat_backend
+    if seat_backend(agent) == "codex":
         return (
             "Sandboxed permissions are active: your sandbox is read-only and has no "
             "network access, so rely on the issue and PR context in this prompt and on "

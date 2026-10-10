@@ -496,7 +496,13 @@ Reviewer board amendment:
 reviewer through the optional `restored_reviewers` key (a non-empty list of
 unique names). A restoration-only record has an empty `removed_reviewers` list
 and `reason` `backend-recovered`; a removal-only record keeps `reason`
-`backend-unavailable`; a record that does both may use either. A name may not be
+`backend-unavailable` for a shared outage. A PR removal of one or more named
+seats whose model chains independently fail uses `seat-unavailable`; other seats
+on their backends remain required. A shared outage must remove all active seats
+on that backend in one record. For mixed shared outages and independent seat
+failures, use `mixed-unavailable` and start the rationale with a line such as
+`shared_outage_backends=antigravity`. Resume validates that every active seat
+of each listed backend was removed. A name may not be
 both removed and restored. Records without `restored_reviewers` keep the exact
 #943 key set and digest. When a rerun's configured board adds reviewers back to
 the persisted board, the drift error prints a filled-in restoration template.
@@ -569,7 +575,7 @@ helpers accept `--require-risk-test-matrix-contract` for fresh contract checks.
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
-Named reviewer seats have a phase-1 configuration preflight. Declare each seat
+PR reviewer seats have a configuration preflight. Declare each seat
 with `--reviewer-seat ID=BACKEND` and at least one `--seat-model ID=MODEL`.
 Only Antigravity accepts repeated seat models as a fallback chain. Codex and
 Claude seats may use `--seat-effort ID=EFFORT`; `--seat-dir ID=PATH` assigns a
@@ -581,10 +587,19 @@ have no read-only grant. A legacy Codex, Claude, or Gemini reviewer sharing a
 backend with a named seat needs an explicit reviewer model, since its implicit
 CLI default cannot be checked for overlap. Backend-wide model and effort flags
 require an active coder or explicit legacy reviewer for that backend; use
-`--seat-model` and `--seat-effort` for named seats. Named review execution
-remains gated until durable PR and plan review state supports seat IDs. Legacy
-`--reviewer agy` and `--antigravity-models` still describe one fallback
-reviewer, sharing the usual Antigravity quota and settings lock.
+`--seat-model` and `--seat-effort` for named seats. Named-only PR boards suppress
+the implicit Codex reviewer; an explicit `--reviewer` adds a legacy default
+seat. `--primary-reviewer-seat ID` selects the named primary under PR
+`primary-then-panel`. The PR, task, managed PR, and plain issue PR paths use
+seat IDs for scheduling, response validation, artifacts, approval, and resume.
+Saved PR records bind seat IDs to backends and model chains. Changing a chain
+invalidates old approvals and response checkpoints, preserves verified open
+seat-owned findings, and starts a fresh review round. A backend change is
+refused. Issue `--plan-first` and `discuss` continue to reject named seats.
+Legacy `--reviewer agy` and `--antigravity-models` still describe one fallback
+reviewer. Same-account Antigravity seats share quota state and take turns under
+the host settings lock; lock waits are visible and bounded separately from the
+agent turn timeout.
 
 ### Sub-items for conjunctive review findings
 

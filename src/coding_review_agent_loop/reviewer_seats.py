@@ -1,8 +1,4 @@
-"""Typed reviewer-seat configuration, ahead of review-loop persistence.
-
-Named seats are parsed and validated at the CLI boundary. Execution remains
-gated until the durable review board understands seat identity.
-"""
+"""Typed reviewer-seat configuration and durable PR reviewer identity."""
 
 from __future__ import annotations
 
@@ -11,8 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .agents.base import normalize_agent_name
-from .agents.registry import agent_display_name, agent_signature
-from .comment_rendering import canonical_model_identity
 from .errors import AgentLoopError
 
 _ID = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z", re.ASCII)
@@ -32,7 +26,188 @@ class ReviewerSeat:
 
     def signature(self, model_used: str | None = None) -> str:
         """A future named-review renderer; legacy callers keep their existing bytes."""
+        from .agents.registry import agent_signature
         return f"{self.seat_id} ({agent_signature(self.backend, model_used=model_used or self.model_chain[0])})"
+
+
+class SeatAgent(str):
+    """A reviewer-role key that remains a string in historical round records.
+
+    The string value is the durable seat ID. Backend routing is carried on the
+    instance, so two seats using one CLI never share a review-board key.
+    """
+
+    def __new__(cls, seat: ReviewerSeat, workdir: Path):
+        value = str.__new__(cls, seat.seat_id)
+        value.backend = seat.backend
+        value.model_chain = seat.model_chain
+        value.effort = seat.effort
+        value.workdir = workdir
+        return value
+
+
+def seat_backend(agent: str) -> str:
+    return agent.backend if isinstance(agent, SeatAgent) else agent
+
+
+def reviewer_seat_binding(config: object) -> dict[str, object] | None:
+    """Versioned board identity stored on named PR round records."""
+    override = getattr(config, "pr_seat_binding_override", None)
+    if override is not None:
+        return override
+    if not getattr(config, "reviewer_seats", ()):
+        return None
+    from .agents.registry import agent_display_name
+    from .config import resolve_invocation
+
+    entries: list[dict[str, object]] = []
+    for reviewer in config.reviewer:
+        if isinstance(reviewer, SeatAgent):
+            chain = list(reviewer.model_chain)
+            effort = reviewer.effort
+        else:
+            invocation = resolve_invocation(config, provider=reviewer, role="reviewer")
+            chain = (
+                list(config.antigravity_models)
+                if reviewer == "antigravity" else [invocation.configured_model]
+            )
+            effort = invocation.resolved_effort
+        entries.append({
+            "id": agent_display_name(reviewer),
+            "backend": seat_backend(reviewer),
+            "model_chain": chain,
+            "effort": effort,
+        })
+    return {"version": 1, "seats": entries}
+
+
+def validate_pr_seat_bindings(records: object, config: object) -> set[str]:
+    """Check historical named identity before any PR recovery or amendment.
+
+    A model change returns the seat IDs requiring fresh review. The caller
+    retains the old finding ledger; only approvals and response checkpoints
+    become ineligible for reuse.
+    """
+    current = reviewer_seat_binding(config)
+    from .agents.registry import agent_display_name
+    changed: set[str] = set()
+    latest_binding_by_seat: dict[str, dict] = {}
+    historical_backends: dict[str, str] = {}
+    current_entries = {
+        entry["id"]: entry for entry in current["seats"]
+    } if current is not None else {}
+    saw_bound = False
+    for record in records:
+        metadata = record.metadata
+        historical = metadata.seat_binding
+        if historical is None:
+            if current is not None and metadata.role in {"reviewer", "coder", "summary"}:
+                raise AgentLoopError(
+                    "Named PR reviewer board cannot adopt an unbound historical recovery record "
+                    f"({metadata.role}, {metadata.phase or 'no phase'})."
+                )
+            continue
+        saw_bound = True
+        if current is None:
+            raise AgentLoopError("A bound named PR reviewer board cannot resume as a legacy board.")
+        if not isinstance(historical, dict) or historical.get("version") != 1:
+            raise AgentLoopError("PR reviewer seat binding has an unsupported version.")
+        entries = historical.get("seats")
+        if not isinstance(entries, list) or not entries:
+            raise AgentLoopError("PR reviewer seat binding is incomplete.")
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not isinstance(entry.get("backend"), str) or not isinstance(entry.get("model_chain"), list):
+                raise AgentLoopError("PR reviewer seat binding has invalid seat fields.")
+            if (
+                not entry["model_chain"]
+                or any(
+                    (model is None and entry["id"] != agent_display_name(entry["backend"]))
+                    or (model is not None and (not isinstance(model, str) or not model.strip()))
+                    for model in entry["model_chain"]
+                )
+                or entry.get("effort") is not None and not isinstance(entry["effort"], str)
+            ):
+                raise AgentLoopError("PR reviewer seat binding has invalid model or effort fields.")
+            seat_id = entry["id"]
+            if seat_id in seen:
+                raise AgentLoopError("PR reviewer seat binding contains duplicate identities.")
+            seen.add(seat_id)
+            prior_backend = historical_backends.setdefault(seat_id, entry["backend"])
+            if prior_backend != entry["backend"]:
+                raise AgentLoopError(f"Reviewer seat {seat_id!r} changed backend in PR history.")
+            configured = current_entries.get(seat_id)
+            if configured is None:
+                continue  # Signed amendment lineage checks required-board changes.
+            if configured["backend"] != entry["backend"]:
+                raise AgentLoopError(f"Reviewer seat {seat_id!r} changed backend; refusing PR recovery.")
+            latest_binding_by_seat[seat_id] = entry
+        if metadata.role == "reviewer" and metadata.agent not in seen:
+            raise AgentLoopError("PR reviewer record is not represented in its seat binding.")
+    if current is not None and not saw_bound and any(
+        record.metadata.role in {"reviewer", "coder", "summary"} for record in records
+    ):
+        raise AgentLoopError("Named PR reviewer board has no verifiable historical binding.")
+    for seat_id, entry in latest_binding_by_seat.items():
+        configured = current_entries.get(seat_id)
+        if configured is None:
+            continue
+        if configured["model_chain"] != entry["model_chain"] or configured["effort"] != entry.get("effort"):
+            changed.add(seat_id)
+    return changed
+
+
+def validate_pr_backend_outage_amendments(amendments: object, config: object) -> None:
+    """A named shared-backend outage must remove all its active seats."""
+    from .board_amendment import (
+        REVIEWER_BOARD_REMOVAL_REASON, REVIEWER_SEAT_REMOVAL_REASON,
+        REVIEWER_MIXED_REMOVAL_REASON,
+    )
+    binding = reviewer_seat_binding(config)
+    if binding is None:
+        if any(amendment.reason == REVIEWER_MIXED_REMOVAL_REASON for amendment in amendments):
+            raise AgentLoopError("Mixed PR amendment requires a verified named seat binding.")
+        return
+    backends = {entry["id"]: entry["backend"] for entry in binding["seats"]}
+    for amendment in amendments:
+        removed = set(amendment.removed_reviewers)
+        if not removed:
+            continue
+        unknown = removed - backends.keys()
+        if unknown:
+            raise AgentLoopError(
+                "Named PR board amendment has no verified backend binding for "
+                + ", ".join(sorted(unknown))
+            )
+        if amendment.reason == REVIEWER_SEAT_REMOVAL_REASON:
+            continue
+        if amendment.reason == REVIEWER_MIXED_REMOVAL_REASON:
+            first_line = amendment.rationale.split("\n", 1)[0]
+            prefix = "shared_outage_backends="
+            if not first_line.startswith(prefix):
+                raise AgentLoopError("Mixed PR amendment must identify shared outage backends.")
+            listed = first_line[len(prefix):].split(",")
+            if (not listed or any(name not in _BACKENDS for name in listed)
+                    or len(set(listed)) != len(listed)):
+                raise AgentLoopError("Mixed PR amendment has invalid shared outage backends.")
+            affected = set(listed)
+            removed_backends = {backends[name] for name in removed}
+            if not affected <= removed_backends:
+                raise AgentLoopError("Mixed PR amendment names an outage backend without a removed seat.")
+            if affected == removed_backends:
+                raise AgentLoopError("Mixed PR amendment requires a separate seat-local failure.")
+        elif amendment.reason == REVIEWER_BOARD_REMOVAL_REASON:
+            affected = {backends[name] for name in removed}
+        else:
+            continue
+        required = set(amendment.original_required_reviewers)
+        for backend in affected:
+            active = {name for name in required if backends.get(name) == backend}
+            if not active <= removed:
+                raise AgentLoopError(
+                    f"Named PR backend outage for {backend} must remove every active seat: "
+                    + ", ".join(sorted(active))
+                )
 
 
 def _assignments(values: list[str] | None, option: str) -> dict[str, list[str]]:
@@ -47,6 +222,8 @@ def _assignments(values: list[str] | None, option: str) -> dict[str, list[str]]:
 
 def resolve_reviewer_seats(args: object) -> tuple[ReviewerSeat, ...]:
     """Validate the complete board without I/O or checkout creation."""
+    from .agents.registry import agent_display_name, agent_signature
+    from .comment_rendering import canonical_model_identity
     declarations = getattr(args, "reviewer_seat", None) or ()
     options = {
         "--seat-model": _assignments(getattr(args, "seat_model", None), "--seat-model"),

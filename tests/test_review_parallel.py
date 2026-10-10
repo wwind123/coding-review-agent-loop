@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import pytest
@@ -26,6 +27,126 @@ from agent_loop_helpers import (
     structured_plan_state,
     structured_pr_review,
 )
+from coding_review_agent_loop.agents import antigravity as agy_backend
+from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+
+def test_named_agy_seats_serialize_host_settings_and_bound_wait(tmp_path, monkeypatch):
+    import fcntl
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(agy_backend, "_antigravity_settings_path", lambda: settings)
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+    base = make_config(tmp_path)
+    active = 0
+    peak = 0
+    gate = threading.Lock()
+
+    class DelayedRunner(FakeRunner):
+        def run_with_log(self, args, **kwargs):
+            nonlocal active, peak
+            if args and args[0] == "agy":
+                with gate:
+                    active += 1
+                    peak = max(peak, active)
+                time.sleep(0.05)
+                try:
+                    return super().run_with_log(args, **kwargs)
+                finally:
+                    with gate:
+                        active -= 1
+            return super().run_with_log(args, **kwargs)
+
+    def invoke(seat):
+        config = dataclasses.replace(
+            base, antigravity_dir=seat.workdir, antigravity_model=seat.model_chain[0],
+            antigravity_models=seat.model_chain, active_reviewer_seat_id=str(seat),
+        )
+        return agy_backend.AntigravityBackend().run(
+            DelayedRunner(antigravity_outputs=[("review", 0)]), config, "Review PR.", role="reviewer"
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert all(result.text == "review" for result in pool.map(invoke, (flash, opus)))
+    assert peak == 1
+
+    lock_path = settings.with_suffix(".json.lock")
+    monkeypatch.setattr(agy_backend, "SETTINGS_LOCK_WAIT_SECONDS", 0.05)
+    runner = DelayedRunner(antigravity_outputs=[("review", 0)])
+    config = dataclasses.replace(
+        base, antigravity_dir=flash.workdir, antigravity_model="Model A",
+        antigravity_models=("Model A",), active_reviewer_seat_id="flash",
+    )
+    with lock_path.open("a+") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        try:
+            with pytest.raises(AgentLoopError, match="review is incomplete"):
+                agy_backend.AntigravityBackend().run(runner, config, "Review PR.", role="reviewer")
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN)
+    assert not any(command[0] == "agy" for command, _ in runner.commands)
+
+
+def test_named_pr_lock_wait_resume_keeps_seats_incomplete(tmp_path, monkeypatch):
+    import fcntl
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(agy_backend, "_antigravity_settings_path", lambda: settings)
+    monkeypatch.setattr(agy_backend, "SETTINGS_LOCK_WAIT_SECONDS", 0.05)
+    seats = tuple(
+        SeatAgent(ReviewerSeat(name, "antigravity", (model,)), tmp_path / name)
+        for name, model in (("flash", "Model A"), ("opus", "Model B"))
+    )
+    for seat in seats:
+        seat.workdir.mkdir()
+    runner = FakeRunner(antigravity_outputs=[
+        (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+        (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+    ])
+    config = make_config(
+        tmp_path, reviewer=seats, reviewer_seats=seats,
+        review_parallel=True, pr_review_policy="selective-intermediate",
+        pre_review_tests=False, agent_max_retries=0,
+    )
+    original_flock = fcntl.flock
+    lock_state = {"acquires": 0, "blocked": True}
+
+    def block_second_seat(handle, operation):
+        if (
+            getattr(handle, "name", None) == str(settings.with_suffix(".json.lock"))
+            and operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+        ):
+            if lock_state["acquires"] and lock_state["blocked"]:
+                raise BlockingIOError
+            lock_state["acquires"] += 1
+        return original_flock(handle, operation)
+
+    monkeypatch.setattr(fcntl, "flock", block_second_seat)
+    with pytest.raises(AgentLoopError, match="review is incomplete"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert lock_state["acquires"] == 1
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 1
+    assert _spool_files(config)
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from types import SimpleNamespace
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
+        flow="pr",
+    )
+    assert any(record.metadata.phase == "scheduler-prelaunch" for record in records)
+    assert not any(record.metadata.role == "reviewer" for record in records)
+    lock_state["blocked"] = False
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 2
+    reviews = [c["body"] for c in runner.pr_payload["comments"] if "**Review verdict:**" in c["body"]]
+    assert len(reviews) == 2
+    assert any(body.endswith("-- flash (Google Antigravity: Model A)") for body in reviews)
+    assert any(body.endswith("-- opus (Google Antigravity: Model B)") for body in reviews)
 
 
 def _initial_plan() -> str:

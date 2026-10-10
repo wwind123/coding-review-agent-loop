@@ -13,6 +13,7 @@ import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass
 from .agents.registry import agent_display_name, get_backend
+from .workdirs import agent_workdir
 from .config import AgentLoopConfig, phased_delivery_guard_active, reviewers
 from .decomposition import (
     _decode_json_payload,
@@ -295,7 +296,7 @@ def _prior_discuss_split_proposals(
         return list(latest.metadata.split_proposals)
     configured_reviewers = reviewers(config)
     reviewer_workdirs = {
-        agent_display_name(agent): get_backend(agent).workdir(config) for agent in configured_reviewers
+        agent_display_name(agent): agent_workdir(config, agent) for agent in configured_reviewers
     }
     recovered = _recover_final_discuss_split_proposals(
         issue_context,

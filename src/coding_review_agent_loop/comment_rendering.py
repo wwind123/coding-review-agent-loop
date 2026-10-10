@@ -351,6 +351,10 @@ def _public_reviewer_name(
     *,
     role: str | None = None,
 ) -> str:
+    from .reviewer_seats import SeatAgent
+
+    if isinstance(name, SeatAgent):
+        return agent_signature(name, config, model_used, role=role)
     agent = _AGENT_BY_DISPLAY_NAME.get(name)
     if agent is None and name in {"claude", "codex", "gemini", "antigravity"}:
         agent = name  # type: ignore[assignment]

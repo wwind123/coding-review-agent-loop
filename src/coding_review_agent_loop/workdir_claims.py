@@ -322,6 +322,7 @@ def release_workdir_claims(owner: ClaimOwner) -> None:
 
 def _agent_paths(config) -> list[tuple[str, Path]]:
     from .config import required_agents
+    from .workdirs import agent_workdir
 
     paths = {
         "claude": config.claude_dir,
@@ -332,7 +333,7 @@ def _agent_paths(config) -> list[tuple[str, Path]]:
     seen: set[str] = set()
     result: list[tuple[str, Path]] = []
     for agent in sorted(required_agents(config)):
-        path = paths[agent]
+        path = agent_workdir(config, agent)
         key = _claim_key(path)
         if key in seen:
             continue

@@ -50,17 +50,19 @@ def test_named_sandboxed_reviewer_is_refused_before_command_lookup(monkeypatch, 
 
 
 @pytest.mark.parametrize("backend", ["claude", "codex"])
-def test_named_sandboxed_supported_backend_reaches_phase_gate(monkeypatch, capsys, backend):
+def test_named_sandboxed_supported_backend_reaches_configuration(monkeypatch, backend):
     from coding_review_agent_loop import cli
 
-    monkeypatch.setattr(cli, "config_from_args", lambda *a, **k: pytest.fail("command preflight ran"))
-    code = cli.main([
-        "pr", "77", "--repo", "OWNER/REPO", "--agent-permissions", "sandboxed",
-        "--reviewer-seat", f"model-a={backend}", "--seat-model", "model-a=Model A",
-        "--repair-backend", "codex", "--semantic-followup-backend", "codex",
-    ])
-    assert code == 1
-    assert "execution is unavailable in phase 1" in capsys.readouterr().err
+    def reached_configuration(*_args, **_kwargs):
+        raise RuntimeError("configuration reached")
+
+    monkeypatch.setattr(cli, "config_from_args", reached_configuration)
+    with pytest.raises(RuntimeError, match="configuration reached"):
+        cli.main([
+            "pr", "77", "--repo", "OWNER/REPO", "--agent-permissions", "sandboxed",
+            "--reviewer-seat", f"model-a={backend}", "--seat-model", "model-a=Model A",
+            "--repair-backend", "codex", "--semantic-followup-backend", "codex",
+        ])
 
 
 @pytest.mark.parametrize("extra,expected", [

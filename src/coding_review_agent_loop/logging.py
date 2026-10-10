@@ -108,7 +108,7 @@ def agent_log_path(
     attempt = f"-{attempt_suffix}" if attempt_suffix else ""
     root = config.subprocess_log_dir or config.log_dir
     _prepare_capture_root(root)
-    return root / f"{prefix}{stamp}-{agent}{suffix}{attempt}.log"
+    return root / f"{prefix}{stamp}-{config.active_reviewer_seat_id or agent}{suffix}{attempt}.log"
 
 
 def run_usage_summary_path(config: AgentLoopConfig, run_id: str) -> Path:

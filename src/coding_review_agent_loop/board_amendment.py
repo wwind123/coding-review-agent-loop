@@ -40,9 +40,12 @@ from .round_state import PostedRoundRecord
 REVIEWER_BOARD_AMENDMENT_KIND = "reviewer-board-amendment"
 REVIEWER_BOARD_AMENDMENT_SCHEMA_VERSION = 1
 REVIEWER_BOARD_REMOVAL_REASON = "backend-unavailable"
+REVIEWER_SEAT_REMOVAL_REASON = "seat-unavailable"
+REVIEWER_MIXED_REMOVAL_REASON = "mixed-unavailable"
 REVIEWER_BOARD_RESTORATION_REASON = "backend-recovered"
 REVIEWER_BOARD_AMENDMENT_REASONS = frozenset(
-    {REVIEWER_BOARD_REMOVAL_REASON, REVIEWER_BOARD_RESTORATION_REASON}
+    {REVIEWER_BOARD_REMOVAL_REASON, REVIEWER_SEAT_REMOVAL_REASON,
+     REVIEWER_MIXED_REMOVAL_REASON, REVIEWER_BOARD_RESTORATION_REASON}
 )
 REVIEWER_BOARD_AMENDMENT_AUDIT_HEADING = "Reviewer board amendment applied."
 # ``restored_reviewers`` (#984) is optional so every removal-only record
@@ -327,8 +330,15 @@ def _amendment_record_problem(payload: dict[str, object]) -> str | None:
     reason = payload.get("reason")
     if reason not in REVIEWER_BOARD_AMENDMENT_REASONS:
         return f"reason must be one of {sorted(REVIEWER_BOARD_AMENDMENT_REASONS)}"
-    if not restored and reason != REVIEWER_BOARD_REMOVAL_REASON:
-        return f"a removal-only record must give reason `{REVIEWER_BOARD_REMOVAL_REASON}`"
+    if reason in {REVIEWER_SEAT_REMOVAL_REASON, REVIEWER_MIXED_REMOVAL_REASON} and flow != "pr":
+        return f"{reason} is supported only for pr amendments"
+    if reason in {REVIEWER_SEAT_REMOVAL_REASON, REVIEWER_MIXED_REMOVAL_REASON} and not removed:
+        return f"{reason} must remove at least one reviewer seat"
+    if not restored and reason not in {
+        REVIEWER_BOARD_REMOVAL_REASON, REVIEWER_SEAT_REMOVAL_REASON,
+        REVIEWER_MIXED_REMOVAL_REASON,
+    }:
+        return "a removal-only record must give a removal reason"
     if not removed and reason != REVIEWER_BOARD_RESTORATION_REASON:
         return (
             f"a restoration-only record must give reason `{REVIEWER_BOARD_RESTORATION_REASON}`"

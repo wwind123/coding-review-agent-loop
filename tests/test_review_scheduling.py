@@ -3,7 +3,214 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_loop_helpers import FakeRunner, make_config
+from agent_loop_helpers import (
+    FakeRunner, make_config, structured_coder_followup, structured_pr_review,
+)
+from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
+from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+
+def test_named_pr_primary_runs_before_same_backend_panel(tmp_path):
+    from coding_review_agent_loop.cli import run_pr_loop
+
+    first = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    primary = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    first.workdir.mkdir()
+    primary.workdir.mkdir()
+    runner = FakeRunner(antigravity_outputs=[
+        (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+        (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+    ])
+    config = make_config(
+        tmp_path, reviewer=(first, primary), reviewer_seats=(first, primary),
+        pr_review_policy="primary-then-panel", primary_reviewer=primary,
+        pre_review_tests=False, agent_max_retries=0,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
+              if cmd and cmd[0] == "agy" and "--model" in cmd]
+    assert models == ["Model B", "Model A"]
+
+
+def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
+    tmp_path, monkeypatch, capsys,
+):
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    seats = tuple(
+        SeatAgent(ReviewerSeat(name, "antigravity", (model,)), tmp_path / name)
+        for name, model in (("flash", "Model A"), ("opus", "Model B"))
+    )
+    for seat in seats:
+        seat.workdir.mkdir()
+    outputs = [
+        (structured_pr_review(
+            reviewer=f"{seat} (Google Antigravity: {seat.model_chain[0]})",
+            prior_item_dispositions=(
+                [{"item_id": "item-1", "disposition": "resolved"}] if round_number == 2 else []
+            ),
+        ), 0)
+        for round_number in (1, 2) for seat in seats
+    ]
+    runner = FakeRunner(
+        antigravity_outputs=outputs,
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    config = make_config(
+        tmp_path, reviewer=seats, reviewer_seats=seats,
+        pr_review_policy="all-reviewers", pre_review_tests=False,
+        agent_max_retries=0, max_rounds=2,
+    )
+    failed_check = PullRequestCheck(name="test", kind="check_run", status="failure")
+
+    def checks(*args, **kwargs):
+        failing = kwargs["metadata"].head_sha == "abc123"
+        return PullRequestChecks(
+            state="failing" if failing else "passing",
+            required_checks=("test",),
+            passing=() if failing else (PullRequestCheck(
+                name="test", kind="check_run", status="success",
+            ),),
+            failing=(failed_check,) if failing else (),
+            pending=(), missing_required=(),
+            branch_protection_status="configured", check_query_status="ok",
+        )
+
+    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
+    original_invoke = orchestrator._run_validated_agent
+    interrupted = False
+
+    def records():
+        return _extract_round_metadata_records(
+            [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
+            flow="pr",
+        )
+
+    def interrupt_before_second_new_head_review(*args, **kwargs):
+        nonlocal interrupted
+        if (
+            not interrupted and kwargs.get("role") == "reviewer"
+            and str(kwargs.get("agent")) == "opus"
+            and runner.pr_payload["headRefOid"] != "abc123"
+        ):
+            interrupted = True
+            raise KeyboardInterrupt
+        return original_invoke(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(orchestrator, "_run_validated_agent", interrupt_before_second_new_head_review)
+        with pytest.raises(KeyboardInterrupt):
+            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+
+    assert interrupted
+    assert runner.pr_payload["headRefOid"] != "abc123"
+    head = runner.pr_payload["headRefOid"]
+    approvals = [
+        record.metadata for record in records()
+        if record.metadata.role == "reviewer" and record.metadata.state == "approved"
+    ]
+    assert {(record.agent, record.subject) for record in approvals} == {
+        ("flash", "abc123"), ("opus", "abc123"), ("flash", head),
+    }
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 3
+    assert "PR #77 approved by" not in capsys.readouterr().out
+
+    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert "PR #77 approved by" in capsys.readouterr().out
+    approvals = [
+        record.metadata for record in records()
+        if record.metadata.role == "reviewer" and record.metadata.state == "approved"
+    ]
+    assert {(record.agent, record.subject) for record in approvals if record.subject == head} == {
+        ("flash", head), ("opus", head),
+    }
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 4
+
+
+def test_named_selective_pr_keeps_same_backend_seats_distinct(tmp_path, monkeypatch):
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from agent_loop_helpers import structured_coder_followup
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+    monkeypatch.setattr(
+        orchestrator, "_observe_pr_transition",
+        lambda *args, **kwargs: orchestrator.TransitionClassification("narrow", "worker-only fix"),
+    )
+    runner = FakeRunner(
+        antigravity_outputs=[
+            (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+            (structured_pr_review(
+                state="blocking", reviewer="opus (Google Antigravity: Model B)",
+                blocking_items=[{"text": "Fix worker", "fix_scope": ["src/worker.py"]}],
+            ), 0),
+            (structured_pr_review(
+                reviewer="opus (Google Antigravity: Model B)",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ), 0),
+            (structured_pr_review(
+                reviewer="flash (Google Antigravity: Model A)",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ), 0),
+        ],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+    )
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        pr_review_policy="selective-intermediate", pre_review_tests=False,
+        agent_max_retries=0, max_rounds=3,
+    )
+    original_post = orchestrator.post_pr_comment
+    audits = 0
+
+    def interrupt_after_second_audit(*args, **kwargs):
+        nonlocal audits
+        result = original_post(*args, **kwargs)
+        if "PR review scheduling audit:" in kwargs["body"]:
+            audits += 1
+            if audits == 2:
+                raise KeyboardInterrupt
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(orchestrator, "post_pr_comment", interrupt_after_second_audit)
+        with pytest.raises(KeyboardInterrupt):
+            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+    assert audits == 2
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    interrupted_records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
+        flow="pr",
+    )
+    assert any(record.metadata.phase == "coder-dispatch" and record.metadata.seat_binding
+               for record in interrupted_records)
+    checkpoint = next(
+        record.metadata for record in interrupted_records
+        if record.metadata.round_number == 2 and record.metadata.phase == "scheduler-prelaunch"
+    )
+    assert checkpoint.scheduler_selected_reviewers == ("opus",)
+    assert any(name == "flash" for name, _ in checkpoint.scheduler_paused_reviewers)
+    assert checkpoint.prior_items[0].reviewer == "opus"
+    assert checkpoint.prior_items[0].resolution_owners == ("opus",)
+    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
+              if cmd and cmd[0] == "agy" and "--model" in cmd]
+    assert models[:2] == ["Model A", "Model B"]
+    assert models.count("Model B") >= 2
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
+        flow="pr",
+    )
+    assert any(
+        record.metadata.round_number == 2
+        and "opus" in record.metadata.scheduler_selected_reviewers
+        and any(name == "flash" for name, _reason in record.metadata.scheduler_paused_reviewers)
+        for record in records
+    )
 
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.cli import build_parser

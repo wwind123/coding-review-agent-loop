@@ -87,6 +87,7 @@ class UsageCallRecord:
     session_id: str | None
     returncode: int | None
     usage: UsageMetadata
+    backend: str | None = None
     validation_status: Literal["validated", "invalid"] = "invalid"
     raw_backend_usage: object | None = None
     role: Literal["repair", "completion-recovery"] | None = None
@@ -122,7 +123,7 @@ class UsageCallRecord:
         if self.raw_backend_usage is not None:
             payload["raw_backend_usage"] = self.raw_backend_usage
         for key in (
-            "role", "turn_role", "model", "configured_model", "configured_effort",
+            "backend", "role", "turn_role", "model", "configured_model", "configured_effort",
             "effort_source", "observed_model", "observed_effort", "observation_provenance",
             "outcome", "log_path", "fallback_planned", "containment",
         ):
@@ -216,6 +217,7 @@ class RunUsageContext:
         session_id: str | None,
         returncode: int | None,
         usage: UsageMetadata,
+        backend: str | None = None,
         raw_backend_usage: object | None = None,
         role: Literal["repair", "completion-recovery"] | None = None,
         turn_role: str | None = None,
@@ -245,6 +247,7 @@ class RunUsageContext:
                 session_id=session_id,
                 returncode=returncode,
                 usage=usage,
+                backend=backend,
                 raw_backend_usage=raw_backend_usage,
                 role=role,
                 turn_role=turn_role,

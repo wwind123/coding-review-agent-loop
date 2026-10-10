@@ -10,7 +10,7 @@ import datetime
 import hashlib
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclasses_replace
 
 from .agents.base import AgentName, AgentResult
 from .agents.antigravity import AntigravityAttemptState
@@ -1085,9 +1085,19 @@ def _run_validated_agent(
         marker_description=marker_description,
     )
     log_paths: list[object] = []
+    from .reviewer_seats import SeatAgent, seat_backend
+    backend_agent = seat_backend(agent)
+    if isinstance(agent, SeatAgent):
+        seat_overrides = {"active_reviewer_seat_id": str(agent)}
+        if backend_agent == "antigravity":
+            seat_overrides.update(
+                antigravity_models=agent.model_chain,
+                antigravity_model=None,
+            )
+        config = dataclasses_replace(config, **seat_overrides)
     antigravity_attempts = (
         AntigravityAttemptState.from_config(config, config.agent_max_retries)
-        if agent == "antigravity"
+        if backend_agent == "antigravity"
         else None
     )
     # Each fallback retains an initial attempt; retry allowance is shared. The
@@ -1244,19 +1254,19 @@ def _run_validated_agent(
         )
         invocation_kwargs: dict[str, object] = {}
         is_executable_replacement_replay = executable_replacement_replay_pending
-        if agent == "claude":
+        if backend_agent == "claude":
             invocation_kwargs["attempt_suffix"] = (
                 "self-update-attempt2"
                 if is_executable_replacement_replay
                 else f"attempt{ordinary_retries_used + 1}"
             )
         elif is_executable_replacement_replay:
-            invocation_kwargs["attempt_suffix"] = executable_replacement_policies[agent][2]
+            invocation_kwargs["attempt_suffix"] = executable_replacement_policies[backend_agent][2]
         if pending_matrix_integrity_reprompt is not None:
             attempt_prompt = _fresh_matrix_contract_retry_prompt(
                 prompt, pending_matrix_integrity_reprompt
             )
-            if agent == "claude":
+            if backend_agent == "claude":
                 invocation_kwargs["attempt_suffix"] = "matrix-integrity-replay"
             pending_matrix_integrity_reprompt = None
         elif pending_judgement_reask is not None:
@@ -1264,7 +1274,7 @@ def _run_validated_agent(
             attempt_prompt = _missing_judgement_field_reask_prompt(
                 prompt, *pending_judgement_reask
             )
-            if agent == "claude":
+            if backend_agent == "claude":
                 invocation_kwargs["attempt_suffix"] = "judgement-reask"
             pending_judgement_reask = None
         elif pending_omission_reask_ids is not None:
@@ -1273,7 +1283,7 @@ def _run_validated_agent(
             attempt_prompt = _prior_disposition_omission_reask_prompt(
                 prompt, pending_omission_reask_ids
             )
-            if agent == "claude":
+            if backend_agent == "claude":
                 invocation_kwargs["attempt_suffix"] = "omission-reask"
             pending_omission_reask_ids = None
         else:
@@ -1291,7 +1301,7 @@ def _run_validated_agent(
                 prompt, pending_evidence_reask_detail
             )
             attempt_session_id = pending_evidence_reask_session
-            if agent == "claude":
+            if backend_agent == "claude":
                 invocation_kwargs["attempt_suffix"] = "evidence-reask"
             pending_evidence_reask_detail = None
             pending_evidence_reask_session = None
@@ -1333,6 +1343,7 @@ def _run_validated_agent(
         if usage_context is not None and usage is not None:
             usage_record = usage_context.add_record(
                 agent=agent,
+                backend=backend_agent if isinstance(agent, SeatAgent) else None,
                 session_id=result.session_id,
                 returncode=result.returncode,
                 usage=usage,
@@ -1506,7 +1517,7 @@ def _run_validated_agent(
         # bounded stability wait, one replay, and retry accounting. A workdir
         # refusal deliberately remains diagnostic-only and cannot enter it.
         if (
-            agent in executable_replacement_policies
+            backend_agent in executable_replacement_policies
             and result.self_update_reason is not None
             and result.self_update_replay_refusal_kind is None
             and not executable_replacement_considered
@@ -1517,7 +1528,7 @@ def _run_validated_agent(
             executable_replacement_reason = result.self_update_reason
             observation = result.command_result.observation
             command, provider_label, _suffix, uses_remaining_deadline = (
-                executable_replacement_policies[agent]
+                executable_replacement_policies[backend_agent]
             )
             if uses_remaining_deadline:
                 self_update_deadline = (
@@ -1667,7 +1678,7 @@ def _run_validated_agent(
                 returncode=result.returncode,
                 empty_response=False,
                 signatures=config.antigravity_quota_signatures,
-            ) if agent == "antigravity" else None
+            ) if backend_agent == "antigravity" else None
             provider_capacity = bool(capacity and capacity.is_capacity)
             if provider_capacity:
                 should_retry = True
@@ -1696,7 +1707,7 @@ def _run_validated_agent(
                 returncode=result.returncode,
                 empty_response=True,
                 signatures=config.antigravity_quota_signatures,
-            ) if agent == "antigravity" else None
+            ) if backend_agent == "antigravity" else None
             provider_capacity = bool(capacity and capacity.is_capacity)
             if provider_capacity:
                 should_retry = True
@@ -1834,7 +1845,7 @@ def _run_validated_agent(
                 if (
                     completion_recovery is not None
                     and not completion_recovery_attempted
-                    and agent == "claude"
+                    and backend_agent == "claude"
                     and result.session_id
                     and looks_like_backgrounded_completion(classification_text)
                 ):
