@@ -1110,7 +1110,9 @@ def _run_plan_first_loop(
             try:
                 return _extract_round_metadata_records(issue_context.comments, flow="plan")
             except AgentLoopError as exc:
-                stop_plan_pre_panel(plan_undecodable_history_message(exc))
+                stop_plan_pre_panel(
+                    plan_undecodable_history_message(exc), round_number=None
+                )
                 raise
         try:
             return _extract_round_metadata_records(issue_context.comments, flow="plan")

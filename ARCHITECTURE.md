@@ -1879,4 +1879,7 @@ writes the same versioned seat binding into coder, reviewer, and scheduling
 round records. Resume validates the binding before reading
 approvals or amendments; a model-chain change starts a fresh review round
 while preserving verifiable seat-owned findings. The issue-to-PR handoff checks
-the plan board and binding before PR review begins.
+the plan board and binding before PR review begins. For a staged child with no
+plan records, it reads the parent issue that supplied the approved plan and
+verifies that issue's seat binding and amendment lineage. A named handoff
+without verifiable plan review records stops before reviewer invocation.

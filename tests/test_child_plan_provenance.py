@@ -1202,6 +1202,49 @@ def test_managed_ci_resume_recovers_staged_parent_held_plan(tmp_path, monkeypatc
     assert_no_agent_process(runner)
 
 
+def test_staged_child_pr_rejects_divergent_parent_plan_seat_board(tmp_path, monkeypatch):
+    """A handoff-only child must validate the parent plan's bound board."""
+    from coding_review_agent_loop.plan_review_scheduling import make_plan_contract
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent, reviewer_seat_binding
+
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    extra = SeatAgent(ReviewerSeat("extra", "codex", ("gpt-6-sol",)), tmp_path / "extra")
+    approved_config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+    )
+    bound_record = _attach_round_metadata(plan, PostedRoundMetadata(
+        flow="plan", role="summary", agent="Orchestrator", round_number=1,
+        subject=_plan_subject(plan), canonical_plan=plan,
+        seat_binding=reviewer_seat_binding(approved_config),
+        scheduler_contract=make_plan_contract(
+            ("flash", "opus"), "all-reviewers", None,
+        ).as_dict(),
+    ))
+    parent = dataclasses.replace(
+        parent, comments=(comment(bound_record),) + parent.comments[1:],
+    )
+    assert not orchestrator._extract_round_metadata_records(child.comments, flow="plan")
+    monkeypatch.setattr(
+        orchestrator, "get_issue_context",
+        lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
+    )
+    runner = FakeRunner(pr_payload={"body": "Fixes #56"})
+    config = make_config(
+        tmp_path, reviewer=(flash, opus, extra),
+        reviewer_seats=(flash, opus, extra),
+    )
+
+    with pytest.raises(AgentLoopError, match="required reviewer seat board"):
+        orchestrator.run_pr_loop(
+            runner, pr_number=77, config=config,
+            issue_context=child, parent_issue_context=parent,
+        )
+    assert_no_agent_process(runner)
+
+
 def test_managed_ci_resume_refreshes_stale_parent_snapshot_once(tmp_path, monkeypatch):
     """A caller snapshot predating plan approval is refreshed before the lookup."""
     plan = fresh_staged_plan()

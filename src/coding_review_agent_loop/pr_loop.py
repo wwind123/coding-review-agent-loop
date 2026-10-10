@@ -1826,17 +1826,38 @@ def run_pr_loop(
             log(config, f"PR #{pr_number}: managed-CI adoption provenance changed; using ordinary CI")
             managed_ci = None
             return False
+        plan_handoff_comments = issue_context.comments if issue_context is not None else ()
+        plan_handoff_issue_number = issue_context.number if issue_context is not None else None
         if issue_context is not None and approved_plan_context is not None and config.reviewer_seats:
+            # A direct staged child can contain only its implementation handoff.
+            # Its approved plan and reviewer board then live on the parent issue.
+            child_plan_records = _extract_round_metadata_records(
+                issue_context.comments, flow="plan"
+            )
+            if not child_plan_records and parent_issue_context is not None:
+                parent_plan = recover_approved_plan_context(
+                    parent_issue_context.comments,
+                    expected_hash=approved_plan_context.plan_hash,
+                )
+                if parent_plan.is_available:
+                    plan_handoff_comments = parent_issue_context.comments
+                    plan_handoff_issue_number = parent_issue_context.number
+            plan_records = _extract_round_metadata_records(
+                plan_handoff_comments, flow="plan"
+            )
+            if not plan_records:
+                raise AgentLoopError(
+                    "Named issue-to-PR handoff has no verifiable approved plan reviewer board."
+                )
             from .reviewer_seats import reconcile_plan_handoff_board
             config = reconcile_plan_handoff_board(
-                config, issue_context.comments, issue_context.number,
+                config, plan_handoff_comments, plan_handoff_issue_number,
             )
         memory = prepare_agent_memory(runner, config)
         from .reviewer_seats import reviewer_seat_binding, validate_pr_seat_bindings
         seat_binding = reviewer_seat_binding(config)
         if issue_context is not None and approved_plan_context is not None and seat_binding is not None:
             from .reviewer_seats import validate_plan_handoff_seats
-            plan_records = _extract_round_metadata_records(issue_context.comments, flow="plan")
             validate_plan_handoff_seats(plan_records, config)
 
         def bound_pr_metadata(**fields: object) -> PostedRoundMetadata:
