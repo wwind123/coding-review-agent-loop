@@ -552,8 +552,14 @@ def _entry_plan_handoff_board(
     plan is bound, so no plan authorization applies.
     """
     owning_number = issue_context.number if issue_context is not None else None
+    # Only the managed-CI recovery paths bind an issue's canonical plan when
+    # no handoff record names this PR (#1378 review item-10).
+    canonical_recovery_scope = False
     if owning_number is None:
         owning_number = managed_ci_issue_number or config.managed_ci_issue_number
+        canonical_recovery_scope = (
+            owning_number is not None and config.managed_ci_fresh_authorization
+        )
     if owning_number is None:
         recorded = find_latest_pr_contract(
             pr_context.comments, repository=config.repo, pr_number=pr_number,
@@ -568,6 +574,7 @@ def _entry_plan_handoff_board(
         )
         if branch is not None:
             owning_number = int(branch.group(1))
+            canonical_recovery_scope = True
     if owning_number is None:
         # The same single-linked-issue fallback the provenance block applies;
         # its handoff record must still name this PR to bind a plan.
@@ -584,9 +591,14 @@ def _entry_plan_handoff_board(
         handoff = find_latest_issue_pr_handoff(
             owning.comments, issue_number=owning.number, repo=config.repo,
         )
+        if handoff is None and not canonical_recovery_scope:
+            # An ordinary PR binds a plan only through a handoff record that
+            # names it; unrelated or unfinished planning is not consulted.
+            return None
         if handoff is None:
-            # No handoff record: the recovery paths bind the issue's completely
-            # approved canonical plan, verified the same way here.
+            # No handoff record: managed-CI fresh authorization and ordinary
+            # managed-CI resume bind the issue's completely approved canonical
+            # plan, verified the same way here.
             canonical = _canonical_plan_without_handoff(
                 config,
                 owning,

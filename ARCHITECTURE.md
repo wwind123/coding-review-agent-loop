@@ -1960,9 +1960,12 @@ primary issue, the issue named by the managed branch (ordinary managed-CI
 recovery), or the single issue the PR body links. The plan identity comes from the caller's approved plan or from
 the issue-side handoff that names this PR. The board then comes from the issue
 holding exactly that plan, either the child or its staged parent. With no
-handoff record, the owning issue's completely approved canonical plan is
-verified by the same helper the recovery paths use, and that issue's board is
-used. The read-only PR preflight also validates persisted PR seat bindings
+handoff record, only the managed-CI recovery scopes (fresh authorization with
+an explicit issue, or ordinary resume from the managed branch) bind the owning
+issue's completely approved canonical plan. It is verified by the same helper
+those recovery paths use, and that issue's board is used. An ordinary PR whose
+linked issue has no handoff record naming it binds no plan, so unfinished
+planning on that issue is never consulted. The read-only PR preflight also validates persisted PR seat bindings
 before it grants a signed floor exception, so a backend change on a remaining
 seat fails before any write. This is the
 same selection the handoff seam applies, and the seam repeats the check. The

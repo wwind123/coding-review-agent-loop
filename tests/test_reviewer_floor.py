@@ -600,6 +600,10 @@ def _no_handoff_plan_pr(tmp_path, *, plan_state, scope):
     if scope == "explicit-scope":
         # Managed-CI fresh authorization with an explicit issue scope.
         kwargs["managed_ci_issue_number"] = 56
+        overrides.update(
+            managed_ci=True, managed_ci_pr_mode=True, managed_ci_fresh_authorization=True,
+            managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        )
     else:
         # Ordinary managed-CI recovery binds the issue named by the managed branch.
         runner.pr_payload["headRefName"] = "agent-loop/managed-56"
@@ -738,3 +742,45 @@ def test_fresh_authorization_with_a_signed_plan_reduction_reaches_authorization(
         run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True)
     assert runner.comments == []
     assert _agent_commands(runner) == []
+
+
+def _incomplete_linked_plan_comments(tmp_path):
+    _seats, runner, _kwargs, _overrides = _no_handoff_plan_pr(
+        tmp_path, plan_state="incomplete", scope="managed-branch",
+    )
+    return runner.issue_comments_by_number[56]
+
+
+@pytest.mark.parametrize("trigger", ["floor", "signed-pr-amendment"])
+def test_ordinary_pr_ignores_unfinished_planning_on_its_linked_issue(
+    tmp_path, monkeypatch, trigger
+):
+    """item-10: only managed-CI recovery binds a canonical plan without a handoff record."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+
+    plan_comments = _incomplete_linked_plan_comments(tmp_path)
+
+    def reached(*_a, **_k):
+        raise _Reached
+
+    if trigger == "floor":
+        from coding_review_agent_loop.cli import run_pr_loop
+
+        runner = FakeRunner(
+            issue_payloads_by_number={56: {"number": 56}},
+            issue_comments_by_number={56: plan_comments},
+        )
+        config = make_config(
+            tmp_path, reviewer=("codex", "claude"), pre_review_tests=False, min_reviewers=2,
+        )
+    else:
+        runner, board, run_pr_loop = _amended_named_pr(tmp_path, monkeypatch)
+        runner.issue_payloads_by_number = {56: {"number": 56}}
+        runner.issue_comments_by_number = {56: plan_comments}
+        config = make_config(tmp_path, **board)
+    runner.pr_payload["body"] = "Closes #56"
+    comments_before = len(runner.comments)
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", reached)
+    with pytest.raises(_Reached):
+        run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True)
+    assert len(runner.comments) == comments_before
