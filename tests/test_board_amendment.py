@@ -272,6 +272,164 @@ def test_named_pr_backend_outage_requires_one_complete_removal():
         validate_pr_backend_outage_amendments((amendment(("unbound",)),), config)
 
 
+@pytest.mark.parametrize("policy", ["primary-then-panel", "all-reviewers"])
+def test_named_plan_signed_outage_requires_complete_removal_and_explicit_restore(tmp_path, policy):
+    from coding_review_agent_loop.reviewer_seats import (
+        ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,
+    )
+
+    board = ("primary", "flash", "opus", "other")
+    config = SimpleNamespace(
+        reviewer_seats=("named",),
+        reviewer=tuple(
+            SeatAgent(ReviewerSeat(name, backend, (model,)), tmp_path / name)
+            for name, backend, model in (
+                ("primary", "codex", "gpt-6-sol"),
+                ("flash", "antigravity", "gemini-flash"),
+                ("opus", "antigravity", "claude-opus"),
+                ("other", "claude", "claude-sonnet"),
+            )
+        ),
+    )
+    primary = "primary" if policy == "primary-then-panel" else None
+    original = make_plan_contract(board, policy, primary)
+
+    def signed(original_board, removed, restored, round_number):
+        return format_reviewer_board_amendment_comment(
+            flow="plan", issue=942, pr_number=None,
+            original_required_reviewers=original_board,
+            policy=policy, primary_reviewer=primary,
+            removed_reviewers=removed, restored_reviewers=restored,
+            effective_from_round=round_number,
+            rationale="Shared backend outage or recovery.",
+        )
+
+    comments = [
+        _comment(signed(board, ("flash", "opus"), (), 2)),
+        _comment(signed(("primary", "other"), (), ("flash", "opus"), 3)),
+    ]
+    amendments = _plan_amendments(comments)
+    validate_pr_backend_outage_amendments(amendments, config)
+    lineage = resolve_contract_lineage(
+        [_checkpoint(0, 1, original)], amendments, original,
+        accept_base_configured=True,
+        contract_from_metadata=_plan_contract, drift_error=_drift,
+    )
+    assert lineage.contracts[1].required_reviewers == ("primary", "other")
+    assert lineage.contracts[-1].required_reviewers == board
+    partial = _plan_amendments([_comment(signed(board, ("flash",), (), 2))])
+    with pytest.raises(AgentLoopError, match="must remove every active seat"):
+        validate_pr_backend_outage_amendments(partial, config)
+    if primary is not None:
+        removes_primary = _plan_amendments([_comment(signed(board, ("primary",), (), 2))])
+        with pytest.raises(AgentLoopError, match="primary reviewer"):
+            amend_contract(original, removes_primary[0], base_board=board)
+
+
+@pytest.mark.parametrize("policy", ["primary-then-panel", "all-reviewers"])
+def test_named_plan_resume_applies_signed_shared_outage_before_panel(tmp_path, policy):
+    from agent_loop_helpers import FakeRunner, make_config, structured_plan_review, structured_v1_plan_state
+    from coding_review_agent_loop.cli import run_issue_loop
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    unavailable = json.dumps({
+        "schema_version": 1, "kind": "agent_unavailable", "retryable": False,
+        "category": "provider", "summary": "Shared account unavailable.",
+        "suggested_action": "Restore the account.",
+    }) + "\n<!-- AGENT_UNAVAILABLE -->\n-- Google Antigravity"
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review()],
+        gemini_outputs=[structured_plan_review(reviewer="Google Gemini")],
+        antigravity_outputs=[unavailable, unavailable],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", flash, opus),
+        reviewer_seats=(flash, opus), review_parallel=True,
+        plan_review_policy=policy,
+        primary_plan_reviewer="codex" if policy == "primary-then-panel" else None,
+        plan_execution_mode="plan-only", agent_max_retries=0, max_rounds=4,
+    )
+    with pytest.raises(AgentLoopError) as initial_error:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert runner.issue_comments, str(initial_error.value)
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    initial_records = _extract_round_metadata_records(
+        [_comment(entry["body"]) for entry in runner.issue_comments], flow="plan"
+    )
+    assert any(record.metadata.scheduler_contract for record in initial_records), str(
+        initial_error.value
+    )
+    before = len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"])
+    body = format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("Codex", "Gemini", "flash", "opus"),
+        policy=policy, primary_reviewer="Codex" if policy == "primary-then-panel" else None,
+        removed_reviewers=("flash", "opus"),
+        effective_from_round=2 if policy == "primary-then-panel" else 1,
+        rationale="The shared Antigravity account is unavailable.",
+    )
+    runner.issue_comments.append({
+        "body": body, "author": {"login": "operator", "id": 81},
+        "createdAt": f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z", "id": 995,
+    })
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == before
+
+    restore_round = 3 if policy == "primary-then-panel" else 2
+    from dataclasses import replace
+    revised_flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model C",)), tmp_path / "flash")
+    restored_config = replace(
+        config, reviewer=("codex", "gemini", revised_flash, opus),
+        reviewer_seats=(revised_flash, opus), review_parallel=False,
+    )
+    restoration = format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None,
+        original_required_reviewers=("Codex", "Gemini"),
+        policy=policy, primary_reviewer="Codex" if policy == "primary-then-panel" else None,
+        removed_reviewers=(), restored_reviewers=("flash", "opus"),
+        effective_from_round=restore_round,
+        rationale="The shared Antigravity account has recovered.",
+    )
+    runner.issue_comments.append({
+        "body": restoration, "author": {"login": "operator", "id": 81},
+        "createdAt": f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z", "id": 996,
+    })
+    runner.antigravity_outputs.extend([
+        structured_plan_review(reviewer="flash (Google Antigravity: Model C)"),
+        unavailable,
+    ])
+    runner.codex_outputs.append(structured_plan_review())
+    runner.gemini_outputs.append(structured_plan_review(reviewer="Google Gemini"))
+    before = len(runner.commands)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=restored_config, plan_first=True)
+    incomplete_reviews = _extract_round_metadata_records(
+        [_comment(entry["body"]) for entry in runner.issue_comments], flow="plan"
+    )
+    assert not any(record.metadata.agent == "opus" and record.metadata.state == "approved"
+                   for record in incomplete_reviews)
+    runner.antigravity_outputs.append(
+        structured_plan_review(reviewer="opus (Google Antigravity: Model B)")
+    )
+    assert run_issue_loop(runner, issue_number=56, config=restored_config, plan_first=True) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands[before:]
+              if cmd[0] == "agy" and "--model" in cmd]
+    assert models == ["Model C", "Model B", "Model B"]
+    restored_reviews = [
+        record.metadata for record in _extract_round_metadata_records(
+            [_comment(entry["body"]) for entry in runner.issue_comments], flow="plan"
+        ) if record.metadata.role == "reviewer"
+        and record.metadata.agent in {"flash", "opus"}
+        and record.metadata.state == "approved"
+    ]
+    assert {review.agent for review in restored_reviews} == {"flash", "opus"}
+    assert len(restored_reviews) == 2
+    assert len({review.subject for review in restored_reviews}) == 1
+
+
 def test_named_pr_seat_local_amendment_reason_is_signed_and_recoverable():
     from coding_review_agent_loop.reviewer_seats import (
         ReviewerSeat, SeatAgent, validate_pr_backend_outage_amendments,

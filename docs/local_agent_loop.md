@@ -462,6 +462,9 @@ Reviewer board amendment:
   records after an amendment comment it could not read, those records are never
   reinterpreted. The drift error then tells you to delete the unread amendment
   comment and post a fresh signed record with the printed `effective_from_round`.
+- **Named plan boards.** Under `all-reviewers`, named plan rounds persist the
+  bound board even though they do not schedule a subset. Signed plan amendments
+  can remove every seat on an unavailable backend and restore them in a later round.
 - **Retroactive use.** The record rescues runs whose contract was persisted
   before this feature existed. Earlier rounds are never rewritten. Inside the
   re-entered round, reviews already posted by the remaining reviewers are
@@ -575,7 +578,7 @@ helpers accept `--require-risk-test-matrix-contract` for fresh contract checks.
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
-PR reviewer seats have a configuration preflight. Declare each seat
+PR and issue-plan reviewer seats have a configuration preflight. Declare each seat
 with `--reviewer-seat ID=BACKEND` and at least one `--seat-model ID=MODEL`.
 Only Antigravity accepts repeated seat models as a fallback chain. Codex and
 Claude seats may use `--seat-effort ID=EFFORT`; `--seat-dir ID=PATH` assigns a
@@ -589,13 +592,15 @@ CLI default cannot be checked for overlap. Backend-wide model and effort flags
 require an active coder or explicit legacy reviewer for that backend; use
 `--seat-model` and `--seat-effort` for named seats. Named-only PR boards suppress
 the implicit Codex reviewer; an explicit `--reviewer` adds a legacy default
-seat. `--primary-reviewer-seat ID` selects the named primary under PR
-`primary-then-panel`. The PR, task, managed PR, and plain issue PR paths use
+seat. `--primary-reviewer-seat ID` selects the named PR primary; use
+`--primary-plan-reviewer-seat ID` for issue-plan `primary-then-panel` review.
+The PR, task, managed PR, plain issue PR, and issue `--plan-first` paths use
 seat IDs for scheduling, response validation, artifacts, approval, and resume.
-Saved PR records bind seat IDs to backends and model chains. Changing a chain
-invalidates old approvals and response checkpoints, preserves verified open
+Saved plan and PR records bind seat IDs to backends and model chains. Changing a
+chain invalidates old approvals and response checkpoints, preserves verified open
 seat-owned findings, and starts a fresh review round. A backend change is
-refused. Issue `--plan-first` and `discuss` continue to reject named seats.
+refused. A plan-to-PR handoff checks the required seat board and binding before
+PR approvals can be reused. `discuss` continues to reject named seats.
 Legacy `--reviewer agy` and `--antigravity-models` still describe one fallback
 reviewer. Same-account Antigravity seats share quota state and take turns under
 the host settings lock; lock waits are visible and bounded separately from the

@@ -1947,6 +1947,40 @@ def _decode_plan_scheduler_fields(payload: Mapping[str, object]) -> dict[str, ob
         PlanReviewSchedulingContract,
     )
 
+    # Named all-reviewers plans persist a board contract for signed amendment
+    # lineage without enabling scheduler selection or carried approvals. The
+    # contract is accepted only with a bound seat board and no scheduler vote.
+    if (
+        isinstance(payload.get("seat_binding"), dict)
+        and payload.get("scheduler_contract") is not None
+    ):
+        try:
+            board = PlanReviewSchedulingContract.from_mapping(payload["scheduler_contract"])
+        except (AgentLoopError, TypeError, ValueError, KeyError):
+            board = None
+        if board is not None and board.policy == "all-reviewers" and board.primary_reviewer is None:
+            neutral = {
+                "scheduler_obligation_digest": None,
+                "scheduler_selected_reviewers": [],
+                "scheduler_paused_reviewers": [],
+                "scheduler_reasons": [],
+                "scheduler_final_sweep": None,
+                "scheduler_force_full": None,
+                "scheduler_calls_avoided": None,
+            }
+            auxiliary = (
+                _SCHEDULER_AUXILIARY_KEYS
+                | _PLAN_ONLY_SCHEDULER_KEYS
+                | _PR_ONLY_SCHEDULER_KEYS
+            )
+            if all(payload.get(key) == value for key, value in neutral.items()) and not any(
+                payload.get(key) is not None for key in auxiliary
+            ):
+                return {
+                    "scheduler_contract": board.as_dict(),
+                    "scheduler_metadata_status": "valid",
+                }
+
     if not _PLAN_SCHEDULER_METADATA_KEYS.issubset(payload.keys()):
         return {"scheduler_metadata_status": "invalid"}
     if any(payload.get(key) is not None for key in _PR_ONLY_SCHEDULER_KEYS):

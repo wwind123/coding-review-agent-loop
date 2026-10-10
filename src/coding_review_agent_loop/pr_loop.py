@@ -1821,9 +1821,63 @@ def run_pr_loop(
             log(config, f"PR #{pr_number}: managed-CI adoption provenance changed; using ordinary CI")
             managed_ci = None
             return False
+        plan_handoff_comments = issue_context.comments if issue_context is not None else ()
+        plan_handoff_issue_number = issue_context.number if issue_context is not None else None
+        plan_records = ()
+        if issue_context is not None and approved_plan_context is not None:
+            # Select the board from the issue that supplied this exact approved
+            # plan. Unrelated child plan rounds must not replace a parent board.
+            child_plan = recover_approved_plan_context(
+                issue_context.comments,
+                expected_hash=approved_plan_context.plan_hash,
+                expected_subject=approved_plan_context.plan_subject,
+            )
+            if child_plan.is_available:
+                if child_plan.canonical_text != approved_plan_context.canonical_text:
+                    raise AgentLoopError("Named issue-to-PR handoff plan identity changed during recovery.")
+            elif not child_plan.has_matching_candidate and parent_issue_context is not None:
+                parent_plan = recover_approved_plan_context(
+                    parent_issue_context.comments,
+                    expected_hash=approved_plan_context.plan_hash,
+                    expected_subject=approved_plan_context.plan_subject,
+                )
+                if parent_plan.is_available and parent_plan.canonical_text == approved_plan_context.canonical_text:
+                    plan_handoff_comments = parent_issue_context.comments
+                    plan_handoff_issue_number = parent_issue_context.number
+                elif config.reviewer_seats:
+                    raise AgentLoopError("Named issue-to-PR handoff has no matching parent plan reviewer board.")
+                else:
+                    plan_handoff_comments = ()
+            elif config.reviewer_seats:
+                raise AgentLoopError("Named issue-to-PR handoff has no verifiable approved plan reviewer board.")
+            else:
+                plan_handoff_comments = ()
+            plan_records = _extract_round_metadata_records(
+                plan_handoff_comments, flow="plan"
+            )
+            named_plan_board = any(
+                record.metadata.seat_binding is not None for record in plan_records
+            )
+            if named_plan_board and not config.reviewer_seats:
+                raise AgentLoopError(
+                    "Issue-to-PR handoff requires the named reviewer seats from the approved plan; "
+                    "supply the plan's --reviewer-seat configuration before PR review."
+                )
+            if config.reviewer_seats and not plan_records:
+                raise AgentLoopError(
+                    "Named issue-to-PR handoff has no verifiable approved plan reviewer board."
+                )
+            if config.reviewer_seats:
+                from .reviewer_seats import reconcile_plan_handoff_board
+                config = reconcile_plan_handoff_board(
+                    config, plan_handoff_comments, plan_handoff_issue_number,
+                )
         memory = prepare_agent_memory(runner, config)
         from .reviewer_seats import reviewer_seat_binding, validate_pr_seat_bindings
         seat_binding = reviewer_seat_binding(config)
+        if issue_context is not None and approved_plan_context is not None and seat_binding is not None:
+            from .reviewer_seats import validate_plan_handoff_seats
+            validate_plan_handoff_seats(plan_records, config)
 
         def bound_pr_metadata(**fields: object) -> PostedRoundMetadata:
             metadata = PostedRoundMetadata(**fields)

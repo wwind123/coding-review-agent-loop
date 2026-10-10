@@ -1924,7 +1924,10 @@ def validate_sandboxed_args(
                 reviewer=configured_reviewers,
                 reviewer_seats=named_seats,
                 primary_reviewer=getattr(args, "primary_reviewer", None),
-                primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
+                primary_plan_reviewer=(
+                    next((seat for seat in named_seats if seat.seat_id == getattr(args, "primary_plan_reviewer_seat", None)), None)
+                    or getattr(args, "primary_plan_reviewer", None)
+                ),
                 discuss_analyzer=getattr(args, "discuss_analyzer", None),
                 repair_backend=getattr(args, "repair_backend", "antigravity"),
                 semantic_followup_dedupe=getattr(args, "semantic_followup_dedupe", True),
@@ -2243,7 +2246,11 @@ def config_from_args(
         ),
         pr_review_force_full=bool(getattr(args, "pr_review_force_full", False)),
         plan_review_policy=getattr(args, "plan_review_policy", None) or "all-reviewers",
-        primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
+        primary_plan_reviewer=(
+            next((seat for seat in seat_agents if seat == args.primary_plan_reviewer_seat), None)
+            if getattr(args, "primary_plan_reviewer_seat", None)
+            else getattr(args, "primary_plan_reviewer", None)
+        ),
         plan_review_force_full=bool(getattr(args, "plan_review_force_full", False)),
         plan_primary_stall_rounds=_arg_or_default(
             args, "plan_primary_stall_rounds", DEFAULT_PLAN_PRIMARY_STALL_ROUNDS

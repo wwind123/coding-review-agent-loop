@@ -221,13 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
             action="append",
             default=None,
             help=(
-                "Agent that reviews the PR and gates approval. Repeat for multiple "
+                "Agent that reviews the PR or issue plan and gates approval. Repeat for multiple "
                 "reviewers; all must approve (default: codex)."
             ),
         )
         subparser.add_argument(
             "--reviewer-seat", action="append", default=None, metavar="SEAT=BACKEND",
-            help="Declare a named PR reviewer seat (claude, codex, gemini, or agy); plan-first review remains unavailable.",
+            help="Declare a named reviewer seat (claude, codex, gemini, or agy) for PR or issue-plan review.",
         )
         subparser.add_argument(
             "--seat-model", action="append", default=None, metavar="SEAT=MODEL",
@@ -2099,10 +2099,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if named_seats:
             if args.command == "discuss":
                 raise AgentLoopError("discuss does not support named reviewer seats.")
-            if args.command == "issue" and args.plan_first:
-                raise AgentLoopError("issue --plan-first does not support named reviewer seats until plan identity is enabled.")
-            if args.primary_plan_reviewer_seat is not None:
-                raise AgentLoopError("Named primary plan review is unavailable until plan identity is enabled.")
             for option, primary, policy in (
                 ("--primary-reviewer-seat", args.primary_reviewer_seat, args.pr_review_policy),
                 ("--primary-plan-reviewer-seat", args.primary_plan_reviewer_seat, args.plan_review_policy),

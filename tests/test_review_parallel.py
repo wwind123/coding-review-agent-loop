@@ -31,6 +31,238 @@ from coding_review_agent_loop.agents import antigravity as agy_backend
 from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
 
 
+def test_named_plan_parallel_seats_publish_distinct_bound_reviews(tmp_path):
+    seats = tuple(
+        SeatAgent(ReviewerSeat(name, "antigravity", (model,)), tmp_path / name)
+        for name, model in (("flash", "Model A"), ("opus", "Model B"))
+    )
+    runner = FakeRunner(
+        claude_outputs=[_initial_plan()],
+        antigravity_outputs=[
+            structured_plan_review(reviewer="flash (Google Antigravity: Model A)"),
+            structured_plan_review(reviewer="opus (Google Antigravity: Model B)"),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=seats, reviewer_seats=seats,
+        review_parallel=True, plan_execution_mode="plan-only",
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from types import SimpleNamespace
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.issue_comments], flow="plan",
+    )
+    reviews = [record for record in records if record.metadata.role == "reviewer"]
+    assert {record.metadata.agent for record in reviews} == {"flash", "opus"}
+    assert all(record.metadata.seat_binding is not None for record in reviews)
+    assert {entry["id"] for entry in reviews[0].metadata.seat_binding["seats"]} == {"flash", "opus"}
+    assert len([command for command, _ in runner.commands if command[0] == "agy"]) == 2
+
+
+def test_named_plan_fallback_counts_one_approval_for_its_seat(tmp_path):
+    flash = SeatAgent(
+        ReviewerSeat("flash", "antigravity", ("Model A", "Model B")), tmp_path / "flash",
+    )
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model C",)), tmp_path / "opus")
+    runner = FakeRunner(
+        claude_outputs=[_initial_plan()],
+        antigravity_outputs=[
+            ("quota exceeded", 1),
+            structured_plan_review(reviewer="flash (Google Antigravity: Model B)"),
+            structured_plan_review(reviewer="opus (Google Antigravity: Model C)"),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        plan_execution_mode="plan-only", agent_max_retries=0,
+    )
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands if cmd[0] == "agy"]
+    assert models == ["Model A", "Model B", "Model C"]
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from types import SimpleNamespace
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.issue_comments], flow="plan",
+    )
+    assert [record.metadata.agent for record in records if record.metadata.role == "reviewer"] == [
+        "flash", "opus",
+    ]
+
+
+def test_named_plan_primary_seat_gates_other_same_backend_seat(tmp_path):
+    from agent_loop_helpers import structured_v1_plan_state
+
+    seats = tuple(
+        SeatAgent(ReviewerSeat(name, "antigravity", (model,)), tmp_path / name)
+        for name, model in (("flash", "Model A"), ("opus", "Model B"))
+    )
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        antigravity_outputs=[
+            structured_plan_review(reviewer="opus (Google Antigravity: Model B)"),
+            structured_plan_review(reviewer="flash (Google Antigravity: Model A)"),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=seats, reviewer_seats=seats,
+        plan_review_policy="primary-then-panel", primary_plan_reviewer=seats[1],
+        plan_execution_mode="plan-only", max_rounds=4,
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from types import SimpleNamespace
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.issue_comments], flow="plan",
+    )
+    reviews = [record.metadata.agent for record in records if record.metadata.role == "reviewer"]
+    assert reviews == ["opus", "flash"]
+    assert any(record.metadata.scheduler_primary_reviewer == "opus" for record in records)
+
+
+def test_named_plan_model_change_keeps_blocker_and_requires_fresh_review(tmp_path):
+    from agent_loop_helpers import structured_v1_plan_state
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from types import SimpleNamespace
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state(), ("planner unavailable", 1)],
+        antigravity_outputs=[structured_plan_review(
+            state="blocking", reviewer="opus (Google Antigravity: Model B)",
+            blocking_plan_issues=["Name the rollout owner."],
+        )],
+    )
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        plan_review_policy="primary-then-panel", primary_plan_reviewer=opus,
+        plan_execution_mode="plan-only", agent_max_retries=0, max_rounds=4,
+    )
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    original_turns = len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"])
+    changed_opus = SeatAgent(
+        ReviewerSeat("opus", "antigravity", ("Model C",)), tmp_path / "opus",
+    )
+    changed = dataclasses.replace(
+        config, reviewer=(flash, changed_opus), reviewer_seats=(flash, changed_opus),
+        primary_plan_reviewer=changed_opus,
+    )
+    runner.antigravity_outputs.append(structured_plan_review(
+        state="blocking", reviewer="opus (Google Antigravity: Model C)",
+        blocking_plan_issues=["Name the rollout owner."],
+        prior_plan_item_dispositions=[{
+            "item_id": "item-1", "disposition": "blocking",
+            "note": "The rollout owner is still missing.",
+        }],
+    ))
+    runner.claude_outputs.append(("planner unavailable", 1))
+    with pytest.raises(AgentLoopError) as changed_error:
+        run_issue_loop(runner, issue_number=56, config=changed, plan_first=True)
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.issue_comments], flow="plan",
+    )
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == original_turns + 1
+    assert [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands if cmd[0] == "agy"][-1] == "Model C"
+    assert "Claude failed" in str(changed_error.value)
+    assert "Name the rollout owner." in [
+        cmd[-1] for cmd, _ in runner.commands if cmd[0] == "claude"
+    ][-1]
+    assert any(
+        any(item.reviewer == "opus" for item in record.metadata.new_items)
+        for record in records
+    )
+
+
+def test_named_plan_model_change_invalidates_primary_approval(tmp_path):
+    from agent_loop_helpers import structured_v1_plan_state
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        antigravity_outputs=[
+            structured_plan_review(reviewer="opus (Google Antigravity: Model B)"),
+            ("flash unavailable", 1),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        plan_review_policy="primary-then-panel", primary_plan_reviewer=opus,
+        plan_execution_mode="plan-only", agent_max_retries=0, max_rounds=5,
+    )
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    changed_opus = SeatAgent(
+        ReviewerSeat("opus", "antigravity", ("Model C",)), tmp_path / "opus",
+    )
+    changed = dataclasses.replace(
+        config, reviewer=(flash, changed_opus), reviewer_seats=(flash, changed_opus),
+        primary_plan_reviewer=changed_opus,
+    )
+    runner.antigravity_outputs.extend([
+        structured_plan_review(reviewer="opus (Google Antigravity: Model C)"),
+        structured_plan_review(reviewer="flash (Google Antigravity: Model A)"),
+    ])
+    assert run_issue_loop(runner, issue_number=56, config=changed, plan_first=True) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands if cmd[0] == "agy"]
+    assert models == ["Model B", "Model A", "Model C", "Model A"]
+
+
+def test_named_plan_resume_refuses_unamended_board_shrink(tmp_path):
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    runner = FakeRunner(
+        claude_outputs=[_initial_plan()],
+        antigravity_outputs=[
+            structured_plan_review(reviewer="flash (Google Antigravity: Model A)"),
+            ("opus unavailable", 1),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        plan_execution_mode="plan-only", agent_max_retries=0,
+    )
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    calls = len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"])
+    reduced = dataclasses.replace(
+        config, reviewer=(flash,), reviewer_seats=(flash,),
+    )
+    with pytest.raises(AgentLoopError, match="board changed during resume"):
+        run_issue_loop(runner, issue_number=56, config=reduced, plan_first=True)
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == calls
+
+
+def test_named_plan_resume_refuses_backend_rebinding_before_reviewer_turn(tmp_path):
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    runner = FakeRunner(
+        claude_outputs=[_initial_plan()],
+        antigravity_outputs=[
+            structured_plan_review(reviewer="flash (Google Antigravity: Model A)"),
+            ("opus unavailable", 1),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        plan_execution_mode="plan-only", agent_max_retries=0,
+    )
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    calls = len([cmd for cmd, _ in runner.commands if cmd[0] in {"agy", "codex"}])
+    rebound = SeatAgent(ReviewerSeat("flash", "codex", ("gpt-6-sol",)), tmp_path / "flash")
+    changed = dataclasses.replace(
+        config, reviewer=(rebound, opus), reviewer_seats=(rebound, opus),
+    )
+    with pytest.raises(AgentLoopError, match="changed backend"):
+        run_issue_loop(runner, issue_number=56, config=changed, plan_first=True)
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] in {"agy", "codex"}]) == calls
+
+
 def test_named_agy_seats_serialize_host_settings_and_bound_wait(tmp_path, monkeypatch):
     import fcntl
 
