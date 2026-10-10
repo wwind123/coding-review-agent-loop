@@ -386,7 +386,6 @@ def _watch_retained_label(monkeypatch, *, proceed=_Reached):
         releases.append(True)
         raise proceed
 
-    monkeypatch.setattr(pr_loop, "retained_managed_label_present", lambda *a, **k: True)
     monkeypatch.setattr(pr_loop, "release_retained_managed_label", release)
     monkeypatch.setattr(
         orchestrator, "activate_managed_ci",
@@ -662,3 +661,80 @@ def test_persisted_seat_binding_drift_never_authorizes_the_floor_or_writes(tmp_p
     assert releases == []
     assert len(runner.comments) == comments_before
     assert not [c for c, _ in runner.commands[commands_before:] if c[0] in _AGENT_COMMANDS]
+
+
+@pytest.mark.parametrize("lifecycle", ["draft-labeled", "ready-unlabeled"])
+@pytest.mark.parametrize(
+    ("board", "refusal"),
+    [
+        ("one-reviewer", "1 reviewer\\(s\\) is below the floor of 2"),
+        ("one-provider", "1 distinct provider\\(s\\) is below the floor of 2"),
+    ],
+)
+def test_fresh_authorization_below_the_floor_publishes_nothing(
+    tmp_path, monkeypatch, lifecycle, board, refusal
+):
+    """item-9: the floor runs before managed-CI fresh authorization, whatever the label state."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from coding_review_agent_loop.managed_ci import parse_issue_created_authorization_comment
+    from test_managed_ci import _workflow_runner_for_issue_authorization
+
+    runner = _workflow_runner_for_issue_authorization(None, labeled=lifecycle == "draft-labeled")
+    if lifecycle == "ready-unlabeled":
+        runner.rest_pr["draft"] = False
+    if board == "one-reviewer":
+        floor = dict(reviewer=("codex",), min_reviewers=2)
+    else:
+        seats = (_seat(tmp_path, "a", "codex", "gpt-a"), _seat(tmp_path, "b", "codex", "gpt-b"))
+        floor = dict(reviewer=seats, reviewer_seats=seats, min_distinct_providers=2)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=643,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        **floor,
+    )
+    monkeypatch.setattr(
+        orchestrator, "activate_managed_ci",
+        lambda *a, **k: pytest.fail("managed-CI activation ran before the floor"),
+    )
+    with pytest.raises(AgentLoopError, match=refusal):
+        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert not [
+        comment for comment in runner.intent_comments
+        if parse_issue_created_authorization_comment(comment["body"]) is not None
+    ]
+    assert not runner.labels_posted
+    assert runner.comments == []
+    assert not [
+        command for command, _cwd in runner.commands
+        if command[:4] == ["gh", "api", "--method", "DELETE"]
+        or command[:4] == ["gh", "api", "--method", "POST"]
+    ]
+    assert _agent_commands(runner) == []
+
+
+def test_fresh_authorization_with_a_signed_plan_reduction_reaches_authorization(
+    tmp_path, monkeypatch,
+):
+    """item-9: a valid inherited signed plan reduction still reaches fresh authorization."""
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from coding_review_agent_loop.cli import run_pr_loop
+    from test_issue_pr_handoff import _named_config
+
+    seats, runner, kwargs, _overrides = _no_handoff_plan_pr(
+        tmp_path, plan_state="signed", scope="explicit-scope",
+    )
+
+    def authorize(*_a, **_k):
+        raise _Reached
+
+    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", authorize)
+    config = _named_config(
+        tmp_path, seats[:2], min_reviewers=3, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+    )
+    with pytest.raises(_Reached):
+        run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True)
+    assert runner.comments == []
+    assert _agent_commands(runner) == []

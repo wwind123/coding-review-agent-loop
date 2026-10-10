@@ -1950,13 +1950,14 @@ point. That includes the backend-outage completeness check and the activation
 round of pending amendments, so malformed or not-yet-activatable amendment
 history also fails before any write and never supplies a floor exception.
 Malformed round history fails closed under every review policy. The first PR
-write is the release of a retained managed label on a ready PR. Whenever signed
-PR amendments exist, or a floor is set and that label would be released, the
-complete lineage and the floor are resolved first, even without floor flags.
-That resolution uses the authoritative approved plan. The owning issue is the
-caller's issue, an explicit managed-CI issue scope, the PR-side contract's
-primary issue, or, for ordinary managed-CI recovery, the issue named by the
-managed branch. The plan identity comes from the caller's approved plan or from
+write can be the release of a retained managed label on a ready PR or a
+managed-CI fresh authorization record. Whenever signed PR amendments exist, or a
+floor is set, the complete lineage and the floor are resolved at PR entry,
+before either write. Signed amendments are validated there even without floor
+flags. That resolution uses the authoritative approved plan. The owning issue is
+the caller's issue, an explicit managed-CI issue scope, the PR-side contract's
+primary issue, the issue named by the managed branch (ordinary managed-CI
+recovery), or the single issue the PR body links. The plan identity comes from the caller's approved plan or from
 the issue-side handoff that names this PR. The board then comes from the issue
 holding exactly that plan, either the child or its staged parent. With no
 handoff record, the owning issue's completely approved canonical plan is

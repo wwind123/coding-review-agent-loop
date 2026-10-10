@@ -142,7 +142,6 @@ from .managed_ci import (
     publish_round_readiness,
     release_adopted_managed_ci,
     release_retained_managed_label,
-    retained_managed_label_present,
     revalidate_adopted_managed_ci,
     revalidate_issue_created_handoff,
     recover_issue_created_handoff,
@@ -570,6 +569,12 @@ def _entry_plan_handoff_board(
         if branch is not None:
             owning_number = int(branch.group(1))
     if owning_number is None:
+        # The same single-linked-issue fallback the provenance block applies;
+        # its handoff record must still name this PR to bind a plan.
+        linked = parse_linked_issue_numbers(pr_context.metadata.body, repo=config.repo)
+        if len(linked) == 1:
+            owning_number = linked[0]
+    if owning_number is None:
         return None
     owning = get_issue_context(runner, config=config, issue_number=owning_number)
     if approved_plan_context is not None:
@@ -813,21 +818,17 @@ def run_pr_loop(
             pr_metadata=initial_pr_context.metadata,
             cwd=bootstrap_cwd,
         )
-        # The label release below is the first PR write.  Whenever signed PR
-        # amendments exist, or a floor is configured and the label would be
-        # released, resolve the authoritative plan board and the complete
-        # signed PR lineage read-only first, so malformed history or a
-        # below-floor board is refused with nothing written (#1378 review
-        # items 3, 6, 7).  The handoff seam repeats the exact check.
+        # The first PR write (the retained-label release, managed-CI fresh
+        # authorization, activation, or any post) follows this point.  Whenever
+        # signed PR amendments exist or a floor is configured, resolve the
+        # authoritative plan board and the complete signed PR lineage read-only
+        # first, so malformed history or a below-floor board is refused with
+        # nothing written (#1378 review items 3, 6, 7, 9).  The handoff seam
+        # repeats the exact check.
         entry_amendments = collect_reviewer_board_amendments(
             initial_pr_context.comments, flow="pr", pr_number=pr_number, ignored_sink=[],
         )
-        if entry_amendments or (
-            board_floor_enabled(config)
-            and retained_managed_label_present(
-                runner, config=config, pr_number=pr_number, cwd=bootstrap_cwd,
-            )
-        ):
+        if entry_amendments or board_floor_enabled(config):
             entry_board = _entry_plan_handoff_board(
                 runner,
                 config=config,
