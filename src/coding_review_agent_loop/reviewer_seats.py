@@ -99,13 +99,12 @@ def validate_pr_seat_bindings(records: object, config: object) -> set[str]:
     saw_bound = False
     for record in records:
         metadata = record.metadata
-        if metadata.role != "reviewer":
-            continue
         historical = metadata.seat_binding
         if historical is None:
-            if current is not None:
+            if current is not None and metadata.role in {"reviewer", "coder", "summary"}:
                 raise AgentLoopError(
-                    "Named PR reviewer board cannot adopt an unbound historical reviewer record."
+                    "Named PR reviewer board cannot adopt an unbound historical recovery record "
+                    f"({metadata.role}, {metadata.phase or 'no phase'})."
                 )
             continue
         saw_bound = True
@@ -142,14 +141,17 @@ def validate_pr_seat_bindings(records: object, config: object) -> set[str]:
                 continue  # Signed amendment lineage checks required-board changes.
             if configured["backend"] != entry["backend"]:
                 raise AgentLoopError(f"Reviewer seat {seat_id!r} changed backend; refusing PR recovery.")
-            if seat_id == metadata.agent:
-                latest_binding_by_seat[seat_id] = entry
-        if metadata.agent not in seen:
+            latest_binding_by_seat[seat_id] = entry
+        if metadata.role == "reviewer" and metadata.agent not in seen:
             raise AgentLoopError("PR reviewer record is not represented in its seat binding.")
-    if current is not None and not saw_bound and any(record.metadata.role == "reviewer" for record in records):
+    if current is not None and not saw_bound and any(
+        record.metadata.role in {"reviewer", "coder", "summary"} for record in records
+    ):
         raise AgentLoopError("Named PR reviewer board has no verifiable historical binding.")
     for seat_id, entry in latest_binding_by_seat.items():
-        configured = current_entries[seat_id]
+        configured = current_entries.get(seat_id)
+        if configured is None:
+            continue
         if configured["model_chain"] != entry["model_chain"] or configured["effort"] != entry.get("effort"):
             changed.add(seat_id)
     return changed

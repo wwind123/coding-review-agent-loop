@@ -321,6 +321,108 @@ def test_named_pr_signed_outage_removal_and_explicit_restoration():
         amend_contract(original, bad, base_board=board)
 
 
+def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_path, monkeypatch):
+    import coding_review_agent_loop.orchestrator as orchestrator
+
+    from agent_loop_helpers import FakeRunner, make_config, structured_coder_followup, structured_pr_review
+    from coding_review_agent_loop.cli import run_pr_loop
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
+    flash.workdir.mkdir()
+    opus.workdir.mkdir()
+    board = ("Codex", "Gemini", "flash", "opus")
+    runner = FakeRunner(
+        codex_outputs=[
+            structured_pr_review(),
+            structured_pr_review(state="blocking", blocking_items=["Fix worker."], summary="Codex blocks."),
+            *[structured_pr_review(
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ) for _ in range(4)],
+        ],
+        gemini_outputs=[
+            structured_pr_review(reviewer="Google Gemini") for _ in range(2)
+        ] + [structured_pr_review(
+            reviewer="Google Gemini",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ) for _ in range(4)],
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        antigravity_outputs=[
+            (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+            (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+        ],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini", flash, opus), reviewer_seats=(flash, opus),
+        pr_review_policy="selective-intermediate", max_rounds=4,
+        pre_review_tests=False, agent_max_retries=0,
+    )
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    runner.pr_payload["headRefOid"] = "def456"
+
+    def append_amendment(original_board, removed, restored, round_number):
+        comment_index = len(runner.pr_payload["comments"])
+        body = format_reviewer_board_amendment_comment(
+            flow="pr", issue=None, pr_number=77,
+            original_required_reviewers=original_board,
+            policy="selective-intermediate", primary_reviewer=None,
+            removed_reviewers=removed, restored_reviewers=restored,
+            effective_from_round=round_number,
+            rationale="Shared backend outage or recovery.",
+        )
+        runner.pr_payload["comments"].append({
+            "body": body,
+            "author": {"login": "human-reviewer", "id": 81},
+            "createdAt": f"2026-05-23T00:00:{comment_index:02d}Z",
+            "id": 900 + round_number,
+        })
+
+    append_amendment(board, ("flash", "opus"), (), 1)
+    before = len(runner.commands)
+    original_post = orchestrator.post_pr_comment
+
+    def interrupt_after_coder(*args, **kwargs):
+        result = original_post(*args, **kwargs)
+        match = orchestrator.ROUND_RESUME_MARKER_RE.search(kwargs["body"])
+        if match and orchestrator._decode_round_metadata(match["payload"]).role == "coder":
+            raise KeyboardInterrupt
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(orchestrator, "post_pr_comment", interrupt_after_coder)
+        with pytest.raises(KeyboardInterrupt):
+            run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(cmd[0] == "agy" for cmd, _ in runner.commands[before:])
+
+    append_amendment(("Codex", "Gemini"), (), ("flash", "opus"), 2)
+    runner.antigravity_outputs.extend([
+        (structured_pr_review(
+            reviewer="flash (Google Antigravity: Model A)",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ), 0),
+        (structured_pr_review(
+            reviewer="opus (Google Antigravity: Model B)",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ), 0),
+    ])
+    before = len(runner.commands)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands[before:]
+              if cmd[0] == "agy" and "--model" in cmd]
+    assert models == ["Model A", "Model B"]
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    checkpoints = [
+        record.metadata for record in _extract_round_metadata_records(
+            [_comment(comment["body"]) for comment in runner.pr_payload["comments"]], flow="pr"
+        ) if record.metadata.phase == "scheduler-prelaunch"
+    ]
+    assert any(checkpoint.scheduler_contract["required_reviewers"] == ["Codex", "Gemini"]
+               and checkpoint.reviewer_board_amendment_digest for checkpoint in checkpoints)
+    assert any(checkpoint.scheduler_contract["required_reviewers"] == list(board)
+               and checkpoint.reviewer_board_amendment_digest for checkpoint in checkpoints)
+
+
 # --- lineage (rows digest-binding, chain-link-interval, post-amend-old-board)
 
 

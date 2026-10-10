@@ -91,6 +91,57 @@ def test_named_pr_binding_allows_legacy_implicit_model_on_other_backend(tmp_path
     assert validate_pr_seat_bindings((record,), config) == set()
 
 
+def test_named_pr_prelaunch_binding_is_checked_before_first_reviewer(tmp_path):
+    seat = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    config = make_config(tmp_path, reviewer=(seat,), reviewer_seats=(seat,))
+    binding = reviewer_seat_binding(config)
+    checkpoint = PostedRoundRecord(
+        0, _checkpoint(seat_binding=binding), "",
+    )
+    assert validate_pr_seat_bindings((checkpoint,), config) == set()
+    changed = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model B",)), seat.workdir)
+    changed_config = dataclasses.replace(config, reviewer=(changed,), reviewer_seats=(changed,))
+    assert validate_pr_seat_bindings((checkpoint,), changed_config) == {"flash"}
+    rebound = SeatAgent(ReviewerSeat("flash", "codex", ("Model B",)), seat.workdir)
+    rebound_config = dataclasses.replace(config, reviewer=(rebound,), reviewer_seats=(rebound,))
+    with pytest.raises(AgentLoopError, match="changed backend"):
+        validate_pr_seat_bindings((checkpoint,), rebound_config)
+    with pytest.raises(AgentLoopError, match="unbound historical recovery record"):
+        validate_pr_seat_bindings((PostedRoundRecord(0, _checkpoint(), ""),), config)
+
+
+def test_named_pr_resume_refuses_rebound_prelaunch_before_review(tmp_path, monkeypatch):
+    import coding_review_agent_loop.orchestrator as orchestrator
+    from agent_loop_helpers import FakeRunner
+
+    seat = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
+    seat.workdir.mkdir()
+    config = make_config(
+        tmp_path, reviewer=(seat,), reviewer_seats=(seat,),
+        pr_review_policy="selective-intermediate", pre_review_tests=False,
+    )
+    runner = FakeRunner()
+    original_post = orchestrator.post_pr_comment
+
+    def interrupt_after_prelaunch(*args, **kwargs):
+        result = original_post(*args, **kwargs)
+        if "PR review scheduling audit:" in kwargs["body"]:
+            raise KeyboardInterrupt
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(orchestrator, "post_pr_comment", interrupt_after_prelaunch)
+        with pytest.raises(KeyboardInterrupt):
+            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+    assert not any(command[0] == "agy" for command, _ in runner.commands)
+    rebound = SeatAgent(ReviewerSeat("flash", "codex", ("Model B",)), seat.workdir)
+    rebound_config = dataclasses.replace(config, reviewer=(rebound,), reviewer_seats=(rebound,))
+    before = len(runner.commands)
+    with pytest.raises(AgentLoopError, match="changed backend"):
+        orchestrator.run_pr_loop(runner, pr_number=77, config=rebound_config)
+    assert not any(command[0] in {"agy", "codex"} for command, _ in runner.commands[before:])
+
+
 def _checkpoint(**overrides):
     values = dict(
         flow="pr",

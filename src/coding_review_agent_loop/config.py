@@ -1989,8 +1989,14 @@ def config_from_args(
     codex_dir = resolve_agent_dir("codex", args.codex_dir)
     gemini_dir = resolve_agent_dir("gemini", args.gemini_dir)
     antigravity_dir = resolve_agent_dir("antigravity", args.antigravity_dir)
+    for seat in named_seats:
+        if seat.workdir is None:
+            store_by_agent[seat.seat_id] = default_agent_workdir(repo, seat.seat_id).resolve()
     default_checkout_stores = tuple(store_by_agent.items())
-    active_roles = {args.coder, *(seat_backend(reviewer) for reviewer in configured_reviewers)}
+    active_roles = {
+        args.coder, *configured_reviewers,
+        *(seat_backend(reviewer) for reviewer in configured_reviewers),
+    }
     for extra_role in (getattr(args, "implementation_coder", None), getattr(args, "discuss_analyzer", None)):
         if extra_role is not None:
             active_roles.add(extra_role)

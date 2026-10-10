@@ -1418,6 +1418,9 @@ reviewers within one invocation are supported; the orchestrator verifies
 distinct reviewer workdirs. Coder and reviewer turns are separate lifecycle
 stages even when they use the same CLI.
 
+Named seats with no explicit `--seat-dir` use the same per-run worktree lifecycle,
+with a separate shared store and finalizer keyed by each seat ID.
+
 **Per-run worktrees (`run_worktrees.py`).** Store mutations (clone, fetch+pin,
 local-base fast-forward, worktree add, prune, remove) run under a short,
 non-reentrant host `flock` (`<lock root>/workdir-stores/`) that is never held
@@ -1860,8 +1863,9 @@ seat role key carrying backend, model chain, effort, and checkout. Common
 review scheduling and ledger code stores that seat ID in reviewer and agent
 fields. Backend adapters receive an immutable seat-specific invocation view;
 response files and logs use the seat ID while Antigravity quota state and the
-host settings lock remain shared. PR round metadata stores a versioned board
-binding. Recovery verifies backend identity before using history; a changed
+host settings lock remain shared. PR round metadata, including scheduler and
+coder recovery records, stores a versioned board binding. Recovery verifies
+the binding before using any recorded checkpoint; a changed
 model chain starts a fresh round, retaining reconciled open findings but
 invalidating prior approvals and unpublished response checkpoints. Legacy
 default seats keep historical signatures and metadata bytes. Plan-first named

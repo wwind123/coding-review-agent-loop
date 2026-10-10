@@ -91,6 +91,62 @@ def test_named_agy_seats_serialize_host_settings_and_bound_wait(tmp_path, monkey
     assert not any(command[0] == "agy" for command, _ in runner.commands)
 
 
+def test_named_pr_lock_wait_resume_keeps_seats_incomplete(tmp_path, monkeypatch):
+    import fcntl
+
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(agy_backend, "_antigravity_settings_path", lambda: settings)
+    monkeypatch.setattr(agy_backend, "SETTINGS_LOCK_WAIT_SECONDS", 0.05)
+    seats = tuple(
+        SeatAgent(ReviewerSeat(name, "antigravity", (model,)), tmp_path / name)
+        for name, model in (("flash", "Model A"), ("opus", "Model B"))
+    )
+    for seat in seats:
+        seat.workdir.mkdir()
+    runner = FakeRunner(antigravity_outputs=[
+        (structured_pr_review(reviewer="flash (Google Antigravity: Model A)"), 0),
+        (structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0),
+    ])
+    config = make_config(
+        tmp_path, reviewer=seats, reviewer_seats=seats,
+        review_parallel=True, pr_review_policy="selective-intermediate",
+        pre_review_tests=False, agent_max_retries=0,
+    )
+    original_flock = fcntl.flock
+    lock_state = {"acquires": 0, "blocked": True}
+
+    def block_second_seat(handle, operation):
+        if (
+            getattr(handle, "name", None) == str(settings.with_suffix(".json.lock"))
+            and operation == fcntl.LOCK_EX | fcntl.LOCK_NB
+        ):
+            if lock_state["acquires"] and lock_state["blocked"]:
+                raise BlockingIOError
+            lock_state["acquires"] += 1
+        return original_flock(handle, operation)
+
+    monkeypatch.setattr(fcntl, "flock", block_second_seat)
+    with pytest.raises(AgentLoopError, match="review is incomplete"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert lock_state["acquires"] == 1
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 1
+    assert _spool_files(config)
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    from types import SimpleNamespace
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
+        flow="pr",
+    )
+    assert any(record.metadata.phase == "scheduler-prelaunch" for record in records)
+    assert not any(record.metadata.role == "reviewer" for record in records)
+    lock_state["blocked"] = False
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 2
+    reviews = [c["body"] for c in runner.pr_payload["comments"] if "**Review verdict:**" in c["body"]]
+    assert len(reviews) == 2
+
+
 def _initial_plan() -> str:
     return structured_plan_state(
         state="blocking", summary="Initial plan.", plan_steps=["Make the change."]

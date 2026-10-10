@@ -2218,6 +2218,11 @@ def _post_recovery_record(
     message: str,
     metadata: PostedRoundMetadata,
 ) -> None:
+    from .reviewer_seats import reviewer_seat_binding
+
+    binding = reviewer_seat_binding(config)
+    if binding is not None:
+        metadata = dataclasses_replace(metadata, seat_binding=binding)
     # Writer-side assertion: a record this process posts must pass its own
     # per-phase structural validation, or recovery would refuse it later.
     problems = _recovery_record_problems(metadata)

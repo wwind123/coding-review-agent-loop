@@ -2129,7 +2129,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.plan_review_policy == "primary-then-panel" and board_size < 2:
                 raise AgentLoopError("--plan-review-policy primary-then-panel requires at least one secondary reviewer.")
             validate_sandboxed_args(args, tuple(args.reviewer or ()), named_seats=named_seats)
-        if args.primary_reviewer_seat is not None or args.primary_plan_reviewer_seat is not None:
+        if not named_seats and (args.primary_reviewer_seat is not None or args.primary_plan_reviewer_seat is not None):
             raise AgentLoopError("A named primary requires --reviewer-seat.")
         config = config_from_args(args, runner, invocation_argv=invocation)
         if args.command in {"issue", "task", "pr", "discuss", "managed-pr"}:

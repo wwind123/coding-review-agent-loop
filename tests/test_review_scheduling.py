@@ -64,12 +64,43 @@ def test_named_selective_pr_keeps_same_backend_seats_distinct(tmp_path, monkeypa
         pr_review_policy="selective-intermediate", pre_review_tests=False,
         agent_max_retries=0, max_rounds=3,
     )
+    original_post = orchestrator.post_pr_comment
+    audits = 0
+
+    def interrupt_after_second_audit(*args, **kwargs):
+        nonlocal audits
+        result = original_post(*args, **kwargs)
+        if "PR review scheduling audit:" in kwargs["body"]:
+            audits += 1
+            if audits == 2:
+                raise KeyboardInterrupt
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(orchestrator, "post_pr_comment", interrupt_after_second_audit)
+        with pytest.raises(KeyboardInterrupt):
+            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+    assert audits == 2
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    interrupted_records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
+        flow="pr",
+    )
+    assert any(record.metadata.phase == "coder-dispatch" and record.metadata.seat_binding
+               for record in interrupted_records)
+    checkpoint = next(
+        record.metadata for record in interrupted_records
+        if record.metadata.round_number == 2 and record.metadata.phase == "scheduler-prelaunch"
+    )
+    assert checkpoint.scheduler_selected_reviewers == ("opus",)
+    assert any(name == "flash" for name, _ in checkpoint.scheduler_paused_reviewers)
+    assert checkpoint.prior_items[0].reviewer == "opus"
+    assert checkpoint.prior_items[0].resolution_owners == ("opus",)
     assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
     models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
               if cmd and cmd[0] == "agy" and "--model" in cmd]
     assert models[:2] == ["Model A", "Model B"]
     assert models.count("Model B") >= 2
-    from coding_review_agent_loop.round_state import _extract_round_metadata_records
     records = _extract_round_metadata_records(
         [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
         flow="pr",

@@ -1,5 +1,6 @@
 import ast
 import base64
+import contextlib
 import datetime
 import errno
 import inspect
@@ -3542,6 +3543,49 @@ def test_named_primary_cli_selects_seat_identity():
     ])
     config = config_from_args(args, Runner(dry_run=True))
     assert config.primary_reviewer is config.reviewer[1]
+
+
+def test_named_primary_reaches_pr_loop_through_main(monkeypatch):
+    seen = []
+    monkeypatch.setattr(cli_module, "run_pr_loop", lambda *a, **k: seen.append(k["config"]) or 0)
+    code = cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--dry-run",
+        "--reviewer-seat", "flash=agy", "--seat-model", "flash=Model A",
+        "--reviewer-seat", "opus=agy", "--seat-model", "opus=Model B",
+        "--pr-review-policy", "primary-then-panel", "--primary-reviewer-seat", "opus",
+    ])
+    assert code == 0
+    assert len(seen) == 1
+    assert seen[0].primary_reviewer is seen[0].reviewer[1]
+
+
+def test_default_named_seat_checkout_uses_claimed_run_worktree(monkeypatch, tmp_path):
+    from coding_review_agent_loop.config import run_worktree_store, ensure_temp_checkout
+    from coding_review_agent_loop import run_worktrees
+    from coding_review_agent_loop.workdir_claims import workdir_claim_scope
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    args = build_parser().parse_args([
+        "pr", "77", "--repo", "OWNER/REPO", "--dry-run",
+        "--reviewer-seat", "flash=agy", "--seat-model", "flash=Model A",
+    ])
+    config = config_from_args(args, Runner(dry_run=True))
+    seat = config.reviewer[0]
+    assert run_worktree_store(config, seat.workdir) == default_agent_workdir(
+        "OWNER/REPO", "flash"
+    ).resolve()
+    calls = []
+    monkeypatch.setattr(run_worktrees, "prepare_store", lambda *a, **k: "head")
+    monkeypatch.setattr(run_worktrees, "prune_dead_worktrees", lambda *a, **k: None)
+    monkeypatch.setattr(run_worktrees, "store_lock", lambda *a, **k: contextlib.nullcontext())
+    monkeypatch.setattr(run_worktrees, "add_run_worktree", lambda *a, **k: calls.append("add"))
+    monkeypatch.setattr(run_worktrees, "identify_owned_worktree", lambda *a, **k: True)
+    monkeypatch.setattr(run_worktrees, "remove_run_worktree", lambda *a, **k: calls.append("remove"))
+    monkeypatch.setattr("coding_review_agent_loop.config.verify_before_sync", lambda *a, **k: None)
+    monkeypatch.setattr("coding_review_agent_loop.config._sync_base_branch", lambda *a, **k: None)
+    with workdir_claim_scope():
+        ensure_temp_checkout(seat.workdir, agent=seat, config=config, runner=FakeRunner())
+    assert calls == ["add", "remove"]
 
 
 def test_discuss_rejects_named_seats(capsys):
