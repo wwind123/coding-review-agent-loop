@@ -509,6 +509,8 @@ def test_docs_describe_rejected_coder_recovery_continuity_exception():
     assert "A rejected-coder recovery across a fresh grant is the third exception" in doc_text
     assert "The predecessor cutoff is not relaxed" in doc_text
     assert "exactly one attempt-2 recovery coder-dispatch record" in doc_text
+    assert "counts toward \"exactly one\" wherever it sits" in doc_text
+    assert "only the original attempt-1 dispatch of the original head is exempt" in doc_text
     assert "must carry that board's seat binding" in doc_text
     assert "on the current approved plan only" in doc_text
     assert "A recovery across a signed plan rebind is therefore refused" in doc_text
