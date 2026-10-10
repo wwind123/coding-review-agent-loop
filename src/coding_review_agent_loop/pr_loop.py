@@ -589,6 +589,11 @@ def _entry_plan_handoff_board(
                 error_message=(
                     f"Issue #{owning.number} has planning state without a complete "
                     "canonical reviewer approval; no PR write was made."
+                    + _pr_amendment_plan_board_hint(
+                        pr_context.comments,
+                        pr_number=pr_number,
+                        supplied_reviewers=reviewers(config),
+                    )
                 ),
             )
             if canonical is None:
