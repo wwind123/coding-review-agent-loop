@@ -47,6 +47,7 @@ from .config import (
     resolve_base_branch,
     resolve_agent_permissions_mode,
     reviewers,
+    validate_sandboxed_args,
 )
 from .errors import AgentLoopError, HumanDecisionRequiredError, QuotaResetExceededError
 from .managed_ci import (
@@ -2118,13 +2119,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise AgentLoopError("primary-then-panel requires --primary-reviewer-seat or --primary-reviewer.")
             if args.plan_review_policy == "primary-then-panel" and not (args.primary_plan_reviewer_seat or args.primary_plan_reviewer):
                 raise AgentLoopError("plan primary-then-panel requires --primary-plan-reviewer-seat or --primary-plan-reviewer.")
-            if resolve_agent_permissions_mode(args) == "sandboxed":
-                for seat in named_seats:
-                    if seat.backend in {"antigravity", "gemini"}:
-                        raise AgentLoopError(
-                            f"--agent-permissions sandboxed refuses reviewer seat {seat.seat_id!r} "
-                            f"on {seat.backend}: this provider has no read-only grant."
-                        )
+            board_size = len(named_seats) + len(args.reviewer or ())
+            if args.pr_review_policy == "primary-then-panel" and board_size < 2:
+                raise AgentLoopError("--pr-review-policy primary-then-panel requires at least one secondary reviewer.")
+            if args.plan_review_policy == "primary-then-panel" and board_size < 2:
+                raise AgentLoopError("--plan-review-policy primary-then-panel requires at least one secondary reviewer.")
+            validate_sandboxed_args(args, tuple(args.reviewer or ()), named_seats=named_seats)
             raise AgentLoopError(
                 "Named reviewer seats are validated but review execution is unavailable in phase 1; "
                 "use legacy --reviewer until durable seat identity is enabled."

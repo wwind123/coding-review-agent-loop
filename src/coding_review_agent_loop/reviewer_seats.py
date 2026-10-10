@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .agents.base import normalize_agent_name
 from .agents.registry import agent_display_name, agent_signature
+from .comment_rendering import canonical_model_identity
 from .errors import AgentLoopError
 
 _ID = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z", re.ASCII)
@@ -42,11 +43,6 @@ def _assignments(values: list[str] | None, option: str) -> dict[str, list[str]]:
             raise AgentLoopError(f"{option} requires SEAT=VALUE with non-blank parts.")
         result.setdefault(name, []).append(value.strip())
     return result
-
-
-def _canonical_model(model: str) -> str:
-    # Display labels and CLI slugs differ in punctuation and spacing.
-    return re.sub(r"[^a-z0-9]", "", model.casefold())
 
 
 def resolve_reviewer_seats(args: object) -> tuple[ReviewerSeat, ...]:
@@ -100,9 +96,9 @@ def resolve_reviewer_seats(args: object) -> tuple[ReviewerSeat, ...]:
     by_model: dict[tuple[str, str], str] = {}
     for seat in seats:
         for model in seat.model_chain:
-            key = (seat.backend, _canonical_model(model))
+            key = (seat.backend, canonical_model_identity(model))
             previous = by_model.setdefault(key, seat.seat_id)
-            if previous != seat.seat_id or sum(_canonical_model(m) == key[1] for m in seat.model_chain) > 1:
+            if previous != seat.seat_id or sum(canonical_model_identity(m) == key[1] for m in seat.model_chain) > 1:
                 raise AgentLoopError(f"Reviewer seats {previous!r} and {seat.seat_id!r} overlap on model {model!r}.")
     if seats:
         from .config import DEFAULT_ANTIGRAVITY_MODELS
@@ -137,12 +133,16 @@ def resolve_reviewer_seats(args: object) -> tuple[ReviewerSeat, ...]:
             else:
                 chain = (getattr(args, f"reviewer_{legacy}_model", None) or getattr(args, f"{legacy}_model", None),)
             for model in chain:
-                if model and (legacy, _canonical_model(model)) in by_model:
+                if model and (legacy, canonical_model_identity(model)) in by_model:
                     raise AgentLoopError(f"Named reviewer model {model!r} overlaps the legacy {legacy} reviewer.")
         coder_dir = getattr(args, f"{getattr(args, 'coder', 'claude')}_dir", None)
         used_dirs: dict[Path, str] = {}
         if coder_dir is not None:
             used_dirs[Path(coder_dir).resolve()] = "coder"
+        for backend in legacy_backends:
+            reviewer_dir = getattr(args, f"{backend}_dir", None)
+            if reviewer_dir is not None:
+                used_dirs.setdefault(Path(reviewer_dir).resolve(), f"legacy {backend} reviewer")
         for seat in seats:
             if seat.workdir is None:
                 continue

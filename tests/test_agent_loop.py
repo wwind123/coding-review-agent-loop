@@ -3484,6 +3484,10 @@ def test_config_rejects_duplicate_reviewers(tmp_path):
     (["--reviewer-seat", "a=agy", "--seat-model", "a=one", "--seat-effort", "a=high"], "unsupported"),
     (["--reviewer-seat", "a=agy", "--seat-model", "a=Gemini 3.8 Flash (High)",
       "--reviewer-seat", "b=agy", "--seat-model", "b=gemini-3.8-flash-high"], "overlap"),
+    (["--reviewer-seat", "a=agy", "--seat-model", "a=Claude Opus 5.5 (Medium)",
+      "--reviewer-seat", "b=agy", "--seat-model", "b=claude-opus-5-5"], "overlap"),
+    (["--reviewer-seat", "a=agy", "--seat-model", "a=Claude Opus 5.5",
+      "--reviewer-seat", "b=agy", "--seat-model", "b=claude-opus-5-5-medium"], "overlap"),
     (["--reviewer-seat", "a=agy", "--seat-model", "a=Model A",
       "--antigravity-models", "Model B"], "not named antigravity seats"),
     (["--reviewer-seat", "a=codex", "--seat-model", "a=Model A",
@@ -3530,6 +3534,30 @@ def test_named_seat_rejects_legacy_implicit_model_and_coder_workdir(tmp_path, ca
     ]) == 1
     assert "workdir collides with coder" in capsys.readouterr().err
     assert not checkout.exists()
+
+
+def test_named_seat_rejects_legacy_explicit_reviewer_workdir(tmp_path, capsys):
+    checkout = tmp_path / "reviewer-checkout"
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--coder", "claude",
+        "--codex-dir", str(checkout), "--reviewer", "codex",
+        "--reviewer-seat", "other=claude", "--seat-model", "other=Model A",
+        "--seat-dir", f"other={checkout}",
+    ]) == 1
+    assert "workdir collides with legacy codex reviewer" in capsys.readouterr().err
+    assert not checkout.exists()
+
+
+@pytest.mark.parametrize("policy,primary", [
+    ("--pr-review-policy", "--primary-reviewer-seat"),
+    ("--plan-review-policy", "--primary-plan-reviewer-seat"),
+])
+def test_named_primary_requires_secondary_before_phase_gate(capsys, policy, primary):
+    assert cli_module.main([
+        "pr", "77", "--repo", "OWNER/REPO", "--reviewer-seat", "only=codex",
+        "--seat-model", "only=Model A", policy, "primary-then-panel", primary, "only",
+    ]) == 1
+    assert "requires at least one secondary reviewer" in capsys.readouterr().err
 
 
 def test_config_rejects_alias_and_canonical_duplicate_reviewers(tmp_path):

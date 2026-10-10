@@ -1874,6 +1874,38 @@ def parse_antigravity_quota_group_overrides(values) -> tuple[tuple[str, str], ..
     return tuple(parsed)
 
 
+def validate_sandboxed_args(
+    args: argparse.Namespace,
+    configured_reviewers: tuple[str, ...],
+    *,
+    named_seats: tuple[object, ...] = (),
+) -> None:
+    """Check every selected provider before command lookup or checkout setup."""
+    if resolve_agent_permissions_mode(args) == "sandboxed":
+        # Name the unsupported selection before command preflight would
+        # report a missing default helper CLI such as agy.
+        from types import SimpleNamespace
+
+        from .agent_permissions import validate_sandboxed_selections
+
+        validate_sandboxed_selections(
+            SimpleNamespace(
+                coder=args.coder,
+                implementation_coder=getattr(args, "implementation_coder", None),
+                reviewer=configured_reviewers,
+                reviewer_seats=named_seats,
+                primary_reviewer=getattr(args, "primary_reviewer", None),
+                primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
+                discuss_analyzer=getattr(args, "discuss_analyzer", None),
+                repair_backend=getattr(args, "repair_backend", "antigravity"),
+                semantic_followup_dedupe=getattr(args, "semantic_followup_dedupe", True),
+                semantic_followup_backend=getattr(
+                    args, "semantic_followup_backend", DEFAULT_SEMANTIC_FOLLOWUP_BACKEND
+                ),
+            )
+        )
+
+
 def config_from_args(
     args: argparse.Namespace,
     runner: Runner,
@@ -1890,28 +1922,7 @@ def config_from_args(
     configured_reviewers = tuple(args.reviewer or ["codex"])
     if len(set(configured_reviewers)) != len(configured_reviewers):
         raise AgentLoopError("--reviewer cannot include the same agent more than once.")
-    if resolve_agent_permissions_mode(args) == "sandboxed":
-        # Name the unsupported selection before command preflight would
-        # report a missing default helper CLI such as agy.
-        from types import SimpleNamespace
-
-        from .agent_permissions import validate_sandboxed_selections
-
-        validate_sandboxed_selections(
-            SimpleNamespace(
-                coder=args.coder,
-                implementation_coder=getattr(args, "implementation_coder", None),
-                reviewer=configured_reviewers,
-                primary_reviewer=getattr(args, "primary_reviewer", None),
-                primary_plan_reviewer=getattr(args, "primary_plan_reviewer", None),
-                discuss_analyzer=getattr(args, "discuss_analyzer", None),
-                repair_backend=getattr(args, "repair_backend", "antigravity"),
-                semantic_followup_dedupe=getattr(args, "semantic_followup_dedupe", True),
-                semantic_followup_backend=getattr(
-                    args, "semantic_followup_backend", DEFAULT_SEMANTIC_FOLLOWUP_BACKEND
-                ),
-            )
-        )
+    validate_sandboxed_args(args, configured_reviewers)
     preflight_agent_commands(args, runner, configured_reviewers)
 
     detect_dir = args.codex_dir.resolve() if args.codex_dir is not None else Path.cwd().resolve()
