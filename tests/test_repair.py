@@ -14,7 +14,7 @@ from coding_review_agent_loop.repair import (
     require_recoverable_fresh_risk_test_matrix_contract,
 )
 from coding_review_agent_loop.errors import AgentLoopError, FreshContractIntegrityError
-from coding_review_agent_loop.orchestrator import _run_structured_repair
+from coding_review_agent_loop.validated_agent import _run_structured_repair
 from coding_review_agent_loop.protocol import (
     RISK_TEST_MATRIX_CHANGE_KEYS,
     RISK_TEST_MATRIX_REQUIRED_KEYS,
@@ -25,7 +25,12 @@ from coding_review_agent_loop.protocol import (
     validate_structured_coder_followup,
     validate_structured_plan_state,
 )
-from coding_review_agent_loop.orchestrator import _new_usage_context, _structured_response_candidates
+from coding_review_agent_loop.validated_agent import _new_usage_context
+from coding_review_agent_loop.agent_failure import _structured_response_candidates
+import coding_review_agent_loop.agent_failure as agent_failure
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 _PLAN_REQUIREMENT = HumanReviewRequirement(
     source_type="Issue body",
@@ -99,7 +104,7 @@ def test_fresh_matrix_repair_prompt_renders_exact_schema_and_examples():
     ],
 )
 def test_semantic_patch_repair_rejects_malformed_source_before_model_call(raw):
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         repaired, parsed, attempts = _run_structured_repair(
             raw,
             runner=None,
@@ -729,7 +734,7 @@ def test_plan_revision_repair_strips_fabricated_ack_without_signed_requirement_c
     runner = FakeRunner(claude_outputs=[malformed])
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired) as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired) as repair_mock:
         def validate_without_ack(text):
             if HUMAN_REQUIREMENTS_ADDRESSED_MARKER in text or "### Human requirements" in text:
                 raise AgentLoopError("fabricated human requirements acknowledgement")
@@ -1737,7 +1742,7 @@ def test_run_pr_loop_uses_repair_pass_on_format_failure(tmp_path):
         assert expected_kind == "pr_review"
         return repaired_review
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert len(captured_repairs) == 1
@@ -1759,7 +1764,7 @@ def test_run_validated_agent_envelope_normalization_recovers_duplicate_footer(tm
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -1805,7 +1810,7 @@ def test_run_validated_agent_envelope_normalization_semantic_defect_uses_repair(
     normalized_review = attempt_envelope_normalization(malformed_review, expected_kind="pr_review")
 
     with patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair",
+        "coding_review_agent_loop.validated_agent.attempt_repair",
         return_value=repaired_review,
     ) as repair_mock:
         response = _run_validated_agent(
@@ -1847,12 +1852,12 @@ def test_run_validated_agent_attempt_repair_uses_envelope_normalized(tmp_path, m
     )
 
     monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator.attempt_envelope_normalization",
+        "coding_review_agent_loop.validated_agent.attempt_envelope_normalization",
         lambda text, expected_kind: normalized_text,
     )
     repair_inputs = []
     monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator.attempt_repair",
+        "coding_review_agent_loop.validated_agent.attempt_repair",
         lambda text, gemini_cmd, **kwargs: repair_inputs.append(text) or repaired_text,
     )
 
@@ -1891,12 +1896,12 @@ def test_run_validated_agent_attempt_repair_falls_back_to_text_when_no_normaliza
     )
 
     monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator.attempt_envelope_normalization",
+        "coding_review_agent_loop.validated_agent.attempt_envelope_normalization",
         lambda text, expected_kind: None,
     )
     repair_inputs = []
     monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator.attempt_repair",
+        "coding_review_agent_loop.validated_agent.attempt_repair",
         lambda text, gemini_cmd, **kwargs: repair_inputs.append(text) or repaired_text,
     )
 
@@ -1923,7 +1928,7 @@ def test_run_validated_agent_attempt_repair_falls_back_to_text_when_no_normaliza
     assert repair_inputs == [raw_text]
 
 def _plan_revision_validate_with_human_requirements(human_requirements):
-    return lambda text: orchestrator._validate_response_with_human_requirements(
+    return lambda text: response_validation._validate_response_with_human_requirements(
         text,
         marker_validator=lambda revised_text: _validate_plan_revision_response(
             revised_text,
@@ -2031,8 +2036,9 @@ def test_run_validated_agent_strip_path_ack_recovery(tmp_path, monkeypatch):
         recovery_calls.append(text)
         return (recovered_text, "blocking")
 
-    monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator._recover_plan_revision_human_requirements_acknowledgement",
+    patch_attr_in(monkeypatch, (
+        agent_failure, validated_agent,
+    ), "_recover_plan_revision_human_requirements_acknowledgement",
         mock_recovery,
     )
 
@@ -2042,7 +2048,7 @@ def test_run_validated_agent_strip_path_ack_recovery(tmp_path, monkeypatch):
     )
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -2105,17 +2111,18 @@ def test_run_validated_agent_combined_strip_path_ack_recovery(tmp_path, monkeypa
         return "blocking"
 
     monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator.attempt_envelope_normalization",
+        "coding_review_agent_loop.validated_agent.attempt_envelope_normalization",
         lambda text, expected_kind: normalized_text if text == raw_text else None,
     )
     monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator.strip_unknown_prior_item_dispositions",
+        "coding_review_agent_loop.validated_agent.strip_unknown_prior_item_dispositions",
         lambda text, allowed_ids, expected_kind: (
             stripped_from_normalized if text == normalized_text else None
         ),
     )
-    monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator._plan_revision_missing_human_acknowledgement",
+    patch_attr_in(monkeypatch, (
+        agent_failure, validated_agent,
+    ), "_plan_revision_missing_human_acknowledgement",
         lambda text, context: text == stripped_from_normalized,
     )
 
@@ -2125,8 +2132,9 @@ def test_run_validated_agent_combined_strip_path_ack_recovery(tmp_path, monkeypa
         recovery_calls.append(text)
         return (recovered_text, "blocking")
 
-    monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator._recover_plan_revision_human_requirements_acknowledgement",
+    patch_attr_in(monkeypatch, (
+        agent_failure, validated_agent,
+    ), "_recover_plan_revision_human_requirements_acknowledgement",
         mock_recovery,
     )
 
@@ -2136,7 +2144,7 @@ def test_run_validated_agent_combined_strip_path_ack_recovery(tmp_path, monkeypa
     )
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -2184,7 +2192,7 @@ def test_run_pr_loop_repairs_format_failure_with_5xx_source_line_reference(tmp_p
         assert expected_kind == "pr_review"
         return repaired_review
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert len(captured_repairs) == 1
@@ -2206,7 +2214,7 @@ def test_run_pr_loop_falls_back_to_error_when_repair_also_fails(tmp_path):
         assert expected_kind == "pr_review"
         return "still broken output without valid schema"
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair_fails):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair_fails):
         with pytest.raises(AgentLoopError, match="Codex"):
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -2222,7 +2230,7 @@ def test_run_pr_loop_skips_repair_when_repair_returns_none(tmp_path):
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None):
         with pytest.raises(AgentLoopError, match="Codex"):
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -2267,7 +2275,7 @@ def test_run_pr_loop_uses_repair_pass_on_coder_followup_format_failure(tmp_path)
         assert expected_kind == "coder_followup"
         return repaired_followup
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
         result = run_pr_loop(runner, pr_number=77, config=config)
 
     assert result == 0
@@ -2293,7 +2301,7 @@ def test_run_pr_loop_falls_back_to_error_when_coder_followup_repair_also_fails(t
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2, agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value="still broken output"):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value="still broken output"):
         with pytest.raises(AgentLoopError, match="Claude"):
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -2315,7 +2323,7 @@ def test_run_pr_loop_skips_repair_when_coder_followup_repair_returns_none(tmp_pa
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2, agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None):
         with pytest.raises(AgentLoopError, match="Claude"):
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -2431,7 +2439,7 @@ def test_repair_prompt_does_not_suggest_ack_pseudo_item_in_addressed_items():
     'item-human-requirements-acknowledgement' in addressed_items will be rejected
     as an unknown item ID.
     """
-    from coding_review_agent_loop.orchestrator import HUMAN_REQUIREMENTS_ACK_ITEM_ID
+    from coding_review_agent_loop.unresolved_items import HUMAN_REQUIREMENTS_ACK_ITEM_ID
 
     # The ack pseudo-item must not appear in the repair prompt at all, because
     # any mention of it in an addressed_items context will teach Gemini to produce
@@ -2442,7 +2450,7 @@ from coding_review_agent_loop.repair import (
     _reviewer_human_requirements_instruction,
 )
 
-from coding_review_agent_loop.orchestrator import _surfaced_reviewer_requirement_ids
+from coding_review_agent_loop.response_validation import _surfaced_reviewer_requirement_ids
 
 def test_repair_prompt_blocking_state_rules_require_explicit_prior_dispositions():
     """STATE RULES for BLOCKING must prohibit omitting allowed prior items."""
@@ -2656,7 +2664,7 @@ def test_pr_loop_repair_missing_hr_marker_recovers_approved(tmp_path):
         assert reviewer_requirement_ids == (_PR_REQUIREMENT.requirement_id,)
         return repaired_with_marker
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         result = run_pr_loop(runner, pr_number=77, config=config)
 
     assert result == 0
@@ -2710,7 +2718,7 @@ def test_pr_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_pat
             return repaired_blocking
         return None  # don't interfere with coder_followup repair
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         result = run_pr_loop(runner, pr_number=77, config=config)
 
     assert result == 0
@@ -2741,7 +2749,7 @@ def test_pr_loop_repair_missing_hr_marker_failure_uses_synthetic(tmp_path):
     def fake_repair(raw, gemini_cmd, *, expected_kind=None, **kwargs):
         return None  # repair fails
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         with pytest.raises(AgentLoopError, match="blocking issues after round 1"):
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -2779,7 +2787,7 @@ def test_plan_loop_repair_missing_hr_marker_recovers_approved(tmp_path):
         assert reviewer_requirement_ids == (_PLAN_REQUIREMENT.requirement_id,)
         return repaired_with_marker
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         result = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert result == 0
@@ -2842,7 +2850,7 @@ def test_plan_loop_repair_missing_hr_marker_returns_blocking_not_synthetic(tmp_p
             return repaired_blocking
         return None  # subsequent calls not needed
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         result = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert result == 0
@@ -2891,7 +2899,7 @@ def test_plan_loop_repair_missing_hr_marker_failure_uses_synthetic(tmp_path):
     def fake_repair(raw, gemini_cmd, *, expected_kind=None, **kwargs):
         return None  # repair fails
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         result = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert result == 0
@@ -3043,7 +3051,7 @@ def test_pr_loop_repair_blocking_records_same_pr_followups(tmp_path):
             return repaired_blocking
         return None
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         result = run_pr_loop(runner, pr_number=77, config=config)
 
     assert result == 0
@@ -3103,7 +3111,7 @@ def test_plan_loop_repair_blocking_records_same_plan_followups(tmp_path):
             return repaired_blocking
         return None
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         result = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert result == 0
@@ -3236,7 +3244,7 @@ def test_run_validated_agent_deterministically_strips_unknown_plan_review_withou
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -3269,7 +3277,7 @@ def test_run_validated_agent_deterministically_strips_unknown_pr_review_without_
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -3312,7 +3320,7 @@ def test_run_validated_agent_deterministic_strip_preserves_valid_removes_unknown
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -3390,7 +3398,7 @@ def test_run_validated_agent_deterministic_strip_falls_through_to_repair_on_seco
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
     with patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired_review
+        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_review
     ) as repair_mock:
         response = _run_validated_agent(
             runner,
@@ -3423,7 +3431,7 @@ def test_run_validated_agent_real_264_shape_approved_plan_review_same_round_item
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -3459,7 +3467,7 @@ def test_run_validated_agent_deterministic_strip_skipped_when_ledger_incomplete(
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         with pytest.raises(AgentLoopError) as exc_info:
             _run_validated_agent(
                 runner,
@@ -3534,7 +3542,7 @@ def test_resolved_history_predicate_accepts_only_resolved_history_entries():
 def _run_incomplete_ledger_pr_review(tmp_path, review, *, history_ids):
     runner = FakeRunner(gemini_outputs=[review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         try:
             return _run_validated_agent(
                 runner,
@@ -3629,7 +3637,7 @@ def test_run_validated_agent_recovers_plan_revision_human_ack_from_message_text(
     )
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -3688,7 +3696,7 @@ def test_run_validated_agent_refuses_invalid_plan_revision_human_ack_evidence(tm
     )
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None) as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None) as repair_mock:
         with pytest.raises(AgentLoopError, match="No review result was recorded"):
             _run_validated_agent(
                 runner,
@@ -3730,7 +3738,7 @@ def test_run_validated_agent_refuses_plan_revision_missing_direct_discussion_ack
     )
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None):
         with pytest.raises(AgentLoopError, match="No review result was recorded"):
             _run_validated_agent(
                 runner,
@@ -3791,7 +3799,7 @@ def test_run_validated_agent_refuses_conflicting_plan_revision_human_ack_blocks(
     )
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None):
         with pytest.raises(AgentLoopError, match="No review result was recorded"):
             _run_validated_agent(
                 runner,
@@ -3853,7 +3861,7 @@ def test_run_validated_agent_strip_unknown_disposition_then_ack_recovery_succeed
     )
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -3990,7 +3998,7 @@ def test_structured_plan_revision_transient_terms_before_footer_runs_repair(tmp_
     runner = FakeRunner(claude_outputs=[malformed_revision])
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired_revision) as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_revision) as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -4023,7 +4031,7 @@ def test_run_validated_agent_repairs_unknown_prior_item_disposition_when_ledger_
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -4057,7 +4065,7 @@ def test_run_validated_agent_skips_unknown_prior_item_repair_when_ledger_incompl
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         with pytest.raises(AgentLoopError) as exc_info:
             _run_validated_agent(
                 runner,
@@ -4208,7 +4216,7 @@ def test_run_validated_agent_combined_envelope_and_disposition_fix(tmp_path):
     runner = FakeRunner(gemini_outputs=[malformed])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -4257,7 +4265,7 @@ def test_run_validated_agent_rejects_repair_that_invents_prior_item_id(tmp_path)
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired_review):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_review):
         with pytest.raises(AgentLoopError) as exc_info:
             _run_validated_agent(
                 runner,
@@ -4297,7 +4305,7 @@ def test_run_validated_agent_preserves_valid_disposition_when_repair_removes_unk
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -4334,7 +4342,7 @@ def test_run_validated_agent_repairs_unknown_plan_revision_prior_disposition(tmp
     runner = FakeRunner(claude_outputs=[malformed_revision])
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -4372,7 +4380,7 @@ def test_run_validated_agent_plan_revision_unknown_prior_disposition_fails_when_
     runner = FakeRunner(claude_outputs=[malformed_revision])
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         with pytest.raises(AgentLoopError) as exc_info:
             _run_validated_agent(
                 runner,
@@ -4460,7 +4468,7 @@ def test_build_repair_prompt_includes_new_discuss_expected_kind_schemas(kind, fo
 
 # --- #872: semantic plan_revision_patch disposition stripping -----------------
 
-from coding_review_agent_loop.orchestrator import _validate_plan_revision_patch_response
+from coding_review_agent_loop.response_validation import _validate_plan_revision_patch_response
 
 
 def _semantic_patch_text(dispositions):
@@ -4571,7 +4579,7 @@ def test_run_validated_agent_strips_resolved_echo_from_semantic_patch(tmp_path, 
         {"item_id": "item-3", "disposition": "resolved"},
     ])
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_semantic_patch_revision(
             tmp_path,
             patch_text,
@@ -4590,7 +4598,7 @@ def test_run_validated_agent_strips_resolved_echo_from_semantic_patch(tmp_path, 
 
     # The accepted patch must be identical to the one the planner would have
     # produced without the stray resolved-item entries.
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as clean_repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as clean_repair_mock:
         clean_response = _run_semantic_patch_revision(
             tmp_path,
             _semantic_patch_text([
@@ -4616,7 +4624,7 @@ def test_run_validated_agent_semantic_patch_unknown_id_absent_from_history_fails
     ])
 
     with patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair", return_value=None
+        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=None
     ) as repair_mock:
         with pytest.raises(
             AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \['item-9'\]"
@@ -4640,7 +4648,7 @@ def test_run_validated_agent_semantic_patch_active_disposition_fails_closed(tmp_
         {"item_id": "item-3", "disposition": active, "note": "still broken"},
     ])
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None):
         with pytest.raises(
             AgentLoopError, match=r"Unknown prior-item disposition ID\(s\) \['item-3'\]"
         ):
@@ -4693,7 +4701,7 @@ def test_round_resolved_history_uses_post_round_carried_set():
     The pre-round value still lists them, so the whitelist the semantic-patch
     strip depends on comes back empty exactly when the planner echoes them.
     """
-    from coding_review_agent_loop.orchestrator import _round_resolved_history_item_ids
+    from coding_review_agent_loop.review_rounds import _round_resolved_history_item_ids
     from coding_review_agent_loop.round_state import _extract_round_metadata_records
 
     records_comments = _plan_history_comments_with_resolved_items()
@@ -4829,8 +4837,8 @@ def test_gate_refuses_before_any_repair_backend_call(tmp_path):
         )
 
     config = make_config(tmp_path)
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
-        repaired, parsed, attempts = orchestrator._run_structured_repair(
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
+        repaired, parsed, attempts = validated_agent._run_structured_repair(
             NARRATION_ONLY_REVIEWER_OUTPUT,
             runner=None,
             config=config,
@@ -4863,9 +4871,9 @@ def test_legacy_attempt_repair_hook_runs_reviewer_grounding(tmp_path):
         reviewer="Google Gemini",
     )
     config = make_config(tmp_path)
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair",
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair",
                lambda raw, gemini_cmd, **kwargs: fabricated):
-        repaired, parsed, attempts = orchestrator._run_structured_repair(
+        repaired, parsed, attempts = validated_agent._run_structured_repair(
             source,
             runner=None,
             config=config,
@@ -4914,7 +4922,7 @@ def test_run_validated_agent_neutralizes_markers_named_in_response_prose(tmp_pat
     runner = FakeRunner(gemini_outputs=[review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -4962,7 +4970,7 @@ def test_run_validated_agent_salvages_artifact_whose_prose_names_markers(
     )
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",

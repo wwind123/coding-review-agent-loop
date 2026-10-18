@@ -11,7 +11,6 @@ import pytest
 
 from coding_review_agent_loop.runner import CommandResult
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.ci_health import CiInfrastructureStall, StalledCheck
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop, run_pr_loop
 from coding_review_agent_loop.comment_rendering import (
@@ -59,23 +58,26 @@ from coding_review_agent_loop.managed_ci import (
     ManagedCiOutcome,
     OrdinaryRecoveryCapability,
 )
-from coding_review_agent_loop.orchestrator import (
+from coding_review_agent_loop.unresolved_items import (
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+    _reconcile_human_requirements_ack_item,
+)
+from coding_review_agent_loop.round_state import (
     QualificationCheckpoint,
     PostedRoundMetadata,
-    ValidatedAgentResponse,
     _attach_round_metadata,
-    _pending_ci_stop_guidance,
-    _pending_ci_stop_message,
     _decode_round_metadata,
-    _reconcile_human_requirements_ack_item,
     _resume_pr_round,
     _strip_round_metadata,
-    _ensure_finalization_ready,
-    _latest_pr_architecture_observation,
     _latest_pr_approved_reviews_for_head,
+)
+from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
+from coding_review_agent_loop.checks import _pending_ci_stop_guidance, _pending_ci_stop_message
+from coding_review_agent_loop.pr_loop_support import (
+    _ensure_finalization_ready,
     _preserve_issue_created_managed_suppression,
 )
+from coding_review_agent_loop.architecture_contract import _latest_pr_architecture_observation
 from coding_review_agent_loop.prompts import (
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
@@ -108,6 +110,25 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_pr_review,
 )
+import coding_review_agent_loop.agent_failure as agent_failure
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.history_export as history_export
+import coding_review_agent_loop.integration_close as integration_close
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.review_rounds as review_rounds
+import coding_review_agent_loop.round_state as round_state
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in, patch_object_in
 
 
 @pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
@@ -176,7 +197,7 @@ def test_legacy_same_head_approval_is_not_reusable_with_fresh_architecture_gate(
 
 def _advance_head_after_coder(monkeypatch, runner, head_sha="repaired-head"):
     """Make the fake coder handoff obey the repair-head contract."""
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
@@ -184,7 +205,10 @@ def _advance_head_after_coder(monkeypatch, runner, head_sha="repaired-head"):
             runner.pr_payload["headRefOid"] = head_sha
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
 
 
 def _carried_ci_obligations() -> tuple[UnresolvedReviewItem, ...]:
@@ -214,7 +238,7 @@ def _carried_ci_obligations() -> tuple[UnresolvedReviewItem, ...]:
 
 
 def _approved_issue_plan_comments(plan: str) -> list[dict[str, object]]:
-    subject = orchestrator._plan_subject(plan)
+    subject = panel_evidence._plan_subject(plan)
     return [
         {
             "author": {"login": "coding-review-agent-loop"},
@@ -262,7 +286,7 @@ def test_pr_fresh_authorization_binds_server_recovered_approved_plan(tmp_path, m
         captured.update(kwargs)
         raise _FreshScopeCaptured
 
-    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", authorize)
+    monkeypatch.setattr(pr_loop, "authorize_fresh_issue_created_resume", authorize)
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_pr_mode=True,
         managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
@@ -274,7 +298,7 @@ def test_pr_fresh_authorization_binds_server_recovered_approved_plan(tmp_path, m
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert captured["issue_number"] == 56
-    assert captured["approved_plan_hash"] == orchestrator.approved_plan_hash(plan)
+    assert captured["approved_plan_hash"] == panel_evidence.approved_plan_hash(plan)
     assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
 
 
@@ -289,7 +313,7 @@ def test_pr_ordinary_resume_binds_server_recovered_approved_plan_before_activati
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
-    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+    handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
         head_sha="abc123", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
@@ -297,14 +321,14 @@ def test_pr_ordinary_resume_binds_server_recovered_approved_plan_before_activati
     )
     captured = {}
     monkeypatch.setattr(
-        orchestrator, "recover_issue_created_handoff", lambda *_a, **_k: handoff
+        pr_loop, "recover_issue_created_handoff", lambda *_a, **_k: handoff
     )
 
     def revalidate(*_args, **kwargs):
         captured.update(kwargs)
         raise _FreshScopeCaptured
 
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", revalidate)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", revalidate)
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_pr_mode=True,
         managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
@@ -314,13 +338,13 @@ def test_pr_ordinary_resume_binds_server_recovered_approved_plan_before_activati
     with pytest.raises(_FreshScopeCaptured):
         run_pr_loop(runner, pr_number=77, config=config)
 
-    assert captured["handoff"].approved_plan_hash == orchestrator.approved_plan_hash(plan)
+    assert captured["handoff"].approved_plan_hash == panel_evidence.approved_plan_hash(plan)
     assert not any(command[:1] in (["claude"], ["codex"]) for command, _cwd in runner.commands)
 
 
 def test_pr_fresh_authorization_rejects_mismatched_supplied_plan_scope(tmp_path, monkeypatch):
     canonical = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
-    supplied = orchestrator.make_approved_plan_context(
+    supplied = execution_policy.make_approved_plan_context(
         "Different plan.\n\n### Plan steps\n1. Change the boundary.", source_locator="test"
     )
     runner = FakeRunner(
@@ -328,7 +352,7 @@ def test_pr_fresh_authorization_rejects_mismatched_supplied_plan_scope(tmp_path,
         pr_payload={"headRefName": "agent-loop/managed-56", "body": "Fixes #56"},
     )
     monkeypatch.setattr(
-        orchestrator, "authorize_fresh_issue_created_resume",
+        pr_loop, "authorize_fresh_issue_created_resume",
         lambda *args, **kwargs: (_ for _ in ()).throw(_FreshScopeCaptured()),
     )
     config = make_config(
@@ -346,7 +370,7 @@ def test_pr_fresh_authorization_rejects_mismatched_supplied_plan_scope(tmp_path,
 
 def test_pr_fresh_authorization_rejects_incomplete_plan_scope(tmp_path, monkeypatch):
     plan = "Unapproved plan."
-    subject = orchestrator._plan_subject(plan)
+    subject = panel_evidence._plan_subject(plan)
     runner = FakeRunner(
         issue_comments=[{
             "author": {"login": "coding-review-agent-loop"},
@@ -362,7 +386,7 @@ def test_pr_fresh_authorization_rejects_incomplete_plan_scope(tmp_path, monkeypa
         pr_payload={"headRefName": "agent-loop/managed-56", "body": "Fixes #56"},
     )
     monkeypatch.setattr(
-        orchestrator, "authorize_fresh_issue_created_resume",
+        pr_loop, "authorize_fresh_issue_created_resume",
         lambda *args, **kwargs: (_ for _ in ()).throw(_FreshScopeCaptured()),
     )
     config = make_config(
@@ -386,7 +410,7 @@ def test_pr_fresh_authorization_allows_authenticated_planless_issue_scope(tmp_pa
         captured.update(kwargs)
         raise _FreshScopeCaptured
 
-    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", authorize)
+    monkeypatch.setattr(pr_loop, "authorize_fresh_issue_created_resume", authorize)
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_pr_mode=True,
         managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
@@ -420,7 +444,7 @@ def test_managed_issue_fix_round_publishes_correlated_head_continuity(
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
-    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+    handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
         head_sha="abc123", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
@@ -429,15 +453,15 @@ def test_managed_issue_fix_round_publishes_correlated_head_continuity(
     )
     selected = []
     published = []
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop, "activate_managed_ci",
         lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
     )
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
-    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "managed_label_present", lambda *_a, **_k: True)
     monkeypatch.setattr(
-        orchestrator, "find_actor_round_metadata_comment_ids",
+        pr_loop, "find_actor_round_metadata_comment_ids",
         lambda *_a, **kwargs: selected.append(kwargs) or (88, 89),
     )
     def publish(*_args, **kwargs):
@@ -445,7 +469,7 @@ def test_managed_issue_fix_round_publishes_correlated_head_continuity(
         raise _FreshScopeCaptured
 
     monkeypatch.setattr(
-        orchestrator, "publish_issue_created_continuity_authorization", publish
+        pr_loop, "publish_issue_created_continuity_authorization", publish
     )
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
@@ -529,7 +553,7 @@ def test_ordinary_checks_authority_rejects_non_executed_passing_conclusions(stat
         check_query_status="ok",
     )
 
-    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+    assert not pr_loop_support._ordinary_checks_snapshot_is_authoritative(checks)
 
 
 def test_ordinary_checks_authority_requires_a_real_success_conclusion():
@@ -545,13 +569,13 @@ def test_ordinary_checks_authority_requires_a_real_success_conclusion():
         check_query_status="ok",
     )
 
-    assert orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+    assert pr_loop_support._ordinary_checks_snapshot_is_authoritative(checks)
 
 
 def test_ordinary_checks_authority_rejects_forbidden_branch_protection():
     checks = _watch_check_board("passing", protection="forbidden")
 
-    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+    assert not pr_loop_support._ordinary_checks_snapshot_is_authoritative(checks)
 
 
 def test_ordinary_checks_authority_rejects_absent_partial_or_unavailable_boards():
@@ -572,7 +596,7 @@ def test_ordinary_checks_authority_rejects_absent_partial_or_unavailable_boards(
             branch_protection_status="configured",
             check_query_status=query,
         )
-        assert not orchestrator._ordinary_checks_snapshot_is_authoritative(checks)
+        assert not pr_loop_support._ordinary_checks_snapshot_is_authoritative(checks)
 
 
 def test_machine_authority_clears_only_its_own_obligation_kind():
@@ -597,10 +621,10 @@ def test_machine_authority_clears_only_its_own_obligation_kind():
         obligation_identity="github-pr-checks:item-2",
     )
 
-    after_managed = orchestrator._clear_machine_obligations(
+    after_managed = pr_loop._clear_machine_obligations(
         [managed, ordinary], kind="managed-exact-head-ci"
     )
-    after_ordinary = orchestrator._clear_machine_obligations(
+    after_ordinary = pr_loop._clear_machine_obligations(
         [managed, ordinary], kind="github-pr-checks"
     )
 
@@ -637,7 +661,7 @@ def test_qualification_checkpoint_review_identity_is_fail_closed():
         allowed_rounds=1,
     )
 
-    assert not orchestrator._qualification_checkpoint_review_identity_matches(
+    assert not pr_loop_support._qualification_checkpoint_review_identity_matches(
         checkpoint,
         configured_reviewers=("codex",),
         current_approvals={},
@@ -649,12 +673,12 @@ def test_qualification_checkpoint_review_identity_is_fail_closed():
     )
     complete = dataclasses.replace(
         checkpoint,
-        approval_digest=orchestrator._qualification_digest(("Codex",)),
-        scheduler_digest=orchestrator._qualification_digest(
-            orchestrator._prior_item_ledger_signature([item])
+        approval_digest=pr_loop_support._qualification_digest(("Codex",)),
+        scheduler_digest=pr_loop_support._qualification_digest(
+            pr_loop_support._prior_item_ledger_signature([item])
         ),
     )
-    assert orchestrator._qualification_checkpoint_review_identity_matches(
+    assert pr_loop_support._qualification_checkpoint_review_identity_matches(
         complete,
         configured_reviewers=("codex",),
         current_approvals={"Codex": object()},
@@ -672,7 +696,7 @@ def test_qualification_checkpoint_review_identity_is_fail_closed():
         "qualification_attempt_id",
     ):
         tampered = dataclasses.replace(complete, **{field: "different"})
-        assert not orchestrator._qualification_checkpoint_review_identity_matches(
+        assert not pr_loop_support._qualification_checkpoint_review_identity_matches(
             tampered,
             configured_reviewers=("codex",),
             current_approvals={"Codex": object()},
@@ -698,10 +722,10 @@ def test_machine_checkpoint_revert_returns_to_repair_required_without_value_erro
         candidate_head_sha="repair-head",
     )
 
-    advanced = orchestrator._advance_machine_obligations_for_head(
+    advanced = pr_loop._advance_machine_obligations_for_head(
         [item], current_head_sha="failed-head"
     )
-    checkpoint = orchestrator._machine_obligation_checkpoint(
+    checkpoint = pr_loop_support._machine_obligation_checkpoint(
         advanced,
         current_head_sha="failed-head",
         base_branch="main",
@@ -754,7 +778,7 @@ def test_approval_gated_managed_ci_wait_cannot_block_code_approval():
         reviewer="OpenAI Codex",
     )
 
-    normalized = orchestrator._normalize_approval_gated_managed_ci_review(
+    normalized = review_rounds._normalize_approval_gated_managed_ci_review(
         parsed,
         prior_items=[item],
         pr_checks=_watch_check_board("passing"),
@@ -794,7 +818,7 @@ def test_approval_gated_managed_ci_wait_ignores_nonfailing_intermediate_checks(c
         reviewer="OpenAI Codex",
     )
 
-    normalized = orchestrator._normalize_approval_gated_managed_ci_review(
+    normalized = review_rounds._normalize_approval_gated_managed_ci_review(
         parsed,
         prior_items=[item],
         pr_checks=_watch_check_board(checks_state),
@@ -833,7 +857,7 @@ def test_approval_gated_managed_ci_wait_requires_both_heads_to_be_known():
         reviewer="OpenAI Codex",
     )
 
-    normalized = orchestrator._normalize_approval_gated_managed_ci_review(
+    normalized = review_rounds._normalize_approval_gated_managed_ci_review(
         parsed,
         prior_items=[item],
         pr_checks=_watch_check_board("passing"),
@@ -890,7 +914,7 @@ def test_managed_ci_wait_normalization_fails_closed(
         reviewer="OpenAI Codex",
     )
 
-    normalized = orchestrator._normalize_approval_gated_managed_ci_review(
+    normalized = review_rounds._normalize_approval_gated_managed_ci_review(
         parsed,
         prior_items=[item],
         pr_checks=_watch_check_board(checks_state),
@@ -963,20 +987,20 @@ def test_pr_loop_normalizes_managed_ci_wait_before_exact_head_dispatch(
         review_parallel=review_parallel,
     )
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
     dispatches = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "dispatch_final_qualification",
         lambda *args, **kwargs: dispatches.append(kwargs),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -1020,9 +1044,7 @@ def test_selective_pr_loop_only_rechecks_owner_then_final_missing_reviewers(tmp_
             + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
         )
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -1087,9 +1109,7 @@ def test_selective_pr_loop_keeps_multiple_consecutive_narrow_fixes_selective(tmp
             + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
         )
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -1213,14 +1233,12 @@ def test_selective_final_sweep_missing_approval_stops_before_migration_or_merge(
             + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
         )
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     migration_calls = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "validate_pr_migration_topology",
         lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
     )
@@ -1228,17 +1246,17 @@ def test_selective_final_sweep_missing_approval_stops_before_migration_or_merge(
     qualification_calls = []
     optional_test_calls = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "dispatch_final_qualification",
         lambda *args, **kwargs: managed_ci_calls.append(True),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: qualification_calls.append(True),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "run_optional_tests",
         lambda *args, **kwargs: optional_test_calls.append(True),
     )
@@ -1296,9 +1314,7 @@ def test_selective_final_sweep_blocker_dispatches_coder_remediation(tmp_path, mo
             + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
         )
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -1385,9 +1401,7 @@ def _run_selective_owner_unavailable(tmp_path, monkeypatch):
             "suggested_action": "Repair the reviewer environment before retrying.",
         }
     ) + "\n<!-- AGENT_UNAVAILABLE -->\n-- OpenAI Codex"
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -1436,7 +1450,7 @@ def test_unavailable_reviewer_amendment_rejected_prints_prose_only(tmp_path, mon
     def reject(*args, **kwargs):
         raise AgentLoopError("cannot reduce")
 
-    monkeypatch.setattr(orchestrator, "amend_contract", reject)
+    monkeypatch.setattr(review_rounds, "amend_contract", reject)
     runner, message = _run_selective_owner_unavailable(tmp_path, monkeypatch)
 
     assert "cannot be reduced for this run" in message
@@ -1450,7 +1464,7 @@ def test_unavailable_reviewer_advisory_lookup_failure_keeps_the_stop(tmp_path, m
     def broken(*args, **kwargs):
         raise RuntimeError("lookup exploded")
 
-    monkeypatch.setattr(orchestrator, "_pr_amendment_start_round", broken)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_pr_amendment_start_round", broken)
     runner, message = _run_selective_owner_unavailable(tmp_path, monkeypatch)
 
     assert "lookup exploded" not in message
@@ -1472,7 +1486,7 @@ def test_selective_resume_uses_a_valid_persisted_scheduler_checkpoint(tmp_path):
         resolution_owners=("Codex",),
         owner_states=(("Codex", "pending"),),
     )
-    contract = orchestrator.make_contract(
+    contract = pr_loop.make_contract(
         ("Codex", "Gemini", "Antigravity"),
         "selective-intermediate",
         None,
@@ -1591,7 +1605,9 @@ def test_selective_same_head_requirement_edit_invalidates_approval_before_merge(
             human_requirements=(requirement_1 if context_calls == 1 else requirement_2,),
         )
 
-    monkeypatch.setattr(orchestrator, "get_pr_review_context", changing_context)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context", changing_context)
     runner = FakeRunner(
         claude_outputs=[],
         codex_outputs=[
@@ -1640,7 +1656,7 @@ def test_selective_same_head_requirement_edit_invalidates_approval_before_merge(
 
 def test_selective_plan_handoff_change_stops_before_migration_or_merge(tmp_path, monkeypatch):
     plan = "Approved plan.\n\n## Scope\n- Preserve the current API."
-    plan_context = orchestrator.make_approved_plan_context(plan, source_locator="test")
+    plan_context = execution_policy.make_approved_plan_context(plan, source_locator="test")
     handoff = format_issue_pr_handoff_comment(
         issue_number=56,
         pr_number=77,
@@ -1681,10 +1697,13 @@ def test_selective_plan_handoff_change_stops_before_migration_or_merge(tmp_path,
         issue_fetches += 1
         return initial_issue if issue_fetches == 1 else changed_issue
 
-    monkeypatch.setattr(orchestrator, "get_issue_context", changing_issue)
+    patch_attr_in(monkeypatch, (
+        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
+        plan_first_loop, issue_loop,
+    ), "get_issue_context", changing_issue)
     migration_calls = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "validate_pr_migration_topology",
         lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
     )
@@ -1720,8 +1739,8 @@ def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
 ):
     old_plan = "Approved plan.\n\n## Scope\n- Preserve the current API."
     new_plan = "Approved replacement plan.\n\n## Scope\n- Preserve the current API and audit trail."
-    old_plan_context = orchestrator.make_approved_plan_context(old_plan, source_locator="test")
-    new_plan_context = orchestrator.make_approved_plan_context(new_plan, source_locator="test")
+    old_plan_context = execution_policy.make_approved_plan_context(old_plan, source_locator="test")
+    new_plan_context = execution_policy.make_approved_plan_context(new_plan, source_locator="test")
     old_handoff = format_issue_pr_handoff_comment(
         issue_number=56,
         pr_number=77,
@@ -1747,7 +1766,7 @@ def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
     )
 
     def plan_record(plan_text, timestamp):
-        plan_context = orchestrator.make_approved_plan_context(plan_text, source_locator="test")
+        plan_context = execution_policy.make_approved_plan_context(plan_text, source_locator="test")
         return IssueComment(
             author="bot",
             created_at=timestamp,
@@ -1795,7 +1814,10 @@ def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
         issue_fetches += 1
         return initial_issue if issue_fetches == 1 else replacement_issue
 
-    monkeypatch.setattr(orchestrator, "get_issue_context", changing_issue)
+    patch_attr_in(monkeypatch, (
+        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
+        plan_first_loop, issue_loop,
+    ), "get_issue_context", changing_issue)
     migration_calls = []
 
     def validate_migration(*args, **kwargs):
@@ -1808,7 +1830,7 @@ def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
         assert len(reviewer_commands) == 2
         return MigrationValidationResult(ok=True)
 
-    monkeypatch.setattr(orchestrator, "validate_pr_migration_topology", validate_migration)
+    monkeypatch.setattr(pr_loop, "validate_pr_migration_topology", validate_migration)
     runner = FakeRunner(
         codex_outputs=[
             structured_pr_review(summary="Approval bound to the original plan."),
@@ -1854,16 +1876,16 @@ def test_selective_scheduler_contract_change_during_managed_ci_blocks_merge(
         max_rounds=1,
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "activate_managed_ci",
         lambda *args, **kwargs: ManagedCiContract(),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "dispatch_final_qualification",
         lambda *args, **kwargs: None,
     )
-    changed_contract = orchestrator.make_contract(
+    changed_contract = pr_loop.make_contract(
         ("Codex",), "all-reviewers", None
     )
     changed_audit = _attach_round_metadata(
@@ -1895,12 +1917,12 @@ def test_selective_scheduler_contract_change_during_managed_ci_blocks_merge(
         return ManagedCiOutcome(status="passed", head_sha="abc123")
 
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         wait_for_managed_ci,
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "merge_pr",
         lambda *args, **kwargs: pytest.fail("scheduler contract changes must prevent merge"),
     )
@@ -2157,7 +2179,7 @@ def test_m780_09_review_only_recovery_row_survives_coder_handoff_and_pr_reresume
     })
     identity = risk_test_matrix_identity(matrix)
     canonical_plan = "Approved recovery plan.\n\n" + render_risk_test_matrix_section(matrix)
-    plan_context = orchestrator.make_approved_plan_context(
+    plan_context = execution_policy.make_approved_plan_context(
         canonical_plan,
         source_locator="test approved recovery plan",
         risk_test_matrix_contract_version=1,
@@ -2207,12 +2229,12 @@ def test_m780_09_review_only_recovery_row_survives_coder_handoff_and_pr_reresume
         if isinstance(item, dict)
         and isinstance(item.get("body"), str)
         and "AGENT_LOOP_META: " in item["body"]
-        and orchestrator._decode_round_metadata(
+        and round_state._decode_round_metadata(
             item["body"].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
         ).role == "coder"
     ]
     assert coder_metadata_comments
-    coder_metadata = orchestrator._decode_round_metadata(
+    coder_metadata = round_state._decode_round_metadata(
         coder_metadata_comments[-1].split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
     )
     assert coder_metadata.risk_test_matrix_evidence is not None
@@ -2243,7 +2265,7 @@ def _followup_matrix_context():
     })
     approved_plan = "Approved follow-up plan.\n\n" + render_risk_test_matrix_section(matrix)
     identity = risk_test_matrix_identity(matrix)
-    return orchestrator.make_approved_plan_context(
+    return execution_policy.make_approved_plan_context(
         approved_plan,
         source_locator="test approved follow-up plan",
         risk_test_matrix_contract_version=1,
@@ -2364,7 +2386,7 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
         git_head="predecessor-head",
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
-    real_validated_agent = orchestrator._run_validated_agent
+    real_validated_agent = validated_agent._run_validated_agent
 
     def fake_validated_agent(*args, **kwargs):
         if kwargs.get("role") == "coder":
@@ -2373,9 +2395,12 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", fake_validated_agent)
     monkeypatch.setattr(
-        orchestrator,
+        response_validation,
         "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head=runner.pr_payload["headRefOid"],
@@ -2385,14 +2410,14 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
             status_clean=True,
         ),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "_read_assigned_workdir_head",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, issue_loop,
+    ), "_read_assigned_workdir_head",
         lambda *_args, **_kwargs: runner.git_head,
     )
 
-    real_run_agent_result = orchestrator.run_agent_result
-    real_get_pr_review_context = orchestrator.get_pr_review_context
+    real_run_agent_result = validated_agent.run_agent_result
+    real_get_pr_review_context = pr_loop_support.get_pr_review_context
     race_pending = False
 
     def get_pr_context(*args, **kwargs):
@@ -2406,7 +2431,9 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
                 race_pending = False
         return real_get_pr_review_context(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "get_pr_review_context", get_pr_context)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context", get_pr_context)
 
     def fake_correction(*_args, **kwargs):
         nonlocal race_pending
@@ -2418,7 +2445,9 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
             text=("not a structured response" if mode == "exhausted" else corrected_text)
         )
 
-    monkeypatch.setattr(orchestrator, "run_agent_result", fake_correction)
+    patch_attr_in(monkeypatch, (
+        validated_agent, response_validation,
+    ), "run_agent_result", fake_correction)
 
     assert run_pr_loop(
         runner,
@@ -2515,7 +2544,7 @@ def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
         git_head="predecessor-head",
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
-    real_validated_agent = orchestrator._run_validated_agent
+    real_validated_agent = validated_agent._run_validated_agent
 
     def fake_validated_agent(*args, **kwargs):
         if kwargs.get("role") == "coder":
@@ -2527,11 +2556,14 @@ def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
     def forbidden_repair(*_a, **_k):
         raise AssertionError("repair must not run for dropped execution_refs")
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", fake_validated_agent)
-    monkeypatch.setattr(orchestrator, "attempt_repair", forbidden_repair)
-    monkeypatch.setattr(orchestrator, "execute_repair", forbidden_repair)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", fake_validated_agent)
+    monkeypatch.setattr(validated_agent, "attempt_repair", forbidden_repair)
+    monkeypatch.setattr(validated_agent, "execute_repair", forbidden_repair)
     monkeypatch.setattr(
-        orchestrator,
+        response_validation,
         "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head=runner.pr_payload["headRefOid"],
@@ -2541,12 +2573,12 @@ def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
             status_clean=True,
         ),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "_read_assigned_workdir_head",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, issue_loop,
+    ), "_read_assigned_workdir_head",
         lambda *_args, **_kwargs: runner.git_head,
     )
-    real_run_agent_result = orchestrator.run_agent_result
+    real_run_agent_result = validated_agent.run_agent_result
     correction_prompts = []
 
     def fake_correction(*_args, **kwargs):
@@ -2555,7 +2587,9 @@ def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
         correction_prompts.append(kwargs["prompt"])
         return SimpleNamespace(text=command_text)
 
-    monkeypatch.setattr(orchestrator, "run_agent_result", fake_correction)
+    patch_attr_in(monkeypatch, (
+        validated_agent, response_validation,
+    ), "run_agent_result", fake_correction)
 
     assert run_pr_loop(
         runner,
@@ -2816,7 +2850,7 @@ def test_direct_pr_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_pat
     later_identity = risk_test_matrix_identity(later_matrix)
     old_plan = "Preserve the old API.\n\nApproved old plan.\n\n" + render_risk_test_matrix_section(old_matrix)
     later_plan = "Replace the old API.\n\nUnrelated later plan.\n\n" + render_risk_test_matrix_section(later_matrix)
-    old_context = orchestrator.make_approved_plan_context(
+    old_context = execution_policy.make_approved_plan_context(
         old_plan,
         source_locator="test old approved plan",
         risk_test_matrix_contract_version=1,
@@ -2825,7 +2859,7 @@ def test_direct_pr_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_pat
         risk_test_matrix_identity=old_identity,
         risk_test_matrix_boundary_digest=old_identity,
     )
-    later_context = orchestrator.make_approved_plan_context(
+    later_context = execution_policy.make_approved_plan_context(
         later_plan,
         source_locator="test later plan",
         risk_test_matrix_contract_version=1,
@@ -2872,7 +2906,7 @@ def test_direct_pr_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_pat
         pr_url="https://github.com/OWNER/REPO/pull/77",
         pr_head_sha="abc123",
         flow="approved-plan-implementation",
-        plan_hash=orchestrator.approved_plan_hash(old_plan),
+        plan_hash=panel_evidence.approved_plan_hash(old_plan),
     )
     runner = FakeRunner(
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
@@ -2940,9 +2974,9 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
     )
     validations = []
     merged = []
-    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "wait_for_ordinary_recovery",
         lambda *args, **kwargs: ManagedCiOutcome(
             status="passed",
@@ -2950,26 +2984,26 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
             head_sha="abc123",
         ),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
             base_branch="main", head_sha="abc123", url=None,
         )),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "validate_ordinary_recovery_capability",
         lambda *args, **kwargs: validations.append(kwargs.get("require_draft", True)) or True,
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "merge_pr",
         lambda *args, **kwargs: merged.append(kwargs["expected_head_sha"]),
     )
 
-    orchestrator._finalize_ordinary_recovery_merge(
+    pr_loop_support._finalize_ordinary_recovery_merge(
         runner, config=config, pr_number=77, capability=capability,
     )
 
@@ -3004,18 +3038,18 @@ def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
             passing=(PullRequestCheck(name="test", kind="check_run", status=board),),
         )
     monkeypatch.setattr(
-        orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability
+        pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "wait_for_ordinary_recovery",
         lambda *args, **kwargs: ManagedCiOutcome(
             status="passed", checks=snapshot, head_sha="abc123"
         ),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77,
             repo="OWNER/REPO",
@@ -3027,14 +3061,14 @@ def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
         )),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "merge_pr",
         lambda *args, **kwargs: pytest.fail("non-authoritative recovery must not merge"),
     )
 
     ordinary_item = _carried_ci_obligations()[1]
     items = [ordinary_item]
-    assert not orchestrator._finalize_ordinary_recovery_checked(
+    assert not pr_loop_support._finalize_ordinary_recovery_checked(
         runner,
         config=config,
         pr_number=77,
@@ -3055,15 +3089,15 @@ def test_ordinary_recovery_refuses_head_changed_before_ready(monkeypatch, tmp_pa
         pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
         released_label_event_id=101, released_at=100,
     )
-    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "wait_for_ordinary_recovery",
         lambda *args, **kwargs: ManagedCiOutcome(status="head_changed", head_sha="new-head"),
     )
 
     with pytest.raises(AgentLoopError, match="head_changed"):
-        orchestrator._finalize_ordinary_recovery_merge(
+        pr_loop_support._finalize_ordinary_recovery_merge(
             runner, config=config, pr_number=77, capability=capability,
         )
 
@@ -3078,9 +3112,9 @@ def test_ordinary_recovery_refuses_provenance_change_after_ready(monkeypatch, tm
         released_label_event_id=101, released_at=100,
     )
     validations = iter([True, False])
-    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "wait_for_ordinary_recovery",
         lambda *args, **kwargs: ManagedCiOutcome(
             status="passed",
@@ -3088,22 +3122,22 @@ def test_ordinary_recovery_refuses_provenance_change_after_ready(monkeypatch, tm
             head_sha="abc123",
         ),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
             base_branch="main", head_sha="abc123", url=None,
         )),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "validate_ordinary_recovery_capability",
         lambda *args, **kwargs: next(validations),
     )
 
     with pytest.raises(AgentLoopError, match="after `gh pr ready`"):
-        orchestrator._finalize_ordinary_recovery_merge(
+        pr_loop_support._finalize_ordinary_recovery_merge(
             runner, config=config, pr_number=77, capability=capability,
         )
 
@@ -3118,9 +3152,9 @@ def test_ordinary_recovery_merge_failure_leaves_pr_ready(monkeypatch, tmp_path):
         pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
         released_label_event_id=101, released_at=100,
     )
-    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "wait_for_ordinary_recovery",
         lambda *args, **kwargs: ManagedCiOutcome(
             status="passed",
@@ -3128,23 +3162,23 @@ def test_ordinary_recovery_merge_failure_leaves_pr_ready(monkeypatch, tmp_path):
             head_sha="abc123",
         ),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
             base_branch="main", head_sha="abc123", url=None,
         )),
     )
-    monkeypatch.setattr(orchestrator, "validate_ordinary_recovery_capability", lambda *args, **kwargs: True)
+    monkeypatch.setattr(pr_loop_support, "validate_ordinary_recovery_capability", lambda *args, **kwargs: True)
 
     def fail_merge(*args, **kwargs):
         raise AgentLoopError("merge failed")
 
-    monkeypatch.setattr(orchestrator, "merge_pr", fail_merge)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", fail_merge)
 
     with pytest.raises(AgentLoopError, match="merge failed"):
-        orchestrator._finalize_ordinary_recovery_merge(
+        pr_loop_support._finalize_ordinary_recovery_merge(
             runner, config=config, pr_number=77, capability=capability,
         )
 
@@ -3340,7 +3374,7 @@ def test_pr_loop_exits_immediately_on_claude_session_limit_reset(tmp_path, monke
                 return fixed.replace(tzinfo=None)
             return fixed.astimezone(tz)
 
-    monkeypatch.setattr(orchestrator.datetime, "datetime", FixedDateTime)
+    monkeypatch.setattr(agent_failure.datetime, "datetime", FixedDateTime)
     session_limit_output = json.dumps(
         {
             "type": "result",
@@ -3668,14 +3702,14 @@ def test_rejected_structured_response_content_cannot_trigger_provider_advice():
     )
 
     assert (
-        orchestrator._failure_category(
+        agent_failure._failure_category(
             malformed,
             public_response=True,
             repair_expected_kind="coder_followup",
         )
         == "deterministic"
     )
-    error = orchestrator._format_invalid_agent_response_error(
+    error = agent_failure._format_invalid_agent_response_error(
         agent_name="Anthropic Claude",
         marker_description="<!-- AGENT_STATE: approved|blocking -->",
         reason="schema validation failed; repair invocation failure: timeout",
@@ -3790,8 +3824,9 @@ def test_pr_loop_revalidates_latest_coder_output_against_refreshed_human_require
         ]
     )
 
-    monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator.get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *args, **kwargs: next(contexts),
     )
 
@@ -3826,7 +3861,7 @@ def test_pr_loop_routes_migration_validation_failure_through_coder_followup(tmp_
     )
 
     monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator.validate_pr_migration_topology",
+        "coding_review_agent_loop.pr_loop.validate_pr_migration_topology",
         lambda *args, **kwargs: next(validations),
     )
 
@@ -3890,13 +3925,12 @@ def test_pr_loop_routes_failing_github_checks_through_coder_followup(tmp_path, m
         runner.pr_check_runs_payload = next(check_states)
         return original_get_pr_checks(*_args, **_kwargs)
 
-    from coding_review_agent_loop import orchestrator as orchestrator_module
 
-    original_get_pr_checks = orchestrator_module.get_pr_checks
-    monkeypatch.setattr(orchestrator_module, "get_pr_checks", advance_checks)
+    original_get_pr_checks = pr_loop.get_pr_checks
+    monkeypatch.setattr(pr_loop, "get_pr_checks", advance_checks)
     _advance_head_after_coder(monkeypatch, runner)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *args, **kwargs: CiWatchOutcome(
             status="passed", pr_checks=_watch_check_board("passing"),
@@ -3964,7 +3998,7 @@ def test_blocking_review_handoff_includes_available_ci_without_waiting(
         errors=("API unavailable",) if board_state == "unavailable" else (),
     )
     if board_state == "stall":
-        board = orchestrator.dataclasses_replace(board, infrastructure_stalls=(
+        board = architecture_contract.dataclasses_replace(board, infrastructure_stalls=(
             StalledCheck(
                 name="test", kind="check_run", reason="runner_unavailable",
                 check_id=None, run_id="555", url=failure.url, age_seconds=None,
@@ -3980,9 +4014,9 @@ def test_blocking_review_handoff_includes_available_ci_without_waiting(
         # CI finishes while the reviewer is working, not before the review.
         return _watch_check_board("pending", pending=(pending,)) if len(snapshots) == 1 else board
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", snapshot)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
-    original = orchestrator._run_validated_agent
+    monkeypatch.setattr(pr_loop, "get_pr_checks", snapshot)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
+    original = validated_agent._run_validated_agent
     captured = {}
 
     class CoderReached(Exception):
@@ -3994,7 +4028,10 @@ def test_blocking_review_handoff_includes_available_ci_without_waiting(
             raise CoderReached
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", capture)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", capture)
     with pytest.raises(CoderReached):
         run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, auto_merge=auto_merge))
     assert snapshots == ["abc123", "abc123"]
@@ -4030,9 +4067,9 @@ def test_round_ci_failure_is_tracked_and_resolved_with_reviewer_findings(tmp_pat
         _watch_check_board("passing"),
         _watch_check_board("passing"),
     ])
-    monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: next(snapshots))
+    monkeypatch.setattr(pr_loop, "get_pr_checks", lambda *a, **k: next(snapshots))
     _advance_head_after_coder(monkeypatch, runner, "repaired-head")
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -4082,10 +4119,10 @@ def test_review_only_mode_clears_repaired_ordinary_ci_from_fresh_passing_snapsho
             ),
         )
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
+    monkeypatch.setattr(pr_loop, "get_pr_checks", checks)
     _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *args, **kwargs: pytest.fail("review-only mode must not start the watcher"),
     )
@@ -4134,10 +4171,10 @@ def test_review_only_mode_reports_passing_but_uncleared_ci_at_the_gate(
             passing=(PullRequestCheck(name="docs", kind="check_run", status="skipped"),),
         )
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
+    monkeypatch.setattr(pr_loop, "get_pr_checks", checks)
     _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *args, **kwargs: pytest.fail("review-only mode must not start the watcher"),
     )
@@ -4180,7 +4217,7 @@ def test_review_only_mode_reports_passing_but_uncleared_ci_at_the_gate(
     ]
     assert metadata_bodies
     for body in metadata_bodies:
-        decoded = orchestrator._decode_round_metadata(
+        decoded = round_state._decode_round_metadata(
             body.split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
         )
         rendered = repr(decoded)
@@ -4196,7 +4233,7 @@ def test_watch_mode_success_uses_full_board_without_second_wait(
     runner = FakeRunner(codex_outputs=[structured_pr_review(state="approved", summary="Approved.")])
     config = make_config(tmp_path, watch_pending_ci=True, auto_merge=auto_merge)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *args, **kwargs: CiWatchOutcome(
             status="passed", pr_checks=_watch_check_board("passing"),
@@ -4229,7 +4266,7 @@ def test_skipped_only_watcher_pass_does_not_clear_or_merge(
         check_query_status="ok",
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *args, **kwargs: CiWatchOutcome(
             status="passed", pr_checks=skipped_only, head_sha="abc123", attempts_used=1
@@ -4309,7 +4346,7 @@ def test_invalid_watcher_success_cannot_finalize_carried_ci_obligation(
             head_sha=None, attempts_used=1
         )
         expected = "stale head"
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *args, **kwargs: outcome)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *args, **kwargs: outcome)
 
     with pytest.raises(AgentLoopError, match=expected):
         run_pr_loop(
@@ -4381,16 +4418,16 @@ def test_managed_success_does_not_clear_carried_ordinary_ci_obligation(
         max_rounds=1,
     )
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("ordinary obligation was bypassed")
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("ordinary obligation was bypassed")
     )
 
     with pytest.raises(AgentLoopError, match="github-pr-checks"):
@@ -4429,9 +4466,9 @@ def test_ordinary_success_does_not_clear_carried_managed_ci_obligation(
         watch_pending_ci=False,
         max_rounds=1,
     )
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("managed obligation was bypassed")
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("managed obligation was bypassed")
     )
 
     with pytest.raises(AgentLoopError, match="managed-exact-head-ci"):
@@ -4471,7 +4508,7 @@ def test_ordinary_watcher_success_does_not_clear_carried_managed_ci_obligation(
         watch_pending_ci=True,
         max_rounds=1,
     )
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *args, **kwargs: None)
 
     def watch(*args, **kwargs):
         watcher_calls.append(kwargs["metadata"].head_sha)
@@ -4482,9 +4519,9 @@ def test_ordinary_watcher_success_does_not_clear_carried_managed_ci_obligation(
             attempts_used=1,
         )
 
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", watch)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "merge_pr",
         lambda *args, **kwargs: pytest.fail("managed obligation was bypassed"),
     )
@@ -4515,7 +4552,7 @@ def test_resume_machine_authority_upgrade_forces_full_reviewer_board(
         base_branch="main",
         allowed_rounds=1,
     )
-    scheduler_contract = orchestrator.make_contract(
+    scheduler_contract = pr_loop.make_contract(
         ("Codex",), "selective-intermediate", None
     )
     summary = _attach_round_metadata(
@@ -4533,8 +4570,8 @@ def test_resume_machine_authority_upgrade_forces_full_reviewer_board(
             scheduler_contract=scheduler_contract.as_dict(),
             scheduler_previous_sha="abc123",
             scheduler_current_sha="abc123",
-            scheduler_obligation_digest=orchestrator._qualification_digest(
-                orchestrator._prior_item_ledger_signature((legacy,))
+            scheduler_obligation_digest=pr_loop_support._qualification_digest(
+                pr_loop_support._prior_item_ledger_signature((legacy,))
             ),
             scheduler_selected_reviewers=("Codex",),
             scheduler_paused_reviewers=(),
@@ -4558,13 +4595,13 @@ def test_resume_machine_authority_upgrade_forces_full_reviewer_board(
         max_rounds=1,
     )
     force_full_values = []
-    original_select_reviewers = orchestrator.select_reviewers
+    original_select_reviewers = pr_loop.select_reviewers
 
     def capture_force_full(snapshot, *args, **kwargs):
         force_full_values.append(snapshot.force_full)
         return original_select_reviewers(snapshot, *args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "select_reviewers", capture_force_full)
+    monkeypatch.setattr(pr_loop, "select_reviewers", capture_force_full)
 
     with pytest.raises(AgentLoopError, match="awaiting a new repair head"):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -4584,7 +4621,7 @@ def test_resume_reviewer_ledger_digest_mismatch_forces_full_reviewer_board(
         source_status="blocking",
         fix_scope=("src/worker.py",),
     )
-    scheduler_contract = orchestrator.make_contract(
+    scheduler_contract = pr_loop.make_contract(
         ("Codex",), "selective-intermediate", None
     )
     summary = _attach_round_metadata(
@@ -4602,7 +4639,7 @@ def test_resume_reviewer_ledger_digest_mismatch_forces_full_reviewer_board(
             scheduler_contract=scheduler_contract.as_dict(),
             scheduler_previous_sha="abc123",
             scheduler_current_sha="abc123",
-            scheduler_obligation_digest=orchestrator._qualification_digest(()),
+            scheduler_obligation_digest=pr_loop_support._qualification_digest(()),
             scheduler_selected_reviewers=("Codex",),
             scheduler_paused_reviewers=(),
             scheduler_reasons=("stale digest",),
@@ -4638,13 +4675,13 @@ def test_resume_reviewer_ledger_digest_mismatch_forces_full_reviewer_board(
         max_rounds=1,
     )
     force_full_values = []
-    original_select_reviewers = orchestrator.select_reviewers
+    original_select_reviewers = pr_loop.select_reviewers
 
     def capture_force_full(snapshot, *args, **kwargs):
         force_full_values.append(snapshot.force_full)
         return original_select_reviewers(snapshot, *args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "select_reviewers", capture_force_full)
+    monkeypatch.setattr(pr_loop, "select_reviewers", capture_force_full)
 
     with pytest.raises(AgentLoopError, match="still reported blocking"):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -4740,14 +4777,14 @@ def test_post_review_ordinary_recovery_rejects_other_machine_obligation(
         auto_merge=True,
         max_rounds=2,
     )
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: activation)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *args, **kwargs: activation)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "_finalize_ordinary_recovery_merge",
         lambda *args, **kwargs: pytest.fail("ordinary recovery bypassed another machine obligation"),
     )
     guard_calls = []
-    original_guard = orchestrator._ensure_finalization_ready
+    original_guard = pr_loop_support._ensure_finalization_ready
 
     def capture_guard(*args, **kwargs):
         guard_calls.append(
@@ -4758,7 +4795,9 @@ def test_post_review_ordinary_recovery_rejects_other_machine_obligation(
         )
         return original_guard(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_ensure_finalization_ready", capture_guard)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_ensure_finalization_ready", capture_guard)
 
     with pytest.raises(AgentLoopError, match="managed-exact-head-ci"):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -4779,29 +4818,29 @@ def test_auto_merge_supported_repo_dispatches_and_merges_exact_approved_head(
     )
     config = make_config(tmp_path, watch_pending_ci=True, auto_merge=True)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "activate_managed_ci",
         lambda *args, **kwargs: ManagedCiContract(),
     )
     dispatches = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "dispatch_final_qualification",
         lambda *args, **kwargs: dispatches.append(kwargs),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
     merges = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "merge_pr",
         lambda *args, **kwargs: merges.append(kwargs),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *args, **kwargs: pytest.fail("managed CI must bypass the ordinary watcher"),
     )
@@ -4849,14 +4888,14 @@ def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
     )
     config = make_config(tmp_path, auto_merge=True, max_rounds=1)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification", lambda *args, **kwargs: next(outcomes)
+        pr_loop, "wait_for_final_qualification", lambda *args, **kwargs: next(outcomes)
     )
     merges = []
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: merges.append(kwargs))
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: merges.append(kwargs))
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -4870,13 +4909,13 @@ def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
 def _spy_coder_followup_dispatch(monkeypatch):
     """Record the item set each real coder dispatch labels, then log it (#1024)."""
     dispatched = []
-    real = orchestrator._log_coder_followup_dispatch
+    real = pr_loop_support._log_coder_followup_dispatch
 
     def spy(config, round_number, coder_name, coder_followup_items):
         dispatched.append((round_number, tuple(coder_followup_items)))
         return real(config, round_number, coder_name, coder_followup_items)
 
-    monkeypatch.setattr(orchestrator, "_log_coder_followup_dispatch", spy)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_log_coder_followup_dispatch", spy)
     return dispatched
 
 
@@ -4923,8 +4962,9 @@ def test_run_pr_loop_labels_reviewer_and_acknowledgement_rounds_as_reviewer_feed
         number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
         base_branch="main", head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
     )
-    monkeypatch.setattr(
-        orchestrator, "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *_a, **_k: PullRequestReviewContext(
             metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
             comments=(), human_requirements=(requirement,),
@@ -5018,18 +5058,20 @@ def test_run_pr_loop_labels_an_acknowledgement_only_round_as_reviewer_feedback(
             comments=(), human_requirements=requirements,
         )
 
-    monkeypatch.setattr(orchestrator, "get_pr_review_context", review_context)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context", review_context)
     selections = []
-    real_select = orchestrator.select_coder_followup_items
+    real_select = pr_loop.select_coder_followup_items
 
     def select(items):
         selected = real_select(items)
         selections.append(([item.item_id for item in items], selected))
         return selected
 
-    monkeypatch.setattr(orchestrator, "select_coder_followup_items", select)
+    monkeypatch.setattr(pr_loop, "select_coder_followup_items", select)
     dispatched = []
-    real_log = orchestrator._log_coder_followup_dispatch
+    real_log = pr_loop_support._log_coder_followup_dispatch
 
     def log_dispatch(config, round_number, coder_name, coder_followup_items):
         dispatched.append((round_number, tuple(coder_followup_items)))
@@ -5037,7 +5079,9 @@ def test_run_pr_loop_labels_an_acknowledgement_only_round_as_reviewer_feedback(
         if round_number == 3:
             raise _AcknowledgementDispatchReached
 
-    monkeypatch.setattr(orchestrator, "_log_coder_followup_dispatch", log_dispatch)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_log_coder_followup_dispatch", log_dispatch)
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=4, quiet=False)
 
     with pytest.raises(_AcknowledgementDispatchReached):
@@ -5071,9 +5115,9 @@ def test_run_pr_loop_labels_a_mixed_reviewer_and_ci_round_as_reviewer_feedback(
         _watch_check_board("passing"),
         _watch_check_board("passing"),
     ])
-    monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: next(snapshots))
+    monkeypatch.setattr(pr_loop, "get_pr_checks", lambda *a, **k: next(snapshots))
     _advance_head_after_coder(monkeypatch, runner, "repaired-head")
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -5105,7 +5149,7 @@ def test_ci_repair_log_label_requires_a_nonempty_ci_only_followup_set(tmp_path, 
         item_id="item-2", reviewer="Codex", source_round=1, text="Fix it.", status="blocking",
     )
     ack_item = UnresolvedReviewItem(
-        item_id=orchestrator.HUMAN_REQUIREMENTS_ACK_ITEM_ID, reviewer="Orchestrator",
+        item_id=pr_loop.HUMAN_REQUIREMENTS_ACK_ITEM_ID, reviewer="Orchestrator",
         source_round=1, text="Acknowledge.", status="blocking", authority="machine",
         obligation_kind="human-requirements-acknowledgement", lifecycle="repair_required",
     )
@@ -5117,8 +5161,8 @@ def test_ci_repair_log_label_requires_a_nonempty_ci_only_followup_set(tmp_path, 
     }
     labels = {}
     for name, items in cases.items():
-        orchestrator._log_coder_followup_dispatch(
-            config, 4, "Claude", orchestrator.select_coder_followup_items(items)
+        pr_loop_support._log_coder_followup_dispatch(
+            config, 4, "Claude", pr_loop.select_coder_followup_items(items)
         )
         labels[name] = capsys.readouterr().err
 
@@ -5132,7 +5176,7 @@ def test_managed_qualification_resume_attaches_without_redispatch(
     tmp_path, monkeypatch
 ):
     config = make_config(tmp_path, managed_ci=True, auto_merge=True, max_rounds=1)
-    invocation = orchestrator.resolve_invocation(
+    invocation = pr_loop.resolve_invocation(
         config, provider="codex", role="reviewer"
     )
     acquisition_contract = {
@@ -5159,11 +5203,11 @@ def test_managed_qualification_resume_attaches_without_redispatch(
         failed_head_sha="old-head",
         candidate_head_sha="abc123",
         base_branch="main",
-        requirements_digest=orchestrator._qualification_digest(tuple()),
-        acquisition_digest=orchestrator._qualification_digest(acquisition_contract),
-        approval_digest=orchestrator._qualification_digest(("Codex",)),
-        scheduler_digest=orchestrator._qualification_digest(
-            orchestrator._prior_item_ledger_signature((item,))
+        requirements_digest=pr_loop_support._qualification_digest(tuple()),
+        acquisition_digest=pr_loop_support._qualification_digest(acquisition_contract),
+        approval_digest=pr_loop_support._qualification_digest(("Codex",)),
+        scheduler_digest=pr_loop_support._qualification_digest(
+            pr_loop_support._prior_item_ledger_signature((item,))
         ),
         qualification_attempt_id="123/1",
         allowed_rounds=1,
@@ -5211,10 +5255,10 @@ def test_managed_qualification_resume_attaches_without_redispatch(
     dispatches = []
     merges = []
     waited = []
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: contract)
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *a, **k: True)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "dispatch_final_qualification",
         lambda *a, **k: dispatches.append(k),
     )
@@ -5224,8 +5268,8 @@ def test_managed_qualification_resume_attaches_without_redispatch(
         waited.append((c.attached_run_id, c.run_attempt, c.expected_head_sha))
         return ManagedCiOutcome(status="passed", head_sha="abc123")
 
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait)
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *a, **k: merges.append(k))
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: merges.append(k))
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert dispatches == []
@@ -5239,7 +5283,7 @@ def _managed_qualifying_resume(tmp_path, *, managed=True, attempt_id="123/1", **
     config = make_config(
         tmp_path, managed_ci=managed, auto_merge=True, max_rounds=1, **config_kwargs
     )
-    invocation = orchestrator.resolve_invocation(config, provider="codex", role="reviewer")
+    invocation = pr_loop.resolve_invocation(config, provider="codex", role="reviewer")
     acquisition_contract = {
         "Codex": (invocation.configured_model, invocation.resolved_effort, "codex")
     }
@@ -5258,11 +5302,11 @@ def _managed_qualifying_resume(tmp_path, *, managed=True, attempt_id="123/1", **
         failed_head_sha="old-head",
         candidate_head_sha="abc123",
         base_branch="main",
-        requirements_digest=orchestrator._qualification_digest(tuple()),
-        acquisition_digest=orchestrator._qualification_digest(acquisition_contract),
-        approval_digest=orchestrator._qualification_digest(("Codex",)),
-        scheduler_digest=orchestrator._qualification_digest(
-            orchestrator._prior_item_ledger_signature((item,))
+        requirements_digest=pr_loop_support._qualification_digest(tuple()),
+        acquisition_digest=pr_loop_support._qualification_digest(acquisition_contract),
+        approval_digest=pr_loop_support._qualification_digest(("Codex",)),
+        scheduler_digest=pr_loop_support._qualification_digest(
+            pr_loop_support._prior_item_ledger_signature((item,))
         ),
         qualification_attempt_id=attempt_id,
         allowed_rounds=1,
@@ -5314,8 +5358,8 @@ def test_managed_qualification_fresh_process_resume_dispatches_a_fresh_attempt(
     dispatches = []
     merges = []
     waited = []
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: contract)
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *a, **k: True)
 
     def dispatch(*a, **k):
         c = k["contract"]
@@ -5327,9 +5371,9 @@ def test_managed_qualification_fresh_process_resume_dispatches_a_fresh_attempt(
         waited.append((c.attached_run_id, c.run_attempt, c.expected_head_sha))
         return ManagedCiOutcome(status="passed", head_sha="abc123")
 
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", dispatch)
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait)
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *a, **k: merges.append(k))
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", dispatch)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: merges.append(k))
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert dispatches == [("abc123", "fresh-gen")]
@@ -5379,14 +5423,14 @@ def test_managed_qualifying_checkpoint_without_fresh_attempt_path_forces_review(
         reviewer=("codex",), pr_review_policy="selective-intermediate",
     )
     if contract is not None:
-        monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: contract)
-        monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+        monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: contract)
+        monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *a, **k: True)
     force_full_values = []
     reviewer_calls = []
     dispatches = []
     downgrades = []
-    real_select = orchestrator.select_reviewers
-    real_run_validated_agent = orchestrator._run_validated_agent
+    real_select = pr_loop.select_reviewers
+    real_run_validated_agent = validated_agent._run_validated_agent
     import coding_review_agent_loop.pr_loop as pr_loop_module
 
     real_helper = pr_loop_module._managed_checkpoint_needs_fresh_attempt
@@ -5406,11 +5450,14 @@ def test_managed_qualifying_checkpoint_without_fresh_attempt_path_forces_review(
         downgrades.append(result)
         return result
 
-    monkeypatch.setattr(orchestrator, "select_reviewers", capture_force_full)
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", stop_at_reviewer)
+    monkeypatch.setattr(pr_loop, "select_reviewers", capture_force_full)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", stop_at_reviewer)
     monkeypatch.setattr(pr_loop_module, "_managed_checkpoint_needs_fresh_attempt", helper)
     monkeypatch.setattr(
-        orchestrator, "dispatch_final_qualification", lambda *a, **k: dispatches.append(k)
+        pr_loop, "dispatch_final_qualification", lambda *a, **k: dispatches.append(k)
     )
 
     with pytest.raises(AgentLoopError, match="review board invoked"):
@@ -5498,7 +5545,7 @@ def test_resume_qualification_identity_gap_forces_review_before_qualification(
         auto_merge=True,
         max_rounds=1,
     )
-    invocation = orchestrator.resolve_invocation(
+    invocation = pr_loop.resolve_invocation(
         config, provider="codex", role="reviewer"
     )
     item = UnresolvedReviewItem(
@@ -5522,13 +5569,13 @@ def test_resume_qualification_identity_gap_forces_review_before_qualification(
         failed_head_sha="old-head",
         candidate_head_sha="abc123",
         base_branch="main",
-        requirements_digest=orchestrator._qualification_digest(tuple()),
-        acquisition_digest=orchestrator._qualification_digest(
+        requirements_digest=pr_loop_support._qualification_digest(tuple()),
+        acquisition_digest=pr_loop_support._qualification_digest(
             {"Codex": (invocation.configured_model, invocation.resolved_effort, "codex")}
         ),
-        approval_digest=orchestrator._qualification_digest(("Codex",)),
-        scheduler_digest=orchestrator._qualification_digest(
-            orchestrator._prior_item_ledger_signature((item,))
+        approval_digest=pr_loop_support._qualification_digest(("Codex",)),
+        scheduler_digest=pr_loop_support._qualification_digest(
+            pr_loop_support._prior_item_ledger_signature((item,))
         ),
         qualification_attempt_id="github-checks:abc123",
         allowed_rounds=1,
@@ -5557,8 +5604,8 @@ def test_resume_qualification_identity_gap_forces_review_before_qualification(
     )
     force_full_values = []
     reviewer_calls = []
-    original_select_reviewers = orchestrator.select_reviewers
-    original_run_validated_agent = orchestrator._run_validated_agent
+    original_select_reviewers = pr_loop.select_reviewers
+    original_run_validated_agent = validated_agent._run_validated_agent
 
     def capture_force_full(snapshot, *args, **kwargs):
         force_full_values.append(snapshot.force_full)
@@ -5570,11 +5617,14 @@ def test_resume_qualification_identity_gap_forces_review_before_qualification(
             raise AgentLoopError("review board invoked before qualification")
         return original_run_validated_agent(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "select_reviewers", capture_force_full)
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", stop_at_reviewer)
+    monkeypatch.setattr(pr_loop, "select_reviewers", capture_force_full)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", stop_at_reviewer)
     dispatches = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "dispatch_final_qualification",
         lambda *args, **kwargs: dispatches.append(kwargs),
     )
@@ -5605,20 +5655,20 @@ def test_managed_manual_success_publishes_result_without_merge_even_with_pending
     contract = ManagedCiContract(protocol_version=2, protection_mode="strict")
     published = []
 
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: contract)
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *args, **kwargs: contract)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "publish_manual_v2_qualification",
         lambda *args, **kwargs: published.append(kwargs["expected_head_sha"]) or "abc123",
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "merge_pr",
         lambda *args, **kwargs: pytest.fail("manual managed-CI success must not merge"),
     )
@@ -5638,7 +5688,7 @@ def test_managed_manual_issue_created_label_loss_cancels_qualification(tmp_path,
     )
     config = make_config(tmp_path, managed_ci=True, max_rounds=1)
     contract = ManagedCiContract(protocol_version=2, issue_created_pr=True)
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: contract)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *args, **kwargs: contract)
 
     with pytest.raises(AgentLoopError, match="lost its authenticated"):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -5662,8 +5712,8 @@ def test_managed_manual_adopted_provenance_loss_cancels_qualification(tmp_path, 
         base_ref="main",
         adopted_existing_pr=True,
     )
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: contract)
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *args, **kwargs: False)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *args, **kwargs: contract)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *args, **kwargs: False)
 
     with pytest.raises(AgentLoopError, match="adoption provenance changed"):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -5680,9 +5730,9 @@ def test_managed_ci_head_change_restarts_review_without_coder(tmp_path, monkeypa
     )
     config = make_config(tmp_path, auto_merge=True, max_rounds=1)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     call_count = 0
 
     def wait_for_managed_ci(*args, **kwargs):
@@ -5693,9 +5743,9 @@ def test_managed_ci_head_change_restarts_review_without_coder(tmp_path, monkeypa
             return ManagedCiOutcome(status="head_changed", head_sha="new-head")
         return ManagedCiOutcome(status="passed", head_sha="new-head")
 
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait_for_managed_ci)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait_for_managed_ci)
     merges = []
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: merges.append(kwargs))
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: merges.append(kwargs))
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -5736,13 +5786,13 @@ def test_managed_ci_merge_conflict_routes_through_reconciliation(tmp_path, monke
     )
     config = make_config(tmp_path, auto_merge=True, max_rounds=2)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification", lambda *args, **kwargs: next(outcomes)
+        pr_loop, "wait_for_final_qualification", lambda *args, **kwargs: next(outcomes)
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -5767,18 +5817,18 @@ def test_managed_ci_infrastructure_stall_stops_cleanly(tmp_path, monkeypatch):
     )
     config = make_config(tmp_path, auto_merge=True, max_rounds=1)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: ManagedCiOutcome(
             status="infrastructure_stall", head_sha="abc123", stall=stall
         ),
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "merge_pr",
         lambda *args, **kwargs: pytest.fail("infrastructure stall must not merge"),
     )
@@ -5811,20 +5861,20 @@ def test_managed_ci_does_not_publish_readiness_without_configured_pre_review_gat
         test_command=test_command,
     )
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "publish_round_readiness",
         lambda *args, **kwargs: pytest.fail("readiness must not be published"),
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
 
     assert run_pr_loop(
         runner,
@@ -5847,21 +5897,21 @@ def test_managed_ci_publishes_readiness_after_configured_pre_review_gate(
         test_command=("verify-managed-head",),
     )
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
     published_heads = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "publish_round_readiness",
         lambda *args, **kwargs: published_heads.append(kwargs["head_sha"]),
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
 
     assert run_pr_loop(
         runner,
@@ -5920,7 +5970,7 @@ def test_watch_failure_on_final_round_dispatches_coder_with_check_diagnostic(
     config = make_config(tmp_path, watch_pending_ci=True, max_rounds=1)
     _advance_head_after_coder(monkeypatch, runner, "repaired-head")
     monkeypatch.setattr(
-        orchestrator, "watch_pr_checks", lambda *args, **kwargs: next(outcomes)
+        pr_loop, "watch_pr_checks", lambda *args, **kwargs: next(outcomes)
     )
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -5968,7 +6018,7 @@ def test_watch_head_change_re_reviews_without_coder_and_preserves_budget(
             head_sha="new-head", attempts_used=1
         )
 
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", watch)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -6034,7 +6084,7 @@ def test_watch_combined_failure_and_head_change_can_use_both_extensions(
             head_sha="newer-head", attempts_used=1
         )
 
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", watch)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert call_count == 3
@@ -6092,7 +6142,7 @@ def test_watch_combined_head_change_and_failure_can_use_both_extensions(
             head_sha="repaired-head", attempts_used=1
         )
 
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", watch)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert call_count == 3
@@ -6130,7 +6180,7 @@ def test_watch_timeout_renders_local_rerun_without_leaking_it_to_comment(
         invocation_argv=invocation_argv,
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *args, **kwargs: CiWatchOutcome(
             status="timeout",
@@ -6178,7 +6228,7 @@ def test_watch_budget_exhaustion_stops_before_announcing_new_poll(
         runner.pr_payload["headRefOid"] = "new-head"
         return CiWatchOutcome(status="head_changed", head_sha="new-head", attempts_used=2)
 
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", watch)
 
     if auto_merge:
         with pytest.raises(AgentLoopError, match="watch budget was exhausted"):
@@ -6233,7 +6283,7 @@ def test_disabled_watch_mode_preserves_manual_path_and_auto_merge_uses_full_boar
             head_sha="abc123", attempts_used=1
         )
 
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", watch)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -6264,7 +6314,7 @@ def test_auto_merge_green_full_board_merges_once(
         auto_merge=True,
         watch_pending_ci=False,
     )
-    with patch.object(orchestrator, "watch_pr_checks", wraps=orchestrator.watch_pr_checks) as watch_spy:
+    with patch.object(pr_loop, "watch_pr_checks", wraps=pr_loop.watch_pr_checks) as watch_spy:
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert watch_spy.call_count == 1
@@ -6336,7 +6386,7 @@ def test_watch_publishes_approved_followups_only_after_terminal_success(
             head_sha="repaired-head", attempts_used=1
         )
 
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", watch)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", watch)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     followup_comments = [
@@ -6410,12 +6460,11 @@ def test_pr_loop_refreshes_checks_between_reviewers_and_before_coder(tmp_path, m
         runner.pr_check_runs_payload = next(check_states)
         return original_get_pr_checks(*args, **kwargs)
 
-    from coding_review_agent_loop import orchestrator as orchestrator_module
 
-    original_get_pr_checks = orchestrator_module.get_pr_checks
-    monkeypatch.setattr(orchestrator_module, "get_pr_checks", next_checks)
+    original_get_pr_checks = pr_loop.get_pr_checks
+    monkeypatch.setattr(pr_loop, "get_pr_checks", next_checks)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *args, **kwargs: CiWatchOutcome(
             status="passed", pr_checks=_watch_check_board("passing"),
@@ -6461,10 +6510,9 @@ def test_pr_loop_refreshes_pending_to_passing_without_ci_coder_round(tmp_path, m
         runner.pr_check_runs_payload = next(check_states)
         return original_get_pr_checks(*args, **kwargs)
 
-    from coding_review_agent_loop import orchestrator as orchestrator_module
 
-    original_get_pr_checks = orchestrator_module.get_pr_checks
-    monkeypatch.setattr(orchestrator_module, "get_pr_checks", next_checks)
+    original_get_pr_checks = pr_loop.get_pr_checks
+    monkeypatch.setattr(pr_loop, "get_pr_checks", next_checks)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
@@ -6533,7 +6581,7 @@ def test_real_findings_survive_publication_and_reconciliation(tmp_path, monkeypa
         gemini_outputs=[structured_pr_review(state="approved", summary="Review complete.")],
         pr_check_runs_payload={"check_runs": [{"name": "test", "status": "in_progress"}]},
     )
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
     captured = {}
 
     class CoderReached(Exception):
@@ -6545,8 +6593,11 @@ def test_real_findings_survive_publication_and_reconciliation(tmp_path, monkeypa
             raise CoderReached
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", capture)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", capture)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: pytest.fail("must not wait"))
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=parallel)
     with pytest.raises(CoderReached):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -6570,7 +6621,7 @@ def test_pending_only_items_do_not_override_substantive_summary(summary):
                              blocking_items=["GitHub check `test` is pending."]),
         reviewer="OpenAI Codex",
     )
-    assert not orchestrator._is_pending_ci_only_review(
+    assert not review_rounds._is_pending_ci_only_review(
         review, _watch_check_board("pending", missing_required=("test",))
     )
 
@@ -6694,7 +6745,7 @@ def test_pending_ci_watch_hint_is_not_emitted_when_the_watch_was_active(
         pr_branch_protection_payload={"contexts": ["test"]},
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *args, **kwargs: CiWatchOutcome(
             status="timeout", pr_checks=_watch_check_board("pending"), head_sha="abc123",
@@ -7124,14 +7175,14 @@ def test_ordinary_checks_authority_accepts_forbidden_protection_with_clean_head(
     checks = _watch_check_board("passing", protection="forbidden")
     clean = PullRequestMergeability("mergeable", "MERGEABLE", "CLEAN", "abc123", "main")
 
-    assert orchestrator._ordinary_checks_snapshot_is_authoritative(
+    assert pr_loop_support._ordinary_checks_snapshot_is_authoritative(
         checks, clean, head_sha="abc123"
     )
-    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+    assert not pr_loop_support._ordinary_checks_snapshot_is_authoritative(
         checks, clean, head_sha="other"
     )
     for merge_state in ("BLOCKED", "UNSTABLE", "BEHIND", "DRAFT", None):
-        assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+        assert not pr_loop_support._ordinary_checks_snapshot_is_authoritative(
             checks,
             PullRequestMergeability("mergeable", "MERGEABLE", merge_state, "abc123", "main"),
             head_sha="abc123",
@@ -7139,16 +7190,16 @@ def test_ordinary_checks_authority_accepts_forbidden_protection_with_clean_head(
     # Deferral (the recovery finalizer re-checks CLEAN after readiness) only
     # relaxes an unreadable protection; the board conditions still apply.
     draft = PullRequestMergeability("mergeable", "MERGEABLE", "DRAFT", "abc123", "main")
-    assert orchestrator._ordinary_checks_snapshot_is_authoritative(
+    assert pr_loop_support._ordinary_checks_snapshot_is_authoritative(
         checks, draft, head_sha="abc123", defer_unreadable_protection=True,
     )
-    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+    assert not pr_loop_support._ordinary_checks_snapshot_is_authoritative(
         _watch_check_board("passing", protection="unavailable"),
         draft,
         head_sha="abc123",
         defer_unreadable_protection=True,
     )
-    assert not orchestrator._ordinary_checks_snapshot_is_authoritative(
+    assert not pr_loop_support._ordinary_checks_snapshot_is_authoritative(
         _watch_check_board("pending", pending=(PullRequestCheck("x", "check_run", "queued"),),
                            protection="forbidden"),
         draft,
@@ -7636,8 +7687,9 @@ def test_pr_loop_rereviews_unchanged_head_when_human_requirement_changes(
             else (requirement_1,),
         )
 
-    monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator.get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         next_context,
     )
     config = make_config(
@@ -8360,7 +8412,7 @@ def test_same_pr_followup_repair_uses_only_visible_items_not_retained_future_ite
         repair_calls.append((expected_kind, kwargs.get("unresolved_item_ids")))
         return repaired_coder_response
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert repair_calls == [("coder_followup", ("item-2",))]
@@ -8894,9 +8946,9 @@ def test_pr_loop_keeps_active_carried_disposition_actionable_without_duplicate_s
         run_pr_loop(runner, pr_number=77, config=config)
 
     reviewer_records = [
-        _decode_round_metadata(orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"])
+        _decode_round_metadata(discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"])
         for comment in runner.pr_payload["comments"]
-        if orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        if discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
     ]
     round_two = next(record for record in reviewer_records if record.agent == "Codex" and record.round_number == 2)
     assert round_two.new_items == ()
@@ -8979,7 +9031,7 @@ def test_pr_loop_quarantines_unavailable_reviewer_while_healthy_reviewer_finishe
 
 
 def test_incomplete_review_comment_reports_zero_open_must_fix_count():
-    comment = orchestrator._format_incomplete_pr_review_comment(
+    comment = review_rounds._format_incomplete_pr_review_comment(
         pr_number=5,
         unavailable_reviewers={
             "codex": __import__("coding_review_agent_loop.errors", fromlist=["x"]).AgentInvocationError("down", failure_category="agent-unavailable")
@@ -9421,8 +9473,8 @@ def test_pr_loop_resume_after_interrupted_coder_keeps_failed_head_and_budget(
             return _watch_check_board("failing", failing=(failed,))
         return _watch_check_board("passing")
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
-    original = orchestrator._run_validated_agent
+    monkeypatch.setattr(pr_loop, "get_pr_checks", checks)
+    original = validated_agent._run_validated_agent
     interrupt = True
 
     class CoderInterrupted(Exception):
@@ -9435,7 +9487,10 @@ def test_pr_loop_resume_after_interrupted_coder_keeps_failed_head_and_budget(
             raise CoderInterrupted
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", interrupt_during_coder)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", interrupt_during_coder)
     with pytest.raises(CoderInterrupted):
         run_pr_loop(runner, pr_number=77, config=config)
 
@@ -10926,8 +10981,10 @@ def test_run_pr_loop_freeform_coder_followup_includes_model(tmp_path):
 
     runner = FakeRunner()
     config = make_config(tmp_path, coder="claude", reviewer="codex")
-    with patch(
-        "coding_review_agent_loop.orchestrator._run_validated_agent",
+    with patch_object_in((
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent",
         side_effect=fake_run_validated_agent,
     ):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -10983,8 +11040,10 @@ def test_pr_initial_coder_post_includes_model(tmp_path):
 
     runner = FakeRunner(pr_payload={"body": "Fixes #56"})
     config = make_config(tmp_path, coder="claude", reviewer="codex")
-    with patch(
-        "coding_review_agent_loop.orchestrator._run_validated_agent",
+    with patch_object_in((
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent",
         side_effect=fake_run_validated_agent,
     ):
         assert (
@@ -11080,7 +11139,7 @@ def test_pr_loop_releases_adopted_suppression_when_reviewer_rejects_dispute(
         ],
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "activate_managed_ci",
         lambda *_args, **_kwargs: ManagedCiContract(
             adopted_existing_pr=True,
@@ -11284,7 +11343,7 @@ def _audit_phases(runner):
 def _posted_scheduler_metadata(runner):
     return [
         record.metadata
-        for record in orchestrator._extract_round_metadata_records(
+        for record in architecture_contract._extract_round_metadata_records(
             [
                 SimpleNamespace(body=comment["body"])
                 for comment in runner.pr_payload.get("comments", [])
@@ -11296,9 +11355,7 @@ def _posted_scheduler_metadata(runner):
 
 
 def test_staged_primary_blocking_loop_gates_panel_then_independent_audit(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -11346,14 +11403,12 @@ def test_staged_primary_blocking_loop_gates_panel_then_independent_audit(tmp_pat
 def test_staged_secondary_scoped_remediation_rechecks_owner_and_primary_then_sweeps_others(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     migration_calls = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "validate_pr_migration_topology",
         lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
     )
@@ -11408,19 +11463,17 @@ def test_staged_secondary_scoped_remediation_rechecks_owner_and_primary_then_swe
 
 
 def test_staged_owner_and_primary_clearance_does_not_transition_directly_to_ci(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     migration_calls = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "validate_pr_migration_topology",
         lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
     )
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged without the sweep")
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("merged without the sweep")
     )
     runner = FakeRunner(
         claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
@@ -11453,9 +11506,7 @@ def test_staged_owner_and_primary_clearance_does_not_transition_directly_to_ci(t
 
 
 def test_staged_broad_remediation_reactivates_complete_board(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("broad", "diff path 'src/other.py' is outside obligation scopes"),
     )
     runner = FakeRunner(
@@ -11508,7 +11559,9 @@ def test_staged_ambiguous_ownership_reactivates_complete_board(tmp_path, monkeyp
             scopes=scopes, broad_rules=broad_rules, obligations=obligations,
         )
 
-    monkeypatch.setattr(orchestrator, "_observe_pr_transition", classify_from_ledger)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_observe_pr_transition", classify_from_ledger)
     runner = FakeRunner(
         claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
         codex_outputs=[
@@ -11558,12 +11611,10 @@ def test_staged_force_full_selects_complete_board_from_the_primary_phase(tmp_pat
 
 
 def test_staged_legacy_scheduler_payload_before_panel_is_strict_primary_only(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
-    contract = orchestrator.make_contract(("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex")
+    contract = pr_loop.make_contract(("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex")
     # A pre-phase-aware record: complete legacy mandatory keys, no phase authority.
     legacy_checkpoint = _attach_round_metadata(
         "Legacy scheduler checkpoint.",
@@ -11585,7 +11636,7 @@ def test_staged_legacy_scheduler_payload_before_panel_is_strict_primary_only(tmp
             scheduler_calls_avoided=2,
         ),
     )
-    decoded = orchestrator._extract_round_metadata_records(
+    decoded = architecture_contract._extract_round_metadata_records(
         [SimpleNamespace(body=legacy_checkpoint)], flow="pr"
     )[0].metadata
     assert decoded.scheduler_metadata_status == "valid"
@@ -11632,7 +11683,7 @@ def test_staged_legacy_scheduler_payload_before_panel_is_strict_primary_only(tmp
 
 
 def test_staged_legacy_selective_payload_is_contract_drift(tmp_path):
-    contract = orchestrator.make_contract(("Codex", "Gemini"), "selective-intermediate", None)
+    contract = pr_loop.make_contract(("Codex", "Gemini"), "selective-intermediate", None)
     checkpoint = _attach_round_metadata(
         "Selective checkpoint.",
         PostedRoundMetadata(
@@ -11656,7 +11707,7 @@ def test_staged_primary_change_is_a_recorded_board_change(tmp_path):
     It was refused as contract drift before; now one link is posted and the
     next round runs primary-only on the new primary for the current head.
     """
-    contract = orchestrator.make_contract(("Codex", "Gemini"), "primary-then-panel", None, "Gemini")
+    contract = pr_loop.make_contract(("Codex", "Gemini"), "primary-then-panel", None, "Gemini")
     checkpoint = _attach_round_metadata(
         "Staged checkpoint.",
         PostedRoundMetadata(
@@ -11733,14 +11784,13 @@ def test_staged_secondary_failure_keeps_healthy_result_and_resume_dispatches_onl
     assert any("Healthy reviewers approved" in comment or "Google Gemini review" in comment for comment in runner.comments)
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
 
-    import coding_review_agent_loop.orchestrator as module
 
-    original_merge = module.merge_pr
-    module.merge_pr = lambda *args, **kwargs: merges.append(kwargs)
+    original_merge = pr_loop_support.merge_pr
+    pr_loop_support.merge_pr = lambda *args, **kwargs: merges.append(kwargs)
     try:
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
     finally:
-        module.merge_pr = original_merge
+        pr_loop_support.merge_pr = original_merge
     # Completed exact-head work (Codex, Gemini) is reused once; only the
     # outstanding secondary is dispatched.
     assert _agent_sequence(runner) == ["codex", "gemini", "agy", "agy"]
@@ -11748,9 +11798,7 @@ def test_staged_secondary_failure_keeps_healthy_result_and_resume_dispatches_onl
 
 
 def test_staged_resume_after_remediation_checkpoint_dispatches_final_sweep_only(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -11788,9 +11836,7 @@ def test_staged_resume_after_remediation_checkpoint_dispatches_final_sweep_only(
 
 
 def test_staged_external_head_change_invalidates_primary_approval_before_panel(tmp_path, monkeypatch):
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("broad", "external change"),
     )
     runner = FakeRunner(
@@ -11801,7 +11847,7 @@ def test_staged_external_head_change_invalidates_primary_approval_before_panel(t
         gemini_outputs=[_staged_review(reviewer="Google Gemini")],
         antigravity_outputs=[_staged_review(reviewer="Antigravity")],
     )
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
     calls = []
 
     def run(*args, **kwargs):
@@ -11812,7 +11858,10 @@ def test_staged_external_head_change_invalidates_primary_approval_before_panel(t
                 runner.pr_payload["headRefOid"] = "external-head"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
     config = _staged_config(tmp_path)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -11838,7 +11887,9 @@ def test_staged_head_change_during_final_sweep_invalidates_partial_sweep_evidenc
             scopes=scopes, broad_rules=broad_rules, obligations=obligations,
         )
 
-    monkeypatch.setattr(orchestrator, "_observe_pr_transition", classify_from_ledger)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_observe_pr_transition", classify_from_ledger)
     runner = FakeRunner(
         claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
         codex_outputs=[
@@ -11861,7 +11912,7 @@ def test_staged_head_change_during_final_sweep_invalidates_partial_sweep_evidenc
             _staged_review(reviewer="Antigravity"),
         ],
     )
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
     agy_calls = []
 
     def run(*args, **kwargs):
@@ -11873,7 +11924,10 @@ def test_staged_head_change_during_final_sweep_invalidates_partial_sweep_evidenc
                 runner.pr_payload["headRefOid"] = "pushed-during-sweep"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
     config = _staged_config(tmp_path, max_rounds=8)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -11900,12 +11954,12 @@ def test_staged_head_change_during_final_sweep_invalidates_partial_sweep_evidenc
 def test_staged_exact_head_panel_gate_stops_before_migration_and_merge(tmp_path, monkeypatch):
     migration_calls = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "validate_pr_migration_topology",
         lambda *args, **kwargs: migration_calls.append(True) or MigrationValidationResult(ok=True),
     )
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged on primary approval alone")
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("merged on primary approval alone")
     )
     runner = FakeRunner(
         codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
@@ -11932,13 +11986,15 @@ def test_staged_unacknowledged_human_requirement_remains_blocking_after_panel_se
         url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
         body="Keep the audit trail intact.",
     )
-    original_context = orchestrator.get_pr_review_context
+    original_context = pr_loop_support.get_pr_review_context
 
     def context_with_requirement(runner, *args, **kwargs):
         context = original_context(runner, *args, **kwargs)
         return dataclasses.replace(context, human_requirements=(requirement,))
 
-    monkeypatch.setattr(orchestrator, "get_pr_review_context", context_with_requirement)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context", context_with_requirement)
     runner = FakeRunner(
         codex_outputs=[_staged_review(reviewer="OpenAI Codex", resolved=True)],
         # Gemini approves without acknowledging the signed requirement.
@@ -11947,7 +12003,7 @@ def test_staged_unacknowledged_human_requirement_remains_blocking_after_panel_se
     )
     config = _staged_config(tmp_path, max_rounds=2, auto_merge=True)
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged with an unacknowledged requirement")
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("merged with an unacknowledged requirement")
     )
 
     with pytest.raises(AgentLoopError, match=r"blocking issues after round 2.*Orchestrator \(item-1\)"):
@@ -11969,7 +12025,7 @@ def test_staged_ci_failure_remains_blocking_after_unanimous_panel_approval(tmp_p
     )
     config = _staged_config(tmp_path, max_rounds=2, auto_merge=True)
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged with CI failure")
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("merged with CI failure")
     )
 
     with pytest.raises(AgentLoopError, match="blocking issues after round 2"):
@@ -12064,7 +12120,7 @@ def test_840_broad_or_out_of_scope_change_before_primary_approval_is_primary_onl
             scopes=scopes, broad_rules=broad_rules, obligations=obligations,
         )
 
-    monkeypatch.setattr(orchestrator, "_observe_pr_transition", classify)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition", classify)
     runner = FakeRunner(
         claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
         codex_outputs=[
@@ -12114,7 +12170,9 @@ def test_840_panel_starts_after_primary_approval_and_post_panel_broad_change_lat
             TransitionClassification("narrow", "scoped fix"),
         ]
     )
-    monkeypatch.setattr(orchestrator, "_observe_pr_transition", lambda *args, **kwargs: next(transitions))
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_observe_pr_transition", lambda *args, **kwargs: next(transitions))
 
     def resolved(*item_ids):
         return [{"item_id": item_id, "disposition": "resolved"} for item_id in item_ids]
@@ -12153,7 +12211,7 @@ def test_840_panel_starts_after_primary_approval_and_post_panel_broad_change_lat
         ],
     )
     merges = []
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: merges.append(kwargs))
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: merges.append(kwargs))
     config = _staged_config(tmp_path, max_rounds=10, auto_merge=True)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -12193,7 +12251,7 @@ def test_840_panel_starts_after_primary_approval_and_post_panel_broad_change_lat
     final_head = _audit_phases(runner)[-1][1]
     final_approvals = {
         record.metadata.agent
-        for record in orchestrator._extract_round_metadata_records(
+        for record in architecture_contract._extract_round_metadata_records(
             [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
         )
         if record.metadata.role == "reviewer"
@@ -12206,9 +12264,7 @@ def test_840_panel_starts_after_primary_approval_and_post_panel_broad_change_lat
 
 def test_840_post_panel_automatic_fallback_latches_with_automatic_source(tmp_path, monkeypatch):
     """An automatic recovery reason after a qualified opening keeps the durable latch."""
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -12240,7 +12296,9 @@ def test_840_post_panel_automatic_fallback_latches_with_automatic_source(tmp_pat
             return {"stale": "identity"}
         return None
 
-    monkeypatch.setattr(orchestrator, "_latest_pr_architecture_observation", observation)
+    patch_attr_in(monkeypatch, (
+        architecture_contract, pr_loop_support, pr_loop,
+    ), "_latest_pr_architecture_observation", observation)
     config = _staged_config(tmp_path, max_rounds=6)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -12371,7 +12429,7 @@ def test_840_premature_secondary_approvals_are_not_resumed_carried_or_counted(tm
     seeded = len(runner.comments)
     if parallel:
         # Parallel reviewers publish completion-order records.
-        records = orchestrator._extract_round_metadata_records(
+        records = architecture_contract._extract_round_metadata_records(
             [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
         )
         assert any(
@@ -12394,16 +12452,15 @@ def test_840_premature_secondary_approvals_are_not_resumed_carried_or_counted(tm
         assert len(_agent_sequence(runner)) == launches_before
         return
     merges = []
-    import coding_review_agent_loop.orchestrator as module
 
-    original_merge = module.merge_pr
-    module.merge_pr = lambda *args, **kwargs: merges.append(kwargs)
+    original_merge = pr_loop_support.merge_pr
+    pr_loop_support.merge_pr = lambda *args, **kwargs: merges.append(kwargs)
     try:
         assert run_pr_loop(
             runner, pr_number=77, config=_staged_config(tmp_path, auto_merge=True, review_parallel=parallel)
         ) == 0
     finally:
-        module.merge_pr = original_merge
+        pr_loop_support.merge_pr = original_merge
 
     new_agents = _agent_sequence(runner)[3:]
     # The primary's own same-round approval is resumed; every secondary gets a
@@ -12468,7 +12525,7 @@ def test_840_blocking_premature_secondary_completion_stops_with_diagnostic(tmp_p
     seeded_agents = len(_agent_sequence(runner))
     seeded_comments = len(runner.pr_payload["comments"])
 
-    with pytest.raises(orchestrator.PrePanelSafetyError, match="--pr-review-force-full"):
+    with pytest.raises(pr_loop.PrePanelSafetyError, match="--pr-review-force-full"):
         run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
 
     # No reviewer or coder ran, nothing was latched, and the only new comment
@@ -12495,7 +12552,7 @@ def test_840_operator_override_supersedes_blocking_premature_completion(tmp_path
     seeded = len(runner.comments)
     premature_item_ids = {
         item.item_id
-        for record in orchestrator._extract_round_metadata_records(
+        for record in architecture_contract._extract_round_metadata_records(
             [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
         )
         if record.metadata.agent == "Gemini"
@@ -12529,7 +12586,7 @@ def test_840_operator_override_supersedes_blocking_premature_completion(tmp_path
     # The premature item never entered the ledger or ownership accounting.
     later_records = [
         record
-        for record in orchestrator._extract_round_metadata_records(
+        for record in architecture_contract._extract_round_metadata_records(
             [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
         )
         if record.index >= len(runner.pr_payload["comments"]) - (len(runner.comments) - seeded)
@@ -12568,7 +12625,7 @@ def test_840_stale_identity_premature_blocking_completion_is_not_silently_droppe
     )
     premature = next(
         record
-        for record in orchestrator._extract_round_metadata_records(
+        for record in architecture_contract._extract_round_metadata_records(
             [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
         )
         if record.metadata.agent == "Gemini"
@@ -12577,12 +12634,12 @@ def test_840_stale_identity_premature_blocking_completion_is_not_silently_droppe
 
     requirements = _parse_pr_human_requirements(runner.pr_payload)
     assert requirements
-    assert not orchestrator._resumed_pr_reviewer_matches_requirements(premature, requirements)
+    assert not response_validation._resumed_pr_reviewer_matches_requirements(premature, requirements)
     seeded_agents = len(_agent_sequence(runner))
     seeded = len(runner.comments)
 
     if not operator:
-        with pytest.raises(orchestrator.PrePanelSafetyError, match="--pr-review-force-full"):
+        with pytest.raises(pr_loop.PrePanelSafetyError, match="--pr-review-force-full"):
             run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
         assert len(_agent_sequence(runner)) == seeded_agents
         new_comments = runner.comments[seeded:]
@@ -12641,9 +12698,7 @@ def test_840_operator_force_full_is_durable_across_resume(tmp_path):
 
 def test_840_secondary_owned_ledger_item_before_panel_stops_unless_operator(tmp_path, monkeypatch):
     """Row premature-panel-history-resume: a premature secondary finding reached the ledger."""
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -12666,7 +12721,7 @@ def test_840_secondary_owned_ledger_item_before_panel_stops_unless_operator(tmp_
     _rewrite_pr_metadata(runner, _legacyize_operator_latches)
     seeded_agents = len(_agent_sequence(runner))
 
-    with pytest.raises(orchestrator.PrePanelSafetyError) as raised:
+    with pytest.raises(pr_loop.PrePanelSafetyError) as raised:
         run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
     message = str(raised.value)
     assert "item-1" in message and "Gemini" in message
@@ -12689,9 +12744,7 @@ def test_840_secondary_owned_ledger_item_before_panel_stops_unless_operator(tmp_
 
 def test_840_premature_approved_secondary_history_resumes_as_strict_primary_turn(tmp_path, monkeypatch):
     """Row premature-panel-history-resume variant: premature secondaries approved."""
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -12742,7 +12795,7 @@ def test_840_machine_obligation_before_panel_is_primary_only_then_panel_opens(tm
         },
     )
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged with CI failure")
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("merged with CI failure")
     )
     config = _staged_config(tmp_path, max_rounds=2, auto_merge=True)
 
@@ -12757,10 +12810,10 @@ def test_840_machine_obligation_before_panel_is_primary_only_then_panel_opens(tm
     assert "phase: secondary-audit" in audits[1]
 
     # A resume derives qualified panel evidence from that prelaunch record.
-    records = orchestrator._extract_round_metadata_records(
+    records = architecture_contract._extract_round_metadata_records(
         [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
     )
-    evidence = orchestrator._derive_pr_panel_evidence(
+    evidence = panel_evidence._derive_pr_panel_evidence(
         records, primary_reviewer="Codex", required_reviewers=("Codex", "Gemini", "Antigravity")
     )
     assert evidence.opened and evidence.opening_source == "primary-approval"
@@ -12781,9 +12834,7 @@ def test_840_ci_obligation_before_primary_approval_does_not_invoke_panel(tmp_pat
             "check_runs": [{"name": "test", "status": "completed", "conclusion": "failure"}]
         },
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     with pytest.raises(AgentLoopError):
@@ -12806,7 +12857,9 @@ def test_840_architecture_identity_change_before_panel_is_primary_only(tmp_path,
             return {"stale": "identity"}
         return None
 
-    monkeypatch.setattr(orchestrator, "_latest_pr_architecture_observation", observation)
+    patch_attr_in(monkeypatch, (
+        architecture_contract, pr_loop_support, pr_loop,
+    ), "_latest_pr_architecture_observation", observation)
     runner = FakeRunner(
         codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
         gemini_outputs=[_staged_review(reviewer="Google Gemini")],
@@ -12825,9 +12878,7 @@ def test_840_architecture_identity_change_before_panel_is_primary_only(tmp_path,
 
 def test_840_legacy_latch_after_qualified_opening_is_honored(tmp_path, monkeypatch):
     """Row legacy-latch-compatibility: a post-opening unattributed latch keeps the full board."""
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -12875,8 +12926,8 @@ def test_840_legacy_latch_after_qualified_opening_is_honored(tmp_path, monkeypat
 def test_840_round_boundary_undecodable_history_stops_with_diagnostic(tmp_path, monkeypatch, operator):
     """Row prepanel-unsafe-stop: panel state is unknowable when history cannot be decoded."""
     state = {"broken": False}
-    original_extract = orchestrator._extract_round_metadata_records
-    original_mergeability = orchestrator.get_pr_mergeability
+    original_extract = architecture_contract._extract_round_metadata_records
+    original_mergeability = pr_loop_support.get_pr_mergeability
 
     def extract(comments, *, flow):
         if state["broken"]:
@@ -12888,9 +12939,14 @@ def test_840_round_boundary_undecodable_history_stops_with_diagnostic(tmp_path, 
         state["broken"] = True
         return original_mergeability(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_extract_round_metadata_records", extract)
-    monkeypatch.setattr(orchestrator, "get_pr_mergeability", mergeability)
-    monkeypatch.setattr(orchestrator, "_round_ledger_may_be_incomplete", lambda **kwargs: False)
+    patch_attr_in(monkeypatch, (
+        architecture_contract, panel_evidence, review_rounds, discuss_loop, execution_policy,
+        child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, history_export,
+    ), "_extract_round_metadata_records", extract)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "get_pr_mergeability", mergeability)
+    patch_attr_in(monkeypatch, (
+        review_rounds, pr_loop, plan_first_loop,
+    ), "_round_ledger_may_be_incomplete", lambda **kwargs: False)
     runner = FakeRunner(
         codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
         gemini_outputs=[_staged_review(reviewer="Google Gemini")],
@@ -12901,7 +12957,7 @@ def test_840_round_boundary_undecodable_history_stops_with_diagnostic(tmp_path, 
     # Resume, approval, ledger, and qualification accounting all depend on the
     # history, so neither flag state may spend reviewers over an undecodable
     # ledger: both stop through the same no-reviewer diagnostic.
-    with pytest.raises(orchestrator.PrePanelSafetyError, match="could not be decoded"):
+    with pytest.raises(pr_loop.PrePanelSafetyError, match="could not be decoded"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert _agent_sequence(runner) == []
     diagnostics = _scheduling_diagnostics(runner)
@@ -12921,7 +12977,7 @@ def test_840_startup_undecodable_history_stops_with_diagnostic(tmp_path, operato
         encode_mapping,
     )
 
-    contract = orchestrator.make_contract(("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex")
+    contract = pr_loop.make_contract(("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex")
     checkpoint = _attach_round_metadata(
         "Staged checkpoint.",
         PostedRoundMetadata(
@@ -12946,7 +13002,7 @@ def test_840_startup_undecodable_history_stops_with_diagnostic(tmp_path, operato
     }
     broken = checkpoint[: match.start("payload")] + encode_mapping(payload) + checkpoint[match.end("payload"):]
     with pytest.raises(AgentLoopError, match="sidecars are unavailable"):
-        orchestrator._extract_round_metadata_records([SimpleNamespace(body=broken)], flow="pr")
+        architecture_contract._extract_round_metadata_records([SimpleNamespace(body=broken)], flow="pr")
     runner = FakeRunner(
         pr_payload={"comments": [{"author": {"login": "bot"}, "body": broken}]},
         codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
@@ -12954,7 +13010,7 @@ def test_840_startup_undecodable_history_stops_with_diagnostic(tmp_path, operato
         antigravity_outputs=[_staged_review(reviewer="Antigravity")],
     )
 
-    with pytest.raises(orchestrator.PrePanelSafetyError, match="could not be decoded") as raised:
+    with pytest.raises(pr_loop.PrePanelSafetyError, match="could not be decoded") as raised:
         run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, pr_review_force_full=operator))
 
     assert "sidecars are unavailable" in str(raised.value)
@@ -12992,7 +13048,7 @@ def test_840_startup_undecodable_history_keeps_legacy_error_for_other_policies(t
     )
     with pytest.raises(AgentLoopError, match="sidecars are unavailable") as raised:
         run_pr_loop(runner, pr_number=77, config=config)
-    assert not isinstance(raised.value, orchestrator.PrePanelSafetyError)
+    assert not isinstance(raised.value, pr_loop.PrePanelSafetyError)
     assert not _scheduling_diagnostics(runner)
 
 
@@ -13244,10 +13300,10 @@ def test_resolved_history_excludes_future_machine_other_flow_and_carried_items()
         dispositions=[_Disp862("item-1", "Codex", "resolved")]
     )
     # Other-flow comments never decode into this flow's records.
-    plan_records = orchestrator._extract_round_metadata_records(
+    plan_records = architecture_contract._extract_round_metadata_records(
         [
             SimpleNamespace(
-                body=orchestrator._attach_round_metadata(
+                body=discuss_loop._attach_round_metadata(
                     "plan review",
                     dataclasses.replace(record.metadata, flow="plan"),
                 )
@@ -13268,25 +13324,28 @@ def test_resolved_history_excludes_future_machine_other_flow_and_carried_items()
 def test_staged_secondary_audit_strips_resolved_primary_disposition_under_incomplete_ledger(
     tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     ledger_flags = []
-    real_ledger_check = orchestrator._round_ledger_may_be_incomplete
+    real_ledger_check = review_rounds._round_ledger_may_be_incomplete
 
     def ledger_spy(**kwargs):
         result = real_ledger_check(**kwargs)
         ledger_flags.append(result)
         return result
 
-    monkeypatch.setattr(orchestrator, "_round_ledger_may_be_incomplete", ledger_spy)
+    patch_attr_in(monkeypatch, (
+        review_rounds, pr_loop, plan_first_loop,
+    ), "_round_ledger_may_be_incomplete", ledger_spy)
     logged = []
-    real_log = orchestrator.log
-    monkeypatch.setattr(
-        orchestrator,
-        "log",
+    real_log = agent_failure.log
+    patch_attr_in(monkeypatch, (
+        agent_failure, integration_close, architecture_contract, validated_agent,
+        response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy,
+        child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "log",
         lambda config, message, *a, **k: (logged.append(message), real_log(config, message, *a, **k))[1],
     )
     runner = FakeRunner(
@@ -13313,7 +13372,7 @@ def test_staged_secondary_audit_strips_resolved_primary_disposition_under_incomp
     )
     config = _staged_config(tmp_path)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     repair_mock.assert_not_called()
@@ -13334,7 +13393,7 @@ def test_staged_secondary_audit_strips_resolved_primary_disposition_under_incomp
     # The stripped response keeps its approval and posts no disposition.
     gemini_record = next(
         record
-        for record in orchestrator._extract_round_metadata_records(
+        for record in architecture_contract._extract_round_metadata_records(
             [SimpleNamespace(body=c["body"]) for c in runner.pr_payload.get("comments", [])],
             flow="pr",
         )
@@ -13383,7 +13442,7 @@ def test_pr_loop_records_narration_only_reviewer_as_unavailable(tmp_path):
     )
 
     with patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair",
+        "coding_review_agent_loop.validated_agent.attempt_repair",
         lambda raw, gemini_cmd, **kwargs: _fabricated_pr_review(),
     ):
         with pytest.raises(AgentLoopError, match="missing required input from Codex"):
@@ -13408,7 +13467,7 @@ def test_pr_loop_single_narration_only_reviewer_stops_fatally(tmp_path):
     )
 
     with patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair",
+        "coding_review_agent_loop.validated_agent.attempt_repair",
         lambda raw, gemini_cmd, **kwargs: _fabricated_pr_review(),
     ):
         with pytest.raises(AgentLoopError, match="review_substance_integrity"):
@@ -13426,7 +13485,7 @@ def _plan_comment(plan: str) -> IssueComment:
             plan,
             PostedRoundMetadata(
                 flow="plan", role="coder", agent="Claude", round_number=1,
-                subject=orchestrator._plan_subject(plan), canonical_plan=plan,
+                subject=panel_evidence._plan_subject(plan), canonical_plan=plan,
                 raw_structured_coder_response=plan,
             ),
         ),
@@ -13471,8 +13530,8 @@ def _ordinary_managed_config(tmp_path, **overrides):
     )
 
 
-def _issue_created_handoff() -> orchestrator.AuthenticatedIssueCreatedHandoff:
-    return orchestrator.AuthenticatedIssueCreatedHandoff(
+def _issue_created_handoff() -> pr_loop_support.AuthenticatedIssueCreatedHandoff:
+    return pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
         head_sha="abc123", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
@@ -13483,17 +13542,21 @@ def _issue_created_handoff() -> orchestrator.AuthenticatedIssueCreatedHandoff:
 def test_pr_ordinary_resume_without_parent_context_still_fails_closed(tmp_path, monkeypatch):
     """Plain PR-mode resume has no parent identity and keeps the hard stop."""
     plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
-    child = _issue(56, (_handoff_comment(orchestrator.approved_plan_hash(plan)),))
-    monkeypatch.setattr(orchestrator, "validate_open_issue", lambda *_a, **_k: None)
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context", lambda *_a, **_k: child
+    child = _issue(56, (_handoff_comment(panel_evidence.approved_plan_hash(plan)),))
+    patch_attr_in(monkeypatch, (
+        discuss_loop, pr_loop, issue_loop,
+    ), "validate_open_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (
+        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
+        plan_first_loop, issue_loop,
+    ), "get_issue_context", lambda *_a, **_k: child
     )
     monkeypatch.setattr(
-        orchestrator, "recover_issue_created_handoff",
+        pr_loop, "recover_issue_created_handoff",
         lambda *_a, **_k: _issue_created_handoff(),
     )
     monkeypatch.setattr(
-        orchestrator, "revalidate_issue_created_handoff",
+        pr_loop, "revalidate_issue_created_handoff",
         lambda *_a, **_k: (_ for _ in ()).throw(_FreshScopeCaptured()),
     )
     runner = _managed_resume_runner()
@@ -13511,25 +13574,31 @@ def test_pr_ordinary_resume_ignores_parent_when_child_plan_recovers(tmp_path, mo
     """A recoverable child plan wins and the parent comments are never read."""
     plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
     decoy = "Decoy plan.\n\n### Plan steps\n1. Do something else entirely."
-    plan_hash = orchestrator.approved_plan_hash(plan)
+    plan_hash = panel_evidence.approved_plan_hash(plan)
     child = _issue(56, (_plan_comment(plan), _handoff_comment(plan_hash)))
     parent = _issue(55, (_plan_comment(decoy),))
     read_comments: list[int] = []
 
-    real_recover = orchestrator.recover_approved_plan_context
+    real_recover = execution_policy.recover_approved_plan_context
 
     def recording_recover(comments, **kwargs):
         read_comments.append(len(comments))
         return real_recover(comments, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "recover_approved_plan_context", recording_recover)
-    monkeypatch.setattr(orchestrator, "validate_open_issue", lambda *_a, **_k: None)
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (
+        execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop,
+    ), "recover_approved_plan_context", recording_recover)
+    patch_attr_in(monkeypatch, (
+        discuss_loop, pr_loop, issue_loop,
+    ), "validate_open_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (
+        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
+        plan_first_loop, issue_loop,
+    ), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     monkeypatch.setattr(
-        orchestrator, "recover_issue_created_handoff",
+        pr_loop, "recover_issue_created_handoff",
         lambda *_a, **_k: _issue_created_handoff(),
     )
     captured: dict[str, object] = {}
@@ -13538,7 +13607,7 @@ def test_pr_ordinary_resume_ignores_parent_when_child_plan_recovers(tmp_path, mo
         captured.update(kwargs)
         raise _FreshScopeCaptured
 
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", revalidate)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", revalidate)
     runner = _managed_resume_runner()
 
     with pytest.raises(_FreshScopeCaptured):
@@ -13555,12 +13624,16 @@ def test_pr_ordinary_resume_ignores_parent_when_child_plan_recovers(tmp_path, mo
 def test_pr_fresh_authorization_recovers_parent_held_plan(tmp_path, monkeypatch):
     """A staged child under --managed-ci-fresh recovers the parent-held plan."""
     plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
-    plan_hash = orchestrator.approved_plan_hash(plan)
+    plan_hash = panel_evidence.approved_plan_hash(plan)
     child = _issue(56, (_handoff_comment(plan_hash),))
     parent = _issue(55, (_plan_comment(plan),))
-    monkeypatch.setattr(orchestrator, "validate_open_issue", lambda *_a, **_k: None)
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (
+        discuss_loop, pr_loop, issue_loop,
+    ), "validate_open_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (
+        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
+        plan_first_loop, issue_loop,
+    ), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     captured: dict[str, object] = {}
@@ -13569,7 +13642,7 @@ def test_pr_fresh_authorization_recovers_parent_held_plan(tmp_path, monkeypatch)
         captured.update(kwargs)
         raise _FreshScopeCaptured
 
-    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", authorize)
+    monkeypatch.setattr(pr_loop, "authorize_fresh_issue_created_resume", authorize)
     config = _ordinary_managed_config(
         tmp_path, managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
     )
@@ -13586,11 +13659,16 @@ def test_pr_fresh_authorization_recovers_parent_held_plan(tmp_path, monkeypatch)
 
 def test_pr_fresh_authorization_without_parent_context_still_fails_closed(tmp_path, monkeypatch):
     plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
-    child = _issue(56, (_handoff_comment(orchestrator.approved_plan_hash(plan)),))
-    monkeypatch.setattr(orchestrator, "validate_open_issue", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator, "get_issue_context", lambda *_a, **_k: child)
+    child = _issue(56, (_handoff_comment(panel_evidence.approved_plan_hash(plan)),))
+    patch_attr_in(monkeypatch, (
+        discuss_loop, pr_loop, issue_loop,
+    ), "validate_open_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (
+        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
+        plan_first_loop, issue_loop,
+    ), "get_issue_context", lambda *_a, **_k: child)
     monkeypatch.setattr(
-        orchestrator, "authorize_fresh_issue_created_resume",
+        pr_loop, "authorize_fresh_issue_created_resume",
         lambda *_a, **_k: (_ for _ in ()).throw(_FreshScopeCaptured()),
     )
     config = _ordinary_managed_config(
@@ -13620,7 +13698,7 @@ def _coder_records_959(runner):
         body = item.get("body") if isinstance(item, dict) else None
         if not isinstance(body, str) or "AGENT_LOOP_META: " not in body:
             continue
-        metadata = orchestrator._decode_round_metadata(
+        metadata = round_state._decode_round_metadata(
             body.split("AGENT_LOOP_META: ", 1)[1].split(" -->", 1)[0]
         )
         if metadata.role == "coder":
@@ -13656,14 +13734,14 @@ def test_959_in_process_coder_rounds_render_full_then_deltas_with_stable_anchor(
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=4)
     spy_calls = []
-    real_resolve = orchestrator.resolve_matrix_evidence_render
+    real_resolve = pr_loop.resolve_matrix_evidence_render
 
     def spy(current, previous, current_round):
         decision = real_resolve(current, previous, current_round)
         spy_calls.append((previous, current_round, decision))
         return decision
 
-    with patch.object(orchestrator, "resolve_matrix_evidence_render", spy):
+    with patch.object(pr_loop, "resolve_matrix_evidence_render", spy):
         assert run_pr_loop(
             runner, pr_number=77, config=config, approved_plan_context=plan_context
         ) == 0
@@ -13841,7 +13919,7 @@ def test_959_followup_without_evidence_posts_no_section_then_full_on_evidence(tm
         codex_outputs=_blocking_reviews_959(2),
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=3)
-    real_derive = orchestrator._derive_authenticated_risk_evidence_for_coder
+    real_derive = response_validation._derive_authenticated_risk_evidence_for_coder
     derive_calls = []
 
     def derive(followup, **kwargs):
@@ -13853,15 +13931,17 @@ def test_959_followup_without_evidence_posts_no_section_then_full_on_evidence(tm
         return derived, result
 
     resolve_calls = []
-    real_resolve = orchestrator.resolve_matrix_evidence_render
+    real_resolve = pr_loop.resolve_matrix_evidence_render
 
     def resolve(current, previous, current_round):
         assert current is not None
         resolve_calls.append(current_round)
         return real_resolve(current, previous, current_round)
 
-    with patch.object(orchestrator, "_derive_authenticated_risk_evidence_for_coder", derive), \
-            patch.object(orchestrator, "resolve_matrix_evidence_render", resolve):
+    with patch_object_in((
+        response_validation, pr_loop, issue_implementation, issue_loop,
+    ), "_derive_authenticated_risk_evidence_for_coder", derive), \
+            patch.object(pr_loop, "resolve_matrix_evidence_render", resolve):
         assert run_pr_loop(
             runner, pr_number=77, config=config, approved_plan_context=plan_context
         ) == 0
@@ -13950,16 +14030,16 @@ def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkey
 
     _m943_append(runner, template)
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: None
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: None
     )
     assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
 
     # The qualification gate re-reads the fresh PR comments, including the
     # pre-amendment three-reviewer records, and accepts the amended board.
-    amended_contract = orchestrator.make_contract(
+    amended_contract = pr_loop.make_contract(
         ("Codex", "Gemini"), "primary-then-panel", None, "Codex"
     )
-    orchestrator._fresh_pr_qualification_snapshot(
+    pr_loop_support._fresh_pr_qualification_snapshot(
         runner,
         config=reduced,
         pr_number=77,
@@ -13970,7 +14050,7 @@ def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkey
     # A board other than the amended one is a board change the gate never
     # accepts: the run would not have reviewed with it (#1376).
     with pytest.raises(AgentLoopError, match="No qualification or merge is permitted"):
-        orchestrator._fresh_pr_qualification_snapshot(
+        pr_loop_support._fresh_pr_qualification_snapshot(
             runner,
             config=_staged_config(tmp_path, reviewer=("codex", "antigravity"), auto_merge=True),
             pr_number=77,
@@ -14008,7 +14088,7 @@ def test_pr_board_amendment_qualification_refuses_a_stale_contract(tmp_path, mon
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
-    stale_contract = orchestrator.make_contract(
+    stale_contract = pr_loop.make_contract(
         ("Codex", "Gemini", "Antigravity"), "primary-then-panel", None, "Codex"
     )
     stale = _attach_round_metadata(
@@ -14024,17 +14104,17 @@ def test_pr_board_amendment_qualification_refuses_a_stale_contract(tmp_path, mon
         ),
     )
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
 
     def wait_and_inject(*args, **kwargs):
         _m943_append(runner, stale, login="bot")
         return ManagedCiOutcome(status="passed", head_sha="abc123")
 
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait_and_inject)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait_and_inject)
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("stale contract must block merge")
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("stale contract must block merge")
     )
     with pytest.raises(AgentLoopError, match="no qualification or merge is permitted"):
         run_pr_loop(runner, pr_number=77, config=reduced)
@@ -14072,22 +14152,23 @@ def test_pr_board_amendment_managed_completion_names_the_reduced_board(
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     waits = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: waits.append(True) or ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
     merges = []
-    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        orchestrator, "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
+    monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
     )
     monkeypatch.setattr(
-        orchestrator, "publish_manual_v2_qualification", lambda *args, **kwargs: "abc123"
+        pr_loop, "publish_manual_v2_qualification", lambda *args, **kwargs: "abc123"
     )
     capsys.readouterr()
     assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
@@ -14126,13 +14207,13 @@ def test_pr_board_amendment_qualification_refuses_a_digest_on_a_contract_neutral
             reviewer_board_amendment_digest=amendment.digest,
         ),
     )
-    assert orchestrator._extract_round_metadata_records(
+    assert architecture_contract._extract_round_metadata_records(
         [SimpleNamespace(body=neutral)], flow="pr"
     )[0].metadata.scheduler_metadata_status == "absent"
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     injected = []
 
     def wait_and_inject(*args, **kwargs):
@@ -14140,12 +14221,11 @@ def test_pr_board_amendment_qualification_refuses_a_digest_on_a_contract_neutral
         injected.append(True)
         return ManagedCiOutcome(status="passed", head_sha="abc123")
 
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait_and_inject)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait_and_inject)
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("a neutral digest must block merge")
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("a neutral digest must block merge")
     )
-    monkeypatch.setattr(
-        orchestrator, "_merge_with_exact_head_proof",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_merge_with_exact_head_proof",
         lambda *args, **kwargs: pytest.fail("a neutral digest must block merge"),
     )
     with pytest.raises(AgentLoopError, match="(?i)no qualification or merge is permitted") as gate:
@@ -14189,7 +14269,7 @@ def test_m985_pr_loop_stops_after_two_unchanged_head_coder_turns(tmp_path):
 
 
 def test_m985_unchanged_head_count_resets_after_an_external_head_advance():
-    from coding_review_agent_loop.orchestrator import (
+    from coding_review_agent_loop.pr_loop_support import (
         MAX_UNCHANGED_HEAD_CODER_TURNS,
         _UnchangedHeadTracker,
     )
@@ -14235,9 +14315,9 @@ def _ack_pr_run(tmp_path, monkeypatch, *, repaired_status=None):
         head_branch="feature/review-context", base_branch="main",
         head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *args, **kwargs: PullRequestReviewContext(
             metadata=metadata, comments=(), human_requirements=(requirement,)
         ),
@@ -14268,15 +14348,16 @@ def _ack_pr_run(tmp_path, monkeypatch, *, repaired_status=None):
         agent_max_retries=0, agent_retry_backoff_seconds=0,
     )
     repair_results = []
-    real_structured_repair = orchestrator._run_structured_repair
+    real_structured_repair = validated_agent._run_structured_repair
 
     def spy_repair(*args, **kwargs):
         result = real_structured_repair(*args, **kwargs)
         repair_results.append(result)
         return result
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
-        orchestrator, "_run_structured_repair", spy_repair
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair), patch_object_in((
+        validated_agent, pr_loop, plan_first_loop,
+    ), "_run_structured_repair", spy_repair
     ):
         try:
             outcome = run_pr_loop(runner, pr_number=77, config=config)
@@ -14335,10 +14416,10 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
         url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
         body="Keep the current audit trail.",
     )
-    real_context = orchestrator.get_pr_review_context
-    monkeypatch.setattr(
-        orchestrator,
-        "get_pr_review_context",
+    real_context = pr_loop_support.get_pr_review_context
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *args, **kwargs: dataclasses.replace(
             real_context(*args, **kwargs), human_requirements=(requirement,)
         ),
@@ -14371,7 +14452,7 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
                     found.append(decoded)
         return found
 
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
     interrupted = []
 
     def interrupt_after_review(*args, **kwargs):
@@ -14381,15 +14462,17 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
             raise KeyboardInterrupt
         return result
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", lambda raw, cmd, **kw: repaired), \
-            patch.object(orchestrator, "post_pr_comment", side_effect=interrupt_after_review):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", lambda raw, cmd, **kw: repaired), \
+            patch_object_in((
+                pr_loop_support, pr_loop, issue_loop,
+            ), "post_pr_comment", side_effect=interrupt_after_review):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
     codex_before = sum(1 for cmd, _cwd in runner.commands if cmd[:1] == ["codex"])
 
     resumed, carriers, repair_calls = [], [], []
-    real_resumed = orchestrator._resumed_review_architecture
-    real_pin = orchestrator._pin_acknowledgement_repair
+    real_resumed = architecture_contract._resumed_review_architecture
+    real_pin = architecture_contract._pin_acknowledgement_repair
 
     def spy_resumed(*args, **kwargs):
         result = real_resumed(*args, **kwargs)
@@ -14404,9 +14487,12 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
         repair_calls.append(raw)
         return repaired
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
-        orchestrator, "_resumed_review_architecture", spy_resumed
-    ), patch.object(orchestrator, "_pin_acknowledgement_repair", spy_pin):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair), patch_object_in((
+        architecture_contract, pr_loop, plan_first_loop,
+    ), "_resumed_review_architecture", spy_resumed
+    ), patch_object_in((
+        architecture_contract, pr_loop, plan_first_loop,
+    ), "_pin_acknowledgement_repair", spy_pin):
         try:
             outcome = run_pr_loop(runner, pr_number=77, config=config)
         except AgentLoopError as exc:
@@ -14483,7 +14569,7 @@ def _m1034_reviewer_prompts(runner):
 
 
 def test_m1034_followup_head_log_wording():
-    from coding_review_agent_loop.orchestrator import _coder_followup_head_log
+    from coding_review_agent_loop.pr_loop_support import _coder_followup_head_log
 
     advanced = _coder_followup_head_log(3, "Claude", "a" * 40, "b" * 40, 0)
     assert advanced == (
@@ -14628,13 +14714,13 @@ def test_m1034_reviewer_context_flags_unchanged_head_and_keeps_other_bytes():
     advanced = dataclasses.replace(legacy, followup_dispatch_head="0dd000")
     unchanged = dataclasses.replace(legacy, followup_dispatch_head="abc123")
 
-    legacy_text = orchestrator._coder_followup_review_context(raw, legacy, head_sha="abc123")
+    legacy_text = pr_loop_support._coder_followup_review_context(raw, legacy, head_sha="abc123")
     assert '"summary": "Fixed both items."' in legacy_text
     assert "pr_head_unchanged_during_followup" not in legacy_text
     # Changed-head records render exactly like historical records.
-    assert orchestrator._coder_followup_review_context(raw, advanced, head_sha="abc123") == legacy_text
+    assert pr_loop_support._coder_followup_review_context(raw, advanced, head_sha="abc123") == legacy_text
 
-    framed = orchestrator._coder_followup_review_context(raw, unchanged, head_sha="abc123")
+    framed = pr_loop_support._coder_followup_review_context(raw, unchanged, head_sha="abc123")
     assert '"pr_head_unchanged_during_followup": true' in framed
     assert '"followup_dispatch_head": "abc123"' in framed
     assert '"coder_summary_claim": "Fixed both items."' in framed
@@ -14946,7 +15032,7 @@ def test_m1034_resume_from_historical_coder_record_keeps_legacy_context(tmp_path
         flow="pr", role="coder", agent="Claude", round_number=2,
         subject="abc123", raw_structured_coder_response=raw,
     )
-    expected = orchestrator._coder_followup_review_context(raw, legacy_metadata, head_sha="abc123")
+    expected = pr_loop_support._coder_followup_review_context(raw, legacy_metadata, head_sha="abc123")
     assert "pr_head_unchanged_during_followup" not in expected
     assert expected.splitlines()[1] in reviewer_prompt
     assert '"summary": "Fixed both items."' in reviewer_prompt
@@ -15124,7 +15210,7 @@ def test_failed_freeze_write_leaves_no_freeze_and_rerun_posts_exactly_one(tmp_pa
     """Row freeze-write-interrupted."""
     runner = _frozen_runner(tmp_path)
     config = make_config(tmp_path)
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
     failures = []
 
     def flaky_post(runner_, *, config, pr_number, body):
@@ -15133,7 +15219,9 @@ def test_failed_freeze_write_leaves_no_freeze_and_rerun_posts_exactly_one(tmp_pa
             raise AgentLoopError("simulated GitHub outage while posting the freeze")
         return real_post(runner_, config=config, pr_number=pr_number, body=body)
 
-    monkeypatch.setattr(orchestrator, "post_pr_comment", flaky_post)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", flaky_post)
     with pytest.raises(AgentLoopError, match="simulated GitHub outage"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert failures
@@ -15260,21 +15348,21 @@ def test_pending_checks_stop_names_deferred_evidence_and_restart_rederives_it(tm
 def _managed_setup(monkeypatch, *, outcome):
     contract = ManagedCiContract(protocol_version=2, protection_mode="strict")
     events = []
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: contract)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *args, **kwargs: contract)
     monkeypatch.setattr(
-        orchestrator, "dispatch_final_qualification",
+        pr_loop, "dispatch_final_qualification",
         lambda *args, **kwargs: events.append("dispatch"),
     )
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification",
+        pr_loop, "wait_for_final_qualification",
         lambda *args, **kwargs: events.append("wait") or outcome,
     )
     monkeypatch.setattr(
-        orchestrator, "publish_manual_v2_qualification",
+        pr_loop, "publish_manual_v2_qualification",
         lambda *args, **kwargs: pytest.fail("a pending evidence obligation must not qualify"),
     )
     monkeypatch.setattr(
-        orchestrator, "merge_pr",
+        pr_loop_support, "merge_pr",
         lambda *args, **kwargs: pytest.fail("a pending evidence obligation must not merge"),
     )
     return events
@@ -15285,14 +15373,16 @@ def test_managed_qualification_completes_before_the_freeze(tmp_path, monkeypatch
     runner = _frozen_runner(tmp_path)
     config = make_config(tmp_path, managed_ci=True, max_rounds=1)
     events = _managed_setup(monkeypatch, outcome=ManagedCiOutcome(status="passed", head_sha="abc123"))
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
 
     def recording_post(runner_, *, config, pr_number, body):
         if "## Exact-head evidence freeze" in str(body):
             events.append("freeze")
         return real_post(runner_, config=config, pr_number=pr_number, body=body)
 
-    monkeypatch.setattr(orchestrator, "post_pr_comment", recording_post)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", recording_post)
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
     assert events == ["dispatch", "wait", "freeze"]
@@ -15319,7 +15409,7 @@ def test_managed_qualification_failure_is_repaired_without_a_freeze(tmp_path, mo
 
 def _inject_signed_input_before(monkeypatch, runner, *, body, when):
     """Post a signed comment the first time ``when()`` holds at a context read."""
-    real_context = orchestrator.get_pr_review_context
+    real_context = pr_loop_support.get_pr_review_context
     injected = []
 
     def context_with_injection(runner_, **kwargs):
@@ -15328,7 +15418,9 @@ def _inject_signed_input_before(monkeypatch, runner, *, body, when):
             runner.pr_payload["comments"].append(_signed(body, 40 + len(runner.pr_payload["comments"])))
         return real_context(runner_, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "get_pr_review_context", context_with_injection)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context", context_with_injection)
     return injected
 
 
@@ -15448,7 +15540,7 @@ def test_restart_after_cleared_release_refreshes_for_newer_signed_input(tmp_path
         run_pr_loop(runner, pr_number=77, config=config)
     runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
-    real_checks = orchestrator.get_pr_checks
+    real_checks = pr_loop.get_pr_checks
     stops = []
 
     def stop_after_release(*args, **kwargs):
@@ -15457,7 +15549,7 @@ def test_restart_after_cleared_release_refreshes_for_newer_signed_input(tmp_path
             raise AgentLoopError("simulated process stop before finalization")
         return real_checks(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", stop_after_release)
+    monkeypatch.setattr(pr_loop, "get_pr_checks", stop_after_release)
     with pytest.raises(AgentLoopError, match="simulated process stop"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert [record.metadata.evidence_release.reason for record in _release_records(runner)] == [
@@ -15556,7 +15648,7 @@ def test_interrupted_evidence_response_pass_is_rerun_in_full(tmp_path, monkeypat
 
     runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
     stopped = []
 
     def stop_after_first_response_record(runner_, *, config, pr_number, body):
@@ -15566,7 +15658,9 @@ def test_interrupted_evidence_response_pass_is_rerun_in_full(tmp_path, monkeypat
             raise AgentLoopError("simulated process stop mid-pass")
         return result
 
-    monkeypatch.setattr(orchestrator, "post_pr_comment", stop_after_first_response_record)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", stop_after_first_response_record)
     with pytest.raises(AgentLoopError, match="simulated process stop mid-pass"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert "evidence-release" not in _phases(runner)
@@ -15574,7 +15668,7 @@ def test_interrupted_evidence_response_pass_is_rerun_in_full(tmp_path, monkeypat
 
     # The partial transcript cannot clear anything: the rerun restores the
     # freeze (ledger, budget, signed baseline) and reruns the whole board.
-    monkeypatch.setattr(orchestrator, "post_pr_comment", real_post)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_loop), "post_pr_comment", real_post)
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
     runner.gemini_outputs.append(
         _evidence_review(
@@ -15733,7 +15827,7 @@ def test_release_budget_below_the_ceiling_is_restored_after_restart(tmp_path, mo
     runner.pr_check_runs_payload = {
         "check_runs": [{"name": "test", "status": "completed", "conclusion": "failure"}]
     }
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
     stops = []
 
     def stop_after_release(runner_, *, config, pr_number, body):
@@ -15742,10 +15836,12 @@ def test_release_budget_below_the_ceiling_is_restored_after_restart(tmp_path, mo
             raise AgentLoopError("simulated process stop after the release")
         return real_post(runner_, config=config, pr_number=pr_number, body=body)
 
-    monkeypatch.setattr(orchestrator, "post_pr_comment", stop_after_release)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", stop_after_release)
     with pytest.raises(AgentLoopError, match="simulated process stop"):
         run_pr_loop(runner, pr_number=77, config=config)
-    monkeypatch.setattr(orchestrator, "post_pr_comment", real_post)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_loop), "post_pr_comment", real_post)
     release = _release_records(runner)[0].metadata
     assert release.evidence_release.allowed_rounds == 2
     assert _pr_records(runner)[-1].metadata.phase == "evidence-release"
@@ -15815,7 +15911,7 @@ def test_head_moving_at_the_gate_read_publishes_no_freeze(tmp_path, monkeypatch)
     """Row freeze-on-clean-board (variant: live head is H' at the last read)."""
     runner = _frozen_runner(tmp_path)
     config = make_config(tmp_path, max_rounds=1)
-    real_context = orchestrator.get_pr_review_context
+    real_context = pr_loop_support.get_pr_review_context
     moved = []
 
     def head_moves_before_gate(runner_, **kwargs):
@@ -15825,7 +15921,9 @@ def test_head_moving_at_the_gate_read_publishes_no_freeze(tmp_path, monkeypatch)
             runner.git_head = "def456"
         return real_context(runner_, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "get_pr_review_context", head_moves_before_gate)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context", head_moves_before_gate)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     assert moved
@@ -15852,7 +15950,7 @@ def test_refresh_pass_with_deferred_evidence_survives_a_pending_check_stop(tmp_p
         monkeypatch, runner, body="Keep the legacy flag.",
         when=lambda: len(runner.codex_outputs) == 1,
     )
-    real_checks = orchestrator.get_pr_checks
+    real_checks = pr_loop.get_pr_checks
     pending = {"on": True}
 
     def checks_pending_after_refresh(*args, **kwargs):
@@ -15862,7 +15960,7 @@ def test_refresh_pass_with_deferred_evidence_survives_a_pending_check_stop(tmp_p
             }
         return real_checks(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", checks_pending_after_refresh)
+    monkeypatch.setattr(pr_loop, "get_pr_checks", checks_pending_after_refresh)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     releases = _release_records(runner)
     assert [record.metadata.evidence_release.reason for record in releases] == ["refresh-clean"]
@@ -15917,7 +16015,7 @@ def test_trust_set_change_on_resume_validates_against_current_surfaced_set(tmp_p
     projection = _pr_projection(comments=[_gql_comment(1, "agent-bot", body)])
 
     def validate(text, requirements):
-        return orchestrator._validate_response_with_human_requirements(
+        return response_validation._validate_response_with_human_requirements(
             text,
             marker_validator=validate_structured_coder_followup,
             human_requirements=requirements,
@@ -15958,7 +16056,7 @@ def test_trust_set_change_on_resume_validates_against_current_surfaced_set(tmp_p
 
     assert resumed.human_requirements == ()
     validate(structured_coder_followup(), resumed.human_requirements)
-    assert not orchestrator._current_plan_has_complete_human_requirement_dispositions(
+    assert not response_validation._current_plan_has_complete_human_requirement_dispositions(
         historical_ack, surfaced_requirement_ids=()
     )
 
@@ -16104,7 +16202,7 @@ def test_m1067_run_pr_loop_prints_fallback_state_report(tmp_path, monkeypatch, c
     )
     runner = FakeRunner()
     config = make_config(tmp_path, auto_merge=True)
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: activation)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *args, **kwargs: activation)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -16155,15 +16253,15 @@ def _m1133_resume_with_amendment(tmp_path, monkeypatch, *, configured):
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
     resume_boards = []
-    real_resume = orchestrator._resume_pr_round
+    real_resume = pr_loop_support._resume_pr_round
 
     def spy_resume(*args, **kwargs):
         resume_boards.append(tuple(kwargs["configured_reviewers"]))
         return real_resume(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_resume_pr_round", spy_resume)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_resume_pr_round", spy_resume)
     calls_before = len(runner.commands)
     config = (
         reduced
@@ -16264,7 +16362,7 @@ def test_1133_stale_records_posted_after_unread_amendment_print_repost_round(
     comments.remove(next(c for c in comments if "Reviewer board amendment" in c["body"]))
     fresh = template.replace('"effective_from_round": 2', f'"effective_from_round": {round_number}')
     _m943_append(runner, fresh)
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
     assert run_pr_loop(
         runner, pr_number=77, config=_staged_config(tmp_path, auto_merge=True)
     ) == 0
@@ -16275,9 +16373,9 @@ def test_1133_unreadable_amendment_after_startup_is_logged_at_the_gate(
 ):
     """Row gate-unreadable-diagnostic: logged, requirements unchanged, no board change."""
     runner, _, _, _ = _m1133_resume_with_amendment(tmp_path, monkeypatch, configured="original")
-    amended = orchestrator.make_contract(("Codex", "Gemini"), "primary-then-panel", None, "Codex")
+    amended = pr_loop.make_contract(("Codex", "Gemini"), "primary-then-panel", None, "Codex")
     reduced = _staged_config(tmp_path, reviewer=("codex", "gemini"), min_reviewers=3, auto_merge=True)
-    before = orchestrator._fresh_pr_qualification_snapshot(
+    before = pr_loop_support._fresh_pr_qualification_snapshot(
         runner, config=reduced, pr_number=77, issue_context=None,
         parent_issue_context=None, scheduler_contract=amended,
     )
@@ -16287,7 +16385,7 @@ def test_1133_unreadable_amendment_after_startup_is_logged_at_the_gate(
     )
     _m943_append(runner, unreadable)
     capsys.readouterr()
-    after = orchestrator._fresh_pr_qualification_snapshot(
+    after = pr_loop_support._fresh_pr_qualification_snapshot(
         runner, config=dataclasses.replace(reduced, quiet=False), pr_number=77,
         issue_context=None, parent_issue_context=None, scheduler_contract=amended,
     )
@@ -16307,12 +16405,10 @@ def _m1133_latch_run(tmp_path, monkeypatch, *, configured):
     The first run's latch is rewritten to the automatic source; the resume keeps
     the full-board latch on, so every selection is a full-board selection.
     """
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
     runner = FakeRunner(
         codex_outputs=[_unavailable("OpenAI Codex")],
         gemini_outputs=[_unavailable("Google Gemini")],
@@ -16437,19 +16533,20 @@ def test_1133_unreadable_amendment_posted_during_managed_ci_does_not_block_quali
         '{"kind": "reviewer-board-amendment"}\n~~~\n-- Human Reviewer'
     )
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
 
     def wait_and_inject(*args, **kwargs):
         _m943_append(runner, unreadable, login="operator")
         return ManagedCiOutcome(status="passed", head_sha="abc123")
 
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait_and_inject)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait_and_inject)
     merges = []
-    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        orchestrator, "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
+    monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
     )
     config = reduced if configured == "reduced" else _staged_config(tmp_path, auto_merge=True)
     config = dataclasses.replace(config, quiet=False)
@@ -16472,15 +16569,18 @@ class _PlanCheckReached(Exception):
 def _m1133_strict_plan_run(tmp_path, monkeypatch, *, supplied):
     """Fresh managed-CI authorization through run_pr_loop, plan approved by three."""
     plan_board = ("codex", "gemini", "antigravity")
-    monkeypatch.setattr(
-        orchestrator, "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, plan_first_loop, issue_loop,
+    ), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
 
     def require(*_args, config, error_message, **_kw):
         if tuple(config.reviewer) != plan_board:
             raise AgentLoopError(error_message)
 
-    monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+    patch_attr_in(monkeypatch, (
+        panel_evidence, pr_loop_support, pr_loop,
+    ), "_require_complete_canonical_plan_approval", require)
     # The fixture stubs the completion predicate, including the shared
     # classification recovery now applies to real plan history (#1377).
     import coding_review_agent_loop.plan_verification as plan_verification
@@ -16490,7 +16590,7 @@ def _m1133_strict_plan_run(tmp_path, monkeypatch, *, supplied):
     def reached(*_args, **_kwargs):
         raise _PlanCheckReached
 
-    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", reached)
+    monkeypatch.setattr(pr_loop, "authorize_fresh_issue_created_resume", reached)
     runner = _m943_partial_pr_round(
         tmp_path,
         issue_payload={"number": 56, "title": "Linked issue", "body": "Scope."},
@@ -16539,14 +16639,12 @@ def _m1133_post_panel_latch_run(tmp_path, monkeypatch, *, configured):
     No operator force-full flag: the full board is selected only by the
     automatic latch raised after the panel opened.
     """
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     merges = []
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: merges.append(kwargs)
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: merges.append(kwargs)
     )
     runner = FakeRunner(
         claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
@@ -16700,8 +16798,9 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
     _m943_append(runner, _m1133_crlf(_m943_amendment_from_error(str(excinfo.value))))
     plan_board = ("codex", "gemini", "antigravity")
     plan_checks = []
-    monkeypatch.setattr(
-        orchestrator, "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, plan_first_loop, issue_loop,
+    ), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
 
     def require(*_args, config, error_message, **_kw):
@@ -16709,44 +16808,48 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
         if tuple(config.reviewer) != plan_board:
             raise AgentLoopError(error_message)
 
-    monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+    patch_attr_in(monkeypatch, (
+        panel_evidence, pr_loop_support, pr_loop,
+    ), "_require_complete_canonical_plan_approval", require)
     # The fixture stubs the completion predicate, including the shared
     # classification recovery now applies to real plan history (#1377).
     import coding_review_agent_loop.plan_verification as plan_verification
 
     monkeypatch.setattr(plan_verification, "require_recoverable_plan_approval", lambda *a, **k: None)
-    recovered_plan = orchestrator.make_approved_plan_context(
+    recovered_plan = execution_policy.make_approved_plan_context(
         "approved plan",
         source_locator="issue #56 canonical approved plan",
-        expected_hash=orchestrator.approved_plan_hash("approved plan"),
+        expected_hash=panel_evidence.approved_plan_hash("approved plan"),
     )
-    monkeypatch.setattr(
-        orchestrator, "recover_approved_plan_context", lambda *a, **k: recovered_plan
+    patch_attr_in(monkeypatch, (
+        execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop,
+    ), "recover_approved_plan_context", lambda *a, **k: recovered_plan
     )
     handoff = AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
         head_sha="abc123", branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
         trusted_actor_id=1, protection_mode="strict", override_nonce=None,
     )
-    monkeypatch.setattr(orchestrator, "recover_issue_created_handoff", lambda *a, **k: handoff)
+    monkeypatch.setattr(pr_loop, "recover_issue_created_handoff", lambda *a, **k: handoff)
     monkeypatch.setattr(
-        orchestrator, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff
+        pr_loop, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff
     )
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *a, **k: handoff)
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", lambda *a, **k: handoff)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
-    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *args, **kwargs: None)
     merges = []
-    monkeypatch.setattr(
-        orchestrator, "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
     )
     fresh = (
         {"managed_ci_fresh_authorization": True, "managed_ci_issue_number": 56}
@@ -16831,10 +16934,8 @@ def test_evidence_response_pass_with_unavailable_reviewer_stops_before_the_gate_
         run_pr_loop(runner, pr_number=77, config=config)
 
     gate_calls = []
-    real_gate = orchestrator._evidence_freeze_gate
-    monkeypatch.setattr(
-        orchestrator,
-        "_evidence_freeze_gate",
+    real_gate = pr_loop_support._evidence_freeze_gate
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_evidence_freeze_gate",
         lambda *a, **k: gate_calls.append(1) or real_gate(*a, **k),
     )
     runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
@@ -16912,7 +17013,7 @@ def test_scheduler_stop_template_is_accepted_on_rerun_with_the_original_board(
     assert f'"effective_from_round": {printed_round}' in template
     # Post the first stop's template as-is and rerun with the ORIGINAL board.
     _m943_append(runner, template)
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
     mark = len(runner.commands)
     assert run_pr_loop(runner, pr_number=77, config=original) == 0
     assert "agy" not in [cmd[0] for cmd in _stop_commands_after(runner, mark)]
@@ -16956,8 +17057,8 @@ def test_scheduler_stop_with_last_secondary_unavailable_is_prose_only(tmp_path):
 def test_scheduler_stop_survives_a_failing_fresh_context_fetch(tmp_path, monkeypatch):
     """Row advisory-lookup-failure-fallback: the fresh PR-context fetch raises."""
     stopping = []
-    real_advisory = orchestrator._unavailable_reviewer_amendment_advisory
-    real_fetch = orchestrator.get_pr_review_context
+    real_advisory = review_rounds._unavailable_reviewer_amendment_advisory
+    real_fetch = pr_loop_support.get_pr_review_context
 
     def mark_advisory(**kwargs):
         stopping.append(True)
@@ -16968,8 +17069,12 @@ def test_scheduler_stop_survives_a_failing_fresh_context_fetch(tmp_path, monkeyp
             raise RuntimeError("context fetch exploded")
         return real_fetch(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_unavailable_reviewer_amendment_advisory", mark_advisory)
-    monkeypatch.setattr(orchestrator, "get_pr_review_context", fetch)
+    patch_attr_in(monkeypatch, (
+        review_rounds, pr_loop,
+    ), "_unavailable_reviewer_amendment_advisory", mark_advisory)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context", fetch)
     runner = _scheduler_stop_runner()
     with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
         run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
@@ -17050,32 +17155,34 @@ def test_incomplete_non_actionable_review_beside_a_blocking_peer_stops_at_detect
 def test_strict_managed_all_reviewers_stop_suggests_restore_only(tmp_path, monkeypatch):
     """Row strict-managed-all-reviewers-restore-only on a real strict issue-created handoff."""
     plan_board = ("codex", "claude", "antigravity")
-    monkeypatch.setattr(
-        orchestrator, "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, plan_first_loop, issue_loop,
+    ), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
-    monkeypatch.setattr(
-        orchestrator, "_require_complete_canonical_plan_approval", lambda *a, **k: None
+    patch_attr_in(monkeypatch, (
+        panel_evidence, pr_loop_support, pr_loop,
+    ), "_require_complete_canonical_plan_approval", lambda *a, **k: None
     )
     # The fixture stubs the completion predicate, including the shared
     # classification recovery now applies to real plan history (#1377).
     import coding_review_agent_loop.plan_verification as plan_verification
 
     monkeypatch.setattr(plan_verification, "require_recoverable_plan_approval", lambda *a, **k: None)
-    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+    handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
         head_sha="abc123", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="strict", override_nonce=None,
     )
-    assert orchestrator._managed_binding_protection_mode(handoff) == "strict"
+    assert pr_loop_support._managed_binding_protection_mode(handoff) == "strict"
     monkeypatch.setattr(
-        orchestrator, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff
+        pr_loop, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff
     )
     monkeypatch.setattr(
-        orchestrator, "revalidate_issue_created_handoff", lambda *a, **k: k["handoff"]
+        pr_loop, "revalidate_issue_created_handoff", lambda *a, **k: k["handoff"]
     )
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop, "activate_managed_ci",
         lambda *a, **k: ManagedCiContract(protocol_version=2, protection_mode="strict"),
     )
     runner = FakeRunner(
@@ -17141,10 +17248,10 @@ def test_carried_migration_obligation_is_not_revalidated_when_a_reviewer_is_unav
         calls.append("validate")
         return next(validations)
 
-    monkeypatch.setattr(orchestrator, "validate_pr_migration_topology", validate)
-    real_sync = orchestrator.sync_coder_pr_before_validation
+    monkeypatch.setattr(pr_loop, "validate_pr_migration_topology", validate)
+    real_sync = pr_loop.sync_coder_pr_before_validation
     monkeypatch.setattr(
-        orchestrator, "sync_coder_pr_before_validation",
+        pr_loop, "sync_coder_pr_before_validation",
         lambda *a, **k: calls.append("sync") or real_sync(*a, **k),
     )
     with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
@@ -17177,7 +17284,7 @@ def test_refresh_pass_with_unavailable_reviewer_publishes_no_release_and_reruns_
             dispositions=[_resolve("item-1", "Codex owns this request.")],
         )
     )
-    real_checks = orchestrator.get_pr_checks
+    real_checks = pr_loop.get_pr_checks
     stops = []
 
     def stop_after_release(*args, **kwargs):
@@ -17186,7 +17293,7 @@ def test_refresh_pass_with_unavailable_reviewer_publishes_no_release_and_reruns_
             raise AgentLoopError("simulated process stop before finalization")
         return real_checks(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", stop_after_release)
+    monkeypatch.setattr(pr_loop, "get_pr_checks", stop_after_release)
     with pytest.raises(AgentLoopError, match="simulated process stop"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert len(_release_records(runner)) == 1
@@ -17212,8 +17319,8 @@ def test_refresh_pass_with_unavailable_reviewer_publishes_no_release_and_reruns_
 def _stale_attachment_stubs(monkeypatch, *, stale_contract, outcomes):
     """Managed-CI stubs that record dispatches, waits and the attachment each wait saw."""
     state = {"contract": stale_contract, "dispatches": [], "waited": [], "merges": [], "fresh": 0}
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: state["contract"])
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: state["contract"])
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *a, **k: True)
 
     def dispatch(*args, **kwargs):
         state["dispatches"].append(kwargs["expected_head_sha"])
@@ -17229,9 +17336,9 @@ def _stale_attachment_stubs(monkeypatch, *, stale_contract, outcomes):
         state["waited"].append((contract.attached_run_id, contract.expected_head_sha))
         return outcomes(contract, kwargs["metadata"])
 
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", dispatch)
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait)
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *a, **k: state["merges"].append(k))
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", dispatch)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: state["merges"].append(k))
     return state
 
 
@@ -17435,9 +17542,9 @@ def test_full_board_merge_502_is_one_attempt_and_a_rerun_regates_before_merging(
     approval = "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
     runner = _AmbiguousMergeRunner(codex_outputs=[approval, approval], events=events)
     config = make_config(tmp_path, auto_merge=True, test_command=("pytest", "tests/test_agent_loop.py"))
-    original = orchestrator.get_pr_checks
+    original = pr_loop.get_pr_checks
     with patch.object(
-        orchestrator, "get_pr_checks",
+        pr_loop, "get_pr_checks",
         side_effect=lambda *a, **k: events.append("full-board-gate") or original(*a, **k),
     ):
         with pytest.raises(AgentLoopError, match="rerun to re-execute every merge gate"):
@@ -17460,12 +17567,12 @@ def test_managed_merge_502_is_one_attempt_and_a_rerun_requalifies_before_merging
     approval = structured_pr_review(state="approved", summary="Approved.")
     runner = _AmbiguousMergeRunner(codex_outputs=[approval, approval], events=events)
     config = make_config(tmp_path, watch_pending_ci=True, auto_merge=True)
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: ManagedCiContract())
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: ManagedCiContract())
     monkeypatch.setattr(
-        orchestrator, "dispatch_final_qualification", lambda *a, **k: events.append("dispatch")
+        pr_loop, "dispatch_final_qualification", lambda *a, **k: events.append("dispatch")
     )
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification",
+        pr_loop, "wait_for_final_qualification",
         lambda *a, **k: events.append("qualified") or ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
 
@@ -17493,27 +17600,28 @@ def test_ordinary_recovery_merge_502_is_one_attempt_and_a_rerun_revalidates_befo
         pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
         released_label_event_id=101, released_at=100,
     )
-    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
     monkeypatch.setattr(
-        orchestrator, "wait_for_ordinary_recovery",
+        pr_loop_support, "wait_for_ordinary_recovery",
         lambda *a, **k: events.append("recovery-gate") or ManagedCiOutcome(
             status="passed", checks=_watch_check_board("passing"), head_sha="abc123",
         ),
     )
-    monkeypatch.setattr(
-        orchestrator, "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
             base_branch="main", head_sha="abc123", url=None,
         )),
     )
     monkeypatch.setattr(
-        orchestrator, "validate_ordinary_recovery_capability",
+        pr_loop_support, "validate_ordinary_recovery_capability",
         lambda *a, **k: events.append("capability") or True,
     )
 
     with pytest.raises(AgentLoopError, match="rerun to re-execute every merge gate"):
-        orchestrator._finalize_ordinary_recovery_merge(
+        pr_loop_support._finalize_ordinary_recovery_merge(
             runner, config=config, pr_number=77, capability=capability,
         )
     assert len(_merge_commands(runner)) == 1
@@ -17521,7 +17629,7 @@ def test_ordinary_recovery_merge_502_is_one_attempt_and_a_rerun_revalidates_befo
     first_pass = list(events)
     assert first_pass[-1] == "merge" and "recovery-gate" in first_pass and "capability" in first_pass
 
-    orchestrator._finalize_ordinary_recovery_merge(
+    pr_loop_support._finalize_ordinary_recovery_merge(
         runner, config=config, pr_number=77, capability=capability,
     )
 
@@ -17546,22 +17654,23 @@ def test_merge_502_that_actually_merged_is_recovered_with_no_second_merge(tmp_pa
             pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
             released_label_event_id=101, released_at=100,
         )
-        monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
+        monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
         monkeypatch.setattr(
-            orchestrator, "wait_for_ordinary_recovery",
+            pr_loop_support, "wait_for_ordinary_recovery",
             lambda *a, **k: ManagedCiOutcome(
                 status="passed", checks=_watch_check_board("passing"), head_sha="abc123",
             ),
         )
-        monkeypatch.setattr(
-            orchestrator, "get_pr_review_context",
+        patch_attr_in(monkeypatch, (
+            pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+        ), "get_pr_review_context",
             lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
                 number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
                 base_branch="main", head_sha="abc123", url=None,
             )),
         )
-        monkeypatch.setattr(orchestrator, "validate_ordinary_recovery_capability", lambda *a, **k: True)
-        orchestrator._finalize_ordinary_recovery_merge(
+        monkeypatch.setattr(pr_loop_support, "validate_ordinary_recovery_capability", lambda *a, **k: True)
+        pr_loop_support._finalize_ordinary_recovery_merge(
             runner, config=config, pr_number=77, capability=capability,
         )
     assert len(_merge_commands(runner)) == 1
@@ -17595,12 +17704,12 @@ def test_pr_loop_cleanup_refusal_carries_the_release_diagnostic(tmp_path, monkey
         protocol_version=2, adopted_existing_pr=True, invocation_applied_label=True,
         active_label_event_id=None,
     )
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: contract)
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *a, **k: True)
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *a, **k: None)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *a, **k: True)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *a, **k: None)
 
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification",
+        pr_loop, "wait_for_final_qualification",
         lambda *a, **k: (_ for _ in ()).throw(AgentLoopError("qualification aborted")),
     )
 
@@ -17640,22 +17749,23 @@ def _ordinary_recovery_ready_setup(monkeypatch, runner_tmp):
         released_label_event_id=101, released_at=100,
     )
     validations = []
-    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
     monkeypatch.setattr(
-        orchestrator, "wait_for_ordinary_recovery",
+        pr_loop_support, "wait_for_ordinary_recovery",
         lambda *a, **k: ManagedCiOutcome(
             status="passed", checks=_watch_check_board("passing"), head_sha="abc123",
         ),
     )
-    monkeypatch.setattr(
-        orchestrator, "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
             base_branch="main", head_sha="abc123", url=None,
         )),
     )
     monkeypatch.setattr(
-        orchestrator, "validate_ordinary_recovery_capability",
+        pr_loop_support, "validate_ordinary_recovery_capability",
         lambda *a, **k: validations.append(k.get("require_draft", True)) or True,
     )
     return capability, validations
@@ -17669,7 +17779,7 @@ def test_ordinary_recovery_ready_503_with_head_drift_refuses_with_one_ready_and_
     capability, validations = _ordinary_recovery_ready_setup(monkeypatch, tmp_path)
 
     with pytest.raises(AgentLoopError, match="Unable to mark recovered PR #77 ready") as raised:
-        orchestrator._finalize_ordinary_recovery_merge(
+        pr_loop_support._finalize_ordinary_recovery_merge(
             runner, config=config, pr_number=77, capability=capability,
         )
 
@@ -17687,7 +17797,7 @@ def test_ordinary_recovery_same_head_accepted_ready_reaches_post_write_verificat
     config = make_config(tmp_path, auto_merge=True)
     capability, validations = _ordinary_recovery_ready_setup(monkeypatch, tmp_path)
 
-    orchestrator._finalize_ordinary_recovery_merge(
+    pr_loop_support._finalize_ordinary_recovery_merge(
         runner, config=config, pr_number=77, capability=capability,
     )
 
@@ -18394,7 +18504,7 @@ def test_ci_repair_dispatch_shows_the_earlier_ci_failure_by_check_name(
         ],
     )
     counter = iter(range(1, 10))
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
@@ -18402,7 +18512,10 @@ def test_ci_repair_dispatch_shows_the_earlier_ci_failure_by_check_name(
             runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -18414,8 +18527,8 @@ def test_ci_repair_dispatch_shows_the_earlier_ci_failure_by_check_name(
         )
         return _watch_check_board("failing", failing=(failed,))
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "get_pr_checks", boards)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -18475,7 +18588,7 @@ def test_deferred_finding_stays_deferred_across_ci_repair_dispatches_and_on_repl
         ],
     )
     counter = iter(range(1, 10))
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
@@ -18483,7 +18596,10 @@ def test_deferred_finding_stays_deferred_across_ci_repair_dispatches_and_on_repl
             runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -18497,8 +18613,8 @@ def test_deferred_finding_stays_deferred_across_ci_repair_dispatches_and_on_repl
         )
         return _watch_check_board("failing", failing=(failed,))
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "get_pr_checks", boards)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -18566,7 +18682,7 @@ def test_deferred_finding_survives_a_real_resume_and_reintroduction_flips_it_ope
         ],
     )
     counter = iter(range(1, 10))
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
@@ -18574,7 +18690,10 @@ def test_deferred_finding_survives_a_real_resume_and_reintroduction_flips_it_ope
             runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -18586,8 +18705,8 @@ def test_deferred_finding_survives_a_real_resume_and_reintroduction_flips_it_ope
         )
         return _watch_check_board("failing", failing=(failed,))
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "get_pr_checks", boards)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -18679,7 +18798,7 @@ def test_future_finding_cleared_in_full_context_mode_is_resolved_live_and_on_res
         ],
     )
     counter = iter(range(1, 10))
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
@@ -18687,7 +18806,10 @@ def test_future_finding_cleared_in_full_context_mode_is_resolved_live_and_on_res
             runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -18699,8 +18821,8 @@ def test_future_finding_cleared_in_full_context_mode_is_resolved_live_and_on_res
         )
         return _watch_check_board("failing", failing=(failed,))
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "get_pr_checks", boards)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -18768,7 +18890,7 @@ def test_future_finding_reintroduced_as_blocking_in_full_context_mode_is_open_li
         ],
     )
     counter = iter(range(1, 10))
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
@@ -18776,7 +18898,10 @@ def test_future_finding_reintroduced_as_blocking_in_full_context_mode_is_open_li
             runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -18788,8 +18913,8 @@ def test_future_finding_reintroduced_as_blocking_in_full_context_mode_is_open_li
         )
         return _watch_check_board("failing", failing=(failed,))
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "get_pr_checks", boards)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -18832,7 +18957,7 @@ def test_future_finding_cleared_in_the_first_resumed_round_is_resolved_not_defer
         ],
     )
     counter = iter(range(1, 10))
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
@@ -18840,7 +18965,10 @@ def test_future_finding_cleared_in_the_first_resumed_round_is_resolved_not_defer
             runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -18852,8 +18980,8 @@ def test_future_finding_cleared_in_the_first_resumed_round_is_resolved_not_defer
         )
         return _watch_check_board("failing", failing=(failed,))
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "get_pr_checks", boards)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -18923,7 +19051,7 @@ def test_future_finding_cleared_by_subitem_completion_is_resolved_live_and_after
         ],
     )
     counter = iter(range(1, 10))
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
@@ -18931,7 +19059,10 @@ def test_future_finding_cleared_by_subitem_completion_is_resolved_live_and_after
             runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -18943,8 +19074,8 @@ def test_future_finding_cleared_by_subitem_completion_is_resolved_live_and_after
         )
         return _watch_check_board("failing", failing=(failed,))
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "get_pr_checks", boards)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -19045,7 +19176,7 @@ def test_compact_resume_cannot_reintroduce_a_deferred_finding_under_its_old_id(
         ],
     )
     counter = iter(range(1, 10))
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
@@ -19053,7 +19184,10 @@ def test_compact_resume_cannot_reintroduce_a_deferred_finding_under_its_old_id(
             runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -19065,8 +19199,8 @@ def test_compact_resume_cannot_reintroduce_a_deferred_finding_under_its_old_id(
         )
         return _watch_check_board("failing", failing=(failed,))
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "get_pr_checks", boards)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -19150,7 +19284,7 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
         claude_outputs=[structured_coder_followup(remaining_items=["item-1", "item-2"])] * 4,
     )
     heads = iter(["repaired-1", "repaired-1", "repaired-3", "repaired-4"])
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
@@ -19158,7 +19292,10 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
             runner.pr_payload["headRefOid"] = next(heads)
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
@@ -19175,8 +19312,8 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
             url=f"https://example.test/{failing}",
         ),))
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", boards)
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
+    monkeypatch.setattr(pr_loop, "get_pr_checks", boards)
+    monkeypatch.setattr(pr_loop, "watch_pr_checks", lambda *a, **k: CiWatchOutcome(
         status="passed", pr_checks=_watch_check_board("passing"),
         head_sha=runner.pr_payload["headRefOid"], attempts_used=1
     ))
@@ -19833,8 +19970,7 @@ def test_head_review_recovery_under_primary_then_panel_gates_the_panel_and_bound
     tmp_path, monkeypatch, source
 ):
     """Rows legacy-checkpoint-stranded / operator-flag-recovery: ordinary primary gate, no override."""
-    monkeypatch.setattr(
-        orchestrator, "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     if source == "legacy-checkpoint":
@@ -20037,11 +20173,11 @@ def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_t
         return ManagedCiOutcome(status="failed", checks=failed_checks, head_sha=head)
 
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
+        pr_loop, "activate_managed_ci", lambda *args, **kwargs: ManagedCiContract()
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *args, **kwargs: None)
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", watcher)
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", watcher)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
 
     # Round 1 (the final round): the watcher grants its one extension, then the
     # CI-repair coder pushes and is rejected.
@@ -20269,7 +20405,7 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
             "not_applicable_rationale": "Formatting-only change without any stateful path.",
         })
         na_identity = risk_test_matrix_identity(na_matrix)
-        plan_context = orchestrator.make_approved_plan_context(
+        plan_context = execution_policy.make_approved_plan_context(
             "Approved plan.\n\n" + render_risk_test_matrix_section(na_matrix),
             source_locator="test na plan",
             risk_test_matrix_contract_version=1,
@@ -20340,7 +20476,7 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
         git_head="predecessor-head",
     )
     coder_calls = []
-    real_validated_agent = orchestrator._run_validated_agent
+    real_validated_agent = validated_agent._run_validated_agent
 
     def fake_validated_agent(*args, **kwargs):
         if kwargs.get("role") == "coder":
@@ -20350,14 +20486,19 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", fake_validated_agent)
     monkeypatch.setattr(
-        orchestrator, "stable_tracked_tree_snapshot",
+        response_validation, "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head=head, tracked_digest="tree-current", complete=True, stable=True, status_clean=True,
         ),
     )
-    monkeypatch.setattr(orchestrator, "_read_assigned_workdir_head", lambda *_a, **_k: head)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, issue_loop,
+    ), "_read_assigned_workdir_head", lambda *_a, **_k: head)
 
     assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context) == 0
 
@@ -20402,7 +20543,7 @@ def test_run_pr_loop_followup_semantic_correction_keeps_original_gaps_and_fixes_
         "important_exclusions": ["Planned tests are not evidence."],
     })
     identity = risk_test_matrix_identity(matrix)
-    plan_context = orchestrator.make_approved_plan_context(
+    plan_context = execution_policy.make_approved_plan_context(
         "Approved plan.\n\n" + render_risk_test_matrix_section(matrix),
         source_locator="test two-row plan",
         risk_test_matrix_contract_version=1,
@@ -20465,7 +20606,7 @@ def test_run_pr_loop_followup_semantic_correction_keeps_original_gaps_and_fixes_
         pr_payload={"headRefOid": "predecessor-head"}, git_head="predecessor-head",
     )
     coder_calls = []
-    real_validated_agent = orchestrator._run_validated_agent
+    real_validated_agent = validated_agent._run_validated_agent
 
     def fake_validated_agent(*args, **kwargs):
         if kwargs.get("role") == "coder":
@@ -20476,7 +20617,7 @@ def test_run_pr_loop_followup_semantic_correction_keeps_original_gaps_and_fixes_
         return real_validated_agent(*args, **kwargs)
 
     corrections = []
-    real_run_agent_result = orchestrator.run_agent_result
+    real_run_agent_result = validated_agent.run_agent_result
 
     def fake_correction(*a, **kw):
         if kw.get("label") != "semantic-evidence-correction":
@@ -20484,15 +20625,22 @@ def test_run_pr_loop_followup_semantic_correction_keeps_original_gaps_and_fixes_
         corrections.append(1)
         return SimpleNamespace(text=corrected_text)
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", fake_validated_agent)
-    monkeypatch.setattr(orchestrator, "run_agent_result", fake_correction)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (
+        validated_agent, response_validation,
+    ), "run_agent_result", fake_correction)
     monkeypatch.setattr(
-        orchestrator, "stable_tracked_tree_snapshot",
+        response_validation, "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head=head, tracked_digest="tree-current", complete=True, stable=True, status_clean=True,
         ),
     )
-    monkeypatch.setattr(orchestrator, "_read_assigned_workdir_head", lambda *_a, **_k: head)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, issue_loop,
+    ), "_read_assigned_workdir_head", lambda *_a, **_k: head)
 
     assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context) == 0
 
@@ -20577,9 +20725,9 @@ def test_loop_excluded_failing_dispatch_creates_no_checks_blocking_item(tmp_path
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
         claude_outputs=[],
     )
-    monkeypatch.setattr(orchestrator, "get_pr_checks", lambda *a, **k: excluded_only)
+    monkeypatch.setattr(pr_loop, "get_pr_checks", lambda *a, **k: excluded_only)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *a, **k: CiWatchOutcome(
             status="passed", pr_checks=excluded_only, head_sha="abc123", attempts_used=1
@@ -20608,14 +20756,14 @@ def test_loop_failing_pull_request_check_creates_checks_blocking_item(tmp_path, 
     )
     _advance_head_after_coder(monkeypatch, runner)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "get_pr_checks",
         lambda *a, **k: failing_pr
         if runner.pr_payload["headRefOid"] == "abc123"
         else excluded_only,
     )
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "watch_pr_checks",
         lambda *a, **k: CiWatchOutcome(
             status="passed", pr_checks=excluded_only,
@@ -20718,7 +20866,7 @@ def _coder_prompts_1389(runner):
 
 def _advance_head_after_coder_1389(monkeypatch, runner, *, interrupt=None):
     """Advance the PR head after each coder turn; optionally interrupt a call."""
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
     counter = iter(range(1, 20))
     calls = {"coder": 0, "reviewer": 0}
 
@@ -20736,7 +20884,10 @@ def _advance_head_after_coder_1389(monkeypatch, runner, *, interrupt=None):
             runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
         return response
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", run)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", run)
     return Interrupted
 
 
@@ -21140,7 +21291,9 @@ def _run_1388_acknowledgement_round(tmp_path, monkeypatch, *, recorded_history):
             comments=comments, human_requirements=requirements,
         )
 
-    monkeypatch.setattr(orchestrator, "get_pr_review_context", review_context)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context", review_context)
     repairs = []
     real_repair = validated_agent_module._run_structured_repair
 
@@ -21796,7 +21949,7 @@ def _install_v2_dispatch_boundary(monkeypatch):
         lambda *_a, **_k: (discovered.append(1) and None) if len(discovered) == 0 else (555, 1),
     )
     monkeypatch.setattr(
-        orchestrator, "publish_manual_v2_qualification",
+        pr_loop, "publish_manual_v2_qualification",
         lambda *_a, **kwargs: kwargs["expected_head_sha"],
     )
     return contract
@@ -21834,7 +21987,7 @@ def _managed_guard_loop(
         from coding_review_agent_loop import validated_agent
         from coding_review_agent_loop.agents import antigravity as agy_mod
 
-        monkeypatch.setattr(orchestrator, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
+        monkeypatch.setattr(validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
         monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "agy-settings.json")
     contract = None
     if managed and mode in {"implicit", "explicit"}:
@@ -21843,14 +21996,14 @@ def _managed_guard_loop(
         contract = _install_v2_dispatch_boundary(monkeypatch)
     elif managed and mode == "revalidation-drop":
         contract = ManagedCiContract(adopted_existing_pr=True, base_ref="main")
-        monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: False)
-        monkeypatch.setattr(orchestrator, "release_adopted_managed_ci", lambda *_a, **_k: True)
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *_a, **_k: contract)
+        monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_a, **_k: False)
+        monkeypatch.setattr(pr_loop, "release_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *_a, **_k: contract)
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification",
+        pr_loop, "wait_for_final_qualification",
         lambda *_a, **_k: ManagedCiOutcome(status="passed", head_sha=runner.pr_payload["headRefOid"]),
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **_k: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *_a, **_k: None)
     explicit = (
         {"managed_ci": True, "managed_ci_trusted_actor": "agent-loop"}
         if mode in {"explicit", "v2"} else {}
@@ -22346,10 +22499,10 @@ def _failed_qualification_fix_loop(
         from coding_review_agent_loop import validated_agent
         from coding_review_agent_loop.agents import antigravity as agy_mod
 
-        monkeypatch.setattr(orchestrator, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
+        monkeypatch.setattr(validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
         monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "agy-settings.json")
     contract = ManagedCiContract()
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *_a, **_k: contract)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *_a, **_k: contract)
     failed_check = PullRequestCheck(
         name="final-ci/exact-head", kind="check_run", status="failure",
         url="https://github.com/OWNER/REPO/actions/runs/7001",
@@ -22361,8 +22514,8 @@ def _failed_qualification_fix_loop(
         ),
         ManagedCiOutcome(status="passed", head_sha="abc123-coder-1"),
     ])
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes))
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **_k: None)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes))
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *_a, **_k: None)
     rejected_calls = []
     real_rejected = pr_loop_module.publish_rejected_coder_turn_dispatch_audit
 
@@ -22557,7 +22710,7 @@ def _guarded_semantic_correction_loop(
         "important_exclusions": ["Planned tests are not evidence."],
     })
     identity = risk_test_matrix_identity(matrix)
-    plan_context = orchestrator.make_approved_plan_context(
+    plan_context = execution_policy.make_approved_plan_context(
         "Approved plan.\n\n" + render_risk_test_matrix_section(matrix),
         source_locator="test guarded correction plan",
         risk_test_matrix_contract_version=1,
@@ -22636,7 +22789,7 @@ def _guarded_semantic_correction_loop(
         git_head="predecessor-head",
     )
     coder_configs = []
-    real_validated_agent = orchestrator._run_validated_agent
+    real_validated_agent = validated_agent._run_validated_agent
 
     def fake_validated_agent(*args, **kwargs):
         if kwargs.get("role") == "coder":
@@ -22646,20 +22799,25 @@ def _guarded_semantic_correction_loop(
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", fake_validated_agent)
     monkeypatch.setattr(
-        orchestrator, "stable_tracked_tree_snapshot",
+        response_validation, "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head=head, tracked_digest="tree-current", complete=True, stable=True, status_clean=True,
         ),
     )
-    monkeypatch.setattr(orchestrator, "_read_assigned_workdir_head", lambda *_a, **_k: head)
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *_a, **_k: ManagedCiContract())
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, issue_loop,
+    ), "_read_assigned_workdir_head", lambda *_a, **_k: head)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *_a, **_k: ManagedCiContract())
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification",
+        pr_loop, "wait_for_final_qualification",
         lambda *_a, **_k: ManagedCiOutcome(status="passed", head_sha=runner.pr_payload["headRefOid"]),
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **_k: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *_a, **_k: None)
     if correction == "raise":
         with pytest.raises(CheckoutVerificationError):
             run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context)
@@ -23214,7 +23372,7 @@ def _set_persist_approval(runner, head, identity):
 
 
 def _set_qualify(runner, config):
-    context, _requirements, _plan, fresh_config = orchestrator._fresh_pr_qualification_snapshot(
+    context, _requirements, _plan, fresh_config = pr_loop_support._fresh_pr_qualification_snapshot(
         runner, config=config, pr_number=77, issue_context=None, parent_issue_context=None,
     )
     return context, fresh_config
