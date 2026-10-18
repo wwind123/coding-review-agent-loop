@@ -11,7 +11,7 @@ import hashlib
 import shlex
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import replace as dataclasses_replace
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
@@ -68,6 +68,7 @@ from .pr_board_state import (
 )
 from .round_state import (
     canonical_deferred_history_items,
+    drop_inert_post_reconciliation_checkpoints,
     reset_pr_board_stamp,
     set_pr_board_stamp,
 )
@@ -512,6 +513,106 @@ PR_SCHEDULING_DIAGNOSTIC_TEMPLATE = "PR review scheduling diagnostic ({label}): 
 def render_pr_scheduling_diagnostic(label: str, message: str) -> str:
     """The exact body ``stop_pre_panel`` posts."""
     return PR_SCHEDULING_DIAGNOSTIC_TEMPLATE.format(label=label, message=message)
+
+
+def _classify_pr_reviewer_prelaunch(
+    reviewer_name: str,
+    *,
+    unavailable: bool,
+    resumed: bool,
+    selective_policy: bool,
+    selected_reviewer_names: Collection[str],
+    prior_approval: PostedRoundRecord | None,
+    full_board_pass: bool,
+    round_number: int,
+    human_requirements: Sequence[object],
+) -> str:
+    """Pure pre-launch classification: ``skip``, ``resumed``, ``carried`` or ``turn``.
+
+    Shared by the launch path and the closed-round gate (#1553) so the two
+    can never disagree about whether a reviewer needs a fresh turn.
+    """
+    if unavailable:
+        return "skip"
+    if resumed:
+        return "resumed"
+    if selective_policy and reviewer_name not in selected_reviewer_names:
+        return "skip"
+    if (
+        not full_board_pass
+        and prior_approval is not None
+        and prior_approval.metadata.round_number < round_number
+        and (
+            not human_requirements
+            or (
+                human_requirements_resolved(prior_approval.body)
+                and _reviewer_requirement_coverage_matches(
+                    human_requirements,
+                    prior_approval.metadata.surfaced_reviewer_requirement_ids,
+                )
+            )
+        )
+    ):
+        return "carried"
+    return "turn"
+
+
+def _settle_pr_round_ledger(
+    prior_items: Sequence[UnresolvedReviewItem],
+    dispositions_by_item: dict[str, list[ReviewItemDisposition]],
+    round_new_items: Sequence[UnresolvedReviewItem],
+    *,
+    compact: bool,
+    reconciliation_mode: str,
+    ledger_view: Callable[[Sequence[UnresolvedReviewItem]], Sequence[UnresolvedReviewItem]],
+    **evidence_kwargs: object,
+) -> tuple[list[UnresolvedReviewItem], list[UnresolvedReviewItem]]:
+    """The PR round-end ledger settlement, shared with closed-round rollover (#1553).
+
+    Returns the settled ledger and the carried items that left it as future
+    follow-ups (only in compact context, where they are publication-only).
+    Inert converted findings and tombstones keep their identities.
+    """
+    if compact:
+        settled, future_from_prior_items = _apply_unresolved_item_dispositions(
+            ledger_view(prior_items),
+            dispositions_by_item,
+            retain_future=False,
+            reconciliation_mode=reconciliation_mode,
+            **evidence_kwargs,
+        )
+    else:
+        settled, _future_items = _apply_unresolved_item_dispositions(
+            ledger_view(prior_items),
+            dispositions_by_item,
+            reconciliation_mode=reconciliation_mode,
+            **evidence_kwargs,
+        )
+        future_from_prior_items = []
+    return list(ledger_view([*settled, *round_new_items])), future_from_prior_items
+
+
+def _reconciliation_dispositions_by_item(
+    reconciliation: PostedRoundMetadata,
+) -> dict[str, list[ReviewItemDisposition]]:
+    """Round dispositions keyed by carried item, as the round end built them.
+
+    A disposition naming an item the reconciliation did not carry cannot be
+    replayed faithfully, so it refuses instead of silently losing ledger state.
+    """
+    by_item: dict[str, list[ReviewItemDisposition]] = {
+        item.item_id: [] for item in reconciliation.prior_items
+    }
+    for disposition in reconciliation.dispositions:
+        if disposition.item_id not in by_item:
+            raise AgentLoopError(
+                f"PR round {reconciliation.round_number} reconciliation at "
+                f"{reconciliation.subject} records a disposition for {disposition.item_id}, "
+                "which its carried ledger does not hold; refusing to settle the closed "
+                "round. No agent was invoked."
+            )
+        by_item[disposition.item_id].append(disposition)
+    return by_item
 
 
 def _managed_v1_dispatch_records(managed_ci) -> tuple:
@@ -2596,7 +2697,9 @@ def run_pr_loop(
                         plan_handoff_board, board_change, board_change_id,
                     ),
                 )
-        for record in startup_records:
+        # A checkpoint posted into an already reconciled round is inert for
+        # every scheduler reader (#1553).
+        for record in drop_inert_post_reconciliation_checkpoints(startup_records):
             if record.metadata.scheduler_force_full:
                 if record.metadata.scheduler_force_full_source == "operator":
                     scheduler_operator_force_full = True
@@ -2733,6 +2836,8 @@ def run_pr_loop(
                 recovery_round_budget=None,
                 head_review_recovery=None,
                 head_review_recovery_post_required=False,
+                # The re-entry keeps its own round rule; it is never closed.
+                reconciliation_record=None,
             )
             pr_board_carried = True
             log(
@@ -3739,10 +3844,16 @@ def run_pr_loop(
             # reviewer records, so premature secondary work cannot count.
             panel_evidence: PrPanelEvidence | None = None
             superseded_prepanel_reviews: dict[str, PostedRoundRecord] = {}
+            # Completed reviews of the resumed round recorded before any
+            # qualified panel opening (#840); their recovery keeps its own
+            # same-round route and is never rolled over (#1553).
+            prepanel_unqualified_reviews: set[str] = set()
             if scheduler_capabilities.requires_primary:
                 panel_history_error: AgentLoopError | None = None
                 try:
-                    panel_history = _extract_round_metadata_records(pr_comments, flow="pr")
+                    panel_history = drop_inert_post_reconciliation_checkpoints(
+                        _extract_round_metadata_records(pr_comments, flow="pr")
+                    )
                 except AgentLoopError as exc:
                     panel_history = None
                     panel_history_error = exc
@@ -3786,6 +3897,7 @@ def run_pr_loop(
                     # Not resumed, not a summary, not an approval, never early
                     # published: the reviewer needs a fresh post-opening turn.
                     resumed_by_name.pop(resumed_name, None)
+                    prepanel_unqualified_reviews.add(resumed_name)
                     if (
                         resumed_candidate.metadata.state == "approved"
                         and not resumed_candidate.metadata.new_items
@@ -4066,6 +4178,44 @@ def run_pr_loop(
 
             pr_spool_preflight_done = [False]
 
+            def _pr_reviewer_prelaunch_kind(reviewer: AgentName) -> str:
+                # Pure classification, no agent calls: mirrors the resumed/
+                # carried-approval branching below so the pre-round parallel
+                # launch list matches what the per-reviewer loop would decide.
+                # Read at call time, after the board for this round is chosen.
+                reviewer_name = agent_display_name(reviewer)
+                return _classify_pr_reviewer_prelaunch(
+                    reviewer_name,
+                    unavailable=reviewer in unavailable_reviewer_failures,
+                    resumed=resumed_by_name.get(reviewer_name) is not None,
+                    selective_policy=selective_policy,
+                    selected_reviewer_names=selected_reviewer_names,
+                    prior_approval=unchanged_head_approvals.get(reviewer_name),
+                    full_board_pass=full_board_pass,
+                    round_number=round_number,
+                    human_requirements=human_requirements,
+                )
+
+            # A reconciled round is closed (#1553): it never receives another
+            # scheduling or reviewer record.  Recovery, qualification,
+            # evidence, conflict, evidence-pass and conversion resumes keep
+            # their own routes; a board-change re-entry is never closed.
+            closed_round_gate = bool(
+                current_resume is not None
+                and current_resume.reconciliation_record is not None
+                and not skip_reviewers_for_recovery
+                and not conflict_pending
+                and evidence_pass is None
+                and not conversion_pass
+                and not prepanel_unqualified_reviews
+            )
+            closed_round_rollover_reason: str | None = None
+            closed_round_pre_scheduler = (
+                final_sweep_pending,
+                scheduler_calls_avoided,
+                tuple(pending_automatic_fallback_reasons),
+            )
+
             def _pr_spool_preflight(selected_names: set[str]) -> None:
                 """Check every spool record before any checkpoint or reviewer launch (#1258)."""
                 if (
@@ -4097,7 +4247,9 @@ def run_pr_loop(
             metadata_recovery_reasons: list[str] = []
             if selective_policy:
                 try:
-                    historical_records = _extract_round_metadata_records(pr_comments, flow="pr")
+                    historical_records = drop_inert_post_reconciliation_checkpoints(
+                        _extract_round_metadata_records(pr_comments, flow="pr")
+                    )
                 except AgentLoopError:
                     historical_records = ()
                     scheduler_metadata_recovery_full_board = True
@@ -4496,25 +4648,24 @@ def run_pr_loop(
                     f"{', '.join(scheduler_decision.active_owners) or 'none'}"
                     + (f"; {pr_amendment_note}" if pr_amendment_note else ""),
                 )
-                # The amendment's activation round always persists a fresh
-                # digest-bound scheduler decision (#943), even when every
-                # remaining reviewer's review is reused and nobody is invoked.
-                _pr_spool_preflight(selected_reviewer_names)
                 amendment_checkpoint_due = bool(
                     pr_amendment_checkpoint_pending
                     and pr_contract_lineage.active_amendment is not None
                     and round_number == pr_contract_lineage.active_amendment.effective_from_round
                 )
-                if (
-                    (scheduler_decision.selected_reviewers or amendment_checkpoint_due)
-                    and not skip_reviewers_for_recovery
-                    and not conflict_pending
-                    # An evidence pass writes only its reviewer records and
-                    # one terminal record, so an interrupted pass is ignorable.
-                    and evidence_pass is None
+                if closed_round_gate and any(
+                    _pr_reviewer_prelaunch_kind(reviewer) == "turn"
+                    for reviewer in configured_reviewers
                 ):
-                    pr_amendment_checkpoint_pending = False
-                    pr_posted_checkpoint = bound_pr_metadata(
+                    closed_round_rollover_reason = scheduler_decision.reason
+
+                def post_scheduler_checkpoint(
+                    *,
+                    selected: tuple[str, ...],
+                    paused: tuple[tuple[str, str], ...],
+                    reason: str,
+                ) -> PostedRoundMetadata:
+                    checkpoint = bound_pr_metadata(
                         flow="pr", role="summary", agent="Orchestrator",
                         round_number=round_number, subject=current_pr_subject,
                         prior_items=prior_unresolved_items, phase="scheduler-prelaunch",
@@ -4525,9 +4676,9 @@ def run_pr_loop(
                         scheduler_obligation_digest=hashlib.sha256(
                             repr(_prior_item_ledger_signature(prior_unresolved_items)).encode("utf-8")
                         ).hexdigest()[:16],
-                        scheduler_selected_reviewers=scheduler_decision.selected_reviewers,
-                        scheduler_paused_reviewers=scheduler_decision.paused_reviewers,
-                        scheduler_reasons=(scheduler_decision.reason, classification.reason),
+                        scheduler_selected_reviewers=selected,
+                        scheduler_paused_reviewers=paused,
+                        scheduler_reasons=(reason, classification.reason),
                         scheduler_final_sweep=final_sweep,
                         scheduler_force_full=scheduler_recorded_force_full,
                         scheduler_force_full_source=scheduler_recorded_force_full_source,
@@ -4546,9 +4697,9 @@ def run_pr_loop(
                         config=config,
                         pr_number=pr_number,
                         body=_attach_round_metadata(
-                            f"PR review scheduling audit: selected {', '.join(scheduler_decision.selected_reviewers) or 'none'}; "
-                            f"paused {', '.join(name for name, _reason in scheduler_decision.paused_reviewers) or 'none'}; "
-                            f"reason: {scheduler_decision.reason}; phase: {scheduler_decision.phase}; "
+                            f"PR review scheduling audit: selected {', '.join(selected) or 'none'}; "
+                            f"paused {', '.join(name for name, _reason in paused) or 'none'}; "
+                            f"reason: {reason}; phase: {scheduler_decision.phase}; "
                             f"head: {current_pr_subject}; primary: "
                             f"{scheduler_contract.primary_reviewer or '(none)'}; active owners: "
                             f"{', '.join(scheduler_decision.active_owners) or '(none)'}; "
@@ -4557,9 +4708,51 @@ def run_pr_loop(
                             "scheduler-policy calls avoided cumulatively: "
                             f"{scheduler_calls_avoided}.{superseded_audit_text}"
                             + (f" {pr_amendment_note}" if pr_amendment_note else ""),
-                            pr_posted_checkpoint,
+                            checkpoint,
                         ),
                     )
+                    return checkpoint
+
+                if closed_round_rollover_reason is not None:
+                    if amendment_checkpoint_due:
+                        # The amendment is used at its effective round by a
+                        # digest-bound activation-only record that selects
+                        # nobody; the fresh turns open the next round (#1553).
+                        pr_amendment_checkpoint_pending = False
+                        activation_reason = (
+                            "amendment activation only; reconciled round closed, fresh "
+                            f"reviewer turns open round {round_number + 1}"
+                        )
+                        post_scheduler_checkpoint(
+                            selected=(),
+                            paused=tuple(
+                                (name, activation_reason)
+                                for name in scheduler_contract.required_reviewers
+                            ),
+                            reason=activation_reason,
+                        )
+                else:
+                    # The amendment's activation round always persists a fresh
+                    # digest-bound scheduler decision (#943), even when every
+                    # remaining reviewer's review is reused and nobody is
+                    # invoked.  That activation is the only record a closed
+                    # round may still receive (#1553).
+                    _pr_spool_preflight(selected_reviewer_names)
+                    if (
+                        (scheduler_decision.selected_reviewers or amendment_checkpoint_due)
+                        and not skip_reviewers_for_recovery
+                        and not conflict_pending
+                        # An evidence pass writes only its reviewer records and
+                        # one terminal record, so an interrupted pass is ignorable.
+                        and evidence_pass is None
+                        and (not closed_round_gate or amendment_checkpoint_due)
+                    ):
+                        pr_amendment_checkpoint_pending = False
+                        pr_posted_checkpoint = post_scheduler_checkpoint(
+                            selected=scheduler_decision.selected_reviewers,
+                            paused=scheduler_decision.paused_reviewers,
+                            reason=scheduler_decision.reason,
+                        )
             else:
                 scheduler_previous_sha = None
                 scheduler_decision = None
@@ -4568,7 +4761,81 @@ def run_pr_loop(
                 final_sweep = False
                 scheduler_recorded_force_full, scheduler_recorded_force_full_source = False, None
                 superseded_audit_text = ""
-                _pr_spool_preflight(selected_reviewer_names)
+                if closed_round_gate and any(
+                    _pr_reviewer_prelaunch_kind(reviewer) == "turn"
+                    for reviewer in configured_reviewers
+                ):
+                    closed_round_rollover_reason = "fresh full-board reviewer turns are needed"
+                else:
+                    _pr_spool_preflight(selected_reviewer_names)
+            if closed_round_rollover_reason is not None:
+                # Closed-round rollover (#1553): settle round N's ledger from its
+                # own reconciliation record through the ordinary round-end
+                # settlement, then let round N+1 schedule the fresh turns.
+                assert current_resume is not None
+                assert current_resume.reconciliation_record is not None
+                closed_reconciliation = current_resume.reconciliation_record.metadata
+                closed_clearances: list[tuple[str, str]] = []
+                unresolved_items, closed_future_items = _settle_pr_round_ledger(
+                    closed_reconciliation.prior_items,
+                    _reconciliation_dispositions_by_item(closed_reconciliation),
+                    closed_reconciliation.new_items,
+                    compact=use_compact_pr_context,
+                    reconciliation_mode=pr_reconciliation_mode,
+                    ledger_view=pr_ledger_view,
+                    evidence_response_head=None,
+                    configured_reviewers=tuple(
+                        agent_display_name(reviewer) for reviewer in configured_reviewers
+                    ),
+                    evidence_clearances=closed_clearances,
+                    round_number=round_number,
+                    cleared_items_progress=[],
+                    sub_item_degradations=[],
+                )
+                for item in closed_reconciliation.prior_items:
+                    pending_future_items.pop(item.item_id, None)
+                for item in closed_future_items:
+                    pending_future_items[item.item_id] = item
+                for item in unresolved_items:
+                    pending_future_items.pop(item.item_id, None)
+                evidence_clearances.extend(
+                    clearance for clearance in closed_clearances
+                    if clearance not in evidence_clearances
+                )
+                # Item IDs are never reused: the walk's global high-water mark.
+                next_unresolved_item_number = max(
+                    next_unresolved_item_number,
+                    current_resume.next_unresolved_item_number,
+                )
+                for review in current_resume.completed_reviews:
+                    for request_text in review.metadata.evidence_requests:
+                        unresolved_items, consumed_item_number = _upsert_evidence_obligation(
+                            unresolved_items,
+                            item_number=next_unresolved_item_number,
+                            reviewer=review.metadata.agent,
+                            text=request_text,
+                            source_round=review.metadata.round_number,
+                            current_head_sha=review.metadata.subject,
+                            clearances=evidence_clearances,
+                        )
+                        if consumed_item_number:
+                            next_unresolved_item_number += 1
+                # Round N+1 schedules from the same inputs: undo this
+                # decision's consumption of the one-shot scheduler state.
+                (
+                    final_sweep_pending,
+                    scheduler_calls_avoided,
+                    restored_fallback_reasons,
+                ) = closed_round_pre_scheduler
+                pending_automatic_fallback_reasons[:] = list(restored_fallback_reasons)
+                resumed_round = None
+                current_resume = None
+                log(
+                    config,
+                    f"PR #{pr_number}: round {round_number} is reconciled; scheduling "
+                    f"decision {closed_round_rollover_reason} opens round {round_number + 1}",
+                )
+                continue
             skip_reviewers_this_round = skip_reviewers_for_recovery or conflict_pending
 
             pr_fatal_errors: list[tuple[str, AgentLoopError]] = []
@@ -4681,36 +4948,6 @@ def run_pr_loop(
                     ),
                 )
 
-            def _pr_reviewer_prelaunch_kind(reviewer: AgentName) -> str:
-                # Pure classification, no agent calls: mirrors the resumed/
-                # carried-approval branching below so the pre-round parallel
-                # launch list matches what the per-reviewer loop would decide.
-                reviewer_name = agent_display_name(reviewer)
-                if reviewer in unavailable_reviewer_failures:
-                    return "skip"
-                if resumed_by_name.get(reviewer_name) is not None:
-                    return "resumed"
-                if selective_policy and reviewer_name not in selected_reviewer_names:
-                    return "skip"
-                prior_approval = unchanged_head_approvals.get(reviewer_name)
-                if (
-                    not full_board_pass
-                    and prior_approval is not None
-                    and prior_approval.metadata.round_number < round_number
-                    and (
-                        not human_requirements
-                        or (
-                            human_requirements_resolved(prior_approval.body)
-                            and _reviewer_requirement_coverage_matches(
-                                human_requirements,
-                                prior_approval.metadata.surfaced_reviewer_requirement_ids,
-                            )
-                        )
-                    )
-                ):
-                    return "carried"
-                return "turn"
-
             reviewer_fresh_contexts = {
                 reviewer: _returning_reviewer_context(
                     runner,
@@ -4748,7 +4985,7 @@ def run_pr_loop(
             if selective_policy and scheduler_decision is not None:
                 def _derive_pr_visibility_evidence(records: Sequence[PostedRoundRecord]) -> PrPanelEvidence:
                     return _derive_pr_panel_evidence(
-                        records,
+                        drop_inert_post_reconciliation_checkpoints(records),
                         primary_reviewer=scheduler_contract.primary_reviewer,
                         required_reviewers=scheduler_contract.required_reviewers,
                     )
@@ -4803,6 +5040,9 @@ def run_pr_loop(
                     base_length=len(pr_comments),
                     checkpoint=pr_posted_checkpoint,
                 )
+                pr_visibility_records = drop_inert_post_reconciliation_checkpoints(
+                    pr_visibility_records
+                )
                 pr_visibility_evidence = (
                     _derive_pr_visibility_evidence(pr_visibility_records)
                     if scheduler_capabilities.requires_primary else None
@@ -4839,7 +5079,9 @@ def run_pr_loop(
                 if not scheduler_capabilities.requires_primary:
                     return None
                 evidence = _derive_pr_panel_evidence(
-                    _extract_round_metadata_records(remaining, flow="pr"),
+                    drop_inert_post_reconciliation_checkpoints(
+                        _extract_round_metadata_records(remaining, flow="pr")
+                    ),
                     primary_reviewer=scheduler_contract.primary_reviewer,
                     required_reviewers=scheduler_contract.required_reviewers,
                 )
@@ -4880,6 +5122,14 @@ def run_pr_loop(
                     fingerprint=_pr_recovery_fingerprint,
                 )
 
+            if closed_round_gate and any(
+                _pr_reviewer_prelaunch_kind(reviewer) == "turn" for reviewer in configured_reviewers
+            ):
+                raise AgentLoopError(
+                    f"PR #{pr_number}: closed-round invariant violated: reconciled round "
+                    f"{round_number} would launch a fresh reviewer turn. Nothing was posted "
+                    "into the closed round; rerun after reporting this defect."
+                )
             if not pr_round_parallel and not skip_reviewers_this_round and evidence_pass is None:
                 _refuse_partial_round_before_sequential_turns(
                     spool=pr_round_spool,
@@ -5763,18 +6013,16 @@ def run_pr_loop(
                 "cleared_items_progress": round_cleared_sub_items,
                 "sub_item_degradations": round_sub_item_notes,
             }
+            unresolved_items, future_from_prior_items = _settle_pr_round_ledger(
+                prior_unresolved_items,
+                prior_dispositions,
+                round_new_unresolved_items,
+                compact=use_compact_pr_context,
+                reconciliation_mode=pr_reconciliation_mode,
+                ledger_view=pr_ledger_view,
+                **evidence_reconciliation_kwargs,
+            )
             if use_compact_pr_context:
-                unresolved_items, future_from_prior_items = _apply_unresolved_item_dispositions(
-                    pr_ledger_view(prior_unresolved_items),
-                    prior_dispositions,
-                    retain_future=False,
-                    reconciliation_mode=(
-                        "owner-scoped"
-                        if scheduler_capabilities.owner_scoped_reconciliation
-                        else "aggregate"
-                    ),
-                    **evidence_reconciliation_kwargs,
-                )
                 pr_compact_prior_summaries = list(
                     bound_compact_prior_summaries(
                         [
@@ -5787,21 +6035,6 @@ def run_pr_loop(
                         ]
                     )
                 )
-            else:
-                unresolved_items, _future_items = _apply_unresolved_item_dispositions(
-                    pr_ledger_view(prior_unresolved_items),
-                    prior_dispositions,
-                    reconciliation_mode=(
-                        "owner-scoped"
-                        if scheduler_capabilities.owner_scoped_reconciliation
-                        else "aggregate"
-                    ),
-                    **evidence_reconciliation_kwargs,
-                )
-                future_from_prior_items = []
-            unresolved_items = list(
-                pr_ledger_view([*unresolved_items, *round_new_unresolved_items])
-            )
             # The carried ledger was authoritative for its items this round, so
             # a resolved or re-promoted item leaves the pending set; only an
             # item that left the ledger as `future` is held for publication.

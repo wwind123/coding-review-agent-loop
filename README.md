@@ -1224,7 +1224,9 @@ Reviewer board amendment:
   managed CI) one plain completion comment on the PR note that the run
   finished on a reduced board. The activation round always posts a fresh
   scheduler checkpoint carrying the amended board and digest, even when every
-  remaining reviewer's review is reused.
+  remaining reviewer's review is reused. When the activation round was already
+  reconciled and a reviewer now needs a fresh turn, that checkpoint selects
+  nobody and the fresh turns open the next round.
 - Unsigned or malformed records are ignored with a logged diagnostic. A comment
   that contains only the record is not treated as a signed human requirement.
   All-reviewers PR runs and the non-staged plan path persist no contract, so

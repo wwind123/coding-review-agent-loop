@@ -1884,3 +1884,124 @@ def test_planning_checkpoint_mode_round_trips_and_tolerates_unknown_values(tmp_p
     assert legacy.scheduler_execution_mode is None
     assert legacy.scheduler_metadata_status == "valid"
     assert "scheduler_execution_mode" not in decode_mapping(_encode_round_metadata(legacy))
+
+
+# --- #1553: a reconciled PR round is closed --------------------------------------------
+
+
+def _closed_round_history(*, stray_prior_items=(), stray=True, reopen=False):
+    """Round 2 reconciled with two reviewer records, then a stray round-2 checkpoint."""
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+
+    finding = UnresolvedReviewItem(
+        item_id="item-1", reviewer="Gemini", source_round=2, text="Guard the race.",
+        status="blocking",
+    )
+
+    def summary(round_number, phase, prior_items=(), **extra):
+        return PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
+            subject="head", prior_items=tuple(prior_items), phase=phase, **extra,
+        )
+
+    history = [
+        summary(1, "scheduler-prelaunch"),
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=1, subject="head",
+            state="approved", phase="publication",
+        ),
+        summary(1, "reconciliation"),
+        summary(2, "scheduler-prelaunch"),
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Codex", round_number=2, subject="head",
+            state="approved", phase="publication",
+        ),
+        PostedRoundMetadata(
+            flow="pr", role="reviewer", agent="Gemini", round_number=2, subject="head",
+            state="blocking", phase="publication",
+        ),
+        summary(2, "reconciliation", new_items=(finding,)),
+    ]
+    if reopen:
+        history.append(summary(2, "evidence-conversion"))
+    if stray:
+        history.append(summary(2, "scheduler-prelaunch", prior_items=stray_prior_items))
+    return history, finding
+
+
+def test_1553_post_reconciliation_checkpoint_indexes():
+    """Row stray-checkpoint-recovery (round_state unit): only closed-round checkpoints."""
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
+        drop_inert_post_reconciliation_checkpoints,
+        inert_post_reconciliation_checkpoint_indexes,
+    )
+
+    history, _finding = _closed_round_history()
+    records = _extract_round_metadata_records(_comments(*history), flow="pr")
+    # Round 2's own opening checkpoint (index 3) stays; the stray (index 7) is inert.
+    assert inert_post_reconciliation_checkpoint_indexes(records) == frozenset({7})
+    assert [record.index for record in drop_inert_post_reconciliation_checkpoints(records)] == [
+        0, 1, 2, 3, 4, 5, 6,
+    ]
+    # A conversion repeat reopens the round: its checkpoint is not inert.
+    reopened, _finding = _closed_round_history(reopen=True)
+    records = _extract_round_metadata_records(_comments(*reopened), flow="pr")
+    assert inert_post_reconciliation_checkpoint_indexes(records) == frozenset()
+
+
+def test_1553_stray_checkpoint_does_not_change_visibility_or_panel_evidence():
+    """Row stray-checkpoint-recovery: panel opening and checkpoint index are unchanged."""
+    from coding_review_agent_loop.panel_evidence import _derive_pr_panel_evidence
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
+        drop_inert_post_reconciliation_checkpoints,
+    )
+    from coding_review_agent_loop.round_visibility import latest_round_checkpoint_index
+
+    without, _finding = _closed_round_history(stray=False)
+    with_stray, _finding = _closed_round_history()
+    base = _extract_round_metadata_records(_comments(*without), flow="pr")
+    filtered = drop_inert_post_reconciliation_checkpoints(
+        _extract_round_metadata_records(_comments(*with_stray), flow="pr")
+    )
+    assert latest_round_checkpoint_index(
+        filtered, flow="pr", round_number=2, subject="head"
+    ) == latest_round_checkpoint_index(base, flow="pr", round_number=2, subject="head") == 3
+    kwargs = dict(primary_reviewer="Codex", required_reviewers=("Codex", "Gemini"))
+    assert _derive_pr_panel_evidence(filtered, **kwargs) == _derive_pr_panel_evidence(base, **kwargs)
+
+
+@pytest.mark.parametrize("ledger_differs", [False, True])
+def test_1553_resume_anchors_on_the_reconciled_transcript(ledger_differs):
+    """Rows activation-latest-ledger-differs / existing-activation-checkpoint-kept (unit)."""
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+    from coding_review_agent_loop.round_state import _resume_pr_round
+
+    ack = UnresolvedReviewItem(
+        item_id="human-requirements-ack", reviewer="Human requirements", source_round=2,
+        text="Acknowledge the signed requirements.", status="blocking",
+    )
+    history, finding = _closed_round_history(stray_prior_items=(ack,) if ledger_differs else ())
+    resumed = _resume_pr_round(
+        _comments(*history), head_sha="head", configured_reviewers=("codex", "gemini"),
+    )
+    assert resumed is not None
+    assert resumed.round_number == 2 and resumed.reconciled
+    assert [record.metadata.agent for record in resumed.completed_reviews] == ["Codex", "Gemini"]
+    assert resumed.reconciliation_record is not None
+    assert resumed.reconciliation_record.index == 6
+    assert resumed.reconciliation_record.metadata.new_items == (finding,)
+    # Item IDs are never reused after rollover.
+    assert resumed.next_unresolved_item_number == 2
+
+
+def test_1553_unreconciled_round_has_no_reconciliation_record():
+    from coding_review_agent_loop.round_state import _resume_pr_round
+
+    history, _finding = _closed_round_history(stray=False)
+    resumed = _resume_pr_round(
+        _comments(*history[:-1]), head_sha="head", configured_reviewers=("codex", "gemini"),
+    )
+    assert resumed is not None and not resumed.reconciled
+    assert resumed.reconciliation_record is None

@@ -906,6 +906,12 @@ class ResumedReviewRound:
     head_review_recovery_post_required: bool = False
     # Rejection reasons carried into the next coder-dispatch record (bounded).
     carried_rejection_reasons: tuple[str, ...] = ()
+    # The anchor round's own reconciliation-phase summary (#1553).  Set only
+    # by the ordinary transcript resume, never by a qualification-checkpoint,
+    # evidence-boundary, conversion or recovery anchor.  It closes the round:
+    # a later decision that needs fresh reviewer turns opens the next round,
+    # with the ledger settled from this record.
+    reconciliation_record: PostedRoundRecord | None = None
 
 
 PLAN_VALIDATION_DIAGNOSTIC_SUFFIX = "[diagnostic truncated]"
@@ -4245,6 +4251,61 @@ PR_PRE_RECONCILIATION_PHASES = frozenset(
 )
 
 
+# Records that reopen a reconciled PR round at the same head and round number:
+# the conversion repeat (#1325) and a head-review recovery handoff.  A
+# scheduler checkpoint after one of them belongs to the reopened round.
+_PR_ROUND_REOPENING_PHASES = frozenset({EVIDENCE_CONVERSION_PHASE, HEAD_REVIEW_RECOVERY_PHASE})
+
+
+def inert_post_reconciliation_checkpoint_indexes(
+    records: Sequence[PostedRoundRecord],
+) -> frozenset[int]:
+    """Indexes of PR scheduler checkpoints posted into an already closed round (#1553).
+
+    A PR round is closed by its reconciliation-phase summary.  A later
+    ``scheduler-prelaunch`` summary with the same round number and subject
+    (a stray checkpoint written by an older tool version, or a signed
+    board-amendment activation) is inert for resume anchor selection and for
+    every scheduler reader.  Only the amendment-lineage reader, which reads
+    the comments itself, still sees it.  Nothing is deleted.
+    """
+    closed: set[tuple[int, str]] = set()
+    inert: set[int] = set()
+    for record in sorted(records, key=lambda item: item.index):
+        metadata = record.metadata
+        key = (metadata.round_number, metadata.subject)
+        if metadata.role == "summary" and metadata.phase == "reconciliation":
+            closed.add(key)
+        elif metadata.phase in _PR_ROUND_REOPENING_PHASES:
+            closed.discard(key)
+        elif (
+            metadata.role == "summary"
+            and metadata.phase == "scheduler-prelaunch"
+            and key in closed
+        ):
+            inert.add(record.index)
+    return frozenset(inert)
+
+
+def _is_inert_post_reconciliation_checkpoint(
+    record: PostedRoundRecord, inert_indexes: frozenset[int]
+) -> bool:
+    return record.index in inert_indexes
+
+
+def drop_inert_post_reconciliation_checkpoints(
+    records: Sequence[PostedRoundRecord],
+) -> tuple[PostedRoundRecord, ...]:
+    """``records`` without the inert post-reconciliation checkpoints (#1553)."""
+    inert = inert_post_reconciliation_checkpoint_indexes(records)
+    if not inert:
+        return tuple(records)
+    return tuple(
+        record for record in records
+        if not _is_inert_post_reconciliation_checkpoint(record, inert)
+    )
+
+
 def _pr_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
     """True when the PR round holds an actual reconciliation summary.
 
@@ -5904,6 +5965,9 @@ def _resume_pr_round_from_records(
     handoff = _live_recovery_handoff(walk_records, head_sha, head_moved=False)
     if handoff is not None:
         return _consume_recovery_handoff(walk_records, handoff, head_moved=False)
+    # A checkpoint posted into a closed round never anchors the resume, so a
+    # later ledger cannot displace the reconciled transcript (#1553).
+    records = drop_inert_post_reconciliation_checkpoints(records)
     current_head_records = [record for record in records if record.metadata.subject == head_sha]
     if current_head_records and current_head_records[-1].metadata.phase in EVIDENCE_TERMINAL_PHASES:
         # The latest current-head record is the single freeze or release
@@ -6010,7 +6074,17 @@ def _resume_pr_round_from_records(
         None,
     )
     reviewer_records: dict[str, PostedRoundRecord] = {}
+    reconciliation_record: PostedRoundRecord | None = None
     configured_reviewer_names = {agent_display_name(agent) for agent in configured_reviewers}
+    for record in current_round_records:
+        metadata = record.metadata
+        if (
+            metadata.role == "summary"
+            and metadata.phase == "reconciliation"
+            and metadata.round_number == anchor_metadata.round_number
+            and metadata.subject == head_sha
+        ):
+            reconciliation_record = record
     for record in current_round_records:
         metadata = record.metadata
         if metadata.role != "reviewer" or metadata.agent not in configured_reviewer_names:
@@ -6025,6 +6099,7 @@ def _resume_pr_round_from_records(
         # the summary-only record as an incomplete review transcript.
         anchor_metadata = checkpoint_record.metadata
         current_round_records = (checkpoint_record,)
+        reconciliation_record = None
     prior_items = anchor_metadata.prior_items
     round_number = anchor_metadata.round_number
     ledger_may_be_incomplete = (
@@ -6086,6 +6161,7 @@ def _resume_pr_round_from_records(
             if review_handoff is not None
             else None
         ),
+        reconciliation_record=reconciliation_record,
     )
 
 

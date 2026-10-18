@@ -614,9 +614,11 @@ def test_unchanged_plain_board_with_missing_reviewer_outcome_posts_nothing(tmp_p
     config = make_config(tmp_path, reviewer=("codex", "gemini"))
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert _links(runner) == []
-    # The round is never advanced for an unchanged board.
+    # The round is never advanced for an unchanged board.  A reconciled round
+    # is closed, though (#1553): the missing reviewer's turn opens round 3.
+    expected_round = 3 if missing == "unavailable-summary" else 2
     new = [r.metadata for r in _records(runner) if r.metadata.pr_board_root is not None]
-    assert new and all(m.round_number == 2 for m in new)
+    assert new and all(m.round_number == expected_round for m in new)
 
 
 def test_historical_poster_missing_from_the_board_is_one_removal_link(tmp_path):

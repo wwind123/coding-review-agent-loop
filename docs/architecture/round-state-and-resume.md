@@ -2,7 +2,7 @@
 
 Where workflow state lives and how a run resumes: the GitHub and local state table, durable comment carriers and write read-back, transient GitHub failure handling, the known host comment footer, evidence freeze records, rejected coder follow-up recovery, and the context and trust contracts that every prompt and resume path must preserve.
 
-Source paths: `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`.
+Source paths: `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
 
 ## State and Recovery
 
@@ -99,6 +99,27 @@ is an ordinary review round of the current head: it carries only the ledger, the
 bounded budget and a `head-review-recovery` handoff that supersedes earlier
 checkpoints, and never overrides review scheduling or merge-conflict routing.
 Nothing force-pushes or writes a coder-role record on the operator's behalf.
+
+A PR round closed by its reconciliation summary is final. It receives no new
+scheduling or reviewer record; its only possible later record is the
+digest-bound activation checkpoint of a signed reviewer-board amendment that is
+effective from that round. When a resume re-enters a reconciled round and the
+scheduler's selection needs a fresh reviewer turn (for example, a new signed
+human requirement invalidates the primary's carried approval), the PR loop
+settles the round's ledger by replaying that round's reconciliation record
+(its carried ledger, dispositions and settled new items) through the ordinary
+round-end settlement, then opens round N+1 under the normal round bound. If
+the round still needs fresh turns while that activation is due, it is posted
+first as an activation-only record that selects nobody. A reconciled resume
+with no fresh turns continues in place and posts no scheduler checkpoint.
+Recovery, qualification, evidence, conflict, conversion, board-change re-entry
+and pre-panel history recovery resumes keep their own routes. A
+`scheduler-prelaunch` record posted into a reconciled round (a stray checkpoint
+from an older tool version, or an amendment activation) is inert: resume anchor
+selection, visibility, panel evidence and every scheduler-state reader ignore
+it, and only the amendment-lineage reader counts it. A conversion repeat or a
+head-review recovery handoff reopens the round, so a checkpoint after one is
+not inert. Nothing is deleted, so such PRs resume into round N+1 as they are.
 
 Resume reconstructs state from recorded evidence and then checks it against the
 live PR, issue, plan, requirements, and policy. GitHub metadata is durable but

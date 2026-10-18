@@ -491,7 +491,9 @@ Reviewer board amendment:
   managed CI) one plain completion comment on the PR note that the run
   finished on a reduced board. The activation round always posts a fresh
   scheduler checkpoint carrying the amended board and digest, even when every
-  remaining reviewer's review is reused.
+  remaining reviewer's review is reused. When the activation round was already
+  reconciled and a reviewer now needs a fresh turn, that checkpoint selects
+  nobody and the fresh turns open the next round.
 - Unsigned or malformed records are ignored with a logged diagnostic. A comment
   that contains only the record is not treated as a signed human requirement.
   All-reviewers PR runs and the non-staged plan path persist no contract, so
@@ -3304,6 +3306,16 @@ Execution model:
     round now treats a scheduler-prelaunch summary as a pre-reconciliation
     checkpoint, as planning rounds already do. A reset operation that deletes
     the comments for you is out of scope.
+  - This refusal covers only a round that was interrupted before its
+    reconciliation. A PR round whose reconciliation is posted is closed
+    (#1553): when a rerun needs a fresh reviewer turn there (for example, a
+    new signed human requirement invalidates the primary's carried approval,
+    or a reviewer's verdict was lost), the run settles that round's ledger from
+    its reconciliation record and opens the next round instead, within
+    `--max-rounds`. A reviewer the scheduler paused in the closed round is
+    therefore never treated as a missing withheld outcome. Scheduler
+    checkpoints an older version posted into an already reconciled round are
+    ignored, so such a PR resumes as it is, with no comments to delete.
 - The orchestrator still waits for every reviewer to settle before shared state
   changes: it aggregates outcomes, numbers unresolved items, and may begin
   coder work only in configured `--reviewer` order. It then posts a neutral
