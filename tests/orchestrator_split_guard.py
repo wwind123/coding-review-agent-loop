@@ -12,11 +12,10 @@ This module is NOT a test file.  It holds:
 * Pure check functions used by ``tests/test_orchestrator_split.py``; each
   returns a list of human-readable problems so it can be exercised on
   synthetic violations as well as on the real package.
-* ``install_patch_propagation()`` -- a test-only shim that makes attribute
-  set/delete on the ``orchestrator`` facade also apply to every registered
-  extracted module that owns the name, so existing tests that patch
-  ``coding_review_agent_loop.orchestrator.<name>`` keep reaching code that
-  has moved out of it.
+* ``facade_use_problems`` -- a static guard that keeps test files from
+  importing or patching the ``orchestrator`` facade.  A facade patch would
+  not reach the extracted module that owns the name, so tests patch owning
+  modules directly (#1186).
 """
 from __future__ import annotations
 
@@ -27,7 +26,7 @@ import os
 import subprocess
 import sys
 import types
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 PACKAGE = "coding_review_agent_loop"
@@ -139,7 +138,7 @@ def incoherent_bindings(facade: types.ModuleType, modules: Iterable[types.Module
     """Names bound in both the facade and a registered module are the same object.
 
     A module-only global is allowed: extracted modules may grow new helpers
-    the facade does not re-export, and the shim never propagates to them.
+    the facade does not re-export.
     """
     problems: list[str] = []
     for module in modules:
@@ -154,10 +153,10 @@ def incoherent_bindings(facade: types.ModuleType, modules: Iterable[types.Module
 def fresh_incoherent_bindings(
     module_names: Sequence[str], *, facade: str = FACADE, extra_path: str | os.PathLike | None = None
 ) -> list[str]:
-    """Run ``incoherent_bindings`` in a fresh interpreter with no shim installed.
+    """Run ``incoherent_bindings`` in a fresh interpreter with no test patches.
 
-    Inside the test session the propagation shim and the suite-wide repair
-    stub rewrite owned names in registered modules, which would hide a
+    Inside the test session the suite-wide repair stub and per-test patches
+    rewrite owned names in registered modules, which would hide or fake a
     divergent production binding, so the pristine namespaces are checked here.
     """
     code = (
@@ -244,65 +243,74 @@ def fresh_import_problem(name: str) -> str | None:
     return None
 
 
-# --- Patch propagation shim --------------------------------------------------
+# --- Test use of the facade ------------------------------------------------
 
-_STATE_KEY = "__orchestrator_split_propagation__"
-
-
-class _PropagationState:
-    def __init__(self, registry: Callable[[], Iterable[types.ModuleType]]):
-        self.registry = registry
-        # name -> names of registered modules a propagated delete removed it from
-        self.pending_restore: dict[str, set[str]] = {}
+# Only the split guard and its tests may touch the facade itself.
+FACADE_USE_ALLOWLIST: frozenset[str] = frozenset({"test_orchestrator_split.py", "orchestrator_split_guard.py"})
+TESTS_DIR = Path(__file__).resolve().parent
 
 
-class PatchPropagatingModule(types.ModuleType):
-    """Facade module whose attribute set/delete reaches owning extracted modules.
-
-    A registered module owns a name when it currently binds it, or when a
-    propagated delete removed it and the name has not been set again since.
-    Modules that never owned a name are never touched, so propagation can
-    not create attributes anywhere new.
-    """
-
-    def __setattr__(self, name: str, value: object) -> None:
-        super().__setattr__(name, value)
-        state = vars(self).get(_STATE_KEY)
-        if state is None or _is_dunder(name):
-            return
-        pending = state.pending_restore.pop(name, set())
-        for module in state.registry():
-            if name in vars(module) or module.__name__ in pending:
-                setattr(module, name, value)
-
-    def __delattr__(self, name: str) -> None:
-        super().__delattr__(name)
-        state = vars(self).get(_STATE_KEY)
-        if state is None or _is_dunder(name):
-            return
-        for module in state.registry():
-            if name in vars(module):
-                delattr(module, name)
-                state.pending_restore.setdefault(name, set()).add(module.__name__)
+def _names_facade(module: str | None) -> bool:
+    return module == FACADE or (module or "").startswith(f"{FACADE}.")
 
 
-def install_patch_propagation(
-    facade: types.ModuleType | None = None,
-    registry: Callable[[], Iterable[types.ModuleType]] | None = None,
-) -> types.ModuleType:
-    """Install the shim on ``facade`` (default: the real orchestrator); idempotent."""
-    if facade is None:
-        facade = importlib.import_module(FACADE)
-    if _STATE_KEY not in vars(facade):
-        vars(facade)[_STATE_KEY] = _PropagationState(registry or (lambda: registered_modules()))
-    if not isinstance(facade, PatchPropagatingModule):
-        facade.__class__ = PatchPropagatingModule
-    return facade
+def _import_module_target(node: ast.Call) -> str | None:
+    """The absolute module an ``import_module`` call with constant arguments names."""
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else None
+    if name != "import_module" or not node.args:
+        return None
+    first = node.args[0]
+    if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
+        return None
+    target = first.value
+    if not target.startswith("."):
+        return target
+    package = node.args[1] if len(node.args) > 1 else next(
+        (keyword.value for keyword in node.keywords if keyword.arg == "package"), None
+    )
+    if not (isinstance(package, ast.Constant) and isinstance(package.value, str)):
+        return None
+    level = len(target) - len(target.lstrip("."))
+    anchor = package.value.split(".")
+    anchor = anchor[: len(anchor) - (level - 1)]
+    return ".".join([*anchor, target[level:]]) if target[level:] else ".".join(anchor)
 
 
-def pending_restores(facade: types.ModuleType) -> dict[str, set[str]]:
-    state = vars(facade).get(_STATE_KEY)
-    return {} if state is None else {name: set(owners) for name, owners in state.pending_restore.items()}
+def facade_use_problems(source: str, filename: str) -> list[str]:
+    """Imports, ``import_module`` calls and patch-target strings naming the facade."""
+    problems: list[str] = []
+    for node in ast.walk(ast.parse(source, filename=filename)):
+        where = f"{filename} line {getattr(node, 'lineno', '?')}"
+        if isinstance(node, ast.Import):
+            problems.extend(
+                f"{where} imports the orchestrator facade" for alias in node.names if _names_facade(alias.name)
+            )
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and (
+                _names_facade(node.module)
+                or (node.module == PACKAGE and any(alias.name == "orchestrator" for alias in node.names))
+            ):
+                problems.append(f"{where} imports the orchestrator facade")
+        elif isinstance(node, ast.Call):
+            target = _import_module_target(node)
+            if target is not None and _names_facade(target):
+                problems.append(f"{where} imports the orchestrator facade through import_module")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str) and _names_facade(node.value):
+            problems.append(f"{where} names the orchestrator facade in a string such as a patch target")
+    return problems
+
+
+def tests_facade_use_problems(
+    tests_dir: Path = TESTS_DIR, allowlist: Iterable[str] = FACADE_USE_ALLOWLIST
+) -> list[str]:
+    """``facade_use_problems`` over every ``tests/*.py`` file outside ``allowlist``."""
+    allowed = set(allowlist)
+    problems: list[str] = []
+    for path in sorted(tests_dir.glob("*.py")):
+        if path.name not in allowed:
+            problems.extend(facade_use_problems(path.read_text(encoding="utf-8"), path.name))
+    return problems
 
 
 if __name__ == "__main__":

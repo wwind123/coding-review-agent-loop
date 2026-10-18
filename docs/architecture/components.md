@@ -129,9 +129,10 @@ above, which were extracted from it by pure moves. Each extracted module
 imports alone, never imports the facade, and imports only modules extracted
 before it, so the lifecycle layers form an acyclic chain ending at
 `issue_loop.py`; [tests/test_orchestrator_split.py](../../tests/test_orchestrator_split.py) enforces those rules and
-that the facade stays docstring-and-imports only. Tests still patch names on
-the facade; a test-only shim installed from [tests/conftest.py](../../tests/conftest.py) propagates those
-patches to the owning modules. The table describes code ownership, not a
+that the facade stays docstring-and-imports only. Tests patch the owning
+extracted modules directly, since a facade patch would not reach them, and a
+static guard in [tests/test_orchestrator_split.py](../../tests/test_orchestrator_split.py) rejects test imports
+and patch targets of the facade outside that file and its guard helper. The table describes code ownership, not a
 decomposition into independently deployed services. Shared data types live
 alongside their owning modules rather than in one central model package.
 
