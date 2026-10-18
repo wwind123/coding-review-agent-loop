@@ -269,8 +269,26 @@ def test_1553_reconciled_round_with_all_resumed_selection_posts_no_checkpoint(tm
     assert len(_agent_sequence(runner)) == before_agents
 
 
-def test_1553_parallel_reconciliation_only_items_survive_rollover(tmp_path):
-    """Row parallel-reconciliation-only-items: IDs, owners and text are unchanged."""
+@pytest.mark.parametrize("parallel", [False, True])
+def test_1553_selective_intermediate_resumed_owner_selection_posts_no_checkpoint(
+    tmp_path, monkeypatch, parallel
+):
+    """Row reconciled-selected-resumed-no-checkpoint, selective-intermediate variant.
+
+    Round 1 reconciled with a blocking finding owned by Gemini and stopped
+    before its coder dispatch was recorded.  On resume the scheduler selects
+    the resumed blocking owner; nothing is posted into the closed round and
+    the coder route continues in round 1.
+    """
+    decisions = []
+    real_select = pr_loop.select_reviewers
+
+    def recording_select(*args, **kwargs):
+        decision = real_select(*args, **kwargs)
+        decisions.append(decision)
+        return decision
+
+    monkeypatch.setattr(pr_loop, "select_reviewers", recording_select)
     runner = FakeRunner(
         codex_outputs=[structured_pr_review()],
         gemini_outputs=[
@@ -280,14 +298,60 @@ def test_1553_parallel_reconciliation_only_items_survive_rollover(tmp_path):
             )
         ],
     )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"),
+        pr_review_policy="selective-intermediate", review_parallel=parallel,
+    )
+    # The coder has no scripted output: the run stops after round 1 is reconciled.
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+    reconciliation = _last_reconciliation(runner, 1)
+    assert [item.item_id for item in reconciliation.metadata.new_items] == ["item-1"]
+    dispatch_indexes = {
+        record.index for record in _records(runner) if record.metadata.phase == "coder-dispatch"
+    }
+    runner.pr_payload["comments"] = [
+        comment for index, comment in enumerate(runner.pr_payload["comments"])
+        if index not in dispatch_indexes
+    ]
+    decisions.clear()
+    before_agents = len(_agent_sequence(runner))
+
+    with pytest.raises(AgentLoopError):
+        run_pr_loop(runner, pr_number=77, config=config)
+
+    # The scheduler did select the resumed blocking owner in the closed round.
+    assert decisions and "Gemini" in decisions[0].selected_reviewers
+    # Only the coder ran; no reviewer was relaunched.
+    assert _agent_sequence(runner)[before_agents:] == ["claude"]
+    later = _records_after(runner, reconciliation.index)
+    # Only the coder's own dispatch record follows: no scheduler checkpoint, no
+    # reviewer record, no duplicate reconciliation, and no rollover.
+    assert later and all(record.metadata.phase == "coder-dispatch" for record in later)
+
+
+def test_1553_parallel_reconciliation_only_items_survive_rollover(tmp_path):
+    """Row parallel-reconciliation-only-items: blocking and same-PR findings survive."""
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review()],
+        gemini_outputs=[
+            structured_pr_review(
+                reviewer="Google Gemini", state="blocking",
+                blocking_items=["Guard the cache eviction race."],
+                same_pr_followups=["Document the eviction lock in the module docstring."],
+            )
+        ],
+    )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
     # The coder turn has no scripted output: the run stops after round 1 is
     # reconciled and before any coder follow-up exists.
     with pytest.raises(AgentLoopError):
         run_pr_loop(runner, pr_number=77, config=config)
     reconciliation = _last_reconciliation(runner, 1)
-    settled = reconciliation.metadata.new_items
-    assert [item.item_id for item in settled] == ["item-1"]
+    settled = {item.item_id: item for item in reconciliation.metadata.new_items}
+    assert sorted(settled) == ["item-1", "item-2"]
+    assert (settled["item-1"].status, settled["item-1"].reviewer) == ("blocking", "Gemini")
+    assert (settled["item-2"].status, settled["item-2"].reviewer) == ("same-pr", "Gemini")
     gemini_publication = next(
         record.metadata for record in _records(runner)
         if record.metadata.agent == "Gemini" and record.metadata.role == "reviewer"
@@ -306,7 +370,10 @@ def test_1553_parallel_reconciliation_only_items_survive_rollover(tmp_path):
     _sign(runner)
     runner.codex_outputs.append(
         structured_pr_review(
-            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            prior_item_dispositions=[
+                {"item_id": "item-1", "disposition": "resolved"},
+                {"item_id": "item-2", "disposition": "resolved"},
+            ],
             human_requirements_resolved=True,
         )
     )
@@ -318,7 +385,11 @@ def test_1553_parallel_reconciliation_only_items_survive_rollover(tmp_path):
                 {
                     "item_id": "item-1", "disposition": "blocking",
                     "note": "The eviction path in src/cache.py still races; add a lock and a test.",
-                }
+                },
+                {
+                    "item_id": "item-2", "disposition": "same-pr",
+                    "note": "The module docstring still does not describe the eviction lock.",
+                },
             ],
             human_requirements_resolved=True,
         )
@@ -336,10 +407,12 @@ def test_1553_parallel_reconciliation_only_items_survive_rollover(tmp_path):
     assert round_two
     for metadata in round_two:
         carried = {item.item_id: item for item in metadata.prior_items}
-        assert carried["item-1"] == settled[0]
+        # ID, owner, text and status are unchanged for both findings.
+        assert carried["item-1"] == settled["item-1"]
+        assert carried["item-2"] == settled["item-2"]
     new_reconciliation = _last_reconciliation(runner, 2).metadata
-    # A new finding gets a fresh ID; item-1 is never reused.
-    assert [item.item_id for item in new_reconciliation.new_items] == ["item-2"]
+    # A new finding gets a fresh ID above both carried ones.
+    assert [item.item_id for item in new_reconciliation.new_items] == ["item-3"]
 
 
 def test_1553_rollover_keeps_inert_ledger_records(tmp_path):
