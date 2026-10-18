@@ -774,7 +774,7 @@ def test_live_evidence_freeze_takes_precedence_and_a_frozen_rerun_never_reaches_
     tmp_path, monkeypatch
 ):
     """`stall-precedence`: no stall stop at a frozen head."""
-    from test_orchestrator_pr import _EVIDENCE_TEXT, _evidence_review
+    from pr_loop_test_helpers import _EVIDENCE_TEXT, _evidence_review
 
     rounds = _spy_decision(monkeypatch)
     runner = FakeRunner(
@@ -804,7 +804,7 @@ def test_live_evidence_freeze_takes_precedence_and_a_frozen_rerun_never_reaches_
 
 def test_step_back_sibling_escalation_takes_precedence_over_a_filled_stall_window(tmp_path, monkeypatch):
     """`stall-precedence`: the step-back escalation stops first at the round the stall would."""
-    from test_orchestrator_pr import _StepBackRunner, _step_back_coders
+    from pr_loop_test_helpers import _StepBackRunner, _step_back_coders
 
     def review(text, *, resolved=()):
         return _review([_tagged(text)], resolved=resolved)

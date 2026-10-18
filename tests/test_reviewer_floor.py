@@ -432,7 +432,7 @@ def test_staged_malformed_history_with_a_signed_amendment_writes_nothing(
     import coding_review_agent_loop.round_transport as transport
     from coding_review_agent_loop.cli import run_pr_loop
     from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
-    from test_orchestrator_pr import (
+    from pr_loop_test_helpers import (
         _m943_amendment_from_error, _m943_append, _m943_partial_pr_round, _staged_config,
     )
 
@@ -833,7 +833,7 @@ def test_direct_staged_child_entry_floor_uses_the_parent_plan(tmp_path, monkeypa
     from test_issue_pr_handoff import (
         _named_config, _named_plan_comments, _seat as _handoff_seat, _three_provider_plan,
     )
-    from test_orchestrator_issue import _fresh_child_route_fixture
+    from issue_loop_test_helpers import _fresh_child_route_fixture
 
     seats, approved = _three_provider_plan(tmp_path)
     parent_comments = tuple(

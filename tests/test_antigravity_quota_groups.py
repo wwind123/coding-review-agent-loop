@@ -588,7 +588,7 @@ def test_every_unavailable_stop_is_a_transient_category(tmp_path):
 
 
 def test_exhausted_antigravity_is_marked_unavailable_not_fatal_in_a_pr_round(tmp_path):
-    from test_orchestrator_pr import structured_pr_review  # noqa: F401
+    from agent_loop_helpers import structured_pr_review  # noqa: F401
 
     runner = FakeRunner(
         codex_outputs=[structured_pr_review(summary="Codex ok.")],

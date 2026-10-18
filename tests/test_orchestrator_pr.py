@@ -129,6 +129,25 @@ import coding_review_agent_loop.round_state as round_state
 import coding_review_agent_loop.triage as triage
 import coding_review_agent_loop.validated_agent as validated_agent
 from agent_loop_helpers import patch_attr_in, patch_object_in
+from pr_loop_test_helpers import (
+    SB_HEAD,
+    _EVIDENCE_TEXT,
+    _StepBackRunner,
+    _audit_phases,
+    _carried_ci_obligations,
+    _carried_ci_review_comment,
+    _evidence_review,
+    _m943_amendment_from_error,
+    _m943_append,
+    _m943_partial_pr_round,
+    _posted_scheduler_metadata,
+    _resolve,
+    _rewrite_pr_metadata,
+    _signed,
+    _staged_config,
+    _staged_review,
+    _step_back_coders,
+)
 
 
 @pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
@@ -209,32 +228,6 @@ def _advance_head_after_coder(monkeypatch, runner, head_sha="repaired-head"):
         validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
         issue_loop,
     ), "_run_validated_agent", run)
-
-
-def _carried_ci_obligations() -> tuple[UnresolvedReviewItem, ...]:
-    return tuple(
-        UnresolvedReviewItem(
-            item_id=f"item-{index}",
-            reviewer=reviewer,
-            source_round=1,
-            text=f"{kind} failed on the previous head.",
-            status="blocking",
-            source_status="blocking",
-            authority="machine",
-            obligation_kind=kind,
-            lifecycle="qualification_ready",
-            failed_head_sha="old-head",
-            candidate_head_sha="abc123",
-            obligation_identity=f"{kind}:item-{index}",
-        )
-        for index, (reviewer, kind) in enumerate(
-            (
-                ("GitHub managed exact-head CI", "managed-exact-head-ci"),
-                ("GitHub PR checks", "github-pr-checks"),
-            ),
-            start=1,
-        )
-    )
 
 
 def _approved_issue_plan_comments(plan: str) -> list[dict[str, object]]:
@@ -4356,33 +4349,6 @@ def test_invalid_watcher_success_cannot_finalize_carried_ci_obligation(
         )
 
     assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
-
-
-def _carried_ci_review_comment(items):
-    dispositions = tuple(
-        ReviewItemDisposition(item.item_id, "Codex", "resolved") for item in items
-    )
-    return _attach_round_metadata(
-        structured_pr_review(
-            reviewer="OpenAI Codex",
-            state="approved",
-            summary="The reviewed repair is approved.",
-            prior_item_dispositions=[
-                {"item_id": item.item_id, "disposition": "resolved"}
-                for item in items
-            ],
-        ),
-        PostedRoundMetadata(
-            flow="pr",
-            role="reviewer",
-            agent="Codex",
-            round_number=1,
-            subject="abc123",
-            prior_items=items,
-            dispositions=dispositions,
-            state="approved",
-        ),
-    )
 
 
 def test_managed_success_does_not_clear_carried_ordinary_ci_obligation(
@@ -11292,65 +11258,11 @@ def test_pr_loop_dispute_note_is_visible_to_reviewer_in_next_round(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _staged_review(*, reviewer, state="approved", blocking_items=None, dispositions=None, resolved=False):
-    return (
-        json.dumps(
-            {
-                "schema_version": 1,
-                "kind": "pr_review",
-                "state": state,
-                "summary": f"{reviewer} review",
-                "blocking_items": blocking_items or [],
-                "same_pr_followups": [],
-                "future_followups": [],
-                "prior_item_dispositions": dispositions or [],
-            }
-        )
-        + ("\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->" if resolved else "")
-        + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
-    )
-
-
-def _staged_config(tmp_path, **overrides):
-    values = dict(
-        reviewer=("codex", "gemini", "antigravity"),
-        pr_review_policy="primary-then-panel",
-        primary_reviewer="codex",
-        max_rounds=6,
-    )
-    values.update(overrides)
-    return make_config(tmp_path, **values)
-
-
 def _agent_sequence(runner):
     return [
         command[0]
         for command, _cwd in runner.commands
         if command and command[0] in {"claude", "codex", "gemini", "agy"}
-    ]
-
-
-def _audit_phases(runner):
-    phases = []
-    for comment in runner.comments:
-        if comment.startswith("PR review scheduling audit:"):
-            match = re.search(r"phase: ([a-z-]+); head: ([^;]+);", comment)
-            assert match is not None, comment
-            phases.append((match.group(1), match.group(2)))
-    return phases
-
-
-def _posted_scheduler_metadata(runner):
-    return [
-        record.metadata
-        for record in architecture_contract._extract_round_metadata_records(
-            [
-                SimpleNamespace(body=comment["body"])
-                for comment in runner.pr_payload.get("comments", [])
-            ],
-            flow="pr",
-        )
-        if record.metadata.scheduler_metadata_status != "absent"
     ]
 
 
@@ -12052,32 +11964,6 @@ def test_staged_policy_does_not_change_existing_policy_selection(tmp_path):
 # ---------------------------------------------------------------------------
 # #840: strict primary-only pre-panel phase for primary-then-panel
 # ---------------------------------------------------------------------------
-
-
-def _rewrite_pr_metadata(runner, transform):
-    """Rewrite persisted round-metadata payloads in place (legacy simulation).
-
-    ``transform`` receives the decoded payload mapping and returns a new
-    mapping, or ``None`` to leave the comment unchanged.
-    """
-    from coding_review_agent_loop.round_transport import (
-        ROUND_RESUME_MARKER_RE,
-        decode_mapping,
-        encode_mapping,
-    )
-
-    for comment in runner.pr_payload.get("comments", []):
-        body = comment["body"]
-        matches = list(ROUND_RESUME_MARKER_RE.finditer(body))
-        if not matches:
-            continue
-        match = matches[-1]
-        payload = transform(dict(decode_mapping(match.group("payload"))))
-        if payload is None:
-            continue
-        comment["body"] = (
-            body[: match.start("payload")] + encode_mapping(payload) + body[match.end("payload"):]
-        )
 
 
 def _legacyize_operator_latches(payload):
@@ -13968,43 +13854,6 @@ from coding_review_agent_loop.board_amendment import (  # noqa: E402
 )
 
 
-def _m943_partial_pr_round(tmp_path, **payload):
-    """Codex and Gemini review; Antigravity's backend fails before it posts."""
-    runner = FakeRunner(
-        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
-        gemini_outputs=[_staged_review(reviewer="Google Gemini")],
-        antigravity_outputs=[],
-        **payload,
-    )
-    with pytest.raises(AgentLoopError):
-        run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
-    posted = _posted_scheduler_metadata(runner)
-    assert posted and all(
-        tuple(item.scheduler_contract["required_reviewers"]) == ("Codex", "Gemini", "Antigravity")
-        for item in posted
-    )
-    return runner
-
-
-def _m943_amendment_from_error(message):
-    start = message.index("Reviewer board amendment:")
-    template = message[start:]
-    return template.replace(
-        "<why the removed reviewer cannot be reached>", "Antigravity quota exhausted."
-    )
-
-
-def _m943_append(runner, body, login="operator"):
-    comments = runner.pr_payload.setdefault("comments", [])
-    comments.append(
-        {
-            "author": {"login": login},
-            "createdAt": f"2026-05-23T00:00:{len(comments):02d}Z",
-            "body": body,
-        }
-    )
-
-
 @pytest.mark.parametrize("linked_issue", [False, True], ids=["standalone", "issue-mode"])
 def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkeypatch, linked_issue):
     """Row pr-qualification, standalone (issue_context=None) and with a linked issue."""
@@ -14267,7 +14116,6 @@ def test_m985_pr_loop_stops_after_two_unchanged_head_coder_turns(tmp_path):
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
 
 
-
 def test_m985_unchanged_head_count_resets_after_an_external_head_advance():
     from coding_review_agent_loop.pr_loop_support import (
         MAX_UNCHANGED_HEAD_CODER_TURNS,
@@ -14404,7 +14252,6 @@ def test_pr_acknowledgement_repair_cannot_add_an_assessment(tmp_path, monkeypatc
     # The refused repair leaves the approval unacknowledged: nothing merges.
     assert outcome != 0
     assert all(record.architecture_impact is None for record in records)
-
 
 
 def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
@@ -15041,53 +14888,6 @@ def test_m1034_resume_from_historical_coder_record_keeps_legacy_context(tmp_path
 
 
 # --- Human-only exact-head evidence freeze (#1068) ---------------------------
-
-_EVIDENCE_TEXT = (
-    "Run tests/test_sandboxed_permissions_live.py against authenticated CLIs at this exact "
-    "head and attach the output"
-)
-
-
-def _evidence_review(
-    *,
-    state="approved",
-    evidence=(),
-    dispositions=(),
-    blocking=(),
-    hr=False,
-    reviewer="OpenAI Codex",
-    summary="Reviewed.",
-):
-    payload = {
-        "schema_version": 1,
-        "kind": "pr_review",
-        "state": state,
-        "summary": summary,
-        "blocking_items": list(blocking),
-        "same_pr_followups": [],
-        "future_followups": [],
-        "prior_item_dispositions": list(dispositions),
-    }
-    if evidence:
-        payload["exact_head_evidence_requests"] = list(evidence)
-    return (
-        json.dumps(payload)
-        + ("\n<!-- HUMAN_REQUIREMENTS_RESOLVED -->" if hr else "")
-        + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
-    )
-
-
-def _signed(body, index):
-    return {
-        "author": {"login": "maintainer"},
-        "createdAt": f"2026-05-24T00:{index:02d}:00Z",
-        "url": f"https://github.com/OWNER/REPO/pull/77#issuecomment-{900 + index}",
-        "body": f"{body}\n\n-- Human Reviewer",
-    }
-
-
-def _resolve(item_id="item-1", note="The signed live run covers this exact head."):
-    return {"item_id": item_id, "disposition": "resolved", "note": note}
 
 
 def _keep(item_id="item-1", note="The signed output omits the sandbox escape case; rerun it."):
@@ -16184,7 +15984,6 @@ def test_pr_loop_resume_with_trust_set_excludes_historically_acknowledged_requir
     for prompt in (*coder_prompts, *review_prompts):
         assert f"Requirement {excluded.requirement_id}:" not in prompt
     assert "No signed human requirements were surfaced" in coder_prompts[-1]
-
 
 
 @pytest.mark.parametrize("state_report", [None, "measured"])
@@ -17809,41 +17608,6 @@ def test_ordinary_recovery_same_head_accepted_ready_reaches_post_write_verificat
 
 # --- PR fix-loop step-back (#1251, stage 2) ---------------------------------
 
-SB_HEAD = "a" * 40
-
-
-class _StepBackRunner(FakeRunner):
-    """FakeRunner with Git-SHA-shaped heads and scripted ``git diff`` output."""
-
-    def __init__(self, *, name_status="M\tsrc/spool.py\n", hunks="", shift_head=None, **kwargs):
-        kwargs.setdefault("pr_payload", {"headRefOid": SB_HEAD})
-        kwargs.setdefault("git_head", SB_HEAD)
-        super().__init__(**kwargs)
-        self.scripted_name_status = name_status
-        self.scripted_hunks = hunks
-        # The scripted hunks describe the step-back coder's push only; diffs between
-        # earlier heads stay empty so older locations are not shifted by them.
-        self.shift_head = shift_head or f"{3:040x}"
-
-    def _maybe_advance_pr_head_for_coder_followup(self, cmd) -> None:
-        if '"kind": "coder_followup"' not in "\n".join(cmd):
-            return
-        self._coder_followup_counter += 1
-        new_head = f"{self._coder_followup_counter:040x}"
-        self.pr_payload["headRefOid"] = new_head
-        self._move_head(new_head, cwd=self._last_agent_cwd)
-
-    def run(self, args, *, cwd, input_text=None, check=True, env=None):
-        cmd = [str(arg) for arg in args]
-        if cmd[:1] == ["git"] and "diff" in cmd and "--name-status" in cmd and "-M" in cmd:
-            cmd, cwd_path = self._record_command(cmd, cwd)
-            return CommandResult(cmd, cwd_path, self.scripted_name_status, "", 0)
-        if cmd[:1] == ["git"] and "diff" in cmd and "-U0" in cmd:
-            cmd, cwd_path = self._record_command(cmd, cwd)
-            touches = self.shift_head in cmd
-            return CommandResult(cmd, cwd_path, self.scripted_hunks if touches else "", "", 0)
-        return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
-
 
 def _sb_review(
     blocking_items=None, *, resolved=(), carried=(), state=None, summary="review",
@@ -17893,17 +17657,6 @@ def _three_clustered_blocks():
         _sb_review(["gap one at src/spool.py:124-131"]),
         _sb_review(["gap two at src/spool.py:131-136"], resolved=["item-1"]),
         _sb_review(["gap three at src/spool.py:140"], resolved=["item-2"]),
-    ]
-
-
-def _step_back_coders(count=3):
-    return [
-        structured_coder_followup(addressed_items=[f"item-{n}"]) for n in range(1, count)
-    ] + [
-        structured_coder_followup(
-            addressed_items=["item-3"],
-            summary="Generalization: any spool record that fails a validation step is malformed.",
-        )
     ]
 
 
@@ -19020,7 +18773,6 @@ def test_future_finding_cleared_in_the_first_resumed_round_is_resolved_not_defer
     assert "(deferred)" not in history(prompts[2])
 
 
-
 def test_future_finding_cleared_by_subitem_completion_is_resolved_live_and_after_resume(
     tmp_path, monkeypatch
 ):
@@ -19248,7 +19000,6 @@ def test_compact_resume_cannot_reintroduce_a_deferred_finding_under_its_old_id(
     assert "Codex finding item-2 (deferred) src/b.py:20" in history(prompts()[2])
     assert "item-4" not in history(prompts()[2])
     assert "Gap two again in src/b.py:20" in prompts()[2]
-
 
 
 def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches(

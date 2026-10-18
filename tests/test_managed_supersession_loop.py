@@ -14,7 +14,7 @@ from coding_review_agent_loop.round_state import _extract_round_metadata_records
 
 from agent_loop_helpers import FakeRunner, make_config, structured_coder_followup, structured_pr_review
 from test_ci_health import NOW, _StubGhRunner, _metadata, _run
-from test_orchestrator_pr import _carried_ci_obligations, _carried_ci_review_comment
+from pr_loop_test_helpers import _carried_ci_obligations, _carried_ci_review_comment
 import coding_review_agent_loop.pr_loop as pr_loop
 import coding_review_agent_loop.pr_loop_support as pr_loop_support
 from agent_loop_helpers import patch_attr_in
