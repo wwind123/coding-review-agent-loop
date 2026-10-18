@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -285,6 +285,28 @@ PREFLIGHT_KNOWN_NOT_READY = 10
 PREFLIGHT_INDETERMINATE = 11
 
 
+# Only the newest records matter to the post-coder-turn audit's skew window.
+V1_DISPATCH_RECORD_LIMIT = 8
+
+
+@dataclass(frozen=True)
+class ManagedV1DispatchRecord:
+    """One successful managed-CI v1 dispatch made by this process (#1414).
+
+    A v1 run's name is the plain workflow name and GitHub's run listing omits
+    dispatch inputs, so the post-coder-turn audit correlates these fields
+    with listed runs to avoid attributing the orchestrator's own dispatch to
+    the coder.  In-process only: never serialized into any durable record.
+    """
+
+    workflow_file: str
+    ref: str
+    pr_number: int
+    expected_head_sha: str
+    requested_at: datetime
+    returned_at: datetime
+
+
 @dataclass
 class ManagedCiContract:
     workflow_file: str = WORKFLOW_FILE
@@ -354,6 +376,9 @@ class ManagedCiContract:
     # Final write diagnostic and attempt history of the last failed
     # release_adopted_managed_ci removal (empty when it succeeded).
     release_diagnostic: str = ""
+    # Successful v1 dispatches of this process, newest last, for the
+    # post-coder-turn dispatch audit (#1414).  Never persisted.
+    v1_dispatch_records: tuple[ManagedV1DispatchRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -8584,6 +8609,7 @@ def dispatch_final_qualification(
             contract=contract,
         )
         return
+    requested_at = datetime.now(timezone.utc)
     result = runner.run(
         [
             config.gh_cmd,
@@ -8605,6 +8631,17 @@ def dispatch_final_qualification(
         raise AgentLoopError(
             f"Unable to dispatch managed final CI for PR #{pr_number} at {expected_head_sha}."
         )
+    record = ManagedV1DispatchRecord(
+        workflow_file=contract.workflow_file,
+        ref=head_ref,
+        pr_number=pr_number,
+        expected_head_sha=expected_head_sha,
+        requested_at=requested_at,
+        returned_at=datetime.now(timezone.utc),
+    )
+    contract.v1_dispatch_records = (
+        *contract.v1_dispatch_records, record
+    )[-V1_DISPATCH_RECORD_LIMIT:]
     log(config, f"PR #{pr_number}: dispatched managed final CI at {expected_head_sha}")
 
 

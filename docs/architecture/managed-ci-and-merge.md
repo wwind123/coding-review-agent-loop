@@ -391,7 +391,21 @@ heads are covered. Any non-managed run it finds is prepended to the coder
 comment as a non-authoritative diagnostic. The audit runs after the turn's
 last coder continuation. On a rejected guarded turn,
 `publish_rejected_coder_turn_dispatch_audit` posts the note on its own and
-never masks the rejection. The classifier decodes arguments with one
+never masks the rejection. Managed v2 runs are excluded by their
+`managed-ci-v2 nonce=` run name. A v1 run carries only the plain workflow
+name, so `dispatch_final_qualification` appends a `ManagedV1DispatchRecord`
+(workflow file, ref, PR number, expected head, request and return times) to
+the in-process `ManagedCiContract.v1_dispatch_records` after each successful
+v1 POST (#1414). The records are never persisted. Both PR-loop audit paths
+pass them in. Discovery then widens to each record's head and window, and
+records are matched by workflow path, head, branch and time window against
+the full deduplicated candidate set before the turn cutoff applies. A record
+claims a run only when it is that record's sole match, no other record
+matches it, and the record head's listing succeeded. A claimed run is only
+logged. Any other matched run inside the turn window goes to a separate
+"attribution undetermined" section that names no creator and gives a typed
+reason: `multiple-matches`, `shared-match` or `incomplete-lookup`.
+Chronological order never decides ownership. The classifier decodes arguments with one
 pflag-style tokenizer, so grouped and equals shorthands cannot slip past
 it. Gating keeps excluding such runs as
 ad hoc diagnostics, and the workflow and its `unlabeled` recovery are

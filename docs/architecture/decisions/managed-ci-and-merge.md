@@ -18,3 +18,4 @@ never rewritten or deleted. The detail doc describes the current design.
 - Post-approval CI watching stays opt-in without auto-merge (an end-of-run hint names `--watch-pending-ci`). Plumbing-only failures on a complete board are re-run once before any coder round, then stop on infrastructure (#1477).
 - A fresh process resumes a matching `qualifying` managed checkpoint as `qualification_ready` and dispatches a fresh attempt under its own generation, rather than adopting the prior generation's attempt or re-running reviewers (#1177).
 - The merge-conflict continuity transition counts only an open, live machine-authority merge-conflict obligation, matching the CI-repair predicate's authority and status checks (#1057).
+- The post-turn dispatch audit claims a run as the orchestrator's own v1 dispatch only when an in-process dispatch record uniquely matches it; unconfirmed matches are listed with a typed reason and no named creator (#1414).
