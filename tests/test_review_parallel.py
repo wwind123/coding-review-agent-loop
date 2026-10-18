@@ -3456,8 +3456,12 @@ def test_recovery_keeps_known_targets_when_a_retained_reference_marker_is_undeco
     assert "Delete these" not in message
 
 
-def test_reconciled_round_with_unavailable_reviewer_recovers_from_the_message(tmp_path):
-    """#1124 shape: peer verdict and reconciliation public, one reviewer's verdict gone."""
+def test_reconciled_round_with_unavailable_reviewer_rolls_over_without_deletion(tmp_path):
+    """#1124 shape: peer verdict and reconciliation public, one reviewer's verdict gone.
+
+    The reconciliation closed round 1 (#1553), so the missing reviewer's fresh
+    turn opens round 2 instead of requiring the round-1 comments to be deleted.
+    """
     runner, markers = _approving_pr_runner()
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -3472,34 +3476,17 @@ def test_reconciled_round_with_unavailable_reviewer_recovers_from_the_message(tm
     for path in _spool_files(config):
         path.unlink()
     launches_before = len(runner.reviewer_launches)
-
-    message = _refusal_message(runner, config)
-
-    assert len(runner.reviewer_launches) == launches_before
-    assert "Rerun from the host" not in message
-    assert "No review spool for this round exists on this host" in message
-    assert "Delete these 2 comments" in message
-    assert "reconciliation" in message
-    ids = _listed_comment_ids(message)
-    assert len(ids) == 2
-    _delete_listed_comments(runner, ids, surface="pr")
-    assert runner.pr_payload["comments"] == []
-    assert not any(m in body for m in markers for body in runner.comments)
-    runner.peer_body_visible_at_launch = False
+    kept = len(runner.pr_payload["comments"])
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert not runner.peer_body_visible_at_launch
-    baseline, _ = _approving_pr_runner()
-    baseline_config = make_config(
-        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True
-    )
-    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
-    # Same reviewers launched and the same records (verdicts plus a fresh
-    # reconciliation) posted as a never-started round.
-    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
-    assert len(runner.comments) == len(baseline.comments)
-    assert any("reconciliation" in body for body in runner.comments)
+    # Nothing was deleted, nothing was posted into the closed round, and only
+    # the missing reviewer ran (Codex's exact-head approval is carried).
+    assert runner.reviewer_launches[launches_before:] == ["gemini"]
+    records = _comment_records(runner, surface="pr", flow="pr")
+    assert [r.round_number for r in records[:kept]] == [1, 1]
+    assert records[kept:] and all(r.round_number == 2 for r in records[kept:])
+    assert not any("partially published" in body for body in runner.comments)
 
 
 def _overflow_pr_runner(seeds, slow_reviewer=None):
@@ -3526,8 +3513,12 @@ def _overflow_pr_runner(seeds, slow_reviewer=None):
     return runner, markers
 
 
-def test_overflow_peer_verdict_attachments_are_listed_and_recovered(tmp_path):
-    """A peer verdict published as an anchor plus attachments is listed whole."""
+def test_overflow_peer_verdict_attachments_survive_a_closed_round_rollover(tmp_path):
+    """A reconciled round whose peer verdict overflowed into attachments (#1553).
+
+    The lost Gemini verdict needs a fresh turn; the reconciled round is closed,
+    so it opens round 2 and the overflowed Codex anchor and attachments stay.
+    """
     from coding_review_agent_loop.round_transport import attachment_keys
 
     runner, markers = _overflow_pr_runner((11, 12))
@@ -3543,29 +3534,16 @@ def test_overflow_peer_verdict_attachments_are_listed_and_recovered(tmp_path):
     for path in _spool_files(config):
         path.unlink()
     launches_before = len(runner.reviewer_launches)
-
-    message = _refusal_message(runner, config)
-
-    assert len(runner.reviewer_launches) == launches_before
-    ids = _listed_comment_ids(message)
-    # Anchor, both attachments and the reconciliation are all advertised.
-    assert len(ids) == 4, message
-    assert "Delete these 4 comments" in message
-    _delete_listed_comments(runner, ids, surface="pr")
-    # No comment carrying the peer's response (anchor or attachment) remains.
-    assert runner.pr_payload["comments"] == []
-    runner.peer_body_visible_at_launch = False
+    kept = [c["body"] for c in runner.pr_payload["comments"]]
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert not runner.peer_body_visible_at_launch
-    baseline, _ = _overflow_pr_runner((12,))
-    baseline_config = make_config(
-        tmp_path / "baseline", reviewer=("codex", "gemini"), review_parallel=True
-    )
-    assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
-    assert sorted(runner.reviewer_launches[launches_before:]) == sorted(baseline.reviewer_launches)
-    assert len(runner.pr_payload["comments"]) == len(baseline.pr_payload["comments"])
+    assert runner.reviewer_launches[launches_before:] == ["gemini"]
+    assert [c["body"] for c in runner.pr_payload["comments"][: len(kept)]] == kept
+    assert sum(1 for c in runner.pr_payload["comments"] if attachment_keys(c["body"])) == 2
+    records = _comment_records(runner, surface="pr", flow="pr")
+    assert [r.round_number for r in records] == [1, 1, 2, 2]
+    assert not any("partially published" in body for body in runner.comments)
 
 
 def test_orphan_attachments_before_a_lost_anchor_are_listed_and_recovered(tmp_path):
@@ -4022,7 +4000,11 @@ def test_pr_final_sweep_refusal_deletion_and_rerun_matches_a_never_started_round
     assert run_pr_loop(baseline, pr_number=77, config=baseline_config) == 0
 
     assert _prelaunch_phases(runner, round_number=1) == _prelaunch_phases(baseline, round_number=1)
-    assert _prelaunch_phases(runner, round_number=1)[-1] == "secondary-audit"
+    # Round 1 was reconciled after the primary approved, so the panel opens
+    # round 2 (#1553) in both histories.
+    assert _prelaunch_phases(runner, round_number=1)[-1] == "primary"
+    assert _prelaunch_phases(runner, round_number=2) == _prelaunch_phases(baseline, round_number=2)
+    assert _prelaunch_phases(runner, round_number=2)[0] == "secondary-audit"
     assert "final-secondary-sweep" not in {
         r.scheduler_phase for r in _records(runner, flow="pr", surface="pr")
     }
