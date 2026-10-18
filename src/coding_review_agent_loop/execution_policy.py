@@ -18,7 +18,7 @@ from .config import AgentLoopConfig, phased_delivery_guard_active, reviewers
 from .decomposition import (
     _decode_json_payload,
     EXECUTION_DECISION_MARKER_RE,
-    issue_has_execution_decision,
+    issue_execution_decision_evidence,
     CreatedPhaseIssue,
     PlanDecomposition,
     RecordedPhase,
@@ -840,7 +840,7 @@ def _refuse_plain_mode_over_planning(
     *,
     config: AgentLoopConfig,
     issue_number: int,
-    projection_comments: Sequence[object],
+    issue_context: IssueContext,
 ) -> None:
     """Refuse plain issue mode on an issue that planning already decided (#1088).
 
@@ -851,8 +851,14 @@ def _refuse_plain_mode_over_planning(
     Only records authored by the authenticated agent-loop actor count, read
     from the complete REST history so the projection's connection cap cannot
     hide them; a foreign comment can neither fabricate nor mask a decision.
+
+    Planning rounds count only when the round as a whole approved the plan,
+    as the shared history-only classifier judges it (#1090): one reviewer's
+    approval in a split or abandoned round does not refuse.  Records whose
+    approval state cannot be determined still refuse, and the message claims
+    an approved plan only when the evidence proves one.
     """
-    if not _projection_may_carry_planning_record(projection_comments):
+    if not _projection_may_carry_planning_record(issue_context.comments):
         return
     login, actor_id = resolve_authenticated_github_actor(runner, config=config)
     comments = tuple(
@@ -866,27 +872,56 @@ def _refuse_plain_mode_over_planning(
         if comment.author_id == actor_id
         and strip_bot_login_suffix(comment.author) == strip_bot_login_suffix(login)
     )
-    evidence: list[str] = []
+    unreadable_message = (
+        f"Issue #{issue_number} carries planning round records that cannot be read ({{}}); "
+        "plain issue mode will not implement over them. Repair the records, or rerun "
+        f"`agent-loop issue {issue_number} --plan-first`."
+    )
+    proven: list[str] = []
+    uncertain: list[str] = []
     try:
         plan_records = _extract_round_metadata_records(comments, flow="plan")
     except AgentLoopError as exc:
-        raise AgentLoopError(
-            f"Issue #{issue_number} carries planning round records that cannot be read ({exc}); "
-            "plain issue mode will not implement over them. Repair the records, or rerun "
-            f"`agent-loop issue {issue_number} --plan-first`."
-        ) from exc
+        raise AgentLoopError(unreadable_message.format(exc)) from exc
     if any(
         record.metadata.role == "reviewer" and record.metadata.state == "approved"
         for record in plan_records
     ):
-        evidence.append("an approved planning review")
+        from .plan_verification import build_plan_approval_inputs, classify_plan_approval
+
+        try:
+            classification = classify_plan_approval(
+                comments,
+                config=config,
+                issue_number=issue_number,
+                trusted_actor=(login, actor_id),
+                inputs=build_plan_approval_inputs(
+                    runner, config=config, issue_context=issue_context
+                ),
+                execution_mode_guard=False,
+                prove_poster_incompleteness=True,
+            )
+        except AgentLoopError as exc:
+            raise AgentLoopError(unreadable_message.format(exc)) from exc
+        if classification.state == "approved":
+            proven.append(
+                f"a planning round that approved plan (hash {classification.plan_hash})"
+            )
+        elif classification.state == "undetermined":
+            uncertain.append(
+                "planning review records whose round-level approval cannot be determined "
+                f"({classification.reason})"
+            )
     plan_hashes = approved_plan_hashes_for_issue(comments, issue_number=issue_number)
     if plan_hashes:
-        evidence.append(f"an approved plan (hash {plan_hashes[-1]})")
+        proven.append(f"an approved plan (hash {plan_hashes[-1]})")
     # Our own decision records on this thread are posted to their parent
     # issue, so an undecodable one still belongs here and fails closed.
-    if issue_has_execution_decision(comments, issue_number=issue_number):
-        evidence.append("a recorded execution decision")
+    decision_evidence = issue_execution_decision_evidence(comments, issue_number=issue_number)
+    if decision_evidence == "decoded":
+        proven.append("a recorded execution decision")
+    elif decision_evidence == "unreadable":
+        uncertain.append("an execution decision record that cannot be read")
     # Every handoff counts, not only the latest: a later direct-flow handoff
     # to another PR does not retire the approved plan an earlier one bound.
     approved_handoff_prs: list[int] = []
@@ -905,19 +940,26 @@ def _refuse_plain_mode_over_planning(
             ):
                 approved_handoff_prs.append(handoff.pr_number)
     if approved_handoff_prs:
-        evidence.append(
+        proven.append(
             "an approved-plan implementation handoff to "
             + ", ".join(f"PR #{number}" for number in approved_handoff_prs)
         )
     if unreadable_handoff:
-        evidence.append("an implementation handoff record that cannot be read")
-    if not evidence:
-        return
-    raise AgentLoopError(
-        f"Issue #{issue_number} already carries {', '.join(evidence)}; plain issue mode "
-        "implements from the issue text and would bypass the reviewed plan. Rerun "
-        f"`agent-loop issue {issue_number} --plan-first` to resume from the approved plan."
-    )
+        uncertain.append("an implementation handoff record that cannot be read")
+    if proven:
+        raise AgentLoopError(
+            f"Issue #{issue_number} already carries {', '.join([*proven, *uncertain])}; "
+            "plain issue mode implements from the issue text and would bypass the reviewed "
+            f"plan. Rerun `agent-loop issue {issue_number} --plan-first` to resume from the "
+            "approved plan."
+        )
+    if uncertain:
+        raise AgentLoopError(
+            f"Issue #{issue_number} carries planning records whose approval state cannot be "
+            f"determined ({', '.join(uncertain)}); plain issue mode will not implement over "
+            f"them. Rerun `agent-loop issue {issue_number} --plan-first` to resolve the "
+            "planning state."
+        )
 
 
 def _post_child_planning_handoff(

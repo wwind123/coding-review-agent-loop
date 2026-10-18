@@ -13715,45 +13715,252 @@ def test_1088_plain_issue_mode_refuses_top_level_issue_with_execution_decision(t
     assert "a recorded execution decision" in message
 
 
+def _m1090_plan_history(tmp_path, **reviews):
+    """Authenticated history of a real plan-first run with Codex and Gemini.
+
+    The run's approval announcement and execution decision are dropped, as
+    when the process stops between round approval and those records.
+    """
+    runner = FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        authenticated_actor=_M1088_ACTOR,
+        serve_rest_issue_comments=True,
+        **reviews,
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), max_rounds=6,
+        plan_execution_mode="plan-only", agent_max_retries=0,
+    )
+    try:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    except AgentLoopError:
+        pass  # A split or abandoned round stops when scripted outputs run out.
+    return [
+        comment
+        for comment in runner.issue_comments
+        if "AGENT_PLAN_APPROVED_FOLLOWUPS" not in comment["body"]
+        and "AGENT_PLAN_EXECUTION_DECISION" not in comment["body"]
+    ]
+
+
+def _m1090_gemini_review(state):
+    if state == "approved":
+        return structured_plan_review(state="approved", reviewer="Google Gemini")
+    return structured_plan_review(
+        state="blocking", reviewer="Google Gemini", summary="Missing owner.",
+        blocking_plan_issues=["Name the rollout owner."],
+    )
+
+
+def _m1090_complete_history(tmp_path):
+    return _m1090_plan_history(
+        tmp_path,
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[_m1090_gemini_review("approved")],
+    )
+
+
+def _m1090_legacy_history(*reviews):
+    """Legacy plan coder and reviewer records: no contract, binding or lineage."""
+    plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    comments = [
+        _m1088_comment(
+            _attach_round_metadata(
+                plan,
+                PostedRoundMetadata(
+                    flow="plan", role="coder", agent="Claude", round_number=1,
+                    subject=_plan_subject(plan),
+                ),
+            ),
+            created_at="2026-05-23T00:00:00Z",
+        )
+    ]
+    for index, (agent, signature, state) in enumerate(reviews, start=1):
+        review = (
+            structured_plan_review(state="approved", reviewer=signature)
+            if state == "approved"
+            else structured_plan_review(
+                state="blocking", reviewer=signature, summary="Missing owner.",
+                blocking_plan_issues=["Name the rollout owner."],
+            )
+        )
+        comments.append(
+            _m1088_comment(
+                _attach_round_metadata(
+                    review,
+                    PostedRoundMetadata(
+                        flow="plan", role="reviewer", agent=agent, round_number=1,
+                        subject=_plan_subject(plan), state=state,
+                    ),
+                ),
+                created_at=f"2026-05-23T00:00:0{index}Z",
+            )
+        )
+    return comments
+
+
+def _m1090_assert_no_approval_claim(message):
+    assert "approved plan" not in message
+    assert "reviewed plan" not in message
+    assert "resume from the approved plan" not in message
+
+
 def test_1088_plain_issue_mode_refuses_approved_review_without_announcement(tmp_path):
     # Approval can be durable in the planning rounds before the announcement
     # and decision are posted (a preflight stop or an interrupted process).
-    plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    # #1090: the round as a whole must have approved the plan.
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    history = _m1090_complete_history(tmp_path)
+    classification = classify_plan_approval(
+        [
+            SimpleNamespace(body=c["body"], author=c["author"]["login"], author_id=c["_rest_author_id"])
+            for c in history
+        ],
+        config=make_config(tmp_path), issue_number=56, trusted_actor=_M1088_ACTOR,
+        execution_mode_guard=False,
+    )
+    assert classification.state == "approved"
+    runner = _m1088_runner(history)
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert f"a planning round that approved plan (hash {classification.plan_hash})" in message
+    assert "resume from the approved plan" in message
+
+
+def test_1090_split_plan_round_lets_plain_issue_mode_run(tmp_path):
+    history = _m1090_plan_history(
+        tmp_path,
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[_m1090_gemini_review("blocking")],
+    )
+    runner = _m1088_runner(history)
+
+    _m1088_assert_ran_directly(runner, make_config(tmp_path))
+    # Plain mode posted no planning record over the split round.
+    assert not [
+        c for c in runner.issue_comments[len(history):] if "AGENT_PLAN_STATE" in c["body"]
+    ]
+
+
+def test_1090_abandoned_partial_approval_round_lets_plain_issue_mode_run(tmp_path):
+    # Codex approved; the run stopped before Gemini ever reviewed.
+    history = _m1090_plan_history(
+        tmp_path, codex_outputs=[structured_plan_review(state="approved")],
+    )
+    runner = _m1088_runner(history)
+
+    _m1088_assert_ran_directly(runner, make_config(tmp_path))
+
+
+def test_1090_legacy_split_round_lets_plain_issue_mode_run(tmp_path):
+    runner = _m1088_runner(
+        _m1090_legacy_history(
+            ("Codex", "OpenAI Codex", "approved"),
+            ("Gemini", "Google Gemini", "blocking"),
+        )
+    )
+
+    _m1088_assert_ran_directly(runner, make_config(tmp_path))
+
+
+def test_1090_poster_incompleteness_proof_is_opt_in(tmp_path):
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    comments = [
+        SimpleNamespace(body=c["body"], author=c["author"]["login"], author_id=c["_rest_author_id"])
+        for c in _m1090_legacy_history(
+            ("Codex", "OpenAI Codex", "approved"),
+            ("Gemini", "Google Gemini", "blocking"),
+        )
+    ]
+
+    def classify(**kwargs):
+        return classify_plan_approval(
+            comments, config=make_config(tmp_path), issue_number=56,
+            trusted_actor=_M1088_ACTOR, execution_mode_guard=False, **kwargs,
+        )
+
+    default = classify()
+    assert default.state == "undetermined"
+    assert "unanchored plain plan history" in default.reason
+    proven = classify(prove_poster_incompleteness=True)
+    assert proven.state == "unfinished"
+    assert proven.reason == "the latest legacy plan round is provably incomplete"
+
+
+def test_1090_undetermined_planning_state_refuses_without_claiming_approval(tmp_path):
+    # Legacy poster-only history where the sole poster approved: posters
+    # prove membership, never completion, so the guard fails closed.
+    runner = _m1088_runner(_m1090_legacy_history(("Codex", "OpenAI Codex", "approved")))
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "approval state cannot be determined" in message
+    assert "round-level approval cannot be determined" in message
+    _m1090_assert_no_approval_claim(message)
+
+
+def test_1090_malformed_plan_lineage_refuses_as_unreadable(tmp_path):
+    from coding_review_agent_loop.board_change import (
+        PLAN_BOARD_CHANGE_LINK_HEADING,
+        PLAN_BOARD_CHANGE_LINK_MARKER,
+    )
+
+    history = _m1090_complete_history(tmp_path)
+    history.append(
+        _m1088_comment(
+            f"{PLAN_BOARD_CHANGE_LINK_HEADING}\n<!-- {PLAN_BOARD_CHANGE_LINK_MARKER}: e30= -->",
+            created_at="2099-01-01T00:00:00Z",
+        )
+    )
+    runner = _m1088_runner(history)
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "planning round records that cannot be read" in message
+    _m1090_assert_no_approval_claim(message)
+
+
+def test_1090_unreadable_handoff_only_refuses_without_claiming_approval(tmp_path):
+    runner = _m1088_runner(
+        [_m1088_comment("<!-- AGENT_ISSUE_PR_HANDOFF: bm90LWpzb24 -->")]
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "an implementation handoff record that cannot be read" in message
+    assert "approval state cannot be determined" in message
+    _m1090_assert_no_approval_claim(message)
+
+
+def test_1090_unreadable_execution_decision_only_refuses_without_claiming_approval(tmp_path):
+    runner = _m1088_runner(
+        [_m1088_comment("<!-- AGENT_PLAN_EXECUTION_DECISION: bm90LWpzb24 -->")]
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "an execution decision record that cannot be read" in message
+    assert "approval state cannot be determined" in message
+    _m1090_assert_no_approval_claim(message)
+
+
+def test_1090_proven_approval_keeps_approval_wording_beside_unreadable_records(tmp_path):
+    plan_hash = approved_plan_hash("Plan:\n- Make the change.")
     runner = _m1088_runner(
         [
-            _m1088_comment(
-                _attach_round_metadata(
-                    plan,
-                    PostedRoundMetadata(
-                        flow="plan",
-                        role="coder",
-                        agent="Claude",
-                        round_number=1,
-                        subject=_plan_subject(plan),
-                    ),
-                ),
-                created_at="2026-05-23T00:00:00Z",
-            ),
-            _m1088_comment(
-                _attach_round_metadata(
-                    structured_plan_review(state="approved"),
-                    PostedRoundMetadata(
-                        flow="plan",
-                        role="reviewer",
-                        agent="Codex",
-                        round_number=1,
-                        subject=_plan_subject(plan),
-                        state="approved",
-                    ),
-                ),
-                created_at="2026-05-23T00:00:01Z",
-            ),
+            _m1088_comment(_m1088_approval_body(56, plan_hash), created_at="2026-05-23T00:00:01Z"),
+            _m1088_comment("<!-- AGENT_ISSUE_PR_HANDOFF: bm90LWpzb24 -->"),
         ]
     )
 
     message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
 
-    assert "an approved planning review" in message
+    assert f"an approved plan (hash {plan_hash})" in message
+    assert "an implementation handoff record that cannot be read" in message
+    assert "resume from the approved plan" in message
 
 
 def test_1088_plain_issue_mode_sees_approval_beyond_projection_cap(tmp_path):
@@ -13869,7 +14076,10 @@ class _M1088ApprovalAfterFirstSnapshotRunner(FakeRunner):
         if list(args[:3]) == ["gh", "issue", "view"]:
             self.issue_view_calls += 1
             if self.issue_view_calls == 1:
-                self.issue_comments.append(self._approval)
+                if isinstance(self._approval, list):
+                    self.issue_comments.extend(self._approval)
+                else:
+                    self.issue_comments.append(self._approval)
         return result
 
 
@@ -13888,6 +14098,40 @@ def test_1088_plain_issue_mode_rechecks_fresh_snapshot_before_dispatch(tmp_path)
     assert f"an approved plan (hash {plan_hash})" in message
     # The first snapshot was clean; only the fresh pre-dispatch one refused.
     assert runner.issue_view_calls >= 2
+
+
+def test_1090_fresh_snapshot_recheck_refuses_round_approval_completed_after_first_snapshot(
+    tmp_path,
+):
+    # A concurrent plan-first run completes round approval (no announcement,
+    # decision or handoff) after the first snapshot; the fresh guard refuses.
+    history = _m1090_complete_history(tmp_path)
+    runner = _M1088ApprovalAfterFirstSnapshotRunner(
+        history,
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        authenticated_actor=_M1088_ACTOR,
+        serve_rest_issue_comments=True,
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "a planning round that approved plan (hash " in message
+    assert "resume from the approved plan" in message
+    assert runner.issue_view_calls >= 2
+
+
+def test_1090_foreign_complete_planning_round_does_not_block_direct_mode(tmp_path):
+    # A complete, approving planning round authored by a foreign actor is
+    # filtered out before classification.
+    forged = ("mallory", 777)
+    history = [
+        {**comment, "author": {"login": forged[0]}, "_rest_author_id": forged[1]}
+        for comment in _m1090_complete_history(tmp_path)
+    ]
+    runner = _m1088_runner(history)
+
+    _m1088_assert_ran_directly(runner, make_config(tmp_path))
 
 
 def test_1088_plain_issue_mode_without_planning_records_needs_no_rest_history(tmp_path):
