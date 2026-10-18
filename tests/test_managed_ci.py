@@ -15,7 +15,6 @@ import pytest
 
 import orchestrator_split_guard
 import coding_review_agent_loop.managed_ci as managed_ci
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.workdirs import github_api_cwd
 
 from coding_review_agent_loop.errors import AgentLoopError
@@ -80,7 +79,7 @@ from coding_review_agent_loop.protocol_markers import (
     PR_COMMENT_SURFACE,
     protocol_record_label,
 )
-from coding_review_agent_loop.orchestrator import (
+from coding_review_agent_loop.pr_loop_support import (
     _finalize_ordinary_recovery_merge,
     _render_ci_rerun_command,
     _stop_on_terminal_without_status,
@@ -99,6 +98,18 @@ from agent_loop_helpers import (
     structured_coder_followup,
     structured_pr_review,
 )
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 
 WORKFLOW = """
@@ -705,12 +716,12 @@ class _ReviewReached(Exception):
 
 
 def _stop_after_real_activation(monkeypatch, captured_resume=None):
-    monkeypatch.setattr(
-        orchestrator,
-        "_freeze_prompt_architecture",
+    patch_attr_in(monkeypatch, (
+        architecture_contract, pr_loop, issue_implementation, issue_loop,
+    ), "_freeze_prompt_architecture",
         lambda _runner, config, **_kwargs: config,
     )
-    real_activate_managed_ci = orchestrator.activate_managed_ci
+    real_activate_managed_ci = pr_loop.activate_managed_ci
 
     def activate_then_stop(*args, **kwargs):
         if captured_resume is not None:
@@ -719,20 +730,20 @@ def _stop_after_real_activation(monkeypatch, captured_resume=None):
         raise _ActivationReached(result)
 
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "activate_managed_ci",
         activate_then_stop,
     )
 
 
 def _stop_after_real_reviewer(monkeypatch, captured=None):
-    monkeypatch.setattr(
-        orchestrator,
-        "_freeze_prompt_architecture",
+    patch_attr_in(monkeypatch, (
+        architecture_contract, pr_loop, issue_implementation, issue_loop,
+    ), "_freeze_prompt_architecture",
         lambda _runner, config, **_kwargs: config,
     )
-    real_activate_managed_ci = orchestrator.activate_managed_ci
-    real_post_pr_comment = orchestrator.post_pr_comment
+    real_activate_managed_ci = pr_loop.activate_managed_ci
+    real_post_pr_comment = pr_loop_support.post_pr_comment
 
     def activate_and_capture(*args, **kwargs):
         result = real_activate_managed_ci(*args, **kwargs)
@@ -747,8 +758,10 @@ def _stop_after_real_reviewer(monkeypatch, captured=None):
             raise _ReviewReached
         return result
 
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", activate_and_capture)
-    monkeypatch.setattr(orchestrator, "post_pr_comment", post_and_stop)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", activate_and_capture)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", post_and_stop)
 
 
 def _workflow_runner_for_issue_authorization(
@@ -810,7 +823,7 @@ def test_run_pr_loop_ordinary_resume_uses_real_durable_recovery_and_activation(
     _stop_after_real_activation(monkeypatch)
 
     with pytest.raises(_ActivationReached):
-        orchestrator.run_pr_loop(
+        pr_loop.run_pr_loop(
             runner, pr_number=7, config=config, workdirs_ready=True,
         )
 
@@ -847,7 +860,7 @@ def test_run_pr_loop_fresh_recovery_uses_real_authorization_and_activation(
     _stop_after_real_activation(monkeypatch)
 
     with pytest.raises(_ActivationReached):
-        orchestrator.run_pr_loop(
+        pr_loop.run_pr_loop(
             runner, pr_number=7, config=config, workdirs_ready=True,
         )
 
@@ -921,7 +934,7 @@ def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_gr
     _stop_after_real_reviewer(monkeypatch, captured)
 
     with pytest.raises(_ReviewReached):
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     records = [
         (comment["id"], record)
@@ -2107,31 +2120,31 @@ def test_issue_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
     qualified_heads = []
     merges = []
     handoffs = []
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: root)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", lambda *_a, **_k: root)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop, "activate_managed_ci",
         lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
     )
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
-    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "managed_label_present", lambda *_a, **_k: True)
     monkeypatch.setattr(
-        orchestrator, "dispatch_final_qualification",
+        pr_loop, "dispatch_final_qualification",
         lambda *_a, **kwargs: qualified_heads.append(kwargs["expected_head_sha"]),
     )
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes)
+        pr_loop, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes)
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **kwargs: merges.append(kwargs))
-    real_publish = orchestrator.publish_issue_created_continuity_authorization
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *_a, **kwargs: merges.append(kwargs))
+    real_publish = pr_loop.publish_issue_created_continuity_authorization
 
     def publish(*args, **kwargs):
         continued = real_publish(*args, **kwargs)
         handoffs.append((kwargs, continued))
         return continued
 
-    monkeypatch.setattr(orchestrator, "publish_issue_created_continuity_authorization", publish)
+    monkeypatch.setattr(pr_loop, "publish_issue_created_continuity_authorization", publish)
 
-    assert orchestrator.run_pr_loop(
+    assert pr_loop.run_pr_loop(
         runner, pr_number=7, config=config, managed_ci_handoff=root,
         managed_ci_issue_number=643,
     ) == 0
@@ -2241,31 +2254,31 @@ def test_managed_a_to_b_failure_shows_superseded_a_and_open_b_in_the_second_repa
     qualified_heads = []
     merges = []
     handoffs = []
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: root)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", lambda *_a, **_k: root)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop, "activate_managed_ci",
         lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
     )
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
-    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "managed_label_present", lambda *_a, **_k: True)
     monkeypatch.setattr(
-        orchestrator, "dispatch_final_qualification",
+        pr_loop, "dispatch_final_qualification",
         lambda *_a, **kwargs: qualified_heads.append(kwargs["expected_head_sha"]),
     )
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes)
+        pr_loop, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes)
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **kwargs: merges.append(kwargs))
-    real_publish = orchestrator.publish_issue_created_continuity_authorization
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *_a, **kwargs: merges.append(kwargs))
+    real_publish = pr_loop.publish_issue_created_continuity_authorization
 
     def publish(*args, **kwargs):
         continued = real_publish(*args, **kwargs)
         handoffs.append((kwargs, continued))
         return continued
 
-    monkeypatch.setattr(orchestrator, "publish_issue_created_continuity_authorization", publish)
+    monkeypatch.setattr(pr_loop, "publish_issue_created_continuity_authorization", publish)
 
-    assert orchestrator.run_pr_loop(
+    assert pr_loop.run_pr_loop(
         runner, pr_number=7, config=config, managed_ci_handoff=root,
         managed_ci_issue_number=643,
     ) == 0
@@ -2379,31 +2392,31 @@ def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualif
     qualified_heads = []
     merges = []
     handoffs = []
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: root)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", lambda *_a, **_k: root)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop, "activate_managed_ci",
         lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
     )
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
-    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "managed_label_present", lambda *_a, **_k: True)
     monkeypatch.setattr(
-        orchestrator, "dispatch_final_qualification",
+        pr_loop, "dispatch_final_qualification",
         lambda *_a, **kwargs: qualified_heads.append(kwargs["expected_head_sha"]),
     )
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes)
+        pr_loop, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes)
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **kwargs: merges.append(kwargs))
-    real_publish = orchestrator.publish_issue_created_continuity_authorization
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *_a, **kwargs: merges.append(kwargs))
+    real_publish = pr_loop.publish_issue_created_continuity_authorization
 
     def publish(*args, **kwargs):
         continued = real_publish(*args, **kwargs)
         handoffs.append((kwargs, continued))
         return continued
 
-    monkeypatch.setattr(orchestrator, "publish_issue_created_continuity_authorization", publish)
+    monkeypatch.setattr(pr_loop, "publish_issue_created_continuity_authorization", publish)
 
-    assert orchestrator.run_pr_loop(
+    assert pr_loop.run_pr_loop(
         runner, pr_number=7, config=config, managed_ci_handoff=root,
         managed_ci_issue_number=643,
     ) == 0
@@ -5712,9 +5725,9 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
         pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
         released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
     )
-    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "wait_for_ordinary_recovery",
         lambda *args, **kwargs: SimpleNamespace(
             status="passed",
@@ -5726,14 +5739,14 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
             head_sha="abc123",
         ),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
     )
     merged: list[tuple[int, str | None]] = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "merge_pr",
         lambda _runner, _config, number, *, expected_head_sha: merged.append((number, expected_head_sha)),
     )
@@ -5769,9 +5782,9 @@ def test_ordinary_fallback_unreadable_protection_requires_clean_after_ready(
         pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
         released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
     )
-    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "wait_for_ordinary_recovery",
         lambda *args, **kwargs: SimpleNamespace(
             status="passed",
@@ -5784,9 +5797,9 @@ def test_ordinary_fallback_unreadable_protection_requires_clean_after_ready(
             head_sha="abc123",
         ),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
     )
     events: list[str] = []
@@ -5797,10 +5810,10 @@ def test_ordinary_fallback_unreadable_protection_requires_clean_after_ready(
         events.append("probe")
         return PullRequestMergeability("mergeable", "MERGEABLE", states.pop(0), "abc123", "main")
 
-    monkeypatch.setattr(orchestrator, "get_pr_mergeability", fake_mergeability)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "get_pr_mergeability", fake_mergeability)
     merged: list[tuple[int, str | None]] = []
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "merge_pr",
         lambda _runner, _config, number, *, expected_head_sha: merged.append((number, expected_head_sha)),
     )
@@ -5985,9 +5998,9 @@ def test_ordinary_fallback_protection_unreadable_stops_with_guidance(tmp_path, m
         pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
         released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
     )
-    monkeypatch.setattr(orchestrator, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
+    monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop_support,
         "wait_for_ordinary_recovery",
         lambda *args, **kwargs: SimpleNamespace(
             status="protection_unreadable",
@@ -5999,12 +6012,12 @@ def test_ordinary_fallback_protection_unreadable_stops_with_guidance(tmp_path, m
             head_sha="abc123",
         ),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_pr_review_context",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
+    ), "get_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
     )
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("must not merge"))
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("must not merge"))
 
     with pytest.raises(AgentLoopError, match="branch protection is unreadable"):
         _finalize_ordinary_recovery_merge(runner, config=config, pr_number=7, capability=capability)
@@ -10349,7 +10362,7 @@ def test_run_pr_loop_resumes_unreadable_pr_where_protection_reads_voluntary(
     _stop_after_real_activation(monkeypatch, captured)
 
     with pytest.raises(_ActivationReached) as exc_info:
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     contract = exc_info.value.args[0]
     assert contract is not None
@@ -10430,7 +10443,7 @@ def test_run_pr_loop_recovers_unreadable_pr_and_activates_with_both_waivers(
     _stop_after_real_activation(monkeypatch, captured)
 
     with pytest.raises(_ActivationReached) as exc_info:
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     contract = exc_info.value.args[0]
     assert contract is not None
@@ -10491,7 +10504,7 @@ def test_run_pr_loop_refuses_strict_transition_with_foreign_plan_hash(tmp_path, 
     _stop_after_real_activation(monkeypatch)
 
     with pytest.raises(AgentLoopError, match="live assessment is strict"):
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     _no_lifecycle_writes(runner)
 
@@ -11295,12 +11308,13 @@ def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_a
             "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
         ),
     )
-    monkeypatch.setattr(
-        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    patch_attr_in(monkeypatch, (
+        architecture_contract, pr_loop, issue_implementation, issue_loop,
+    ), "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
     )
     captured = {}
-    real_activate = orchestrator.activate_managed_ci
-    real_source_auth = orchestrator.authenticate_source_managed_resume
+    real_activate = pr_loop.activate_managed_ci
+    real_source_auth = pr_loop.authenticate_source_managed_resume
     source_auth_calls = []
 
     def source_auth(*args, **kwargs):
@@ -11320,16 +11334,16 @@ def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_a
         # The run fails after review and before publication.
         raise AgentLoopError("dispatch aborted")
 
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", activate)
-    monkeypatch.setattr(orchestrator, "authenticate_source_managed_resume", source_auth)
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", abort_dispatch)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", activate)
+    monkeypatch.setattr(pr_loop, "authenticate_source_managed_resume", source_auth)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", abort_dispatch)
     monkeypatch.setattr(
-        orchestrator, "publish_manual_v2_qualification",
+        pr_loop, "publish_manual_v2_qualification",
         lambda *a, **k: pytest.fail("publication must not run"),
     )
 
     with pytest.raises(AgentLoopError, match="dispatch aborted"):
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     # Entry released the retained label before recovery classified the PR,
     # so the real classifier saw ready/unlabeled.
@@ -11346,7 +11360,7 @@ def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_a
         assert captured["resume"].source_branch == "feature/source"
     else:
         assert source_auth_calls == []
-    assert orchestrator._preserve_issue_created_managed_suppression(
+    assert pr_loop_support._preserve_issue_created_managed_suppression(
         contract, active_exception=AgentLoopError("dispatch aborted"),
     )
     # Exactly one release, then the existing re-entry: undo readiness first,
@@ -11360,10 +11374,10 @@ def test_m1047_real_reentry_releases_at_entry_then_undo_relabels_and_preserves_a
     def stop_at_activation(*args, **kwargs):
         raise _ActivationReached(kwargs.get("managed_resume"))
 
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", stop_at_activation)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", stop_at_activation)
     before = len(runner.commands)
     with pytest.raises(_ActivationReached) as reached:
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     assert reached.value.args[0].lifecycle == "draft-labeled"
     assert reached.value.args[0].origin == origin
@@ -11380,12 +11394,13 @@ def test_m1047_real_implicit_invocation_releases_then_stops_with_retry_command(
         tmp_path, auto_merge=True, managed_ci_pr_mode=True,
         managed_ci_trusted_actor="agent-loop",
     )
-    monkeypatch.setattr(
-        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    patch_attr_in(monkeypatch, (
+        architecture_contract, pr_loop, issue_implementation, issue_loop,
+    ), "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
     )
 
     with pytest.raises(AgentLoopError, match="ready/unlabeled re-entry state") as raised:
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     assert "It was left unchanged; rerun with explicit `--managed-ci`" in str(raised.value)
     # One entry release, then the implicit path stops with the PR ready and
@@ -13305,9 +13320,9 @@ def test_m1067_recovery_incapable_draft_labeled_resume_reports_measured_state(
     assert _m1067_label_posts(runner) == []
 
     # The orchestrator prints this measured report, not the unmeasured line.
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *args, **kwargs: contract)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *args, **kwargs: contract)
     loop_runner = FakeRunner()
-    assert orchestrator.run_pr_loop(
+    assert pr_loop.run_pr_loop(
         loop_runner, pr_number=7, config=make_config(tmp_path / "loop", auto_merge=True),
     ) == 0
     out = capsys.readouterr().out
@@ -13394,8 +13409,9 @@ def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligatio
         ),
         **kwargs,
     )
-    monkeypatch.setattr(
-        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    patch_attr_in(monkeypatch, (
+        architecture_contract, pr_loop, issue_implementation, issue_loop,
+    ), "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
     )
 
     def board(protection):
@@ -13409,38 +13425,41 @@ def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligatio
         )
 
     state = {"protection": "forbidden"}
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *a, **k: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *a, **k: None)
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification",
+        pr_loop, "wait_for_final_qualification",
         lambda *a, **k: ManagedCiOutcome(
             status="passed", checks=board(state["protection"]), head_sha="abc123"
         ),
     )
-    monkeypatch.setattr(
-        orchestrator, "_mergeability_for_unreadable_protection",
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_mergeability_for_unreadable_protection",
         lambda *a, **k: PullRequestMergeability(
             state="mergeable", mergeable_raw="MERGEABLE", merge_state_raw="DRAFT",
             head_sha="abc123", base_branch="main",
         ),
     )
     finalized = []
-    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *a, **k: finalized.append("prepare"))
-    monkeypatch.setattr(orchestrator, "_merge_with_exact_head_proof", lambda *a, **k: finalized.append("merge"))
+    monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *a, **k: finalized.append("prepare"))
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_merge_with_exact_head_proof", lambda *a, **k: finalized.append("merge"))
     monkeypatch.setattr(
-        orchestrator, "publish_manual_v2_qualification",
+        pr_loop, "publish_manual_v2_qualification",
         lambda *a, **k: finalized.append("publish") or "abc123",
     )
-    real_activate = orchestrator.activate_managed_ci
+    real_activate = pr_loop.activate_managed_ci
     lifecycles = []
 
     def activate(*args, **kwargs):
         lifecycles.append(kwargs["managed_resume"].lifecycle)
         return real_activate(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", activate)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", activate)
 
     with pytest.raises(AgentLoopError, match="administration: read"):
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
     assert lifecycles == ["draft-labeled"]
     assert finalized == []
     assert _lifecycle_writes(runner) == []  # no label, ready, or merge write
@@ -13464,7 +13483,7 @@ def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligatio
 
     # Protection becomes readable: resume the SAME PR through the same real entry path.
     state["protection"] = "configured"
-    assert orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True) == 0
     assert lifecycles == ["draft-labeled", "draft-labeled"]
     assert finalized == (["prepare", "merge"] if auto_merge else ["publish"])
 
@@ -13528,7 +13547,7 @@ def test_run_pr_loop_resume_with_missing_default_checkout_clones_it(tmp_path, mo
     monkeypatch.setattr("coding_review_agent_loop.config._sync_base_branch", stop_after_clone)
 
     with pytest.raises(_CheckoutSetupReached):
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config)
 
     pull_reads = [
         cwd for command, cwd in runner.commands
@@ -13580,7 +13599,7 @@ def test_run_pr_loop_fresh_resume_with_missing_default_checkout_publishes_and_cl
     monkeypatch.setattr("coding_review_agent_loop.config._sync_base_branch", stop_after_clone)
 
     with pytest.raises(_CheckoutSetupReached):
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config)
 
     # A new grant was actually published (a write) before checkout setup,
     # from a directory that is not the missing checkout.
@@ -15342,26 +15361,27 @@ class _RecoveryRoundCommentRunner1367(_OrchestratorRoundCommentRunner):
 
 
 def _pr_loop_stubs_1367(monkeypatch, handoff_box, events):
-    monkeypatch.setattr(
-        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_k: config,
+    patch_attr_in(monkeypatch, (
+        architecture_contract, pr_loop, issue_implementation, issue_loop,
+    ), "_freeze_prompt_architecture", lambda _runner, config, **_k: config,
     )
     monkeypatch.setattr(
-        orchestrator, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff_box[0],
+        pr_loop, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff_box[0],
     )
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop, "activate_managed_ci",
         lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
     )
-    monkeypatch.setattr(orchestrator, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
-    monkeypatch.setattr(orchestrator, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "managed_label_present", lambda *_a, **_k: True)
     monkeypatch.setattr(
-        orchestrator, "dispatch_final_qualification",
+        pr_loop, "dispatch_final_qualification",
         lambda *_a, **kwargs: events.append(("qualify", kwargs["expected_head_sha"])),
     )
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *_a, **kwargs: events.append(("merge", kwargs)),
+        pr_loop_support, "merge_pr", lambda *_a, **kwargs: events.append(("merge", kwargs)),
     )
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
 
     def post_and_stop(*args, **kwargs):
         result = real_post(*args, **kwargs)
@@ -15369,7 +15389,9 @@ def _pr_loop_stubs_1367(monkeypatch, handoff_box, events):
             raise _ReviewReached
         return result
 
-    monkeypatch.setattr(orchestrator, "post_pr_comment", post_and_stop)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", post_and_stop)
 
 
 @pytest.mark.parametrize("predecessor_review", ["real", "absent", "foreign"])
@@ -15411,7 +15433,7 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
     ]
     runner.claude_outputs = [_LIVE_TARGET_FOLLOWUP_1367]
     with pytest.raises(AgentLoopError, match="live remote target"):
-        orchestrator.run_pr_loop(
+        pr_loop.run_pr_loop(
             runner, pr_number=7, config=config, managed_ci_handoff=root,
             managed_ci_issue_number=643,
         )
@@ -15464,13 +15486,13 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
     runner.claude_outputs = [_VALID_FOLLOWUP_1367]
     if predecessor_review == "real":
         with pytest.raises(_ReviewReached):
-            orchestrator.run_pr_loop(
+            pr_loop.run_pr_loop(
                 runner, pr_number=7, config=config, managed_ci_handoff=fresh,
                 managed_ci_issue_number=643,
             )
     else:
         with pytest.raises(AgentLoopError, match=_CORRELATED_1367):
-            orchestrator.run_pr_loop(
+            pr_loop.run_pr_loop(
                 runner, pr_number=7, config=config, managed_ci_handoff=fresh,
                 managed_ci_issue_number=643,
             )
@@ -15557,16 +15579,21 @@ def _m1376_plan_bound(monkeypatch):
         canonical_text="plan", plan_hash=_PLAN_1376, plan_subject="subject",
         availability="available",
     )
-    monkeypatch.setattr(orchestrator, "get_issue_context", lambda *a, **k: issue)
-    monkeypatch.setattr(orchestrator, "recover_approved_plan_context", lambda *a, **k: plan)
+    patch_attr_in(monkeypatch, (
+        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
+        plan_first_loop, issue_loop,
+    ), "get_issue_context", lambda *a, **k: issue)
+    patch_attr_in(monkeypatch, (
+        execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop,
+    ), "recover_approved_plan_context", lambda *a, **k: plan)
     walks = []
-    real_verify = orchestrator.verify_managed_pr_plan_binding
+    real_verify = pr_loop_support.verify_managed_pr_plan_binding
 
     def verify(*args, **kwargs):
         walks.append(kwargs["live_head"])
         return real_verify(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "verify_managed_pr_plan_binding", verify)
+    monkeypatch.setattr(pr_loop_support, "verify_managed_pr_plan_binding", verify)
     return {"issue_context": issue, "approved_plan_context": plan}, walks
 
 
@@ -15616,7 +15643,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     )]
     runner.claude_outputs = [_LIVE_TARGET_FOLLOWUP_1367]
     with pytest.raises(AgentLoopError, match="live remote target"):
-        orchestrator.run_pr_loop(
+        pr_loop.run_pr_loop(
             runner, pr_number=7, config=config_a, managed_ci_handoff=root,
             managed_ci_issue_number=643, **plan_bound,
         )
@@ -15641,7 +15668,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     )]
     runner.claude_outputs = [_VALID_FOLLOWUP_1367]
     with pytest.raises(_ReviewReached):
-        orchestrator.run_pr_loop(
+        pr_loop.run_pr_loop(
             runner, pr_number=7, config=config_a, managed_ci_handoff=fresh,
             managed_ci_issue_number=643, **plan_bound,
         )
@@ -15664,13 +15691,13 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
         tests_run=["pytest tests/test_foo.py"],
     )]
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification",
+        pr_loop, "wait_for_final_qualification",
         lambda *_a, metadata, **_k: managed_ci.ManagedCiOutcome(
             status="passed", head_sha=metadata.head_sha,
         ),
     )
     monkeypatch.setattr(
-        orchestrator, "publish_manual_v2_qualification",
+        pr_loop, "publish_manual_v2_qualification",
         lambda *_a, expected_head_sha, **_k: (
             events.append(("manual-qualify", expected_head_sha)) or expected_head_sha
         ),
@@ -15689,7 +15716,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
         # Every reader of that history -- the PR lineage at startup and the
         # managed-CI chain checks -- judges it by the board that governed it.
         with pytest.raises(AgentLoopError, match="differs from the board that governs it"):
-            orchestrator.run_pr_loop(
+            pr_loop.run_pr_loop(
                 runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
                 managed_ci_issue_number=643, **plan_bound,
             )
@@ -15703,7 +15730,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     if history == "tampered-before-qualification":
         # The history is rewritten after the new seat approves the final head,
         # so only the fresh qualification snapshot can see it.
-        current_post = orchestrator.post_pr_comment
+        current_post = pr_loop_support.post_pr_comment
 
         def post_then_tamper(*args, **kwargs):
             result = current_post(*args, **kwargs)
@@ -15712,9 +15739,11 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
                 _m1376_rebind_review(runner, review_id, reviewer_seat_binding(config_b))
             return result
 
-        monkeypatch.setattr(orchestrator, "post_pr_comment", post_then_tamper)
+        patch_attr_in(monkeypatch, (
+            pr_loop_support, pr_loop, issue_loop,
+        ), "post_pr_comment", post_then_tamper)
         with pytest.raises(AgentLoopError, match="No qualification or merge is permitted"):
-            orchestrator.run_pr_loop(
+            pr_loop.run_pr_loop(
                 runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
                 managed_ci_issue_number=643, **plan_bound,
             )
@@ -15722,7 +15751,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
         assert events == []
         assert not any(command[:3] == ["gh", "pr", "merge"] for command, _cwd in runner.commands)
         return
-    assert orchestrator.run_pr_loop(
+    assert pr_loop.run_pr_loop(
         runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
         managed_ci_issue_number=643, **plan_bound,
     ) == 0
@@ -15750,7 +15779,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     # qualifies the same head again.
     commands = len(runner.commands)
     events.clear()
-    assert orchestrator.run_pr_loop(
+    assert pr_loop.run_pr_loop(
         runner, pr_number=7, config=config_b, managed_ci_handoff=fresh,
         managed_ci_issue_number=643, **plan_bound,
     ) == 0
@@ -15951,10 +15980,10 @@ def _managed_loop(tmp_path, monkeypatch, outcomes, *, rerun_result=None, auto_me
         tmp_path, reviewer=("codex",), managed_ci=True, auto_merge=auto_merge, max_rounds=1,
     )
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop, "activate_managed_ci",
         lambda *a, **k: ManagedCiContract(protocol_version=2, attached_run_id=100, run_attempt=1),
     )
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *a, **k: None)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *a, **k: None)
     waits = []
     scripted = iter(outcomes)
 
@@ -15962,7 +15991,7 @@ def _managed_loop(tmp_path, monkeypatch, outcomes, *, rerun_result=None, auto_me
         waits.append(kwargs)
         return next(scripted)
 
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait)
     reruns = []
 
     def rerun(*_args, **kwargs):
@@ -15973,10 +16002,12 @@ def _managed_loop(tmp_path, monkeypatch, outcomes, *, rerun_result=None, auto_me
         )
 
     monkeypatch.setattr(pr_loop_module, "rerun_managed_attempt", rerun)
-    monkeypatch.setattr(orchestrator, "publish_manual_v2_qualification", lambda *a, **k: "abc123")
+    monkeypatch.setattr(pr_loop, "publish_manual_v2_qualification", lambda *a, **k: "abc123")
     merges = []
-    monkeypatch.setattr(orchestrator, "_merge_with_exact_head_proof", lambda *a, **k: merges.append(k))
-    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_merge_with_exact_head_proof", lambda *a, **k: merges.append(k))
+    monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *a, **k: None)
     return runner, config, waits, reruns, merges
 
 
@@ -16016,7 +16047,7 @@ def test_managed_without_auto_merge_reruns_plumbing_only_once_and_reports_final_
         [_terminal(), ManagedCiOutcome(status="passed", head_sha="abc123", attempts_used=2)],
     )
 
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
 
     # The approval entered the managed qualification wait, not the ordinary pending stop.
     assert len(waits) == 2
@@ -16038,7 +16069,7 @@ def test_managed_plumbing_failing_twice_stops_on_infrastructure(tmp_path, monkey
         tmp_path, monkeypatch, [_terminal(), _terminal(run_attempt=2)],
     )
 
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert len(reruns) == 1 and len(waits) == 2
     stop = [comment for comment in runner.comments if "CI failed only in plumbing jobs" in comment]
@@ -16057,7 +16088,7 @@ def test_managed_refused_rerun_stops_on_infrastructure(tmp_path, monkeypatch):
         ),
     )
 
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert len(reruns) == 1
     stop = [comment for comment in runner.comments if "CI failed only in plumbing jobs" in comment]
@@ -16078,7 +16109,7 @@ def test_managed_published_plumbing_failure_stops_without_rerun_or_dispatch_clai
         tmp_path, monkeypatch, [failed], auto_merge=auto_merge,
     )
 
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert reruns == [] and merges == []
     stop = [comment for comment in runner.comments if "CI failed only in plumbing jobs" in comment]
@@ -16100,7 +16131,7 @@ def test_managed_test_failure_keeps_the_managed_coder_obligation(tmp_path, monke
 
     # The coder is resumed exactly as before (its scripted output is empty).
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
 
     assert [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     assert reruns == []
@@ -16156,7 +16187,7 @@ def test_managed_plumbing_rerun_requires_a_complete_authoritative_board(tmp_path
         tmp_path, monkeypatch, [_terminal(checks=board)],
     )
 
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert reruns == [] and merges == []
     # Not classifiable: the existing terminal-without-status stop applies.
@@ -16194,7 +16225,7 @@ def test_managed_test_failure_takes_precedence_and_resumes_the_coder(tmp_path, m
     runner, config, waits, reruns, merges = _managed_loop(tmp_path, monkeypatch, outcomes)
 
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
 
     assert [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     assert len(reruns) == len(outcomes) - 1
@@ -16226,9 +16257,9 @@ def test_managed_terminal_reports_name_the_final_context_state(tmp_path, monkeyp
 
     if outcome.status == "timeout":
         with pytest.raises(AgentLoopError, match=re.escape(expected)):
-            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+            pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     else:
-        assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
         assert expected in capsys.readouterr().out
         assert any(expected in comment for comment in runner.comments)
 
@@ -16252,10 +16283,10 @@ def test_managed_skipped_board_test_is_never_plumbing_only(tmp_path, monkeypatch
     if status == "failed":
         # Not plumbing-only: the existing managed CI obligation resumes the coder.
         with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+            pr_loop.run_pr_loop(runner, pr_number=77, config=config)
         assert [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     else:
-        assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
         assert any("without publishing a correlated" in comment for comment in runner.comments)
     assert reruns == [] and merges == []
     assert not any("CI failed only in plumbing jobs" in comment for comment in runner.comments)
@@ -16274,7 +16305,7 @@ def test_managed_rerun_is_refused_once_the_shared_deadline_expires(tmp_path, mon
 
     monkeypatch.setattr(pr_loop_module.time, "monotonic", monotonic)
 
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert waits[0]["deadline"] is not None
     assert reruns == [] and merges == []
@@ -16398,7 +16429,7 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
             "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-trusted-actor", "agent-loop",
         ),
     )
-    invocation = orchestrator.resolve_invocation(config, provider="codex", role="reviewer")
+    invocation = pr_loop.resolve_invocation(config, provider="codex", role="reviewer")
     item = UnresolvedReviewItem(
         item_id="item-1", reviewer="GitHub managed exact-head CI", source_round=1,
         text="Managed CI failed on the previous head.", status="blocking",
@@ -16415,15 +16446,15 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
         failed_head_sha="old-head",
         candidate_head_sha="abc123",
         base_branch="main",
-        requirements_digest=orchestrator._qualification_digest(tuple()),
-        acquisition_digest=orchestrator._qualification_digest(
+        requirements_digest=pr_loop_support._qualification_digest(tuple()),
+        acquisition_digest=pr_loop_support._qualification_digest(
             {"Codex": (invocation.configured_model, invocation.resolved_effort, "codex")}
         ),
-        approval_digest=orchestrator._qualification_digest(approvers),
+        approval_digest=pr_loop_support._qualification_digest(approvers),
         scheduler_digest=(
             "stale-scheduler" if drift == "scheduler-digest"
-            else orchestrator._qualification_digest(
-                orchestrator._prior_item_ledger_signature((item,))
+            else pr_loop_support._qualification_digest(
+                pr_loop_support._prior_item_ledger_signature((item,))
             )
         ),
         qualification_attempt_id="555/1",
@@ -16462,11 +16493,12 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
         {"author": {"login": "coding-review-agent-loop"}, "body": approval},
         {"author": {"login": "coding-review-agent-loop"}, "body": summary},
     ]
-    monkeypatch.setattr(
-        orchestrator, "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
+    patch_attr_in(monkeypatch, (
+        architecture_contract, pr_loop, issue_implementation, issue_loop,
+    ), "_freeze_prompt_architecture", lambda _runner, config, **_kwargs: config,
     )
     activations = []
-    real_activate = orchestrator.activate_managed_ci
+    real_activate = pr_loop.activate_managed_ci
 
     def activate(*args, **kwargs):
         contract = real_activate(*args, **kwargs)
@@ -16498,19 +16530,19 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
             ),
         )
 
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", activate)
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", dispatch)
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", wait)
-    monkeypatch.setattr(
-        orchestrator, "_mergeability_for_unreadable_protection",
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", activate)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", dispatch)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait)
+    patch_attr_in(monkeypatch, (
+        pr_loop_support, pr_loop,
+    ), "_mergeability_for_unreadable_protection",
         lambda *a, **k: PullRequestMergeability(
             state="mergeable", mergeable_raw="MERGEABLE", merge_state_raw="CLEAN",
             head_sha="abc123", base_branch="main",
         ),
     )
-    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *a, **k: events.append("prepare"))
-    monkeypatch.setattr(
-        orchestrator, "_merge_with_exact_head_proof",
+    monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *a, **k: events.append("prepare"))
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_merge_with_exact_head_proof",
         lambda *a, **k: events.append(("merge", k["proof"].head_sha)),
     )
     return config, runner, activations, events
@@ -16531,7 +16563,7 @@ def test_fresh_process_resume_of_qualifying_checkpoint_dispatches_fresh_attempt_
     """#1177: real activation + posted approvals after a resumable qualification stop."""
     config, runner, activations, events = _fresh_process_qualifying_resume(tmp_path, monkeypatch)
 
-    assert orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True) == 0
 
     (contract,) = activations
     assert contract.protocol_version == 2 and contract.activation_path == "managed"
@@ -16565,10 +16597,13 @@ def test_fresh_process_resume_with_drifted_review_identity_forces_review_with_re
         events.append("review")
         raise _ReviewReached
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", review_then_stop)
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", review_then_stop)
 
     with pytest.raises(_ReviewReached):
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
 
     assert len(activations) == 1 and activations[0].attached_run_id is None
     assert events == ["review"]

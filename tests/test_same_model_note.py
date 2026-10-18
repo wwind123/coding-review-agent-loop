@@ -8,6 +8,31 @@ from coding_review_agent_loop.comment_rendering import (
     canonical_model_identity,
     same_model_panel_note,
 )
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_object_in
+
+# Every extracted module that binds each comment poster.
+_POSTER_OWNERS = {
+    "post_pr_comment": (pr_loop_support, pr_loop, issue_loop),
+    "post_issue_comment": (
+        architecture_contract,
+        validated_agent,
+        response_validation,
+        discuss_loop,
+        execution_policy,
+        child_plan_binding,
+        plan_first_loop,
+    ),
+}
 
 
 def test_canonical_model_identity_unifies_claude_and_agy_labels():
@@ -90,14 +115,16 @@ def test_resume_before_reconciliation_posts_note_exactly_once(tmp_path):
         gemini_outputs=[structured_pr_review(summary="Gemini ok.", reviewer="Google Gemini")],
     )
     config = _shared_config(tmp_path, review_parallel=True)
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
 
     def interrupt(*args, **kwargs):
         if "reconciliation" in kwargs["body"]:
             raise KeyboardInterrupt
         return real_post(*args, **kwargs)
 
-    with patch.object(orchestrator, "post_pr_comment", side_effect=interrupt):
+    with patch_object_in((
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", side_effect=interrupt):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
     assert not any("reconciliation" in c for c in runner.comments)
@@ -188,14 +215,14 @@ def test_resume_before_reconciliation_posts_note_once(tmp_path, kind, parallel):
     runner = _fallback_pair_runner(fall_back=True, plan=kind == "plan")
     config = _pair_config(tmp_path, parallel)
     attr = "post_pr_comment" if kind == "pr" else "post_issue_comment"
-    real_post = getattr(orchestrator, attr)
+    real_post = getattr(_POSTER_OWNERS[attr][0], attr)
 
     def interrupt(*args, **kwargs):
         if "reconciliation" in kwargs["body"]:
             raise KeyboardInterrupt
         return real_post(*args, **kwargs)
 
-    with patch.object(orchestrator, attr, side_effect=interrupt):
+    with patch_object_in(_POSTER_OWNERS[attr], attr, side_effect=interrupt):
         with pytest.raises(KeyboardInterrupt):
             _run(kind, runner, config)
     assert not any("reconciliation" in c for c in runner.comments)
@@ -246,7 +273,7 @@ def test_resume_after_reconciliation_posted_before_finalization(tmp_path, kind, 
     runner = _fallback_pair_runner(fall_back=True, plan=kind == "plan")
     config = _pair_config(tmp_path, parallel)
     attr = "post_pr_comment" if kind == "pr" else "post_issue_comment"
-    real_post = getattr(orchestrator, attr)
+    real_post = getattr(_POSTER_OWNERS[attr][0], attr)
 
     def post_then_interrupt(*args, **kwargs):
         result = real_post(*args, **kwargs)
@@ -254,7 +281,7 @@ def test_resume_after_reconciliation_posted_before_finalization(tmp_path, kind, 
             raise KeyboardInterrupt
         return result
 
-    with patch.object(orchestrator, attr, side_effect=post_then_interrupt):
+    with patch_object_in(_POSTER_OWNERS[attr], attr, side_effect=post_then_interrupt):
         with pytest.raises(KeyboardInterrupt):
             _run(kind, runner, config)
     assert len([c for c in runner.comments if "reconciliation" in c]) == 1
@@ -275,14 +302,14 @@ def test_resume_before_reconciliation_logs_the_note(tmp_path, kind, parallel):
     runner = _fallback_pair_runner(fall_back=True, plan=kind == "plan")
     config = _pair_config(tmp_path, parallel)
     attr = "post_pr_comment" if kind == "pr" else "post_issue_comment"
-    real_post = getattr(orchestrator, attr)
+    real_post = getattr(_POSTER_OWNERS[attr][0], attr)
 
     def interrupt(*args, **kwargs):
         if "reconciliation" in kwargs["body"]:
             raise KeyboardInterrupt
         return real_post(*args, **kwargs)
 
-    with patch.object(orchestrator, attr, side_effect=interrupt):
+    with patch_object_in(_POSTER_OWNERS[attr], attr, side_effect=interrupt):
         with pytest.raises(KeyboardInterrupt):
             _run(kind, runner, config)
     logs: list[str] = []
@@ -327,7 +354,7 @@ def test_evidence_response_pass_gains_no_reconciliation_summary(tmp_path):
         tmp_path, reviewer=("codex", "gemini"), codex_model="shared-model-1",
         gemini_model="shared-model-1",
     )
-    with pytest.raises(orchestrator.HumanDecisionRequiredError):
+    with pytest.raises(pr_loop_support.HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
     before = len([c for c in runner.comments if "reconciliation" in c])
     assert before == 1  # the authoritative round carries the note

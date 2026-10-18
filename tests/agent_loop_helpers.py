@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.agents.base import with_public_response_file_instruction
 from coding_review_agent_loop.agents.claude import (
     BACKEND as CLAUDE_BACKEND,
@@ -54,7 +53,7 @@ from coding_review_agent_loop.errors import (
     QuotaResetExceededError,
     UnknownPriorItemDispositionError,
 )
-from coding_review_agent_loop.orchestrator import (
+from coding_review_agent_loop.agent_failure import (
     _decode_public_response_json_prefix,
     _format_reset_duration,
     _failure_category,
@@ -63,9 +62,9 @@ from coding_review_agent_loop.orchestrator import (
     _is_transient_public_response,
     _parse_rate_limit_reset_seconds,
     _recover_plan_revision_human_requirements_acknowledgement,
-    _run_validated_agent,
     _split_reconstructable_plan_revision_response,
 )
+from coding_review_agent_loop.validated_agent import _run_validated_agent
 from coding_review_agent_loop.config import (
     default_agent_memory_dir,
     default_agent_workdir,
@@ -107,32 +106,36 @@ from coding_review_agent_loop.followups import (
 )
 from coding_review_agent_loop.memory import AgentMemoryContext
 from coding_review_agent_loop.migrations import MigrationValidationResult, validate_pr_migration_topology
-from coding_review_agent_loop.orchestrator import (
+from coding_review_agent_loop.comment_rendering import (
     ITEM_SUMMARY_LIMIT,
-    HUMAN_REQUIREMENTS_ACK_ITEM_ID,
-    PostedRoundMetadata,
-    ValidatedAgentResponse,
-    _apply_unresolved_item_dispositions,
-    _attach_round_metadata,
-    _collect_prior_compact_summaries,
-    _decode_round_metadata,
-    _encode_round_metadata,
     _format_unresolved_item_label,
-    _plan_subject,
     _render_public_review_comment,
-    _reconcile_human_requirements_ack_item,
     _review_freeform_summary_text,
-    _resume_pr_round,
-    _resume_plan_round,
-    _strip_round_metadata,
-    _validate_coder_followup_response,
-    _validate_plan_revision_response,
-    _validate_review_response,
-    _validate_plan_review_response,
     render_public_agent_comment,
     render_canonical_plan_revision,
     render_canonical_plan_steps,
 )
+from coding_review_agent_loop.unresolved_items import (
+    HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+    _apply_unresolved_item_dispositions,
+    _collect_prior_compact_summaries,
+    _reconcile_human_requirements_ack_item,
+    _validate_coder_followup_response,
+    _validate_review_response,
+    _validate_plan_review_response,
+)
+from coding_review_agent_loop.round_state import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+    _decode_round_metadata,
+    _encode_round_metadata,
+    _plan_subject,
+    _resume_pr_round,
+    _resume_plan_round,
+    _strip_round_metadata,
+)
+from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
+from coding_review_agent_loop.response_validation import _validate_plan_revision_response
 from coding_review_agent_loop.prompts import (
     COMPACT_PLANNING_VOLATILE_TAIL_MARKER,
     COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER,
@@ -2127,6 +2130,52 @@ def plan_decomposition_json(*phases):
             "phases": list(phases),
         }
     )
+
+
+# --- Patching a name on every module that owns it (#1186) --------------------
+
+def _require_owning_modules(modules, name):
+    """Return ``modules`` as a tuple after checking each one binds ``name``.
+
+    A typo or a stale owner fails loudly instead of creating a new attribute
+    that no production code reads.
+    """
+    modules = tuple(modules)
+    if not modules:
+        raise ValueError(f"no owning modules given for {name!r}")
+    strays = [module.__name__ for module in modules if name not in vars(module)]
+    if strays:
+        raise AttributeError(f"{', '.join(strays)} does not bind {name!r}")
+    return modules
+
+
+def patch_attr_in(monkeypatch, modules, name, value):
+    """Set ``name`` to ``value`` on each listed owning module for this test."""
+    for module in _require_owning_modules(modules, name):
+        monkeypatch.setattr(module, name, value)
+
+
+def patch_object_in(modules, name, *args, **kwargs):
+    """``patch.object`` one replacement onto each listed owning module.
+
+    The first module gets ``patch.object(module, name, *args, **kwargs)``; every
+    other module receives that same replacement object, which the context
+    manager yields.  Each module is restored on exit.
+    """
+    import contextlib
+    from unittest import mock
+
+    modules = _require_owning_modules(modules, name)
+
+    @contextlib.contextmanager
+    def patched():
+        with contextlib.ExitStack() as stack:
+            replacement = stack.enter_context(mock.patch.object(modules[0], name, *args, **kwargs))
+            for module in modules[1:]:
+                stack.enter_context(mock.patch.object(module, name, replacement))
+            yield replacement
+
+    return patched()
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

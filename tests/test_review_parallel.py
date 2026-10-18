@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import AgentLoopError, build_parser, run_issue_loop, run_pr_loop
 from coding_review_agent_loop.errors import (
     AgentInvocationError,
@@ -33,6 +32,23 @@ from agent_loop_helpers import (
 )
 from coding_review_agent_loop.agents import antigravity as agy_backend
 from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.history_export as history_export
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.review_rounds as review_rounds
+import coding_review_agent_loop.round_state as round_state
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in, patch_object_in
 
 
 def test_named_plan_parallel_seats_publish_distinct_bound_reviews(tmp_path):
@@ -773,9 +789,7 @@ def test_plan_validation_diagnostic_survives_a_new_invocation_and_is_superseded(
     )
     config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
 
-    with patch.object(
-        orchestrator,
-        "_run_structured_repair",
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair",
         return_value=(None, None, []),
     ):
         with pytest.raises(AgentInvocationError) as error:
@@ -833,7 +847,7 @@ def test_unsatisfied_plan_repair_is_deterministic_and_the_rerun_is_accepted(tmp_
     )
     config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
 
-    with patch.object(orchestrator, "attempt_repair", lambda raw, cmd, **kw: repaired_candidate):
+    with patch.object(validated_agent, "attempt_repair", lambda raw, cmd, **kw: repaired_candidate):
         with pytest.raises(AgentInvocationError) as error:
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -887,7 +901,9 @@ def test_plan_parallel_revision_validation_exhaustion_survives_resume(
         agent_max_retries=0,
     )
 
-    with patch.object(orchestrator, "_run_structured_repair", return_value=(None, None, [])):
+    with patch_object_in((
+        validated_agent, pr_loop, plan_first_loop,
+    ), "_run_structured_repair", return_value=(None, None, [])):
         with pytest.raises(AgentInvocationError) as error:
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -939,12 +955,16 @@ def test_repeated_exhausted_plan_failures_select_highest_attempt_across_invocati
     )
     config = make_config(tmp_path, agent_max_retries=0, max_rounds=1)
 
-    with patch.object(orchestrator, "_run_structured_repair", return_value=(None, None, [])):
+    with patch_object_in((
+        validated_agent, pr_loop, plan_first_loop,
+    ), "_run_structured_repair", return_value=(None, None, [])):
         with pytest.raises(AgentInvocationError):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     runner.claude_outputs = [invalid_candidate]
-    with patch.object(orchestrator, "_run_structured_repair", return_value=(None, None, [])):
+    with patch_object_in((
+        validated_agent, pr_loop, plan_first_loop,
+    ), "_run_structured_repair", return_value=(None, None, [])):
         with pytest.raises(AgentInvocationError):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -1044,10 +1064,10 @@ def test_revision_success_supersedes_diagnostic_before_a_later_same_invocation_p
 ):
     """A verified replacement must not leak its old correction into round N+1."""
     initial_plan = structured_plan_state(summary="Existing plan.")
-    initial_subject = orchestrator._plan_subject(initial_plan)
-    initial_comment = orchestrator._attach_round_metadata(
+    initial_subject = panel_evidence._plan_subject(initial_plan)
+    initial_comment = discuss_loop._attach_round_metadata(
         initial_plan,
-        orchestrator.PostedRoundMetadata(
+        panel_evidence.PostedRoundMetadata(
             flow="plan",
             role="coder",
             agent="Anthropic Claude",
@@ -1277,13 +1297,11 @@ def test_selective_parallel_pr_loop_rechecks_owner_then_only_missing_sweep_revie
             + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
         )
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
-        lambda *args, **kwargs: orchestrator.TransitionClassification("narrow", "scoped fix"),
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
+        lambda *args, **kwargs: pr_loop_support.TransitionClassification("narrow", "scoped fix"),
     )
     observed_reviewer_sessions = []
-    original_run_validated_agent = orchestrator._run_validated_agent
+    original_run_validated_agent = validated_agent._run_validated_agent
 
     def run_validated_agent_with_session_observation(*args, **kwargs):
         if kwargs.get("role") == "reviewer":
@@ -1296,9 +1314,10 @@ def test_selective_parallel_pr_loop_rechecks_owner_then_only_missing_sweep_revie
             )
         return response
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_run_validated_agent",
+    patch_attr_in(monkeypatch, (
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent",
         run_validated_agent_with_session_observation,
     )
     runner = FakeRunner(
@@ -1461,9 +1480,9 @@ def test_pr_parallel_resolves_disputed_scope_claim_and_tracks_translation_defect
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     reviewer_metadata = [
-        orchestrator._decode_round_metadata(match["payload"])
+        round_state._decode_round_metadata(match["payload"])
         for comment in runner.pr_payload["comments"]
-        if (match := orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"]))
+        if (match := discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"]))
     ]
     gemini_round_two = next(
         record for record in reviewer_metadata
@@ -1610,25 +1629,27 @@ def test_pr_parallel_resume_after_publication_does_not_duplicate_or_lose_items(t
         )],
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
 
     def interrupt_before_reconciliation(*args, **kwargs):
         if "reconciliation" in kwargs["body"]:
             raise KeyboardInterrupt
         return real_post(*args, **kwargs)
 
-    with patch.object(orchestrator, "post_pr_comment", side_effect=interrupt_before_reconciliation):
+    with patch_object_in((
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", side_effect=interrupt_before_reconciliation):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
 
     codex_publications = lambda: sum(
-        (metadata := orchestrator._decode_round_metadata(
-            orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
+        (metadata := round_state._decode_round_metadata(
+            discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
         )).agent == "Codex"
         and metadata.phase == "publication"
         and metadata.round_number == 1
         for comment in runner.pr_payload["comments"]
-        if orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        if discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
     )
     assert codex_publications() == 1
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -1688,7 +1709,7 @@ def _published_count(runner, marker):
 
 
 def _spool_files(config):
-    root = orchestrator.review_spool_root(config.agent_memory_dir)
+    root = review_rounds.review_spool_root(config.agent_memory_dir)
     return sorted(root.rglob("*.json")) if root.exists() else []
 
 
@@ -1717,11 +1738,10 @@ def test_pr_parallel_interruption_between_publications_replays_withheld_review(t
         )],
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
 
     # Stop after the first reviewer body is public but before the second one.
-    with patch.object(
-        orchestrator, "post_pr_comment",
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
         side_effect=_interrupt_on_second_review_post(real_post, markers),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -1758,10 +1778,12 @@ def test_plan_parallel_interruption_between_publications_replays_withheld_review
         )],
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
-    real_post = orchestrator.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
-    with patch.object(
-        orchestrator, "post_issue_comment",
+    with patch_object_in((
+        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
+        child_plan_binding, plan_first_loop,
+    ), "post_issue_comment",
         side_effect=_interrupt_on_second_review_post(real_post, markers),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -1808,9 +1830,8 @@ def _pr_partial_round_runner(slow_reviewer=None):
 
 
 def _interrupt_pr_round_between_publications(runner, config, markers):
-    with patch.object(
-        orchestrator, "post_pr_comment",
-        side_effect=_interrupt_on_second_review_post(orchestrator.post_pr_comment, markers),
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
+        side_effect=_interrupt_on_second_review_post(pr_loop_support.post_pr_comment, markers),
     ):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
@@ -1831,9 +1852,11 @@ def _plan_partial_round_runner():
 
 
 def _interrupt_plan_round_between_publications(runner, config, markers):
-    with patch.object(
-        orchestrator, "post_issue_comment",
-        side_effect=_interrupt_on_second_review_post(orchestrator.post_issue_comment, markers),
+    with patch_object_in((
+        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
+        child_plan_binding, plan_first_loop,
+    ), "post_issue_comment",
+        side_effect=_interrupt_on_second_review_post(architecture_contract.post_issue_comment, markers),
     ):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
@@ -1885,7 +1908,7 @@ def test_pr_partial_round_without_spool_record_stops_before_invoking(tmp_path, r
         path.unlink()
     launches_before = len(runner.reviewer_launches)
 
-    with pytest.raises(orchestrator.PartialReviewRoundError, match="partially published"):
+    with pytest.raises(review_rounds.PartialReviewRoundError, match="partially published"):
         run_pr_loop(
             runner, pr_number=77,
             config=dataclasses.replace(config, review_parallel=review_parallel),
@@ -1906,7 +1929,7 @@ def test_plan_partial_round_with_invalid_spool_record_stops_before_invoking(tmp_
         path.write_text(json.dumps(payload), encoding="utf-8")
     launches_before = len(runner.reviewer_launches)
 
-    with pytest.raises(orchestrator.PartialReviewRoundError, match="partially published"):
+    with pytest.raises(review_rounds.PartialReviewRoundError, match="partially published"):
         run_issue_loop(
             runner, issue_number=56,
             config=dataclasses.replace(config, review_parallel=review_parallel), plan_first=True,
@@ -1936,9 +1959,8 @@ def test_pr_partial_round_replays_unavailable_reviewer_without_reinvoking(tmp_pa
     config = make_config(
         tmp_path, reviewer=("codex", "gemini", "claude"), coder="codex", review_parallel=True
     )
-    with patch.object(
-        orchestrator, "post_pr_comment",
-        side_effect=_interrupt_on_second_review_post(orchestrator.post_pr_comment, markers),
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
+        side_effect=_interrupt_on_second_review_post(pr_loop_support.post_pr_comment, markers),
     ):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
@@ -2031,12 +2053,13 @@ def test_pr_partial_round_with_rejected_posted_record_stops_before_invoking(
             path.write_text(json.dumps(payload), encoding="utf-8")
     # Resume rejects the posted record (e.g. requirements changed), but its
     # body is still public on the PR.
-    monkeypatch.setattr(
-        orchestrator, "_resumed_pr_reviewer_matches_requirements", lambda *args, **kwargs: False
+    patch_attr_in(monkeypatch, (
+        response_validation, pr_loop,
+    ), "_resumed_pr_reviewer_matches_requirements", lambda *args, **kwargs: False
     )
     launches_before = len(runner.reviewer_launches)
 
-    with pytest.raises(orchestrator.PartialReviewRoundError, match="partially published"):
+    with pytest.raises(review_rounds.PartialReviewRoundError, match="partially published"):
         run_pr_loop(
             runner, pr_number=77,
             config=dataclasses.replace(config, review_parallel=review_parallel),
@@ -2071,7 +2094,7 @@ def test_pr_spooled_reviewer_falling_back_to_fresh_turn_is_synced_first(tmp_path
     runner.gemini_outputs.append(
         structured_pr_review(summary="Gemini approves on a fresh turn.", reviewer="Google Gemini")
     )
-    real_sync = orchestrator.sync_reviewer_pr_before_review
+    real_sync = pr_loop.sync_reviewer_pr_before_review
     gemini_launches_at_sync = []
 
     def recording_sync(config, runner_arg, reviewer, pr_number, pr_metadata):
@@ -2080,7 +2103,7 @@ def test_pr_spooled_reviewer_falling_back_to_fresh_turn_is_synced_first(tmp_path
         return real_sync(config, runner_arg, reviewer, pr_number, pr_metadata)
 
     launches_before = runner.reviewer_launches.count("gemini")
-    with patch.object(orchestrator, "sync_reviewer_pr_before_review", recording_sync):
+    with patch.object(pr_loop, "sync_reviewer_pr_before_review", recording_sync):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     # Gemini's replay failed, so it ran a fresh turn -- after being synced.
@@ -2090,7 +2113,7 @@ def test_pr_spooled_reviewer_falling_back_to_fresh_turn_is_synced_first(tmp_path
 
 def test_pr_spooled_reviewer_fallback_sync_failure_is_not_launched(tmp_path):
     runner, config = _held_pr_round_with_invalid_gemini_spool(tmp_path)
-    real_sync = orchestrator.sync_reviewer_pr_before_review
+    real_sync = pr_loop.sync_reviewer_pr_before_review
 
     def failing_sync(config, runner_arg, reviewer, pr_number, pr_metadata):
         if reviewer == "gemini":
@@ -2098,7 +2121,7 @@ def test_pr_spooled_reviewer_fallback_sync_failure_is_not_launched(tmp_path):
         return real_sync(config, runner_arg, reviewer, pr_number, pr_metadata)
 
     launches_before = runner.reviewer_launches.count("gemini")
-    with patch.object(orchestrator, "sync_reviewer_pr_before_review", failing_sync):
+    with patch.object(pr_loop, "sync_reviewer_pr_before_review", failing_sync):
         with pytest.raises(AgentLoopError, match="desynced"):
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -2210,7 +2233,7 @@ def test_pr_loop_parallel_withholds_healthy_review_until_failed_peer_retries(tmp
 # ---------------------------------------------------------------------------
 
 def test_pr_loop_parallel_sync_failure_isolated_from_healthy_reviewer(tmp_path):
-    real_sync = orchestrator.sync_reviewer_pr_before_review
+    real_sync = pr_loop.sync_reviewer_pr_before_review
 
     def fake_sync(config, runner, reviewer, pr_number, pr_metadata):
         if reviewer == "codex":
@@ -2224,7 +2247,7 @@ def test_pr_loop_parallel_sync_failure_isolated_from_healthy_reviewer(tmp_path):
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
 
-    with patch("coding_review_agent_loop.orchestrator.sync_reviewer_pr_before_review", fake_sync):
+    with patch("coding_review_agent_loop.pr_loop.sync_reviewer_pr_before_review", fake_sync):
         with pytest.raises(AgentLoopError, match="desynced"):
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -2329,7 +2352,10 @@ def test_pr_loop_parallel_quota_error_takes_precedence_over_other_fatal_error(tm
             raise QuotaResetExceededError("Codex quota exhausted; resets in 2h.")
         raise _OtherFatalError("Gemini failed deterministically.")
 
-    with patch.object(orchestrator, "_run_validated_agent", side_effect=fake_run_validated_agent):
+    with patch_object_in((
+        validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage,
+        issue_loop,
+    ), "_run_validated_agent", side_effect=fake_run_validated_agent):
         with pytest.raises(QuotaResetExceededError):
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -2339,7 +2365,7 @@ def test_pr_loop_parallel_quota_error_takes_precedence_over_other_fatal_error(tm
 # ---------------------------------------------------------------------------
 
 def test_plan_first_parallel_zero_pending_resume_constructs_no_executor(tmp_path):
-    from coding_review_agent_loop.orchestrator import (
+    from coding_review_agent_loop.round_state import (
         PostedRoundMetadata,
         _attach_round_metadata,
         _plan_subject,
@@ -2379,7 +2405,7 @@ def test_plan_first_parallel_zero_pending_resume_constructs_no_executor(tmp_path
     def _boom(*args, **kwargs):
         raise AssertionError("no reviewer turn was pending; a thread pool should not be constructed")
 
-    with patch("coding_review_agent_loop.orchestrator.ThreadPoolExecutor", side_effect=_boom):
+    with patch_object_in((review_rounds, discuss_loop), "ThreadPoolExecutor", side_effect=_boom):
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
     agent_commands = [cmd[0] for cmd, _cwd in runner.commands if cmd[:1] in (["claude"], ["codex"], ["gemini"])]
@@ -2477,7 +2503,7 @@ def test_plan_first_parallel_repair_isolated_between_reviewers(tmp_path):
         tmp_path, reviewer=("codex", "gemini"), review_parallel=True, agent_max_retries=0
     )
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
     assert len(repair_calls) == 1
@@ -2622,7 +2648,7 @@ def test_primary_then_panel_parallel_panel_failure_keeps_healthy_result_and_bloc
         max_rounds=3,
     )
     monkeypatch.setattr(
-        orchestrator, "merge_pr", lambda *args, **kwargs: pytest.fail("merged without panel approval")
+        pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("merged without panel approval")
     )
 
     with pytest.raises(AgentLoopError, match="missing required input from Antigravity"):
@@ -2661,7 +2687,7 @@ def test_parallel_plan_review_settles_healthy_reviewer_when_peer_returns_narrati
     )
 
     with patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair",
+        "coding_review_agent_loop.validated_agent.attempt_repair",
         lambda raw, gemini_cmd, **kwargs: structured_plan_review(
             state="blocking",
             summary="Plan review incomplete: the test command was terminated.",
@@ -2730,7 +2756,7 @@ def test_staged_planning_resume_after_publication_keeps_the_panel_finding(tmp_pa
     from coding_review_agent_loop.protocol import validate_structured_plan_state
 
     fresh = structured_v1_plan_state()
-    base = orchestrator.AuthenticatedPlanState.from_plan(
+    base = plan_first_loop.AuthenticatedPlanState.from_plan(
         validate_structured_plan_state(fresh), round_number=1
     )
     patch_payload = {
@@ -2784,7 +2810,7 @@ def test_staged_planning_resume_after_publication_keeps_the_panel_finding(tmp_pa
         ],
     )
     config = _staged_parallel_config(tmp_path)
-    real_post = orchestrator.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def interrupt_before_reconciliation(*args, **kwargs):
         if "Plan review round 2 reconciliation" in kwargs["body"]:
@@ -2794,8 +2820,10 @@ def test_staged_planning_resume_after_publication_keeps_the_panel_finding(tmp_pa
     # Round 1 settles the primary; round 2 is the reviewer-only panel round.
     # The panel publishes its blocking review and the run is then interrupted
     # at the reconciliation boundary.
-    with patch.object(
-        orchestrator, "post_issue_comment", side_effect=interrupt_before_reconciliation
+    with patch_object_in((
+        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
+        child_plan_binding, plan_first_loop,
+    ), "post_issue_comment", side_effect=interrupt_before_reconciliation
     ):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
@@ -2803,10 +2831,10 @@ def test_staged_planning_resume_after_publication_keeps_the_panel_finding(tmp_pa
     def plan_records():
         records = []
         for comment in runner.issue_comments:
-            match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+            match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
             if match is None:
                 continue
-            metadata = orchestrator._decode_round_metadata(match["payload"])
+            metadata = round_state._decode_round_metadata(match["payload"])
             if metadata.flow == "plan":
                 records.append(metadata)
         return records
@@ -2924,7 +2952,7 @@ def _approving_pr_runner():
 
 
 def _refusal_message(runner, config, *, review_parallel=True):
-    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
         run_pr_loop(
             runner, pr_number=77,
             config=dataclasses.replace(config, review_parallel=review_parallel),
@@ -3059,18 +3087,18 @@ def test_pr_partial_round_invalid_spool_record_cause(tmp_path):
 
 
 def test_replay_unavailable_cause_for_rejected_own_record_ignores_spool(tmp_path):
-    spool = orchestrator.ReviewRoundSpool(
+    spool = review_rounds.ReviewRoundSpool(
         root=tmp_path, repo="OWNER/REPO", surface="pr", number=77, round_number=1, subject="abc"
     )
     spool.store("Codex", {"text": "valid"})
 
-    cause = orchestrator._replay_unavailable_cause(spool, "Codex", own_posted=True)
+    cause = review_rounds._replay_unavailable_cause(spool, "Codex", own_posted=True)
 
     assert "already posted but no longer accepted" in cause
     assert "fresh turn" in cause
     assert "spool" not in cause
     # Without the own-record fact the same intact file is a validation failure.
-    assert "no longer validates" in orchestrator._replay_unavailable_cause(
+    assert "no longer validates" in review_rounds._replay_unavailable_cause(
         spool, "Codex", loaded_unreplayable=True
     )
 
@@ -3085,7 +3113,7 @@ def test_plan_partial_round_refusal_lists_posted_review(tmp_path):
         payload["response"]["text"] = "not a structured plan review"
         path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     message = str(excinfo.value)
@@ -3356,7 +3384,7 @@ def test_plan_partial_round_recovers_from_the_message_alone(tmp_path):
         path.unlink()
     launches_before = len(runner.reviewer_launches)
 
-    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     message = str(excinfo.value)
     assert len(runner.reviewer_launches) == launches_before
@@ -3389,7 +3417,7 @@ def test_plan_partial_round_recovers_from_the_message_alone(tmp_path):
 def test_provisional_target_without_id_but_with_url_never_prints_none():
     from coding_review_agent_loop.partial_round_recovery import RecoveryTarget
 
-    line = orchestrator._format_recovery_target(
+    line = review_rounds._format_recovery_target(
         RecoveryTarget(
             label="Codex review (round 1)", comment_id=None,
             url="https://example.test/c/1", author="bot", created_at="2026-01-01T00:00:01Z",
@@ -3398,7 +3426,7 @@ def test_provisional_target_without_id_but_with_url_never_prints_none():
     assert "comment None" not in line
     assert "id could not be determined" in line
     assert "https://example.test/c/1" in line
-    with_id = orchestrator._format_recovery_target(
+    with_id = review_rounds._format_recovery_target(
         RecoveryTarget(label="x", comment_id=7, url="https://example.test/c/7", author=None, created_at=None)
     )
     assert with_id == "- x: comment 7 https://example.test/c/7"
@@ -3419,7 +3447,7 @@ def test_recovery_keeps_known_targets_when_a_retained_reference_marker_is_undeco
     assert not recovery.verified
     assert recovery.reason == "attachment references could not be fully decoded"
     assert 1000 + verdict + 1 in {t.comment_id for t in recovery.targets}
-    message = str(orchestrator._partial_round_refusal(
+    message = str(review_rounds._partial_round_refusal(
         surface="pr", number=77, round_number=1, reviewer_name="Gemini",
         public_peers=["Codex"], recovery=lambda: recovery,
     ))
@@ -3673,10 +3701,10 @@ def test_scheduler_enabled_round_recovers_with_retained_prelaunch_and_coder(tmp_
     # The prelaunch summaries and the coder record are never advertised.
     doomed = {i - 10_001 for i in ids}
     for index, comment in enumerate(retained):
-        match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
         if match is None:
             continue
-        metadata = orchestrator._decode_round_metadata(match["payload"])
+        metadata = round_state._decode_round_metadata(match["payload"])
         if index in doomed:
             assert metadata.role != "coder" and metadata.phase != "scheduler-prelaunch"
     _delete_listed_comments(runner, ids, surface="pr")
@@ -3744,7 +3772,7 @@ def test_plan_round_with_spilled_coder_artifact_recovers_and_keeps_its_attachmen
     assert spilled, "the coder artifact did not spill into attachments"
     launches_before = len(runner.reviewer_launches)
 
-    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     message = str(excinfo.value)
 
@@ -3851,9 +3879,8 @@ def _panel_pr_config(tmp_path, **overrides):
 
 
 def _interrupt_panel_pr_round(runner, config):
-    with patch.object(
-        orchestrator, "post_pr_comment",
-        side_effect=_interrupt_on_second_review_post(orchestrator.post_pr_comment, _PANEL_MARKERS),
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
+        side_effect=_interrupt_on_second_review_post(pr_loop_support.post_pr_comment, _PANEL_MARKERS),
     ):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
@@ -3865,9 +3892,9 @@ def _interrupt_on_phase(real_post, phase, *, flow="pr", round_number=None):
     state = {"fired": False}
 
     def post(*args, **kwargs):
-        match = orchestrator.ROUND_RESUME_MARKER_RE.search(str(kwargs["body"]))
+        match = discuss_loop.ROUND_RESUME_MARKER_RE.search(str(kwargs["body"]))
         if match is not None and not state["fired"]:
-            metadata = orchestrator._decode_round_metadata(match["payload"])
+            metadata = round_state._decode_round_metadata(match["payload"])
             if (
                 metadata.flow == flow and metadata.role == "summary" and metadata.phase == phase
                 and (round_number is None or metadata.round_number == round_number)
@@ -3963,8 +3990,8 @@ def test_pr_final_sweep_refusal_deletion_and_rerun_matches_a_never_started_round
     }
     phases = []
     for comment in listed.values():
-        match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
-        metadata = orchestrator._decode_round_metadata(match["payload"])
+        match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        metadata = round_state._decode_round_metadata(match["payload"])
         phases.append((metadata.round_number, metadata.role, metadata.agent, metadata.scheduler_phase))
         # Never the primary's gating review, never a round-1 record.
         assert metadata.round_number == 2 and metadata.agent != "Codex"
@@ -3984,10 +4011,9 @@ def test_pr_final_sweep_refusal_deletion_and_rerun_matches_a_never_started_round
     # then rerun.  Deleting the listed records must restore exactly that history.
     baseline = _panel_pr_runner()
     baseline_config = _panel_pr_config(tmp_path / "baseline")
-    with patch.object(
-        orchestrator, "post_pr_comment",
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
         side_effect=_interrupt_on_phase(
-            orchestrator.post_pr_comment, "scheduler-prelaunch", round_number=2
+            pr_loop_support.post_pr_comment, "scheduler-prelaunch", round_number=2
         ),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -4028,9 +4054,8 @@ def test_pr_interrupted_primary_resumed_into_a_same_round_panel_still_launches_t
     """The primary's same-round approval gates the panel; it is not a peer."""
     runner = _panel_pr_runner()
     config = _panel_pr_config(tmp_path)
-    with patch.object(
-        orchestrator, "post_pr_comment",
-        side_effect=_interrupt_on_phase(orchestrator.post_pr_comment, "reconciliation", round_number=1),
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
+        side_effect=_interrupt_on_phase(pr_loop_support.post_pr_comment, "reconciliation", round_number=1),
     ):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
@@ -4054,7 +4079,7 @@ def test_plan_final_sweep_refuses_beside_a_public_panel_peer(tmp_path):
         path.unlink()
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     phases = [
@@ -4086,10 +4111,12 @@ def test_plan_final_sweep_with_an_intact_spool_replays_the_withheld_review(tmp_p
 def test_plan_interrupted_primary_resumed_into_a_same_round_panel_still_launches_the_panel(tmp_path):
     runner = _panel_plan_runner()
     config = _panel_plan_config(tmp_path)
-    with patch.object(
-        orchestrator, "post_issue_comment",
+    with patch_object_in((
+        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
+        child_plan_binding, plan_first_loop,
+    ), "post_issue_comment",
         side_effect=_interrupt_on_phase(
-            orchestrator.post_issue_comment, "reconciliation", flow="plan", round_number=1
+            architecture_contract.post_issue_comment, "reconciliation", flow="plan", round_number=1
         ),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -4103,9 +4130,11 @@ def test_plan_interrupted_primary_resumed_into_a_same_round_panel_still_launches
 
 
 def _interrupt_panel_plan_round(runner, config):
-    with patch.object(
-        orchestrator, "post_issue_comment",
-        side_effect=_interrupt_on_second_review_post(orchestrator.post_issue_comment, _PLAN_PANEL_MARKERS),
+    with patch_object_in((
+        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
+        child_plan_binding, plan_first_loop,
+    ), "post_issue_comment",
+        side_effect=_interrupt_on_second_review_post(architecture_contract.post_issue_comment, _PLAN_PANEL_MARKERS),
     ):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
@@ -4238,7 +4267,7 @@ def test_visibility_snapshot_keeps_refreshed_publications_when_the_checkpoint_is
     base = (record(0, "Codex"),)
     fresh = (record(0, "Codex"), record(1, "Gemini"))
 
-    records, present = orchestrator._visibility_snapshot(
+    records, present = pr_loop_support._visibility_snapshot(
         fresh_records=fresh, base_records=base, base_length=1, checkpoint=checkpoint
     )
 
@@ -4246,7 +4275,7 @@ def test_visibility_snapshot_keeps_refreshed_publications_when_the_checkpoint_is
     assert [r.metadata.agent for r in records[:2]] == ["Codex", "Gemini"]
     assert records[-1].metadata is checkpoint and records[-1].index > 1
     # A failed refresh falls back to the pre-post history plus the checkpoint.
-    records, _ = orchestrator._visibility_snapshot(
+    records, _ = pr_loop_support._visibility_snapshot(
         fresh_records=None, base_records=base, base_length=1, checkpoint=checkpoint
     )
     assert [r.metadata.agent for r in records] == ["Codex", "Orchestrator"]
@@ -4256,9 +4285,8 @@ def _same_round_panel_state(tmp_path):
     """Round 1: primary published, panel opened in the same round, one panel review public."""
     runner = _panel_pr_runner()
     config = _panel_pr_config(tmp_path)
-    with patch.object(
-        orchestrator, "post_pr_comment",
-        side_effect=_interrupt_on_phase(orchestrator.post_pr_comment, "reconciliation", round_number=1),
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
+        side_effect=_interrupt_on_phase(pr_loop_support.post_pr_comment, "reconciliation", round_number=1),
     ):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
@@ -4281,8 +4309,8 @@ def test_pr_same_round_gate_survives_verified_deletion_and_rerun(tmp_path):
     listed = []
     for index, comment in enumerate(runner.pr_payload["comments"]):
         if index + 10_001 in ids:
-            metadata = orchestrator._decode_round_metadata(
-                orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
+            metadata = round_state._decode_round_metadata(
+                discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
             )
             listed.append((metadata.role, metadata.agent, metadata.scheduler_phase))
     # The opening, the refused rerun's checkpoint and the panel review; never the primary.
@@ -4309,10 +4337,12 @@ def test_pr_same_round_gate_survives_verified_deletion_and_rerun(tmp_path):
 def test_plan_same_round_gate_is_kept_and_listing_is_verified(tmp_path):
     runner = _panel_plan_runner()
     config = _panel_plan_config(tmp_path)
-    with patch.object(
-        orchestrator, "post_issue_comment",
+    with patch_object_in((
+        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
+        child_plan_binding, plan_first_loop,
+    ), "post_issue_comment",
         side_effect=_interrupt_on_phase(
-            orchestrator.post_issue_comment, "reconciliation", flow="plan", round_number=1
+            architecture_contract.post_issue_comment, "reconciliation", flow="plan", round_number=1
         ),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -4327,7 +4357,7 @@ def test_plan_same_round_gate_is_kept_and_listing_is_verified(tmp_path):
     ]
     assert plan_phases() == ["primary", "secondary-audit"]
 
-    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     message = str(excinfo.value)
@@ -4348,7 +4378,7 @@ def test_plan_visibility_refresh_failure_falls_back_to_the_posted_checkpoint(tmp
     for path in _spool_files(config):
         path.unlink()
     launches_before = list(runner.reviewer_launches)
-    real_context = orchestrator.get_issue_context
+    real_context = discuss_loop.get_issue_context
     failures = []
 
     def flaky_context(*args, **kwargs):
@@ -4358,8 +4388,11 @@ def test_plan_visibility_refresh_failure_falls_back_to_the_posted_checkpoint(tmp
             raise AgentLoopError("transient read failure")
         return real_context(*args, **kwargs)
 
-    with patch.object(orchestrator, "get_issue_context", side_effect=flaky_context):
-        with pytest.raises(orchestrator.PartialReviewRoundError):
+    with patch_object_in((
+        discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop,
+        plan_first_loop, issue_loop,
+    ), "get_issue_context", side_effect=flaky_context):
+        with pytest.raises(review_rounds.PartialReviewRoundError):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert failures, "the post-checkpoint read was never exercised"
@@ -4423,10 +4456,9 @@ def test_pr_operator_opening_keeps_the_primary_publication_a_peer(tmp_path):
     runner.round_markers = markers
     runner.slow_reviewer = ("gemini", "agy")
     config = _panel_pr_config(tmp_path, pr_review_force_full=True)
-    with patch.object(
-        orchestrator, "post_pr_comment",
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
         side_effect=_interrupt_on_second_publication_of(
-            orchestrator.post_pr_comment, markers, first_marker="OpenAI Codex review"
+            pr_loop_support.post_pr_comment, markers, first_marker="OpenAI Codex review"
         ),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -4452,10 +4484,12 @@ def test_plan_operator_opening_keeps_the_primary_publication_a_peer(tmp_path):
     runner.round_markers = markers
     runner.slow_reviewer = ("gemini", "agy")
     config = _panel_plan_config(tmp_path, plan_review_force_full=True)
-    with patch.object(
-        orchestrator, "post_issue_comment",
+    with patch_object_in((
+        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
+        child_plan_binding, plan_first_loop,
+    ), "post_issue_comment",
         side_effect=_interrupt_on_second_publication_of(
-            orchestrator.post_issue_comment, markers, first_marker=markers[0]
+            architecture_contract.post_issue_comment, markers, first_marker=markers[0]
         ),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -4466,7 +4500,7 @@ def test_plan_operator_opening_keeps_the_primary_publication_a_peer(tmp_path):
     launches_before = list(runner.reviewer_launches)
     assert sorted(launches_before) == ["agy", "codex", "gemini"]
 
-    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert runner.reviewer_launches == launches_before
@@ -4483,7 +4517,7 @@ def test_pr_undecodable_refreshed_history_stops_before_any_launch(tmp_path):
     for path in _spool_files(config):
         path.unlink()
     launches_before = list(runner.reviewer_launches)
-    real_extract = orchestrator._extract_round_metadata_records
+    real_extract = architecture_contract._extract_round_metadata_records
     seen = []
 
     def extract(comments, *, flow):
@@ -4492,12 +4526,15 @@ def test_pr_undecodable_refreshed_history_stops_before_any_launch(tmp_path):
             raise AgentLoopError("Incomplete round metadata: sidecars are unavailable")
         return real_extract(comments, flow=flow)
 
-    with patch.object(orchestrator, "_extract_round_metadata_records", side_effect=extract):
+    with patch_object_in((
+        architecture_contract, panel_evidence, review_rounds, discuss_loop, execution_policy,
+        child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, history_export,
+    ), "_extract_round_metadata_records", side_effect=extract):
         with pytest.raises(AgentLoopError) as excinfo:
             run_pr_loop(runner, pr_number=77, config=config, **{})
 
     assert seen, "the refreshed history was never decoded"
-    assert not isinstance(excinfo.value, orchestrator.PartialReviewRoundError)
+    assert not isinstance(excinfo.value, review_rounds.PartialReviewRoundError)
     assert runner.reviewer_launches == launches_before
     assert not runner.peer_body_visible_at_launch
 
@@ -4555,10 +4592,12 @@ def test_pr_publication_hidden_by_a_ledger_mismatch_still_counts_as_a_peer(tmp_p
 def _same_round_plan_panel_state(tmp_path):
     runner = _panel_plan_runner()
     config = _panel_plan_config(tmp_path)
-    with patch.object(
-        orchestrator, "post_issue_comment",
+    with patch_object_in((
+        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
+        child_plan_binding, plan_first_loop,
+    ), "post_issue_comment",
         side_effect=_interrupt_on_phase(
-            orchestrator.post_issue_comment, "reconciliation", flow="plan", round_number=1
+            architecture_contract.post_issue_comment, "reconciliation", flow="plan", round_number=1
         ),
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -4575,10 +4614,10 @@ def test_plan_publication_stripped_as_pre_opening_still_counts_as_a_peer(tmp_pat
     comments = runner.issue_comments
 
     def role_of(comment):
-        match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
         if match is None:
             return None
-        metadata = orchestrator._decode_round_metadata(match["payload"])
+        metadata = round_state._decode_round_metadata(match["payload"])
         return (metadata.role, metadata.agent, metadata.phase, metadata.scheduler_phase)
 
     gemini = next(i for i, c in enumerate(comments) if role_of(c) == ("reviewer", "Gemini", "publication", None))
@@ -4587,7 +4626,7 @@ def test_plan_publication_stripped_as_pre_opening_still_counts_as_a_peer(tmp_pat
     comments.insert(opening, comments.pop(gemini))  # Gemini's review now precedes the opening
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert runner.reviewer_launches == launches_before
@@ -4601,21 +4640,19 @@ def _remediation_gate_state(tmp_path, monkeypatch):
     from coding_review_agent_loop.migrations import MigrationValidationResult
     from coding_review_agent_loop.review_scheduling import TransitionClassification
 
-    monkeypatch.setattr(
-        orchestrator, "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     monkeypatch.setattr(
-        orchestrator, "validate_pr_migration_topology",
+        pr_loop, "validate_pr_migration_topology",
         lambda *args, **kwargs: MigrationValidationResult(ok=True),
     )
     runner = _panel_pr_runner()
     config = _panel_pr_config(tmp_path, max_rounds=8)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     runner.pr_payload["headRefOid"] = "def456"
-    with patch.object(
-        orchestrator, "post_pr_comment",
-        side_effect=_interrupt_on_phase(orchestrator.post_pr_comment, "reconciliation"),
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
+        side_effect=_interrupt_on_phase(pr_loop_support.post_pr_comment, "reconciliation"),
     ):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
@@ -4658,9 +4695,8 @@ def test_pr_remediation_gate_resumed_into_a_same_round_final_sweep_launches_the_
 
 def test_pr_remediation_gate_is_never_listed_but_the_sweep_peers_are(tmp_path, monkeypatch):
     runner, config = _remediation_gate_state(tmp_path, monkeypatch)
-    with patch.object(
-        orchestrator, "post_pr_comment",
-        side_effect=_interrupt_on_second_review_post(orchestrator.post_pr_comment, _PANEL_MARKERS),
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
+        side_effect=_interrupt_on_second_review_post(pr_loop_support.post_pr_comment, _PANEL_MARKERS),
     ):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
@@ -4676,8 +4712,8 @@ def test_pr_remediation_gate_is_never_listed_but_the_sweep_peers_are(tmp_path, m
     listed = []
     for index, comment in enumerate(runner.pr_payload["comments"]):
         if index + 10_001 in _listed_comment_ids(message):
-            metadata = orchestrator._decode_round_metadata(
-                orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
+            metadata = round_state._decode_round_metadata(
+                discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
             )
             listed.append((metadata.role, metadata.agent, metadata.scheduler_phase))
     # Publication follows completion order, so assert whichever panel reviewer
@@ -4707,10 +4743,10 @@ def test_recovery_lists_a_secondary_remediation_verdict_beside_the_retained_gate
 
 
 def _plan_meta(comment):
-    match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+    match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
     if match is None:
         return None
-    metadata = orchestrator._decode_round_metadata(match["payload"])
+    metadata = round_state._decode_round_metadata(match["payload"])
     return metadata if metadata.flow == "plan" else None
 
 
@@ -4809,7 +4845,7 @@ def test_plan_secondary_remediation_verdict_is_a_peer_beside_the_retained_gate(t
     runner, config = _seeded_plan_remediation_state(tmp_path, secondary_published=True)
     launches_before = list(runner.reviewer_launches)
 
-    with pytest.raises(orchestrator.PartialReviewRoundError) as excinfo:
+    with pytest.raises(review_rounds.PartialReviewRoundError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     message = str(excinfo.value)
@@ -4838,7 +4874,7 @@ def test_pr_parallel_rerun_resumes_the_frozen_publication_without_reinvoking(tmp
     runner.authenticated_actor = ("agent-bot", 7)
     runner.serve_rest_issue_comments = True
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
     state = {"reviews": 0}
 
     def fail_second_review_body(*args, **kwargs):
@@ -4850,7 +4886,9 @@ def test_pr_parallel_rerun_resumes_the_frozen_publication_without_reinvoking(tmp
                     return real_post(*args, **kwargs)
         return real_post(*args, **kwargs)
 
-    with patch.object(orchestrator, "post_pr_comment", side_effect=fail_second_review_body):
+    with patch_object_in((
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", side_effect=fail_second_review_body):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
     assert sorted(_published_count(runner, marker) for marker in markers) == [0, 1]
@@ -4878,7 +4916,7 @@ def test_pr_parallel_rerun_under_a_different_actor_stops_without_posts_or_review
     runner.authenticated_actor = ("agent-bot", 7)
     runner.serve_rest_issue_comments = True
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
     state = {"reviews": 0}
 
     def fail_second_review_body(*args, **kwargs):
@@ -4889,13 +4927,15 @@ def test_pr_parallel_rerun_under_a_different_actor_stops_without_posts_or_review
                     return real_post(*args, **kwargs)
         return real_post(*args, **kwargs)
 
-    with patch.object(orchestrator, "post_pr_comment", side_effect=fail_second_review_body):
+    with patch_object_in((
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", side_effect=fail_second_review_body):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
     launches_before = len(runner.reviewer_launches)
     comments_before = len(runner.pr_payload["comments"])
     runner.authenticated_actor = ("someone-else", 99)
-    orchestrator.reset_authenticated_github_actor(runner)
+    issue_loop.reset_authenticated_github_actor(runner)
 
     with pytest.raises(PublicationResumeStop, match="id 99"):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -4908,7 +4948,7 @@ def test_pr_parallel_rerun_under_a_different_actor_stops_without_posts_or_review
 def _interrupt_plan_second_review_after_freezing(runner, config, markers):
     import coding_review_agent_loop.github as github_module
 
-    real_post = orchestrator.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
     state = {"reviews": 0}
 
     def fail_second_review_body(*args, **kwargs):
@@ -4919,7 +4959,10 @@ def _interrupt_plan_second_review_after_freezing(runner, config, markers):
                     return real_post(*args, **kwargs)
         return real_post(*args, **kwargs)
 
-    with patch.object(orchestrator, "post_issue_comment", side_effect=fail_second_review_body):
+    with patch_object_in((
+        architecture_contract, validated_agent, response_validation, discuss_loop, execution_policy,
+        child_plan_binding, plan_first_loop,
+    ), "post_issue_comment", side_effect=fail_second_review_body):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -5013,7 +5056,7 @@ def _selective_interrupted_after_freeze(tmp_path):
         tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
         pr_review_policy="selective-intermediate",
     )
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
     state = {"reviews": 0}
 
     def fail_second_review_body(*args, **kwargs):
@@ -5024,7 +5067,9 @@ def _selective_interrupted_after_freeze(tmp_path):
                     return real_post(*args, **kwargs)
         return real_post(*args, **kwargs)
 
-    with patch.object(orchestrator, "post_pr_comment", side_effect=fail_second_review_body):
+    with patch_object_in((
+        pr_loop_support, pr_loop, issue_loop,
+    ), "post_pr_comment", side_effect=fail_second_review_body):
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
     carriers = _frozen_carriers(config)
@@ -5062,7 +5107,7 @@ def test_pr_refusals_publish_no_checkpoint_and_launch_no_reviewer(tmp_path):
     launches_before = list(runner.reviewer_launches)
     comments_before = len(runner.pr_payload["comments"])
     runner.authenticated_actor = ("someone-else", 99)
-    orchestrator.reset_authenticated_github_actor(runner)
+    issue_loop.reset_authenticated_github_actor(runner)
 
     with pytest.raises(PublicationResumeStop, match="id 99"):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -5086,13 +5131,13 @@ def test_pr_already_public_anchor_is_still_checked_before_the_spool_is_discarded
     })
     comments_before = len(runner.pr_payload["comments"])
     runner.authenticated_actor = ("someone-else", 99)
-    orchestrator.reset_authenticated_github_actor(runner)
+    issue_loop.reset_authenticated_github_actor(runner)
     with pytest.raises(PublicationResumeStop, match="id 99"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert len(_frozen_carriers(config)) == 1 and len(runner.pr_payload["comments"]) == comments_before
 
     runner.authenticated_actor = ("agent-bot", 7)
-    orchestrator.reset_authenticated_github_actor(runner)
+    issue_loop.reset_authenticated_github_actor(runner)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert sum(c["body"] == carrier["bodies"][-1] for c in runner.pr_payload["comments"]) == 1
     assert _spool_files(config) == []
@@ -5110,7 +5155,7 @@ def test_pr_carrier_is_checked_before_a_fresh_peer_is_launched(tmp_path):
     ]
     launches_before = list(runner.reviewer_launches)
     runner.authenticated_actor = ("someone-else", 99)
-    orchestrator.reset_authenticated_github_actor(runner)
+    issue_loop.reset_authenticated_github_actor(runner)
 
     with pytest.raises(PublicationResumeStop):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -5129,7 +5174,7 @@ def test_plan_rerun_under_a_different_actor_stops_before_any_post_or_launch(tmp_
     launches_before = list(runner.reviewer_launches)
     comments_before = len(runner.issue_comments)
     runner.authenticated_actor = ("someone-else", 99)
-    orchestrator.reset_authenticated_github_actor(runner)
+    issue_loop.reset_authenticated_github_actor(runner)
 
     with pytest.raises(PublicationResumeStop, match="id 99"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
@@ -5303,11 +5348,11 @@ def test_pr_legacy_record_with_a_public_anchor_is_still_refused(tmp_path):
 def _plan_checkpoint_indexes(runner):
     indexes = []
     for index, comment in enumerate(runner.issue_comments):
-        match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
         if not match:
             continue
         try:
-            metadata = orchestrator._decode_round_metadata(match["payload"])
+            metadata = round_state._decode_round_metadata(match["payload"])
         except AgentLoopError:
             continue
         if metadata.role == "summary" and metadata.phase == "scheduler-prelaunch":
@@ -5501,7 +5546,7 @@ def test_pr_frozen_bodies_survive_scheduler_and_peer_drift(tmp_path, monkeypatch
     runner, config, carrier = _exhausted_pr(tmp_path, monkeypatch)
     frozen = carrier["bodies"]
     _age_everything(config, runner.pr_payload["comments"])
-    real_attach = orchestrator._attach_round_metadata
+    real_attach = discuss_loop._attach_round_metadata
 
     composed = []
 
@@ -5516,7 +5561,10 @@ def test_pr_frozen_bodies_survive_scheduler_and_peer_drift(tmp_path, monkeypatch
         return real_attach(body, metadata)
 
     launches_before = len(runner.reviewer_launches)
-    with patch.object(orchestrator, "_attach_round_metadata", side_effect=drifting):
+    with patch_object_in((
+        discuss_loop, child_plan_binding, pr_loop_support, pr_loop, issue_implementation,
+        plan_first_loop, issue_loop,
+    ), "_attach_round_metadata", side_effect=drifting):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert composed, "the drifting composition was never exercised"
@@ -5747,9 +5795,9 @@ def test_pr_peer_publication_between_attempts_changes_live_scheduler_state(tmp_p
     # records both approvals although the frozen anchor never saw them.
     states = []
     for comment in comments:
-        match = orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        match = discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
         if match:
-            states.append(orchestrator._decode_round_metadata(match["payload"]))
+            states.append(round_state._decode_round_metadata(match["payload"]))
     assert any(
         md.phase == "reconciliation" and set(md.scheduler_approved_reviewers) == {"Codex", "Gemini"}
         for md in states
@@ -5881,13 +5929,16 @@ def test_pr_peer_already_public_before_the_rerun_changes_scheduler_inputs(tmp_pa
     launches_before = len(runner.reviewer_launches)
     audits_before = len(_audit_indexes(runner))
     seen = []
-    real_attach = orchestrator._attach_round_metadata
+    real_attach = discuss_loop._attach_round_metadata
 
     def observing(body, metadata):
         seen.append(metadata)
         return real_attach(body, metadata)
 
-    with patch.object(orchestrator, "_attach_round_metadata", side_effect=observing):
+    with patch_object_in((
+        discuss_loop, child_plan_binding, pr_loop_support, pr_loop, issue_implementation,
+        plan_first_loop, issue_loop,
+    ), "_attach_round_metadata", side_effect=observing):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     comments = runner.pr_payload["comments"]
@@ -5935,13 +5986,16 @@ def test_pr_peer_publishes_between_freeze_and_rerun_changes_scheduler_inputs(tmp
     launches_before = len(runner.reviewer_launches)
     audits_before = len(_audit_indexes(runner))
     seen = []
-    real_attach = orchestrator._attach_round_metadata
+    real_attach = discuss_loop._attach_round_metadata
 
     def observing(body, metadata):
         seen.append(metadata)
         return real_attach(body, metadata)
 
-    with patch.object(orchestrator, "_attach_round_metadata", side_effect=observing):
+    with patch_object_in((
+        discuss_loop, child_plan_binding, pr_loop_support, pr_loop, issue_implementation,
+        plan_first_loop, issue_loop,
+    ), "_attach_round_metadata", side_effect=observing):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     comments = runner.pr_payload["comments"]
