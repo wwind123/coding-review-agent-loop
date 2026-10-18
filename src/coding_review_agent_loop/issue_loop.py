@@ -373,7 +373,7 @@ def run_issue_loop(
                 runner,
                 config=config,
                 issue_number=issue_number,
-                projection_comments=issue_context.comments,
+                issue_context=issue_context,
             )
 
         recovered_plan_hash: str | None = None
@@ -822,7 +822,7 @@ def run_issue_loop(
             runner,
             config=config,
             issue_number=issue_number,
-            projection_comments=issue_context.comments,
+            issue_context=issue_context,
         )
         if parent_issue_context is not None:
             parent_issue_context = get_issue_context(

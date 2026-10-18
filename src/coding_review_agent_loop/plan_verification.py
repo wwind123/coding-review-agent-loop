@@ -1136,6 +1136,7 @@ def classify_plan_approval(
     poster_completion_proven: bool = False,
     execution_mode_guard: bool = True,
     scope_start_round: int | None = None,
+    prove_poster_incompleteness: bool = False,
 ) -> PlanApprovalClassification:
     """Read-only plan approval classification from history alone (#1377 step 12).
 
@@ -1159,6 +1160,14 @@ def classify_plan_approval(
     current planning scope (``scope_start_round``, derived from the admitted
     scope-boundary record when omitted).  A scope with no candidate yet is
     ``empty-scope``.
+
+    ``prove_poster_incompleteness`` is set only by the plain-issue-mode guard
+    (#1090).  Before unanchored poster-derived history is reported
+    ``undetermined``, the latest round's completeness is checked first: a
+    round that is provably incomplete (an approving poster beside another
+    poster whose latest record does not approve the exact plan) is
+    ``unfinished``.  Posters still never prove completion, so a round that
+    looks complete stays ``undetermined``.
     """
     from .config import reviewers
     from .panel_evidence import _require_complete_canonical_plan_approval
@@ -1265,7 +1274,22 @@ def classify_plan_approval(
         comments, issue_number=issue_number, repo=getattr(config, "repo", None),
         plan_hash=plan_hash,
     ):
-        # Historical posters prove membership, never completion (step 12a).
+        # Historical posters prove membership, never completion (step 12a),
+        # but they can prove incompleteness (#1090).
+        if prove_poster_incompleteness:
+            try:
+                _require_complete_canonical_plan_approval(
+                    plan_comments,
+                    config=plan_config,
+                    plan_text=plan_text,
+                    plan_round=plan_round,
+                    human_requirements=human_requirements,
+                    error_message="incomplete",
+                )
+            except AgentLoopError:
+                return result("unfinished", "the latest legacy plan round is provably incomplete")
+            except (ValueError, KeyError, TypeError):
+                pass
         return result(
             "undetermined",
             "unanchored plain plan history has no issue-side handoff bound to the plan hash",

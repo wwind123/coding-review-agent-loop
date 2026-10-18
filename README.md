@@ -498,12 +498,16 @@ agent-loop issue 123 \
 ```
 
 Without `--plan-first`, issue mode asks the coder to implement immediately,
-unless planning already decided the issue. If the issue carries an approved
-planning review, a plan-approval announcement, a recorded execution decision, or
-an approved-plan implementation handoff, plain issue mode refuses before
-invoking any agent and names the resume command,
-`agent-loop issue <n> --plan-first`. Only records authored by the authenticated
-agent-loop GitHub actor count, read from the issue's complete comment history.
+unless planning already decided the issue. If the issue carries a planning
+round that approved the plan as a whole, a plan-approval announcement, a
+recorded execution decision, or an approved-plan implementation handoff, plain
+issue mode refuses before invoking any agent and names the resume command,
+`agent-loop issue <n> --plan-first`. A single reviewer's approval in a split or
+abandoned planning round does not count. Planning records whose approval state
+cannot be determined, including unreadable records, still refuse, and the
+error says so instead of claiming the plan was approved. Only records authored
+by the authenticated agent-loop GitHub actor count, read from the issue's
+complete comment history.
 
 Plan-first implementation carries the approved plan through a dedicated,
 lossless PR-bound context. The PR handoff binds reviewers and coder follow-ups

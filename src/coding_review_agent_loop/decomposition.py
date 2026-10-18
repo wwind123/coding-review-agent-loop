@@ -2437,12 +2437,16 @@ def execution_decisions_for_parent(
     return tuple(found)
 
 
-def issue_has_execution_decision(comments: Sequence[object], *, issue_number: int) -> bool:
-    """Whether any execution decision record is bound to ``issue_number``.
+def issue_execution_decision_evidence(
+    comments: Sequence[object], *, issue_number: int
+) -> str | None:
+    """Classify the execution decision records bound to ``issue_number``.
 
-    Used by plain issue mode to refuse bypassing a planning decision (#1088).
-    An undecodable record counts as present so the check fails closed.
+    ``"decoded"`` when a decoded record is bound to the issue (proven
+    approval); otherwise ``"unreadable"`` when any record cannot be decoded,
+    which still fails closed but proves nothing (#1090); otherwise ``None``.
     """
+    unreadable = False
     for comment in comments:
         body = getattr(comment, "body", None)
         if not isinstance(body, str):
@@ -2451,10 +2455,20 @@ def issue_has_execution_decision(comments: Sequence[object], *, issue_number: in
             try:
                 decision = _decode_execution_decision(match.group("payload"))
             except AgentLoopError:
-                return True
+                unreadable = True
+                continue
             if decision.parent_issue == issue_number:
-                return True
-    return False
+                return "decoded"
+    return "unreadable" if unreadable else None
+
+
+def issue_has_execution_decision(comments: Sequence[object], *, issue_number: int) -> bool:
+    """Whether any execution decision record is bound to ``issue_number``.
+
+    Used by plain issue mode to refuse bypassing a planning decision (#1088).
+    An undecodable record counts as present so the check fails closed.
+    """
+    return issue_execution_decision_evidence(comments, issue_number=issue_number) is not None
 
 
 def post_execution_decision(
