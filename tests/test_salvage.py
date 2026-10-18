@@ -10,6 +10,9 @@ from coding_review_agent_loop.salvage import (
     render_remote_salvage_summary,
 )
 from agent_loop_helpers import FakeRunner, make_config
+from coding_review_agent_loop.decomposition import approved_plan_hash
+from issue_loop_test_helpers import _write_salvage_summary
+from coding_review_agent_loop.salvage import latest_salvage_summary
 
 CLEAN_PATCH = (
     "diff --git a/file.txt b/file.txt\n"
@@ -397,3 +400,34 @@ def test_find_latest_remote_salvage_skips_malformed_markers():
     assert find_latest_remote_salvage(
         comments, repo="OWNER/REPO", issue_number=56, scope="issue-implementation", approved_plan_hash=None
     ) is None
+
+
+def test_latest_salvage_summary_filters_approved_plan_hash(tmp_path):
+    config = make_config(tmp_path)
+    plan_hash = approved_plan_hash("Plan:\n- Current.")
+    _write_salvage_summary(
+        config,
+        name="old-plan",
+        summary="stale approved-plan summary",
+        created_at_ns=5,
+        scope="approved-plan-implementation",
+        approved_plan_hash_value=approved_plan_hash("Plan:\n- Old."),
+    )
+    _write_salvage_summary(
+        config,
+        name="current-plan",
+        summary="current approved-plan summary",
+        created_at_ns=4,
+        scope="approved-plan-implementation",
+        approved_plan_hash_value=plan_hash,
+    )
+
+    summary = latest_salvage_summary(
+        config.log_dir,
+        repo=config.repo,
+        issue_number=56,
+        scope="approved-plan-implementation",
+        approved_plan_hash=plan_hash,
+    )
+
+    assert summary == "current approved-plan summary"

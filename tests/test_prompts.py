@@ -6749,3 +6749,30 @@ def test_configured_baseline_budget_reaches_the_renderer(tmp_path):
     )
     assert "disabled by --plan-provenance-baseline-max-chars 0" in disabled
     assert "a diff, compact diff, or the full text of the plan you last reviewed" in prompt
+
+
+def test_issue_resume_prompt_retains_configured_command_when_wrapper_probe_fails(
+    tmp_path, monkeypatch
+):
+    config = make_config(
+        tmp_path,
+        test_command=("pytest", "tests/test_protocol.py", "-q"),
+    )
+    memory = AgentMemoryContext(
+        memory_dir=tmp_path / "memory",
+        current_commit=None,
+        last_analyzed_commit=None,
+        changed_files=(),
+        repo_summary=None,
+        architecture_map=None,
+        test_profile=None,
+        toolchain=None,
+    )
+    monkeypatch.setattr(
+        prompts_module,
+        "preflight_wrapper_candidates",
+        lambda **_kwargs: (runtime.LauncherProbeResult(("/opt/agent-loop", "run-tests"), "failed", "import failed"),),
+    )
+    prompt = build_issue_prompt(764, config, memory=memory)
+    assert "pytest tests/test_protocol.py -q" in prompt
+    assert "no wrapper candidate verified" in prompt

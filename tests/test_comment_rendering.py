@@ -3439,3 +3439,43 @@ def test_legacy_provider_and_unconfigured_seat_footers_are_unchanged(tmp_path, k
     # A seat removed from the board is not guessed: the bare ID remains.
     assert _render_seat_footer_1363(kind, "flash", seat_config, "Model A") == "-- flash"
     assert _render_seat_footer_1363(kind, "sol", None, "gpt-6-sol (medium)") == "-- sol"
+
+
+def test_issue_handoff_receipt_must_belong_to_current_coder_turn():
+    from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
+
+    parsed = validate_structured_issue_implementation(
+        json.dumps({
+            "schema_version": 1,
+            "kind": "issue_implementation",
+            "state": "blocking",
+            "summary": "Implemented the issue.",
+            "pr_number": 77,
+            "human_requirement_dispositions": [],
+            "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+            "test_observations": [{
+                "command": "python -m pytest tests/test_protocol.py -q",
+                "receipt_id": "old-receipt",
+                "claim": "current-result",
+            }],
+            "tests_run": [],
+        }) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    evidence = bounded_evidence_for_round({"observations": [{
+        "command": ["python", "-m", "pytest", "tests/test_protocol.py", "-q"],
+        "outcome": "passed",
+        "provenance": "parent-observed",
+        "receipt_id": "old-receipt",
+        "turn_id": "prior-turn",
+        "environment": "unknown",
+        "attribution": {"state": "current-head"},
+    }]})
+
+    rendered = _render_public_issue_implementation_comment(
+        parsed,
+        agent="Claude",
+        local_test_evidence=evidence,
+        current_test_turn_id="current-turn",
+    )
+
+    assert "unverified: unknown or cross-turn receipt" in rendered

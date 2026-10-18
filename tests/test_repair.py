@@ -31,6 +31,10 @@ import coding_review_agent_loop.agent_failure as agent_failure
 import coding_review_agent_loop.response_validation as response_validation
 import coding_review_agent_loop.validated_agent as validated_agent
 from agent_loop_helpers import patch_attr_in
+from issue_loop_test_helpers import _deg_with
+from coding_review_agent_loop.validated_agent import (
+    _new_usage_context as _r2_new_usage_context,
+)
 
 _PLAN_REQUIREMENT = HumanReviewRequirement(
     source_type="Issue body",
@@ -5512,3 +5516,35 @@ def test_execute_repair_non_evidence_invalid_candidate_still_falls_back(tmp_path
     assert [a.outcome for a in attempts] == ["invalid_output", "succeeded"]
     assert attempts[0].evidence_rejection is None
     assert attempts[0].fallback_planned is True
+
+
+def test_refused_repair_candidate_is_decided_per_candidate_before_success(tmp_path):
+    """A pinned refusal stops the chain and never counts as a success."""
+    from coding_review_agent_loop.repair import CandidateDecision, execute_repair
+    from test_cli_repair import RepairRunner
+
+    source = _deg_with(structured_issue_implementation(), None, unexpected_key=True)
+    candidate = _deg_with(structured_issue_implementation(), None)
+    config = make_config(
+        tmp_path, repair_backend="claude", repair_models=("model-a", "model-b")
+    )
+    usage = _r2_new_usage_context(config)
+    parse = lambda text: validate_structured_issue_implementation(  # noqa: E731
+        text, required_architecture_impact_contract=1, architecture_status_mode="degradable"
+    )
+    runner = RepairRunner([(candidate, 0), (candidate, 0)])
+    repaired, parsed, attempts = execute_repair(
+        source, runner=runner, config=config, run_id=None, usage_context=usage,
+        validate=parse, forbid_architecture_impact=True,
+        candidate_refusal=lambda output, result: CandidateDecision(
+            parsed=result, refusal="issue_implementation must include architecture_impact"
+        ),
+        expected_kind="issue_implementation",
+    )
+    assert (repaired, parsed) == (None, None)
+    assert [a.outcome for a in attempts] == ["architecture_contract_unsatisfied"]
+    assert attempts[0].fallback_planned is False
+    assert attempts[0].validation_result is not None
+    (record,) = usage.records
+    assert record.outcome == "architecture_contract_unsatisfied"
+    assert record.validation_status == "invalid"

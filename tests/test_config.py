@@ -10,6 +10,7 @@ import pytest
 from agent_loop_helpers import FakeRunner, make_config
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.review_step_back import DEFAULT_PROVENANCE_BASELINE_MAX_CHARS
+from agent_loop_helpers import FakeRunner as _FakeRunner
 
 FLAG = "--plan-provenance-baseline-max-chars"
 
@@ -136,3 +137,63 @@ def test_approved_all_reviewers_board_switch_resets_and_restores_the_budget(tmp_
     restored = _restore_invocation_board(approving, invocation)
     assert restored.plan_review_policy == "primary-then-panel"
     assert restored.plan_provenance_baseline_max_chars == 50000
+
+
+def test_narrow_staged_flag_is_validated(tmp_path):
+    """`narrow-flag-validation`."""
+    with pytest.raises(AgentLoopError, match="--plan-narrow-staged"):
+        make_config(tmp_path, plan_narrow_staged=True, plan_execution_mode="decompose-only")
+    make_config(tmp_path, plan_narrow_staged=True, plan_execution_mode="plan-only")
+    make_config(tmp_path, plan_narrow_staged=True, plan_execution_mode="implement-one-shot")
+    assert main_exit_for(["issue", "56", "--repo", "OWNER/REPO", "--plan-narrow-staged"]) == 1
+
+
+def main_exit_for(argv):
+    from coding_review_agent_loop.cli import main
+
+    return main(argv)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"plan_sweep_rounds": 1}, "--plan-sweep-rounds requires --plan-review-policy primary-then-panel"),
+        ({"plan_sweep_reasoning_effort": "high"}, "--plan-sweep-reasoning-effort requires"),
+        ({"plan_sweep_rounds": -1}, "--plan-sweep-rounds must be a non-negative integer"),
+        ({"plan_sweep_rounds": True}, "--plan-sweep-rounds must be a non-negative integer"),
+        ({"plan_sweep_reasoning_effort": "turbo"}, "--plan-sweep-reasoning-effort value 'turbo'"),
+    ],
+)
+def test_sweep_flags_are_validated_at_config_time(tmp_path, overrides, message):
+    """`disabled-and-policy`, `sweep-effort-turn` (config unit)."""
+    values = {"reviewer": ("codex", "gemini")}
+    if "requires" not in message:
+        values.update(plan_review_policy="primary-then-panel", primary_plan_reviewer="codex")
+    values.update(overrides)
+    with pytest.raises(AgentLoopError, match=re.escape(message)):
+        make_config(tmp_path, **values)
+
+
+def test_sweep_flags_reach_the_config_from_the_cli(tmp_path):
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.config import config_from_args
+
+    base_argv = [
+        "issue", "56", "--repo", "OWNER/REPO", "--plan-first",
+        "--reviewer", "codex", "--reviewer", "gemini",
+        "--codex-dir", str(tmp_path / "codex"), "--gemini-dir", str(tmp_path / "gemini"),
+        "--dangerous-agent-permissions",
+        "--plan-review-policy", "primary-then-panel", "--primary-plan-reviewer", "codex",
+    ]
+    parser = build_parser()
+    defaults = config_from_args(parser.parse_args(base_argv), _FakeRunner())
+    assert (defaults.plan_sweep_rounds, defaults.plan_sweep_reasoning_effort) == (2, "")
+    config = config_from_args(
+        parser.parse_args(
+            [*base_argv, "--plan-sweep-rounds", "1", "--plan-sweep-reasoning-effort", "high"]
+        ),
+        _FakeRunner(),
+    )
+    assert (config.plan_sweep_rounds, config.plan_sweep_reasoning_effort) == (1, "high")
+    with pytest.raises(AgentLoopError, match="--plan-sweep-rounds must be"):
+        config_from_args(parser.parse_args([*base_argv, "--plan-sweep-rounds", "-1"]), _FakeRunner())

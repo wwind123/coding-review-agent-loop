@@ -36,6 +36,9 @@ import coding_review_agent_loop.issue_loop as issue_loop
 import coding_review_agent_loop.pr_loop as pr_loop
 import coding_review_agent_loop.pr_loop_support as pr_loop_support
 from agent_loop_helpers import patch_attr_in
+import re
+from dataclasses import replace
+from issue_loop_test_helpers import _m1103_stalled_runner, _plan_round_records
 
 
 def test_named_pr_seat_binding_and_exact_head_approval(tmp_path):
@@ -1765,3 +1768,119 @@ def test_malformed_provenance_baseline_decodes_as_absent_without_degrading(
     assert decoded.step_back_status == "absent"
     assert decoded.plan_sweep is (not overrides)
     assert any("provenance_baseline" in message for message in caplog.messages)
+
+
+def _m1112_first_primary_payload(runner):
+    for comment in runner.issue_comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if match is None:
+            continue
+        payload = decode_mapping(match.group("payload"))
+        if payload.get("phase") == "scheduler-prelaunch":
+            return payload
+    raise AssertionError("no scheduler checkpoint")
+
+
+def test_issue_digest_and_reset_fields_are_strictly_validated(tmp_path):
+    """`malformed-fields` and `all-reviewers-unaffected` at the codec."""
+    from coding_review_agent_loop.round_state import (
+        _decode_round_metadata_mapping,
+        _encode_round_metadata,
+    )
+
+    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    base = _m1112_first_primary_payload(runner)
+    assert _decode_round_metadata_mapping(base).scheduler_metadata_status == "valid"
+    good_digest = base["scheduler_issue_digest"]
+    assert re.fullmatch(r"[0-9a-f]{16}", good_digest)
+
+    def status(**changes):
+        payload = {**base, **changes}
+        return _decode_round_metadata_mapping(payload).scheduler_metadata_status
+
+    assert status(scheduler_stall_reset=True) == "valid"
+    assert status(scheduler_issue_digest="XYZ") == "invalid"
+    assert status(scheduler_issue_digest=None) == "invalid"
+    assert status(scheduler_stall_reset=False) == "invalid"
+    assert status(scheduler_stall_reset="yes") == "invalid"
+    assert status(scheduler_stall_reset=True, scheduler_phase="full-board") == "invalid"
+    # Plan board identity fields are flow-scoped (#1377): a PR-flow record
+    # carrying them is malformed, so compare the scheduler status without them.
+    with pytest.raises(AgentLoopError, match="only valid on plan-flow records"):
+        status(flow="pr")
+    unstamped = {
+        key: value for key, value in base.items() if not key.startswith("plan_board_")
+    }
+    assert _decode_round_metadata_mapping(
+        {**unstamped, "flow": "pr"}
+    ).scheduler_metadata_status == "invalid"
+
+    # Unset fields serialize with no new keys (byte-stable legacy shape).
+    decoded = _decode_round_metadata_mapping(base)
+    unset = replace(decoded, scheduler_issue_digest=None, scheduler_stall_reset=False)
+    legacy = decode_mapping(_encode_round_metadata(unset))
+    assert "scheduler_issue_digest" not in legacy
+    assert "scheduler_stall_reset" not in legacy
+    # A record carrying only the new keys is not classified absent.
+    only_new = {"flow": "plan", "role": "summary", "agent": "Orchestrator",
+                "round_number": 1, "subject": "s", "scheduler_stall_reset": True}
+    assert _decode_round_metadata_mapping(only_new).scheduler_metadata_status == "invalid"
+
+
+def test_step_back_deferral_marker_is_strictly_validated(tmp_path):
+    """`deferral-marker-roundtrip` at the codec (#1275)."""
+    from coding_review_agent_loop.round_state import (
+        _decode_round_metadata_mapping,
+        _encode_round_metadata,
+    )
+
+    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    base = _m1112_first_primary_payload(runner)
+
+    def decoded(**changes):
+        return _decode_round_metadata_mapping({**base, **changes})
+
+    assert decoded().scheduler_step_back_deferral is False
+    marked = decoded(scheduler_step_back_deferral=True)
+    assert marked.scheduler_metadata_status == "valid"
+    assert marked.scheduler_step_back_deferral is True
+    assert (
+        decode_mapping(_encode_round_metadata(marked))["scheduler_step_back_deferral"]
+        is True
+    )
+    assert "scheduler_step_back_deferral" not in decode_mapping(
+        _encode_round_metadata(decoded())
+    )
+    for bad in (False, "yes", 1, None):
+        assert decoded(scheduler_step_back_deferral=bad).scheduler_metadata_status == "invalid"
+    assert (
+        decoded(
+            scheduler_step_back_deferral=True, scheduler_phase="full-board"
+        ).scheduler_metadata_status
+        == "invalid"
+    )
+
+
+def test_planning_checkpoint_mode_round_trips_and_tolerates_unknown_values(tmp_path):
+    """`metadata-roundtrip` on a valid planning checkpoint."""
+    from coding_review_agent_loop.round_state import _encode_round_metadata
+    from coding_review_agent_loop.round_transport import encode_mapping
+
+    runner, _config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
+    checkpoint = next(r for r in _plan_round_records(runner) if r.phase == "scheduler-prelaunch")
+    assert checkpoint.scheduler_metadata_status == "valid"
+    assert checkpoint.scheduler_execution_mode == "plan-only"
+    encoded = _encode_round_metadata(checkpoint)
+    assert _decode_round_metadata(encoded).scheduler_execution_mode == "plan-only"
+
+    payload = decode_mapping(encoded)
+    payload["scheduler_execution_mode"] = "not-a-mode"
+    unknown = _decode_round_metadata(encode_mapping(payload))
+    assert unknown.scheduler_execution_mode is None
+    assert unknown.scheduler_metadata_status == "valid"
+
+    payload.pop("scheduler_execution_mode")
+    legacy = _decode_round_metadata(encode_mapping(payload))
+    assert legacy.scheduler_execution_mode is None
+    assert legacy.scheduler_metadata_status == "valid"
+    assert "scheduler_execution_mode" not in decode_mapping(_encode_round_metadata(legacy))
