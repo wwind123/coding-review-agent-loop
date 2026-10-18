@@ -13,6 +13,7 @@ import types
 from pathlib import Path
 
 import pytest
+import coding_review_agent_loop.execution_policy as execution_policy
 
 HELPERS = Path(__file__).parent.parent / "helpers"
 SRC = Path(__file__).parent.parent / "src"
@@ -5138,7 +5139,7 @@ class TestValidateCoderImplementationResponse:
 
     def test_blocked_positive_pr_is_returned_as_terminal_conflict(self) -> None:
         from helpers.skill_runner import _validate_coder_implementation_response
-        from coding_review_agent_loop.orchestrator import _TerminalIssueImplementationConflict
+        from coding_review_agent_loop.architecture_contract import _TerminalIssueImplementationConflict
 
         result = _validate_coder_implementation_response(
             _IMPL_WITH_BLOCKED_REQUIREMENT,
@@ -5887,7 +5888,6 @@ class TestRunDecompose:
         import helpers.skill_runner as sr
         import coding_review_agent_loop.decomposition as decomp
         import coding_review_agent_loop.github as gh
-        import coding_review_agent_loop.orchestrator as orchestrator_module
         from coding_review_agent_loop.github import IssueContext
 
         raw_outputs: list[str] = []
@@ -6090,7 +6090,6 @@ class TestRunDecompose:
         import helpers.skill_runner as sr
         import coding_review_agent_loop.decomposition as decomp
         import coding_review_agent_loop.github as gh
-        import coding_review_agent_loop.orchestrator as orchestrator_module
         from coding_review_agent_loop.errors import AgentLoopError
         from coding_review_agent_loop.github import IssueComment, IssueContext
 
@@ -6178,7 +6177,7 @@ class TestRunDecompose:
             )
 
         monkeypatch.setattr(gh, "get_issue_context", fake_get_issue_context)
-        monkeypatch.setattr(orchestrator_module, "search_issues", lambda *_args, **_kwargs: ())
+        monkeypatch.setattr(execution_policy, "search_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(sr, "_run_helper", lambda *_args, **_kwargs: pytest.fail("coder must not run"))
 
         with pytest.raises(AgentLoopError, match="older-plan|recorded topology"):
@@ -6200,7 +6199,6 @@ class TestRunDecompose:
         import helpers.skill_runner as sr
         import coding_review_agent_loop.decomposition as decomp
         import coding_review_agent_loop.github as gh
-        import coding_review_agent_loop.orchestrator as orchestrator_module
         from coding_review_agent_loop.errors import AgentLoopError
         from coding_review_agent_loop.github import IssueComment, IssueContext
 
@@ -6232,7 +6230,7 @@ class TestRunDecompose:
                 human_requirements=(),
             ),
         )
-        monkeypatch.setattr(orchestrator_module, "search_issues", lambda *_args, **_kwargs: ())
+        monkeypatch.setattr(execution_policy, "search_issues", lambda *_args, **_kwargs: ())
         monkeypatch.setattr(sr, "_run_helper", lambda *_args, **_kwargs: pytest.fail("coder must not run"))
 
         with pytest.raises(AgentLoopError, match="older-plan|existing decomposition"):

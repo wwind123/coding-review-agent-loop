@@ -10,8 +10,17 @@ from agent_loop_helpers import (
     structured_plan_review,
     structured_v1_plan_state,
 )
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 
 def _staged_outcome(created, approved_plan, *, mode="implement-by-phase"):
@@ -42,10 +51,7 @@ from coding_review_agent_loop.decomposition import (
 )
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import IssueComment, IssueContext
-from coding_review_agent_loop.orchestrator import (
-    CHILD_ROUTE_HUMAN,
-    resolve_child_execution_route,
-)
+from coding_review_agent_loop.execution_policy import CHILD_ROUTE_HUMAN, resolve_child_execution_route
 from coding_review_agent_loop.protocol import (
     EXECUTION_DISPOSITION_DIRECT,
     EXECUTION_DISPOSITION_PLANNING,
@@ -229,27 +235,21 @@ def test_rtm_direct_and_planning_dispatch_persists_handoff_before_agent(
         title="Parent",
         url="https://github.com/OWNER/REPO/issues/55",
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "post_phase_implementation_handoff_comment",
+    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop), "post_phase_implementation_handoff_comment",
         lambda *_args, **_kwargs: events.append("direct-handoff"),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "_post_child_planning_handoff",
+    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop, issue_loop), "_post_child_planning_handoff",
         lambda *_args, **_kwargs: events.append("planning-handoff"),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "_implement_approved_issue",
+    patch_attr_in(monkeypatch, (issue_implementation, plan_first_loop), "_implement_approved_issue",
         lambda *_args, **_kwargs: events.append("implement") or 6,
     )
     monkeypatch.setattr(
-        orchestrator,
+        plan_first_loop,
         "_run_child_planning_cycle",
         lambda *_args, **_kwargs: events.append("plan") or 7,
     )
-    result = orchestrator._dispatch_decomposition_child(
+    result = plan_first_loop._dispatch_decomposition_child(
         FakeRunner(),
         config=make_config(tmp_path),
         memory=None,
@@ -435,12 +435,10 @@ def test_rtm_human_first_stage_workflow_stops_without_handoff_and_other_override
         comments=(IssueComment(author="human", created_at=None, body=other_override),),
     )
     child = dataclasses.replace(parent, number=56, title="Human", comments=())
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
-    monkeypatch.setattr(
-        orchestrator, "post_phase_implementation_handoff_comment",
+    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop), "post_phase_implementation_handoff_comment",
         lambda *_args, **_kwargs: pytest.fail("human stage must not post a handoff"),
     )
     recommendation = SimpleNamespace(
@@ -448,7 +446,7 @@ def test_rtm_human_first_stage_workflow_stops_without_handoff_and_other_override
         identity=lambda: {"recommendation_sha256": "digest"},
         child_stages=(human_phase, agent_phase),
     )
-    result = orchestrator._dispatch_current_decomposition_phase(
+    result = plan_first_loop._dispatch_current_decomposition_phase(
         FakeRunner(), config=make_config(tmp_path), memory=None,
         usage_context=SimpleNamespace(), issue_number=55,
         current_plan=approved_plan, plan_subject="subject",
@@ -492,12 +490,10 @@ def test_rtm_human_first_stage_workflow_rejects_override_without_handoff(
         title="Human",
         comments=(override_comment,) if override_location == "child" else (),
     )
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
-    monkeypatch.setattr(
-        orchestrator, "post_phase_implementation_handoff_comment",
+    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop), "post_phase_implementation_handoff_comment",
         lambda *_args, **_kwargs: pytest.fail("rejected human override must not post a handoff"),
     )
     recommendation = SimpleNamespace(
@@ -507,7 +503,7 @@ def test_rtm_human_first_stage_workflow_rejects_override_without_handoff(
     )
 
     with pytest.raises(AgentLoopError, match="Human-owned stages"):
-        orchestrator._dispatch_current_decomposition_phase(
+        plan_first_loop._dispatch_current_decomposition_phase(
             FakeRunner(), config=make_config(tmp_path), memory=None,
             usage_context=SimpleNamespace(), issue_number=55,
             current_plan=approved_plan, plan_subject="subject",
@@ -537,15 +533,11 @@ def test_rtm_nested_staged_child_stops_before_topology_mutation(
         title="Parent",
         url="https://github.com/OWNER/REPO/issues/55",
     )
-    monkeypatch.setattr(orchestrator, "_infer_staged_parent_issue", lambda _context: 55)
-    monkeypatch.setattr(
-        orchestrator,
-        "_fresh_phase_marker_payload",
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop, plan_first_loop, issue_loop), "_infer_staged_parent_issue", lambda _context: 55)
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, plan_first_loop), "_fresh_phase_marker_payload",
         lambda _context: {"source": "approved-plan-v1"},
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -557,14 +549,14 @@ def test_rtm_nested_staged_child_stops_before_topology_mutation(
         plan_execution_mode="auto",
         execution_strategy_contract_required=True,
     )
-    result = orchestrator._run_plan_first_loop(
+    result = plan_first_loop._run_plan_first_loop(
         runner,
         issue_number=56,
         config=config,
         memory=None,
         issue_context=child,
         requested_policy="auto",
-        usage_context=orchestrator._new_usage_context(config),
+        usage_context=validated_agent._new_usage_context(config),
     )
     assert result == 2
     output = capsys.readouterr().out
@@ -631,21 +623,16 @@ def test_rtm_multi_stage_overrides_scope_independently_and_dedupe(
     assert second_route.override_digest == second_scoped[0].digest
 
     recorded_handoffs = []
-    monkeypatch.setattr(
-        orchestrator,
-        "_post_child_planning_handoff",
+    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop, issue_loop), "_post_child_planning_handoff",
         lambda *_args, **kwargs: recorded_handoffs.append(("stage-one", kwargs)),
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "post_phase_implementation_handoff_comment",
+    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop), "post_phase_implementation_handoff_comment",
         lambda *_args, **kwargs: recorded_handoffs.append(("stage-two", kwargs)),
     )
     monkeypatch.setattr(
-        orchestrator, "_run_child_planning_cycle", lambda *_args, **_kwargs: 0
+        plan_first_loop, "_run_child_planning_cycle", lambda *_args, **_kwargs: 0
     )
-    monkeypatch.setattr(
-        orchestrator, "_implement_approved_issue", lambda *_args, **_kwargs: 0
+    patch_attr_in(monkeypatch, (issue_implementation, plan_first_loop), "_implement_approved_issue", lambda *_args, **_kwargs: 0
     )
     recommendation = SimpleNamespace(
         strategy="staged",
@@ -665,7 +652,7 @@ def test_rtm_multi_stage_overrides_scope_independently_and_dedupe(
         child = dataclasses.replace(
             parent, number=issue_number, title=phase.title, url=f"child-{issue_number}"
         )
-        assert orchestrator._dispatch_decomposition_child(
+        assert plan_first_loop._dispatch_decomposition_child(
             FakeRunner(), config=make_config(tmp_path), memory=None,
             usage_context=SimpleNamespace(), parent_issue=55,
             approved_plan="Approved parent plan.", plan_hash="plan-hash",

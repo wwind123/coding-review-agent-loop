@@ -12,17 +12,23 @@ from coding_review_agent_loop.comment_rendering import _format_unresolved_item_l
 from coding_review_agent_loop.config import config_from_args, resolve_invocation
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.managed_ci import _render_recovery_command
-from coding_review_agent_loop.orchestrator import (
-    _approved_implementation_config,
-    _build_unsupported_model_diagnostic,
-    _run_discuss_analyzer,
-)
+from coding_review_agent_loop.issue_implementation import _approved_implementation_config
+from coding_review_agent_loop.agent_failure import _build_unsupported_model_diagnostic
+from coding_review_agent_loop.discuss_loop import _run_discuss_analyzer
 from coding_review_agent_loop.protocol import UnresolvedReviewItem
 from coding_review_agent_loop.prompts import (
     build_discuss_review_prompt,
     build_plan_review_prompt,
     build_review_prompt,
 )
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 
 @pytest.mark.parametrize("command", ["issue", "pr", "discuss"])
@@ -160,7 +166,7 @@ def test_discuss_agenda_uses_analyzer_role(monkeypatch, tmp_path):
     captured = {}
 
     monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator.build_discuss_agenda_prompt",
+        "coding_review_agent_loop.discuss_loop.build_discuss_agenda_prompt",
         lambda *args, **kwargs: "agenda prompt",
     )
 
@@ -168,8 +174,7 @@ def test_discuss_agenda_uses_analyzer_role(monkeypatch, tmp_path):
         captured.update(kwargs)
         raise AgentLoopError("stop after invocation metadata is captured")
 
-    monkeypatch.setattr(
-        "coding_review_agent_loop.orchestrator._run_validated_agent",
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent",
         reject_after_capturing,
     )
 

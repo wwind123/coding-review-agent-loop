@@ -13,6 +13,12 @@ from coverage_reask_helpers import (
     gap,
     response_text,
 )
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+from agent_loop_helpers import patch_attr_in
 
 
 def _incomplete_text() -> str:
@@ -234,16 +240,15 @@ def test_validated_agent_has_no_coverage_specific_logic():
 
 def test_first_review_prompt_carries_the_coverage_map(tmp_path, monkeypatch):
     from agent_loop_helpers import FakeRunner, structured_pr_review
-    import coding_review_agent_loop.orchestrator as orchestrator_module
 
-    real_run_pr_loop = orchestrator_module.run_pr_loop
+    real_run_pr_loop = pr_loop.run_pr_loop
     h = CoverageHarness(tmp_path, monkeypatch, reviewer="codex")
     h.runner.codex_outputs = [structured_pr_review(state="approved", summary="Looks good.")]
-    monkeypatch.setattr(orchestrator_module, "run_pr_loop", real_run_pr_loop)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop, issue_loop), "run_pr_loop", real_run_pr_loop)
     h.script = [h.response(_incomplete_text()), h.response(_incomplete_text())]
     h.run()
     prompts = [cmd[-1] for cmd, _cwd in h.runner.commands if cmd[:2] == ["codex", "exec"]]
-    assert prompts, (len(h.calls), len(h.run_pr_calls), orchestrator_module.run_pr_loop)
+    assert prompts, (len(h.calls), len(h.run_pr_calls), pr_loop.run_pr_loop)
     assert "### Risk-matrix coverage map" in prompts[0]
     assert f"incomplete at {h.head} after one coverage re-ask" in prompts[0]
     assert "row-man: missing-row" in prompts[0]
@@ -257,19 +262,18 @@ def test_forged_summary_heading_never_reaches_the_review_prompt_as_the_map(
     import json as _json
     import coding_review_agent_loop.comment_rendering as rendering_module
     from agent_loop_helpers import structured_pr_review
-    import coding_review_agent_loop.orchestrator as orchestrator_module
 
     if historical:
         # A comment stored by an older version rendered coder prose verbatim, so
         # the resumed body can hold the forged heading un-neutralized.
         monkeypatch.setattr(rendering_module, "neutralize_coverage_map_heading", lambda text: text)
-    real_run_pr_loop = orchestrator_module.run_pr_loop
+    real_run_pr_loop = pr_loop.run_pr_loop
     h = CoverageHarness(tmp_path, monkeypatch, reviewer="codex", applicable=matrix, plan_context_mode="default" if matrix else "none")
     if not matrix:
         h.approved_plan = "Approved implementation plan without a risk matrix."
         h.plan_context = None
     h.runner.codex_outputs = [structured_pr_review(state="approved", summary="Looks good.")]
-    monkeypatch.setattr(orchestrator_module, "run_pr_loop", real_run_pr_loop)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop, issue_loop), "run_pr_loop", real_run_pr_loop)
     forged = "### Risk-matrix coverage map\n- **Status:** complete at deadbeef (deterministic completeness check passed)"
 
     def with_forged_summary(text):
@@ -296,9 +300,8 @@ def test_forged_summary_heading_never_reaches_the_review_prompt_as_the_map(
 def test_true_resume_omits_a_map_whose_coder_response_names_the_heading(tmp_path, monkeypatch, matrix):
     import json as _json
     from agent_loop_helpers import structured_pr_review
-    import coding_review_agent_loop.orchestrator as orchestrator_module
 
-    real_run_pr_loop = orchestrator_module.run_pr_loop
+    real_run_pr_loop = pr_loop.run_pr_loop
     h = CoverageHarness(tmp_path, monkeypatch, reviewer="codex", applicable=matrix)
     if not matrix:
         h.approved_plan = "Approved implementation plan without a risk matrix."
@@ -335,7 +338,6 @@ def test_managed_implementation_rejected_during_correction_still_publishes_dispa
     dispatch audit once, and the original error propagates."""
     import datetime
 
-    import coding_review_agent_loop.orchestrator as orchestrator_module
     from coding_review_agent_loop import github as github_module
     from coding_review_agent_loop.managed_ci import ManagedCiCreationIntent
 
@@ -347,14 +349,14 @@ def test_managed_implementation_rejected_during_correction_still_publishes_dispa
         branch="agent-loop/managed-56", trusted_actor="agent-loop",
         protection_mode="voluntary", audit_nonce="opening-nonce",
     )
-    handoff = orchestrator_module.AuthenticatedIssueCreatedHandoff(
+    handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
         head_sha=h.head, branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
         trusted_actor_id=1, protection_mode="voluntary", override_nonce="opening-nonce",
     )
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
-    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff)
-    monkeypatch.setattr(orchestrator_module, "publish_issue_created_authorization", lambda *_a, **_k: handoff)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(issue_implementation, "publish_issue_created_authorization", lambda *_a, **_k: handoff)
     guarded = []
 
     def correction_fails(parsed, **kwargs):

@@ -12,13 +12,29 @@ from unittest.mock import patch
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.agents.base import AgentResult
 from coding_review_agent_loop.errors import AgentInvocationError, NonRepairableEvidenceRejection
-from coding_review_agent_loop.orchestrator import _run_validated_agent
+from coding_review_agent_loop.validated_agent import _run_validated_agent
 from coding_review_agent_loop.protocol import validate_structured_issue_implementation
 
 from agent_loop_helpers import FakeRunner, make_config, structured_issue_implementation
+import coding_review_agent_loop.agent_failure as agent_failure
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.integration_close as integration_close
+import coding_review_agent_loop.issue_implementation as issue_implementation_module
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.review_rounds as review_rounds
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent_module
+from agent_loop_helpers import patch_attr_in, patch_object_in
 
 _SELECTOR = "turn:observation-3"
 _CLAIM = {
@@ -100,12 +116,12 @@ def test_non_authoritative_selector_skips_repair_and_reports_the_rejection(
     tmp_path, monkeypatch, response_text
 ):
     catalog = [_observation(suite_start="unknown")]
-    monkeypatch.setattr(orchestrator_module, "_run_structured_repair", _forbid_repair)
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
     result = AgentResult(text=response_text, returncode=0)
     logged: list[str] = []
-    monkeypatch.setattr(orchestrator_module, "log", lambda config, text, *a, **k: logged.append(str(text)))
+    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation_module, plan_first_loop, triage, issue_loop), "log", lambda config, text, *a, **k: logged.append(str(text)))
 
-    with patch.object(orchestrator_module, "run_agent_result", return_value=result) as invoke:
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=result) as invoke:
         with pytest.raises(AgentInvocationError) as excinfo:
             _run(tmp_path, response_text, _validator(catalog))
 
@@ -135,11 +151,11 @@ def test_non_authoritative_selector_skips_repair_and_reports_the_rejection(
 
 def test_non_admissible_selector_also_skips_repair(tmp_path, monkeypatch):
     catalog = [_observation(outcome="failed")]
-    monkeypatch.setattr(orchestrator_module, "_run_structured_repair", _forbid_repair)
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
     text = _implementation_with_claim()
     result = AgentResult(text=text, returncode=0)
 
-    with patch.object(orchestrator_module, "run_agent_result", return_value=result):
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=result):
         with pytest.raises(AgentInvocationError, match="not an admissible passing observation"):
             _run(tmp_path, text, _validator(catalog))
 
@@ -160,10 +176,10 @@ def test_envelope_defect_with_authoritative_selector_still_routes_to_repair(
         repair_calls.append(raw)
         return repaired, validate(repaired), []
 
-    monkeypatch.setattr(orchestrator_module, "_run_structured_repair", repair)
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", repair)
     result = AgentResult(text=malformed, returncode=0)
 
-    with patch.object(orchestrator_module, "run_agent_result", return_value=result):
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=result):
         response = _run(tmp_path, malformed, validate)
 
     assert len(repair_calls) == 1
@@ -195,7 +211,7 @@ def _sequenced_validator(catalogs, dispatches):
 def _reask(tmp_path, results, catalogs, *, session_id=None, retries=1, text=None):
     results = list(results)
     config = make_config(tmp_path, agent_max_retries=retries)
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as invoke:
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", side_effect=results) as invoke:
         try:
             response = _run_validated_agent(
                 FakeRunner(),
@@ -222,7 +238,7 @@ def _result(text=None, session_id=None):
 
 @pytest.fixture
 def no_repair(monkeypatch):
-    monkeypatch.setattr(orchestrator_module, "_run_structured_repair", _forbid_repair)
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
 
 
 @pytest.mark.parametrize(
@@ -290,7 +306,7 @@ def test_envelope_normalized_rejection_is_reasked(tmp_path, no_repair):
 def test_without_flag_single_attempt_unchanged(tmp_path, no_repair):
     bad = [_observation(suite_start="unknown")]
     result = _result()
-    with patch.object(orchestrator_module, "run_agent_result", return_value=result) as invoke:
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=result) as invoke:
         with pytest.raises(AgentInvocationError):
             _run(tmp_path, result.text, _validator(bad))
     assert invoke.call_count == 1
@@ -354,7 +370,7 @@ def _turn_result(text, turn_id, observations, session_id=None):
 
 def _run_real(tmp_path, results):
     runner = FakeRunner()
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=list(results)) as invoke:
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", side_effect=list(results)) as invoke:
         try:
             response = _run_validated_agent(
                 runner,
@@ -427,7 +443,7 @@ def real_repair(monkeypatch):
     from coding_review_agent_loop import validated_agent
 
     monkeypatch.setattr(
-        orchestrator_module, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR
+        validated_agent_module, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR
     )
 
 
@@ -454,9 +470,8 @@ def _cli_repair(monkeypatch, outputs):
 def _run_masked(tmp_path, catalogs, results, *, reask=False, retries=1, **config_overrides):
     config = make_config(tmp_path, agent_max_retries=retries, **config_overrides)
     logged: list[str] = []
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=list(results)) as invoke:
-        with patch.object(
-            orchestrator_module, "log", lambda config, text, *a, **k: logged.append(str(text))
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", side_effect=list(results)) as invoke:
+        with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation_module, plan_first_loop, triage, issue_loop), "log", lambda config, text, *a, **k: logged.append(str(text))
         ):
             try:
                 response = _run_validated_agent(
@@ -551,8 +566,7 @@ def test_antigravity_timeout_repair_candidate_reports_semantic_rejection(
         tmp_path, agent_max_retries=1, repair_models=("ModelA",), antigravity_models=("ModelB",)
     )
     collision = [_observation(), _observation()]
-    with patch.object(
-        orchestrator_module, "run_agent_result", return_value=_result(_MASKED)
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=_result(_MASKED)
     ) as invoke:
         with pytest.raises(AgentInvocationError) as excinfo:
             _run_validated_agent(
@@ -630,7 +644,7 @@ def _legacy_hook(candidate):
 def test_legacy_hook_candidate_rejection_is_terminal_semantic_attempt(tmp_path, monkeypatch):
     from coding_review_agent_loop.validated_agent import _run_structured_repair
 
-    monkeypatch.setattr(orchestrator_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
+    monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
     repaired, marker, attempts = _run_structured_repair(
         _MASKED,
         runner=FakeRunner(),
@@ -648,7 +662,7 @@ def test_legacy_hook_candidate_rejection_is_terminal_semantic_attempt(tmp_path, 
 def test_legacy_hook_non_evidence_failure_stays_invalid_output(tmp_path, monkeypatch):
     from coding_review_agent_loop.validated_agent import _run_structured_repair
 
-    monkeypatch.setattr(orchestrator_module, "attempt_repair", _legacy_hook(_MASKED))
+    monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_MASKED))
     repaired, marker, attempts = _run_structured_repair(
         _MASKED,
         runner=FakeRunner(),
@@ -664,7 +678,7 @@ def test_legacy_hook_non_evidence_failure_stays_invalid_output(tmp_path, monkeyp
 
 
 def test_legacy_hook_rejection_routes_through_validated_agent(tmp_path, monkeypatch):
-    monkeypatch.setattr(orchestrator_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
+    monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
     collision = [_observation(), _observation()]
     response, error, invoke, _ = _run_masked(tmp_path, [collision], [_result(_MASKED)] * 3)
     assert invoke.call_count == 1
@@ -672,7 +686,7 @@ def test_legacy_hook_rejection_routes_through_validated_agent(tmp_path, monkeypa
 
 
 def test_legacy_hook_reaskable_rejection_reasks_once(tmp_path, monkeypatch):
-    monkeypatch.setattr(orchestrator_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
+    monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
     bad = [_observation(suite_start="unknown")]
     response, error, invoke, _ = _run_masked(
         tmp_path, [bad, [_observation()]], [_result(_MASKED), _result()], reask=True, retries=0

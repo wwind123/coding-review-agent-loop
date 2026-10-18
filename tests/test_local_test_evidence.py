@@ -38,6 +38,7 @@ from coding_review_agent_loop.local_test_evidence import (
 from coding_review_agent_loop.containment import open_confined_cwd
 from coding_review_agent_loop.runner import Runner
 import coding_review_agent_loop.local_test_evidence as evidence_module
+import coding_review_agent_loop.validated_agent as validated_agent
 
 
 def _observation(
@@ -1793,14 +1794,13 @@ def test_real_coder_launch_broker_attempt_carries_nested_run_attribution(tmp_pat
     """#1107: a real coder launch inside issue -> nested PR attribution."""
     from types import SimpleNamespace
 
-    from coding_review_agent_loop import orchestrator as orch
 
     _git_checkout(tmp_path)
     runner = _runner_with_budget(tmp_path, 2, "clamp")
     context = SimpleNamespace(run_id="outer-run")
     config = SimpleNamespace(repo="o/r")
-    outer = orch._begin_run_telemetry(runner, config, context, True, issue_number=56)
-    inner = orch._begin_run_telemetry(runner, config, context, False, pr_number=77)
+    outer = validated_agent._begin_run_telemetry(runner, config, context, True, issue_number=56)
+    inner = validated_agent._begin_run_telemetry(runner, config, context, False, pr_number=77)
     script = (
         "import sys; from coding_review_agent_loop.local_test_evidence import broker_client_from_environment; "
         "print('outcome=' + broker_client_from_environment().run("
@@ -1812,9 +1812,9 @@ def test_real_coder_launch_broker_attempt_carries_nested_run_attribution(tmp_pat
             label="coder", progress_interval_seconds=1, env=_src_env(),
         )
     finally:
-        orch._end_run_telemetry(runner, inner)
+        validated_agent._end_run_telemetry(runner, inner)
         after_nested = dict(runner.telemetry_attribution)
-        orch._end_run_telemetry(runner, outer)
+        validated_agent._end_run_telemetry(runner, outer)
     assert result.returncode == 0 and "outcome=passed" in (tmp_path / "coder.log").read_text()
     (row,) = _telemetry_attempts()
     assert (row["run_id"], row["issue_number"], row["pr_number"]) == ("outer-run", 56, 77)

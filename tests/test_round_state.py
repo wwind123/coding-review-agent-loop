@@ -32,6 +32,10 @@ from agent_loop_helpers import make_config
 from coding_review_agent_loop.reviewer_seats import (
     ReviewerSeat, SeatAgent, reviewer_seat_binding, validate_pr_seat_bindings,
 )
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+from agent_loop_helpers import patch_attr_in
 
 
 def test_named_pr_seat_binding_and_exact_head_approval(tmp_path):
@@ -147,7 +151,6 @@ def test_named_pr_resume_records_rebound_prelaunch_as_board_change(tmp_path, mon
     It was refused as drift before; now one orchestrator link is posted
     before any reviewer turn, and the rebound seat reviews on its new backend.
     """
-    import coding_review_agent_loop.orchestrator as orchestrator
     from agent_loop_helpers import FakeRunner, structured_pr_review
 
     seat = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
@@ -157,7 +160,7 @@ def test_named_pr_resume_records_rebound_prelaunch_as_board_change(tmp_path, mon
         pr_review_policy="selective-intermediate", pre_review_tests=False,
     )
     runner = FakeRunner()
-    original_post = orchestrator.post_pr_comment
+    original_post = pr_loop_support.post_pr_comment
 
     def interrupt_after_prelaunch(*args, **kwargs):
         result = original_post(*args, **kwargs)
@@ -166,14 +169,14 @@ def test_named_pr_resume_records_rebound_prelaunch_as_board_change(tmp_path, mon
         return result
 
     with monkeypatch.context() as patch:
-        patch.setattr(orchestrator, "post_pr_comment", interrupt_after_prelaunch)
+        patch_attr_in(patch, (pr_loop_support, pr_loop, issue_loop), "post_pr_comment", interrupt_after_prelaunch)
         with pytest.raises(KeyboardInterrupt):
-            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+            pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     assert not any(command[0] == "agy" for command, _ in runner.commands)
     rebound = SeatAgent(ReviewerSeat("flash", "codex", ("Model B",)), seat.workdir)
     rebound_config = dataclasses.replace(config, reviewer=(rebound,), reviewer_seats=(rebound,))
     runner.codex_outputs.append(structured_pr_review(reviewer="flash (OpenAI Codex: Model B)"))
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=rebound_config) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=rebound_config) == 0
     links = [c for c in runner.comments if c.startswith("Reviewer board change recorded.")]
     assert len(links) == 1
     assert "flash (antigravity: Model A) -> flash (codex: Model B)" in links[0]

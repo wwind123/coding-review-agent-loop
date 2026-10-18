@@ -9,7 +9,6 @@ import unittest.mock
 import pytest
 
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
-import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.config import DEFAULT_FLAT_CHILD_LIMIT
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue,
@@ -69,14 +68,10 @@ from coding_review_agent_loop.phase_progress import (
     resolve_staged_phase_progress,
 )
 from coding_review_agent_loop.child_topology import NeedsHumanDecision
-from coding_review_agent_loop.orchestrator import (
-    PostedRoundMetadata,
-    _attach_round_metadata,
-    _plan_subject,
-    _preflight_fresh_one_shot_recovery,
-    _preflight_fresh_staged_topology,
-    _dispatch_current_decomposition_phase,
-)
+from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
+from coding_review_agent_loop.discuss_loop import _attach_round_metadata
+from coding_review_agent_loop.execution_policy import _preflight_fresh_one_shot_recovery, _preflight_fresh_staged_topology
+from coding_review_agent_loop.plan_first_loop import _dispatch_current_decomposition_phase
 from coding_review_agent_loop.split_materialization import (
     MaterializedSplitChild,
     SplitMaterializationMetadata,
@@ -96,6 +91,11 @@ from agent_loop_helpers import (
     structured_plan_state,
     structured_v1_plan_state,
 )
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+from agent_loop_helpers import patch_attr_in
 
 
 def test_parse_plan_decomposition_accepts_agent_and_human_phases():
@@ -2457,8 +2457,8 @@ def test_staged_parent_advances_to_the_next_phase_after_the_first_completes(
     # Order the durable handoff against the coder invocation without relying on
     # comment/command index arithmetic.
     events = []
-    real_post = orchestrator_module.post_phase_implementation_handoff_comment
-    real_implement = orchestrator_module._implement_approved_issue
+    real_post = execution_policy.post_phase_implementation_handoff_comment
+    real_implement = issue_implementation._implement_approved_issue
 
     def _record_post(*args, **kwargs):
         events.append(f"handoff-{kwargs['phase_index']}")
@@ -2468,10 +2468,9 @@ def test_staged_parent_advances_to_the_next_phase_after_the_first_completes(
         events.append("coder")
         return real_implement(*args, **kwargs)
 
-    monkeypatch.setattr(
-        orchestrator_module, "post_phase_implementation_handoff_comment", _record_post
+    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop), "post_phase_implementation_handoff_comment", _record_post
     )
-    monkeypatch.setattr(orchestrator_module, "_implement_approved_issue", _record_implement)
+    patch_attr_in(monkeypatch, (issue_implementation, plan_first_loop), "_implement_approved_issue", _record_implement)
 
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
@@ -2599,9 +2598,9 @@ def test_fresh_staged_parent_advances_to_the_next_phase_after_the_first_complete
     override_calls = []
     route_calls = []
     handoff_calls = []
-    real_overrides = orchestrator_module.collect_child_disposition_overrides
-    real_route = orchestrator_module.resolve_child_execution_route
-    real_post = orchestrator_module.post_phase_implementation_handoff_comment
+    real_overrides = execution_policy.collect_child_disposition_overrides
+    real_route = execution_policy.resolve_child_execution_route
+    real_post = execution_policy.post_phase_implementation_handoff_comment
 
     def _record_overrides(*args, **kwargs):
         override_calls.append(kwargs)
@@ -2616,18 +2615,13 @@ def test_fresh_staged_parent_advances_to_the_next_phase_after_the_first_complete
         events.append(f"handoff-{kwargs['phase_index']}")
         return real_post(*args, **kwargs)
 
-    monkeypatch.setattr(
-        orchestrator_module, "collect_child_disposition_overrides", _record_overrides
+    patch_attr_in(monkeypatch, (execution_policy, pr_loop, plan_first_loop), "collect_child_disposition_overrides", _record_overrides
     )
-    monkeypatch.setattr(
-        orchestrator_module, "resolve_child_execution_route", _record_route
+    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop), "resolve_child_execution_route", _record_route
     )
-    monkeypatch.setattr(
-        orchestrator_module, "post_phase_implementation_handoff_comment", _record_post
+    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop), "post_phase_implementation_handoff_comment", _record_post
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_implement_approved_issue",
+    patch_attr_in(monkeypatch, (issue_implementation, plan_first_loop), "_implement_approved_issue",
         lambda *_args, **kwargs: events.append(f"coder-{kwargs['issue_context'].number}") or 0,
     )
 
@@ -2827,7 +2821,7 @@ def test_child_merge_of_the_last_stage_records_parent_completion(
             "coding_review_agent_loop.phase_progress.close_child_after_integration_merge",
             return_value="default-branch",
         ):
-            orchestrator_module._record_staged_parent_completion_after_merge(
+            execution_policy._record_staged_parent_completion_after_merge(
                 runner,
                 config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
                 issue_context=_staged_child_context(100),
@@ -2888,7 +2882,7 @@ def _run_merge_hook(runner, tmp_path):
         "coding_review_agent_loop.phase_progress.close_child_after_integration_merge",
         return_value="default-branch",
     ):
-        orchestrator_module._record_staged_parent_completion_after_merge(
+        execution_policy._record_staged_parent_completion_after_merge(
             runner,
             config=make_config(tmp_path, plan_execution_mode="implement-by-phase"),
             issue_context=_staged_child_context(100),

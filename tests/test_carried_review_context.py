@@ -4,7 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
 from agent_loop_helpers import *  # noqa: F403
 from coding_review_agent_loop.unresolved_items import (
@@ -13,11 +12,18 @@ from coding_review_agent_loop.unresolved_items import (
     _format_unresolved_items_for_coder,
     _validate_review_response,
 )
-from coding_review_agent_loop.orchestrator import (
-    _coder_followup_review_context,
-    _returning_reviewer_context,
-    _reviewer_summary_context,
-)
+from coding_review_agent_loop.pr_loop_support import _coder_followup_review_context, _returning_reviewer_context, _reviewer_summary_context
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 
 CLAIM = "Skill-mode reviewers must receive the PR-bound approved plan."
@@ -42,7 +48,7 @@ def test_named_seat_blocker_and_owner_survive_pr_resume(tmp_path):
         max_rounds=1, pre_review_tests=False, agent_max_retries=0,
     )
     with pytest.raises(AgentLoopError, match=r"flash \(item-1\)"):
-        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     from coding_review_agent_loop.round_state import _extract_round_metadata_records
     records = _extract_round_metadata_records(
         [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
@@ -64,7 +70,7 @@ def test_named_seat_blocker_and_owner_survive_pr_resume(tmp_path):
         ), 0),
     ])
     resumed = dataclasses.replace(config, max_rounds=3)
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=resumed) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=resumed) == 0
     reviewed = [comment for comment in runner.pr_payload["comments"] if "**Review verdict:**" in comment["body"]]
     assert len(reviewed) >= 4
     recovered_records = _extract_round_metadata_records(
@@ -95,7 +101,7 @@ def test_named_seat_model_change_keeps_open_blocker_until_fresh_disposition(tmp_
         max_rounds=1, pre_review_tests=False, agent_max_retries=0,
     )
     with pytest.raises(AgentLoopError, match="flash"):
-        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     new_flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model C",)), flash.workdir)
     changed = dataclasses.replace(
         config, reviewer=(new_flash, opus), reviewer_seats=(new_flash, opus), max_rounds=3,
@@ -110,7 +116,7 @@ def test_named_seat_model_change_keeps_open_blocker_until_fresh_disposition(tmp_
             prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
         ), 0),
     ])
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=changed) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=changed) == 0
     from coding_review_agent_loop.round_state import _extract_round_metadata_records
     records = _extract_round_metadata_records(
         [SimpleNamespace(body=comment["body"]) for comment in runner.pr_payload["comments"]],
@@ -419,13 +425,11 @@ def test_selective_sequential_returning_reviewer_gets_fresh_session(
             + f"\n<!-- AGENT_STATE: {state} -->\n-- {reviewer}"
         )
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_observe_pr_transition",
-        lambda *args, **kwargs: orchestrator.TransitionClassification("narrow", "scoped fix"),
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
+        lambda *args, **kwargs: pr_loop_support.TransitionClassification("narrow", "scoped fix"),
     )
     observed_sessions = []
-    original_run_validated_agent = orchestrator._run_validated_agent
+    original_run_validated_agent = validated_agent._run_validated_agent
 
     def run_validated_agent_with_session_observation(*args, **kwargs):
         if kwargs.get("role") == "reviewer":
@@ -435,9 +439,7 @@ def test_selective_sequential_returning_reviewer_gets_fresh_session(
             return dataclasses.replace(response, session_id=f"{kwargs['agent']}-session")
         return response
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_run_validated_agent",
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent",
         run_validated_agent_with_session_observation,
     )
     runner = FakeRunner(
@@ -659,7 +661,7 @@ def test_reviewer_context_shows_dropped_citations_restored_from_metadata_927():
         {"command": "python -m pytest -q", "receipt_id": "r-1", "claim": "bogus"},
     ]
     text = json.dumps(payload) + structured_coder_followup(summary="Checked receipts.")[end:]
-    parsed = orchestrator.validate_structured_coder_followup(text)
+    parsed = response_validation.validate_structured_coder_followup(text)
     [record] = parsed.test_observation_degradations
     metadata = PostedRoundMetadata(
         flow="pr", role="coder", agent="Codex", round_number=2, subject="abc123",
@@ -678,9 +680,9 @@ def test_metadata_writer_persists_citation_records_only_for_coder_results_927():
     payload, end = json.JSONDecoder().raw_decode(structured_coder_followup(summary="Checked."))
     payload["test_observations"] = [7]
     text = json.dumps(payload) + structured_coder_followup(summary="Checked.")[end:]
-    parsed = orchestrator.validate_structured_coder_followup(text)
-    fields = orchestrator._test_observation_degradation_fields(parsed)
+    parsed = response_validation.validate_structured_coder_followup(text)
+    fields = architecture_contract._test_observation_degradation_fields(parsed)
     assert fields == {"test_observation_degradations": parsed.test_observation_degradations}
     assert len(fields["test_observation_degradations"]) == 1
-    assert orchestrator._test_observation_degradation_fields(None) == {}
-    assert orchestrator._test_observation_degradation_fields("clarify") == {}
+    assert architecture_contract._test_observation_degradation_fields(None) == {}
+    assert architecture_contract._test_observation_degradation_fields("clarify") == {}

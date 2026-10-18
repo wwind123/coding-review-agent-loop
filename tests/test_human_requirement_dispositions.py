@@ -3,13 +3,14 @@ import json
 import pytest
 
 from agent_loop_helpers import structured_coder_followup
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import HumanReviewRequirement
 from coding_review_agent_loop.protocol import (
     validate_human_requirement_dispositions,
     validate_structured_plan_state,
 )
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.response_validation as response_validation
 
 
 def _plan(dispositions):
@@ -86,14 +87,14 @@ def test_initial_plan_validator_checks_coder_dispositions():
         body="Provide Grafana.",
     )
     with pytest.raises(AgentLoopError, match="missing requirement ID"):
-        orchestrator._validate_response_with_human_requirements(
+        response_validation._validate_response_with_human_requirements(
             _plan([]).replace(
                 "\n<!-- AGENT_PLAN_STATE: blocking -->",
                 "\n<!-- HUMAN_REQUIREMENTS_ADDRESSED -->\n\n### Human requirements\n"
                 f"- Requirement {requirement.requirement_id}: Grafana is planned.\n"
                 "<!-- AGENT_PLAN_STATE: blocking -->",
             ),
-            marker_validator=lambda text: orchestrator._require_plan_state_or_clarification(
+            marker_validator=lambda text: response_validation._require_plan_state_or_clarification(
                 text, architecture_status_mode="legacy"
             ),
             human_requirements=(requirement,),
@@ -103,7 +104,7 @@ def test_initial_plan_validator_checks_coder_dispositions():
 
 
 def test_current_plan_gate_rejects_missing_coder_dispositions():
-    assert not orchestrator._current_plan_has_complete_human_requirement_dispositions(
+    assert not response_validation._current_plan_has_complete_human_requirement_dispositions(
         _plan([]),
         surfaced_requirement_ids=("Requirement 1",),
     )
@@ -172,10 +173,10 @@ def _plan_key(requirement_ids):
 
 def test_carried_plan_approval_requires_the_current_requirement_acknowledgement():
     """`carried-approval-requires-current-ack`."""
-    evidence = orchestrator.PlanPanelEvidence(opening_index=0, opening_source="operator")
+    evidence = panel_evidence.PlanPanelEvidence(opening_index=0, opening_source="operator")
     key = _plan_key(("req-1",))
 
-    acknowledged = orchestrator._carried_plan_approvals(
+    acknowledged = panel_evidence._carried_plan_approvals(
         (
             _carried_plan_record(
                 agent="Gemini", state="approved", key=key,
@@ -192,7 +193,7 @@ def test_carried_plan_approval_requires_the_current_requirement_acknowledgement(
 
     # The stored approval carried no acknowledgement: it cannot be repaired in
     # place, so the reviewer must be re-invoked.
-    unacknowledged = orchestrator._carried_plan_approvals(
+    unacknowledged = panel_evidence._carried_plan_approvals(
         (
             _carried_plan_record(
                 agent="Gemini", state="approved", key=key,
@@ -212,7 +213,7 @@ def test_a_changed_surfaced_requirement_set_invalidates_every_carried_plan_appro
     """`plan-identity-change-invalidates-approvals` and
     `human-requirements-and-decomposition`: an added, edited, replaced, or
     withdrawn requirement changes the key's requirement digest."""
-    evidence = orchestrator.PlanPanelEvidence(opening_index=0, opening_source="operator")
+    evidence = panel_evidence.PlanPanelEvidence(opening_index=0, opening_source="operator")
     stored_key = _plan_key(("req-1",))
     records = (
         _carried_plan_record(
@@ -225,7 +226,7 @@ def test_a_changed_surfaced_requirement_set_invalidates_every_carried_plan_appro
         current_key = _plan_key(surfaced)
         assert current_key.components != stored_key.components
         assert (
-            orchestrator._carried_plan_approvals(
+            panel_evidence._carried_plan_approvals(
                 records,
                 current_key=current_key,
                 required_reviewers=("Codex", "Gemini"),
@@ -249,12 +250,12 @@ def test_a_premature_secondary_plan_approval_is_never_carried():
         ),
     )
 
-    carried = orchestrator._carried_plan_approvals(
+    carried = panel_evidence._carried_plan_approvals(
         records,
         current_key=key,
         required_reviewers=("Codex", "Gemini"),
         surfaced_requirement_ids=(),
-        panel_evidence=orchestrator.PlanPanelEvidence(),
+        panel_evidence=panel_evidence.PlanPanelEvidence(),
         primary_reviewer="Codex",
     )
 

@@ -12,7 +12,6 @@ import os
 import subprocess
 from types import SimpleNamespace
 
-import coding_review_agent_loop.orchestrator as orchestrator_module
 from agent_loop_helpers import FakeRunner, make_config, structured_issue_implementation
 from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
 from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
@@ -23,10 +22,20 @@ from coding_review_agent_loop.protocol import (
     validate_structured_issue_implementation,
 )
 from coding_review_agent_loop.round_state import make_approved_plan_context
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 ROWS = ("row-wf", "row-unit", "row-man")
-_REAL_RUN_VALIDATED_AGENT = orchestrator_module._run_validated_agent
-_REAL_RUN_AGENT_RESULT = orchestrator_module.run_agent_result
+_REAL_RUN_VALIDATED_AGENT = validated_agent._run_validated_agent
+_REAL_RUN_AGENT_RESULT = validated_agent.run_agent_result
 
 
 def _row(row_id: str, level: str) -> dict:
@@ -178,21 +187,20 @@ class CoverageHarness:
             return step(self) if callable(step) else step
 
         if not self.real_agent:
-            m.setattr(orchestrator_module, "_run_validated_agent", scripted)
-        m.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
-        m.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
-        m.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
-        m.setattr(orchestrator_module, "validate_assigned_head_advanced", lambda **_k: None)
-        m.setattr(
-            orchestrator_module, "run_pr_loop",
+            patch_attr_in(m, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", scripted)
+        patch_attr_in(m, (execution_policy, issue_implementation, plan_first_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+        patch_attr_in(m, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
+        patch_attr_in(m, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
+        patch_attr_in(m, (issue_implementation, issue_loop), "validate_assigned_head_advanced", lambda **_k: None)
+        patch_attr_in(m, (pr_loop, issue_implementation, plan_first_loop, issue_loop), "run_pr_loop",
             lambda *_a, **kwargs: self.run_pr_calls.append(kwargs) or 0,
         )
         m.setattr(
-            orchestrator_module, "reconcile_test_observations",
+            response_validation, "reconcile_test_observations",
             lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
         )
         m.setattr(
-            orchestrator_module, "stable_tracked_tree_snapshot",
+            response_validation, "stable_tracked_tree_snapshot",
             lambda _workdir: SimpleNamespace(
                 head=self.runner.pr_payload["headRefOid"],
                 tracked_digest="tree-current", complete=True, stable=True, status_clean=True,
@@ -207,7 +215,7 @@ class CoverageHarness:
                 return SimpleNamespace(text=self.correction_handler(self))
             return SimpleNamespace(text="not a structured response")
 
-        m.setattr(orchestrator_module, "run_agent_result", no_agent_result)
+        patch_attr_in(m, (validated_agent, response_validation), "run_agent_result", no_agent_result)
 
     def response(self, text: str, *, session_id: str = "coder-session", turn_id: str = "coder-turn", observations=()):
         parsed = validate_structured_issue_implementation(
@@ -228,7 +236,7 @@ class CoverageHarness:
             number=56, repo="OWNER/REPO", title="Issue", body="Issue body",
             url="https://github.com/OWNER/REPO/issues/56", comments=(), human_requirements=(),
         )
-        return orchestrator_module._implement_approved_issue(
+        return issue_implementation._implement_approved_issue(
             self.runner,
             issue_number=56,
             approved_plan=self.approved_plan,
@@ -236,7 +244,7 @@ class CoverageHarness:
             memory=None,
             issue_context=issue_context,
             coder_session_id=None,
-            usage_context=orchestrator_module._new_usage_context(self.config),
+            usage_context=validated_agent._new_usage_context(self.config),
             approved_plan_context=self.plan_context,
         )
 

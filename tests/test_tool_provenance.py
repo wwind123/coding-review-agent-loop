@@ -17,14 +17,13 @@ from coding_review_agent_loop import tool_provenance as tp
 from coding_review_agent_loop.cli import main
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.inspect_tool import ExecResult
-from coding_review_agent_loop.orchestrator import (
-    _new_usage_context,
-    _persist_usage_summary,
-    _run_validated_agent,
-)
+from coding_review_agent_loop.validated_agent import _new_usage_context, _persist_usage_summary, _run_validated_agent
 from coding_review_agent_loop.usage import RunUsageContext
 
 from agent_loop_helpers import FakeRunner, make_config
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_object_in
 
 GIT = shutil.which("git")
 pytestmark = pytest.mark.skipif(GIT is None, reason="git is required")
@@ -320,9 +319,8 @@ def test_dispatch_stamp_precedes_completion(tmp_path, dry_run):
     class Delayed(FakeRunner):
         pass
 
-    from coding_review_agent_loop import orchestrator
 
-    real = orchestrator.run_agent_result
+    real = validated_agent.run_agent_result
 
     def delayed(*args, **kwargs):
         observed["at_call"] = context.first_agent_dispatch_at
@@ -330,14 +328,11 @@ def test_dispatch_stamp_precedes_completion(tmp_path, dry_run):
         return real(*args, **kwargs)
 
     runner = FakeRunner(codex_outputs=["OK"], claude_outputs=["OK"])
-    orchestrator.run_agent_result = delayed
-    try:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", delayed):
         _run_validated_agent(
             runner, agent="codex", config=config, prompt="p", marker_description="OK",
             validate=lambda t: t, usage_context=context,
         )
-    finally:
-        orchestrator.run_agent_result = real
     assert observed["at_call"] is not None
     assert context.first_agent_dispatch_at == observed["at_call"]
 
@@ -425,7 +420,7 @@ def _summaries(config):
 
 @pytest.mark.parametrize("quiet", [False, True])
 def test_owning_task_run_writes_summary_with_provenance(tmp_path, capsys, quiet):
-    from coding_review_agent_loop.orchestrator import run_task_loop
+    from coding_review_agent_loop.issue_loop import run_task_loop
 
     config = make_config(
         tmp_path, base=None, reviewer="codex", auto_agent_dirs=("claude", "codex"), quiet=quiet,
@@ -444,7 +439,7 @@ def test_owning_task_run_writes_summary_with_provenance(tmp_path, capsys, quiet)
 
 
 def test_failing_owning_run_still_writes_provenance_summary(tmp_path):
-    from coding_review_agent_loop.orchestrator import run_task_loop
+    from coding_review_agent_loop.issue_loop import run_task_loop
 
     config = make_config(tmp_path)
     with pytest.raises(AgentLoopError, match="Task text is empty"):
@@ -458,7 +453,7 @@ def test_failing_owning_run_still_writes_provenance_summary(tmp_path):
 
 
 def test_nested_run_shares_context_without_recapture(tmp_path, monkeypatch, capsys):
-    from coding_review_agent_loop.orchestrator import run_pr_loop
+    from coding_review_agent_loop.pr_loop import run_pr_loop
 
     calls = []
     _cli_setup(monkeypatch, tmp_path, calls)

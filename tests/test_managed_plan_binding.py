@@ -9,7 +9,6 @@ import pytest
 
 from agent_loop_helpers import make_config
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import IssueComment, IssueContext
 from coding_review_agent_loop.managed_ci import (
@@ -23,6 +22,17 @@ from coding_review_agent_loop.round_state import (
     _attach_round_metadata,
 )
 from coding_review_agent_loop.runner import CommandResult
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+from agent_loop_helpers import patch_attr_in
 
 PLAN = "8c6ed707e3700a21"
 
@@ -250,22 +260,20 @@ def _snapshot(
         architecture_identity_changed=False,
     )
     calls = []
-    monkeypatch.setattr(orchestrator, "get_pr_review_context", lambda *a, **k: pr_context)
-    monkeypatch.setattr(orchestrator, "get_issue_context", lambda *a, **k: issue)
-    monkeypatch.setattr(
-        orchestrator, "_revalidate_pr_architecture_identity", lambda *a, **k: (None, False)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "get_pr_review_context", lambda *a, **k: pr_context)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop), "get_issue_context", lambda *a, **k: issue)
+    patch_attr_in(monkeypatch, (architecture_contract, pr_loop_support), "_revalidate_pr_architecture_identity", lambda *a, **k: (None, False)
+    )
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop), "recover_approved_plan_context", lambda *a, **k: plan
     )
     monkeypatch.setattr(
-        orchestrator, "recover_approved_plan_context", lambda *a, **k: plan
-    )
-    monkeypatch.setattr(
-        orchestrator, "verify_managed_pr_plan_binding", lambda *a, **k: calls.append(k)
+        pr_loop_support, "verify_managed_pr_plan_binding", lambda *a, **k: calls.append(k)
     )
     extra = {"reviewer": reviewer} if reviewer is not None else {}
     config = make_config(
         tmp_path, managed_ci=managed_ci, managed_ci_trusted_actor="agent-loop", **extra
     )
-    result = orchestrator._fresh_pr_qualification_snapshot(
+    result = pr_loop_support._fresh_pr_qualification_snapshot(
         object(), config=config, pr_number=7, issue_context=issue,
         parent_issue_context=None, approved_plan_context=plan,
         managed_protection_mode=managed_protection_mode,
@@ -333,8 +341,7 @@ def test_two_fresh_grants_at_the_live_head_fail_closed(tmp_path):
 
 
 def _strict(monkeypatch, *, plan_text="approved plan", complete=True):
-    monkeypatch.setattr(
-        orchestrator, "_resume_plan_round",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, plan_first_loop, issue_loop), "_resume_plan_round",
         lambda comments, **_k: None if plan_text is None else (plan_text, object()),
     )
 
@@ -342,14 +349,13 @@ def _strict(monkeypatch, *, plan_text="approved plan", complete=True):
         if not complete:
             raise AgentLoopError(error_message)
 
-    monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+    patch_attr_in(monkeypatch, (panel_evidence, pr_loop_support, pr_loop), "_require_complete_canonical_plan_approval", require)
     # The fixture stubs the completion predicate, including the shared
     # classification recovery now applies to real plan history (#1377).
     import coding_review_agent_loop.plan_verification as plan_verification
 
     monkeypatch.setattr(plan_verification, "require_recoverable_plan_approval", lambda *a, **k: None)
-    monkeypatch.setattr(
-        orchestrator, "approved_plan_hash",
+    patch_attr_in(monkeypatch, (panel_evidence, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "approved_plan_hash",
         lambda text: PLAN if text == "approved plan" else "0" * 16,
     )
 
@@ -390,8 +396,8 @@ def test_strict_managed_qualification_fails_closed(
 )
 def test_only_a_recordless_strict_handoff_skips_the_chain(protection_mode, override_nonce, expected):
     handoff = SimpleNamespace(protection_mode=protection_mode, override_nonce=override_nonce)
-    assert orchestrator._managed_binding_protection_mode(handoff) == expected
-    assert orchestrator._managed_binding_protection_mode(None) is None
+    assert pr_loop_support._managed_binding_protection_mode(handoff) == expected
+    assert pr_loop_support._managed_binding_protection_mode(None) is None
 
 
 # A signed rebind keeps the PR head, so the retired-plan grant stays at the
@@ -450,7 +456,7 @@ def test_strict_qualification_checks_the_plan_against_the_supplied_board_not_the
     def require(*_a, config, error_message, **_k):
         seen.append(tuple(config.reviewer))
 
-    monkeypatch.setattr(orchestrator, "_require_complete_canonical_plan_approval", require)
+    patch_attr_in(monkeypatch, (panel_evidence, pr_loop_support, pr_loop), "_require_complete_canonical_plan_approval", require)
     (_context, _ids, plan, returned), _calls = _snapshot(
         tmp_path, monkeypatch, managed_ci=True, managed_protection_mode="strict",
         reviewer=("codex", "claude"), plan_binding_reviewers=("codex", "claude", "gemini"),

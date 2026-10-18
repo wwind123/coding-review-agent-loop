@@ -3,7 +3,7 @@
 import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.orchestrator import (
+from coding_review_agent_loop.pr_loop_support import (
     _partition_unresolved_items,
     _refuse_dispatch_while_evidence_frozen,
     _round_limit_diagnostic,

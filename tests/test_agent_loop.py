@@ -18,7 +18,6 @@ import pytest
 import orchestrator_split_guard
 import coding_review_agent_loop.agent_failure as agent_failure
 import coding_review_agent_loop.cli as cli_module
-import coding_review_agent_loop.orchestrator as orchestrator_module
 import coding_review_agent_loop.prompts as prompts_module
 
 from coding_review_agent_loop.agents.base import AgentResult, with_public_response_file_instruction
@@ -51,13 +50,10 @@ from coding_review_agent_loop.managed_ci import ManagedCiReadiness, ProtectionAs
 from coding_review_agent_loop.managed_pr import ManagedPrHandoff
 from coding_review_agent_loop.runner import CommandResult, ExecutableIdentity, ExecutionObservation
 from coding_review_agent_loop.usage import RunUsageContext
-from coding_review_agent_loop.orchestrator import (
-    CompletionRecoveryPolicy,
-    PostedRoundMetadata,
+from coding_review_agent_loop.validated_agent import CompletionRecoveryPolicy, _run_validated_agent
+from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
+from coding_review_agent_loop.agent_failure import (
     ValidatedAgentResponse,
-    _attach_round_metadata,
-    _decode_round_metadata,
-    _encode_round_metadata,
     _failure_category,
     _failure_suggestion,
     _format_invalid_agent_response_error,
@@ -65,18 +61,14 @@ from coding_review_agent_loop.orchestrator import (
     _is_transient_agent_output,
     _is_transient_public_response,
     _parse_rate_limit_reset_seconds,
-    _plan_subject,
-    ROUND_RESUME_MARKER_RE,
-    _resume_plan_round,
     _resolve_requested_model,
-    _run_validated_agent,
-    _strip_round_metadata,
-    _validate_coder_followup_response,
-    _validate_plan_review_response,
-    _validate_review_response,
-    render_canonical_plan_revision,
-    render_public_agent_comment,
 )
+from coding_review_agent_loop.discuss_loop import _attach_round_metadata, ROUND_RESUME_MARKER_RE
+from coding_review_agent_loop.round_state import _decode_round_metadata, _encode_round_metadata, _strip_round_metadata
+from coding_review_agent_loop.pr_loop_support import _resume_plan_round
+from coding_review_agent_loop.pr_loop import _validate_coder_followup_response, _validate_review_response
+from coding_review_agent_loop.plan_first_loop import _validate_plan_review_response, render_canonical_plan_revision
+from coding_review_agent_loop.response_validation import render_public_agent_comment
 from coding_review_agent_loop.protocol import (
     UnresolvedReviewItem,
     parse_plan_item_dispositions,
@@ -100,6 +92,15 @@ from agent_loop_helpers import (
     structured_plan_state,
     structured_pr_review,
 )
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in, patch_object_in
 
 
 def test_pre_review_tests_can_be_disabled(tmp_path):
@@ -638,7 +639,7 @@ def test_gemini_pre_marker_429_does_not_suppress_structured_review_repair(tmp_pa
         assert expected_kind == "pr_review"
         return repaired_review
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert captured_repairs == [malformed_public_review]
@@ -684,7 +685,7 @@ def test_gemini_response_file_repair_ignores_raw_stdout_transient_diagnostics(tm
         captured_repairs.append(raw)
         return repaired_review
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert captured_repairs == [malformed_public_review]
@@ -701,7 +702,7 @@ def test_diagnostic_shaped_public_response_remains_transient(tmp_path):
     runner = FakeRunner(gemini_outputs=[{"stdout": public_response}])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         with pytest.raises(AgentLoopError) as exc_info:
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -748,7 +749,7 @@ def test_codex_chatgpt_unsupported_model_public_response_skips_retry_repair_and_
     # The scripted dirty tree is this checkout's prepared state.
     establish_initial_baseline(config, runner, config.codex_dir)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         with pytest.raises(AgentInvocationError) as exc_info:
             _run_validated_agent(
                 runner,
@@ -825,9 +826,7 @@ def test_marker_safety_failure_does_not_capture_plan_validation_exhaustion(tmp_p
     config = make_config(tmp_path, agent_max_retries=0)
     persisted = []
 
-    with patch.object(
-        orchestrator_module,
-        "_run_structured_repair",
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair",
         return_value=(None, None, []),
     ):
         with pytest.raises(AgentInvocationError) as error:
@@ -865,7 +864,7 @@ def test_structured_plan_review_transient_terms_with_trailing_prose_normalizes(t
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -908,7 +907,7 @@ def test_structured_pr_review_transient_terms_duplicate_footer_normalizes(tmp_pa
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -975,7 +974,7 @@ def test_structured_coder_followup_transient_terms_before_footer_runs_repair(tmp
     runner = FakeRunner(claude_outputs=[malformed_followup])
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired_followup) as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_followup) as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -1116,7 +1115,7 @@ def test_gemini_duplicate_trailing_agent_state_marker_normalizes_without_repair(
     runner = FakeRunner(gemini_outputs=[{"stdout": raw_stdout}])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     repair_mock.assert_not_called()
@@ -1149,7 +1148,7 @@ def test_gemini_pre_marker_429_malformed_public_response_fails_deterministically
     runner = FakeRunner(gemini_outputs=[{"stdout": raw_stdout}])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value="still invalid"):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value="still invalid"):
         with pytest.raises(AgentLoopError) as exc_info:
             run_pr_loop(runner, pr_number=77, config=config)
 
@@ -1193,7 +1192,7 @@ def test_malformed_structured_review_model_support_terms_still_runs_repair(tmp_p
     runner = FakeRunner(gemini_outputs=[malformed_review])
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired_review) as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_review) as repair_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -2692,8 +2691,7 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
             marker_value=pr_review_marker,
         )
 
-    with patch(
-        "coding_review_agent_loop.orchestrator._run_validated_agent",
+    with patch_object_in((validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent",
         side_effect=fake_run_validated_agent,
     ):
         assert (
@@ -2925,14 +2923,14 @@ def test_direct_issue_and_task_implementation_turns_run_as_coder_role(tmp_path, 
         pr_payload={"body": "Fixes #56"},
     )
     config = make_config(tmp_path, reviewer="codex", auto_agent_dirs=("claude", "codex"))
-    real_run_validated_agent = orchestrator_module._run_validated_agent
+    real_run_validated_agent = validated_agent._run_validated_agent
     roles: dict[str, object] = {}
 
     def recording_run_validated_agent(*args, **kwargs):
         roles.setdefault(kwargs.get("operation_description"), kwargs.get("role"))
         return real_run_validated_agent(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", recording_run_validated_agent)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", recording_run_validated_agent)
 
     if mode == "issue":
         assert run_issue_loop(runner, issue_number=56, config=config) == 0
@@ -4697,7 +4695,7 @@ def test_coder_validation_keeps_acquisition_catalog_through_format_repair(tmp_pa
     seen_catalogs = []
 
     def validate(text):
-        catalog = orchestrator_module._current_test_turn_observations(runner)
+        catalog = response_validation._current_test_turn_observations(runner)
         seen_catalogs.append(catalog)
         if text != repaired:
             raise AgentLoopError("malformed response")
@@ -4712,8 +4710,8 @@ def test_coder_validation_keeps_acquisition_catalog_through_format_repair(tmp_pa
         parsed = validate(repaired)
         return repaired, parsed, []
 
-    monkeypatch.setattr(orchestrator_module, "_run_structured_repair", repair_with_new_broker_turn)
-    with patch.object(orchestrator_module, "run_agent_result", return_value=result):
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", repair_with_new_broker_turn)
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", return_value=result):
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -4759,9 +4757,7 @@ def test_claude_completion_recovery_keeps_original_acquisition_catalog(
             return validate_structured_issue_implementation(text)
         raise AgentLoopError("response deferred to background work")
 
-    with patch.object(
-        orchestrator_module,
-        "run_agent_result",
+    with patch_object_in((validated_agent, response_validation), "run_agent_result",
         side_effect=[original_result, recovery_result],
     ):
         response = _run_validated_agent(
@@ -4957,7 +4953,7 @@ def test_claude_replay_refusal_is_diagnostic_only_and_does_not_wait_or_override_
     config = make_config(tmp_path, reviewer="claude", agent_max_retries=0)
     usage = RunUsageContext(run_id="run-refusal", summary_path=tmp_path / "usage.json")
 
-    with patch.object(orchestrator_module, "run_agent_result", return_value=result):
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", return_value=result):
         with pytest.raises(AgentInvocationError) as error:
             _run_validated_agent(
                 runner,
@@ -4989,7 +4985,7 @@ def test_transient_claude_replay_refusal_keeps_provider_retry_and_category(tmp_p
     runner = FakeRunner()
     config = make_config(tmp_path, reviewer="claude", agent_max_retries=1)
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=[refused, valid]):
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=[refused, valid]):
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -5010,7 +5006,7 @@ def test_transient_claude_replay_refusal_only_retains_transient_category(tmp_pat
     runner = FakeRunner()
     config = make_config(tmp_path, reviewer="claude", agent_max_retries=0)
 
-    with patch.object(orchestrator_module, "run_agent_result", return_value=refused):
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", return_value=refused):
         with pytest.raises(AgentInvocationError) as error:
             _run_validated_agent(
                 runner,
@@ -5068,7 +5064,7 @@ def test_codex_executable_replacement_replay_uses_fresh_full_timeout(tmp_path):
     )
     config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=results) as run_mock:
         response = _run_validated_agent(
             runner,
             agent="codex",
@@ -5107,7 +5103,7 @@ def test_codex_replacement_replay_does_not_consume_ordinary_retry(tmp_path):
     runner.wait_for_executable_stability = lambda command, *, deadline=None: True
     config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=results) as run_mock:
         response = _run_validated_agent(
             runner,
             agent="codex",
@@ -5137,7 +5133,7 @@ def test_codex_replacement_exhaustion_keeps_specific_terminal_category(tmp_path)
     runner.wait_for_executable_stability = lambda command, *, deadline=None: True
     config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=results):
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=results):
         with pytest.raises(AgentInvocationError) as error:
             _run_validated_agent(
                 runner,
@@ -5171,7 +5167,7 @@ def test_codex_unstable_replacement_retains_ordinary_retry(tmp_path):
 
     # The first failed replacement observation remains subject to normal
     # retry accounting; this test uses a scripted valid ordinary retry.
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=results) as run_mock:
         response = _run_validated_agent(
             runner,
             agent="codex",
@@ -5197,7 +5193,7 @@ def test_codex_replacement_context_does_not_change_long_quota_exit_priority(tmp_
     runner.wait_for_executable_stability = lambda command, *, deadline=None: False
     config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
 
-    with patch.object(orchestrator_module, "run_agent_result", return_value=result):
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", return_value=result):
         with pytest.raises(QuotaResetExceededError) as error:
             _run_validated_agent(
                 runner,
@@ -5258,7 +5254,7 @@ def test_gemini_replacement_replay_uses_fresh_timeout_and_provider_suffix(tmp_pa
     )
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=0)
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=results) as run_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -5297,7 +5293,7 @@ def test_gemini_unstable_replacement_preserves_ordinary_retry(tmp_path):
     runner.wait_for_executable_stability = lambda command, *, deadline=None: False
     config = make_config(tmp_path, reviewer="gemini", agent_max_retries=1)
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=results) as run_mock:
         response = _run_validated_agent(
             runner,
             agent="gemini",
@@ -5332,7 +5328,7 @@ def test_claude_quiet_unstable_replacement_keeps_ordinary_retry(tmp_path):
     runner.wait_for_executable_stability = lambda command, *, deadline=None: False
     config = make_config(tmp_path, reviewer="claude", agent_max_retries=1)
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=results) as run_mock:
         response = _run_validated_agent(
             runner,
             agent="claude",
@@ -5380,7 +5376,7 @@ def test_antigravity_quiet_unstable_replacement_reaches_model_fallback(tmp_path)
         models.append(config.antigravity_models)
         return next(results)
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=mock_run) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=mock_run) as run_mock:
         response = _run_validated_agent(
             runner,
             agent="antigravity",
@@ -5429,7 +5425,7 @@ def test_antigravity_replacement_replay_does_not_advance_model_state(tmp_path):
         models.append(config.antigravity_models)
         return next(results)
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=mock_run) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=mock_run) as run_mock:
         response = _run_validated_agent(
             runner,
             agent="antigravity",
@@ -5596,8 +5592,7 @@ def test_orchestrator_retries_capture_diagnostics_as_tooling_failure(
         command_result=command_result,
     )
 
-    with patch(
-        "coding_review_agent_loop.orchestrator.run_agent_result", return_value=result
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", return_value=result
     ) as run_mock:
         with pytest.raises(AgentInvocationError) as exc_info:
             _run_validated_agent(
@@ -5631,8 +5626,7 @@ def test_orchestrator_classifies_resource_exhaustion_with_diagnostics(tmp_path):
         ),
     )
 
-    with patch(
-        "coding_review_agent_loop.orchestrator.run_agent_result", return_value=result
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", return_value=result
     ):
         with pytest.raises(AgentInvocationError) as exc_info:
             _run_validated_agent(
@@ -5674,8 +5668,7 @@ def test_orchestrator_target_exec_error_without_command_result_is_retryable(tmp_
     )
     runner = TargetExecRunner()
 
-    with patch(
-        "coding_review_agent_loop.orchestrator.run_agent_result", return_value=result
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", return_value=result
     ):
         with pytest.raises(AgentInvocationError) as exc_info:
             _run_validated_agent(
@@ -5748,7 +5741,7 @@ def test_validated_agent_recovers_after_contained_enoent_during_self_update(
         tmp_path, reviewer="codex", agent_max_retries=2, quiet=False
     )
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=results) as run_mock:
         response = _run_validated_agent(
             runner,
             agent="codex",
@@ -5776,9 +5769,7 @@ def test_validated_agent_exhausted_contained_enoent_stays_transient(
         tmp_path, reviewer="codex", agent_max_retries=2, quiet=False
     )
 
-    with patch.object(
-        orchestrator_module,
-        "run_agent_result",
+    with patch_object_in((validated_agent, response_validation), "run_agent_result",
         side_effect=lambda *a, **k: _contained_target_exec_result(tmp_path, command),
     ) as run_mock:
         with pytest.raises(AgentInvocationError) as exc_info:
@@ -5819,7 +5810,7 @@ def test_validated_agent_target_exec_relaunch_ignores_stability_result(
     )
     config = make_config(tmp_path, reviewer="codex", agent_max_retries=1)
 
-    with patch.object(orchestrator_module, "run_agent_result", side_effect=results) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", side_effect=results) as run_mock:
         response = _run_validated_agent(
             runner,
             agent="codex",
@@ -5841,9 +5832,7 @@ def test_validated_agent_target_exec_without_retry_budget_skips_stability_wait(
     runner, stability_calls = _preflighted_target_exec_runner(monkeypatch, command)
     config = make_config(tmp_path, reviewer="codex", agent_max_retries=0)
 
-    with patch.object(
-        orchestrator_module,
-        "run_agent_result",
+    with patch_object_in((validated_agent, response_validation), "run_agent_result",
         side_effect=lambda *a, **k: _contained_target_exec_result(tmp_path, command),
     ) as run_mock:
         with pytest.raises(AgentInvocationError) as exc_info:
@@ -5893,7 +5882,7 @@ def test_validated_agent_target_exec_retry_keeps_safety_precedence(
     )
     config = make_config(tmp_path, reviewer="codex", agent_max_retries=2)
 
-    with patch.object(orchestrator_module, "run_agent_result", return_value=result) as run_mock:
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", return_value=result) as run_mock:
         with pytest.raises(AgentInvocationError) as exc_info:
             _run_validated_agent(
                 runner,
@@ -6701,7 +6690,7 @@ def test_approved_implementation_role_override_reaches_real_backend_turn(
     tmp_path, provider, effort_option, agent_effort_option
 ):
     from coding_review_agent_loop.agents.registry import run_agent_result
-    from coding_review_agent_loop.orchestrator import _approved_implementation_config
+    from coding_review_agent_loop.issue_implementation import _approved_implementation_config
 
     config = make_config(
         tmp_path,
@@ -6897,7 +6886,7 @@ def test_antigravity_reviewer_capacity_retry_falls_back_with_repair_enabled(tmp_
         models.append(config.antigravity_models)
         return next(results)
 
-    with patch("coding_review_agent_loop.orchestrator.run_agent_result", mock_run):
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", mock_run):
         response = _run_validated_agent(
             FakeRunner(), agent="antigravity", config=config, prompt="Review.",
             marker_description="test", validate=lambda text: text, use_repair=True, role="reviewer",
@@ -6922,7 +6911,7 @@ def test_antigravity_capacity_exhaustion_is_reported_transient(tmp_path):
         model_used="ModelA",
     )
 
-    with patch("coding_review_agent_loop.orchestrator.run_agent_result", return_value=result):
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", return_value=result):
         with pytest.raises(AgentInvocationError, match="transient"):
             _run_validated_agent(
                 FakeRunner(), agent="antigravity", config=config, prompt="Review.",
@@ -6953,7 +6942,7 @@ def test_reviewer_and_coder_call_sites_pass_correct_role(tmp_path):
         captured_roles.append(role)
         return AgentResult(text="ok")
 
-    with patch("coding_review_agent_loop.orchestrator.run_agent_result", mock_run):
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", mock_run):
         _run_validated_agent(
             FakeRunner(),
             agent="gemini",
@@ -6967,7 +6956,7 @@ def test_reviewer_and_coder_call_sites_pass_correct_role(tmp_path):
     assert captured_roles == ["reviewer"]
     captured_roles.clear()
 
-    with patch("coding_review_agent_loop.orchestrator.run_agent_result", mock_run):
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", mock_run):
         _run_validated_agent(
             FakeRunner(),
             agent="gemini",
@@ -7289,8 +7278,7 @@ def test_run_plan_loop_freeform_initial_plan_includes_model(tmp_path):
 
     runner = FakeRunner()
     config = make_config(tmp_path, coder="claude", reviewer="codex")
-    with patch(
-        "coding_review_agent_loop.orchestrator._run_validated_agent",
+    with patch_object_in((validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent",
         side_effect=fake_run_validated_agent,
     ):
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
@@ -7351,8 +7339,7 @@ def test_run_plan_loop_freeform_revision_includes_model(tmp_path):
 
     runner = FakeRunner()
     config = make_config(tmp_path, coder="claude", reviewer="codex")
-    with patch(
-        "coding_review_agent_loop.orchestrator._run_validated_agent",
+    with patch_object_in((validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent",
         side_effect=fake_run_validated_agent,
     ):
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
@@ -7557,7 +7544,7 @@ def test_format_invalid_agent_response_error_no_suggestion_empty_response():
 
 def test_m953_discuss_round_comment_with_spilled_prior_items_is_bot_authored():
     import coding_review_agent_loop.round_transport as transport
-    from coding_review_agent_loop.orchestrator import _discuss_subject, _is_bot_authored_discuss_comment
+    from coding_review_agent_loop.discuss_loop import _discuss_subject, _is_bot_authored_discuss_comment
     from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
     from coding_review_agent_loop.github import IssueContext
 
@@ -7663,13 +7650,13 @@ def test_host_footer_log_latch_resets_with_each_owned_usage_context(tmp_path, mo
     # Two successive owning invocations each log once, however often the
     # footer is observed on write and re-read paths.
     for expected in (2, 3):
-        orchestrator_module._new_usage_context(config)
+        validated_agent._new_usage_context(config)
         for context in ("write", "re-read", "nested PR run"):
             github_module.note_host_footer_observed(config, context)
         assert len(lines) == expected
 
     # With no footer observed, an owning invocation logs nothing.
-    orchestrator_module._new_usage_context(config)
+    validated_agent._new_usage_context(config)
     assert len(lines) == 3
 
 
@@ -7883,7 +7870,7 @@ def _drive_codex(tmp_path, raws, *, retries=2, containment=None):
         return AgentResult(text="", raw_output=raw, returncode=1, provider="codex", containment=containment)
 
     runner = FakeRunner()
-    with patch("coding_review_agent_loop.orchestrator.run_agent_result", mock_run):
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", mock_run):
         try:
             out = _run_validated_agent(
                 runner, agent="codex", config=config, prompt="Review.",

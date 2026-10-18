@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 import coding_review_agent_loop.pr_loop as pr_loop_module
 from coding_review_agent_loop.agents.registry import agent_display_name
 from coding_review_agent_loop.cli import build_parser, run_pr_loop
@@ -42,6 +41,8 @@ from coding_review_agent_loop.unresolved_items import (
 )
 
 from agent_loop_helpers import FakeRunner, make_config, structured_coder_followup
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.panel_evidence as panel_evidence
 
 ACTOR = ("coding-review-agent-loop", 424242)
 START_HEAD = "abc123"
@@ -72,7 +73,7 @@ def _plan_context(*row_ids: str):
         {"applicability": "applicable", "rows": [_row(r) for r in row_ids], "important_exclusions": []}
     )
     identity = risk_test_matrix_identity(matrix)
-    return orchestrator.make_approved_plan_context(
+    return execution_policy.make_approved_plan_context(
         "Approved plan.\n\n" + render_risk_test_matrix_section(matrix),
         source_locator="test approved plan",
         risk_test_matrix_contract_version=1,
@@ -1238,7 +1239,7 @@ def _issue_bound_plan(context):
         context.canonical_text,
         PostedRoundMetadata(
             flow="plan", role="coder", agent="Claude", round_number=1,
-            subject=orchestrator._plan_subject(context.canonical_text),
+            subject=panel_evidence._plan_subject(context.canonical_text),
             canonical_plan=context.canonical_text,
             raw_structured_coder_response=context.canonical_text,
         ),

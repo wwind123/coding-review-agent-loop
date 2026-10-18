@@ -13,6 +13,7 @@ from coding_review_agent_loop.reviewer_floor import (
     check_reviewer_floor,
 )
 from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+import coding_review_agent_loop.pr_loop as pr_loop_module
 
 _AGENT_COMMANDS = {"codex", "claude", "agy", "gemini"}
 
@@ -275,7 +276,6 @@ def test_signed_pr_amendment_floor_is_resolved_before_any_pr_write(
     tmp_path, monkeypatch, floor, refusal
 ):
     """item-3: lineage resolution and the floor run before activation and posts."""
-    import coding_review_agent_loop.orchestrator as orchestrator
 
     runner, board, run_pr_loop = _amended_named_pr(tmp_path, monkeypatch)
     comments_before = len(runner.comments)
@@ -284,7 +284,7 @@ def test_signed_pr_amendment_floor_is_resolved_before_any_pr_write(
     def reached(*_a, **_k):
         raise _Reached
 
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", reached)
+    monkeypatch.setattr(pr_loop_module, "activate_managed_ci", reached)
     config = make_config(tmp_path, **board, **floor)
     if refusal is None:
         with pytest.raises(_Reached):
@@ -297,12 +297,11 @@ def test_signed_pr_amendment_floor_is_resolved_before_any_pr_write(
 
 
 def test_malformed_pr_amendment_history_is_refused_before_any_pr_write(tmp_path, monkeypatch):
-    import coding_review_agent_loop.orchestrator as orchestrator
 
     runner, board, run_pr_loop = _amended_named_pr(tmp_path, monkeypatch, amendment_pr=78)
     comments_before = len(runner.comments)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop_module, "activate_managed_ci",
         lambda *a, **k: pytest.fail("managed-CI activation ran before amendment validation"),
     )
     with pytest.raises(AgentLoopError, match="PR #78|another|pull request"):
@@ -329,13 +328,12 @@ def test_invalid_signed_pr_lineage_never_authorizes_the_floor_or_writes(
     tmp_path, monkeypatch, amendment, refusal
 ):
     """item-3: every read-only amendment check runs before authorization and writes."""
-    import coding_review_agent_loop.orchestrator as orchestrator
 
     runner, board, run_pr_loop = _amended_named_pr(tmp_path, monkeypatch, **amendment)
     comments_before = len(runner.comments)
     commands_before = len(runner.commands)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop_module, "activate_managed_ci",
         lambda *a, **k: pytest.fail("managed-CI activation ran before amendment validation"),
     )
     with pytest.raises(AgentLoopError, match=refusal):
@@ -350,7 +348,6 @@ def test_invalid_signed_pr_lineage_never_authorizes_the_floor_or_writes(
 @pytest.mark.parametrize("below_floor", [True, False])
 def test_retained_managed_label_is_released_only_after_the_floor(tmp_path, monkeypatch, below_floor):
     """item-6: a below-floor board leaves the ready PR's retained label untouched."""
-    import coding_review_agent_loop.orchestrator as orchestrator
     from test_managed_ci import EntryNormalizationRunner, _live_pr, _managed_label_deletes
 
     runner = EntryNormalizationRunner(_live_pr())
@@ -360,15 +357,15 @@ def test_retained_managed_label_is_released_only_after_the_floor(tmp_path, monke
     def reached(*_a, **_k):
         raise _Reached
 
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", reached)
+    monkeypatch.setattr(pr_loop_module, "activate_managed_ci", reached)
     if below_floor:
         with pytest.raises(AgentLoopError, match="1 reviewer\\(s\\) is below the floor of 2"):
-            orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+            pr_loop_module.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
         assert _managed_label_deletes(runner) == []
         assert runner.comments == []
     else:
         with pytest.raises(_Reached):
-            orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+            pr_loop_module.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
         assert len(_managed_label_deletes(runner)) == 1
 
 
@@ -377,7 +374,6 @@ def test_retained_managed_label_is_released_only_after_the_floor(tmp_path, monke
 
 def _watch_retained_label(monkeypatch, *, proceed=_Reached):
     """A ready PR that retains the managed label; record any release attempt."""
-    import coding_review_agent_loop.orchestrator as orchestrator
     import coding_review_agent_loop.pr_loop as pr_loop
 
     releases = []
@@ -388,7 +384,7 @@ def _watch_retained_label(monkeypatch, *, proceed=_Reached):
 
     monkeypatch.setattr(pr_loop, "release_retained_managed_label", release)
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop_module, "activate_managed_ci",
         lambda *a, **k: pytest.fail("managed-CI activation ran before the board was resolved"),
     )
     return releases
@@ -720,7 +716,6 @@ def test_fresh_authorization_below_the_floor_publishes_nothing(
     tmp_path, monkeypatch, lifecycle, board, refusal
 ):
     """item-9: the floor runs before managed-CI fresh authorization, whatever the label state."""
-    import coding_review_agent_loop.orchestrator as orchestrator
     from coding_review_agent_loop.managed_ci import parse_issue_created_authorization_comment
     from test_managed_ci import _workflow_runner_for_issue_authorization
 
@@ -739,11 +734,11 @@ def test_fresh_authorization_below_the_floor_publishes_nothing(
         **floor,
     )
     monkeypatch.setattr(
-        orchestrator, "activate_managed_ci",
+        pr_loop_module, "activate_managed_ci",
         lambda *a, **k: pytest.fail("managed-CI activation ran before the floor"),
     )
     with pytest.raises(AgentLoopError, match=refusal):
-        orchestrator.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        pr_loop_module.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
     assert not [
         comment for comment in runner.intent_comments
         if parse_issue_created_authorization_comment(comment["body"]) is not None
@@ -762,7 +757,6 @@ def test_fresh_authorization_with_a_signed_plan_reduction_reaches_authorization(
     tmp_path, monkeypatch,
 ):
     """item-9: a valid inherited signed plan reduction still reaches fresh authorization."""
-    import coding_review_agent_loop.orchestrator as orchestrator
     from coding_review_agent_loop.cli import run_pr_loop
     from test_issue_pr_handoff import _named_config
 
@@ -773,7 +767,7 @@ def test_fresh_authorization_with_a_signed_plan_reduction_reaches_authorization(
     def authorize(*_a, **_k):
         raise _Reached
 
-    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", authorize)
+    monkeypatch.setattr(pr_loop_module, "authorize_fresh_issue_created_resume", authorize)
     config = _named_config(
         tmp_path, seats[:2], min_reviewers=3, managed_ci=True, managed_ci_pr_mode=True,
         managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
@@ -797,7 +791,6 @@ def test_ordinary_pr_ignores_unfinished_planning_on_its_linked_issue(
     tmp_path, monkeypatch, trigger
 ):
     """item-10: only managed-CI recovery binds a canonical plan without a handoff record."""
-    import coding_review_agent_loop.orchestrator as orchestrator
 
     plan_comments = _incomplete_linked_plan_comments(tmp_path)
 
@@ -821,7 +814,7 @@ def test_ordinary_pr_ignores_unfinished_planning_on_its_linked_issue(
         config = make_config(tmp_path, **board)
     runner.pr_payload["body"] = "Closes #56"
     comments_before = len(runner.comments)
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", reached)
+    monkeypatch.setattr(pr_loop_module, "activate_managed_ci", reached)
     with pytest.raises(_Reached):
         run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True)
     assert len(runner.comments) == comments_before

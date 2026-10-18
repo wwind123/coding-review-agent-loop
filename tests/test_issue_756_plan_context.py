@@ -3,12 +3,8 @@ from dataclasses import replace
 import pytest
 
 from agent_loop_helpers import make_config
-from coding_review_agent_loop.orchestrator import (
-    _reconcile_human_requirements_ack_item,
-    _reviewer_requirement_coverage_matches,
-    _reviewer_requirement_identity_ids,
-    _resumed_pr_reviewer_matches_requirements,
-)
+from coding_review_agent_loop.pr_loop import _reconcile_human_requirements_ack_item
+from coding_review_agent_loop.response_validation import _reviewer_requirement_coverage_matches, _reviewer_requirement_identity_ids, _resumed_pr_reviewer_matches_requirements
 from coding_review_agent_loop.github import (
     HumanReviewRequirement,
     IssueComment,

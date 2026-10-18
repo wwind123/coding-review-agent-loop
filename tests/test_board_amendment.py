@@ -26,6 +26,13 @@ from coding_review_agent_loop.plan_review_scheduling import (
 from coding_review_agent_loop.protocol import UnresolvedReviewItem
 from coding_review_agent_loop.review_scheduling import make_contract
 from coding_review_agent_loop.round_state import PostedRoundMetadata, PostedRoundRecord
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.round_state as round_state
+from agent_loop_helpers import patch_attr_in
 
 BOARD = ("Codex", "Claude", "Antigravity")
 C0 = make_plan_contract(BOARD, "primary-then-panel", "Codex")
@@ -710,7 +717,6 @@ def test_named_pr_signed_outage_removal_and_explicit_restoration():
 
 @pytest.mark.parametrize("seat_local", [False, True])
 def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_path, monkeypatch, seat_local):
-    import coding_review_agent_loop.orchestrator as orchestrator
 
     from agent_loop_helpers import FakeRunner, make_config, structured_coder_followup, structured_pr_review
     from coding_review_agent_loop.cli import run_pr_loop
@@ -774,17 +780,17 @@ def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_pat
     removed_seats = ("flash",) if seat_local else ("flash", "opus")
     append_amendment(board, removed_seats, (), 1)
     before = len(runner.commands)
-    original_post = orchestrator.post_pr_comment
+    original_post = pr_loop_support.post_pr_comment
 
     def interrupt_after_coder(*args, **kwargs):
         result = original_post(*args, **kwargs)
-        match = orchestrator.ROUND_RESUME_MARKER_RE.search(kwargs["body"])
-        if match and orchestrator._decode_round_metadata(match["payload"]).role == "coder":
+        match = discuss_loop.ROUND_RESUME_MARKER_RE.search(kwargs["body"])
+        if match and round_state._decode_round_metadata(match["payload"]).role == "coder":
             raise KeyboardInterrupt
         return result
 
     with monkeypatch.context() as patch:
-        patch.setattr(orchestrator, "post_pr_comment", interrupt_after_coder)
+        patch_attr_in(patch, (pr_loop_support, pr_loop, issue_loop), "post_pr_comment", interrupt_after_coder)
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
     assert not any(cmd[0] == "agy" and "Model A" in cmd for cmd, _ in runner.commands[before:])
@@ -1283,7 +1289,6 @@ def test_restoration_does_not_reopen_reassigned_and_cleared_items():
 
 
 def test_restored_reviewer_must_reapprove_and_summary_names_it():
-    from coding_review_agent_loop import orchestrator
     from coding_review_agent_loop.board_amendment import (
         amendment_summary_line,
         predates_restoration,
@@ -1333,12 +1338,12 @@ def test_restored_reviewer_must_reapprove_and_summary_names_it():
         )
 
     def carried(records):
-        return orchestrator._carried_plan_approvals(
+        return panel_evidence._carried_plan_approvals(
             records,
             current_key=key,
             required_reviewers=BOARD,
             surfaced_requirement_ids=(),
-            panel_evidence=orchestrator.PlanPanelEvidence(
+            panel_evidence=panel_evidence.PlanPanelEvidence(
                 opening_index=0, opening_source="operator"
             ),
             primary_reviewer="Codex",
@@ -1359,12 +1364,11 @@ def test_restored_reviewer_must_reapprove_and_summary_names_it():
 
 
 def test_drift_error_offers_a_restore_template_when_config_adds_a_reviewer():
-    from coding_review_agent_loop import orchestrator
     from coding_review_agent_loop.board_amendment import added_in_config
 
     assert added_in_config(C1, C0) == ("Antigravity",)
     assert added_in_config(C0, C1) is None
-    clause = orchestrator._board_amendment_route_clause(
+    clause = panel_evidence._board_amendment_route_clause(
         flow="plan",
         issue_number=942,
         pr_number=None,
@@ -1458,7 +1462,6 @@ def test_resolver_accepts_the_base_board_only_when_asked_and_never_other_boards(
 
 
 def test_stale_record_detail_is_tagged_and_drift_builders_print_the_repost_round():
-    from coding_review_agent_loop import orchestrator
     from coding_review_agent_loop.board_amendment import (
         STALE_UNREAD_AMENDMENT_HINT,
         stale_unread_amendment_locator,
@@ -1473,20 +1476,19 @@ def test_stale_record_detail_is_tagged_and_drift_builders_print_the_repost_round
     locator = stale_unread_amendment_locator(str(excinfo.value))
     assert locator == "issue #942 comment 4"
     detail = str(excinfo.value)
-    text = orchestrator._stale_amendment_repost_clause(detail, lambda: 2)
+    text = panel_evidence._stale_amendment_repost_clause(detail, lambda: 2)
     assert f"Delete the amendment comment at {locator}" in text
     assert "effective_from_round 2" in text
-    assert "the round the next resume re-enters" in orchestrator._stale_amendment_repost_clause(
+    assert "the round the next resume re-enters" in panel_evidence._stale_amendment_repost_clause(
         detail, lambda: None
     )
-    assert orchestrator._stale_amendment_repost_clause("no tag", lambda: 2) == ""
+    assert panel_evidence._stale_amendment_repost_clause("no tag", lambda: 2) == ""
 
 
 def test_route_clause_names_rerun_rules_and_the_not_recognized_hint():
-    from coding_review_agent_loop import orchestrator
 
     def clause(flow, recognized):
-        return orchestrator._board_amendment_route_clause(
+        return panel_evidence._board_amendment_route_clause(
             flow=flow,
             issue_number=942 if flow == "plan" else None,
             pr_number=77 if flow == "pr" else None,
@@ -1508,11 +1510,10 @@ def test_route_clause_names_rerun_rules_and_the_not_recognized_hint():
 
 
 def test_plan_board_hint_only_when_a_pr_amendment_explains_the_reduced_flags():
-    from coding_review_agent_loop import orchestrator
 
     body = _amendment_body(flow="pr", issue=None, pr_number=77)
     comments = [_comment(body)]
-    hint = orchestrator._pr_amendment_plan_board_hint
+    hint = pr_loop_support._pr_amendment_plan_board_hint
     assert "original reviewer board" in hint(
         comments, pr_number=77, supplied_reviewers=("codex", "claude")
     )

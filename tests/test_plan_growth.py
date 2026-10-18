@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator_module
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 from agent_loop_helpers import (
     FakeRunner,
@@ -53,6 +52,9 @@ from coding_review_agent_loop.round_state import (
     _attach_round_metadata,
     _extract_round_metadata_records,
 )
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
 
 FOOTER = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
 RATIONALE = "The scope items share one parser seam and cannot ship separately."
@@ -197,10 +199,10 @@ def test_planner_candidate_rounds_ignore_reviewer_only_rounds_and_replays():
         ))
 
     comments = [coder(1), phase_advance(2), phase_advance(3), coder(1), coder(4)]
-    rounds = orchestrator_module._planner_candidate_rounds(comments)
+    rounds = panel_evidence._planner_candidate_rounds(comments)
     assert rounds == {1, 4}
-    assert orchestrator_module._plan_growth_candidate_count(rounds, 4) == 2
-    assert orchestrator_module._plan_growth_candidate_count(rounds, 5) == 3
+    assert panel_evidence._plan_growth_candidate_count(rounds, 4) == 2
+    assert panel_evidence._plan_growth_candidate_count(rounds, 5) == 3
 
 
 # --- justification rules ---------------------------------------------------
@@ -515,7 +517,7 @@ def test_near_limit_digest_with_metadata_fits_and_oversize_is_refused(tmp_path):
         full_comment=full, raw_text=raw, prior_items=(), model_used=None,
         surfaced_requirement_ids=(), requires_direct_discussion_ack=False,
     )
-    body = orchestrator_module._assemble_structured_plan_round_body(metadata=metadata, **kwargs)
+    body = child_plan_binding._assemble_structured_plan_round_body(metadata=metadata, **kwargs)
     text = str(body)
     assert "### One-shot growth justification (digest)" in text
     assert "`rendered-size`" in text
@@ -528,7 +530,7 @@ def test_near_limit_digest_with_metadata_fits_and_oversize_is_refused(tmp_path):
         ),
     )
     with pytest.raises(AgentLoopError, match="exceeds 60000 characters"):
-        orchestrator_module._assemble_structured_plan_round_body(metadata=oversized, **kwargs)
+        child_plan_binding._assemble_structured_plan_round_body(metadata=oversized, **kwargs)
 
 
 # --- prompts ----------------------------------------------------------------
@@ -732,19 +734,19 @@ def test_carried_approval_of_a_noncompliant_plan_fails_closed(tmp_path):
     history = [SimpleNamespace(body=str(item["body"])) for item in _approved_history(tmp_path)]
     for overrides in ({}, {"plan_growth_gate": "off", "plan_growth_max_scope_items": 1}):
         config = _config(tmp_path, **overrides)
-        plan_text, plan_round = orchestrator_module._resume_plan_round(
-            history, configured_reviewers=orchestrator_module.reviewers(config)
+        plan_text, plan_round = pr_loop_support._resume_plan_round(
+            history, configured_reviewers=panel_evidence.reviewers(config)
         )
-        orchestrator_module._require_complete_canonical_plan_approval(
+        panel_evidence._require_complete_canonical_plan_approval(
             history, config=config, plan_text=plan_text, plan_round=plan_round,
             human_requirements=(), error_message="incomplete",
         )
     config = _config(tmp_path, plan_growth_max_scope_items=1)
-    plan_text, plan_round = orchestrator_module._resume_plan_round(
-        history, configured_reviewers=orchestrator_module.reviewers(config)
+    plan_text, plan_round = pr_loop_support._resume_plan_round(
+        history, configured_reviewers=panel_evidence.reviewers(config)
     )
     with pytest.raises(AgentLoopError, match="incomplete Plan growth gate: .*Re-run planning"):
-        orchestrator_module._require_complete_canonical_plan_approval(
+        panel_evidence._require_complete_canonical_plan_approval(
             history, config=config, plan_text=plan_text, plan_round=plan_round,
             human_requirements=(), error_message="incomplete",
         )
@@ -788,8 +790,8 @@ def test_rebind_advisory_measures_the_stored_canonical_text(tmp_path):
     state_only = render_canonical_plan_state(validate_structured_plan_state(json.dumps(payload) + FOOTER))
     canonical = state_only + "\n\n### Prior plan item dispositions\n- [item-1] resolved: " + "x" * 400
     config = _config(tmp_path, plan_growth_max_chars=len(state_only) + 200)
-    plan_hash = orchestrator_module.approved_plan_hash(canonical)
-    advisory = orchestrator_module._rebind_growth_advisory(
+    plan_hash = panel_evidence.approved_plan_hash(canonical)
+    advisory = child_plan_binding._rebind_growth_advisory(
         config=config, issue_number=56, comments=[_rebind_record(canonical, payload)],
         pr_number=77, plan_hash=plan_hash,
     )
@@ -798,7 +800,7 @@ def test_rebind_advisory_measures_the_stored_canonical_text(tmp_path):
     assert RATIONALE in advisory
     assert "AGENT_" not in advisory
     # A failure is logged and never raised.
-    broken = orchestrator_module._rebind_growth_advisory(
+    broken = child_plan_binding._rebind_growth_advisory(
         config=config, issue_number=56, comments=[object()], pr_number=77, plan_hash=plan_hash,
     )
     assert broken is None
@@ -809,10 +811,10 @@ def test_rebind_advisory_rationale_is_bounded_and_marker_safe(tmp_path):
         _parsed(one_shot_growth_justification=_justification("scope-items", rationale="y" * 2000))
     )
     canonical = render_canonical_plan_state(validate_structured_plan_state(json.dumps(payload) + FOOTER))
-    advisory = orchestrator_module._rebind_growth_advisory(
+    advisory = child_plan_binding._rebind_growth_advisory(
         config=_config(tmp_path, plan_growth_max_scope_items=1), issue_number=56,
         comments=[_rebind_record(canonical, payload)], pr_number=77,
-        plan_hash=orchestrator_module.approved_plan_hash(canonical),
+        plan_hash=panel_evidence.approved_plan_hash(canonical),
     )
     assert "y" * 400 not in advisory and "complete rationale in the authenticated plan round" in advisory
 
@@ -821,9 +823,9 @@ def test_rebind_advisory_skips_staged_and_structurally_small_plans(tmp_path):
     payload = structured_plan_revision_to_payload(_parsed())
     canonical = render_canonical_plan_state(_parsed())
     comments = [_rebind_record(canonical, payload)]
-    plan_hash = orchestrator_module.approved_plan_hash(canonical)
+    plan_hash = panel_evidence.approved_plan_hash(canonical)
     # Case (e): structurally small; reviewer findings are not an input.
-    assert orchestrator_module._rebind_growth_advisory(
+    assert child_plan_binding._rebind_growth_advisory(
         config=_config(tmp_path), issue_number=56, comments=comments, pr_number=77,
         plan_hash=plan_hash,
     ) is None
@@ -835,10 +837,10 @@ def test_rebind_advisory_skips_staged_and_structurally_small_plans(tmp_path):
     )
     staged_payload = structured_plan_revision_to_payload(staged)
     staged_canonical = render_canonical_plan_state(staged)
-    assert orchestrator_module._rebind_growth_advisory(
+    assert child_plan_binding._rebind_growth_advisory(
         config=_config(tmp_path, plan_growth_max_chars=1, plan_growth_max_scope_items=1),
         issue_number=56, comments=[_rebind_record(staged_canonical, staged_payload)],
-        pr_number=77, plan_hash=orchestrator_module.approved_plan_hash(staged_canonical),
+        pr_number=77, plan_hash=panel_evidence.approved_plan_hash(staged_canonical),
     ) is None
 
 
@@ -1061,11 +1063,11 @@ def test_phase_advance_round_does_not_increment_revision_count(tmp_path):
     # Carried-approval recovery anchors on the round-2 panel record and still
     # counts one candidate.
     comments = [SimpleNamespace(body=str(item["body"])) for item in runner.issue_comments]
-    plan_text, plan_round = orchestrator_module._resume_plan_round(
-        comments, configured_reviewers=orchestrator_module.reviewers(config)
+    plan_text, plan_round = pr_loop_support._resume_plan_round(
+        comments, configured_reviewers=panel_evidence.reviewers(config)
     )
     assert plan_round.round_number == 2
-    orchestrator_module._require_complete_canonical_plan_approval(
+    panel_evidence._require_complete_canonical_plan_approval(
         comments, config=config, plan_text=plan_text, plan_round=plan_round,
         human_requirements=(), error_message="incomplete",
     )
@@ -1117,10 +1119,10 @@ def test_rebind_advisory_asserts_no_approval_time_gate_state(tmp_path):
     rebound after the thresholds were lowered gets no false 'gate was off' claim."""
     payload = structured_plan_revision_to_payload(_parsed())
     canonical = render_canonical_plan_state(_parsed())
-    advisory = orchestrator_module._rebind_growth_advisory(
+    advisory = child_plan_binding._rebind_growth_advisory(
         config=_config(tmp_path, plan_growth_gate="enforce", plan_growth_max_scope_items=1),
         issue_number=56, comments=[_rebind_record(canonical, payload)], pr_number=77,
-        plan_hash=orchestrator_module.approved_plan_hash(canonical),
+        plan_hash=panel_evidence.approved_plan_hash(canonical),
     )
     assert advisory is not None and "`scope-items`" in advisory
     assert "No reviewed one-shot growth justification exists for this plan." in advisory

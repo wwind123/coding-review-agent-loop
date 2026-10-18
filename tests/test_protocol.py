@@ -11,16 +11,11 @@ from coding_review_agent_loop.cli import (
     AgentLoopError,
     parse_agent_state,
 )
-from coding_review_agent_loop.orchestrator import (
-    HUMAN_REQUIREMENTS_ACK_ITEM_ID,
-    _TerminalIssueImplementationConflict,
-    _review_freeform_summary_text,
-    _validate_issue_implementation_response,
-    _validate_coder_followup_response,
-    _validate_plan_revision_response,
-    _validate_review_response,
-    _validate_plan_review_response,
-)
+from coding_review_agent_loop.pr_loop import HUMAN_REQUIREMENTS_ACK_ITEM_ID, _validate_coder_followup_response, _validate_review_response
+from coding_review_agent_loop.architecture_contract import _TerminalIssueImplementationConflict
+from coding_review_agent_loop.comment_rendering import _review_freeform_summary_text
+from coding_review_agent_loop.response_validation import _validate_issue_implementation_response, _validate_plan_revision_response
+from coding_review_agent_loop.plan_first_loop import _validate_plan_review_response
 from coding_review_agent_loop.protocol import (
     ApprovedFollowup,
     DeferredStage,
@@ -299,14 +294,10 @@ from coding_review_agent_loop.errors import (
     NonRepairableEvidenceRejection,
     UnknownPriorItemDispositionError,
 )
-from coding_review_agent_loop.orchestrator import (
-    _detect_discuss_consensus,
-    _decode_public_response_json_prefix,
-    _failure_category,
-    _is_transient_public_response,
-    _plan_subject,
-    render_canonical_plan_revision,
-)
+from coding_review_agent_loop.discuss_loop import _detect_discuss_consensus
+from coding_review_agent_loop.agent_failure import _decode_public_response_json_prefix, _failure_category, _is_transient_public_response
+from coding_review_agent_loop.panel_evidence import _plan_subject
+from coding_review_agent_loop.plan_first_loop import render_canonical_plan_revision
 from coding_review_agent_loop.prompts import (
     HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
     HUMAN_REQUIREMENTS_DIRECT_DISCUSSION_ACK,
@@ -3714,7 +3705,7 @@ def test_architecture_impact_sanitization_neutralizes_all_agent_strings():
 
 def test_fresh_task_contract_rejects_legacy_marker_only_output():
     with pytest.raises(AgentLoopError, match="Fresh task implementation"):
-        from coding_review_agent_loop.orchestrator import _require_task_implementation_result
+        from coding_review_agent_loop.response_validation import _require_task_implementation_result
         _require_task_implementation_result(
             "Implemented.\n<!-- AGENT_PR: 12 -->\n<!-- AGENT_STATE: blocking -->",
             required_architecture_impact_contract=1, architecture_status_mode="legacy",
@@ -4170,7 +4161,7 @@ def test_generation_one_identity_covers_complete_recommendation_content():
 
 
 def test_unversioned_plans_keep_explicit_legacy_typed_stages_materializable():
-    from coding_review_agent_loop.orchestrator import _extract_current_child_stages
+    from coding_review_agent_loop.execution_policy import _extract_current_child_stages
 
     payload = _execution_plan_payload()
     payload.pop("execution_strategy_contract_version")

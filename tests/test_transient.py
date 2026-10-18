@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from coding_review_agent_loop import orchestrator, transient
+from coding_review_agent_loop import transient
 
 
 def test_transient_signals_are_retryable() -> None:
@@ -70,7 +70,7 @@ def test_antigravity_capacity_requires_framed_provider_failure() -> None:
 
 def test_orchestrator_alias_preserves_identity() -> None:
     # orchestrator keeps the old private name as an alias to the moved implementation.
-    assert orchestrator._is_transient_agent_output is transient.is_transient_agent_output
+    assert agent_failure._is_transient_agent_output is transient.is_transient_agent_output
 
 
 def test_backgrounded_completion_phrases_match() -> None:
