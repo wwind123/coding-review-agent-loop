@@ -2178,6 +2178,9 @@ def patch_object_in(modules, name, *args, **kwargs):
     return patched()
 
 
+_CAPACITY = "Selected model is at capacity. Please try a different model."
+
+
 __all__ = [name for name in globals() if not name.startswith("__")]
 
 
