@@ -254,21 +254,26 @@ def _names_facade(module: str | None) -> bool:
     return module == FACADE or (module or "").startswith(f"{FACADE}.")
 
 
+def _call_argument(node: ast.Call, position: int, keyword: str) -> ast.expr | None:
+    """The argument bound to ``keyword``, passed positionally or by keyword."""
+    if len(node.args) > position:
+        return node.args[position]
+    return next((item.value for item in node.keywords if item.arg == keyword), None)
+
+
 def _import_module_target(node: ast.Call) -> str | None:
-    """The absolute module an ``import_module`` call with constant arguments names."""
+    """The absolute module an ``import_module(name, package)`` call with constant arguments names."""
     func = node.func
-    name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else None
-    if name != "import_module" or not node.args:
+    called = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else None
+    if called != "import_module":
         return None
-    first = node.args[0]
+    first = _call_argument(node, 0, "name")
     if not (isinstance(first, ast.Constant) and isinstance(first.value, str)):
         return None
     target = first.value
     if not target.startswith("."):
         return target
-    package = node.args[1] if len(node.args) > 1 else next(
-        (keyword.value for keyword in node.keywords if keyword.arg == "package"), None
-    )
+    package = _call_argument(node, 1, "package")
     if not (isinstance(package, ast.Constant) and isinstance(package.value, str)):
         return None
     level = len(target) - len(target.lstrip("."))

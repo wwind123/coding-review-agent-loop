@@ -250,8 +250,9 @@ def test_facade_use_guard_rejects_each_banned_form(source, expected, line):
     [
         "importlib.import_module('coding_review_agent_loop.orchestrator')\n",
         "import_module('coding_review_agent_loop.orchestrator')\n",
+        "importlib.import_module(name='coding_review_agent_loop.orchestrator')\n",
     ],
-    ids=["importlib-attribute", "bare-import-module"],
+    ids=["importlib-attribute", "bare-import-module", "name-keyword"],
 )
 def test_facade_use_guard_rejects_import_module_of_the_facade(source):
     assert guard.facade_use_problems(source, "test_synthetic.py") == [
@@ -260,8 +261,19 @@ def test_facade_use_guard_rejects_import_module_of_the_facade(source):
     ]
 
 
-def test_facade_use_guard_rejects_relative_import_module_of_the_facade():
-    source = "importlib.import_module('.orchestrator', 'coding_review_agent_loop')\n"
+@pytest.mark.parametrize(
+    "call",
+    [
+        "importlib.import_module('.orchestrator', 'coding_review_agent_loop')",
+        "importlib.import_module('.orchestrator', package='coding_review_agent_loop')",
+        "importlib.import_module(name='.orchestrator', package='coding_review_agent_loop')",
+        "importlib.import_module(package='coding_review_agent_loop', name='.orchestrator')",
+        "import_module(name='.orchestrator', package='coding_review_agent_loop')",
+    ],
+    ids=["positional", "package-keyword", "both-keywords", "keywords-reordered", "bare-both-keywords"],
+)
+def test_facade_use_guard_rejects_relative_import_module_of_the_facade(call):
+    source = call + "\n"
     assert guard.facade_use_problems(source, "test_synthetic.py") == [
         "test_synthetic.py line 1 imports the orchestrator facade through import_module"
     ]
