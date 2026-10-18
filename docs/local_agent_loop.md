@@ -5727,6 +5727,14 @@ a green check:
   approved-plan implementation this applies once the created managed draft is
   authenticated. On a rejected turn a lookup failure is only logged. A
   lookup failure adds only a diagnostic note and never blocks the round.
+  The orchestrator's own managed dispatch is not reported: a v2 run is
+  recognized by its run name, and a v1 run by the dispatch this process
+  recorded (workflow, head, branch and time window) when exactly one listed
+  run matches it (#1414). When the match cannot be confirmed (several
+  matching runs, one run matching several dispatches, or an unavailable
+  listing for the dispatched head), the in-turn matching runs are listed in a
+  separate "attribution undetermined" section with that reason, without
+  naming a creator.
 
 The guard and the prompt text share one invocation-scoped decision. In the PR
 loop that decision is the live managed-CI state for the turn: explicit managed

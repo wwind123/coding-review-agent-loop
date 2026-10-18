@@ -21659,8 +21659,16 @@ class _GuardedCoderRunner(FakeRunner):
     full-suite receipt, records orchestrator dispatches, and scripts the
     dispatch audit."""
 
-    def __init__(self, *, audit_runs=(), audit_returncode=0, seed_receipt=True, **kwargs):
+    def __init__(self, *, audit_runs=(), audit_returncode=0, seed_receipt=True,
+                 audit_failing_queries=(), dispatch_returncode=0, first_dispatch_runs=None,
+                 **kwargs):
         super().__init__(**kwargs)
+        # Query substrings whose listing fails (#1414).
+        self.audit_failing_queries = tuple(audit_failing_queries)
+        self.dispatch_returncode = dispatch_returncode
+        # Called with the dispatched head on the first orchestrator dispatch;
+        # the runs it returns become visible to later audits (#1414).
+        self.first_dispatch_runs = first_dispatch_runs
         self.launch_envs = []
         self.coder_dispatch_attempts = []
         self.coder_turn_receipts = []
@@ -21713,14 +21721,22 @@ class _GuardedCoderRunner(FakeRunner):
         if cmd[:3] == ["gh", "api", "--paginate"] and "/actions/runs?" in cmd[3]:
             self.audit_queries.append(cmd[3])
             cmd, cwd_path = self._record_command(cmd, cwd)
-            if self.audit_returncode:
-                return CommandResult(cmd, cwd_path, "", "HTTP 502", self.audit_returncode)
+            if self.audit_returncode or any(part in cmd[3] for part in self.audit_failing_queries):
+                return CommandResult(cmd, cwd_path, "", "HTTP 502", self.audit_returncode or 1)
             payload = {"total_count": len(self.audit_runs), "workflow_runs": self.audit_runs}
             return CommandResult(cmd, cwd_path, json.dumps(payload), "", 0)
         if cmd[:2] == ["gh", "api"] and any(part.endswith("/dispatches") for part in cmd):
             # The orchestrator's real exact-head dispatch, at the GitHub boundary.
             self.orchestrator_dispatches.append((cmd, dict(env or {})))
+            if self.first_dispatch_runs is not None and len(self.orchestrator_dispatches) == 1:
+                head = next(
+                    part.split("=", 1)[1] for part in cmd
+                    if part.startswith("inputs[expected_head_sha]=")
+                )
+                self.audit_runs.extend(self.first_dispatch_runs(head))
             cmd, cwd_path = self._record_command(cmd, cwd)
+            if self.dispatch_returncode:
+                return CommandResult(cmd, cwd_path, "", "HTTP 500", self.dispatch_returncode)
             return CommandResult(cmd, cwd_path, "", "", 0)
         return super().run(args, cwd=cwd, input_text=input_text, check=check, env=env)
 
@@ -21942,10 +21958,14 @@ def test_unmanaged_coder_turn_has_no_guard_prompt_or_audit(tmp_path, monkeypatch
     assert dispatches == []
 
 
-def _dispatch_run(run_id, head_sha, *, created_at, name="CI", branch="agent-loop/managed-77"):
+def _dispatch_run(
+    run_id, head_sha, *, created_at, name="CI", branch="agent-loop/managed-77",
+    path=".github/workflows/ci.yml", head_branch=None,
+):
     return {
         "id": run_id, "name": name, "display_title": name, "event": "workflow_dispatch",
-        "head_sha": head_sha, "head_branch": branch, "created_at": created_at,
+        "head_sha": head_sha, "head_branch": head_branch or branch, "created_at": created_at,
+        "path": path,
         "html_url": f"https://github.com/OWNER/REPO/actions/runs/{run_id}",
         "repository": {"full_name": "OWNER/REPO"}, "check_suite_id": run_id + 1,
     }
@@ -22012,6 +22032,401 @@ def test_audit_coder_turn_dispatches_unit_filters_and_dedupes(tmp_path):
     note = render_coder_dispatch_audit_note(audit)
     assert "run 1 on `b` (https://github.com/OWNER/REPO/actions/runs/1)" in note
     assert render_coder_dispatch_audit_note(type(audit)()) == ""
+
+
+# ---- orchestrator v1 self-dispatch correlation in the coder-turn audit (#1414) ----
+
+_UTC = datetime.timezone.utc
+
+
+def _at(clock):
+    hour, minute, second = (int(part) for part in clock.split(":"))
+    return datetime.datetime(2026, 10, 11, hour, minute, second, tzinfo=_UTC)
+
+
+def _v1_record(requested, returned, *, head="rec-head", workflow_file="ci.yml"):
+    from coding_review_agent_loop.managed_ci import ManagedV1DispatchRecord
+
+    return ManagedV1DispatchRecord(
+        workflow_file=workflow_file, ref="agent-loop/managed-77", pr_number=77,
+        expected_head_sha=head, requested_at=_at(requested), returned_at=_at(returned),
+    )
+
+
+def _audit_1414(tmp_path, runs, *, turn, records=(), failing=()):
+    from coding_review_agent_loop.github import audit_coder_turn_dispatches
+
+    runner = _GuardedCoderRunner(audit_runs=runs, audit_failing_queries=failing)
+    audit = audit_coder_turn_dispatches(
+        runner, make_config(tmp_path), branch="agent-loop/managed-77",
+        head_shas=("known-head",), turn_started_at=_at(turn),
+        orchestrator_dispatches=records,
+    )
+    return runner, audit
+
+
+def _ambiguous(audit):
+    return {entry.run.run_id: entry.reasons for entry in audit.ambiguous_runs}
+
+
+def test_coder_turn_audit_claims_the_sole_matching_orchestrator_v1_run(tmp_path):
+    from coding_review_agent_loop.github import render_coder_dispatch_audit_note
+
+    run = _dispatch_run(10, "rec-head", created_at="2026-10-11T12:00:00Z")
+    record = _v1_record("12:00:00", "12:00:01")
+    # (a) Inside the turn skew window and the record's only match: claimed.
+    runner, audit = _audit_1414(tmp_path, [run], turn="12:00:10", records=(record,))
+    assert audit.runs == () and audit.ambiguous_runs == ()
+    # (g) The branch and per-head listings both return it; deduplicated once.
+    assert len(runner.audit_queries) == 3
+    assert [r.run_id for r in audit.excluded_orchestrator_runs] == [10]
+    assert render_coder_dispatch_audit_note(audit) == ""
+    # (b) Without a record the same run is reported exactly as before.
+    _runner, unrecorded = _audit_1414(tmp_path, [run], turn="12:00:10")
+    assert [r.run_id for r in unrecorded.runs] == [10]
+    assert unrecorded.ambiguous_runs == () and unrecorded.excluded_orchestrator_runs == ()
+
+
+def test_coder_turn_audit_never_picks_an_owner_by_chronological_order(tmp_path):
+    # (c) An ordinary run before the orchestrator run; both match the record.
+    runs = [
+        _dispatch_run(11, "rec-head", created_at="2026-10-11T11:59:55Z"),
+        _dispatch_run(12, "rec-head", created_at="2026-10-11T12:00:00Z"),
+    ]
+    _runner, audit = _audit_1414(
+        tmp_path, runs, turn="12:00:10", records=(_v1_record("12:00:00", "12:00:01"),),
+    )
+    assert audit.runs == ()
+    assert audit.excluded_orchestrator_runs == ()
+    assert _ambiguous(audit) == {11: ("multiple-matches",), 12: ("multiple-matches",)}
+
+
+def test_coder_turn_audit_later_coder_duplicate_makes_the_record_ambiguous(tmp_path):
+    runs = [
+        _dispatch_run(13, "rec-head", created_at="2026-10-11T12:00:01Z"),
+        _dispatch_run(14, "rec-head", created_at="2026-10-11T12:00:20Z"),
+    ]
+    _runner, audit = _audit_1414(
+        tmp_path, runs, turn="12:00:10", records=(_v1_record("12:00:00", "12:00:01"),),
+    )
+    assert audit.runs == () and audit.excluded_orchestrator_runs == ()
+    assert _ambiguous(audit) == {13: ("multiple-matches",), 14: ("multiple-matches",)}
+
+
+def test_coder_turn_audit_pre_cutoff_record_run_never_hides_an_in_window_duplicate(tmp_path):
+    # (d) Association runs before the turn cutoff over the widened discovery.
+    runs = [
+        _dispatch_run(15, "rec-head", created_at="2026-10-11T12:00:01Z"),
+        _dispatch_run(16, "rec-head", created_at="2026-10-11T12:00:36Z"),
+    ]
+    record = _v1_record("12:00:00", "12:00:10")
+    _runner, audit = _audit_1414(tmp_path, runs, turn="12:00:35", records=(record,))
+    assert audit.runs == () and audit.excluded_orchestrator_runs == ()
+    assert _ambiguous(audit) == {16: ("multiple-matches",)}
+    # (e) The orchestrator run alone, before the cutoff: claimed, nothing reported.
+    _runner, alone = _audit_1414(tmp_path, runs[:1], turn="12:00:35", records=(record,))
+    assert alone.runs == () and alone.ambiguous_runs == ()
+    assert [r.run_id for r in alone.excluded_orchestrator_runs] == [15]
+
+
+def test_coder_turn_audit_reports_runs_that_do_not_match_the_record(tmp_path):
+    # (f) The record's workflow is managed.yml, so ci.yml is "another path".
+    runs = [
+        _dispatch_run(20, "rec-head", created_at="2026-10-11T12:00:00Z",
+                      path=".github/workflows/managed.yml"),
+        _dispatch_run(21, "other-head", created_at="2026-10-11T12:00:00Z",
+                      path=".github/workflows/managed.yml"),
+        _dispatch_run(22, "rec-head", created_at="2026-10-11T12:00:00Z"),
+        _dispatch_run(23, "rec-head", created_at="2026-10-11T12:00:35Z",
+                      path=".github/workflows/managed.yml"),
+    ]
+    record = _v1_record("12:00:00", "12:00:01", workflow_file="managed.yml")
+    _runner, audit = _audit_1414(tmp_path, runs, turn="12:00:10", records=(record,))
+    assert [r.run_id for r in audit.excluded_orchestrator_runs] == [20]
+    assert [r.run_id for r in audit.runs] == [21, 22, 23]
+    assert audit.ambiguous_runs == ()
+
+
+def test_coder_turn_audit_record_head_lookup_failure_claims_nothing(tmp_path):
+    from coding_review_agent_loop.github import render_coder_dispatch_audit_note
+
+    # (h) The branch listing returns the sole match; the record head's fails.
+    run = _dispatch_run(30, "rec-head", created_at="2026-10-11T12:00:00Z")
+    _runner, audit = _audit_1414(
+        tmp_path, [run], turn="12:00:10", records=(_v1_record("12:00:00", "12:00:01"),),
+        failing=("head_sha=rec-head&",),
+    )
+    assert audit.runs == () and audit.excluded_orchestrator_runs == ()
+    assert _ambiguous(audit) == {30: ("incomplete-lookup",)}
+    assert len(audit.lookup_notes) == 1 and "head `rec-head`" in audit.lookup_notes[0]
+    # (j) Neutral heading; no claim that another run matched.
+    note = render_coder_dispatch_audit_note(audit)
+    assert "Coder-turn CI dispatch audit (attribution undetermined)" in note
+    assert "could not confirm which run the orchestrator created" in note
+    assert (
+        "run 30 on `rec-head` (https://github.com/OWNER/REPO/actions/runs/30): the run listing "
+        "for the dispatched head was unavailable, so the match could not be confirmed"
+    ) in note
+    assert "more than one run" not in note
+    assert "at least one other run" not in note
+    assert "ordinary workflow_dispatch created during coder turn" not in note
+
+
+def test_coder_turn_audit_widens_discovery_to_the_record_window_and_head(tmp_path):
+    # (i) The branch floor drops to the record's start minus the skew.
+    runner, _audit = _audit_1414(
+        tmp_path, [], turn="12:00:10", records=(_v1_record("12:00:00", "12:00:01"),),
+    )
+    assert any(
+        "branch=agent-loop%2Fmanaged-77" in query and "created=%3E%3D2026-10-11T11%3A59%3A30Z" in query
+        for query in runner.audit_queries
+    )
+    assert any("head_sha=rec-head&" in query for query in runner.audit_queries)
+    assert any("head_sha=known-head&" in query for query in runner.audit_queries)
+    # Without a record the floor is the turn start minus the skew.
+    runner, _audit = _audit_1414(tmp_path, [], turn="12:00:10")
+    assert any("created=%3E%3D2026-10-11T11%3A59%3A40Z" in query for query in runner.audit_queries)
+    assert not any("rec-head" in query for query in runner.audit_queries)
+
+
+def test_coder_turn_audit_run_shared_by_two_records_is_unattributed(tmp_path):
+    from coding_review_agent_loop.github import render_coder_dispatch_audit_note
+
+    run = _dispatch_run(40, "rec-head", created_at="2026-10-11T12:00:03Z")
+    records = (_v1_record("12:00:00", "12:00:01"), _v1_record("12:00:05", "12:00:06"))
+    _runner, audit = _audit_1414(tmp_path, [run], turn="12:00:10", records=records)
+    assert audit.runs == () and audit.excluded_orchestrator_runs == ()
+    assert _ambiguous(audit) == {40: ("shared-match",)}
+    note = render_coder_dispatch_audit_note(audit)
+    assert "this run matches more than one orchestrator dispatch" in note
+    assert "more than one run matches" not in note
+
+
+def test_coder_turn_audit_renders_multiple_match_and_combined_reasons(tmp_path):
+    from coding_review_agent_loop.github import (
+        CoderTurnAmbiguousRun,
+        CoderTurnDispatchAudit,
+        CoderTurnDispatchRun,
+        render_coder_dispatch_audit_note,
+    )
+
+    runs = [
+        _dispatch_run(11, "rec-head", created_at="2026-10-11T11:59:55Z"),
+        _dispatch_run(12, "rec-head", created_at="2026-10-11T12:00:00Z"),
+    ]
+    _runner, audit = _audit_1414(
+        tmp_path, runs, turn="12:00:10", records=(_v1_record("12:00:00", "12:00:01"),),
+    )
+    note = render_coder_dispatch_audit_note(audit)
+    assert note.count("more than one run matches the same orchestrator dispatch") == 2
+    assert "ordinary workflow_dispatch created during coder turn" not in note
+    run = CoderTurnDispatchRun(run_id=9, head_sha="h", url=None, created_at="x")
+    combined = render_coder_dispatch_audit_note(CoderTurnDispatchAudit(ambiguous_runs=(
+        CoderTurnAmbiguousRun(run=run, reasons=("multiple-matches", "incomplete-lookup")),
+    )))
+    assert (
+        "- run 9 on `h`: more than one run matches the same orchestrator dispatch; the run "
+        "listing for the dispatched head was unavailable, so the match could not be confirmed"
+    ) in combined
+
+
+def test_rejected_coder_turn_audit_posts_nothing_for_a_claimed_orchestrator_run(tmp_path):
+    from coding_review_agent_loop.github import publish_rejected_coder_turn_dispatch_audit
+
+    run = _dispatch_run(50, "rec-head", created_at="2026-10-11T12:00:00Z")
+    runner = _GuardedCoderRunner(audit_runs=[run], pr_payload={
+        "headRefName": "agent-loop/managed-77", "headRefOid": "rec-head", "baseRefName": "main",
+    })
+    config = make_config(tmp_path)
+    kwargs = dict(
+        pr_number=77, branch="agent-loop/managed-77", head_shas=("rec-head",),
+        turn_started_at=_at("12:00:10"),
+    )
+    note = publish_rejected_coder_turn_dispatch_audit(
+        runner, config, orchestrator_dispatches=(_v1_record("12:00:00", "12:00:01"),), **kwargs,
+    )
+    assert note == ""
+    assert not runner.pr_payload.get("comments")
+    # The same run without the record is still published.
+    note = publish_rejected_coder_turn_dispatch_audit(runner, config, **kwargs)
+    assert "run 50 on `rec-head`" in note
+    assert len(runner.pr_payload["comments"]) == 1
+
+
+def test_v1_dispatch_records_only_a_successful_post(tmp_path):
+    from coding_review_agent_loop.managed_ci import dispatch_final_qualification
+
+    payload = {"headRefName": "agent-loop/managed-77", "headRefOid": "abc123", "baseRefName": "main"}
+    config = make_config(tmp_path)
+    contract = ManagedCiContract()
+    before = datetime.datetime.now(_UTC)
+    dispatch_final_qualification(
+        _GuardedCoderRunner(pr_payload=dict(payload)), config=config, pr_number=77,
+        expected_head_sha="abc123", head_ref="agent-loop/managed-77", contract=contract,
+    )
+    [record] = contract.v1_dispatch_records
+    assert (record.workflow_file, record.ref, record.pr_number, record.expected_head_sha) == (
+        "ci.yml", "agent-loop/managed-77", 77, "abc123",
+    )
+    assert before <= record.requested_at <= record.returned_at <= datetime.datetime.now(_UTC)
+    # A failed POST created no run, so it records nothing and still raises.
+    failing = ManagedCiContract()
+    with pytest.raises(AgentLoopError, match="Unable to dispatch managed final CI"):
+        dispatch_final_qualification(
+            _GuardedCoderRunner(pr_payload=dict(payload), dispatch_returncode=1), config=config,
+            pr_number=77, expected_head_sha="abc123", head_ref="agent-loop/managed-77",
+            contract=failing,
+        )
+    assert failing.v1_dispatch_records == ()
+    # The record list stays bounded to the newest entries.
+    for _ in range(12):
+        dispatch_final_qualification(
+            _GuardedCoderRunner(pr_payload=dict(payload)), config=config, pr_number=77,
+            expected_head_sha="abc123", head_ref="agent-loop/managed-77", contract=contract,
+        )
+    assert len(contract.v1_dispatch_records) == 8
+    assert contract.v1_dispatch_records[-1].requested_at >= record.requested_at
+
+
+def test_v2_dispatch_never_appends_a_v1_record(tmp_path, monkeypatch):
+    from coding_review_agent_loop.managed_ci import dispatch_final_qualification
+
+    contract = _install_v2_dispatch_boundary(monkeypatch)
+    runner = _GuardedCoderRunner(pr_payload={
+        "headRefName": "agent-loop/managed-77", "headRefOid": "abc123", "baseRefName": "main",
+    })
+    dispatch_final_qualification(
+        runner, config=make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop"),
+        pr_number=77, expected_head_sha="abc123", head_ref="agent-loop/managed-77",
+        contract=contract,
+    )
+    assert len(runner.orchestrator_dispatches) == 1
+    assert contract.v1_dispatch_records == ()
+
+
+def _failed_qualification_fix_loop(
+    tmp_path, monkeypatch, *, coder_run=True, claude_outputs=None, antigravity_outputs=(),
+    real_repair=False, expect_error=False,
+):
+    """Approval, a real v1 dispatch, a failed qualification, then a guarded
+    coder fix turn whose audit sees the orchestrator's own run (#1414)."""
+    from coding_review_agent_loop import pr_loop as pr_loop_module
+
+    _fake_real_gh(tmp_path, monkeypatch)
+
+    def created_by_first_dispatch(head):
+        now = datetime.datetime.now(_UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        runs = [_dispatch_run(7001, head, created_at=now)]
+        if coder_run:
+            runs.append(_dispatch_run(
+                7002, "abc123", created_at=now, path=".github/workflows/other.yml",
+            ))
+        return runs
+
+    runner = _GuardedCoderRunner(
+        first_dispatch_runs=created_by_first_dispatch,
+        codex_outputs=[
+            structured_pr_review(state="approved", summary="Approved."),
+            structured_pr_review(
+                state="approved", summary="Approved after managed CI fix.",
+                prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+            ),
+        ],
+        claude_outputs=claude_outputs or [structured_coder_followup(
+            state="blocking", summary="Fixed managed CI.", addressed_items=["item-1"],
+        )],
+        antigravity_outputs=list(antigravity_outputs),
+        pr_payload={"headRefName": "agent-loop/managed-77", "headRefOid": "abc123", "baseRefName": "main"},
+        pr_check_runs_payload={"total_count": 1, "check_runs": [{
+            "id": 1, "name": "ci", "status": "completed", "conclusion": "skipped",
+            "app": {"slug": "github-actions"}, "check_suite": {"id": 5},
+        }]},
+    )
+    if real_repair:
+        from coding_review_agent_loop import validated_agent
+        from coding_review_agent_loop.agents import antigravity as agy_mod
+
+        monkeypatch.setattr(orchestrator, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
+        monkeypatch.setattr(agy_mod, "_antigravity_settings_path", lambda: tmp_path / "agy-settings.json")
+    contract = ManagedCiContract()
+    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *_a, **_k: contract)
+    failed_check = PullRequestCheck(
+        name="final-ci/exact-head", kind="check_run", status="failure",
+        url="https://github.com/OWNER/REPO/actions/runs/7001",
+    )
+    outcomes = iter([
+        ManagedCiOutcome(
+            status="failed", checks=_watch_check_board("failing", failing=(failed_check,)),
+            head_sha="abc123",
+        ),
+        ManagedCiOutcome(status="passed", head_sha="abc123-coder-1"),
+    ])
+    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", lambda *_a, **_k: next(outcomes))
+    monkeypatch.setattr(orchestrator, "merge_pr", lambda *_a, **_k: None)
+    rejected_calls = []
+    real_rejected = pr_loop_module.publish_rejected_coder_turn_dispatch_audit
+
+    def spy_rejected(*args, **kwargs):
+        rejected_calls.append(kwargs)
+        return real_rejected(*args, **kwargs)
+
+    monkeypatch.setattr(pr_loop_module, "publish_rejected_coder_turn_dispatch_audit", spy_rejected)
+    config = make_config(tmp_path, auto_merge=True, reviewer=("codex",), max_rounds=1)
+    if expect_error:
+        with pytest.raises(AgentLoopError):
+            run_pr_loop(runner, pr_number=77, config=config)
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    return runner, contract, rejected_calls
+
+
+def test_failed_v1_qualification_then_guarded_fix_turn_skips_the_orchestrator_run(
+    tmp_path, monkeypatch,
+):
+    from coding_review_agent_loop import github as github_module
+
+    logged = []
+    real_log = github_module.log
+    monkeypatch.setattr(
+        github_module, "log", lambda config, message: (logged.append(message), real_log(config, message)),
+    )
+    runner, contract, _rejected = _failed_qualification_fix_loop(tmp_path, monkeypatch)
+
+    # The orchestrator's v1 dispatch on the approved head was recorded.
+    assert contract.v1_dispatch_records[0].expected_head_sha == "abc123"
+    assert len(runner.orchestrator_dispatches) == 2
+    # The guarded fix turn's audit reports only the ordinary coder run.
+    body = next(
+        comment["body"] for comment in runner.pr_payload.get("comments", [])
+        if "## Coder follow-up" in comment["body"]
+    )
+    assert "ordinary workflow_dispatch created during coder turn before managed approval" in body
+    assert "run 7002 on `abc123`" in body
+    assert "run 7001" not in body
+    assert "attribution undetermined" not in body
+    assert any("head_sha=abc123&" in query for query in runner.audit_queries)
+    assert (
+        "Coder-turn dispatch audit: run 7001 on abc123 matches the orchestrator's own "
+        "managed v1 dispatch; not attributed to the coder"
+    ) in logged
+
+
+def test_rejected_guarded_fix_turn_passes_records_and_posts_nothing_for_own_run(
+    tmp_path, monkeypatch,
+):
+    malformed = _prose_before_footer(structured_coder_followup(addressed_items=["item-1"]))
+    runner, contract, rejected = _failed_qualification_fix_loop(
+        tmp_path, monkeypatch, coder_run=False, claude_outputs=[malformed],
+        antigravity_outputs=["still not a response"] * 12, real_repair=True, expect_error=True,
+    )
+
+    [call] = rejected
+    assert call["orchestrator_dispatches"] == contract.v1_dispatch_records
+    assert len(call["orchestrator_dispatches"]) == 1
+    assert not any(
+        "Coder-turn CI dispatch audit" in comment["body"]
+        for comment in runner.pr_payload.get("comments", [])
+    )
 
 
 @pytest.mark.parametrize("mode", ["fallback", "revalidation-drop"])

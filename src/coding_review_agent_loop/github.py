@@ -82,6 +82,7 @@ from .workdirs import active_workdir, github_api_cwd
 
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
+    from .managed_ci import ManagedV1DispatchRecord
 
 # PullRequestCheck/PullRequestChecks/StalledCheck/CiInfrastructureStall are
 # defined in ci_health.py (kept dependency-free of this module's live GitHub
@@ -1814,16 +1815,42 @@ class CoderTurnDispatchRun:
     created_at: str
 
 
+CoderTurnAmbiguityReason = Literal["multiple-matches", "shared-match", "incomplete-lookup"]
+CODER_TURN_AMBIGUITY_REASONS: tuple[CoderTurnAmbiguityReason, ...] = (
+    "multiple-matches", "shared-match", "incomplete-lookup",
+)
+_CODER_TURN_AMBIGUITY_CLAUSES: dict[str, str] = {
+    "multiple-matches": "more than one run matches the same orchestrator dispatch",
+    "shared-match": "this run matches more than one orchestrator dispatch",
+    "incomplete-lookup": (
+        "the run listing for the dispatched head was unavailable, so the match could not be confirmed"
+    ),
+}
+
+
+@dataclass(frozen=True)
+class CoderTurnAmbiguousRun:
+    """A turn-window run that may be the orchestrator's own v1 dispatch (#1414)."""
+
+    run: CoderTurnDispatchRun
+    reasons: tuple[CoderTurnAmbiguityReason, ...]
+
+
 @dataclass(frozen=True)
 class CoderTurnDispatchAudit:
     """Non-managed workflow_dispatch runs created during one coder turn (#1366).
 
     Purely diagnostic: these runs are never qualification, and gating keeps
-    excluding them through :func:`_fetch_head_dispatch_runs`.
+    excluding them through :func:`_fetch_head_dispatch_runs`.  Runs that may
+    be the orchestrator's own v1 dispatch are kept apart in
+    ``ambiguous_runs``; a run uniquely matched to a recorded orchestrator
+    dispatch is only logged (``excluded_orchestrator_runs``) (#1414).
     """
 
     runs: tuple[CoderTurnDispatchRun, ...] = ()
     lookup_notes: tuple[str, ...] = ()
+    ambiguous_runs: tuple[CoderTurnAmbiguousRun, ...] = ()
+    excluded_orchestrator_runs: tuple[CoderTurnDispatchRun, ...] = ()
 
 
 def _parse_github_timestamp(value: object) -> datetime.datetime | None:
@@ -1865,6 +1892,27 @@ def _list_dispatch_runs(
     return runs, None
 
 
+@dataclass(frozen=True)
+class _DispatchCandidate:
+    run: CoderTurnDispatchRun
+    head_branch: str | None
+    path: str | None
+    created: datetime.datetime
+
+
+def _candidate_matches_record(
+    candidate: _DispatchCandidate, record: ManagedV1DispatchRecord
+) -> bool:
+    skew = datetime.timedelta(seconds=CODER_DISPATCH_AUDIT_SKEW_SECONDS)
+    return (
+        candidate.path is not None
+        and candidate.path.endswith(f".github/workflows/{record.workflow_file}")
+        and candidate.run.head_sha == record.expected_head_sha
+        and (candidate.head_branch is None or candidate.head_branch == record.ref)
+        and record.requested_at - skew <= candidate.created <= record.returned_at + skew
+    )
+
+
 def audit_coder_turn_dispatches(
     runner: Runner,
     config: AgentLoopConfig,
@@ -1872,6 +1920,7 @@ def audit_coder_turn_dispatches(
     branch: str | None,
     head_shas: Sequence[str | None],
     turn_started_at: datetime.datetime,
+    orchestrator_dispatches: Sequence[ManagedV1DispatchRecord] = (),
 ) -> CoderTurnDispatchAudit:
     """Find non-managed workflow_dispatch runs created since a coder turn started.
 
@@ -1879,30 +1928,50 @@ def audit_coder_turn_dispatches(
     intermediate head that a later push superseded is still found; it is
     unioned with the per-SHA listing of every known head and deduplicated by
     run id.  A lookup failure yields only a note and never raises.
+
+    ``orchestrator_dispatches`` are this process's own managed v1 dispatches
+    (#1414).  Discovery is widened to cover each record's correlation window
+    and head, and records are associated with the complete deduplicated
+    candidate set before the turn cutoff applies.  A record claims a run only
+    when that run is its sole match, no other record matches the run, and the
+    record head's listing succeeded; a claimed run is never reported.  Every
+    other matched run inside the turn window is reported as ambiguous with
+    typed reasons, never as coder-created.  Chronological order never decides
+    ownership.
     """
-    since = turn_started_at - datetime.timedelta(seconds=CODER_DISPATCH_AUDIT_SKEW_SECONDS)
-    since_text = since.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    skew = datetime.timedelta(seconds=CODER_DISPATCH_AUDIT_SKEW_SECONDS)
+    since = turn_started_at - skew
+    records = tuple(orchestrator_dispatches)
+    floor = min([since, *(record.requested_at - skew for record in records)])
+    floor_text = floor.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     known_heads = tuple(dict.fromkeys(sha for sha in head_shas if sha))
-    queries: list[tuple[str, str]] = []
+    scope_heads = tuple(dict.fromkeys(
+        (*known_heads, *(record.expected_head_sha for record in records if record.expected_head_sha))
+    ))
+    queries: list[tuple[str, str, str | None]] = []
     if branch:
         queries.append((
             f"branch `{branch}`",
             "event=workflow_dispatch"
-            f"&branch={quote(branch, safe='')}&created={quote('>=' + since_text, safe='')}",
+            f"&branch={quote(branch, safe='')}&created={quote('>=' + floor_text, safe='')}",
+            None,
         ))
     queries.extend(
-        (f"head `{sha}`", f"event=workflow_dispatch&head_sha={quote(sha, safe='')}")
-        for sha in known_heads
+        (f"head `{sha}`", f"event=workflow_dispatch&head_sha={quote(sha, safe='')}", sha)
+        for sha in scope_heads
     )
-    found: dict[int, CoderTurnDispatchRun] = {}
+    candidates: dict[int, _DispatchCandidate] = {}
+    failed_heads: set[str] = set()
     notes: list[str] = []
-    for scope, query in queries:
+    for scope, query, query_head in queries:
         try:
             runs, problem = _list_dispatch_runs(runner, config=config, query=query)
         except Exception as exc:  # diagnostic only: never block the round
             runs, problem = None, f"lookup raised {type(exc).__name__}"
         if runs is None:
             notes.append(f"workflow_dispatch audit for {scope} unavailable: {problem}")
+            if query_head is not None:
+                failed_heads.add(query_head)
             continue
         for run in runs:
             run_id = run.get("id")
@@ -1921,20 +1990,69 @@ def audit_coder_turn_dispatches(
                 or any(n.startswith(V2_RUN_NAME_PREFIX) for n in names)
                 or not isinstance(head_sha, str)
                 or created is None
-                or created < since
             ):
                 continue
-            if branch and run.get("head_branch") != branch and head_sha not in known_heads:
+            head_branch = _optional_str(run.get("head_branch"))
+            if branch and head_branch != branch and head_sha not in scope_heads:
                 continue
-            found.setdefault(run_id, CoderTurnDispatchRun(
-                run_id=run_id,
-                head_sha=head_sha,
-                url=_optional_str(run.get("html_url")),
-                created_at=str(run.get("created_at")),
+            path = _optional_str(run.get("path"))
+            candidates.setdefault(run_id, _DispatchCandidate(
+                run=CoderTurnDispatchRun(
+                    run_id=run_id,
+                    head_sha=head_sha,
+                    url=_optional_str(run.get("html_url")),
+                    created_at=str(run.get("created_at")),
+                ),
+                head_branch=head_branch,
+                path=path.split("@", 1)[0] if path else None,
+                created=created,
             ))
+
+    record_matches = [
+        [run_id for run_id, candidate in candidates.items() if _candidate_matches_record(candidate, record)]
+        for record in records
+    ]
+    run_record_count: dict[int, int] = {}
+    for matches in record_matches:
+        for run_id in matches:
+            run_record_count[run_id] = run_record_count.get(run_id, 0) + 1
+    claimed: set[int] = set()
+    reasons: dict[int, set[str]] = {}
+    for record, matches in zip(records, record_matches):
+        lookup_ok = record.expected_head_sha not in failed_heads
+        if len(matches) == 1 and run_record_count[matches[0]] == 1 and lookup_ok:
+            claimed.add(matches[0])
+            continue
+        for run_id in matches:
+            run_reasons = reasons.setdefault(run_id, set())
+            if len(matches) > 1:
+                run_reasons.add("multiple-matches")
+            if run_record_count[run_id] > 1:
+                run_reasons.add("shared-match")
+            if not lookup_ok:
+                run_reasons.add("incomplete-lookup")
+
+    reported: list[CoderTurnDispatchRun] = []
+    ambiguous: list[CoderTurnAmbiguousRun] = []
+    excluded: list[CoderTurnDispatchRun] = []
+    for run_id in sorted(candidates):
+        candidate = candidates[run_id]
+        if run_id in claimed:
+            excluded.append(candidate.run)
+        elif candidate.created < since:
+            continue
+        elif reasons.get(run_id):
+            ambiguous.append(CoderTurnAmbiguousRun(
+                run=candidate.run,
+                reasons=tuple(r for r in CODER_TURN_AMBIGUITY_REASONS if r in reasons[run_id]),
+            ))
+        else:
+            reported.append(candidate.run)
     return CoderTurnDispatchAudit(
-        runs=tuple(sorted(found.values(), key=lambda r: r.run_id)),
+        runs=tuple(reported),
         lookup_notes=tuple(notes),
+        ambiguous_runs=tuple(ambiguous),
+        excluded_orchestrator_runs=tuple(excluded),
     )
 
 
@@ -1949,12 +2067,41 @@ def render_coder_dispatch_audit_note(audit: CoderTurnDispatchAudit) -> str:
         for run in audit.runs:
             where = f" ({run.url})" if run.url else ""
             lines.append(f"- run {run.run_id} on `{run.head_sha}`{where}")
+    if audit.ambiguous_runs:
+        lines.append(
+            "**Coder-turn CI dispatch audit (attribution undetermined):** these workflow_dispatch "
+            "runs could be the orchestrator's own managed dispatch, but this audit could not "
+            "confirm which run the orchestrator created; non-authoritative diagnostic, not "
+            "qualification."
+        )
+        for entry in audit.ambiguous_runs:
+            where = f" ({entry.run.url})" if entry.run.url else ""
+            clauses = "; ".join(_CODER_TURN_AMBIGUITY_CLAUSES[r] for r in entry.reasons)
+            lines.append(f"- run {entry.run.run_id} on `{entry.run.head_sha}`{where}: {clauses}")
     if audit.lookup_notes:
         lines.append(
             "**Coder-turn CI dispatch audit (diagnostic only, does not block this round):** "
             + "; ".join(audit.lookup_notes)
         )
     return "\n".join(lines)
+
+
+def _log_orchestrator_dispatch_attribution(
+    config: AgentLoopConfig, audit: CoderTurnDispatchAudit
+) -> None:
+    for run in audit.excluded_orchestrator_runs:
+        log(
+            config,
+            f"Coder-turn dispatch audit: run {run.run_id} on {run.head_sha} matches the "
+            "orchestrator's own managed v1 dispatch; not attributed to the coder",
+        )
+    for entry in audit.ambiguous_runs:
+        log(
+            config,
+            f"Coder-turn dispatch audit: run {entry.run.run_id} on {entry.run.head_sha} may be "
+            f"the orchestrator's own managed v1 dispatch ({', '.join(entry.reasons)}); "
+            "attribution undetermined",
+        )
 
 
 def coder_turn_dispatch_audit_note(
@@ -1964,10 +2111,12 @@ def coder_turn_dispatch_audit_note(
     branch: str | None,
     head_shas: Sequence[str | None],
     turn_started_at: datetime.datetime,
+    orchestrator_dispatches: Sequence[ManagedV1DispatchRecord] = (),
 ) -> str:
     """Run the post-turn audit, log its outcome, and return the visible note."""
     audit = audit_coder_turn_dispatches(
         runner, config, branch=branch, head_shas=head_shas, turn_started_at=turn_started_at,
+        orchestrator_dispatches=orchestrator_dispatches,
     )
     for run in audit.runs:
         log(
@@ -1975,6 +2124,7 @@ def coder_turn_dispatch_audit_note(
             f"Ordinary workflow_dispatch run {run.run_id} on {run.head_sha} was created during "
             "a guarded coder turn; non-authoritative diagnostic, not qualification",
         )
+    _log_orchestrator_dispatch_attribution(config, audit)
     for note in audit.lookup_notes:
         log(config, f"Coder-turn dispatch audit: {note}")
     return render_coder_dispatch_audit_note(audit)
@@ -1988,6 +2138,7 @@ def publish_rejected_coder_turn_dispatch_audit(
     branch: str | None,
     head_shas: Sequence[str | None],
     turn_started_at: datetime.datetime,
+    orchestrator_dispatches: Sequence[ManagedV1DispatchRecord] = (),
 ) -> str:
     """Audit a guarded coder turn whose response was rejected (#1366).
 
@@ -2005,12 +2156,17 @@ def publish_rejected_coder_turn_dispatch_audit(
         audit = audit_coder_turn_dispatches(
             runner, config, branch=branch, head_shas=(*head_shas, live_head),
             turn_started_at=turn_started_at,
+            orchestrator_dispatches=orchestrator_dispatches,
         )
         for problem in audit.lookup_notes:
             log(config, f"Coder-turn dispatch audit: {problem}")
+        _log_orchestrator_dispatch_attribution(config, audit)
         # Only a found run is published: a lookup failure on a rejected turn
-        # stays a logged diagnostic, so a rejection adds no PR noise.
-        note = render_coder_dispatch_audit_note(CoderTurnDispatchAudit(runs=audit.runs))
+        # stays a logged diagnostic, so a rejection adds no PR noise.  A run
+        # claimed as the orchestrator's own dispatch is never published.
+        note = render_coder_dispatch_audit_note(
+            CoderTurnDispatchAudit(runs=audit.runs, ambiguous_runs=audit.ambiguous_runs)
+        )
         for run in audit.runs:
             log(
                 config,

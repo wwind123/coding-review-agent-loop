@@ -514,6 +514,13 @@ def render_pr_scheduling_diagnostic(label: str, message: str) -> str:
     return PR_SCHEDULING_DIAGNOSTIC_TEMPLATE.format(label=label, message=message)
 
 
+def _managed_v1_dispatch_records(managed_ci) -> tuple:
+    """This process's own managed v1 dispatches, for the coder-turn audit (#1414)."""
+    if managed_ci is None or managed_ci.protocol_version != 1:
+        return ()
+    return tuple(managed_ci.v1_dispatch_records)
+
+
 def unchanged_head_stop_message(
     *, pr, coder_name, previous_head, turns, round_number, evidence, route
 ) -> str:
@@ -9274,6 +9281,7 @@ def run_pr_loop(
                         branch=pr_metadata.head_branch,
                         head_shas=(pre_turn_head,),
                         turn_started_at=coder_turn_started_at,
+                        orchestrator_dispatches=_managed_v1_dispatch_records(managed_ci),
                     )
                 # A coder that pushed and was then rejected leaves a head with no
                 # coder or reviewer record; persist why, then surface the original
@@ -9305,6 +9313,7 @@ def run_pr_loop(
                     branch=updated_pr_context.metadata.head_branch or pr_metadata.head_branch,
                     head_shas=(pre_turn_head, updated_pr_context.metadata.head_sha),
                     turn_started_at=coder_turn_started_at,
+                    orchestrator_dispatches=_managed_v1_dispatch_records(managed_ci),
                 )
             post_pr_comment(
                 runner,
