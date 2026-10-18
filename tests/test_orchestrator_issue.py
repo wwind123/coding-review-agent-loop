@@ -14076,7 +14076,10 @@ class _M1088ApprovalAfterFirstSnapshotRunner(FakeRunner):
         if list(args[:3]) == ["gh", "issue", "view"]:
             self.issue_view_calls += 1
             if self.issue_view_calls == 1:
-                self.issue_comments.append(self._approval)
+                if isinstance(self._approval, list):
+                    self.issue_comments.extend(self._approval)
+                else:
+                    self.issue_comments.append(self._approval)
         return result
 
 
@@ -14095,6 +14098,40 @@ def test_1088_plain_issue_mode_rechecks_fresh_snapshot_before_dispatch(tmp_path)
     assert f"an approved plan (hash {plan_hash})" in message
     # The first snapshot was clean; only the fresh pre-dispatch one refused.
     assert runner.issue_view_calls >= 2
+
+
+def test_1090_fresh_snapshot_recheck_refuses_round_approval_completed_after_first_snapshot(
+    tmp_path,
+):
+    # A concurrent plan-first run completes round approval (no announcement,
+    # decision or handoff) after the first snapshot; the fresh guard refuses.
+    history = _m1090_complete_history(tmp_path)
+    runner = _M1088ApprovalAfterFirstSnapshotRunner(
+        history,
+        claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
+        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+        authenticated_actor=_M1088_ACTOR,
+        serve_rest_issue_comments=True,
+    )
+
+    message = _m1088_assert_refused_without_coder(runner, make_config(tmp_path))
+
+    assert "a planning round that approved plan (hash " in message
+    assert "resume from the approved plan" in message
+    assert runner.issue_view_calls >= 2
+
+
+def test_1090_foreign_complete_planning_round_does_not_block_direct_mode(tmp_path):
+    # A complete, approving planning round authored by a foreign actor is
+    # filtered out before classification.
+    forged = ("mallory", 777)
+    history = [
+        {**comment, "author": {"login": forged[0]}, "_rest_author_id": forged[1]}
+        for comment in _m1090_complete_history(tmp_path)
+    ]
+    runner = _m1088_runner(history)
+
+    _m1088_assert_ran_directly(runner, make_config(tmp_path))
 
 
 def test_1088_plain_issue_mode_without_planning_records_needs_no_rest_history(tmp_path):
