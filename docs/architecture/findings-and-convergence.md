@@ -2,7 +2,7 @@
 
 How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline and future follow-ups, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the PR step-back, sweep and sibling escalation, the non-convergence stop, the evidence-only stall stop and evidence conversion.
 
-Source paths: `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_orchestrator_pr.py`.
+Source paths: `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
 
 ## Findings, evidence and convergence
 

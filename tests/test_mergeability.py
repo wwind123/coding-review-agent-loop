@@ -578,7 +578,7 @@ def test_merge_without_expected_head_is_a_single_unreconciled_attempt(tmp_path, 
 
 
 # The full-board, managed and ordinary-recovery entry paths are exercised as
-# workflows in tests/test_orchestrator_pr.py (test_*_merge_502_*).
+# workflows in tests/test_pr_loop_merge.py (test_*_merge_502_*).
 
 
 def test_merged_at_head_recovery_succeeds_through_the_proof_path(tmp_path, merge_env):

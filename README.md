@@ -1981,7 +1981,7 @@ Use focused tests while changing one subsystem, for example:
 ```bash
 python -m pytest tests/test_docs_guidance.py
 python -m pytest tests/test_protocol.py
-python -m pytest tests/test_orchestrator_pr.py
+python -m pytest tests/test_pr_loop_ci_gate.py
 ```
 
 Tests use fake subprocess runners and do not invoke real agent CLIs or GitHub.

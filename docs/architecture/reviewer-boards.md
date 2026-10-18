@@ -2,7 +2,7 @@
 
 How reviewer boards are configured and changed: named reviewer seat preflight, the per-invocation PR board and its handoff rule, the reviewer floor, and the recorded board lineages that keep every reviewer on the board in force approving the exact final PR head or plan across in-run board changes.
 
-Source paths: `src/coding_review_agent_loop/reviewer_seats.py`, `src/coding_review_agent_loop/reviewer_floor.py`, `src/coding_review_agent_loop/board_change.py`, `src/coding_review_agent_loop/board_amendment.py`, `src/coding_review_agent_loop/pr_board_state.py`, `src/coding_review_agent_loop/plan_board_state.py`, `src/coding_review_agent_loop/plan_verification.py`, `tests/test_reviewer_floor.py`, `tests/test_board_change.py`, `tests/test_board_amendment.py`.
+Source paths: `src/coding_review_agent_loop/reviewer_seats.py`, `src/coding_review_agent_loop/reviewer_floor.py`, `src/coding_review_agent_loop/board_change.py`, `src/coding_review_agent_loop/board_amendment.py`, `src/coding_review_agent_loop/pr_board_state.py`, `src/coding_review_agent_loop/plan_board_state.py`, `src/coding_review_agent_loop/plan_verification.py`, `tests/test_reviewer_floor.py`, `tests/test_board_change.py`, `tests/test_board_amendment.py`, `tests/test_pr_loop_reviewer_boards.py`.
 
 ## Named reviewer seat preflight
 
