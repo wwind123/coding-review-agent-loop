@@ -17,6 +17,7 @@ import coding_review_agent_loop.plan_first_loop as plan_first_loop
 import coding_review_agent_loop.pr_loop as pr_loop
 import coding_review_agent_loop.validated_agent as validated_agent
 from agent_loop_helpers import patch_object_in
+import coding_review_agent_loop.response_validation as response_validation
 
 
 def test_structured_plan_review_preserves_human_requirements_resolution_marker():
@@ -1351,3 +1352,20 @@ def test_1388_repair_that_strips_a_valid_optional_note_is_refused(tmp_path):
             items=items,
             optional_ids=("item-2",),
         )
+
+
+def test_degrade_out_of_checkout_tests_keeps_baseline_out_of_evidence(tmp_path):
+    """Issue #991: the baseline never reaches the tests_run evidence source."""
+    baseline = "cd /tmp/scratch-main && python3 -m pytest tests/ -q"
+    parsed = validate_structured_issue_implementation(
+        structured_issue_implementation(
+            tests_run=["python3 -m pytest tests/test_api.py -q", baseline]
+        )
+    )
+    config = make_config(tmp_path, coder="codex", reviewer="claude")
+
+    degraded = response_validation._degrade_out_of_checkout_tests(parsed, config=config)
+
+    assert degraded.tests_run == ("python3 -m pytest tests/test_api.py -q",)
+    assert degraded.out_of_checkout_tests_run == (baseline,)
+    assert response_validation._degrade_out_of_checkout_tests(degraded, config=config) is degraded

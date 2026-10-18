@@ -1,0 +1,1932 @@
+"""Plan-first loop tests: staged plan-review scheduling and finding provenance (#1543)."""
+
+import json
+import re
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+
+import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
+from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
+from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
+from coding_review_agent_loop.github import (
+    HumanReviewRequirement,
+    IssueComment,
+    IssueContext,
+)
+from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
+from coding_review_agent_loop.discuss_loop import _attach_round_metadata
+from coding_review_agent_loop.round_state import _decode_round_metadata
+from coding_review_agent_loop.prompts import (
+    COMPACT_PLANNING_VOLATILE_TAIL_MARKER,
+    HUMAN_REQUIREMENTS_ADDRESSED_MARKER,
+)
+from coding_review_agent_loop.protocol import (
+    UnresolvedReviewItem,
+    validate_structured_plan_state,
+    risk_test_matrix_identity,
+)
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+from agent_loop_helpers import patch_attr_in, patch_object_in
+from issue_loop_test_helpers import (
+    _STEP_BACK_MARKER,
+    _invalid_plan_scheduler_comment,
+    _m1103_agent_calls,
+    _m1103_blocking_chain,
+    _m1103_fresh_base,
+    _m1251_prompts,
+    _plan_round_records,
+    _remediation_plan_fixtures,
+    _repaired_acknowledgement_fixtures,
+    _staged_plan_config,
+)
+from coding_review_agent_loop.plan_assembly import AuthenticatedPlanState
+from agent_loop_helpers import (
+    FakeRunner as _FakeRunner,
+    make_config,
+    structured_plan_review,
+    structured_v1_plan_state,
+)
+from coding_review_agent_loop.plan_assembly import assemble_plan_revision  # noqa: E402
+from coding_review_agent_loop.round_state import PostedRoundRecord  # noqa: E402
+import coding_review_agent_loop.validated_agent as validated_agent_module
+
+
+def _plan_audit_body(runner, *, round_number):
+    """The posted planning scheduler audit body for one round."""
+    for comment in runner.issue_comments:
+        body = comment["body"]
+        if not body.startswith("Plan review scheduling audit."):
+            continue
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", body)
+        if match is None:
+            continue
+        metadata = _decode_round_metadata(match.group("payload"))
+        if (
+            metadata.flow == "plan"
+            and metadata.phase == "scheduler-prelaunch"
+            and metadata.round_number == round_number
+        ):
+            return body
+    raise AssertionError(f"no planning scheduler audit posted for round {round_number}")
+
+
+def _staged_plan_history(
+    tmp_path, *, reviewer_records=(), scheduler_record=True, reconciliation_record=False
+):
+    """A generation-1 planning round-1 coder record plus reviewer records.
+
+    ``scheduler_record`` writes the round-1 planning scheduler checkpoint, so
+    the history decodes as intact rather than as the ``absent`` degraded class.
+    """
+    config = _staged_plan_config(tmp_path)
+    structured = validate_structured_plan_state(structured_v1_plan_state())
+    canonical = render_canonical_plan_state(structured, config)
+    sidecar = plan_first_loop_module.make_assembled_plan_sidecar(
+        structured, round_number=1, response_form="fresh-plan-state", rendered_plan=canonical
+    )
+    subject = _plan_subject(canonical)
+    comments = [
+        {
+            "author": {"login": "bot"},
+            "createdAt": "2026-01-01T00:00:00Z",
+            "body": _attach_round_metadata(
+                canonical + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+                PostedRoundMetadata(
+                    flow="plan",
+                    role="coder",
+                    agent="Anthropic Claude",
+                    round_number=1,
+                    subject=subject,
+                    canonical_plan=canonical,
+                    raw_structured_coder_response=structured_v1_plan_state(),
+                    state="blocking",
+                    execution_strategy_contract_version=1,
+                    execution_strategy_identity=structured.execution_recommendation.identity(),
+                    risk_test_matrix_contract_version=1,
+                    risk_test_matrix_payload=structured.risk_test_matrix.to_payload(),
+                    risk_test_matrix_changes_payload=(),
+                    risk_test_matrix_identity=risk_test_matrix_identity(
+                        structured.risk_test_matrix, structured.risk_test_matrix_changes
+                    ),
+                    risk_test_matrix_boundary_digest=risk_test_matrix_identity(
+                        structured.risk_test_matrix, structured.risk_test_matrix_changes
+                    ),
+                    response_form="fresh-plan-state",
+                    aggregate_plan_identity=sidecar.aggregate_identity,
+                    assembled_plan_sidecar=sidecar.to_payload(),
+                ),
+            ),
+        }
+    ]
+    if scheduler_record:
+        contract = panel_evidence.make_plan_contract(
+            ("Codex", "Gemini"), "primary-then-panel", "Codex"
+        )
+        key = panel_evidence._plan_candidate_key_for(
+            plan_subject=subject, sidecar=sidecar, surfaced_requirement_ids=()
+        )
+        comments.append(
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-01-01T00:00:00Z",
+                "body": _attach_round_metadata(
+                    "Plan review scheduling audit.\n\n-- Orchestrator",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="summary",
+                        agent="Orchestrator",
+                        round_number=1,
+                        subject=subject,
+                        phase="scheduler-prelaunch",
+                        scheduler_contract=contract.as_dict(),
+                        scheduler_obligation_digest="0" * 16,
+                        scheduler_selected_reviewers=("Codex",),
+                        scheduler_paused_reviewers=(("Gemini", "primary phase"),),
+                        scheduler_reasons=("primary phase",),
+                        scheduler_final_sweep=False,
+                        scheduler_force_full=False,
+                        scheduler_calls_avoided=1,
+                        scheduler_phase="primary",
+                        scheduler_primary_reviewer="Codex",
+                        plan_candidate_key=key.as_dict(),
+                    ),
+                ),
+            }
+        )
+    for index, (agent, state, items) in enumerate(reviewer_records, start=1):
+        comments.append(
+            {
+                "author": {"login": "bot"},
+                "createdAt": f"2026-01-01T00:00:{index:02d}Z",
+                "body": _attach_round_metadata(
+                    f"{agent} plan review.\n<!-- AGENT_PLAN_STATE: {state} -->\n-- {agent}",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="reviewer",
+                        agent=agent,
+                        round_number=1,
+                        subject=subject,
+                        state=state,
+                        new_items=items,
+                    ),
+                ),
+            }
+        )
+    if reconciliation_record:
+        # A reconciled round: the summary checkpoint repeats the round's items,
+        # so a resume rehydrates them into the current-round ledger.
+        reconciled_items = tuple(
+            item for _agent, _state, items in reviewer_records for item in items
+        )
+        comments.append(
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-01-01T00:01:00Z",
+                "body": _attach_round_metadata(
+                    "Plan round reconciliation.\n\n-- Orchestrator",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="summary",
+                        agent="Orchestrator",
+                        round_number=1,
+                        subject=subject,
+                        phase="reconciliation",
+                        new_items=reconciled_items,
+                    ),
+                ),
+            }
+        )
+    return comments, canonical
+
+
+def test_default_full_board_planning_writes_no_scheduler_metadata(tmp_path):
+    """`default-full-board-planning`: the compatibility path is unchanged."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=3)
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    records = _plan_round_records(runner)
+    assert records, "the planning flow must still post durable round records"
+    assert all(record.scheduler_metadata_status == "absent" for record in records)
+    # Reviewer records of a generation-1 plan carry the exact-plan key as
+    # requirement-binding evidence only (#1377); no other record carries it.
+    assert all(
+        record.plan_candidate_key is None for record in records if record.role != "reviewer"
+    )
+    assert all(
+        record.plan_candidate_key is not None for record in records if record.role == "reviewer"
+    )
+    assert all(record.phase != "scheduler-prelaunch" for record in records)
+    reviewer_rounds = {
+        (record.agent, record.round_number)
+        for record in records
+        if record.role == "reviewer"
+    }
+    # Every configured reviewer is invoked in the same planning round.
+    assert reviewer_rounds == {("Codex", 1), ("Gemini", 1)}
+
+
+def test_staged_planning_primary_gate_then_reviewer_only_panel_round(tmp_path):
+    """`primary-blocking-revision`, `panel-opens-on-primary-approval`,
+    `reviewer-only-phase-advance`, and `final-exact-plan-gate` together."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+
+    assert run_issue_loop(
+        runner, issue_number=56, config=_staged_plan_config(tmp_path), plan_first=True
+    ) == 0
+
+    records = _plan_round_records(runner)
+    prelaunch = [record for record in records if record.phase == "scheduler-prelaunch"]
+    assert [record.scheduler_phase for record in prelaunch] == [
+        "primary",
+        "secondary-audit",
+    ]
+    # Round 1 is strictly primary-only; the secondary is paused, not dropped.
+    assert prelaunch[0].scheduler_selected_reviewers == ("Codex",)
+    assert [name for name, _why in prelaunch[0].scheduler_paused_reviewers] == ["Gemini"]
+    assert prelaunch[0].scheduler_metadata_status == "valid"
+    # The panel opens on the exact-plan primary approval, against the same key.
+    assert prelaunch[1].scheduler_selected_reviewers == ("Gemini",)
+    assert "Codex" in prelaunch[1].scheduler_approved_reviewers
+    assert prelaunch[0].plan_candidate_key == prelaunch[1].plan_candidate_key
+    # The panel round is reviewer-only: one planner turn in the whole run.
+    advance = [record for record in records if record.phase == "plan-phase-advance"]
+    assert [record.round_number for record in advance] == [2]
+    # The advance names the phase that is still pending, not the primary round
+    # that just finished.
+    advance_body = next(
+        comment["body"]
+        for comment in runner.issue_comments
+        if "Plan review phase advance to round 2." in comment["body"]
+    )
+    assert "Outstanding phase after this advance: `secondary-audit`" in advance_body
+    assert "`primary`" not in advance_body
+    assert len([record for record in records if record.role == "coder"]) == 1
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "claude") == 1
+    # Each reviewer ran exactly once, in its own round.
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "codex") == 1
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "gemini") == 1
+    assert [
+        record.round_number
+        for record in records
+        if record.role == "reviewer" and record.agent == "Gemini"
+    ] == [2]
+
+
+def test_staged_planning_withdrawn_requirement_blocks_carried_approvals(
+    tmp_path, monkeypatch
+):
+    """`human-requirements-and-decomposition`, `carried-approval-requires-current-ack`.
+
+    The primary's carried exact-key approval and the panel's fresh approval are
+    both bound to the earlier surfaced requirement digest, so withdrawing a
+    signed requirement at the live approval boundary must stop the run instead
+    of letting those acknowledgements satisfy the gate for a requirement set
+    that no longer exists.
+    """
+    requirement_1 = HumanReviewRequirement(
+        source_type="Issue body",
+        author="maintainer",
+        created_at="2026-05-17T08:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56",
+        body="Keep the public API unchanged.",
+    )
+    requirement_2 = HumanReviewRequirement(
+        source_type="Issue comment",
+        author="maintainer",
+        created_at="2026-05-17T08:10:00Z",
+        url="https://github.com/OWNER/REPO/issues/56#issuecomment-2",
+        body="Also preserve the audit trail.",
+    )
+    dispositions = [
+        {
+            "requirement_id": requirement_1.requirement_id,
+            "disposition": "addressed",
+            "evidence": "The plan preserves the public API.",
+        },
+        {
+            "requirement_id": requirement_2.requirement_id,
+            "disposition": "addressed",
+            "evidence": "The plan preserves the audit trail.",
+        },
+    ]
+    plan_output = structured_v1_plan_state().replace(
+        '"human_requirement_dispositions": []',
+        '"human_requirement_dispositions": ' + json.dumps(dispositions),
+        1,
+    ).replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        "\n"
+        f"{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n"
+        "### Human requirements\n"
+        f"- {requirement_1.requirement_id}: the plan preserves the public API.\n"
+        f"- {requirement_2.requirement_id}: the plan preserves the audit trail.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+    runner = _FakeRunner(
+        claude_outputs=[plan_output],
+        codex_outputs=[
+            structured_plan_review(
+                state="approved",
+                human_requirements_resolved=True,
+                human_requirement_dispositions=dispositions,
+            )
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                human_requirements_resolved=True,
+                human_requirement_dispositions=dispositions,
+            )
+        ],
+    )
+    real_get_issue_context = discuss_loop.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(
+            runner_arg, config=config, issue_number=issue_number
+        )
+        # The withdrawal lands only after the panel round has settled, so the
+        # primary already holds a carried approval for the earlier digest.
+        panel_ran = any(cmd[0] == "gemini" for cmd, _cwd in runner.commands)
+        requirements = (
+            (requirement_1,) if panel_ran else (requirement_1, requirement_2)
+        )
+        return replace(context, human_requirements=requirements)
+
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+
+    with pytest.raises(
+        AgentLoopError,
+        match=r"Issue #56 signed human requirement\(s\) changed after plan approval: "
+        r"withdrawn hr-",
+    ):
+        run_issue_loop(
+            runner, issue_number=56, config=_staged_plan_config(tmp_path), plan_first=True
+        )
+
+    # Both reviewers approved, yet the plan is not carried into implementation.
+    assert not any(cmd[:3] == ["gh", "pr", "create"] for cmd, _cwd in runner.commands)
+
+
+def test_staged_planning_persists_a_repaired_primary_acknowledgement(tmp_path, monkeypatch):
+    """`carried-approval-requires-current-ack`, `reviewer-only-phase-advance`.
+
+    A repaired acknowledgement must reach the durable record before the phase
+    advance. The record posted with the original text stores no surfaced
+    requirement IDs, so without the amendment the next round would reject the
+    primary's approval as unacknowledged and invoke the primary again instead
+    of opening the independent panel.
+    """
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    runner = _FakeRunner(
+        claude_outputs=[plan_output],
+        codex_outputs=[unacknowledged],
+        gemini_outputs=[panel],
+    )
+    real_get_issue_context = discuss_loop.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(
+            runner_arg, config=config, issue_number=issue_number
+        )
+        return replace(context, human_requirements=(requirement,))
+
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+
+    with patch(
+        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired
+    ):
+        assert run_issue_loop(
+            runner,
+            issue_number=56,
+            config=_staged_plan_config(tmp_path),
+            plan_first=True,
+        ) == 0
+
+    records = _plan_round_records(runner)
+    codex_records = [
+        record
+        for record in records
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+    # The amended record supersedes the one written before the repair, and it
+    # is the one that carries the acknowledgement for the surfaced set.
+    assert codex_records[-1].round_number == 1
+    assert codex_records[-1].state == "approved"
+    assert codex_records[-1].surfaced_reviewer_requirement_ids == (
+        requirement.requirement_id,
+    )
+    prelaunch = [record for record in records if record.phase == "scheduler-prelaunch"]
+    assert [record.scheduler_phase for record in prelaunch] == [
+        "primary",
+        "secondary-audit",
+    ]
+    # The panel opens instead of re-running the primary.
+    assert prelaunch[1].scheduler_selected_reviewers == ("Gemini",)
+    assert "Codex" in prelaunch[1].scheduler_approved_reviewers
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "codex") == 1
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "gemini") == 1
+
+
+def test_staged_planning_resume_reads_the_repaired_primary_acknowledgement(
+    tmp_path, monkeypatch
+):
+    """`resume-no-duplicate-calls`: the repaired approval survives a restart.
+
+    The amendment is durable, so a process that stops after the phase-advance
+    record and restarts still carries the primary's acknowledged approval and
+    invokes only the secondary panel.
+    """
+    requirement, plan_output, unacknowledged, repaired, panel = (
+        _repaired_acknowledgement_fixtures()
+    )
+    runner = _FakeRunner(
+        claude_outputs=[plan_output],
+        codex_outputs=[unacknowledged],
+        gemini_outputs=[panel],
+    )
+    real_get_issue_context = discuss_loop.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(
+            runner_arg, config=config, issue_number=issue_number
+        )
+        return replace(context, human_requirements=(requirement,))
+
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    config = _staged_plan_config(tmp_path)
+    real_post = architecture_contract.post_issue_comment
+
+    def interrupt_after_the_advance(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        if kwargs["body"].startswith("Plan review phase advance to round 2."):
+            raise KeyboardInterrupt
+        return result
+
+    with patch(
+        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired
+    ):
+        with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment",
+            side_effect=interrupt_after_the_advance,
+        ):
+            with pytest.raises(KeyboardInterrupt):
+                run_issue_loop(
+                    runner, issue_number=56, config=config, plan_first=True
+                )
+
+        calls_before = [
+            cmd[0]
+            for cmd, _cwd in runner.commands
+            if cmd[0] in {"claude", "codex", "gemini"}
+        ]
+        assert calls_before.count("codex") == 1
+
+        assert run_issue_loop(
+            runner, issue_number=56, config=config, plan_first=True
+        ) == 0
+
+    records = _plan_round_records(runner)
+    prelaunch = {
+        record.round_number: record
+        for record in records
+        if record.phase == "scheduler-prelaunch"
+    }
+    assert prelaunch[2].scheduler_phase == "secondary-audit"
+    assert prelaunch[2].scheduler_selected_reviewers == ("Gemini",)
+    assert "Codex" in prelaunch[2].scheduler_approved_reviewers
+    # The restart adds the panel reviewer and nothing else.
+    after = [
+        cmd[0]
+        for cmd, _cwd in runner.commands
+        if cmd[0] in {"claude", "codex", "gemini"}
+    ]
+    assert after == [*calls_before, "gemini"]
+
+
+def _named_repaired_acknowledgement_run_1363(tmp_path, monkeypatch, *, interrupt_repost):
+    """A named Antigravity primary approves on fallback Model B without the ack."""
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    requirement, plan_output, _unack, _repaired, _panel = _repaired_acknowledgement_fixtures()
+    dispositions = [{
+        "requirement_id": requirement.requirement_id,
+        "disposition": "addressed",
+        "evidence": "The plan preserves the public API.",
+    }]
+    flash = SeatAgent(
+        ReviewerSeat("flash", "antigravity", ("Model A", "Model B")), tmp_path / "flash",
+    )
+    opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model C",)), tmp_path / "opus")
+    for seat in (flash, opus):
+        seat.workdir.mkdir()
+
+    def review(seat_signature, *, resolved):
+        return structured_plan_review(
+            state="approved", reviewer=seat_signature,
+            human_requirements_resolved=resolved,
+            human_requirement_dispositions=dispositions,
+        )
+
+    repaired = review("flash (Google Antigravity: Model B)", resolved=True)
+    runner = _FakeRunner(
+        claude_outputs=[plan_output],
+        antigravity_outputs=[
+            ("quota exceeded", 1),
+            review("flash (Google Antigravity: Model B)", resolved=False),
+            review("opus (Google Antigravity: Model C)", resolved=True),
+        ],
+    )
+    real_get_issue_context = discuss_loop.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    config = make_config(
+        tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
+        plan_review_policy="primary-then-panel", primary_plan_reviewer=flash,
+        review_parallel=True, agent_max_retries=0, max_rounds=6,
+    )
+    real_post = architecture_contract.post_issue_comment
+    state = {"interrupted": False}
+
+    def interrupt_before_the_repost(*args, **kwargs):
+        body = kwargs["body"]
+        if (
+            interrupt_repost and not state["interrupted"]
+            and "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in body
+            and "\n-- flash (" in body
+        ):
+            state["interrupted"] = True
+            raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
+        with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", side_effect=interrupt_before_the_repost,
+        ):
+            if interrupt_repost:
+                with pytest.raises(KeyboardInterrupt):
+                    run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+                assert state["interrupted"]
+                restored = [r for r in _plan_round_records(runner) if r.agent == "flash"]
+                assert [(r.model_used, r.surfaced_reviewer_requirement_ids) for r in restored] == [
+                    ("Model B", ()),
+                ]
+            assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    return runner
+
+
+@pytest.mark.parametrize("interrupt_repost", [False, True])
+def test_named_seat_repaired_plan_approval_keeps_the_fallback_model(
+    tmp_path, monkeypatch, interrupt_repost
+):
+    """Row repaired-approval-model-preserved (#1363), live and on resume.
+
+    The repaired repost re-renders a completed review, so it keeps the model
+    that produced it rather than the chain head or no model at all.
+    """
+    runner = _named_repaired_acknowledgement_run_1363(
+        tmp_path, monkeypatch, interrupt_repost=interrupt_repost,
+    )
+
+    flash_records = [r for r in _plan_round_records(runner) if r.agent == "flash"]
+    assert flash_records[-1].round_number == 1
+    assert flash_records[-1].surfaced_reviewer_requirement_ids != ()
+    assert {r.model_used for r in flash_records} == {"Model B"}
+    flash_bodies = [
+        c["body"] for c in runner.issue_comments
+        if "<!-- AGENT_PLAN_STATE: approved -->" in c["body"] and "\n-- flash (" in c["body"]
+    ]
+    assert len(flash_bodies) == 2
+    reposted = flash_bodies[-1]
+    assert "<!-- HUMAN_REQUIREMENTS_RESOLVED -->" in reposted
+    assert reposted.rstrip().endswith("-- flash (Google Antigravity: Model B)")
+    assert "Model A" not in reposted.rstrip().splitlines()[-1]
+    # The repair never re-invokes the reviewer: one failed Model A attempt,
+    # one Model B review, and the panel's Model C review.
+    models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands if cmd[0] == "agy"]
+    assert models == ["Model A", "Model B", "Model C"]
+
+
+def test_staged_planning_round_budget_diagnostic_is_distinct(tmp_path):
+    """`round-budget-diagnostic`: exhaustion during a pending phase advance."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=_staged_plan_config(tmp_path, max_rounds=1),
+            plan_first=True,
+        )
+
+    message = str(excinfo.value)
+    assert "reviewer-only plan phase advance was still pending" in message
+    # The diagnostic names the outstanding phase, not the primary round that ran.
+    assert "Outstanding phase: secondary-audit" in message
+    assert "Gemini" in message
+    assert "--max-rounds" in message
+    assert "still reported blocking plan issues" not in message
+
+
+def test_staged_planning_stops_on_premature_secondary_plan_review(tmp_path):
+    """`pre-panel-safety-diagnostic`: no reviewer and no planner turn."""
+    comments, _canonical = _staged_plan_history(
+        tmp_path,
+        reviewer_records=[
+            (
+                "Gemini",
+                "blocking",
+                (
+                    UnresolvedReviewItem(
+                        item_id="item-1",
+                        reviewer="Gemini",
+                        source_round=1,
+                        text="Secondary-owned plan finding.",
+                        status="blocking",
+                    ),
+                ),
+            )
+        ],
+    )
+    runner = _FakeRunner(issue_comments=comments)
+
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
+        run_issue_loop(
+            runner, issue_number=56, config=_staged_plan_config(tmp_path), plan_first=True
+        )
+
+    assert "no qualified panel opening exists" in str(excinfo.value)
+    assert any(
+        "Plan review scheduling diagnostic" in comment["body"]
+        for comment in runner.issue_comments
+    )
+    assert not any(
+        cmd[0] in {"claude", "codex", "gemini"} for cmd, _cwd in runner.commands
+    )
+
+
+def test_plan_review_force_full_recovers_the_premature_secondary_review(tmp_path):
+    """`operator-force-full-override`: the override authorizes the board."""
+    comments, _canonical = _staged_plan_history(
+        tmp_path,
+        # The interrupted round is reconciled, so a resume rehydrates every
+        # current-round item, including the superseded secondary's claim.
+        reconciliation_record=True,
+        reviewer_records=[
+            (
+                "Gemini",
+                "blocking",
+                (
+                    UnresolvedReviewItem(
+                        item_id="item-1",
+                        reviewer="Gemini",
+                        source_round=1,
+                        text="Secondary-owned plan finding.",
+                        status="blocking",
+                    ),
+                ),
+            )
+        ],
+    )
+    runner = _FakeRunner(
+        issue_comments=comments,
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+
+    # The override selects the complete board rather than stopping with the
+    # planning diagnostic, and the superseded review establishes no obligation,
+    # so the freshly invoked board settles the round.
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=_staged_plan_config(tmp_path, plan_review_force_full=True, max_rounds=1),
+        plan_first=True,
+    ) == 0
+
+    prelaunch = [
+        record for record in _plan_round_records(runner) if record.phase == "scheduler-prelaunch"
+    ]
+    # The last checkpoint is this run's decision; the first is seeded history.
+    decision = prelaunch[-1]
+    assert decision.scheduler_phase == "full-board"
+    assert set(decision.scheduler_selected_reviewers) == {"Codex", "Gemini"}
+    assert decision.scheduler_force_full is True
+    assert decision.scheduler_force_full_source == "operator"
+    assert "superseded premature secondary plan review" in " ".join(
+        decision.scheduler_reasons
+    )
+    # The superseded review establishes no approval and no ownership: the same
+    # secondary is freshly invoked, and its earlier blocking claim never
+    # becomes a durable obligation that outlives the override.
+    assert any(cmd[0] == "gemini" for cmd, _cwd in runner.commands)
+    fresh_reviews = [
+        record
+        for record in _plan_round_records(runner)
+        if record.role == "reviewer" and not record.new_items
+    ]
+    assert {record.agent for record in fresh_reviews} == {"Codex", "Gemini"}
+    # The superseded review reaches its own author as explicitly
+    # non-authoritative context, and no other reviewer.
+    gemini_prompt = [
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["gemini"]
+    ][-1]
+    flat = " ".join(gemini_prompt.split())
+    assert (
+        "Superseded pre-panel plan review context (non-authoritative; context only):"
+        in gemini_prompt
+    )
+    assert "not a finding, not a plan-item disposition, not an approval" in flat
+    assert (
+        "none of its claims entered the unresolved plan-item ledger "
+        "(superseded plan item IDs: item-1)"
+    ) in flat
+    assert "- Earlier claim: Secondary-owned plan finding." in gemini_prompt
+    codex_prompt = [
+        command[-1] for command, _cwd in runner.commands if command[:1] == ["codex"]
+    ][-1]
+    assert "Superseded pre-panel plan review context" not in codex_prompt
+    # The reconciled resume rehydrates the round's items, but the superseded
+    # claim establishes no obligation: no planner turn is needed, and the
+    # fresh approvals settle the round with no surviving must-fix item.
+    assert not any(cmd[0] == "claude" for cmd, _cwd in runner.commands)
+    posted = _plan_round_records(runner)[len(comments):]
+    assert posted, "the resumed round must post its own durable records"
+    for record in posted:
+        assert "item-1" not in {item.item_id for item in record.new_items}
+        assert "item-1" not in {item.item_id for item in record.prior_items}
+
+
+def test_staged_planning_stops_when_planning_history_cannot_be_extracted(tmp_path):
+    """`undecodable-planning-history-stop`: only class D stops the run, and the
+    operator override cannot recover it."""
+    config = _staged_plan_config(tmp_path, plan_review_force_full=True)
+    issue_context = IssueContext(
+        number=56,
+        repo="OWNER/REPO",
+        title="Issue",
+        body="Body",
+        url="https://github.com/OWNER/REPO/issues/56",
+        comments=(
+            IssueComment(
+                author="bot",
+                created_at="2026-01-01T00:00:30Z",
+                body="Plan round record.\n<!-- AGENT_LOOP_META: not-a-valid-payload -->",
+            ),
+        ),
+    )
+    runner = _FakeRunner()
+
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
+        plan_first_loop_module._run_plan_first_loop(
+            runner,
+            issue_number=56,
+            config=config,
+            memory=None,
+            issue_context=issue_context,
+            usage_context=validated_agent_module._new_usage_context(config),
+        )
+
+    message = str(excinfo.value)
+    assert "could not be extracted" in message
+    assert "--plan-review-force-full cannot authorize" in message
+    assert not any(
+        cmd[0] in {"claude", "codex", "gemini"} for cmd, _cwd in runner.commands
+    )
+    assert any(
+        "Plan review scheduling diagnostic (startup)" in comment["body"]
+        for comment in runner.issue_comments
+    )
+
+
+def test_staged_planning_panel_blocker_routes_to_owner_plus_primary(tmp_path):
+    """`panel-blocker-remediation`: a `same-plan` panel finding keeps its owner.
+
+    Regression for the planning obligation status set: `same-plan` is the
+    planning counterpart of `same-pr`, so it must stay an active obligation or
+    the scheduler falls through to a final sweep instead of remediation.
+    """
+    fresh = structured_v1_plan_state()
+    base = plan_first_loop_module.AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(fresh), round_number=1
+    )
+    patch = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Name the rollout owner in the plan steps.",
+        "prior_plan_item_dispositions": [
+            {
+                "item_id": "item-1",
+                "disposition": "resolved",
+                "rationale": "The revised plan step names the rollout owner.",
+            }
+        ],
+        "base_round_number": 1,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {
+                "op": "replace",
+                "field": "plan_steps",
+                "value": ["Implement the reviewed scope and name the rollout owner."],
+            }
+        ],
+    }
+    patch_text = (
+        json.dumps(patch) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}]
+    runner = _FakeRunner(
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_plan_review(
+                state="approved", prior_plan_item_dispositions=resolved
+            ),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="blocking",
+                reviewer="Google Gemini",
+                summary="One plan step omits the rollout owner.",
+                same_plan_followups=["Name the rollout owner in the plan steps."],
+            ),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+        antigravity_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Antigravity"),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Antigravity",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+    )
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    prelaunch = [
+        record
+        for record in _plan_round_records(runner)
+        if record.phase == "scheduler-prelaunch"
+    ]
+    phases = [record.scheduler_phase for record in prelaunch]
+    assert phases[:2] == ["primary", "secondary-audit"]
+    assert "remediation" in phases, phases
+    remediation = prelaunch[phases.index("remediation")]
+    # Owner-scoped: the `same-plan` finding owner plus the primary, never the
+    # complete board, and no automatic full-board latch is raised.
+    assert set(remediation.scheduler_selected_reviewers) == {"Gemini", "Codex"}
+    assert [name for name, _why in remediation.scheduler_paused_reviewers] == [
+        "Antigravity"
+    ]
+    assert remediation.scheduler_active_owners == ("Gemini",)
+    assert remediation.scheduler_force_full is False
+    assert remediation.scheduler_force_full_source is None
+    assert "narrow plan remediation" in " ".join(remediation.scheduler_reasons)
+    assert "full-board" not in phases
+    # The posted audit must describe the ordinary owner-scoped remediation as
+    # what it is, not as the complete-board post-panel fallback, so its decision
+    # kind agrees with the phase, board, and force-full fields beside it.
+    remediation_body = _plan_audit_body(runner, round_number=remediation.round_number)
+    assert (
+        "owner-scoped remediation decision (partial board, no automatic latch)"
+        in remediation_body
+    )
+    assert "post-panel fallback (complete board" not in remediation_body
+    assert "- Phase: `remediation`" in remediation_body
+    assert "- Force-full: False (source: none)" in remediation_body
+
+
+def _remediation_runner():
+    """Primary gate, panel blocker, narrow remediation, then the final sweep."""
+    fresh, patch_text = _remediation_plan_fixtures()
+    resolved = [{"item_id": "item-1", "disposition": "resolved"}]
+    return _FakeRunner(
+        claude_outputs=[fresh, patch_text],
+        codex_outputs=[
+            structured_plan_review(state="approved"),
+            structured_plan_review(
+                state="approved", prior_plan_item_dispositions=resolved
+            ),
+        ],
+        gemini_outputs=[
+            structured_plan_review(
+                state="blocking",
+                reviewer="Google Gemini",
+                summary="One plan step omits the rollout owner.",
+                blocking_plan_issues=["Name the rollout owner in the plan steps."],
+            ),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Gemini",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+        antigravity_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Antigravity"),
+            structured_plan_review(
+                state="approved",
+                reviewer="Google Antigravity",
+                prior_plan_item_dispositions=resolved,
+            ),
+        ],
+    )
+
+
+def test_staged_planning_advance_after_remediation_names_the_final_sweep(tmp_path):
+    """`reviewer-only-phase-advance`: the advance names the pending phase.
+
+    After an owner-scoped remediation round the decision in hand still reads
+    `remediation`, but the outstanding reviewer-only round is the final
+    exact-plan sweep for the secondary that has no approval of the new key.
+    """
+    runner = _remediation_runner()
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
+    )
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    prelaunch = [
+        record
+        for record in _plan_round_records(runner)
+        if record.phase == "scheduler-prelaunch"
+    ]
+    phases = [record.scheduler_phase for record in prelaunch]
+    assert phases[:3] == ["primary", "secondary-audit", "remediation"]
+    assert "final-secondary-sweep" in phases, phases
+    advance_bodies = {
+        comment["body"].splitlines()[0]: comment["body"]
+        for comment in runner.issue_comments
+        if "Plan review phase advance to round" in comment["body"]
+    }
+    # The panel advance names the audit; the post-remediation advance names the
+    # sweep, never the remediation round that just ran.
+    assert (
+        "Outstanding phase after this advance: `secondary-audit`"
+        in advance_bodies["Plan review phase advance to round 2."]
+    )
+    post_remediation = advance_bodies["Plan review phase advance to round 4."]
+    assert (
+        "Outstanding phase after this advance: `final-secondary-sweep`"
+        in post_remediation
+    )
+    assert "`remediation`" not in post_remediation
+    assert "Antigravity" in post_remediation
+
+
+def test_staged_planning_resumed_remediation_stays_owner_scoped(tmp_path):
+    """`panel-blocker-remediation`: resume keeps the narrow classification.
+
+    The classifier decides `narrow` from the authenticated semantic patch and
+    the cross-cutting contracts of the state it was bound to, and the ledger
+    stays reconstructible because the run has already accounted for the items
+    recorded under the earlier plan subject. An interruption between the
+    remediation coder turn and its scheduler checkpoint must therefore resume
+    into the same owner-scoped board and the same final sweep an uninterrupted
+    run produces, with no complete-board re-invocation and no latch.
+    """
+    runner = _remediation_runner()
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
+    )
+    real_post = architecture_contract.post_issue_comment
+    audits = {"count": 0}
+
+    def interrupt_before_remediation_checkpoint(*args, **kwargs):
+        # Rounds 1 and 2 post their own scheduler checkpoints first, so the
+        # third one is the remediation round's, posted after the round-3
+        # planner turn has already been recorded.
+        if kwargs["body"].startswith("Plan review scheduling audit."):
+            audits["count"] += 1
+            if audits["count"] == 3:
+                raise KeyboardInterrupt
+        return real_post(*args, **kwargs)
+
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment",
+        side_effect=interrupt_before_remediation_checkpoint,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    interrupted = _plan_round_records(runner)
+    # The remediation planner turn is durable; its scheduler checkpoint is not.
+    assert any(
+        record.round_number == 3 and record.role == "coder" for record in interrupted
+    )
+    assert not any(
+        record.round_number == 3 and record.phase == "scheduler-prelaunch"
+        for record in interrupted
+    )
+
+    def reviewer_calls():
+        return [
+            cmd[0]
+            for cmd, _cwd in runner.commands
+            if cmd[0] in {"codex", "gemini", "agy"}
+        ]
+
+    calls_before = reviewer_calls()
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    resumed = _plan_round_records(runner)
+    prelaunch = {
+        record.round_number: record
+        for record in resumed
+        if record.phase == "scheduler-prelaunch"
+    }
+    remediation = prelaunch[3]
+    # Owner-scoped: the ledger owner plus the primary, and no latch.
+    assert remediation.scheduler_phase == "remediation"
+    assert set(remediation.scheduler_selected_reviewers) == {"Gemini", "Codex"}
+    assert [name for name, _why in remediation.scheduler_paused_reviewers] == [
+        "Antigravity"
+    ]
+    assert remediation.scheduler_active_owners == ("Gemini",)
+    assert remediation.scheduler_force_full is False
+    assert remediation.scheduler_force_full_source is None
+    assert "narrow plan remediation" in " ".join(remediation.scheduler_reasons)
+    # The round-3 approvals are carried: the sweep invokes only the reviewer
+    # that still lacks an exact-plan approval, with no post-panel latch.
+    sweep = prelaunch[4]
+    assert sweep.scheduler_phase == "final-secondary-sweep"
+    assert sweep.scheduler_selected_reviewers == ("Antigravity",)
+    assert sweep.scheduler_force_full is False
+    assert sweep.scheduler_force_full_source is None
+    assert not any(
+        record.scheduler_phase == "full-board" for record in prelaunch.values()
+    )
+    reviewer_rounds = [
+        (record.agent, record.round_number)
+        for record in resumed
+        if record.role == "reviewer"
+    ]
+    assert reviewer_rounds.count(("Antigravity", 4)) == 1
+    assert ("Codex", 4) not in reviewer_rounds
+    assert ("Gemini", 4) not in reviewer_rounds
+    # The resumed run re-invokes nothing already settled: it adds exactly the
+    # remediation owner plus primary and the single sweep reviewer.
+    assert reviewer_calls() == [*calls_before, "codex", "gemini", "agy"]
+
+
+def test_staged_planning_resume_on_the_phase_advance_seam_keeps_the_sweep_narrow(tmp_path):
+    """`reviewer-only-phase-advance`: the cleared ledger survives a restart.
+
+    A reviewer-only advance carries no unresolved item, so its durable record
+    persists an empty ledger. A process that stops on exactly that seam and
+    restarts must still read the ledger as reconstructible -- the remediated
+    item is cleared by recorded history, not merely by the interrupted run's
+    memory -- so the final sweep stays narrow and invokes only the reviewer
+    that still lacks an exact-plan approval.
+    """
+    runner = _remediation_runner()
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
+    )
+    real_post = architecture_contract.post_issue_comment
+
+    def interrupt_after_the_sweep_advance(*args, **kwargs):
+        # Post the advance first: the seam under test is a restart with that
+        # record durable and nothing after it.
+        result = real_post(*args, **kwargs)
+        if kwargs["body"].startswith("Plan review phase advance to round 4."):
+            raise KeyboardInterrupt
+        return result
+
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment",
+        side_effect=interrupt_after_the_sweep_advance,
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    interrupted = _plan_round_records(runner)
+    advance = [
+        record
+        for record in interrupted
+        if record.phase == "plan-phase-advance" and record.round_number == 4
+    ]
+    assert len(advance) == 1
+    # The seam: the advance record carries no ledger at all, because
+    # remediation cleared the only item before it was written.
+    assert advance[0].prior_items == ()
+    assert not any(
+        record.round_number == 4 and record.phase == "scheduler-prelaunch"
+        for record in interrupted
+    )
+
+    def reviewer_calls():
+        return [
+            cmd[0]
+            for cmd, _cwd in runner.commands
+            if cmd[0] in {"codex", "gemini", "agy"}
+        ]
+
+    calls_before = reviewer_calls()
+
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+
+    resumed = _plan_round_records(runner)
+    prelaunch = {
+        record.round_number: record
+        for record in resumed
+        if record.phase == "scheduler-prelaunch"
+    }
+    sweep = prelaunch[4]
+    assert sweep.scheduler_phase == "final-secondary-sweep"
+    assert sweep.scheduler_selected_reviewers == ("Antigravity",)
+    assert sweep.scheduler_force_full is False
+    assert sweep.scheduler_force_full_source is None
+    assert not any(
+        record.scheduler_phase == "full-board" for record in prelaunch.values()
+    )
+    reviewer_rounds = [
+        (record.agent, record.round_number)
+        for record in resumed
+        if record.role == "reviewer"
+    ]
+    assert reviewer_rounds.count(("Antigravity", 4)) == 1
+    assert ("Codex", 4) not in reviewer_rounds
+    assert ("Gemini", 4) not in reviewer_rounds
+    assert reviewer_calls() == [*calls_before, "agy"]
+
+
+def test_staged_planning_round_budget_names_the_outstanding_final_sweep(tmp_path):
+    """`round-budget-diagnostic`: exhaustion after remediation names the sweep."""
+    runner = _remediation_runner()
+    config = _staged_plan_config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=3
+    )
+
+    with pytest.raises(AgentLoopError) as excinfo:
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+
+    message = str(excinfo.value)
+    assert "reviewer-only plan phase advance was still pending" in message
+    assert "Outstanding phase: final-secondary-sweep" in message
+    assert "Antigravity" in message
+    assert "still reported blocking plan issues" not in message
+
+
+def test_staged_planning_contract_drift_stops_a_default_policy_restart(tmp_path):
+    """A persisted staged planning contract is immutable across a restart.
+
+    Restarting with the compatibility default must stop rather than silently
+    continue on a different contract.
+    """
+    comments, _canonical = _staged_plan_history(tmp_path)
+    runner = _FakeRunner(issue_comments=comments)
+
+    with pytest.raises(AgentLoopError, match="scheduler contract changed during resume"):
+        run_issue_loop(
+            runner,
+            issue_number=56,
+            config=make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=3),
+            plan_first=True,
+        )
+
+    assert not any(
+        cmd[0] in {"claude", "codex", "gemini"} for cmd, _cwd in runner.commands
+    )
+
+    # A restart that changes only the primary is a recorded plan board change
+    # (#1377), not contract drift: exactly one plan board-change link is posted
+    # before the new primary's primary-only round.
+    drifted = _FakeRunner(issue_comments=comments)
+    with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+        run_issue_loop(
+            drifted,
+            issue_number=56,
+            config=_staged_plan_config(tmp_path, primary_plan_reviewer="gemini"),
+            plan_first=True,
+        )
+    links = [
+        comment for comment in drifted.issue_comments
+        if "AGENT_PLAN_BOARD_CHANGE" in comment["body"]
+    ]
+    assert len(links) == 1
+    assert [cmd[0] for cmd, _cwd in drifted.commands if cmd[0] in {"claude", "codex", "gemini"}] == [
+        "gemini"
+    ]
+
+
+def test_invalid_planning_history_recovers_after_its_fallback_round(tmp_path):
+    """`legacy-planning-metadata-fallback`: class B continues and progresses.
+
+    An invalid scheduler record before the current recovery boundary must not
+    pin every later round to the strict pre-panel fallback, which would suppress
+    each fresh exact-key primary approval until the round budget ran out.
+    """
+    comments, canonical = _staged_plan_history(tmp_path, scheduler_record=False)
+    comments.append(_invalid_plan_scheduler_comment(_plan_subject(canonical)))
+    runner = _FakeRunner(
+        issue_comments=comments,
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[
+            structured_plan_review(state="approved", reviewer="Google Gemini")
+        ],
+    )
+
+    assert run_issue_loop(
+        runner,
+        issue_number=56,
+        config=_staged_plan_config(tmp_path, max_rounds=6),
+        plan_first=True,
+    ) == 0
+
+    prelaunch = [
+        record
+        for record in _plan_round_records(runner)
+        if record.phase == "scheduler-prelaunch"
+        and record.scheduler_metadata_status == "valid"
+    ]
+    phases = [record.scheduler_phase for record in prelaunch]
+    # The invalid record degrades exactly one round, then the valid checkpoint
+    # it wrote becomes the recovery boundary and the run advances.
+    assert phases == ["primary", "secondary-audit"]
+    assert "strict pre-panel fallback:" in " ".join(prelaunch[0].scheduler_reasons)
+    assert "strict pre-panel fallback:" not in " ".join(prelaunch[1].scheduler_reasons)
+    # No planner turn was fabricated and no reviewer was invoked twice.
+    assert not any(cmd[0] == "claude" for cmd, _cwd in runner.commands)
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "codex") == 1
+    assert sum(1 for cmd, _cwd in runner.commands if cmd[0] == "gemini") == 1
+
+
+# --- Plan sweep trigger and finding provenance (#1505) ------------------------
+
+_SWEEP_HEADING = "PRIMARY SWEEP REQUEST"
+
+
+def _m1505_patch(base, *, resolved_items, summary):
+    payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": summary,
+        "prior_plan_item_dispositions": [
+            {"item_id": item_id, "disposition": "resolved"} for item_id in resolved_items
+        ],
+        "base_round_number": base.round_number,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {"op": "replace", "field": "plan_steps", "value": [f"{summary} Implement it."]}
+        ],
+    }
+    next_base = AuthenticatedPlanState.from_plan(
+        assemble_plan_revision(base, payload), round_number=base.round_number + 1
+    )
+    return (
+        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude",
+        next_base,
+    )
+
+
+def _m1505_run(tmp_path, *, claude, codex, expect=AgentLoopError, **overrides):
+    values = {"max_rounds": 3}
+    values.update(overrides)
+    runner = _FakeRunner(claude_outputs=list(claude), codex_outputs=list(codex))
+    config = _staged_plan_config(tmp_path, **values)
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(expect):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    return runner, [str(call.args[-1]) for call in logged.call_args_list]
+
+
+def _m1505_primary_records(runner):
+    return [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == "Codex"
+    ]
+
+
+def _m1505_three_blocking_rounds():
+    fresh, base = _m1103_fresh_base()
+    codex, claude, _base = _m1103_blocking_chain(1, 3, base=base)
+    return [fresh, *claude], codex
+
+
+def test_primary_sweep_fires_after_k_counting_blocks(tmp_path):
+    """`sweep-fires-at-k`, `provenance-baseline`: live fake-runner plan loop."""
+    claude, codex = _m1505_three_blocking_rounds()
+    runner, messages = _m1505_run(tmp_path, claude=claude, codex=codex)
+
+    reviews = _m1251_prompts(runner, "codex")
+    assert [_SWEEP_HEADING in prompt for prompt in reviews] == [False, False, True]
+    assert "- [item-1] (round 1) Close gap 1." in reviews[2]
+    assert "- [item-2] (round 2) Close gap 2." in reviews[2]
+    assert "one exhaustive pass over the whole current plan" in reviews[2]
+    # The orchestrator-owned marker is on the swept primary record only.
+    assert [record.plan_sweep for record in _m1505_primary_records(runner)] == [
+        False, False, True,
+    ]
+    assert any("primary sweep requested (streak 2 >= 2)" in m for m in messages)
+    # Never the planner, never a step-back turn, never a stop.
+    planner = _m1251_prompts(runner, "claude")
+    assert not any(_SWEEP_HEADING in prompt for prompt in planner)
+    assert not any(_STEP_BACK_MARKER in prompt for prompt in planner)
+    assert all(record.step_back_entries == () for record in _plan_round_records(runner))
+    # The durable previous-plan baseline: first-review notice, then a diff.
+    assert "this is your first plan review of this issue" in reviews[0]
+    assert "you last reviewed the plan of round 1" in reviews[1]
+    assert "----- BEGIN BASELINE DIFF -----" in reviews[1]
+    assert "you last reviewed the plan of round 2" in reviews[2]
+    assert any(
+        "Codex new mandatory finding provenance: pre_existing=0 revision_introduced=0 "
+        "untagged=1 repeats=0; first_review=True; sweep=False" in m
+        for m in messages
+    )
+    assert any("first_review=False; sweep=True" in m for m in messages)
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_resumed_run_reaches_the_same_sweep_decision(tmp_path, compact):
+    """`resume-parity`, `provenance-baseline`: durable records only, fresh sessions."""
+    claude, codex = _m1505_three_blocking_rounds()
+    overrides = {"planning_context_mode": "compact"} if compact else {}
+    # The first process dies at the planner revision after round 2's review.
+    first, _messages = _m1505_run(tmp_path, claude=claude[:2], codex=codex[:2], **overrides)
+    assert len(_m1505_primary_records(first)) == 2
+    rerun = _FakeRunner(
+        issue_comments=list(first.issue_comments),
+        claude_outputs=claude[2:],
+        codex_outputs=codex[2:],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=3, **overrides)
+    with pytest.raises(AgentLoopError):
+        run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+
+    # Round 2's recorded review is not re-run; round 3 gets the sweep.
+    reviews = _m1251_prompts(rerun, "codex")
+    assert len(reviews) == 1
+    assert _SWEEP_HEADING in reviews[0]
+    assert "- [item-2] (round 2) Close gap 2." in reviews[0]
+    assert "you last reviewed the plan of round 2" in reviews[0]
+    assert "+++ current plan" in reviews[0]
+    if compact:
+        prefix, tail = reviews[0].split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)
+        assert _SWEEP_HEADING not in prefix and _SWEEP_HEADING in tail
+        assert "Finding provenance baseline" in tail
+    assert _m1505_primary_records(rerun)[-1].plan_sweep is True
+
+    live, _messages = _m1505_run(tmp_path / "live", claude=claude, codex=codex, **overrides)
+    live_sweep = _m1251_prompts(live, "codex")[2]
+    assert live_sweep.split(_SWEEP_HEADING, 1)[1].split("Finding provenance baseline")[0] == (
+        reviews[0].split(_SWEEP_HEADING, 1)[1].split("Finding provenance baseline")[0]
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{"plan_sweep_rounds": 0}, {"plan_review_policy": "all-reviewers", "primary_plan_reviewer": None}],
+)
+def test_disabled_or_full_board_planning_never_sweeps(tmp_path, overrides):
+    """`disabled-and-policy`: K=0 or the full-board policy keeps today's prompts."""
+    claude, codex = _m1505_three_blocking_rounds()
+    values = dict(overrides)
+    full_board = values.get("plan_review_policy") == "all-reviewers"
+    if full_board:
+        values["reviewer"] = ("codex",)
+    runner, _messages = _m1505_run(tmp_path, claude=claude, codex=codex, **values)
+    reviews = _m1251_prompts(runner, "codex")
+    assert len(reviews) == 3
+    assert not any(_SWEEP_HEADING in prompt for prompt in reviews)
+    assert not any(record.plan_sweep for record in _plan_round_records(runner))
+    if full_board:
+        assert not any("Finding provenance" in prompt for prompt in reviews)
+
+
+def _m1505_repeat_script(*, mixed):
+    fresh, base1 = _m1103_fresh_base()
+    round1 = structured_plan_review(
+        state="blocking", summary="Gap 1 remains.", blocking_plan_issues=["Close gap 1."],
+    )
+    patch1, base2 = _m1505_patch(base1, resolved_items=["item-1"], summary="Close gap 1.")
+    # Round 2 keeps item-1 and also re-emits its text as a "new" finding.
+    round2 = structured_plan_review(
+        state="blocking",
+        summary="Gap 1 still open.",
+        blocking_plan_issues=["Close gap 1.", *(["Close gap 2b."] if mixed else [])],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "blocking"}],
+    )
+    resolved = ["item-1", "item-2", *(["item-3"] if mixed else [])]
+    patch2, base3 = _m1505_patch(base2, resolved_items=resolved, summary="Close gap 1 again.")
+    round3 = structured_plan_review(
+        state="blocking",
+        summary="Gap 3 remains.",
+        blocking_plan_issues=["Close gap 3."],
+        prior_plan_item_dispositions=[
+            {"item_id": item_id, "disposition": "resolved"} for item_id in resolved
+        ],
+    )
+    patch3, _base = _m1505_patch(base3, resolved_items=[f"item-{len(resolved) + 1}"], summary="Close gap 3.")
+    return [fresh, patch1, patch2, patch3], [round1, round2, round3]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_a_re_emitted_carried_finding_is_marked_and_not_counted(tmp_path, mixed):
+    """`repeat-reemission`: minted with repeat_of, kept on the ledger, never counted."""
+    claude, codex = _m1505_repeat_script(mixed=mixed)
+    runner, messages = _m1505_run(tmp_path, claude=claude, codex=codex)
+
+    round_two = _m1505_primary_records(runner)[1]
+    duplicate = next(item for item in round_two.new_items if item.text == "Close gap 1.")
+    assert duplicate.item_id == "item-2"
+    assert duplicate.repeat_of == "item-1"
+    assert duplicate.status == "blocking"
+    if mixed:
+        fresh_item = next(item for item in round_two.new_items if item.text == "Close gap 2b.")
+        assert fresh_item.repeat_of is None
+    # The duplicate stays an ordinary finding for the planner.
+    assert "[item-2]" in _m1251_prompts(runner, "claude")[2]
+    reviews = _m1251_prompts(runner, "codex")
+    # The repeat-only review ends the streak; the mixed one counts through item-3.
+    assert (_SWEEP_HEADING in reviews[2]) is mixed
+    assert any(
+        f"repeats=1; first_review=False" in m and "Planning round 2: Codex" in m
+        for m in messages
+    )
+
+
+def test_a_revision_introduced_only_review_breaks_the_live_streak(tmp_path):
+    """`streak-breakers` (live): later-review revision tags do not count."""
+    fresh, base1 = _m1103_fresh_base()
+    round1 = structured_plan_review(
+        state="blocking", summary="Gap 1.", blocking_plan_issues=["Close gap 1."],
+    )
+    patch1, base2 = _m1505_patch(base1, resolved_items=["item-1"], summary="Close gap 1.")
+    round2 = structured_plan_review(
+        state="blocking", summary="The revision broke step 2.",
+        blocking_plan_issues=[{"finding": "Step 2 regressed.", "provenance": "revision_introduced"}],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+    )
+    patch2, base3 = _m1505_patch(base2, resolved_items=["item-2"], summary="Fix step 2.")
+    round3 = structured_plan_review(
+        state="blocking", summary="Gap 3.",
+        blocking_plan_issues=[{"finding": "Close gap 3.", "provenance": "pre_existing"}],
+        prior_plan_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
+    )
+    patch3, _base = _m1505_patch(base3, resolved_items=["item-3"], summary="Close gap 3.")
+    runner, messages = _m1505_run(
+        tmp_path, claude=[fresh, patch1, patch2, patch3], codex=[round1, round2, round3],
+    )
+    assert not any(_SWEEP_HEADING in prompt for prompt in _m1251_prompts(runner, "codex"))
+    tagged = [item.provenance for record in _m1505_primary_records(runner) for item in record.new_items]
+    assert tagged == [None, "revision_introduced", "pre_existing"]
+    assert any("pre_existing=0 revision_introduced=1 untagged=0" in m for m in messages)
+
+
+def _m1505_codex_argv(runner):
+    return [argv for argv, _cwd in runner.argv_commands if argv[:1] == ["codex"]]
+
+
+def test_sweep_effort_applies_to_the_primary_sweep_turn_only(tmp_path):
+    """`sweep-effort-turn`: invocation, signature and session of the sweep turn only."""
+    claude, codex = _m1505_three_blocking_rounds()
+    runner, messages = _m1505_run(
+        tmp_path, claude=claude, codex=codex,
+        plan_sweep_reasoning_effort="high", codex_model="gpt-test",
+    )
+    efforts = [
+        next(arg for arg in argv if arg.startswith("model_reasoning_effort="))
+        for argv in _m1505_codex_argv(runner)
+    ]
+    assert efforts == [
+        'model_reasoning_effort="medium"', 'model_reasoning_effort="medium"',
+        'model_reasoning_effort="high"',
+    ]
+    # The sweep turn starts a fresh provider session.
+    assert "resume" not in _m1505_codex_argv(runner)[2]
+    assert any("sweep turn at effort high in a fresh session" in m for m in messages)
+    primary_comments = [
+        comment["body"] for comment in runner.issue_comments
+        if "AGENT_PLAN_STATE" in comment["body"]
+        and "-- OpenAI Codex: gpt-test" in comment["body"]
+    ]
+    assert len(primary_comments) == 3
+    assert primary_comments[-1].rstrip().endswith("gpt-test (high)")
+    assert all(body.rstrip().endswith("gpt-test (medium)") for body in primary_comments[:-1])
+    # The planner's effort is untouched.
+    assert not any(
+        "--effort" in argv and "high" in argv
+        for argv, _cwd in runner.argv_commands if argv[:1] == ["claude"]
+    )
+
+
+def test_unsupported_sweep_effort_for_the_primary_backend_fails_before_any_turn(tmp_path):
+    """`sweep-effort-turn`: `max` is a Claude effort, not a Codex one."""
+    claude, codex = _m1505_three_blocking_rounds()
+    runner, _messages = _m1505_run(
+        tmp_path, claude=claude, codex=codex, plan_sweep_reasoning_effort="max",
+    )
+    assert _m1103_agent_calls(runner) == []
+
+
+def test_sweep_effort_is_ignored_with_a_log_line_for_a_backend_without_effort(tmp_path):
+    """`sweep-effort-turn`: a Gemini primary runs unchanged."""
+    fresh, base = _m1103_fresh_base()
+    review = structured_plan_review(
+        state="blocking", summary="Gap 1.", blocking_plan_issues=["Close gap 1."],
+        reviewer="Google Gemini",
+    )
+    runner = _FakeRunner(claude_outputs=[fresh], gemini_outputs=[review])
+    config = _staged_plan_config(
+        tmp_path, max_rounds=1, primary_plan_reviewer="gemini",
+        plan_sweep_reasoning_effort="high",
+    )
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+    assert any(
+        "--plan-sweep-reasoning-effort high is ignored: the primary plan reviewer's "
+        "gemini backend has no effort control" in m
+        for m in messages
+    )
+
+
+@pytest.mark.parametrize("backend", ["claude", "codex"])
+def test_sweep_turn_inputs_override_bare_and_seat_efforts(tmp_path, backend):
+    """`sweep-effort-turn`: bare agents get a turn config, seats a turn-local copy."""
+    from coding_review_agent_loop.agents.registry import agent_signature
+    from coding_review_agent_loop.config import resolve_invocation
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    config = make_config(tmp_path, claude_model="claude-test", codex_model="gpt-test")
+    agent, turn_config = plan_first_loop_module._plan_sweep_turn_inputs(backend, config, "high")
+    assert agent == backend
+    assert resolve_invocation(turn_config, provider=backend, role="reviewer").resolved_effort == "high"
+    assert resolve_invocation(config, provider=backend, role="reviewer").resolved_effort == "medium"
+    assert plan_first_loop_module._plan_sweep_turn_inputs(backend, config, None) == (backend, config)
+
+    seat = SeatAgent(ReviewerSeat("primary-seat", backend, ("model-x",), "low"), tmp_path)
+    turn_seat, seat_config = plan_first_loop_module._plan_sweep_turn_inputs(seat, config, "high")
+    assert seat_config is config
+    assert isinstance(turn_seat, SeatAgent) and turn_seat == seat
+    assert turn_seat.effort == "high" and seat.effort == "low"
+    assert turn_seat.backend == backend and turn_seat.workdir == tmp_path
+    assert agent_signature(turn_seat).endswith("model-x (high))")
+    assert resolve_invocation(config, provider=turn_seat, role="reviewer").resolved_effort == "high"
+
+
+def _m1505_effort_arg(argv):
+    """The effort a recorded claude or codex invocation ran at."""
+    if argv[0] == "claude":
+        return argv[argv.index("--effort") + 1]
+    value = next(arg for arg in argv if arg.startswith("model_reasoning_effort="))
+    return value.split("=", 1)[1].strip('"')
+
+
+@pytest.mark.parametrize("primary_kind", ["claude", "codex-seat", "claude-seat"])
+def test_sweep_effort_workflow_for_claude_and_seat_primaries(tmp_path, primary_kind):
+    """`sweep-effort-turn`: bare Claude and named-seat primaries through the plan loop."""
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    primary_backend = "codex" if primary_kind == "codex-seat" else "claude"
+    planner_backend = "claude" if primary_backend == "codex" else "codex"
+    planner_signature = "Anthropic Claude" if planner_backend == "claude" else "OpenAI Codex"
+    claude_plan, _reviews = _m1505_three_blocking_rounds()
+    planner = [text.replace("-- Anthropic Claude", f"-- {planner_signature}") for text in claude_plan]
+    overrides: dict = {"coder": planner_backend, "plan_sweep_reasoning_effort": "high"}
+    if primary_kind == "claude":
+        signature = "Anthropic Claude"
+        overrides.update(
+            reviewer=("claude", "gemini"), primary_plan_reviewer="claude",
+            claude_model="claude-test",
+        )
+        base_effort = "medium"
+    else:
+        seat_dir, panel_dir = tmp_path / "primary-seat", tmp_path / "panel-seat"
+        seat_dir.mkdir()
+        panel_dir.mkdir()
+        seat = SeatAgent(
+            ReviewerSeat("primary-seat", primary_backend, ("seat-model",), "low"), seat_dir
+        )
+        panel = SeatAgent(ReviewerSeat("panel-seat", "gemini", ("gemini-model",)), panel_dir)
+        backend_name = "OpenAI Codex" if primary_backend == "codex" else "Anthropic Claude"
+        signature = f"primary-seat ({backend_name}: seat-model (low))"
+        overrides.update(
+            reviewer=(seat, panel), reviewer_seats=(seat, panel), primary_plan_reviewer=seat,
+        )
+        base_effort = "low"
+    reviews = [
+        structured_plan_review(
+            state="blocking", summary=f"Gap {n} remains.",
+            blocking_plan_issues=[f"Close gap {n}."],
+            prior_plan_item_dispositions=(
+                [{"item_id": f"item-{n - 1}", "disposition": "resolved"}] if n > 1 else None
+            ),
+            reviewer=signature,
+        )
+        for n in (1, 2, 3)
+    ]
+    outputs = {
+        f"{planner_backend}_outputs": planner,
+        f"{primary_backend}_outputs": reviews,
+    }
+    runner = _FakeRunner(**outputs)
+    config = _staged_plan_config(tmp_path, max_rounds=3, **overrides)
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+
+    primary_argv = [argv for argv, _cwd in runner.argv_commands if argv[:1] == [primary_backend]]
+    planner_argv = [argv for argv, _cwd in runner.argv_commands if argv[:1] == [planner_backend]]
+    assert len(primary_argv) == 3
+    assert [_m1505_effort_arg(argv) for argv in primary_argv] == [base_effort, base_effort, "high"]
+    # The planner's effort never changes; no gemini panel turn runs.
+    planner_efforts = {_m1505_effort_arg(argv) for argv in planner_argv}
+    assert planner_efforts == {"medium"}
+    assert not any(argv[:1] == ["gemini"] for argv, _cwd in runner.argv_commands)
+    # The sweep turn starts a fresh provider session.
+    assert "--resume" not in primary_argv[2] and "resume" not in primary_argv[2]
+    assert any("sweep turn at effort high in a fresh session" in m for m in messages)
+    sweep_prompt = _m1251_prompts(runner, primary_backend)[2]
+    assert _SWEEP_HEADING in sweep_prompt
+    # Published signatures report the effort that ran.
+    primary_bodies = [
+        comment["body"].rstrip() for comment in runner.issue_comments
+        if "AGENT_PLAN_STATE" in comment["body"]
+        and comment["body"].rstrip().splitlines()[-1].startswith(
+            "-- primary-seat" if primary_kind != "claude" else "-- Anthropic Claude"
+        )
+    ]
+    if primary_kind == "claude":
+        # The planner is Codex here, so every Claude-signed plan comment is a review.
+        assert [body.endswith("(high)") for body in primary_bodies] == [False, False, True]
+        assert all(body.endswith("claude-test (medium)") for body in primary_bodies[:2])
+    else:
+        assert [body.endswith("seat-model (high))") for body in primary_bodies] == [
+            False, False, True,
+        ]
+        assert all(body.endswith("seat-model (low))") for body in primary_bodies[:2])
+    records = _m1505_primary_records_for(runner, "primary-seat" if primary_kind != "claude" else "Claude")
+    assert [record.plan_sweep for record in records] == [False, False, True]
+
+
+def _m1505_primary_records_for(runner, agent):
+    return [
+        record for record in _plan_round_records(runner)
+        if record.role == "reviewer" and record.agent == agent
+    ]
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch, mixed):
+    """`repeat-reemission` (repaired path): the acknowledgement repair returns blocking."""
+    requirement, plan_output, _unack, _repaired, _panel = _repaired_acknowledgement_fixtures()
+    dispositions = [{
+        "requirement_id": requirement.requirement_id,
+        "disposition": "addressed",
+        "evidence": "The plan preserves the public API.",
+    }]
+    base1 = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(plan_output), round_number=1
+    )
+    round1 = structured_plan_review(
+        state="blocking", summary="Gap 1 remains.", blocking_plan_issues=["Close gap 1."],
+        human_requirement_dispositions=dispositions,
+    )
+    patch1, _base2 = _m1505_patch(base1, resolved_items=["item-1"], summary="Close gap 1.")
+    patch1 = patch1.replace(
+        "\n<!-- AGENT_PLAN_STATE: blocking -->",
+        f"\n{HUMAN_REQUIREMENTS_ADDRESSED_MARKER}\n### Human requirements\n"
+        f"- {requirement.requirement_id}: the plan preserves the public API.\n"
+        "<!-- AGENT_PLAN_STATE: blocking -->",
+        1,
+    )
+    # Round 2 approves without the acknowledgement; its repair blocks and
+    # re-emits the carried item-1 text as a "new" finding.
+    # Repair may only recover findings grounded in the reviewer's own source
+    # text, so the approval lists them as future follow-ups.
+    round2 = structured_plan_review(
+        state="approved", summary="Gap 1 closed.",
+        future_followups=["Close gap 1.", *(["Close gap 2b."] if mixed else [])],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        human_requirement_dispositions=dispositions,
+    )
+    repaired = structured_plan_review(
+        state="blocking", summary="Gap 1 closed.",
+        blocking_plan_issues=["Close gap 1.", *(["Close gap 2b."] if mixed else [])],
+        prior_plan_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        human_requirements_resolved=True,
+        human_requirement_dispositions=dispositions,
+    )
+    runner = _FakeRunner(claude_outputs=[plan_output, patch1], codex_outputs=[round1, round2])
+    real_get_issue_context = discuss_loop.get_issue_context
+
+    def _patched(runner_arg, *, config, issue_number):
+        context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
+        return replace(context, human_requirements=(requirement,))
+
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
+        with patch.object(
+            plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+        ) as logged:
+            with pytest.raises(AgentLoopError):
+                run_issue_loop(
+                    runner, issue_number=56, config=_staged_plan_config(tmp_path, max_rounds=2),
+                    plan_first=True,
+                )
+    messages = [str(call.args[-1]) for call in logged.call_args_list]
+    assert any("repair returned blocking for Codex" in m for m in messages)
+    assert any(
+        "Codex repaired blocking outcome new mandatory finding provenance: "
+        f"pre_existing=0 revision_introduced=0 untagged={int(mixed)} repeats=1" in m
+        for m in messages
+    )
+    from coding_review_agent_loop.history_export import _plan_provenance_counts
+    from coding_review_agent_loop.review_step_back import derive_plan_sweep_state
+
+    # Everything below is derived from the posted durable records only.
+    records = [
+        PostedRoundRecord(index=index, metadata=metadata, body="")
+        for index, metadata in enumerate(_plan_round_records(runner))
+    ]
+    round_two = [
+        record.metadata for record in records
+        if record.metadata.role == "reviewer" and record.metadata.agent == "Codex"
+        and record.metadata.round_number == 2
+    ]
+    # The repaired blocking outcome supersedes the approval posted before it.
+    assert [metadata.state for metadata in round_two] == ["approved", "blocking"]
+    repaired_items = [item for item in round_two[-1].new_items if item.status == "blocking"]
+    assert len(repaired_items) == (2 if mixed else 1)
+    duplicate = next(item for item in repaired_items if item.text == "Close gap 1.")
+    assert duplicate.repeat_of == "item-1"
+    if mixed:
+        fresh_item = next(item for item in repaired_items if item.text == "Close gap 2b.")
+        assert fresh_item.repeat_of is None
+    # The repeat-only repair ends the streak; the mixed one extends it.
+    state = derive_plan_sweep_state(records, primary="Codex")
+    assert [review.classification for review in state.reviews][-1] == (
+        "new-finding" if mixed else "repeat-only"
+    )
+    assert state.streak_before(3) == (2 if mixed else 0)
+    # The export counts the genuinely new item and never the duplicate.
+    counts = _plan_provenance_counts(records)
+    assert counts.resolvable
+    assert (counts.pre_existing, counts.revision_introduced, counts.untagged) == (0, 0, int(mixed))
+
+
+# --- Tiered finding-provenance baseline (#1516) -------------------------------
+
+
+def _m1516_long_plan_outputs():
+    """A fresh #1590-sized plan, then a one-word-edit patch of its long steps."""
+    from agent_loop_helpers import long_plan_revision_pair
+
+    previous, current = long_plan_revision_pair()
+    fresh_payload = json.loads(structured_v1_plan_state().split("\n<!--", 1)[0])
+    fresh_payload["plan_steps"] = previous.splitlines()
+    fresh = (
+        json.dumps(fresh_payload)
+        + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    base = AuthenticatedPlanState.from_plan(
+        validate_structured_plan_state(fresh), round_number=1
+    )
+    patch_payload = {
+        "schema_version": 1,
+        "kind": "plan_revision_patch",
+        "semantic_patch_contract_version": 1,
+        "state": "blocking",
+        "summary": "Close gap 1.",
+        "prior_plan_item_dispositions": [{"item_id": "item-1", "disposition": "resolved"}],
+        "base_round_number": 1,
+        "base_state_identity": base.state_identity,
+        "operations": [
+            {"op": "replace", "field": "plan_steps", "value": current.splitlines()}
+        ],
+    }
+    revision = (
+        json.dumps(patch_payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    )
+    reviews = [
+        structured_plan_review(
+            state="blocking", summary=f"Gap {n} remains.",
+            blocking_plan_issues=[f"Close gap {n}."],
+            prior_plan_item_dispositions=(
+                [{"item_id": "item-1", "disposition": "resolved"}] if n > 1 else None
+            ),
+        )
+        for n in (1, 2)
+    ]
+    return [fresh, revision], reviews
+
+
+def _m1516_baseline_lines(messages):
+    return [m for m in messages if "Codex provenance baseline:" in m]
+
+
+def _m1516_primary_records(runner):
+    """The primary's plan reviewer records, hydrating large-plan sidecars."""
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=comment["body"]) for comment in runner.issue_comments],
+        flow="plan",
+    )
+    return [
+        record.metadata for record in records
+        if record.metadata.role == "reviewer" and record.metadata.agent == "Codex"
+    ]
+
+
+def test_resumed_round_renders_and_records_the_same_baseline_form(tmp_path):
+    """`resume-same-form`: prompt, log line and record agree, fresh or resumed."""
+    claude, codex = _m1516_long_plan_outputs()
+    live, live_messages = _m1505_run(
+        tmp_path / "live", claude=claude, codex=codex, max_rounds=2
+    )
+    live_reviews = _m1251_prompts(live, "codex")
+    assert len(live_reviews) == 2
+    assert "this is your first plan review of this issue" in live_reviews[0]
+    assert "+++ current plan (compact: changed sentences only)" in live_reviews[1]
+    assert "the comparison baseline is unavailable" not in live_reviews[1]
+    live_records = _m1516_primary_records(live)
+    assert [record.provenance_baseline_form for record in live_records] == [
+        "first-review", "compact-diff",
+    ]
+    compact_chars = live_records[1].provenance_baseline_chars
+    assert compact_chars > 0
+    live_lines = _m1516_baseline_lines(live_messages)
+    assert len(live_lines) == 2
+    assert "form=first-review chars=0" in live_lines[0]
+    assert f"form=compact-diff chars={compact_chars} " in live_lines[1]
+    assert "from_round=1" in live_lines[1]
+
+    # The first process dies after the planner revision, before round 2's review.
+    first, _messages = _m1505_run(
+        tmp_path / "resumed", claude=claude, codex=codex[:1], max_rounds=2
+    )
+    assert len(_m1516_primary_records(first)) == 1
+    rerun = _FakeRunner(issue_comments=list(first.issue_comments), codex_outputs=codex[1:])
+    config = _staged_plan_config(tmp_path / "resumed", max_rounds=2)
+    with patch.object(
+        plan_first_loop_module, "log", wraps=plan_first_loop_module.log
+    ) as logged:
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
+    rerun_messages = [str(call.args[-1]) for call in logged.call_args_list]
+    resumed_reviews = _m1251_prompts(rerun, "codex")
+    assert len(resumed_reviews) == 1
+    baseline_block = live_reviews[1].split("Finding provenance baseline", 1)[1].split(
+        "----- END BASELINE DIFF -----", 1
+    )[0]
+    assert "REVISED" in baseline_block
+    assert baseline_block in resumed_reviews[0]
+    resumed_record = _m1516_primary_records(rerun)[-1]
+    assert (resumed_record.provenance_baseline_form, resumed_record.provenance_baseline_chars) == (
+        "compact-diff", compact_chars,
+    )
+    resumed_lines = _m1516_baseline_lines(rerun_messages)
+    assert resumed_lines == [live_lines[1]]

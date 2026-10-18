@@ -28,6 +28,15 @@ from coding_review_agent_loop.unresolved_items import (
     release_evidence_freeze,
     select_coder_followup_items,
 )
+from types import SimpleNamespace
+
+import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
+import coding_review_agent_loop.pr_loop as pr_loop
+from issue_loop_test_helpers import _DEG_CORROBORATED, _deg_with
+from agent_loop_helpers import (
+    structured_plan_review as _r2_plan_review,
+    structured_pr_review as _r2_pr_review,
+)
 
 REQUEST = "Attach authenticated live-CLI suite output for this exact head"
 H1 = "1111111111111111111111111111111111111111"
@@ -456,3 +465,24 @@ def test_1388_resolved_proof_excludes_re_carried_and_machine_items():
     )
 
     assert proof == ("item-1",)
+
+
+@pytest.mark.parametrize("kind", ["plan", "pr"])
+def test_carried_item_review_rebuild_keeps_every_parsed_field(kind):
+    item = SimpleNamespace(item_id="item-1", status="blocking", reviewer="Codex", text="Fix it.")
+    dispositions = [{"item_id": "item-1", "disposition": "resolved", "note": "Fixed."}]
+    rendered = (
+        _r2_plan_review(prior_plan_item_dispositions=dispositions)
+        if kind == "plan" else _r2_pr_review(prior_item_dispositions=dispositions)
+    )
+    text = _deg_with(rendered, _DEG_CORROBORATED)
+    helper = (
+        plan_first_loop_module._validate_plan_review_response
+        if kind == "plan" else pr_loop._validate_review_response
+    )
+    with_items = helper(
+        text, reviewer="OpenAI Codex", unresolved_items=[item], architecture_status_mode="degradable"
+    )
+    assert with_items.architecture_impact.status == "changed"
+    assert [r.outcome for r in with_items.architecture_impact_degradations] == ["normalized-to-changed"]
+    assert [d.item_id for d in with_items.dispositions] == ["item-1"]

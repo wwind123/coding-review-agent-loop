@@ -51,6 +51,8 @@ import coding_review_agent_loop.pr_loop_support as pr_loop_support
 import coding_review_agent_loop.triage as triage
 import coding_review_agent_loop.validated_agent as validated_agent
 from agent_loop_helpers import patch_attr_in, patch_object_in
+import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
+from agent_loop_helpers import FakeRunner as _FakeRunner
 
 
 def test_pr_loop_does_not_post_gemini_diagnostics_without_agent_state(tmp_path):
@@ -1024,6 +1026,23 @@ def test_owning_pr_loop_writes_run_window_on_normal_exit(tmp_path):
         pr_payload={"body": "Fixes #56"},
     )
     assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, quiet=False)) == 0
+    records = list(load_records(telemetry_log_path()))
+    assert [r["record"] for r in records] == ["run-start", "run-end"]
+    assert records[0]["pr_number"] == 77 and records[0]["run_id"] == records[1]["run_id"]
+    assert runner.telemetry_attribution is None
+
+
+def test_owning_pr_loop_writes_run_end_on_exception(tmp_path, monkeypatch):
+    from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
+
+    runner = _FakeRunner()
+
+    def boom(*_a, **_k):
+        raise AgentLoopError("pr stop")
+
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_pr_review_context", boom)
+    with pytest.raises(AgentLoopError, match="pr stop"):
+        pr_loop.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
     records = list(load_records(telemetry_log_path()))
     assert [r["record"] for r in records] == ["run-start", "run-end"]
     assert records[0]["pr_number"] == 77 and records[0]["run_id"] == records[1]["run_id"]

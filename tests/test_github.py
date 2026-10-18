@@ -33,6 +33,17 @@ from coding_review_agent_loop.round_state import (
 )
 
 from agent_loop_helpers import make_config
+import re
+from coding_review_agent_loop.github import (
+    IssueComment,
+    get_issue_context,
+    get_issue_state,
+)
+from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
+from coding_review_agent_loop.discuss_loop import _attach_round_metadata
+from issue_loop_test_helpers import FakeRunner
+from coding_review_agent_loop.runner import CommandResult
+from agent_loop_helpers import FakeRunner as _FakeRunner, structured_plan_state
 
 
 FOOTER = KNOWN_HOST_COMMENT_FOOTER
@@ -787,3 +798,445 @@ def test_patch_malformed_readback_never_authorizes_replay(tmp_path, quiet, sleep
     with pytest.raises(GitHubAmbiguousWriteError):
         _patch(fake, tmp_path, comment["id"])
     assert len(fake.writes) == 1
+
+
+class _PaginatedIssueCommentsRunner(_FakeRunner):
+    def __init__(self, pages):
+        super().__init__(issue_comments=[])
+        self.pages = pages
+        self.rest_comment_requests = []
+
+    def _run_locked(self, args, *, cwd, check, input_text=None):
+        command = list(args)
+        if command[:2] == ["gh", "api"] and len(command) > 2 and command[2].startswith(
+            "repos/OWNER/REPO/issues/56/comments?"
+        ):
+            recorded, cwd_path = self._record_command(args, cwd)
+            query = command[2].split("?", 1)[1]
+            self.rest_comment_requests.append(query)
+            page = int(dict(part.split("=", 1) for part in query.split("&"))["page"])
+            return CommandResult(
+                recorded,
+                cwd_path,
+                json.dumps(self.pages[page - 1]),
+                "",
+                0,
+            )
+        return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+
+def test_issue_comment_recovery_parses_rest_user_identity_across_all_pages(tmp_path):
+    marker_body = "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: payload -->"
+    first_page = [
+        {"id": index + 1, "body": f"ordinary {index}", "user": {"login": "agent", "id": 7}}
+        for index in range(100)
+    ]
+    second_page = [
+        {
+            "id": 101,
+            "created_at": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+            "user": {"login": "agent", "id": 7},
+        }
+    ]
+    runner = _PaginatedIssueCommentsRunner([first_page, second_page])
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+        }
+    ]
+    context = get_issue_context(
+        runner,
+        config=make_config(tmp_path),
+        issue_number=56,
+    )
+
+    recovered = next(comment for comment in context.comments if comment.body == marker_body)
+    assert recovered.author == "agent"
+    assert recovered.author_id == 7
+    assert recovered.comment_id == 101
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+
+
+def test_issue_comment_recovery_discovers_diagnostic_beyond_graphql_projection(tmp_path):
+    marker_body = "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: payload -->"
+    first_page = [
+        {
+            "id": index + 1,
+            "body": f"ordinary {index}",
+            "created_at": f"2026-09-17T04:00:{index:02d}Z",
+            "user": {"login": "agent", "id": 7},
+        }
+        for index in range(100)
+    ]
+    second_page = [
+        {
+            "id": 101,
+            "created_at": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+            "user": {"login": "agent", "id": 7},
+        }
+    ]
+    runner = _PaginatedIssueCommentsRunner([first_page, second_page])
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": f"2026-09-17T04:00:{index:02d}Z",
+            "body": f"ordinary {index}",
+        }
+        for index in range(100)
+    ]
+
+    context = get_issue_context(runner, config=make_config(tmp_path), issue_number=56)
+
+    recovered = next(comment for comment in context.comments if comment.body == marker_body)
+    assert recovered.comment_id == 101
+    assert recovered.author == "agent"
+    assert recovered.author_id == 7
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+
+
+def test_issue_comment_recovery_discovers_canonical_round_transport(
+    tmp_path,
+):
+    canonical_plan = structured_plan_state(summary="Historical canonical plan.")
+    canonical_body = _attach_round_metadata(
+        canonical_plan,
+        PostedRoundMetadata(
+            flow="plan",
+            role="coder",
+            agent="Claude",
+            round_number=1,
+            subject=_plan_subject(canonical_plan),
+            canonical_plan=canonical_plan,
+            raw_structured_coder_response=canonical_plan,
+            architecture_contract_version=1,
+            state="approved",
+        ),
+    )
+    first_page = [
+        {
+            "id": index + 1,
+            "body": f"ordinary {index}",
+            "created_at": f"2026-09-17T04:00:{index:02d}Z",
+            "user": {"login": "agent", "id": 7},
+        }
+        for index in range(100)
+    ]
+    second_page = [
+        {
+            "id": 101,
+            "created_at": "2026-09-17T05:30:00Z",
+            "body": str(canonical_body),
+            "user": {"login": "agent", "id": 7},
+        }
+    ]
+    runner = _PaginatedIssueCommentsRunner([first_page, second_page])
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": f"2026-09-17T04:00:{index:02d}Z",
+            "body": f"ordinary {index}",
+        }
+        for index in range(100)
+    ]
+
+    context = get_issue_context(runner, config=make_config(tmp_path), issue_number=56)
+
+    recovered = next(comment for comment in context.comments if comment.body == str(canonical_body))
+    assert recovered.comment_id == 101
+    assert recovered.author == "agent"
+    assert recovered.author_id == 7
+    assert runner.rest_comment_requests == ["per_page=100&page=1", "per_page=100&page=2"]
+
+
+def test_issue_comment_recovery_fails_closed_when_a_later_rest_page_is_unavailable(tmp_path):
+    marker_body = "<!-- AGENT_PLAN_VALIDATION_DIAGNOSTIC: payload -->"
+
+    class IncompleteRunner(_PaginatedIssueCommentsRunner):
+        def _run_locked(self, args, *, cwd, check, input_text=None):
+            command = list(args)
+            if command[:2] == ["gh", "api"] and len(command) > 2 and command[2].startswith(
+                "repos/OWNER/REPO/issues/56/comments?"
+            ):
+                recorded, cwd_path = self._record_command(args, cwd)
+                page = int(command[2].rsplit("=", 1)[1])
+                if page == 2:
+                    return CommandResult(recorded, cwd_path, "", "network failure", 1)
+            return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
+
+    runner = IncompleteRunner(
+        [[
+            {"id": index + 1, "body": f"ordinary {index}", "user": {"login": "agent", "id": 7}}
+            for index in range(100)
+        ]]
+    )
+    runner.issue_comments = [
+        {
+            "author": {"login": "agent", "id": 7},
+            "createdAt": "2026-09-17T05:30:00Z",
+            "body": marker_body,
+        }
+    ]
+    with pytest.raises(AgentLoopError, match="incomplete"):
+        get_issue_context(runner, config=make_config(tmp_path), issue_number=56)
+
+
+def test_get_issue_context_parses_signed_issue_body_and_comments(tmp_path):
+    runner = FakeRunner(
+        issue_payload={
+            "number": 56,
+            "title": "Support signed issue requirements",
+            "body": "Use the stable API path.\n\n-- Human Reviewer",
+            "url": "https://github.com/OWNER/REPO/issues/56",
+            "author": {"login": "issue-author"},
+            "createdAt": "2026-05-17T08:00:00Z",
+        },
+        issue_comments=[
+            {
+                "author": {"login": "maintainer"},
+                "createdAt": "2026-05-17T09:00:00Z",
+                "url": "https://github.com/OWNER/REPO/issues/56#issuecomment-1",
+                "body": "Unsigned discussion remains normal context.",
+            },
+            {
+                "author": {"login": "lead"},
+                "createdAt": "2026-05-17T10:00:00Z",
+                "url": "https://github.com/OWNER/REPO/issues/56#issuecomment-2",
+                "body": "Add a regression test.\n\n-- Human Reviewer",
+            },
+        ],
+    )
+    config = make_config(tmp_path)
+
+    issue_context = get_issue_context(runner, config=config, issue_number=56)
+
+    assert [item.source_type for item in issue_context.human_requirements] == [
+        "Issue body",
+        "Issue comment",
+    ]
+    assert [item.author for item in issue_context.human_requirements] == ["issue-author", "lead"]
+    assert [item.created_at for item in issue_context.human_requirements] == [
+        "2026-05-17T08:00:00Z",
+        "2026-05-17T10:00:00Z",
+    ]
+    assert issue_context.human_requirements[0].body == "Use the stable API path."
+    assert issue_context.human_requirements[1].body == "Add a regression test."
+    assert issue_context.comments[0].body == "Unsigned discussion remains normal context."
+
+
+# --- Visible sidecar labels at the issue posting seams (#842) ----------------
+
+
+class _SidecarPostingRunner:
+    """Record posted bodies; echo REST bodies back (optionally altered)."""
+
+    def __init__(self, *, alter_sidecar_label: bool = False) -> None:
+        self.bodies: list[str] = []
+        self.alter_sidecar_label = alter_sidecar_label
+
+    def run(self, args, *, cwd, input_text=None, check=True, env=None):
+        from pathlib import Path
+
+        if "--body-file" in args:
+            self.bodies.append(Path(args[args.index("--body-file") + 1]).read_text())
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if input_text is None:
+            # Reconciliation baseline reads (#510) are unsupported here.
+            return SimpleNamespace(returncode=1, stdout="", stderr="unsupported read")
+        body = json.loads(input_text)["body"]
+        self.bodies.append(body)
+        returned = body
+        if self.alter_sidecar_label and "AGENT_LOOP_SIDECAR" in body:
+            returned = body.replace("Agent-loop plan attachment", "Agent-loop attachment", 1)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "id": len(self.bodies),
+                    "body": returned,
+                    "created_at": "2026-09-19T00:00:00Z",
+                    "user": {"login": "agent-bot", "id": 7},
+                }
+            ),
+            stderr="",
+        )
+
+
+def _sidecar_seam_config():
+    return SimpleNamespace(quiet=True, dry_run=False, gh_cmd="gh", repo="owner/repo")
+
+
+def _oversized_round_body(flow: str, role: str) -> TrustedBody:
+    import base64
+    import os
+
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+
+    large = base64.urlsafe_b64encode(os.urandom(70_000)).decode("ascii")
+    field = "canonical_plan" if flow == "plan" and role == "coder" else "canonical_reviewer_response"
+    text = _attach_round_metadata(
+        "Visible round response",
+        PostedRoundMetadata(
+            flow=flow,
+            role=role,
+            agent="codex",
+            round_number=1,
+            subject="sidecar-label-seam",
+            **{field: large},
+        ),
+    )
+    return TrustedBody.canonical(text, expected_tokens=("AGENT_LOOP_META",))
+
+
+def test_verified_plan_round_posts_labeled_sidecars_and_accepts_exact_readback(monkeypatch):
+    import coding_review_agent_loop.github as github_module
+    from coding_review_agent_loop.round_transport import is_round_transport_sidecar
+
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    runner = _SidecarPostingRunner()
+
+    posted = github_module.post_verified_trusted_issue_round_comment(
+        runner,
+        config=_sidecar_seam_config(),
+        issue_number=842,
+        body=_oversized_round_body("plan", "coder"),
+        expected_author_login="agent-bot",
+        expected_author_id=7,
+    )
+
+    sidecars = runner.bodies[:-1]
+    assert sidecars
+    for position, body in enumerate(sidecars, start=1):
+        assert is_round_transport_sidecar(body)
+        assert body.startswith(f"Agent-loop plan attachment {position}/{len(sidecars)} ")
+        assert "see the following plan comment." in body
+    assert posted.body == runner.bodies[-1]
+    assert not is_round_transport_sidecar(posted.body)
+
+
+def test_verified_plan_round_rejects_readback_with_altered_sidecar_label(monkeypatch):
+    import coding_review_agent_loop.github as github_module
+
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    runner = _SidecarPostingRunner(alter_sidecar_label=True)
+
+    with pytest.raises(AgentLoopError, match="returned a different body"):
+        github_module.post_verified_trusted_issue_round_comment(
+            runner,
+            config=_sidecar_seam_config(),
+            issue_number=842,
+            body=_oversized_round_body("plan", "coder"),
+            expected_author_login="agent-bot",
+            expected_author_id=7,
+        )
+    assert len(runner.bodies) == 1
+
+
+@pytest.mark.parametrize("role", ["debater", "summary"])
+def test_discuss_round_sidecars_posted_to_issue_use_neutral_wording(monkeypatch, role):
+    import coding_review_agent_loop.github as github_module
+
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    runner = _SidecarPostingRunner()
+
+    github_module.post_issue_comment(
+        runner,
+        config=_sidecar_seam_config(),
+        issue_number=842,
+        body=_oversized_round_body("discuss", role),
+    )
+
+    sidecars = runner.bodies[:-1]
+    assert sidecars
+    for body in sidecars:
+        assert body.startswith("Agent-loop attachment ")
+        assert "see the following agent-loop comment." in body
+        assert "plan attachment" not in body and "review attachment" not in body
+
+
+def test_rest_recovery_merges_labeled_sidecars_missing_from_projection(monkeypatch):
+    import coding_review_agent_loop.github as github_module
+    from coding_review_agent_loop.round_transport import prepare_round_comment
+
+    monkeypatch.setattr(github_module, "active_workdir", lambda config: None)
+    prepared = [str(item) for item in prepare_round_comment(_oversized_round_body("plan", "coder"))]
+    sidecars = prepared[:-1]
+    projection = tuple(
+        IssueComment(author="human", created_at=f"2026-09-19T00:{index // 60:02d}:{index % 60:02d}Z", body=f"note {index}")
+        for index in range(100)
+    )
+    rest_page_1 = [
+        {"id": index + 1, "body": comment.body, "created_at": comment.created_at, "user": {"login": "human", "id": 3}}
+        for index, comment in enumerate(projection)
+    ]
+    rest_page_2 = [
+        {"id": 1000 + index, "body": body, "created_at": "2026-09-19T01:00:00Z", "user": {"login": "agent-bot", "id": 7}}
+        for index, body in enumerate(sidecars)
+    ]
+
+    class _RestRunner:
+        def run(self, args, *, cwd, input_text=None, check=True, env=None):
+            page = rest_page_1 if args[-1].endswith("page=1") else rest_page_2
+            return SimpleNamespace(returncode=0, stdout=json.dumps(page), stderr="")
+
+    merged = github_module._merge_issue_comment_transport_identity(
+        _RestRunner(), config=_sidecar_seam_config(), issue_number=842, comments=projection
+    )
+
+    recovered = [comment for comment in merged if comment.comment_id and comment.comment_id >= 1000]
+    assert [comment.body for comment in recovered] == sidecars
+
+
+def test_get_issue_state_normalizes_lowercase_states(tmp_path):
+    """Matrix row `issue-state-read-fails-closed`: the accepted case."""
+    runner = _FakeRunner(issue_payloads_by_number={99: {"state": "closed"}})
+    assert get_issue_state(runner, config=make_config(tmp_path), issue_number=99) == "CLOSED"
+
+
+@pytest.mark.parametrize(
+    ("payload", "returncode", "message"),
+    [
+        ({"state": None}, 0, "Unable to determine the state of issue #99"),
+        ({"state": 7}, 0, "Unable to determine the state of issue #99"),
+        ({"state": "open"}, 1, "`gh` exited 1"),
+        ({"state": "open", "is_pr": True}, 0, "is a pull request, not an issue"),
+        ({"state": "merged"}, 0, "reported unexpected state"),
+    ],
+)
+def test_get_issue_state_fails_closed(tmp_path, payload, returncode, message):
+    """Matrix row `issue-state-read-fails-closed`: every rejected case.
+
+    The stub reproduces the real `Runner.run` check semantics, so a reader that
+    left `check` at its default would raise the generic command failure instead
+    of the contextual diagnostic and this test would fail.
+    """
+
+    class _Runner:
+        def run(self, cmd, *, check=True, **_kwargs):
+            if check and returncode != 0:
+                raise AgentLoopError(
+                    f"Command failed with exit {returncode}: {' '.join(cmd)}"
+                )
+            return CommandResult(cmd, None, json.dumps(payload), "", returncode)
+
+    with pytest.raises(AgentLoopError, match=re.escape(message)):
+        get_issue_state(_Runner(), config=make_config(tmp_path), issue_number=99)
+
+
+def test_get_issue_state_reads_with_check_disabled(tmp_path):
+    """A nonzero `gh` exit must reach the contextual diagnostic, not the generic one."""
+    seen = {}
+
+    class _Runner:
+        def run(self, cmd, *, check=True, **_kwargs):
+            seen["check"] = check
+            if check:
+                raise AgentLoopError("Command failed with exit 1: " + " ".join(cmd))
+            return CommandResult(cmd, None, "", "not found", 1)
+
+    with pytest.raises(AgentLoopError, match=re.escape("`gh` exited 1")):
+        get_issue_state(_Runner(), config=make_config(tmp_path), issue_number=99)
+    assert seen["check"] is False
