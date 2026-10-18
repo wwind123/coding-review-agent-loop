@@ -105,37 +105,13 @@ import coding_review_agent_loop.response_validation as response_validation
 import coding_review_agent_loop.review_rounds as review_rounds
 import coding_review_agent_loop.triage as triage
 from agent_loop_helpers import patch_attr_in, patch_object_in
-
-
-def _fresh_child_route_fixture(disposition, *, handoff=None):
-    phase = PlanPhase(
-        title="Child", scope="Implement child.", non_goals="No unrelated work.",
-        dependency_notes="No dependencies.", rollout_risk="low",
-        validation="Run focused tests.", parent_context="Approved slice.",
-        automation="agent-pr", stage_id="stage-one", position=1,
-        deliverables=("Child",), non_goals_items=("Unrelated work",),
-        acceptance_criteria=("Tests pass",), compatibility_constraints=("Preserve API",),
-        covered_scope_item_ids=("scope-1",), execution_disposition=disposition,
-        disposition_rationale="Reviewed route.",
-    )
-    route = execution_policy.resolve_child_execution_route(
-        phase, topology_source="approved-plan-v1", recorded_handoff=handoff
-    )
-    issue = IssueContext(
-        number=56, repo="OWNER/REPO", title="Child", body="Child", url="child-url", comments=()
-    )
-    parent = replace(issue, number=55, title="Parent", url="parent-url")
-    return SimpleNamespace(
-        parent_issue=55, plan_hash="plan-hash", plan_subject="plan-subject",
-        approved_plan="Approved parent plan", parent_plan_context=SimpleNamespace(
-            matrix_available=False, risk_test_matrix_payload=None
-        ), recommendation=SimpleNamespace(
-            strategy="staged", identity=lambda: {"recommendation_sha256": "digest"},
-            child_stages=(phase,),
-        ), decomposition=SimpleNamespace(phases=(phase,)),
-        created=CreatedPhaseIssue(phase=phase, issue_url=issue.url, issue_number=56),
-        phase_index=1, stage_id="stage-one", handoff=handoff, overrides=(), route=route,
-    ), issue, parent
+from issue_loop_test_helpers import (
+    _STEP_BACK_MARKER,
+    _fresh_child_route_fixture,
+    _m1103_blocking_chain,
+    _m1103_fresh_base,
+    _m1251_justify_patch,
+)
 
 
 @pytest.mark.parametrize(
@@ -2407,7 +2383,6 @@ def test_terminal_plan_repair_provider_failure_does_not_persist_stale_diagnostic
     assert runner.diagnostic_posts == []
 
 
-
 _TRANSIENT_REPAIR_SUGGESTION = (
     "Suggestion: re-run the same command — the Antigravity repair model "
     "reported a transient model-access failure; the round is resumable "
@@ -3739,7 +3714,6 @@ def test_issue_loop_activates_semantic_revision_from_fresh_authenticated_base(tm
     }
     assert metadata.assembled_plan_sidecar is not None
     assert "Revised semantic plan." in runner.comments[2]
-
 
 
 def test_semantic_revision_replacing_architecture_impact_records_and_resumes(tmp_path):
@@ -12914,8 +12888,6 @@ def test_nonstaged_acknowledgement_repair_cannot_add_an_assessment(
     assert codex_records[0].architecture_impact is None
 
 
-
-
 def _ack_plan_resume_run(tmp_path, monkeypatch, *, parallel, codex_impact, repaired_impact):
     """Interrupt a plan round at its acknowledgement repair, then resume it.
 
@@ -14308,68 +14280,6 @@ def test_1087_decision_with_a_child_issue_still_refuses(tmp_path):
 
 from coding_review_agent_loop.plan_assembly import assemble_plan_revision  # noqa: E402
 from coding_review_agent_loop.round_state import PostedRoundRecord  # noqa: E402
-
-
-def _m1103_blocking_chain(
-    first_round, last_round, *, base, resolve_first=True, item_offset=0
-):
-    """Primary blocking reviews and chained planner patches for a round range.
-
-    Round ``n``'s primary review blocks with a fresh finding ``item-k`` (and
-    resolves ``item-(k-1)``), where ``k`` is ``n - item_offset``; the
-    planner's revision after it is an authenticated patch bound to the
-    round-``n`` state that resolves ``item-k``.  Returns the scripted outputs
-    and the next base.
-    """
-    codex, claude = [], []
-    for n in range(first_round, last_round + 1):
-        k = n - item_offset
-        codex.append(
-            structured_plan_review(
-                state="blocking",
-                summary=f"Gap {n} remains.",
-                blocking_plan_issues=[f"Close gap {n}."],
-                prior_plan_item_dispositions=(
-                    [{"item_id": f"item-{k - 1}", "disposition": "resolved"}]
-                    if k > 1 and (resolve_first or n > first_round)
-                    else None
-                ),
-            )
-        )
-        patch_payload = {
-            "schema_version": 1,
-            "kind": "plan_revision_patch",
-            "semantic_patch_contract_version": 1,
-            "state": "blocking",
-            "summary": f"Close gap {n}.",
-            "prior_plan_item_dispositions": [
-                {"item_id": f"item-{k}", "disposition": "resolved"}
-            ],
-            "base_round_number": n,
-            "base_state_identity": base.state_identity,
-            "operations": [
-                {
-                    "op": "replace",
-                    "field": "plan_steps",
-                    "value": [f"Implement the reviewed scope, revision {n}."],
-                }
-            ],
-        }
-        base = AuthenticatedPlanState.from_plan(
-            assemble_plan_revision(base, patch_payload), round_number=n + 1
-        )
-        claude.append(
-            json.dumps(patch_payload)
-            + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-        )
-    return codex, claude, base
-
-
-def _m1103_fresh_base():
-    fresh = structured_v1_plan_state()
-    return fresh, AuthenticatedPlanState.from_plan(
-        validate_structured_plan_state(fresh), round_number=1
-    )
 
 
 def _m1103_agent_calls(runner):
@@ -16222,10 +16132,8 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
     assert not any("turn-1:observation-1" in comment for comment in runner.comments)
 
 
-
 # --- Plan step-back turn and early human decision (#1251) ---------------------
 
-_STEP_BACK_MARKER = "STEP-BACK REVISION"
 _STEP_BACK_NOTICE = "Step-back notice"
 
 
@@ -16239,38 +16147,6 @@ def _m1251_coder_record(runner, round_number):
         for record in _plan_round_records(runner)
         if record.role == "coder" and record.round_number == round_number
     )
-
-
-def _m1251_justify_patch(base, *, resolved_item, summary="Justify one-shot."):
-    payload = {
-        "schema_version": 1,
-        "kind": "plan_revision_patch",
-        "semantic_patch_contract_version": 1,
-        "state": "blocking",
-        "summary": summary,
-        "prior_plan_item_dispositions": [
-            {"item_id": resolved_item, "disposition": "resolved"}
-        ],
-        "base_round_number": base.round_number,
-        "base_state_identity": base.state_identity,
-        "operations": [
-            {
-                "op": "replace",
-                "field": "one_shot_growth_justification",
-                "value": {
-                    "crossed_signals": ["revision-count"],
-                    "rationale": "The revisions share one seam and cannot ship separately.",
-                },
-            }
-        ],
-    }
-    next_base = AuthenticatedPlanState.from_plan(
-        assemble_plan_revision(base, payload), round_number=base.round_number + 1
-    )
-    text = (
-        json.dumps(payload) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
-    )
-    return text, next_base
 
 
 def _m1251_steps_patch(base, *, resolved_item, summary):

@@ -344,7 +344,7 @@ def test_unknown_resolved_models_never_produce_a_note(tmp_path, kind, parallel):
 
 
 def test_evidence_response_pass_gains_no_reconciliation_summary(tmp_path):
-    from test_orchestrator_pr import _EVIDENCE_TEXT, _evidence_review, _signed
+    from pr_loop_test_helpers import _EVIDENCE_TEXT, _evidence_review, _signed
 
     runner = FakeRunner(
         codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT])],
@@ -359,7 +359,7 @@ def test_evidence_response_pass_gains_no_reconciliation_summary(tmp_path):
     before = len([c for c in runner.comments if "reconciliation" in c])
     assert before == 1  # the authoritative round carries the note
     runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
-    from test_orchestrator_pr import _resolve
+    from pr_loop_test_helpers import _resolve
 
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
     runner.gemini_outputs.append(

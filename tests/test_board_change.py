@@ -1075,7 +1075,7 @@ def test_primary_change_restarts_the_primary_phase_and_carries_secondary_obligat
     """Row pr-primary-change: a new primary, or a model or effort change on the
     same primary seat, restarts the primary phase; the panel's open item
     survives it and is dispositioned by its owner when the panel reopens."""
-    from test_orchestrator_pr import _audit_phases, _staged_config, _staged_review
+    from pr_loop_test_helpers import _audit_phases, _staged_config, _staged_review
 
     runner = _staged_panel_history(tmp_path, monkeypatch)
     assert _agents(runner)[:3] == ["codex", "gemini", "agy"]
@@ -1241,7 +1241,7 @@ def test_signed_restoration_after_a_link_only_restores_seats_signed_off_since_it
 
 def _strip_board_identity(runner):
     """Simulate pre-upgrade history: drop every board identity field."""
-    from test_orchestrator_pr import _rewrite_pr_metadata
+    from pr_loop_test_helpers import _rewrite_pr_metadata
 
     keys = ("pr_board_root", "pr_board_identity", "pr_board_binding_init",
             "reviewer_board_change_digest")
@@ -1672,7 +1672,7 @@ def test_frozen_evidence_is_answered_by_the_new_board_after_a_change(
     both at abc123.  Gemini's re-emission reopens nothing, and the PR
     qualifies.
     """
-    from test_orchestrator_pr import _evidence_review, _signed
+    from pr_loop_test_helpers import _evidence_review, _signed
 
     runner = FakeRunner(
         codex_outputs=[_evidence_review(evidence=[_LIVE_LOG])],
@@ -1770,7 +1770,7 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
     test_evidence_requests_survive_a_board_change_with_their_head_scoped_clearances.)  At a different head the retained requester's same request is a
     new obligation and freezes that head.
     """
-    from test_orchestrator_pr import _evidence_review, _signed
+    from pr_loop_test_helpers import _evidence_review, _signed
 
     runner = FakeRunner(
         codex_outputs=[_evidence_review(evidence=[_LIVE_LOG])],
@@ -1864,7 +1864,7 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
 
 def _staged_panel_history(tmp_path, monkeypatch):
     """Codex (primary) approves, the panel opens, Gemini raises item-1; then stop."""
-    from test_orchestrator_pr import _staged_config, _staged_review
+    from pr_loop_test_helpers import _staged_config, _staged_review
     from coding_review_agent_loop.review_scheduling import TransitionClassification
 
     patch_attr_in(monkeypatch, (pr_loop_support_module, pr_loop_module), "_observe_pr_transition",
@@ -1888,7 +1888,7 @@ def _staged_panel_history(tmp_path, monkeypatch):
 def test_carried_obligations_require_a_qualified_pre_epoch_opening(tmp_path, monkeypatch, opening):
     """Item-4 (row pr-primary-change): only items created under a qualified
     panel opening before the epoch are exempt from the pre-panel stop."""
-    from test_orchestrator_pr import _staged_config
+    from pr_loop_test_helpers import _staged_config
     from coding_review_agent_loop.board_change import (
         carried_secondary_obligations,
         pre_epoch_panel_items,
@@ -1916,7 +1916,7 @@ def test_carried_obligations_require_a_qualified_pre_epoch_opening(tmp_path, mon
 def test_unqualified_secondary_item_still_stops_after_a_primary_change(tmp_path, monkeypatch):
     """Item-4: a secondary-owned item that never had a qualified opening keeps
     the pre-panel safety stop, before any reviewer runs."""
-    from test_orchestrator_pr import _rewrite_pr_metadata, _staged_config
+    from pr_loop_test_helpers import _rewrite_pr_metadata, _staged_config
 
     runner = _staged_panel_history(tmp_path, monkeypatch)
 
@@ -1943,7 +1943,7 @@ def test_carried_secondary_finding_survives_successive_primary_changes(
     primary change -- after the first change activated (later windows hold it
     only in their ledgers), and when the second change supersedes the first
     while it is still pending (both epochs share one round)."""
-    from test_orchestrator_pr import _staged_config, _staged_review
+    from pr_loop_test_helpers import _staged_config, _staged_review
 
     runner = _staged_panel_history(tmp_path, monkeypatch)
     first = _staged_config(tmp_path, primary_reviewer="antigravity", pre_review_tests=False)
@@ -1999,7 +1999,7 @@ def test_co_owned_carried_obligation_through_primary_restart_and_panel(
     secondaries is carried through a same-seat primary model change.  Its
     owners keep their states; each still-pending owner dispositions it when
     the panel reopens, and the run qualifies."""
-    from test_orchestrator_pr import _rewrite_pr_metadata, _staged_config, _staged_review
+    from pr_loop_test_helpers import _rewrite_pr_metadata, _staged_config, _staged_review
 
     runner = _staged_panel_history(tmp_path, monkeypatch)
 
@@ -2056,7 +2056,7 @@ def test_primary_seat_backend_change_restarts_the_primary_phase(tmp_path, monkey
     rebound seat, the carried secondary finding is exempt from the pre-panel
     stop, its owner dispositions it when the panel reopens, and the run
     qualifies."""
-    from test_orchestrator_pr import _audit_phases, _staged_review
+    from pr_loop_test_helpers import _audit_phases, _staged_review
     from coding_review_agent_loop.review_scheduling import TransitionClassification
 
     patch_attr_in(monkeypatch, (pr_loop_support_module, pr_loop_module), "_observe_pr_transition",
@@ -4543,7 +4543,7 @@ def test_primary_change_after_a_step_back_episode_resets_its_counters(tmp_path, 
     Gemini reviews the candidate, its single block neither escalates nor earns a
     step-back, and the run revises without approving."""
     from coding_review_agent_loop.review_step_back import derive_plan_step_back_state
-    from test_orchestrator_issue import (
+    from issue_loop_test_helpers import (
         _STEP_BACK_MARKER,
         _m1103_blocking_chain,
         _m1103_fresh_base,

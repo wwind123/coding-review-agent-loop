@@ -13384,7 +13384,7 @@ def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligatio
 ):
     """#1117: stop a real draft-labeled managed PR carrying the persisted item, then resume it."""
     import dataclasses
-    from test_orchestrator_pr import _carried_ci_obligations, _carried_ci_review_comment
+    from pr_loop_test_helpers import _carried_ci_obligations, _carried_ci_review_comment
     from coding_review_agent_loop.github import PullRequestMergeability
     from coding_review_agent_loop.managed_ci import ManagedCiOutcome
 
