@@ -4,13 +4,10 @@ import json
 
 import pytest
 
-from coding_review_agent_loop.orchestrator import (
+from coding_review_agent_loop.discuss_loop import (
     DISCUSS_CONSENSUS_MARKER_RE,
-    PostedRoundMetadata,
     ROUND_RESUME_MARKER_RE,
     _attach_round_metadata,
-    _decode_round_metadata,
-    _encode_round_metadata,
     _discuss_subject,
     _validate_discuss_analyzer_agenda_fidelity,
     _validate_discuss_final_analyzer_fidelity,
@@ -21,10 +18,12 @@ from coding_review_agent_loop.orchestrator import (
     _safe_discuss_synthesis_serialization,
     _disc_synthesis_text_supported_by_vote,
     _resume_discuss_round,
-    render_public_agent_comment,
     run_discuss_loop,
     _detect_discuss_answer_consensus,
 )
+from coding_review_agent_loop.panel_evidence import PostedRoundMetadata
+from coding_review_agent_loop.round_state import _decode_round_metadata, _encode_round_metadata
+from coding_review_agent_loop.response_validation import render_public_agent_comment
 from coding_review_agent_loop.comment_rendering import render_discuss_round_summary_comment
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import IssueComment, IssueContext
@@ -48,6 +47,15 @@ from coding_review_agent_loop.protocol import (
 )
 
 from agent_loop_helpers import FakeRunner, make_config
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.review_rounds as review_rounds
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 
 def test_answer_consensus_does_not_escalate_for_one_early_needs_human():
@@ -2796,7 +2804,7 @@ def test_discuss_loop_rejects_repaired_hallucinated_analyzer_agenda(tmp_path):
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_analyzer="claude")
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
         result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=1)
 
     assert result == 0
@@ -3149,7 +3157,7 @@ def test_discuss_loop_required_research_missing_research_repaired(tmp_path):
     config = make_config(tmp_path, reviewer=("codex", "gemini"), discuss_research="required")
 
     with patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired
+        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired
     ):
         result = run_discuss_loop(runner, issue_number=56, config=config)
 
@@ -3375,7 +3383,6 @@ import threading
 import time
 from pathlib import Path
 
-import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.runner import CommandResult, Runner
 
 from agent_loop_helpers import read_usage_summary
@@ -3760,7 +3767,7 @@ def test_discuss_parallel_zero_pending_resume_skips_executor(tmp_path, monkeypat
     def _fail_executor(*args, **kwargs):
         raise AssertionError("ThreadPoolExecutor must not be constructed on a zero-pending resume")
 
-    monkeypatch.setattr(orchestrator_module, "ThreadPoolExecutor", _fail_executor)
+    patch_attr_in(monkeypatch, (review_rounds, discuss_loop), "ThreadPoolExecutor", _fail_executor)
 
     result = run_discuss_loop(runner, issue_number=56, config=config)
 
@@ -3851,7 +3858,7 @@ def test_discuss_debater_checkout_inspected_claim_invalid_reference_triggers_rep
         gemini_outputs=[_discuss_review_text(outcome="implement")],
     )
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
         result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
 
     assert result == 0
@@ -3879,7 +3886,7 @@ def test_discuss_debater_checkout_inspected_claim_implausibly_large_line_trigger
         gemini_outputs=[_discuss_review_text(outcome="implement")],
     )
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
         result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
 
     assert result == 0
@@ -3920,7 +3927,7 @@ def test_discuss_debater_checkout_inspected_claim_unreadable_file_triggers_repai
     )
 
     with patch.object(Path, "open", failing_open), patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired
+        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired
     ) as repair:
         result = run_discuss_loop(runner, issue_number=56, config=config, discuss_max_rounds=0)
 
@@ -4096,10 +4103,9 @@ def test_discuss_loop_is_unaffected_by_the_staged_planning_policy(tmp_path):
 
 def test_discuss_loop_writes_run_window_on_normal_exit(tmp_path, monkeypatch):
     """Reservation telemetry (#1107): normal return of the owning discuss loop."""
-    import coding_review_agent_loop.orchestrator as orchestrator
     from coding_review_agent_loop.worker_telemetry import load_records, telemetry_log_path
 
-    monkeypatch.setattr(orchestrator, "_run_discuss_loop", lambda *_a, **_k: 0)
+    monkeypatch.setattr(discuss_loop, "_run_discuss_loop", lambda *_a, **_k: 0)
     runner = FakeRunner()
     assert run_discuss_loop(runner, issue_number=56, config=make_config(tmp_path)) == 0
     records = list(load_records(telemetry_log_path()))
@@ -4117,14 +4123,13 @@ def _refusal(*args, **kwargs):
 
 
 def test_discuss_analyzer_helpers_propagate_checkout_refusals(monkeypatch, tmp_path):
-    from coding_review_agent_loop import orchestrator
     from coding_review_agent_loop.errors import CheckoutVerificationError
 
     config = make_config(tmp_path)
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", _refusal)
-    monkeypatch.setattr(orchestrator, "build_discuss_agenda_prompt", lambda *a, **k: "p")
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", _refusal)
+    monkeypatch.setattr(discuss_loop, "build_discuss_agenda_prompt", lambda *a, **k: "p")
     with pytest.raises(CheckoutVerificationError):
-        orchestrator._run_discuss_analyzer(
+        discuss_loop._run_discuss_analyzer(
             FakeRunner(), issue_number=1, config=config, analyzer="codex", memory=None,
             issue_context=None, round_number=1, round_history=(), prior_agenda=None,
             prior_round_synthesis=None, configured_reviewers=("codex",), usage_context=None,
@@ -4133,10 +4138,9 @@ def test_discuss_analyzer_helpers_propagate_checkout_refusals(monkeypatch, tmp_p
 
 @pytest.mark.parametrize("parallel", [False, True])
 def test_discuss_debater_refusal_is_terminal_even_in_partial_mode(monkeypatch, tmp_path, parallel):
-    from coding_review_agent_loop import orchestrator
     from coding_review_agent_loop.errors import CheckoutVerificationError
 
-    monkeypatch.setattr(orchestrator, "_run_discuss_debater_turn", _refusal)
+    monkeypatch.setattr(discuss_loop, "_run_discuss_debater_turn", _refusal)
     runner = FakeRunner(codex_outputs=["x"], gemini_outputs=["x"])
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), discuss_parallel=parallel,
@@ -4147,7 +4151,6 @@ def test_discuss_debater_refusal_is_terminal_even_in_partial_mode(monkeypatch, t
 
 
 def test_evidence_reconciler_propagates_checkout_refusals(monkeypatch, tmp_path):
-    from coding_review_agent_loop import orchestrator
     from coding_review_agent_loop.errors import CheckoutVerificationError
 
     candidates = [{"id": "o1"}, {"id": "o2"}]
@@ -4155,12 +4158,12 @@ def test_evidence_reconciler_propagates_checkout_refusals(monkeypatch, tmp_path)
         type("Observation", (), {"observation_id": "o1", "status": "open"})(),
         type("Observation", (), {"observation_id": "o2", "status": "open"})(),
     ]
-    monkeypatch.setattr(orchestrator, "collect_evidence_observations", lambda *a, **k: (items, ()))
-    monkeypatch.setattr(orchestrator, "bounded_reconciliation_candidates", lambda *a, **k: candidates)
-    monkeypatch.setattr(orchestrator, "build_discuss_evidence_reconciliation_prompt", lambda *a, **k: "p")
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", _refusal)
+    monkeypatch.setattr(discuss_loop, "collect_evidence_observations", lambda *a, **k: (items, ()))
+    monkeypatch.setattr(discuss_loop, "bounded_reconciliation_candidates", lambda *a, **k: candidates)
+    monkeypatch.setattr(discuss_loop, "build_discuss_evidence_reconciliation_prompt", lambda *a, **k: "p")
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", _refusal)
     with pytest.raises(CheckoutVerificationError):
-        orchestrator._run_discuss_evidence_reconciler(
+        discuss_loop._run_discuss_evidence_reconciler(
             FakeRunner(), issue_number=1, config=make_config(tmp_path), analyzer="codex",
             subject="issue-1", round_history=(), usage_context=None,
         )

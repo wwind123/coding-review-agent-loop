@@ -7,7 +7,6 @@ from unittest.mock import patch
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator_module
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 import coding_review_agent_loop.phase_progress as phase_progress_module
 from coding_review_agent_loop.agents.base import AgentResult
@@ -59,17 +58,13 @@ from coding_review_agent_loop.issue_pr_provenance import IssuePrProvenanceScope
 from coding_review_agent_loop.memory import AgentMemoryContext
 import coding_review_agent_loop.prompts as prompts_module
 from coding_review_agent_loop.plan_review_scheduling import PlanCandidateKey
-from coding_review_agent_loop.orchestrator import (
-    PostedRoundMetadata,
-    ValidatedAgentResponse,
-    _advisory_issue_pr_provenance,
-    _attach_round_metadata,
-    _decode_round_metadata,
-    _infer_staged_parent_issue,
-    _plan_subject,
-    _resume_plan_round,
-    _strip_round_metadata,
-)
+from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
+from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
+from coding_review_agent_loop.issue_implementation import _advisory_issue_pr_provenance
+from coding_review_agent_loop.discuss_loop import _attach_round_metadata
+from coding_review_agent_loop.round_state import _decode_round_metadata, _strip_round_metadata
+from coding_review_agent_loop.execution_policy import _infer_staged_parent_issue
+from coding_review_agent_loop.pr_loop_support import _resume_plan_round
 from coding_review_agent_loop.prompts import (
     build_completion_recovery_prompt,
     build_issue_prompt,
@@ -95,6 +90,21 @@ from coding_review_agent_loop.protocol import (
     risk_test_matrix_identity,
 )
 from coding_review_agent_loop.round_state import make_approved_plan_context
+import coding_review_agent_loop.agent_failure as agent_failure
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.integration_close as integration_close
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.review_rounds as review_rounds
+import coding_review_agent_loop.triage as triage
+from agent_loop_helpers import patch_attr_in, patch_object_in
 
 
 def _fresh_child_route_fixture(disposition, *, handoff=None):
@@ -108,7 +118,7 @@ def _fresh_child_route_fixture(disposition, *, handoff=None):
         covered_scope_item_ids=("scope-1",), execution_disposition=disposition,
         disposition_rationale="Reviewed route.",
     )
-    route = orchestrator_module.resolve_child_execution_route(
+    route = execution_policy.resolve_child_execution_route(
         phase, topology_source="approved-plan-v1", recorded_handoff=handoff
     )
     issue = IssueContext(
@@ -139,11 +149,10 @@ def test_fresh_child_issue_flags_cannot_switch_reviewed_route(
     tmp_path, monkeypatch, disposition, plan_first, message
 ):
     fresh, issue, parent = _fresh_child_route_fixture(disposition)
-    monkeypatch.setattr(
-        orchestrator_module, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
     )
-    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: fresh)
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: fresh)
     with pytest.raises(AgentLoopError, match=re.escape(message)):
         run_issue_loop(
             _FakeRunner(), issue_number=56, config=make_config(tmp_path), plan_first=plan_first
@@ -158,20 +167,16 @@ def test_direct_child_entry_posts_planning_handoff_before_planner_and_reuses_it(
     fresh.route = replace(fresh.route, override_digest=override_digest)
     events = []
     handoff_calls = []
-    monkeypatch.setattr(
-        orchestrator_module, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
     )
-    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: fresh)
-    monkeypatch.setattr(
-        orchestrator_module, "_post_child_planning_handoff",
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: fresh)
+    patch_attr_in(monkeypatch, (execution_policy, plan_first_loop_module, issue_loop), "_post_child_planning_handoff",
         lambda *_args, **kwargs: (handoff_calls.append(kwargs), events.append("handoff")),
     )
-    monkeypatch.setattr(
-        orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "_run_plan_first_loop",
+    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_run_plan_first_loop",
         lambda *_args, **_kwargs: events.append("planner") or 19,
     )
     assert run_issue_loop(
@@ -199,7 +204,7 @@ def test_direct_child_entry_posts_planning_handoff_before_planner_and_reuses_it(
     resumed, _, _ = _fresh_child_route_fixture(
         EXECUTION_DISPOSITION_PLANNING, handoff=recorded
     )
-    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: resumed)
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: resumed)
     assert run_issue_loop(
         _FakeRunner(), issue_number=56, config=make_config(tmp_path), plan_first=True
     ) == 19
@@ -209,14 +214,12 @@ def test_direct_child_entry_posts_planning_handoff_before_planner_and_reuses_it(
 def test_direct_child_entry_dispatches_through_shared_child_dispatch(tmp_path, monkeypatch):
     fresh, issue, parent = _fresh_child_route_fixture(EXECUTION_DISPOSITION_DIRECT)
     calls = []
-    monkeypatch.setattr(
-        orchestrator_module, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
     )
-    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: fresh)
-    monkeypatch.setattr(orchestrator_module, "prepare_agent_memory", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        orchestrator_module, "_dispatch_decomposition_child",
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: fresh)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", lambda *_args, **_kwargs: None)
+    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child",
         lambda *_args, **kwargs: calls.append(kwargs) or 23,
     )
     assert run_issue_loop(_FakeRunner(), issue_number=56, config=make_config(tmp_path)) == 23
@@ -247,12 +250,11 @@ def test_parent_rerun_resume_hint_follows_recorded_disposition(
         recommendation_digest="digest", stage_id="stage-one", plan_subject="plan-subject",
         execution_disposition=disposition,
     )
-    monkeypatch.setattr(
-        orchestrator_module, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     monkeypatch.setattr(
-        orchestrator_module, "find_existing_phase_implementation_handoff",
+        plan_first_loop_module, "find_existing_phase_implementation_handoff",
         lambda *_args, **_kwargs: handoff,
     )
     monkeypatch.setattr(
@@ -264,7 +266,7 @@ def test_parent_rerun_resume_hint_follows_recorded_disposition(
         "find_phase_implementation_handoffs_for_parent",
         lambda *_args, **_kwargs: (handoff,),
     )
-    result = orchestrator_module._dispatch_current_decomposition_phase(
+    result = plan_first_loop_module._dispatch_current_decomposition_phase(
         _FakeRunner(), config=make_config(tmp_path), memory=None,
         usage_context=SimpleNamespace(), issue_number=55,
         current_plan="Approved parent plan", plan_subject="plan-subject",
@@ -310,7 +312,7 @@ def test_auto_execution_resolves_one_shot_after_approval(tmp_path):
         structured_v1_plan_state()
     ).execution_recommendation
 
-    resolved = orchestrator_module._resolve_execution_policy(
+    resolved = execution_policy._resolve_execution_policy(
         config,
         recommendation=recommendation,
     )
@@ -327,7 +329,7 @@ def test_auto_execution_resolves_staged_after_approval(tmp_path):
     ).execution_recommendation
     staged_recommendation = replace(recommendation, strategy="staged")
 
-    resolved = orchestrator_module._resolve_execution_policy(
+    resolved = execution_policy._resolve_execution_policy(
         config,
         recommendation=staged_recommendation,
     )
@@ -341,7 +343,7 @@ def test_auto_execution_rejects_legacy_undecided_plan(tmp_path):
     config = make_config(tmp_path, plan_execution_mode="auto")
 
     with pytest.raises(AgentLoopError, match="legacy-undecided"):
-        orchestrator_module._resolve_execution_policy(
+        execution_policy._resolve_execution_policy(
             config,
             recommendation=None,
         )
@@ -432,7 +434,7 @@ def test_legacy_plan_revision_gate_runs_through_issue_loop(tmp_path, monkeypatch
         max_rounds=3,
     )
     captured_gate_values = []
-    original_validator = orchestrator_module._validate_plan_revision_response
+    original_validator = response_validation._validate_plan_revision_response
 
     def capture_validator(*args, **kwargs):
         captured_gate_values.append(
@@ -440,11 +442,10 @@ def test_legacy_plan_revision_gate_runs_through_issue_loop(tmp_path, monkeypatch
         )
         return original_validator(*args, **kwargs)
 
-    monkeypatch.setattr(
-        orchestrator_module, "_validate_plan_revision_response", capture_validator
+    patch_attr_in(monkeypatch, (response_validation, plan_first_loop_module), "_validate_plan_revision_response", capture_validator
     )
     if include_matrix:
-        with patch.object(orchestrator_module, "attempt_repair", return_value=None):
+        with patch.object(validated_agent_module, "attempt_repair", return_value=None):
             with pytest.raises(AgentLoopError):
                 run_issue_loop(
                     runner,
@@ -855,35 +856,25 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
         comments=(),
         human_requirements=(),
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_run_validated_agent",
+    patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent",
         lambda *_args, **_kwargs: (
             setattr(runner, "git_head", "abc123-agent-1") or coder_response
         ),
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "resolve_canonical_pr_for_issue",
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue",
         lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "sync_coder_base_before_implementation",
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation",
         lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "preflight_managed_ci_creation",
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation",
         lambda *_args, **_kwargs: None,
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "run_pr_loop",
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop",
         lambda *_args, **_kwargs: 0,
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head=checkout_head,
@@ -894,13 +885,13 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
         ),
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "reconcile_test_observations",
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
 
     assert (
-        orchestrator_module._implement_approved_issue(
+        issue_implementation._implement_approved_issue(
             runner,
             issue_number=56,
             approved_plan=approved_plan,
@@ -908,7 +899,7 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
             memory=None,
             issue_context=issue_context,
             coder_session_id=None,
-            usage_context=orchestrator_module._new_usage_context(config),
+            usage_context=validated_agent_module._new_usage_context(config),
             approved_plan_context=plan_context,
         )
         == 0
@@ -1043,13 +1034,11 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
         acquisition_test_observations=(wrong, current),
     )
     run_pr_calls = []
-    monkeypatch.setattr(
-        orchestrator_module, "_run_validated_agent", lambda *_a, **_k: coder_response
+    patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent", lambda *_a, **_k: coder_response
     )
-    monkeypatch.setattr(
-        orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
-    real_get_pr_review_context = orchestrator_module.get_pr_review_context
+    real_get_pr_review_context = pr_loop_support.get_pr_review_context
     review_context_calls = 0
 
     def get_pr_review_context_with_optional_race(*args, **kwargs):
@@ -1059,29 +1048,21 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
             runner.pr_payload["headRefOid"] = "raced-head"
         return real_get_pr_review_context(*args, **kwargs)
 
-    monkeypatch.setattr(
-        orchestrator_module,
-        "get_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_pr_review_context",
         get_pr_review_context_with_optional_race,
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "sync_coder_base_before_implementation",
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation",
         lambda *_a, **_k: None,
     )
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "validate_assigned_head_advanced", lambda **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "validate_assigned_head_advanced", lambda **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "run_pr_loop",
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop",
         lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "reconcile_test_observations",
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
@@ -1089,7 +1070,7 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
         ("abc123", "abc123") if mode != "head-race" else ("abc123", "raced-head")
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head=next(snapshot_heads),
@@ -1099,14 +1080,12 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
             status_clean=True,
         ),
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "run_agent_result",
+    patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result",
         lambda *_a, **_k: SimpleNamespace(
             text=("not a structured response" if mode == "exhausted" else corrected_text)
         ),
     )
-    result = orchestrator_module._implement_approved_issue(
+    result = issue_implementation._implement_approved_issue(
         runner,
         issue_number=56,
         approved_plan=approved_plan,
@@ -1114,7 +1093,7 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
         memory=None,
         issue_context=issue_context,
         coder_session_id=None,
-        usage_context=orchestrator_module._new_usage_context(config),
+        usage_context=validated_agent_module._new_usage_context(config),
         approved_plan_context=plan_context,
     )
 
@@ -1221,8 +1200,8 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
         implementation_calls.append(1)
         return coder_response
 
-    real_contract_record = orchestrator_module.post_trusted_pr_contract_record
-    real_handoff = orchestrator_module.post_issue_pr_handoff_comment
+    real_contract_record = issue_implementation.post_trusted_pr_contract_record
+    real_handoff = pr_loop.post_issue_pr_handoff_comment
 
     def recording_contract_record(*args, **kwargs):
         result = real_contract_record(*args, **kwargs)
@@ -1245,36 +1224,30 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
     def forbidden_repair(*_a, **_k):
         raise AssertionError("repair must not run for an incomplete semantic claim")
 
-    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", fake_validated_agent)
-    monkeypatch.setattr(orchestrator_module, "post_trusted_pr_contract_record", recording_contract_record)
-    monkeypatch.setattr(orchestrator_module, "post_issue_pr_handoff_comment", recording_handoff)
-    monkeypatch.setattr(orchestrator_module, "run_agent_result", fake_correction)
-    monkeypatch.setattr(orchestrator_module, "attempt_repair", forbidden_repair)
-    monkeypatch.setattr(orchestrator_module, "execute_repair", forbidden_repair)
-    monkeypatch.setattr(
-        orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "post_trusted_pr_contract_record", recording_contract_record)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "post_issue_pr_handoff_comment", recording_handoff)
+    patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_correction)
+    monkeypatch.setattr(validated_agent_module, "attempt_repair", forbidden_repair)
+    monkeypatch.setattr(validated_agent_module, "execute_repair", forbidden_repair)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "validate_assigned_head_advanced", lambda **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "validate_assigned_head_advanced", lambda **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "run_pr_loop",
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop",
         lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "reconcile_test_observations",
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head="abc123",
@@ -1285,7 +1258,7 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
         ),
     )
 
-    result = orchestrator_module._implement_approved_issue(
+    result = issue_implementation._implement_approved_issue(
         runner,
         issue_number=56,
         approved_plan=approved_plan,
@@ -1293,7 +1266,7 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
         memory=None,
         issue_context=issue_context,
         coder_session_id=None,
-        usage_context=orchestrator_module._new_usage_context(config),
+        usage_context=validated_agent_module._new_usage_context(config),
         approved_plan_context=plan_context,
     )
 
@@ -1368,7 +1341,7 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
         else _command_string_issue_implementation_text()
     )
     # Real orchestrator validator with the live current-turn catalog.
-    initial_parsed = orchestrator_module._validate_issue_implementation_response(
+    initial_parsed = response_validation._validate_issue_implementation_response(
         initial_text,
         human_requirements=(),
         delivered_risk_test_matrix=plan_context.risk_test_matrix_payload,
@@ -1411,7 +1384,7 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
         implementation_calls.append(1)
         return coder_response
 
-    real_handoff = orchestrator_module.post_issue_pr_handoff_comment
+    real_handoff = pr_loop.post_issue_pr_handoff_comment
 
     def recording_handoff(*args, **kwargs):
         result = real_handoff(*args, **kwargs)
@@ -1427,35 +1400,29 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
     def forbidden_repair(*_a, **_k):
         raise AssertionError("repair must not run for dropped execution_refs")
 
-    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", fake_validated_agent)
-    monkeypatch.setattr(orchestrator_module, "post_issue_pr_handoff_comment", recording_handoff)
-    monkeypatch.setattr(orchestrator_module, "run_agent_result", fake_correction)
-    monkeypatch.setattr(orchestrator_module, "attempt_repair", forbidden_repair)
-    monkeypatch.setattr(orchestrator_module, "execute_repair", forbidden_repair)
-    monkeypatch.setattr(
-        orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent", fake_validated_agent)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "post_issue_pr_handoff_comment", recording_handoff)
+    patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_correction)
+    monkeypatch.setattr(validated_agent_module, "attempt_repair", forbidden_repair)
+    monkeypatch.setattr(validated_agent_module, "execute_repair", forbidden_repair)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "validate_assigned_head_advanced", lambda **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "validate_assigned_head_advanced", lambda **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "run_pr_loop",
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop",
         lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "reconcile_test_observations",
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head="abc123",
@@ -1466,7 +1433,7 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
         ),
     )
 
-    result = orchestrator_module._implement_approved_issue(
+    result = issue_implementation._implement_approved_issue(
         runner,
         issue_number=56,
         approved_plan=approved_plan,
@@ -1474,7 +1441,7 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
         memory=None,
         issue_context=issue_context,
         coder_session_id=None,
-        usage_context=orchestrator_module._new_usage_context(config),
+        usage_context=validated_agent_module._new_usage_context(config),
         approved_plan_context=plan_context,
     )
 
@@ -1614,43 +1581,43 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
         assert kwargs["handoff"] == handoff
         return handoff
 
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_args, **_kwargs: intent)
-    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_args, **_kwargs: intent)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", authenticate)
     monkeypatch.setattr(
-        orchestrator_module,
+        issue_implementation,
         "publish_issue_created_authorization",
         lambda *_args, **kwargs: publication_calls.append(kwargs) or handoff,
     )
-    monkeypatch.setattr(orchestrator_module, "revalidate_issue_created_handoff", revalidate)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", revalidate)
     monkeypatch.setattr(
-        orchestrator_module,
+        pr_loop,
         "activate_managed_ci",
         lambda *_args, **_kwargs: ManagedCiContract(protocol_version=2, issue_created_pr=True),
     )
-    monkeypatch.setattr(orchestrator_module, "revalidate_adopted_managed_ci", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(orchestrator_module, "managed_label_present", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(pr_loop, "managed_label_present", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
-        orchestrator_module,
+        pr_loop,
         "publish_round_readiness",
         lambda *_args, **kwargs: readiness_heads.append(kwargs["head_sha"]),
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        pr_loop,
         "dispatch_final_qualification",
         lambda *_args, **kwargs: dispatches.append(kwargs),
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        pr_loop,
         "wait_for_final_qualification",
         lambda *_args, **_kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        pr_loop,
         "prepare_v2_merge",
         lambda *_args, **kwargs: prepared_heads.append(kwargs["expected_head_sha"]),
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        pr_loop_support,
         "merge_pr",
         lambda *_args, **kwargs: merged_heads.append(kwargs["expected_head_sha"]),
     )
@@ -1672,11 +1639,11 @@ def test_direct_issue_conflict_posts_once_and_stops_before_pr_handoff_gates(tmp_
     issue_context = _issue_context_with_blocked_requirement()
     gate_calls = []
 
-    monkeypatch.setattr(orchestrator_module, "validate_open_issue", lambda *args, **kwargs: None)
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", lambda *args, **kwargs: issue_context)
-    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
-    monkeypatch.setattr(orchestrator_module, "prepare_agent_memory", lambda *args, **kwargs: None)
-    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "validate_open_issue", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", lambda *args, **kwargs: issue_context)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
 
     def unexpected_gate(name):
         def _fail(*args, **kwargs):
@@ -1685,13 +1652,13 @@ def test_direct_issue_conflict_posts_once_and_stops_before_pr_handoff_gates(tmp_
 
         return _fail
 
-    for name in (
-        "validate_open_pr",
-        "get_pr_review_context",
-        "post_issue_pr_handoff_comment",
-        "run_pr_loop",
+    for name, owners in (
+        ("validate_open_pr", (response_validation, pr_loop, issue_implementation, issue_loop)),
+        ("get_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
+        ("post_issue_pr_handoff_comment", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
+        ("run_pr_loop", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
     ):
-        monkeypatch.setattr(orchestrator_module, name, unexpected_gate(name))
+        patch_attr_in(monkeypatch, owners, name, unexpected_gate(name))
 
     with pytest.raises(AgentLoopError, match="not accepted for handoff"):
         run_issue_loop(runner, issue_number=56, config=config)
@@ -1709,9 +1676,9 @@ def test_approved_plan_implementation_conflict_posts_once_and_stops_before_pr_ga
     issue_context = _issue_context_with_blocked_requirement()
     gate_calls = []
 
-    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
-    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *args, **kwargs: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *args, **kwargs: None)
 
     def unexpected_gate(name):
         def _fail(*args, **kwargs):
@@ -1720,16 +1687,16 @@ def test_approved_plan_implementation_conflict_posts_once_and_stops_before_pr_ga
 
         return _fail
 
-    for name in (
-        "validate_open_pr",
-        "get_pr_review_context",
-        "post_issue_pr_handoff_comment",
-        "run_pr_loop",
+    for name, owners in (
+        ("validate_open_pr", (response_validation, pr_loop, issue_implementation, issue_loop)),
+        ("get_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
+        ("post_issue_pr_handoff_comment", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
+        ("run_pr_loop", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
     ):
-        monkeypatch.setattr(orchestrator_module, name, unexpected_gate(name))
+        patch_attr_in(monkeypatch, owners, name, unexpected_gate(name))
 
     with pytest.raises(AgentLoopError, match="not accepted for handoff"):
-        orchestrator_module._implement_approved_issue(
+        issue_implementation._implement_approved_issue(
             runner,
             issue_number=56,
             approved_plan="Approved implementation plan.",
@@ -1737,7 +1704,7 @@ def test_approved_plan_implementation_conflict_posts_once_and_stops_before_pr_ga
             memory=None,
             issue_context=issue_context,
             coder_session_id=None,
-            usage_context=orchestrator_module._new_usage_context(config),
+            usage_context=validated_agent_module._new_usage_context(config),
         )
 
     assert gate_calls == []
@@ -1756,14 +1723,14 @@ def test_approved_plan_non_managed_rejects_forged_pr_body_before_handoff(
         pr_payload={"body": f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=forged"},
     )
     config = make_config(tmp_path)
-    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
 
     with pytest.raises(
         AgentLoopError, match="forged reserved protocol record syntax"
     ) as excinfo:
-        orchestrator_module._implement_approved_issue(
+        issue_implementation._implement_approved_issue(
             runner, issue_number=56, approved_plan="Approved implementation plan.",
             config=config, memory=None,
             issue_context=IssueContext(
@@ -1771,7 +1738,7 @@ def test_approved_plan_non_managed_rejects_forged_pr_body_before_handoff(
                 url="https://github.test/issues/56", comments=(), human_requirements=(),
             ),
             coder_session_id=None,
-            usage_context=orchestrator_module._new_usage_context(config),
+            usage_context=validated_agent_module._new_usage_context(config),
         )
 
     # The diagnostic names the surface that carried the span, not just the token.
@@ -1798,15 +1765,14 @@ def test_approved_plan_non_managed_allows_pr_body_naming_reserved_token(
         },
     )
     config = make_config(tmp_path)
-    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
     reviewed = []
-    monkeypatch.setattr(
-        orchestrator_module, "run_pr_loop", lambda *_a, **kwargs: reviewed.append(kwargs["pr_number"]) or 0
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop", lambda *_a, **kwargs: reviewed.append(kwargs["pr_number"]) or 0
     )
 
-    assert orchestrator_module._implement_approved_issue(
+    assert issue_implementation._implement_approved_issue(
         runner, issue_number=56, approved_plan="Approved implementation plan.",
         config=config, memory=None,
         issue_context=IssueContext(
@@ -1814,7 +1780,7 @@ def test_approved_plan_non_managed_allows_pr_body_naming_reserved_token(
             url="https://github.test/issues/56", comments=(), human_requirements=(),
         ),
         coder_session_id=None,
-        usage_context=orchestrator_module._new_usage_context(config),
+        usage_context=validated_agent_module._new_usage_context(config),
     ) == 0
 
     assert reviewed == [77]
@@ -1869,14 +1835,14 @@ def test_plan_first_issue_managed_draft_nonce_is_authenticated_before_pr_review(
         reviewed.append(kwargs)
         return 0
 
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_args, **_kwargs: intent)
-    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_args, **_kwargs: intent)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", authenticate)
     monkeypatch.setattr(
-        orchestrator_module,
+        issue_implementation,
         "publish_issue_created_authorization",
         lambda *_args, **_kwargs: handoff,
     )
-    monkeypatch.setattr(orchestrator_module, "run_pr_loop", review_entry)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop", review_entry)
 
     assert (
         run_issue_loop(
@@ -2191,7 +2157,7 @@ def test_exhausted_fresh_plan_validation_diagnostic_survives_resume(tmp_path):
         diagnostic="missing complete-scope audit operation",
         candidate_digest="a" * 64,
     )
-    orchestrator_module._persist_exhausted_plan_validation_diagnostic(
+    child_plan_binding._persist_exhausted_plan_validation_diagnostic(
         runner,
         config=config,
         issue_context=issue_context,
@@ -2220,7 +2186,7 @@ def test_exhausted_fresh_plan_validation_diagnostic_survives_resume(tmp_path):
             ),
         ),
     )
-    diagnostic = orchestrator_module._recover_current_plan_validation_diagnostic(
+    diagnostic = child_plan_binding._recover_current_plan_validation_diagnostic(
         runner,
         config=config,
         issue_context=resumed_context,
@@ -2253,7 +2219,7 @@ def test_validation_record_post_failure_preserves_original_error(tmp_path):
         candidate_digest="b" * 64,
     )
     with pytest.raises(AgentInvocationError) as raised:
-        orchestrator_module._persist_exhausted_plan_validation_diagnostic(
+        child_plan_binding._persist_exhausted_plan_validation_diagnostic(
             runner,
             config=config,
             issue_context=issue_context,
@@ -2282,9 +2248,7 @@ def test_exhausted_plan_validation_persists_from_the_planning_orchestration_path
     )
     runner = _PlanDiagnosticRunner(issue_number=56)
     runner.claude_outputs = [invalid_candidate]
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_run_structured_repair",
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair",
         lambda *args, **kwargs: (None, None, []),
     )
     config = make_config(tmp_path, agent_max_retries=0)
@@ -2375,9 +2339,7 @@ def test_invalid_terminal_plan_repair_replaces_persisted_candidate_provenance(
         log_path=None,
         fallback_planned=False,
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_run_structured_repair",
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair",
         lambda *args, **kwargs: (repair_candidate, None, [repair_attempt]),
     )
     runner = _PlanDiagnosticRunner(issue_number=56)
@@ -2426,9 +2388,7 @@ def test_terminal_plan_repair_provider_failure_does_not_persist_stale_diagnostic
         log_path=None,
         fallback_planned=False,
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_run_structured_repair",
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair",
         lambda *args, **kwargs: (None, None, [repair_attempt]),
     )
     runner = _PlanDiagnosticRunner(issue_number=56)
@@ -2502,9 +2462,7 @@ def test_terminal_transient_plan_repair_is_resumable_provider_failure(
         )
         for outcome in chain
     ]
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_run_structured_repair",
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair",
         lambda *args, **kwargs: (None, None, attempts),
     )
     runner = _PlanDiagnosticRunner(issue_number=56)
@@ -2534,10 +2492,10 @@ def test_repair_provider_failure_suggestion_matches_transient_reason_only():
         "(model-access validation errors)"
     )
     assert (
-        orchestrator_module._failure_suggestion("repair-provider-failure", reason, "Codex")
+        agent_failure._failure_suggestion("repair-provider-failure", reason, "Codex")
         == _TRANSIENT_REPAIR_SUGGESTION
     )
-    assert orchestrator_module._failure_suggestion(
+    assert agent_failure._failure_suggestion(
         "repair-provider-failure",
         "repair invocation failure: antigravity/model: nonzero_exit (boom)",
         "Codex",
@@ -3059,9 +3017,7 @@ def test_issue_loop_plan_first_fails_closed_when_requirements_change_after_appro
         human_requirements=(requirement_1, requirement_2),
     )
     contexts = iter((initial, refreshed))
-    monkeypatch.setattr(
-        orchestrator_module,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
         lambda *args, **kwargs: next(contexts),
     )
     plan_output = structured_plan_state(summary="Plan the compatibility fix.").replace(
@@ -3143,9 +3099,7 @@ def test_issue_loop_plan_first_fails_closed_when_a_requirement_is_withdrawn(
     contexts = iter(
         (_context(requirement_1, requirement_2), _context(requirement_1))
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
         lambda *args, **kwargs: next(contexts),
     )
     dispositions = [
@@ -3241,11 +3195,11 @@ def test_approved_plan_completion_recovery_carries_parent_and_child_requirements
         captured["policy"] = kwargs["completion_recovery"]
         raise _StopAfterCapture
 
-    monkeypatch.setattr(orchestrator_module, "_run_validated_agent", capture_policy)
+    patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent", capture_policy)
     config = make_config(tmp_path)
 
     with pytest.raises(_StopAfterCapture):
-        orchestrator_module._implement_approved_issue(
+        issue_implementation._implement_approved_issue(
             FakeRunner(),
             issue_number=56,
             approved_plan="Approved plan.\n\n### Scope\n- Preserve both APIs.",
@@ -3254,7 +3208,7 @@ def test_approved_plan_completion_recovery_carries_parent_and_child_requirements
             issue_context=issue_context,
             parent_issue_context=parent_context,
             coder_session_id=None,
-            usage_context=orchestrator_module._new_usage_context(config),
+            usage_context=validated_agent_module._new_usage_context(config),
         )
 
     policy = captured["policy"]
@@ -3425,7 +3379,7 @@ def test_is_incomplete_plan_review(state, blocking, same_plan, summary, expected
         items=PlanReviewItems(blocking=blocking, same_plan=same_plan, future=()),
         dispositions=(),
     )
-    assert orchestrator_module._is_incomplete_plan_review(parsed_review) is expected
+    assert review_rounds._is_incomplete_plan_review(parsed_review) is expected
 
 def test_is_incomplete_plan_review_matches_disposition_note():
     parsed_review = ParsedPlanReview(
@@ -3441,7 +3395,7 @@ def test_is_incomplete_plan_review_matches_disposition_note():
             ),
         ),
     )
-    assert orchestrator_module._is_incomplete_plan_review(parsed_review) is True
+    assert review_rounds._is_incomplete_plan_review(parsed_review) is True
 
 
 def test_is_incomplete_plan_review_allows_active_carried_disposition():
@@ -3459,7 +3413,7 @@ def test_is_incomplete_plan_review_allows_active_carried_disposition():
         ),
     )
 
-    assert orchestrator_module._is_incomplete_plan_review(parsed_review) is False
+    assert review_rounds._is_incomplete_plan_review(parsed_review) is False
 
 
 def test_issue_loop_plan_review_allows_active_carried_blocking_disposition(tmp_path):
@@ -3931,13 +3885,13 @@ def test_semantic_revision_inherits_signed_requirement_dispositions(tmp_path):
         f"- Requirement {requirement.requirement_id}: the authenticated disposition remains valid.\n"
         "<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
     )
-    validated_patch = orchestrator_module._validate_plan_revision_patch_response(
+    validated_patch = response_validation._validate_plan_revision_patch_response(
         direct_patch_text,
         human_requirements=(requirement,),
         inherited_human_requirement_dispositions=base.plan.human_requirement_dispositions,
     )
     assert validated_patch.operations[0].field == "summary"
-    assert orchestrator_module._current_plan_has_complete_human_requirement_dispositions(
+    assert response_validation._current_plan_has_complete_human_requirement_dispositions(
         direct_patch_text,
         surfaced_requirement_ids=(requirement.requirement_id,),
         inherited_dispositions=base.plan.human_requirement_dispositions,
@@ -4133,7 +4087,7 @@ def test_issue_loop_plan_revision_repair_preserves_signed_human_requirements(tmp
         captured_repairs.append((raw, expected_kind))
         return repaired_revision
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
     assert len(captured_repairs) == 1
@@ -4200,7 +4154,7 @@ def test_issue_loop_plan_revision_repair_rejects_wrong_kind_from_human_requireme
         captured_kinds.append(expected_kind)
         return wrong_kind_repair
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_attempt_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_attempt_repair):
         with pytest.raises(AgentLoopError, match="expected `plan_revision`"):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -4243,7 +4197,7 @@ def test_issue_loop_plan_revision_repair_without_human_ack_fails_clearly(tmp_pat
     )
     config = make_config(tmp_path, agent_max_retries=0)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired_without_ack):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired_without_ack):
         with pytest.raises(AgentLoopError, match="missing required signed human requirements marker"):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -4669,19 +4623,17 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
         ),
     )
     ledger_flags = []
-    real_ledger_check = orchestrator_module._round_ledger_may_be_incomplete
+    real_ledger_check = review_rounds._round_ledger_may_be_incomplete
 
     def ledger_spy(**kwargs):
         result = real_ledger_check(**kwargs)
         ledger_flags.append(result)
         return result
 
-    monkeypatch.setattr(orchestrator_module, "_round_ledger_may_be_incomplete", ledger_spy)
+    patch_attr_in(monkeypatch, (review_rounds, pr_loop, plan_first_loop_module), "_round_ledger_may_be_incomplete", ledger_spy)
     logged = []
-    real_log = orchestrator_module.log
-    monkeypatch.setattr(
-        orchestrator_module,
-        "log",
+    real_log = agent_failure.log
+    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "log",
         lambda config, message, *a, **k: (logged.append(message), real_log(config, message, *a, **k))[1],
     )
     runner = FakeRunner(
@@ -4699,7 +4651,7 @@ def test_issue_loop_plan_review_strips_resolved_history_disposition_under_incomp
     )
     config = make_config(tmp_path, coder="claude", reviewer=("codex",))
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair") as repair_mock:
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair") as repair_mock:
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
 
     repair_mock.assert_not_called()
@@ -4747,7 +4699,7 @@ def test_round_resolved_history_ids_available_when_plan_ledger_is_complete():
     )
     comments = [SimpleNamespace(body=raised), SimpleNamespace(body=resolved)]
 
-    assert orchestrator_module._round_resolved_history_item_ids(
+    assert review_rounds._round_resolved_history_item_ids(
         prior_unresolved_items=(),
         comments=comments,
         flow="plan",
@@ -4789,14 +4741,14 @@ def test_post_round_resolved_history_ids_cover_the_round_still_in_progress():
         "item-2": [ReviewItemDisposition("item-2", "OpenAI Codex", "resolved")],
     }
 
-    assert orchestrator_module._round_resolved_history_item_ids(
+    assert review_rounds._round_resolved_history_item_ids(
         prior_unresolved_items=(blocking,),
         comments=comments,
         flow="plan",
         reconciliation_mode="aggregate",
         same_status="same-plan",
     ) == ()
-    assert orchestrator_module._post_round_resolved_history_item_ids(
+    assert review_rounds._post_round_resolved_history_item_ids(
         prior_unresolved_items=(blocking, cleared),
         dispositions_by_item=dispositions,
         carried_items=(blocking,),
@@ -4830,7 +4782,7 @@ def test_post_round_resolved_history_ids_exclude_actively_disputed_and_carried_i
         ],
     }
 
-    assert orchestrator_module._post_round_resolved_history_item_ids(
+    assert review_rounds._post_round_resolved_history_item_ids(
         prior_unresolved_items=(carried, mixed, untouched),
         dispositions_by_item=dispositions,
         # item-1 survived reconciliation, so it is still carried.
@@ -4852,7 +4804,7 @@ def test_issue_loop_plan_revision_proof_covers_items_resolved_in_the_same_round(
     revision_history_ids = []
     revision_snapshot_sizes = []
     snapshots = []
-    real_run_validated_agent = orchestrator_module._run_validated_agent
+    real_run_validated_agent = validated_agent_module._run_validated_agent
 
     def run_validated_agent_spy(*args, **kwargs):
         if kwargs.get("operation_description") == "plan revision":
@@ -4864,18 +4816,16 @@ def test_issue_loop_plan_revision_proof_covers_items_resolved_in_the_same_round(
             )
         return real_run_validated_agent(*args, **kwargs)
 
-    monkeypatch.setattr(
-        orchestrator_module, "_run_validated_agent", run_validated_agent_spy
+    patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent", run_validated_agent_spy
     )
-    real_get_issue_context = orchestrator_module.get_issue_context
+    real_get_issue_context = discuss_loop.get_issue_context
 
     def get_issue_context_spy(*args, **kwargs):
         context = real_get_issue_context(*args, **kwargs)
         snapshots.append(context)
         return context
 
-    monkeypatch.setattr(
-        orchestrator_module, "get_issue_context", get_issue_context_spy
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", get_issue_context_spy
     )
     runner = FakeRunner(
         claude_outputs=[
@@ -6032,7 +5982,7 @@ def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path,
         assert config.repo == "OWNER/REPO"
         return child if issue_number == 56 else parent
 
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", issue_context_for)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", issue_context_for)
     runner = _FakeRunner(
         pr_payload={
             "number": 77,
@@ -6798,11 +6748,9 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
         protection_mode="voluntary", audit_nonce="opening-nonce",
     )
     handoff = _managed_issue_handoff(nonce="opening-nonce")
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent
     )
-    monkeypatch.setattr(
-        orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
     )
 
     with pytest.raises(AgentLoopError, match="authorization checkpoint.*persisted"):
@@ -6888,15 +6836,13 @@ def test_approved_plan_invalid_post_pr_observation_keeps_authorization_resumable
         audit_nonce="opening-nonce",
     )
     handoff = _managed_issue_handoff(nonce="opening-nonce")
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent
     )
-    monkeypatch.setattr(
-        orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
     )
 
     with pytest.raises(AgentLoopError) as exc_info:
-        orchestrator_module._implement_approved_issue(
+        issue_implementation._implement_approved_issue(
             runner,
             issue_number=56,
             approved_plan="Plan:\n- Preserve managed recovery.",
@@ -6904,7 +6850,7 @@ def test_approved_plan_invalid_post_pr_observation_keeps_authorization_resumable
             memory=None,
             issue_context=issue_context,
             coder_session_id=None,
-            usage_context=orchestrator_module._new_usage_context(config),
+            usage_context=validated_agent_module._new_usage_context(config),
         )
 
     message = str(exc_info.value)
@@ -7102,19 +7048,17 @@ class _RealManagedActivationReached(Exception):
 
 
 def _stop_issue_resume_after_real_activation(monkeypatch):
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_freeze_prompt_architecture",
+    patch_attr_in(monkeypatch, (architecture_contract, pr_loop, issue_implementation, issue_loop), "_freeze_prompt_architecture",
         lambda _runner, config, **_kwargs: config,
     )
-    real_activate_managed_ci = orchestrator_module.activate_managed_ci
+    real_activate_managed_ci = pr_loop.activate_managed_ci
 
     def activate_then_stop(*args, **kwargs):
         result = real_activate_managed_ci(*args, **kwargs)
         raise _RealManagedActivationReached(result)
 
     monkeypatch.setattr(
-        orchestrator_module,
+        pr_loop,
         "activate_managed_ci",
         activate_then_stop,
     )
@@ -7125,12 +7069,10 @@ class _RealManagedReviewReached(Exception):
 
 
 def _stop_issue_resume_after_reviewer(monkeypatch):
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_freeze_prompt_architecture",
+    patch_attr_in(monkeypatch, (architecture_contract, pr_loop, issue_implementation, issue_loop), "_freeze_prompt_architecture",
         lambda _runner, config, **_kwargs: config,
     )
-    real_post_pr_comment = orchestrator_module.post_pr_comment
+    real_post_pr_comment = pr_loop_support.post_pr_comment
 
     def post_and_stop(*args, **kwargs):
         result = real_post_pr_comment(*args, **kwargs)
@@ -7138,7 +7080,7 @@ def _stop_issue_resume_after_reviewer(monkeypatch):
             raise _RealManagedReviewReached
         return result
 
-    monkeypatch.setattr(orchestrator_module, "post_pr_comment", post_and_stop)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_loop), "post_pr_comment", post_and_stop)
 
 
 def test_managed_issue_resume_reviews_same_head_after_post_pr_report_rejection(
@@ -7165,11 +7107,9 @@ def test_managed_issue_resume_reviews_same_head_after_post_pr_report_rejection(
         protection_mode="voluntary", audit_nonce="opening-nonce",
     )
     handoff = _managed_issue_handoff(nonce="opening-nonce")
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent
     )
-    monkeypatch.setattr(
-        orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
     )
 
     with pytest.raises(AgentLoopError, match="authorization checkpoint.*persisted"):
@@ -7225,11 +7165,9 @@ def test_invalid_post_pr_report_then_issue_resume_runs_real_activation_without_r
         protection_mode="voluntary", audit_nonce="opening-nonce",
     )
     handoff = _managed_issue_handoff(nonce="opening-nonce")
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent
     )
-    monkeypatch.setattr(
-        orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", lambda *_a, **_k: handoff
     )
 
     with pytest.raises(AgentLoopError, match="authorization checkpoint.*persisted"):
@@ -7307,12 +7245,9 @@ def test_pre_pr_number_response_rejection_then_fresh_issue_recovery_uses_real_ac
         branch="agent-loop/managed-56", trusted_actor="agent-loop",
         protection_mode="voluntary", audit_nonce="opening-nonce",
     )
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_run_structured_repair",
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair",
         lambda *_a, **_k: (None, None, ()),
     )
 
@@ -7412,12 +7347,9 @@ def test_strict_pre_pr_number_rejection_directs_ordinary_discovery_without_reimp
         trusted_actor="agent-loop",
         protection_mode="strict",
     )
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_run_structured_repair",
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair",
         lambda *_a, **_k: (None, None, ()),
     )
 
@@ -7485,12 +7417,9 @@ def test_pre_pr_number_rejection_guidance_follows_the_state_specific_waiver(
         trusted_actor="agent-loop",
         protection_mode=protection_mode,
     )
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "_run_structured_repair",
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair",
         lambda *_a, **_k: (None, None, ()),
     )
 
@@ -7707,7 +7636,7 @@ def test_managed_pr_recovery_keeps_closing_reference_gate_without_pr_contract(
     )
 
     with pytest.raises(AgentLoopError, match="outside the expected contract"):
-        orchestrator_module.run_pr_loop(
+        pr_loop.run_pr_loop(
             runner,
             pr_number=77,
             config=config,
@@ -7739,14 +7668,14 @@ def test_managed_issue_authorization_publication_failure_prints_fresh_recovery(
         ),
     )
     monkeypatch.setattr(
-        orchestrator_module, "publish_issue_created_authorization",
+        issue_implementation, "publish_issue_created_authorization",
         lambda *_a, **_k: (_ for _ in ()).throw(AgentLoopError("comment returned no ID")),
     )
     with pytest.raises(AgentLoopError) as exc_info:
-        orchestrator_module._publish_issue_authorization_with_recovery(
+        issue_implementation._publish_issue_authorization_with_recovery(
             FakeRunner(), config=config,
             handoff=_managed_issue_handoff(nonce="nonce"),
-            metadata=orchestrator_module.PullRequestMetadata(
+            metadata=architecture_contract.PullRequestMetadata(
                 number=77, repo="OWNER/REPO", title="PR",
                 head_branch="agent-loop/managed-56", base_branch="main",
                 head_sha="abc123", url="https://github.test/pull/77",
@@ -7778,8 +7707,8 @@ def test_managed_issue_publication_malformed_response_stops_before_handoff_or_re
         protection_mode="voluntary", audit_nonce="opening-nonce",
     )
     handoff = _managed_issue_handoff(nonce="opening-nonce")
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
-    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", lambda *_a, **_k: handoff)
 
     with pytest.raises(AgentLoopError, match="publication was interrupted"):
         run_issue_loop(runner, issue_number=56, config=config)
@@ -7951,11 +7880,11 @@ def test_degrade_out_of_checkout_tests_keeps_baseline_out_of_evidence(tmp_path):
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
 
-    degraded = orchestrator_module._degrade_out_of_checkout_tests(parsed, config=config)
+    degraded = response_validation._degrade_out_of_checkout_tests(parsed, config=config)
 
     assert degraded.tests_run == ("python3 -m pytest tests/test_api.py -q",)
     assert degraded.out_of_checkout_tests_run == (baseline,)
-    assert orchestrator_module._degrade_out_of_checkout_tests(degraded, config=config) is degraded
+    assert response_validation._degrade_out_of_checkout_tests(degraded, config=config) is degraded
 
 
 def test_issue_loop_live_target_after_reported_pr_mentions_confirmed_resume(tmp_path):
@@ -8191,7 +8120,7 @@ def test_failed_issue_implementation_salvage_oserror_preserves_original_failure(
     def fail_capture(*args, **kwargs):
         raise OSError("simulated disk full")
 
-    monkeypatch.setattr(orchestrator_module, "capture_salvage_artifacts", fail_capture)
+    monkeypatch.setattr(agent_failure, "capture_salvage_artifacts", fail_capture)
 
     with pytest.raises(QuotaResetExceededError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config)
@@ -8603,9 +8532,9 @@ def test_approved_plan_implementation_rerun_discovers_remote_salvage_with_matchi
     )
     config = make_config(tmp_path)
     issue_context = get_issue_context(runner, config=config, issue_number=56)
-    usage_context = orchestrator_module._new_usage_context(config)
+    usage_context = validated_agent_module._new_usage_context(config)
 
-    result = orchestrator_module._implement_approved_issue(
+    result = issue_implementation._implement_approved_issue(
         runner,
         issue_number=56,
         approved_plan=approved_plan,
@@ -8638,7 +8567,7 @@ def test_approved_plan_no_pr_terminal_result_bypasses_human_requirements_and_pr_
     issue_context = get_issue_context(runner, config=config, issue_number=56)
 
     with pytest.raises(AgentLoopError, match=f"implementation is {expected_state}"):
-        orchestrator_module._implement_approved_issue(
+        issue_implementation._implement_approved_issue(
             runner,
             issue_number=56,
             approved_plan="Plan:\n- Do the thing.",
@@ -8646,7 +8575,7 @@ def test_approved_plan_no_pr_terminal_result_bypasses_human_requirements_and_pr_
             memory=None,
             issue_context=issue_context,
             coder_session_id=None,
-            usage_context=orchestrator_module._new_usage_context(config),
+            usage_context=validated_agent_module._new_usage_context(config),
         )
 
     assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _cwd in runner.commands)
@@ -8682,9 +8611,9 @@ def test_approved_plan_implementation_rerun_ignores_remote_salvage_on_plan_hash_
     )
     config = make_config(tmp_path)
     issue_context = get_issue_context(runner, config=config, issue_number=56)
-    usage_context = orchestrator_module._new_usage_context(config)
+    usage_context = validated_agent_module._new_usage_context(config)
 
-    result = orchestrator_module._implement_approved_issue(
+    result = issue_implementation._implement_approved_issue(
         runner,
         issue_number=56,
         approved_plan=approved_plan,
@@ -8711,10 +8640,10 @@ def test_task_and_pr_followup_salvage_scopes_post_no_github_comment(tmp_path):
     runner._mark_agent_command_seen()
 
     for scope in (
-        orchestrator_module.TASK_IMPLEMENTATION_SALVAGE_SCOPE,
-        orchestrator_module.PR_FOLLOWUP_SALVAGE_SCOPE,
+        agent_failure.TASK_IMPLEMENTATION_SALVAGE_SCOPE,
+        agent_failure.PR_FOLLOWUP_SALVAGE_SCOPE,
     ):
-        diagnostic = orchestrator_module._capture_failed_run_salvage_diagnostic(
+        diagnostic = agent_failure._capture_failed_run_salvage_diagnostic(
             runner=runner,
             config=config,
             agent_name="claude",
@@ -8907,14 +8836,14 @@ def test_plan_round_metadata_failure_raises_diagnosed_error(tmp_path, monkeypatc
         claude_outputs=[structured_v1_plan_state()],
         codex_outputs=[structured_plan_review(state="approved")],
     )
-    real_metadata = orchestrator_module.PostedRoundMetadata
+    real_metadata = panel_evidence.PostedRoundMetadata
 
     def _exploding(**kwargs):
         if kwargs.get("flow") == "plan" and kwargs.get("role") == "coder":
             raise ValueError("semantic patch metadata is incomplete")
         return real_metadata(**kwargs)
 
-    monkeypatch.setattr(orchestrator_module, "PostedRoundMetadata", _exploding)
+    patch_attr_in(monkeypatch, (panel_evidence, discuss_loop, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "PostedRoundMetadata", _exploding)
 
     with pytest.raises(AgentLoopError) as error:
         run_issue_loop(
@@ -8956,7 +8885,7 @@ def test_narration_only_plan_reviewer_is_unavailable_and_posts_no_verdict(tmp_pa
         return _fabricated_plan_review()
 
     config = make_config(tmp_path, agent_max_retries=1, agent_retry_backoff_seconds=0)
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         with pytest.raises(AgentLoopError, match="review_substance_integrity") as excinfo:
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
@@ -8980,7 +8909,7 @@ def test_empty_plan_reviewer_response_never_reaches_repair(tmp_path):
 
     config = make_config(tmp_path, agent_max_retries=0, agent_retry_backoff_seconds=0)
     with patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair",
+        "coding_review_agent_loop.validated_agent.attempt_repair",
         lambda raw, gemini_cmd, **kwargs: repair_calls.append(raw) or _fabricated_plan_review(),
     ):
         with pytest.raises(AgentLoopError):
@@ -9000,7 +8929,7 @@ def test_refused_plan_reviewer_leaves_nothing_for_a_resume_to_replay(tmp_path):
             codex_outputs=[_NARRATION_ONLY_PLAN_REVIEW] * 4,
         )
         with patch(
-            "coding_review_agent_loop.orchestrator.attempt_repair",
+            "coding_review_agent_loop.validated_agent.attempt_repair",
             lambda raw, gemini_cmd, **kwargs: _fabricated_plan_review(),
         ):
             with pytest.raises(AgentLoopError):
@@ -9072,7 +9001,7 @@ def _staged_plan_history(
     config = _staged_plan_config(tmp_path)
     structured = validate_structured_plan_state(structured_v1_plan_state())
     canonical = render_canonical_plan_state(structured, config)
-    sidecar = orchestrator_module.make_assembled_plan_sidecar(
+    sidecar = plan_first_loop_module.make_assembled_plan_sidecar(
         structured, round_number=1, response_form="fresh-plan-state", rendered_plan=canonical
     )
     subject = _plan_subject(canonical)
@@ -9110,10 +9039,10 @@ def _staged_plan_history(
         }
     ]
     if scheduler_record:
-        contract = orchestrator_module.make_plan_contract(
+        contract = panel_evidence.make_plan_contract(
             ("Codex", "Gemini"), "primary-then-panel", "Codex"
         )
-        key = orchestrator_module._plan_candidate_key_for(
+        key = panel_evidence._plan_candidate_key_for(
             plan_subject=subject, sidecar=sidecar, surfaced_requirement_ids=()
         )
         comments.append(
@@ -9288,8 +9217,8 @@ def _completed_staged_plan_comments(tmp_path):
 def test_managed_ci_plan_approval_accepts_staged_approvals_across_rounds(tmp_path):
     """#962: the primary approves in round 1 and the panel in round 2."""
     config, comments = _completed_staged_plan_comments(tmp_path)
-    plan_text, plan_round = orchestrator_module._resume_plan_round(
-        comments, configured_reviewers=orchestrator_module.reviewers(config)
+    plan_text, plan_round = pr_loop_support._resume_plan_round(
+        comments, configured_reviewers=panel_evidence.reviewers(config)
     )
     # The resumed round alone holds only the panel's approval.
     assert {
@@ -9298,7 +9227,7 @@ def test_managed_ci_plan_approval_accepts_staged_approvals_across_rounds(tmp_pat
         if record.metadata.state == "approved"
     } == {"Gemini"}
 
-    orchestrator_module._require_complete_canonical_plan_approval(
+    panel_evidence._require_complete_canonical_plan_approval(
         comments,
         config=config,
         plan_text=plan_text,
@@ -9327,12 +9256,12 @@ def test_managed_ci_plan_approval_rejects_superseded_staged_approval(tmp_path):
                 )
     assert len(revoked) == 1
     comments = [*comments, *revoked]
-    plan_text, plan_round = orchestrator_module._resume_plan_round(
-        comments, configured_reviewers=orchestrator_module.reviewers(config)
+    plan_text, plan_round = pr_loop_support._resume_plan_round(
+        comments, configured_reviewers=panel_evidence.reviewers(config)
     )
 
     with pytest.raises(AgentLoopError, match="incomplete"):
-        orchestrator_module._require_complete_canonical_plan_approval(
+        panel_evidence._require_complete_canonical_plan_approval(
             comments,
             config=config,
             plan_text=plan_text,
@@ -9356,8 +9285,8 @@ def test_managed_ci_plan_approval_staged_full_board_round_requires_exact_key(tmp
     config = _staged_plan_config(tmp_path, plan_review_force_full=True)
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     comments = [SimpleNamespace(body=comment["body"]) for comment in runner.issue_comments]
-    plan_text, plan_round = orchestrator_module._resume_plan_round(
-        comments, configured_reviewers=orchestrator_module.reviewers(config)
+    plan_text, plan_round = pr_loop_support._resume_plan_round(
+        comments, configured_reviewers=panel_evidence.reviewers(config)
     )
     # The operator force-full run put the whole board in one round.
     assert {
@@ -9366,7 +9295,7 @@ def test_managed_ci_plan_approval_staged_full_board_round_requires_exact_key(tmp
         if record.metadata.state == "approved"
     } == {"Codex", "Gemini"}
 
-    orchestrator_module._require_complete_canonical_plan_approval(
+    panel_evidence._require_complete_canonical_plan_approval(
         comments,
         config=config,
         plan_text=plan_text,
@@ -9382,7 +9311,7 @@ def test_managed_ci_plan_approval_staged_full_board_round_requires_exact_key(tmp
         body="Keep the public API unchanged.",
     )
     with pytest.raises(AgentLoopError, match="incomplete"):
-        orchestrator_module._require_complete_canonical_plan_approval(
+        panel_evidence._require_complete_canonical_plan_approval(
             comments,
             config=config,
             plan_text=plan_text,
@@ -9393,11 +9322,11 @@ def test_managed_ci_plan_approval_staged_full_board_round_requires_exact_key(tmp
 
 
 def _assert_managed_ci_plan_recovery_fails_closed(config, comments):
-    plan_text, plan_round = orchestrator_module._resume_plan_round(
-        comments, configured_reviewers=orchestrator_module.reviewers(config)
+    plan_text, plan_round = pr_loop_support._resume_plan_round(
+        comments, configured_reviewers=panel_evidence.reviewers(config)
     )
     with pytest.raises(AgentLoopError, match="incomplete"):
-        orchestrator_module._require_complete_canonical_plan_approval(
+        panel_evidence._require_complete_canonical_plan_approval(
             comments,
             config=config,
             plan_text=plan_text,
@@ -9419,7 +9348,7 @@ def test_managed_ci_plan_approval_rejects_post_approval_contradictory_key(tmp_pa
         if metadata.flow == "plan" and metadata.scheduler_metadata_status == "valid":
             latest_checkpoint = metadata
     assert latest_checkpoint is not None
-    stored_key = orchestrator_module._plan_key_from_payload(
+    stored_key = panel_evidence._plan_key_from_payload(
         latest_checkpoint.plan_candidate_key
     )
     contradictory = replace(stored_key, aggregate_plan_identity="f" * 64)
@@ -9440,8 +9369,8 @@ def test_managed_ci_plan_approval_rejects_post_approval_contradictory_key(tmp_pa
 def test_managed_ci_plan_approval_rejects_post_boundary_invalid_checkpoint(tmp_path):
     """An invalid checkpoint after the recovery boundary degrades the history."""
     config, comments = _completed_staged_plan_comments(tmp_path)
-    plan_text, _plan_round = orchestrator_module._resume_plan_round(
-        comments, configured_reviewers=orchestrator_module.reviewers(config)
+    plan_text, _plan_round = pr_loop_support._resume_plan_round(
+        comments, configured_reviewers=panel_evidence.reviewers(config)
     )
     invalid = _invalid_plan_scheduler_comment(_plan_subject(plan_text))
     comments = [*comments, SimpleNamespace(body=invalid["body"])]
@@ -9453,12 +9382,12 @@ def test_managed_ci_plan_approval_all_reviewers_still_requires_one_round(tmp_pat
     """The compatibility policy keeps requiring the full set in one round."""
     _config, comments = _completed_staged_plan_comments(tmp_path)
     config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=6)
-    plan_text, plan_round = orchestrator_module._resume_plan_round(
-        comments, configured_reviewers=orchestrator_module.reviewers(config)
+    plan_text, plan_round = pr_loop_support._resume_plan_round(
+        comments, configured_reviewers=panel_evidence.reviewers(config)
     )
 
     with pytest.raises(AgentLoopError, match="incomplete"):
-        orchestrator_module._require_complete_canonical_plan_approval(
+        panel_evidence._require_complete_canonical_plan_approval(
             comments,
             config=config,
             plan_text=plan_text,
@@ -9537,7 +9466,7 @@ def test_staged_planning_withdrawn_requirement_blocks_carried_approvals(
             )
         ],
     )
-    real_get_issue_context = orchestrator_module.get_issue_context
+    real_get_issue_context = discuss_loop.get_issue_context
 
     def _patched(runner_arg, *, config, issue_number):
         context = real_get_issue_context(
@@ -9551,7 +9480,7 @@ def test_staged_planning_withdrawn_requirement_blocks_carried_approvals(
         )
         return replace(context, human_requirements=requirements)
 
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
 
     with pytest.raises(
         AgentLoopError,
@@ -9637,7 +9566,7 @@ def test_staged_planning_persists_a_repaired_primary_acknowledgement(tmp_path, m
         codex_outputs=[unacknowledged],
         gemini_outputs=[panel],
     )
-    real_get_issue_context = orchestrator_module.get_issue_context
+    real_get_issue_context = discuss_loop.get_issue_context
 
     def _patched(runner_arg, *, config, issue_number):
         context = real_get_issue_context(
@@ -9645,10 +9574,10 @@ def test_staged_planning_persists_a_repaired_primary_acknowledgement(tmp_path, m
         )
         return replace(context, human_requirements=(requirement,))
 
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
 
     with patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired
+        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired
     ):
         assert run_issue_loop(
             runner,
@@ -9699,7 +9628,7 @@ def test_staged_planning_resume_reads_the_repaired_primary_acknowledgement(
         codex_outputs=[unacknowledged],
         gemini_outputs=[panel],
     )
-    real_get_issue_context = orchestrator_module.get_issue_context
+    real_get_issue_context = discuss_loop.get_issue_context
 
     def _patched(runner_arg, *, config, issue_number):
         context = real_get_issue_context(
@@ -9707,9 +9636,9 @@ def test_staged_planning_resume_reads_the_repaired_primary_acknowledgement(
         )
         return replace(context, human_requirements=(requirement,))
 
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
     config = _staged_plan_config(tmp_path)
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def interrupt_after_the_advance(*args, **kwargs):
         result = real_post(*args, **kwargs)
@@ -9718,11 +9647,9 @@ def test_staged_planning_resume_reads_the_repaired_primary_acknowledgement(
         return result
 
     with patch(
-        "coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired
+        "coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired
     ):
-        with patch.object(
-            orchestrator_module,
-            "post_issue_comment",
+        with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment",
             side_effect=interrupt_after_the_advance,
         ):
             with pytest.raises(KeyboardInterrupt):
@@ -9792,19 +9719,19 @@ def _named_repaired_acknowledgement_run_1363(tmp_path, monkeypatch, *, interrupt
             review("opus (Google Antigravity: Model C)", resolved=True),
         ],
     )
-    real_get_issue_context = orchestrator_module.get_issue_context
+    real_get_issue_context = discuss_loop.get_issue_context
 
     def _patched(runner_arg, *, config, issue_number):
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=(requirement,))
 
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
     config = make_config(
         tmp_path, reviewer=(flash, opus), reviewer_seats=(flash, opus),
         plan_review_policy="primary-then-panel", primary_plan_reviewer=flash,
         review_parallel=True, agent_max_retries=0, max_rounds=6,
     )
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
     state = {"interrupted": False}
 
     def interrupt_before_the_repost(*args, **kwargs):
@@ -9818,9 +9745,8 @@ def _named_repaired_acknowledgement_run_1363(tmp_path, monkeypatch, *, interrupt
             raise KeyboardInterrupt
         return real_post(*args, **kwargs)
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
-        with patch.object(
-            orchestrator_module, "post_issue_comment", side_effect=interrupt_before_the_repost,
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
+        with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", side_effect=interrupt_before_the_repost,
         ):
             if interrupt_repost:
                 with pytest.raises(KeyboardInterrupt):
@@ -9913,7 +9839,7 @@ def test_staged_planning_stops_on_premature_secondary_plan_review(tmp_path):
     )
     runner = _FakeRunner(issue_comments=comments)
 
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         run_issue_loop(
             runner, issue_number=56, config=_staged_plan_config(tmp_path), plan_first=True
         )
@@ -10040,14 +9966,14 @@ def test_staged_planning_stops_when_planning_history_cannot_be_extracted(tmp_pat
     )
     runner = _FakeRunner()
 
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
-        orchestrator_module._run_plan_first_loop(
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
+        plan_first_loop_module._run_plan_first_loop(
             runner,
             issue_number=56,
             config=config,
             memory=None,
             issue_context=issue_context,
-            usage_context=orchestrator_module._new_usage_context(config),
+            usage_context=validated_agent_module._new_usage_context(config),
         )
 
     message = str(excinfo.value)
@@ -10070,7 +9996,7 @@ def test_staged_planning_panel_blocker_routes_to_owner_plus_primary(tmp_path):
     the scheduler falls through to a final sweep instead of remediation.
     """
     fresh = structured_v1_plan_state()
-    base = orchestrator_module.AuthenticatedPlanState.from_plan(
+    base = plan_first_loop_module.AuthenticatedPlanState.from_plan(
         validate_structured_plan_state(fresh), round_number=1
     )
     patch = {
@@ -10172,7 +10098,7 @@ def test_staged_planning_panel_blocker_routes_to_owner_plus_primary(tmp_path):
 def _remediation_plan_fixtures():
     """A fresh generation-1 plan plus a narrow plan-step remediation patch."""
     fresh = structured_v1_plan_state()
-    base = orchestrator_module.AuthenticatedPlanState.from_plan(
+    base = plan_first_loop_module.AuthenticatedPlanState.from_plan(
         validate_structured_plan_state(fresh), round_number=1
     )
     patch = {
@@ -10297,7 +10223,7 @@ def test_staged_planning_resumed_remediation_stays_owner_scoped(tmp_path):
     config = _staged_plan_config(
         tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
     )
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
     audits = {"count": 0}
 
     def interrupt_before_remediation_checkpoint(*args, **kwargs):
@@ -10310,9 +10236,7 @@ def test_staged_planning_resumed_remediation_stays_owner_scoped(tmp_path):
                 raise KeyboardInterrupt
         return real_post(*args, **kwargs)
 
-    with patch.object(
-        orchestrator_module,
-        "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment",
         side_effect=interrupt_before_remediation_checkpoint,
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -10393,7 +10317,7 @@ def test_staged_planning_resume_on_the_phase_advance_seam_keeps_the_sweep_narrow
     config = _staged_plan_config(
         tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
     )
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def interrupt_after_the_sweep_advance(*args, **kwargs):
         # Post the advance first: the seam under test is a restart with that
@@ -10403,9 +10327,7 @@ def test_staged_planning_resume_on_the_phase_advance_seam_keeps_the_sweep_narrow
             raise KeyboardInterrupt
         return result
 
-    with patch.object(
-        orchestrator_module,
-        "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment",
         side_effect=interrupt_after_the_sweep_advance,
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -10618,7 +10540,7 @@ def test_operator_opening_requires_a_complete_candidate_key(tmp_path):
                 round_number=1,
                 subject="a" * 64,
                 phase="scheduler-prelaunch",
-                scheduler_contract=orchestrator_module.make_plan_contract(
+                scheduler_contract=panel_evidence.make_plan_contract(
                     ("Codex", "Gemini"), "primary-then-panel", "Codex"
                 ).as_dict(),
                 scheduler_obligation_digest="0" * 16,
@@ -10635,12 +10557,12 @@ def test_operator_opening_requires_a_complete_candidate_key(tmp_path):
             ),
         )
 
-    partial_evidence = orchestrator_module._derive_plan_panel_evidence(
+    partial_evidence = panel_evidence._derive_plan_panel_evidence(
         (_force_full_record(1, partial),),
         primary_reviewer="Codex",
         required_reviewers=("Codex", "Gemini"),
     )
-    complete_evidence = orchestrator_module._derive_plan_panel_evidence(
+    complete_evidence = panel_evidence._derive_plan_panel_evidence(
         (_force_full_record(1, complete),),
         primary_reviewer="Codex",
         required_reviewers=("Codex", "Gemini"),
@@ -10723,8 +10645,7 @@ def _dispatch_staged(runner, tmp_path, outcome, handoffs, monkeypatch, **overrid
         number=55, repo="OWNER/REPO", title="Parent", body="Parent",
         url="https://github.com/OWNER/REPO/issues/55", comments=(),
     )
-    monkeypatch.setattr(
-        orchestrator_module, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: parent,
     )
     kwargs = dict(
@@ -10735,7 +10656,7 @@ def _dispatch_staged(runner, tmp_path, outcome, handoffs, monkeypatch, **overrid
         issue_context=parent, mode="implement-by-phase", coder_session_id=None,
     )
     kwargs.update(overrides)
-    return orchestrator_module._dispatch_current_decomposition_phase(runner, **kwargs)
+    return plan_first_loop_module._dispatch_current_decomposition_phase(runner, **kwargs)
 
 
 def test_staged_terminal_report_names_required_parent_obligations(tmp_path, monkeypatch, capsys):
@@ -10758,8 +10679,7 @@ def test_staged_terminal_report_names_required_parent_obligations(tmp_path, monk
     runner = _merged_child_runner(
         {99: "closed", 100: "closed"}, pr_states={99: 912, 100: 913}
     )
-    monkeypatch.setattr(
-        orchestrator_module, "_dispatch_decomposition_child",
+    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child",
         lambda *_a, **_k: pytest.fail("a delivered topology must not dispatch a child"),
     )
 
@@ -10807,8 +10727,7 @@ def test_staged_pending_human_stage_stops_then_advances_when_closed(tmp_path, mo
     created = _staged_created(("agent-pr", "human-action", "agent-pr"))
     outcome = _staged_outcome(created)
     handoffs = (_staged_handoff(1, 99),)
-    monkeypatch.setattr(
-        orchestrator_module, "_dispatch_decomposition_child",
+    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child",
         lambda *_a, **_k: pytest.fail("a human-owned stage must not dispatch an agent"),
     )
     pending = _merged_child_runner({99: "closed", 100: "open"}, pr_states={99: 912})
@@ -10821,8 +10740,7 @@ def test_staged_pending_human_stage_stops_then_advances_when_closed(tmp_path, mo
     )
 
     dispatched = []
-    monkeypatch.setattr(
-        orchestrator_module, "_dispatch_decomposition_child",
+    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child",
         lambda *_a, **kwargs: dispatched.append(kwargs) or 0,
     )
     advanced = _merged_child_runner(
@@ -10938,8 +10856,8 @@ def _deg_task_text(impact, outcome="opened_pr"):
 
 def _deg_issue_validators():
     """The opt-in degradable validate and its strict re-parse, as call sites build them."""
-    return orchestrator_module._architecture_mode_validators(
-        lambda mode: lambda text: orchestrator_module._validate_issue_implementation_response(
+    return architecture_contract._architecture_mode_validators(
+        lambda mode: lambda text: response_validation._validate_issue_implementation_response(
             text, human_requirements=(), require_architecture_impact=True,
             architecture_status_mode=mode,
         )
@@ -10957,7 +10875,7 @@ def test_seam_refuses_and_retains_an_unsatisfied_response(tmp_path, impact, reco
     config = make_config(tmp_path, agent_max_retries=0)
 
     with pytest.raises(_DegInvocationError) as error:
-        orchestrator_module._run_validated_agent(
+        validated_agent_module._run_validated_agent(
             runner, agent="claude", config=config, prompt="Implement.",
             marker_description="structured issue_implementation result",
             **_deg_issue_validators(),
@@ -10978,7 +10896,7 @@ def test_seam_refuses_and_retains_an_unsatisfied_response(tmp_path, impact, reco
 def test_seam_accepts_a_corroborated_near_miss_with_its_record(tmp_path):
     text = _deg_with(structured_issue_implementation(), _DEG_CORROBORATED)
     runner = _FakeRunner(claude_outputs=[text])
-    response = orchestrator_module._run_validated_agent(
+    response = validated_agent_module._run_validated_agent(
         runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
         prompt="Implement.", marker_description="structured issue_implementation result",
         **_deg_issue_validators(), require_architecture_impact_contract=True,
@@ -11007,30 +10925,30 @@ def test_unsatisfied_conflict_payload_is_not_hidden_by_the_conflict_wrapper():
     # unsatisfied one returns the parsed payload for the seam to refuse.
     result = validate_structured_issue_implementation(text, required_architecture_impact_contract=1)
     assert result.pr_number == 77
-    assert orchestrator_module.architecture_impact_contract_unsatisfied(result)
+    assert architecture_contract.architecture_impact_contract_unsatisfied(result)
     # A conflict wrapper around an unsatisfied payload is still unsatisfied.
-    wrapped = orchestrator_module._TerminalIssueImplementationConflict(result)
-    assert orchestrator_module.architecture_impact_contract_unsatisfied(wrapped)
+    wrapped = architecture_contract._TerminalIssueImplementationConflict(result)
+    assert architecture_contract.architecture_impact_contract_unsatisfied(wrapped)
 
 
 def test_unsatisfied_blocking_task_is_not_hidden_by_the_no_pr_wrapper(tmp_path):
-    result = orchestrator_module._require_task_implementation_result(
+    result = response_validation._require_task_implementation_result(
         _deg_task_text(None, outcome="blocking"), required_architecture_impact_contract=1, architecture_status_mode="legacy"
     )
-    assert not isinstance(result, orchestrator_module._TerminalNoPrImplementation)
-    assert orchestrator_module.architecture_impact_contract_unsatisfied(result)
-    satisfied = orchestrator_module._require_task_implementation_result(
+    assert not isinstance(result, architecture_contract._TerminalNoPrImplementation)
+    assert architecture_contract.architecture_impact_contract_unsatisfied(result)
+    satisfied = response_validation._require_task_implementation_result(
         _deg_task_text({"status": "unchanged", "rationale": "No change."}, outcome="blocking"),
         required_architecture_impact_contract=1, architecture_status_mode="legacy",
     )
-    assert isinstance(satisfied, orchestrator_module._TerminalNoPrImplementation)
+    assert isinstance(satisfied, architecture_contract._TerminalNoPrImplementation)
 
     runner = _FakeRunner(claude_outputs=[_deg_task_text(None, outcome="blocking")])
     with pytest.raises(_DegInvocationError) as error:
-        orchestrator_module._run_validated_agent(
+        validated_agent_module._run_validated_agent(
             runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
             prompt="Task.", marker_description="structured task_result JSON",
-            validate=lambda text: orchestrator_module._require_task_implementation_result(
+            validate=lambda text: response_validation._require_task_implementation_result(
                 text, required_architecture_impact_contract=1, architecture_status_mode="legacy"
             ),
             require_architecture_impact_contract=True,
@@ -11042,25 +10960,25 @@ def test_unsatisfied_blocking_task_is_not_hidden_by_the_no_pr_wrapper(tmp_path):
 
 def test_unknown_result_type_fails_closed(tmp_path):
     with pytest.raises(AgentLoopError, match="not an enumerated"):
-        orchestrator_module.architecture_impact_contract_unsatisfied(object())
+        architecture_contract.architecture_impact_contract_unsatisfied(object())
     with pytest.raises(AgentLoopError, match="not an enumerated"):
-        orchestrator_module._architecture_result_fields(object())
+        architecture_contract._architecture_result_fields(object())
     runner = _FakeRunner(claude_outputs=[structured_issue_implementation()])
     with pytest.raises(_DegInvocationError, match="not an enumerated"):
-        orchestrator_module._run_validated_agent(
+        validated_agent_module._run_validated_agent(
             runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
             prompt="Implement.", marker_description="result",
             validate=lambda text: object(), require_architecture_impact_contract=True,
         )
     # Contract-free results pass through.
-    for value in ("clarification", 77, orchestrator_module._TerminalNoPrImplementation("clarification")):
-        assert orchestrator_module.architecture_impact_contract_unsatisfied(value) is False
+    for value in ("clarification", 77, architecture_contract._TerminalNoPrImplementation("clarification")):
+        assert architecture_contract.architecture_impact_contract_unsatisfied(value) is False
 
 
 def test_metadata_writer_requires_the_whole_result():
     config_like = SimpleNamespace(architecture_context=None)
     with pytest.raises(TypeError):
-        orchestrator_module._architecture_metadata_fields(config_like, impact=None)
+        architecture_contract._architecture_metadata_fields(config_like, impact=None)
 
 
 @pytest.mark.parametrize("kind", ["plan_state", "plan_revision"])
@@ -11068,7 +10986,7 @@ def test_unsatisfied_repair_outcome_is_dispatched_as_deterministic(tmp_path, kin
     factory = structured_plan_state if kind == "plan_state" else structured_plan_revision
     source = _deg_with(factory(), _DEG_UNCORROBORATED, unexpected_key=True)
     repaired = _deg_with(factory(), None)
-    validators = orchestrator_module._architecture_mode_validators(
+    validators = architecture_contract._architecture_mode_validators(
         (lambda mode: lambda text: validate_structured_plan_state(
             text, required_architecture_impact_contract=1, architecture_status_mode=mode))
         if kind == "plan_state"
@@ -11077,9 +10995,9 @@ def test_unsatisfied_repair_outcome_is_dispatched_as_deterministic(tmp_path, kin
     )
     persisted = []
     runner = _FakeRunner(claude_outputs=[source])
-    with patch.object(orchestrator_module, "attempt_repair", lambda raw, cmd, **kw: repaired):
+    with patch.object(validated_agent_module, "attempt_repair", lambda raw, cmd, **kw: repaired):
         with pytest.raises(_DegInvocationError) as error:
-            orchestrator_module._run_validated_agent(
+            validated_agent_module._run_validated_agent(
                 runner, agent="claude", config=make_config(tmp_path, agent_max_retries=0),
                 prompt="Plan.", marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",
                 **validators, use_repair=True, repair_expected_kind=kind,
@@ -11108,7 +11026,7 @@ def test_unsatisfied_repair_outcome_is_dispatched_as_deterministic(tmp_path, kin
 def _deg_round_trip(result):
     metadata = PostedRoundMetadata(
         flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
-        **orchestrator_module._architecture_metadata_fields(
+        **architecture_contract._architecture_metadata_fields(
             make_config_for_metadata(), result=result
         ),
     )
@@ -11159,8 +11077,8 @@ def test_accepted_conflict_wrapper_persists_its_record():
         _deg_with(structured_issue_implementation(), _DEG_CORROBORATED),
         architecture_status_mode="degradable",
     )
-    wrapped = orchestrator_module._TerminalIssueImplementationConflict(parsed)
-    fields = orchestrator_module._architecture_metadata_fields(make_config_for_metadata(), result=wrapped)
+    wrapped = architecture_contract._TerminalIssueImplementationConflict(parsed)
+    fields = architecture_contract._architecture_metadata_fields(make_config_for_metadata(), result=wrapped)
     assert [r.outcome for r in fields["architecture_impact_degradations"]] == ["normalized-to-changed"]
 
 
@@ -11206,7 +11124,7 @@ def _m936_historical_approved_plan(tmp_path, *, reviewers_kwargs=None):
         claude_outputs=[weak],
         codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
     )
-    assert orchestrator_module.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         first, issue_number=56, config=_m936_cpp._plan_config(tmp_path), plan_first=True
     ) == 0
     return weak, list(first.issue_comments)
@@ -11221,7 +11139,7 @@ def test_m936_approved_inadmissible_plan_is_revised_instead_of_dead_ending(tmp_p
         claude_outputs=[good],
         codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
     )
-    assert orchestrator_module.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         resumed, issue_number=56, config=_m936_cpp._plan_config(tmp_path), plan_first=True
     ) == 0
 
@@ -11257,7 +11175,7 @@ def test_m936_guard_audit_comment_is_not_duplicated_and_recheck_exhaustion_persi
         issue_comments=list(history), claude_outputs=[still_weak] * 3,
     )
     with pytest.raises(AgentLoopError, match="consecutive plan candidates that weaken"):
-        orchestrator_module.run_issue_loop(
+        issue_loop.run_issue_loop(
             resumed, issue_number=56, config=_m936_cpp._plan_config(tmp_path), plan_first=True
         )
     assert len(_m936_cpp._agent_prompts(resumed, "claude")) == 3
@@ -11268,7 +11186,7 @@ def test_m936_guard_audit_comment_is_not_duplicated_and_recheck_exhaustion_persi
         issue_comments=list(resumed.issue_comments), claude_outputs=[still_weak] * 3,
     )
     with pytest.raises(AgentLoopError):
-        orchestrator_module.run_issue_loop(
+        issue_loop.run_issue_loop(
             rerun, issue_number=56, config=_m936_cpp._plan_config(tmp_path), plan_first=True
         )
     audits = [
@@ -11287,7 +11205,7 @@ def test_m936_guard_at_max_rounds_names_the_round_budget(tmp_path, monkeypatch):
         execution_strategy_contract_required=True,
     )
     with pytest.raises(AgentLoopError, match="Raise --max-rounds"):
-        orchestrator_module.run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
+        issue_loop.run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
     assert _m936_cpp._agent_prompts(resumed, "claude") == []
     assert len(resumed.issue_comments) == len(history)
 
@@ -11316,7 +11234,7 @@ def test_m936_guard_full_board_latch_survives_a_restart_after_the_revised_round(
         codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
         gemini_outputs=[gemini_approval],
     )
-    assert orchestrator_module.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         first, issue_number=56, config=staged_config(), plan_first=True
     ) == 0
     _m936_cpp._bind_child_planning(monkeypatch)
@@ -11326,7 +11244,7 @@ def test_m936_guard_full_board_latch_survives_a_restart_after_the_revised_round(
         issue_comments=list(first.issue_comments), claude_outputs=[good],
     )
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        orchestrator_module.run_issue_loop(
+        issue_loop.run_issue_loop(
             interrupted, issue_number=56, config=staged_config(), plan_first=True
         )
     comments = [
@@ -11337,7 +11255,7 @@ def test_m936_guard_full_board_latch_survives_a_restart_after_the_revised_round(
         if record.metadata.role == "coder"
     )
     durable = list(interrupted.issue_comments[: last_coder + 1])
-    assert orchestrator_module._resumed_inherited_replan_force_full(comments[: last_coder + 1])
+    assert child_plan_binding._resumed_inherited_replan_force_full(comments[: last_coder + 1])
     # No digest is involved on this path: the audit comment is the durable key.
     assert _extract_round_metadata_records(
         comments, flow="plan"
@@ -11348,7 +11266,7 @@ def test_m936_guard_full_board_latch_survives_a_restart_after_the_revised_round(
         codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
         gemini_outputs=[gemini_approval],
     )
-    assert orchestrator_module.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         restarted, issue_number=56, config=staged_config(), plan_first=True
     ) == 0
     assert _m936_cpp._agent_prompts(restarted, "claude") == []
@@ -11359,7 +11277,7 @@ def test_m936_guard_full_board_latch_survives_a_restart_after_the_revised_round(
     assert "Force-full: True (source: automatic)" in audits[0]
     assert "Selected reviewers: Codex, Gemini" in audits[0]
     # An ordinary revision round reconstructs no latch.
-    assert not orchestrator_module._resumed_inherited_replan_force_full(
+    assert not child_plan_binding._resumed_inherited_replan_force_full(
         [_m936_cpp.comment(str(item["body"])) for item in first.issue_comments]
     )
 
@@ -11459,10 +11377,10 @@ def test_m948_oversized_collection_posts_digest_and_resume_recovers_it_from_meta
 
     metadata = _m948_hydrated_metadata(anchor, bodies)
     canonical_plan = metadata["canonical_plan"]
-    assert canonical_plan == orchestrator_module.render_canonical_plan_state(parsed) or (
+    assert canonical_plan == plan_first_loop_module.render_canonical_plan_state(parsed) or (
         parsed.execution_recommendation is None and canonical_plan == plan
     )
-    assert metadata["subject"] == orchestrator_module._plan_subject(canonical_plan)
+    assert metadata["subject"] == panel_evidence._plan_subject(canonical_plan)
     assert _M948_NOTICE not in canonical_plan
 
     second = FakeRunner(
@@ -11498,22 +11416,22 @@ def test_m948_resumed_collections_equal_the_full_form_publication():
     payload["plan_actions"] = _m948_stages("Action", 5)
     payload["additional_closing_issue_ids"] = [101, 102]
     parsed = _m948_validate_state(json.dumps(payload) + _M948_FOOTER)
-    canonical_plan = orchestrator_module.render_canonical_plan_state(parsed)
+    canonical_plan = plan_first_loop_module.render_canonical_plan_state(parsed)
 
     # Stage and closing collections are read from the canonical plan only; the
     # digest carries none of their records.
-    assert orchestrator_module._extract_current_deferred_stages(canonical_plan) == parsed.deferred_stages
-    assert orchestrator_module._extract_current_expected_closing_issue_ids(canonical_plan) == (101, 102)
+    assert execution_policy._extract_current_deferred_stages(canonical_plan) == parsed.deferred_stages
+    assert execution_policy._extract_current_expected_closing_issue_ids(canonical_plan) == (101, 102)
     digest = render_public_agent_comment(
         kind="plan_state", parsed=parsed, agent="claude", compact=True
     )
-    assert orchestrator_module._extract_current_deferred_stages(digest) == ()
-    assert orchestrator_module._extract_current_expected_closing_issue_ids(digest) is None
+    assert execution_policy._extract_current_deferred_stages(digest) == ()
+    assert execution_policy._extract_current_expected_closing_issue_ids(digest) is None
 
 
 def test_m948_fitting_plan_posts_the_full_form_byte_identically(tmp_path, monkeypatch):
     compact_calls = []
-    real_render = orchestrator_module.render_public_agent_comment
+    real_render = response_validation.render_public_agent_comment
 
     full_renders = {}
 
@@ -11524,7 +11442,7 @@ def test_m948_fitting_plan_posts_the_full_form_byte_identically(tmp_path, monkey
         full_renders[kwargs["kind"]] = rendered
         return rendered
 
-    monkeypatch.setattr(orchestrator_module, "render_public_agent_comment", spy)
+    patch_attr_in(monkeypatch, (response_validation, discuss_loop, child_plan_binding, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "render_public_agent_comment", spy)
     plan = structured_plan_state(summary="Small plan.")
     revision = structured_plan_revision(
         summary="Small revision.",
@@ -11565,7 +11483,7 @@ def test_m948_non_size_transport_failure_aborts_without_selecting_the_digest(
     tmp_path, monkeypatch
 ):
     compact_calls = []
-    real_render = orchestrator_module.render_public_agent_comment
+    real_render = response_validation.render_public_agent_comment
 
     def spy(**kwargs):
         if kwargs.get("compact"):
@@ -11575,7 +11493,7 @@ def test_m948_non_size_transport_failure_aborts_without_selecting_the_digest(
     def malformed(_body_text):
         raise AgentLoopError("Risk matrix marker is not a recoverable JSON object.")
 
-    monkeypatch.setattr(orchestrator_module, "render_public_agent_comment", spy)
+    patch_attr_in(monkeypatch, (response_validation, discuss_loop, child_plan_binding, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "render_public_agent_comment", spy)
     monkeypatch.setattr(_m948_transport, "_prepare_risk_test_matrix_transport", malformed)
     payload = json.loads(structured_plan_state().split("\n", 1)[0])
     payload["plan_steps"] = [f"Step {index}: {_m948_noise(index)}" for index in range(300)]
@@ -11679,11 +11597,11 @@ def _m948_assemble(kind, parsed, raw_text, *, config, ids, direct, metadata=None
         kind=kind, parsed=parsed, agent=config.coder, raw_text=raw_text, config=config
     )
     canonical_plan = (
-        orchestrator_module.render_canonical_plan_state(parsed)
+        plan_first_loop_module.render_canonical_plan_state(parsed)
         if kind == "plan_state"
-        else orchestrator_module.render_canonical_plan_revision(parsed, (), config)
+        else plan_first_loop_module.render_canonical_plan_revision(parsed, (), config)
     )
-    return orchestrator_module._assemble_structured_plan_round_body(
+    return child_plan_binding._assemble_structured_plan_round_body(
         config=config,
         issue_number=56,
         kind=kind,
@@ -11691,7 +11609,7 @@ def _m948_assemble(kind, parsed, raw_text, *, config, ids, direct, metadata=None
         full_comment=full_comment,
         metadata=metadata or _M948Metadata(
             flow="plan", role="coder", agent="Claude", round_number=1,
-            subject=orchestrator_module._plan_subject(canonical_plan),
+            subject=panel_evidence._plan_subject(canonical_plan),
             canonical_plan=canonical_plan, raw_structured_coder_response=raw_text,
         ),
         raw_text=raw_text,
@@ -11766,10 +11684,10 @@ def test_m948_overflow_the_digest_cannot_fix_fails_closed_and_posts_nothing(tmp_
     config = _m948_plan_config(tmp_path)
     raw_text = json.dumps(_m948_signed_payload("plan_state", ())) + _M948_FOOTER
     parsed = _m948_validate_state(raw_text)
-    canonical_plan = orchestrator_module.render_canonical_plan_state(parsed)
+    canonical_plan = plan_first_loop_module.render_canonical_plan_state(parsed)
     metadata = _M948Metadata(
         flow="plan", role="coder", agent="Claude", round_number=1,
-        subject=orchestrator_module._plan_subject(canonical_plan),
+        subject=panel_evidence._plan_subject(canonical_plan),
         canonical_plan=canonical_plan,
         # Not in the transport spill set, so no presentation change can help.
         compact_prior_summaries=(_m948_noise("unspillable", 120_000),),
@@ -11816,7 +11734,7 @@ def test_959_direct_issue_implementation_metadata_anchors_to_own_round(
 ):
     runner = FakeRunner(claude_outputs=[structured_issue_implementation(pr_number=77)])
     config = make_config(tmp_path, coder="claude", reviewer="codex")
-    real_derive = orchestrator_module._derive_authenticated_risk_evidence_for_coder
+    real_derive = response_validation._derive_authenticated_risk_evidence_for_coder
 
     def derive(result, **kwargs):
         derived, extra = real_derive(result, **kwargs)
@@ -11824,8 +11742,8 @@ def test_959_direct_issue_implementation_metadata_anchors_to_own_round(
             derived = replace(derived, risk_test_matrix_evidence=_issue_evidence_959())
         return derived, extra
 
-    monkeypatch.setattr(orchestrator_module, "_derive_authenticated_risk_evidence_for_coder", derive)
-    monkeypatch.setattr(orchestrator_module, "run_pr_loop", lambda *_a, **_k: 0)
+    patch_attr_in(monkeypatch, (response_validation, pr_loop, issue_implementation, issue_loop), "_derive_authenticated_risk_evidence_for_coder", derive)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop", lambda *_a, **_k: 0)
 
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
 
@@ -11871,7 +11789,7 @@ def test_959_structured_no_pr_terminal_comment_omits_matrix_evidence(tmp_path):
     runner = FakeRunner()
     config = make_config(tmp_path, coder="claude", reviewer="codex")
 
-    orchestrator_module._post_structured_issue_implementation_terminal_comment(
+    response_validation._post_structured_issue_implementation_terminal_comment(
         runner, config=config, issue_number=56, parsed=parsed, model_used=None
     )
 
@@ -11929,7 +11847,7 @@ def _m943_interrupted_history(tmp_path):
     """Round 3 is partial: Codex's remediation review is posted, Antigravity never ran."""
     runner = _m943_runner()
     config = _staged_plan_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8)
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def stop_after_codex_round_3(*args, **kwargs):
         result = real_post(*args, **kwargs)
@@ -11943,7 +11861,7 @@ def _m943_interrupted_history(tmp_path):
             raise KeyboardInterrupt
         return result
 
-    with patch.object(orchestrator_module, "post_issue_comment", side_effect=stop_after_codex_round_3):
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", side_effect=stop_after_codex_round_3):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     return runner
@@ -12077,7 +11995,7 @@ def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(
     # partial-round-activation: the amendment starts inside round 3.  A first
     # resume is interrupted right after the fresh amended checkpoint.
     _m943_post_amendment(runner, effective_from_round=3)
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def stop_after_fresh_checkpoint(*args, **kwargs):
         result = real_post(*args, **kwargs)
@@ -12086,7 +12004,7 @@ def test_board_amendment_partial_round_rescues_legacy_run_and_reassigns_finding(
             raise KeyboardInterrupt
         return result
 
-    with patch.object(orchestrator_module, "post_issue_comment", side_effect=stop_after_fresh_checkpoint):
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", side_effect=stop_after_fresh_checkpoint):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=_m943_reduced_config(tmp_path), plan_first=True)
     assert _m943_reviewer_calls(runner) == calls_before
@@ -12338,11 +12256,7 @@ def test_board_amendment_reenters_a_reconciled_round_under_the_amended_board(tmp
 # acceptance boundary, per-candidate repair refusal, and carriers
 # ---------------------------------------------------------------------------
 
-from coding_review_agent_loop.orchestrator import (  # noqa: E402
-    CompletionRecoveryPolicy as _r2_CompletionRecoveryPolicy,
-    _attempt_claude_completion_recovery as _r2_attempt_recovery,
-    _new_usage_context as _r2_new_usage_context,
-)
+from coding_review_agent_loop.validated_agent import CompletionRecoveryPolicy as _r2_CompletionRecoveryPolicy, _attempt_claude_completion_recovery as _r2_attempt_recovery, _new_usage_context as _r2_new_usage_context
 from coding_review_agent_loop.protocol import ParsedPlanReview as _r2_ParsedPlanReview  # noqa: E402
 from coding_review_agent_loop.round_state import PostedRoundMetadata as _r2_Metadata  # noqa: E402
 from agent_loop_helpers import (  # noqa: E402
@@ -12357,7 +12271,7 @@ def _r2_claude_prompts(runner):
 
 
 def _r2_run(runner, tmp_path, *, retries, **extra):
-    return orchestrator_module._run_validated_agent(
+    return validated_agent_module._run_validated_agent(
         runner, agent="claude", config=make_config(tmp_path, agent_max_retries=retries),
         prompt="Implement the issue.",
         marker_description="structured issue_implementation result",
@@ -12379,7 +12293,7 @@ def test_unsatisfied_contract_retries_once_with_a_field_naming_reprompt(tmp_path
     assert "Previous response not accepted: architecture_impact" in second
     for token in ("architecture_impact", "`changed`", "`unchanged`"):
         assert token in second
-    section = orchestrator_module._architecture_contract_retry_prompt(
+    section = architecture_contract._architecture_contract_retry_prompt(
         "P", "<!-- AGENT_STATE: approved --> " + "x" * 5000
     )
     assert "<!--" not in section and len(section) < 2000
@@ -12402,7 +12316,7 @@ def test_contract_only_failure_makes_no_repair_invocation(tmp_path):
     unsatisfied = _deg_with(structured_issue_implementation(), None)
     runner = _r2_FakeRunner(claude_outputs=[unsatisfied])
     with patch.object(
-        orchestrator_module, "attempt_repair", lambda raw, cmd, **kw: calls.append(raw)
+        validated_agent_module, "attempt_repair", lambda raw, cmd, **kw: calls.append(raw)
     ):
         with pytest.raises(_DegInvocationError):
             _r2_run(runner, tmp_path, retries=0, use_repair=True,
@@ -12464,7 +12378,7 @@ def test_artifact_canonicalization_failure_is_deterministic_not_transport(tmp_pa
     usage = _r2_new_usage_context(make_config(tmp_path))
     validators = dict(_deg_issue_validators(), strict_revalidate=lambda _text: mismatched)
     with pytest.raises(_DegInvocationError) as error:
-        orchestrator_module._run_validated_agent(
+        validated_agent_module._run_validated_agent(
             runner, agent="claude", config=make_config(tmp_path, agent_max_retries=1),
             prompt="Implement the issue.",
             marker_description="structured issue_implementation result",
@@ -12491,9 +12405,9 @@ def test_metadata_helper_rejects_an_unlisted_assessment_bearing_object():
         architecture_impact_degradations=(),
     )
     with pytest.raises(AgentLoopError, match="not an enumerated"):
-        orchestrator_module._architecture_result_fields(impostor)
+        architecture_contract._architecture_result_fields(impostor)
     with pytest.raises(AgentLoopError, match="not an enumerated"):
-        orchestrator_module._architecture_metadata_fields(
+        architecture_contract._architecture_metadata_fields(
             make_config_for_metadata(), result=impostor
         )
 
@@ -12511,9 +12425,9 @@ def test_completion_recovery_routes_an_unsatisfied_contract_to_the_ordinary_retr
 
     def refusing(text):
         parsed = validators["validate"](text)
-        if orchestrator_module.architecture_impact_contract_unsatisfied(parsed):
-            raise orchestrator_module._ArchitectureImpactContractUnsatisfied(
-                orchestrator_module._architecture_contract_diagnostic(parsed)
+        if architecture_contract.architecture_impact_contract_unsatisfied(parsed):
+            raise architecture_contract._ArchitectureImpactContractUnsatisfied(
+                architecture_contract._architecture_contract_diagnostic(parsed)
             )
         return parsed
 
@@ -12534,13 +12448,13 @@ def test_completion_recovery_routes_an_unsatisfied_contract_to_the_ordinary_retr
 def test_accepted_uncorroborated_review_text_drops_the_assessment(tmp_path):
     text = _deg_with(_r2_plan_review(), _DEG_UNCORROBORATED)
     runner = _r2_FakeRunner(codex_outputs=[text])
-    validators = orchestrator_module._architecture_mode_validators(
-        lambda mode: lambda candidate: orchestrator_module._validate_plan_review_response(
+    validators = architecture_contract._architecture_mode_validators(
+        lambda mode: lambda candidate: plan_first_loop_module._validate_plan_review_response(
             candidate, reviewer="OpenAI Codex", unresolved_items=(),
             architecture_status_mode=mode,
         )
     )
-    response = orchestrator_module._run_validated_agent(
+    response = validated_agent_module._run_validated_agent(
         runner, agent="codex", config=make_config(tmp_path, agent_max_retries=0),
         prompt="Review.", marker_description="plan review", **validators,
     )
@@ -12550,7 +12464,7 @@ def test_accepted_uncorroborated_review_text_drops_the_assessment(tmp_path):
     assert "architecture_impact" not in json.loads(response.text.split("\n<!--", 1)[0])
     assert response.text.rstrip().endswith("-- OpenAI Codex")
     # The accepted text passes every strict re-parse.
-    strict = orchestrator_module._validate_plan_review_response(
+    strict = plan_first_loop_module._validate_plan_review_response(
         response.text, reviewer="OpenAI Codex", unresolved_items=(),
         architecture_status_mode="strict",
     )
@@ -12559,7 +12473,7 @@ def test_accepted_uncorroborated_review_text_drops_the_assessment(tmp_path):
 
 def test_record_free_candidates_pass_the_boundary_byte_identical(tmp_path):
     parsed = validate_structured_issue_implementation(structured_issue_implementation())
-    accepted = orchestrator_module._accept_candidate(
+    accepted = architecture_contract._accept_candidate(
         structured_issue_implementation(), parsed,
         strict_revalidate=None, runner=None, acquisition=None,
     )
@@ -12573,15 +12487,15 @@ def test_projection_mismatch_is_refused_rather_than_accepted():
     other = validate_structured_issue_implementation(
         _deg_with(structured_issue_implementation(pr_number=99), dict(_DEG_CORROBORATED, status="changed"))
     )
-    with pytest.raises(orchestrator_module._AcceptedTextCanonicalizationError):
-        orchestrator_module._accept_candidate(
+    with pytest.raises(architecture_contract._AcceptedTextCanonicalizationError):
+        architecture_contract._accept_candidate(
             text, degraded, strict_revalidate=lambda _text: other, runner=None, acquisition=None,
         )
 
 
 def test_degrade_flag_without_a_strict_reparse_fails_closed(tmp_path):
     with pytest.raises(AgentLoopError, match="strict re-parse"):
-        orchestrator_module._run_validated_agent(
+        validated_agent_module._run_validated_agent(
             _r2_FakeRunner(), agent="claude", config=make_config(tmp_path),
             prompt="x", marker_description="x", validate=lambda text: text,
             degrade_architecture_impact=True,
@@ -12590,26 +12504,26 @@ def test_degrade_flag_without_a_strict_reparse_fails_closed(tmp_path):
 
 def test_satisfied_blocking_task_keeps_its_payload_and_records():
     text = _deg_task_text(_DEG_CORROBORATED, outcome="blocking")
-    result = orchestrator_module._require_task_implementation_result(
+    result = response_validation._require_task_implementation_result(
         text, required_architecture_impact_contract=1, architecture_status_mode="degradable"
     )
-    assert isinstance(result, orchestrator_module._TerminalNoPrImplementation)
+    assert isinstance(result, architecture_contract._TerminalNoPrImplementation)
     assert result.state == "blocking"
     assert result.parsed.architecture_impact.status == "changed"
-    fields = orchestrator_module._architecture_metadata_fields(
+    fields = architecture_contract._architecture_metadata_fields(
         make_config_for_metadata(), result=result
     )
     assert fields["architecture_impact"]["status"] == "changed"
     assert [r.outcome for r in fields["architecture_impact_degradations"]] == ["normalized-to-changed"]
     # The accepted text is canonical and the wrapper survives the boundary.
-    accepted = orchestrator_module._accept_candidate(
+    accepted = architecture_contract._accept_candidate(
         text, result,
-        strict_revalidate=lambda candidate: orchestrator_module._require_task_implementation_result(
+        strict_revalidate=lambda candidate: response_validation._require_task_implementation_result(
             candidate, required_architecture_impact_contract=1, architecture_status_mode="strict"
         ),
         runner=None, acquisition=None,
     )
-    assert isinstance(accepted.marker_value, orchestrator_module._TerminalNoPrImplementation)
+    assert isinstance(accepted.marker_value, architecture_contract._TerminalNoPrImplementation)
     assert '"modified"' not in accepted.text
     assert accepted.marker_value.parsed.architecture_impact_degradations == (
         result.parsed.architecture_impact_degradations
@@ -12626,8 +12540,8 @@ def test_carried_item_review_rebuild_keeps_every_parsed_field(kind):
     )
     text = _deg_with(rendered, _DEG_CORROBORATED)
     helper = (
-        orchestrator_module._validate_plan_review_response
-        if kind == "plan" else orchestrator_module._validate_review_response
+        plan_first_loop_module._validate_plan_review_response
+        if kind == "plan" else pr_loop._validate_review_response
     )
     with_items = helper(
         text, reviewer="OpenAI Codex", unresolved_items=[item], architecture_status_mode="degradable"
@@ -12641,12 +12555,12 @@ def test_refused_decomposition_posts_one_comment_and_never_masks_the_error(tmp_p
     runner = _r2_FakeRunner()
     error = _DegInvocationError(
         "exhausted",
-        preserved_unsatisfied_response=orchestrator_module.PreservedUnsatisfiedResponse(
+        preserved_unsatisfied_response=validated_agent_module.PreservedUnsatisfiedResponse(
             text="{}", diagnostic="plan_decomposition must include architecture_impact",
             architecture_impact_degradations=(),
         ),
     )
-    orchestrator_module._surface_refused_decomposition(
+    architecture_contract._surface_refused_decomposition(
         runner, config=make_config(tmp_path), issue_number=56, error=error
     )
     bodies = [c["body"] for c in runner.issue_comments]
@@ -12658,8 +12572,8 @@ def test_refused_decomposition_posts_one_comment_and_never_masks_the_error(tmp_p
     def failing_post(*args, **kwargs):
         raise RuntimeError("GitHub unavailable")
 
-    with patch.object(orchestrator_module, "post_issue_comment", failing_post):
-        orchestrator_module._surface_refused_decomposition(
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", failing_post):
+        architecture_contract._surface_refused_decomposition(
             runner, config=make_config(tmp_path), issue_number=56, error=error
         )
 
@@ -12668,16 +12582,16 @@ def test_resumed_review_architecture_comes_from_round_metadata():
     impact = validate_structured_issue_implementation(
         _deg_with(structured_issue_implementation(), dict(_DEG_CORROBORATED, status="changed"))
     ).architecture_impact
-    record = orchestrator_module.ParseDegradation.build(
+    record = architecture_contract.ParseDegradation.build(
         element_path="plan_review.architecture_impact.status", rule="r",
         observed="modified", outcome="normalized-to-changed",
     )
     metadata = SimpleNamespace(
         architecture_contract_version=1,
-        architecture_impact=orchestrator_module.sanitize_architecture_impact(impact),
+        architecture_impact=architecture_contract.sanitize_architecture_impact(impact),
         architecture_impact_degradations=(record,),
     )
-    rebuilt, records = orchestrator_module._resumed_review_architecture(metadata, None)
+    rebuilt, records = architecture_contract._resumed_review_architecture(metadata, None)
     assert rebuilt == impact
     assert records == (record,)
     # A degraded review stored no assessment: it stays absent, with its record.
@@ -12685,44 +12599,44 @@ def test_resumed_review_architecture_comes_from_round_metadata():
         architecture_contract_version=1, architecture_impact=None,
         architecture_impact_degradations=(record,),
     )
-    assert orchestrator_module._resumed_review_architecture(degraded, impact) == (None, (record,))
+    assert architecture_contract._resumed_review_architecture(degraded, impact) == (None, (record,))
     # Wrong keys or a non-declared status never fabricate an assessment.
-    bad = dict(orchestrator_module.sanitize_architecture_impact(impact), status="undetermined")
-    assert orchestrator_module._architecture_impact_from_metadata(bad) is None
-    assert orchestrator_module._architecture_impact_from_metadata({"status": "changed"}) is None
+    bad = dict(architecture_contract.sanitize_architecture_impact(impact), status="undetermined")
+    assert architecture_contract._architecture_impact_from_metadata(bad) is None
+    assert architecture_contract._architecture_impact_from_metadata({"status": "changed"}) is None
     # A record older than architecture metadata falls back to its text.
     legacy = SimpleNamespace(architecture_contract_version=None)
-    assert orchestrator_module._resumed_review_architecture(legacy, impact) == (impact, ())
+    assert architecture_contract._resumed_review_architecture(legacy, impact) == (impact, ())
 
 
 def test_acknowledgement_repair_pins_the_accepted_assessment(tmp_path):
-    record = orchestrator_module.ParseDegradation.build(
+    record = architecture_contract.ParseDegradation.build(
         element_path="pr_review.architecture_impact.status", rule="r",
         observed="modified", outcome="degraded-to-undetermined",
     )
     accepted = SimpleNamespace(architecture_impact=None, architecture_impact_degradations=(record,))
-    fabricated = orchestrator_module._validate_review_response(
+    fabricated = pr_loop._validate_review_response(
         _deg_with(_r2_pr_review(), {"status": "unchanged", "rationale": "No change."}),
         reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="strict",
     )
     config = make_config(tmp_path)
-    assert orchestrator_module._pin_acknowledgement_repair(
+    assert architecture_contract._pin_acknowledgement_repair(
         accepted, fabricated, config=config, reviewer_name="Codex"
     ) is None
-    ack_only = orchestrator_module._validate_review_response(
+    ack_only = pr_loop._validate_review_response(
         _deg_with(_r2_pr_review(), None),
         reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="strict",
     )
-    pinned = orchestrator_module._pin_acknowledgement_repair(
+    pinned = architecture_contract._pin_acknowledgement_repair(
         accepted, ack_only, config=config, reviewer_name="Codex"
     )
     assert pinned.architecture_impact is None
     assert pinned.architecture_impact_degradations == (record,)
     # Absence is pinned for the repair when the accepted source has none.
-    assert orchestrator_module._acknowledgement_repair_forbids_assessment(_deg_with(_r2_pr_review(), None))
+    assert architecture_contract._acknowledgement_repair_forbids_assessment(_deg_with(_r2_pr_review(), None))
     # New repair output is validated strictly: a legacy synonym is rejected.
     with pytest.raises(AgentLoopError, match="must be `changed` or `unchanged`"):
-        orchestrator_module._validate_review_response(
+        pr_loop._validate_review_response(
             _deg_with(_r2_pr_review(), {"status": "none", "rationale": "No change."}),
             reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="strict",
         )
@@ -12784,13 +12698,13 @@ def _ack_staged_run(
         codex_outputs=[unacknowledged] * 4,
         gemini_outputs=[panel] * 4,
     )
-    real_get_issue_context = orchestrator_module.get_issue_context
+    real_get_issue_context = discuss_loop.get_issue_context
 
     def _patched(runner_arg, *, config, issue_number):
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=(requirement,))
 
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
     repair_calls = []
 
     def fake_repair(raw, cmd, **kwargs):
@@ -12799,15 +12713,14 @@ def _ack_staged_run(
 
     outcome = None
     repair_results = []
-    real_structured_repair = orchestrator_module._run_structured_repair
+    real_structured_repair = validated_agent_module._run_structured_repair
 
     def spy_repair(*args, **kwargs):
         result = real_structured_repair(*args, **kwargs)
         repair_results.append(result)
         return result
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
-        orchestrator_module, "_run_structured_repair", spy_repair
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair), patch_object_in((validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair", spy_repair
     ):
         try:
             outcome = run_issue_loop(
@@ -12892,13 +12805,13 @@ def _ack_nonstaged_run(tmp_path, monkeypatch, *, repaired_status=None):
         codex_outputs=[unacknowledged] * 4,
         gemini_outputs=[panel] * 4,
     )
-    real_get_issue_context = orchestrator_module.get_issue_context
+    real_get_issue_context = discuss_loop.get_issue_context
 
     def _patched(runner_arg, *, config, issue_number):
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=(requirement,))
 
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
     repair_calls = []
 
     def fake_repair(raw, cmd, **kwargs):
@@ -12910,15 +12823,14 @@ def _ack_nonstaged_run(tmp_path, monkeypatch, *, repaired_status=None):
         agent_max_retries=0, agent_retry_backoff_seconds=0,
     )
     repair_results = []
-    real_structured_repair = orchestrator_module._run_structured_repair
+    real_structured_repair = validated_agent_module._run_structured_repair
 
     def spy_repair(*args, **kwargs):
         result = real_structured_repair(*args, **kwargs)
         repair_results.append(result)
         return result
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
-        orchestrator_module, "_run_structured_repair", spy_repair
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair), patch_object_in((validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair", spy_repair
     ):
         try:
             outcome = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
@@ -13021,13 +12933,13 @@ def _ack_plan_resume_run(tmp_path, monkeypatch, *, parallel, codex_impact, repai
         codex_outputs=[unacknowledged] * 4,
         gemini_outputs=[panel] * 4,
     )
-    real_get_issue_context = orchestrator_module.get_issue_context
+    real_get_issue_context = discuss_loop.get_issue_context
 
     def _patched(runner_arg, *, config, issue_number):
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=(requirement,))
 
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
         agent_max_retries=0, agent_retry_backoff_seconds=0, review_parallel=parallel,
@@ -13036,14 +12948,14 @@ def _ack_plan_resume_run(tmp_path, monkeypatch, *, parallel, codex_impact, repai
     def interrupt(raw, cmd, **kwargs):
         raise KeyboardInterrupt
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", interrupt):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", interrupt):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     agents_before = [cmd[0] for cmd, _cwd in runner.commands if cmd[0] in {"claude", "codex", "gemini"}]
 
     carriers, pinned, repair_results, repair_calls = [], [], [], []
-    real_pin = orchestrator_module._pin_acknowledgement_repair
-    real_structured_repair = orchestrator_module._run_structured_repair
+    real_pin = architecture_contract._pin_acknowledgement_repair
+    real_structured_repair = validated_agent_module._run_structured_repair
 
     def spy_pin(accepted, repaired_value, **kwargs):
         carriers.append(accepted)
@@ -13060,9 +12972,8 @@ def _ack_plan_resume_run(tmp_path, monkeypatch, *, parallel, codex_impact, repai
         repair_calls.append(raw)
         return repaired
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair), patch.object(
-        orchestrator_module, "_pin_acknowledgement_repair", spy_pin
-    ), patch.object(orchestrator_module, "_run_structured_repair", spy_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair), patch_object_in((architecture_contract, pr_loop, plan_first_loop_module), "_pin_acknowledgement_repair", spy_pin
+    ), patch_object_in((validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair", spy_repair):
         try:
             outcome = run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
         except AgentLoopError as exc:
@@ -13187,7 +13098,7 @@ def test_acknowledgement_equality_check_refuses_a_changed_assessment_directly(tm
         accepted,
         architecture_impact=replace(accepted.architecture_impact, rationale="Different."),
     )
-    assert orchestrator_module._pin_acknowledgement_repair(
+    assert architecture_contract._pin_acknowledgement_repair(
         accepted, altered, config=make_config(tmp_path), reviewer_name="Codex"
     ) is None
 
@@ -13212,7 +13123,7 @@ def test_resumed_publication_genuine_omission_cannot_gain_an_assessment(
 
 import coding_review_agent_loop.managed_ci as _m1047_managed_ci  # noqa: E402
 from coding_review_agent_loop.config import github_bootstrap_cwd as _m1047_bootstrap_cwd  # noqa: E402
-from coding_review_agent_loop.orchestrator import run_pr_loop as _m1047_run_pr_loop  # noqa: E402
+from coding_review_agent_loop.pr_loop import run_pr_loop as _m1047_run_pr_loop  # noqa: E402
 
 _M1047_DELETE = [
     "gh", "api", "--method", "DELETE",
@@ -13313,13 +13224,13 @@ def _m1047_contract(origin):
 
 def _m1047_release_spy(monkeypatch):
     calls = []
-    real = orchestrator_module.release_adopted_managed_ci
+    real = pr_loop.release_adopted_managed_ci
 
     def spy(*args, **kwargs):
         calls.append(kwargs.get("contract"))
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator_module, "release_adopted_managed_ci", spy)
+    monkeypatch.setattr(pr_loop, "release_adopted_managed_ci", spy)
     return calls
 
 
@@ -13335,39 +13246,38 @@ def test_m1047_entry_normalization_runs_before_every_managed_resume_path(
     seen = []
     kwargs = {}
     if path == "activation":
-        monkeypatch.setattr(orchestrator_module, "recover_issue_created_handoff", lambda *a, **k: None)
+        monkeypatch.setattr(pr_loop, "recover_issue_created_handoff", lambda *a, **k: None)
         monkeypatch.setattr(
-            orchestrator_module, "activate_managed_ci", _m1047_recorder(runner, seen, path)
+            pr_loop, "activate_managed_ci", _m1047_recorder(runner, seen, path)
         )
     elif path == "revalidation":
         kwargs["managed_ci_handoff"] = object()
         monkeypatch.setattr(
-            orchestrator_module, "revalidate_issue_created_handoff",
+            pr_loop, "revalidate_issue_created_handoff",
             _m1047_recorder(runner, seen, path),
         )
     elif path == "recovery":
         monkeypatch.setattr(
-            orchestrator_module, "recover_issue_created_handoff",
+            pr_loop, "recover_issue_created_handoff",
             _m1047_recorder(runner, seen, path),
         )
     elif path == "fresh":
-        monkeypatch.setattr(orchestrator_module, "validate_open_issue", lambda *a, **k: None)
-        monkeypatch.setattr(
-            orchestrator_module, "get_issue_context",
+        patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "validate_open_issue", lambda *a, **k: None)
+        patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
             lambda *a, **k: SimpleNamespace(number=5, comments=[], human_requirements=()),
         )
         monkeypatch.setattr(
-            orchestrator_module, "authorize_fresh_issue_created_resume",
+            pr_loop, "authorize_fresh_issue_created_resume",
             _m1047_recorder(runner, seen, path),
         )
     else:
         monkeypatch.setattr(
-            orchestrator_module, "recover_managed_pr_origin",
+            pr_loop, "recover_managed_pr_origin",
             lambda *a, **k: ("feature", "abc123", "agent-loop/managed-77", None),
         )
-        monkeypatch.setattr(orchestrator_module, "validate_managed_pr_body", lambda *a, **k: None)
+        monkeypatch.setattr(pr_loop, "validate_managed_pr_body", lambda *a, **k: None)
         monkeypatch.setattr(
-            orchestrator_module, "authenticate_source_managed_resume",
+            pr_loop, "authenticate_source_managed_resume",
             _m1047_recorder(runner, seen, path),
         )
 
@@ -13384,7 +13294,7 @@ def test_m1047_implicit_invocation_also_releases_retained_label(tmp_path, monkey
     config = make_config(tmp_path, max_rounds=1)
     seen = []
     monkeypatch.setattr(
-        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+        pr_loop, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
     )
 
     with pytest.raises(_M1047Stop):
@@ -13408,7 +13318,7 @@ def test_m1047_entry_normalization_leaves_other_pr_states_untouched(tmp_path, mo
     config = make_config(tmp_path, managed_ci=True, max_rounds=1)
     seen = []
     monkeypatch.setattr(
-        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+        pr_loop, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
     )
 
     with pytest.raises(_M1047Stop):
@@ -13424,7 +13334,7 @@ def test_m1047_failed_automerge_ready_labeled_pr_is_normalized_on_retry(tmp_path
     config = make_config(tmp_path, managed_ci=True, max_rounds=1)
     seen = []
     monkeypatch.setattr(
-        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+        pr_loop, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
     )
 
     with pytest.raises(_M1047Stop):
@@ -13444,7 +13354,7 @@ def test_m1047_entry_release_failure_stops_before_any_other_work(tmp_path, monke
         "activate_managed_ci",
     ):
         monkeypatch.setattr(
-            orchestrator_module, name,
+            pr_loop, name,
             lambda *a, _name=name, **k: pytest.fail(f"{_name} ran after a failed entry release"),
         )
 
@@ -13474,7 +13384,7 @@ def test_m1047_entry_normalization_uses_bootstrap_cwd_without_coder_checkout(
     runner = _M1047LivePrRunner(labels=labels, delete_returncode=delete_returncode)
     seen = []
     monkeypatch.setattr(
-        orchestrator_module, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
+        pr_loop, "recover_issue_created_handoff", _m1047_recorder(runner, seen, "recovery"),
     )
 
     expected = (
@@ -13496,16 +13406,16 @@ def test_m1047_entry_normalization_uses_bootstrap_cwd_without_coder_checkout(
 
 
 def _m1047_reach_publication(monkeypatch, runner, contract, *, dispatch_error=None):
-    monkeypatch.setattr(orchestrator_module, "recover_issue_created_handoff", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator_module, "activate_managed_ci", lambda *a, **k: contract)
-    monkeypatch.setattr(orchestrator_module, "dispatch_final_qualification", lambda *a, **k: None)
+    monkeypatch.setattr(pr_loop, "recover_issue_created_handoff", lambda *a, **k: None)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: contract)
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *a, **k: None)
 
     def wait(*args, **kwargs):
         if dispatch_error is not None:
             raise dispatch_error
         return ManagedCiOutcome(status="passed", head_sha=runner.pr_payload.get("headRefOid"))
 
-    monkeypatch.setattr(orchestrator_module, "wait_for_final_qualification", wait)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait)
 
 
 @pytest.mark.parametrize("origin", ["issue-created", "source-managed"])
@@ -13522,7 +13432,7 @@ def test_m1047_failed_publication_releases_label_despite_preservation(
     )
     config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop", max_rounds=1)
     contract = _m1047_contract(origin)
-    assert orchestrator_module._preserve_issue_created_managed_suppression(
+    assert pr_loop_support._preserve_issue_created_managed_suppression(
         contract, active_exception=AgentLoopError("any")
     )
     _m1047_reach_publication(monkeypatch, runner, contract)
@@ -13549,7 +13459,7 @@ def test_m1047_interruption_before_publication_still_preserves_label(tmp_path, m
         dispatch_error=AgentLoopError("dispatch lost"),
     )
     monkeypatch.setattr(
-        orchestrator_module, "publish_manual_v2_qualification",
+        pr_loop, "publish_manual_v2_qualification",
         lambda *a, **k: pytest.fail("publication must not run"),
     )
     release_calls = _m1047_release_spy(monkeypatch)
@@ -13575,7 +13485,7 @@ def test_m1047_successful_publication_keeps_label_and_finally_does_not_release(
         runner.live_pr["draft"] = False
         return kwargs["expected_head_sha"]
 
-    monkeypatch.setattr(orchestrator_module, "publish_manual_v2_qualification", publish)
+    monkeypatch.setattr(pr_loop, "publish_manual_v2_qualification", publish)
     release_calls = _m1047_release_spy(monkeypatch)
 
     assert _m1047_run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -13606,7 +13516,7 @@ def test_m1047_reentry_that_aborts_before_publication_is_preserved_for_exact_res
         runner.live_pr["labels"] = [{"name": "agent-loop-managed"}]
         return contract
 
-    monkeypatch.setattr(orchestrator_module, "activate_managed_ci", reenter)
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", reenter)
     release_calls = _m1047_release_spy(monkeypatch)
 
     with pytest.raises(AgentLoopError, match="review aborted"):
@@ -13620,7 +13530,7 @@ def test_m1047_reentry_that_aborts_before_publication_is_preserved_for_exact_res
     # The next invocation resumes through the draft/labeled path untouched.
     seen = []
     monkeypatch.setattr(
-        orchestrator_module, "activate_managed_ci", _m1047_recorder(runner, seen, "activation"),
+        pr_loop, "activate_managed_ci", _m1047_recorder(runner, seen, "activation"),
     )
     with pytest.raises(_M1047Stop):
         _m1047_run_pr_loop(runner, pr_number=77, config=config)
@@ -14472,7 +14382,7 @@ def _m1103_stalled_runner(tmp_path, *, threshold=2, rounds=2):
     codex, claude, _base = _m1103_blocking_chain(1, rounds, base=base)
     runner = _FakeRunner(claude_outputs=[fresh, *claude], codex_outputs=codex)
     config = _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=threshold)
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     return runner, config, excinfo.value
 
@@ -14512,7 +14422,7 @@ def test_primary_stall_stop_rerun_is_deterministic_and_overridable(tmp_path):
     history = list(runner.issue_comments)
 
     rerun = _FakeRunner(issue_comments=list(history))
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
         run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
     assert _m1103_agent_calls(rerun) == []
     # The rerun wrote no new checkpoint; only the stopped run's two remain.
@@ -14573,7 +14483,7 @@ def test_primary_stall_stop_does_not_count_an_interrupted_round(tmp_path):
     codex, claude, _base = _m1103_blocking_chain(1, 2, base=base)
     runner = _FakeRunner(claude_outputs=[fresh, claude[0]], codex_outputs=[codex[0]])
     config = _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=2)
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def interrupt_after_round_two_checkpoint(*args, **kwargs):
         result = real_post(*args, **kwargs)
@@ -14586,9 +14496,7 @@ def test_primary_stall_stop_does_not_count_an_interrupted_round(tmp_path):
             raise KeyboardInterrupt
         return result
 
-    with patch.object(
-        orchestrator_module,
-        "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment",
         side_effect=interrupt_after_round_two_checkpoint,
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -14597,7 +14505,7 @@ def test_primary_stall_stop_does_not_count_an_interrupted_round(tmp_path):
 
     runner.codex_outputs = [codex[1]]
     runner.claude_outputs = [claude[1]]
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     # The interrupted round's primary turn ran before the stop fired.
     assert _m1103_agent_calls(runner) == ["claude", "codex", "claude", "codex", "claude"]
@@ -14635,12 +14543,10 @@ def test_primary_stall_stop_is_suppressed_across_degraded_history(tmp_path):
     # The degraded round's ledger carries no prior item to disposition.
     codex, claude, _base = _m1103_blocking_chain(3, 4, base=base, resolve_first=False)
     rerun = _FakeRunner(issue_comments=history, codex_outputs=codex, claude_outputs=claude)
-    with patch.object(
-        orchestrator_module,
-        "log",
-        wraps=orchestrator_module.log,
+    with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "log",
+        wraps=agent_failure.log,
     ) as logged:
-        with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+        with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
             run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
     assert any(
         "stall stop suppressed: degraded planning history (invalid)" in str(call.args[-1])
@@ -14794,8 +14700,8 @@ def test_growth_gated_primary_approval_resets_the_stall_streak(tmp_path):
         # An active step-back episode would defer the stall stop (#1275).
         plan_step_back_rounds=0,
     )
-    with patch.object(orchestrator_module, "log", wraps=orchestrator_module.log) as logged:
-        with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+    with patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "log", wraps=agent_failure.log) as logged:
+        with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
             run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
 
     # Round 4 opened with the growth-gated approval: no reviewer and no panel
@@ -14854,7 +14760,7 @@ def test_zero_stall_threshold_runs_to_the_round_budget(tmp_path):
 
     with pytest.raises(AgentLoopError, match="still reported blocking plan issues") as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-    assert not isinstance(excinfo.value, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(excinfo.value, plan_first_loop_module.PlanPrePanelSafetyError)
     assert _m1103_agent_calls(runner).count("codex") == 3
     assert "gemini" not in _m1103_agent_calls(runner)
 
@@ -14905,7 +14811,7 @@ def _m1103_rounds(*states, start=1):
 
 
 def _m1103_streak(records, **kwargs):
-    return orchestrator_module.plan_primary_blocking_streak(
+    return panel_evidence.plan_primary_blocking_streak(
         records, primary="Codex", **kwargs
     )
 
@@ -15118,7 +15024,7 @@ def test_resume_after_a_narrative_only_patch_reconstructs_the_narrow_classificat
     config = _staged_plan_config(
         tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=8
     )
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
     audits = {"count": 0}
 
     def interrupt_before_remediation_checkpoint(*args, **kwargs):
@@ -15128,9 +15034,7 @@ def test_resume_after_a_narrative_only_patch_reconstructs_the_narrow_classificat
                 raise KeyboardInterrupt
         return real_post(*args, **kwargs)
 
-    with patch.object(
-        orchestrator_module,
-        "post_issue_comment",
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment",
         side_effect=interrupt_before_remediation_checkpoint,
     ):
         with pytest.raises(KeyboardInterrupt):
@@ -15152,7 +15056,7 @@ def test_run_windows_are_written_once_per_owning_run_and_survive_exceptions(tmp_
         seen["attribution"] = dict(runner.telemetry_attribution)
         raise AgentLoopError("stop")
 
-    monkeypatch.setattr(orchestrator_module, "resolve_base_branch", boom)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "resolve_base_branch", boom)
     with pytest.raises(AgentLoopError, match="stop"):
         run_issue_loop(runner, issue_number=56, config=make_config(tmp_path))
     records = list(load_records(telemetry_log_path()))
@@ -15170,13 +15074,13 @@ def test_nested_pr_phase_carries_pr_number_without_a_second_window(tmp_path):
     runner = _FakeRunner()
     config = make_config(tmp_path)
     context = SimpleNamespace(run_id="outer-run")
-    outer = orchestrator_module._begin_run_telemetry(runner, config, context, True, issue_number=56)
-    inner = orchestrator_module._begin_run_telemetry(runner, config, context, False, pr_number=99)
+    outer = validated_agent_module._begin_run_telemetry(runner, config, context, True, issue_number=56)
+    inner = validated_agent_module._begin_run_telemetry(runner, config, context, False, pr_number=99)
     assert runner.telemetry_attribution["run_id"] == "outer-run"
     assert (runner.telemetry_attribution["issue_number"], runner.telemetry_attribution["pr_number"]) == (56, 99)
-    orchestrator_module._end_run_telemetry(runner, inner)
+    validated_agent_module._end_run_telemetry(runner, inner)
     assert runner.telemetry_attribution["pr_number"] is None
-    orchestrator_module._end_run_telemetry(runner, outer)
+    validated_agent_module._end_run_telemetry(runner, outer)
     assert runner.telemetry_attribution is None
     kinds = [r["record"] for r in load_records(telemetry_log_path())]
     assert kinds == ["run-start", "run-end"]
@@ -15201,16 +15105,16 @@ def test_issue_to_pr_workflow_carries_outer_run_and_pr_number_through_a_real_att
         pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "abc123"},
     )
     config = make_config(tmp_path)
-    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
     seen = {}
 
     def nested_pr_phase(inner_runner, *, pr_number, config, usage_context, **_kwargs):
         # The real run_pr_loop attributes its phase exactly like this and then
         # its coder turn's broker runs the test command with the runner's
         # attribution snapshot.
-        token = orchestrator_module._begin_run_telemetry(
+        token = validated_agent_module._begin_run_telemetry(
             inner_runner, config, usage_context, False, pr_number=pr_number
         )
         try:
@@ -15220,11 +15124,11 @@ def test_issue_to_pr_workflow_carries_outer_run_and_pr_number_through_a_real_att
                 reservation_telemetry=ReservationTelemetry(telemetry_log_path(), attribution),
             )
         finally:
-            orchestrator_module._end_run_telemetry(inner_runner, token)
+            validated_agent_module._end_run_telemetry(inner_runner, token)
         seen["after_nested"] = dict(inner_runner.telemetry_attribution)
         return 0
 
-    monkeypatch.setattr(orchestrator_module, "run_pr_loop", nested_pr_phase)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop", nested_pr_phase)
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True) == 0
 
     records = list(load_records(telemetry_log_path()))
@@ -15248,12 +15152,12 @@ def test_other_owning_loops_write_run_end_on_exception(tmp_path, monkeypatch, lo
     def boom(*_a, **_k):
         raise AgentLoopError("stop")
 
-    monkeypatch.setattr(orchestrator_module, "resolve_base_branch", boom)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "resolve_base_branch", boom)
     with pytest.raises(AgentLoopError, match="stop"):
         if loop == "task":
-            orchestrator_module.run_task_loop(runner, task_text="do it", config=config)
+            issue_loop.run_task_loop(runner, task_text="do it", config=config)
         else:
-            orchestrator_module.run_discuss_loop(runner, issue_number=56, config=config)
+            discuss_loop.run_discuss_loop(runner, issue_number=56, config=config)
     assert [r["record"] for r in load_records(telemetry_log_path())] == ["run-start", "run-end"]
     assert runner.telemetry_attribution is None
 
@@ -15278,13 +15182,13 @@ def test_real_nested_pr_loop_runs_broker_attempt_with_outer_run_and_both_numbers
         pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "abc123"},
     )
     config = make_config(tmp_path)
-    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
     seen = {}
-    real_pr_loop = orchestrator_module.run_pr_loop
+    real_pr_loop = pr_loop.run_pr_loop
 
-    real_pr_context = orchestrator_module.get_pr_review_context
+    real_pr_context = pr_loop_support.get_pr_review_context
 
     def observed_pr_loop(*args, **kwargs):
         seen["in_pr_loop"] = True
@@ -15315,8 +15219,8 @@ def test_real_nested_pr_loop_runs_broker_attempt_with_outer_run_and_both_numbers
             broker.stop()
         raise AgentLoopError("stop after broker attempt")
 
-    monkeypatch.setattr(orchestrator_module, "run_pr_loop", observed_pr_loop)
-    monkeypatch.setattr(orchestrator_module, "get_pr_review_context", first_pr_read)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop", observed_pr_loop)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_pr_review_context", first_pr_read)
     with pytest.raises(AgentLoopError, match="stop after broker attempt"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)
 
@@ -15340,9 +15244,9 @@ def test_owning_pr_loop_writes_run_end_on_exception(tmp_path, monkeypatch):
     def boom(*_a, **_k):
         raise AgentLoopError("pr stop")
 
-    monkeypatch.setattr(orchestrator_module, "get_pr_review_context", boom)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_pr_review_context", boom)
     with pytest.raises(AgentLoopError, match="pr stop"):
-        orchestrator_module.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+        pr_loop.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
     records = list(load_records(telemetry_log_path()))
     assert [r["record"] for r in records] == ["run-start", "run-end"]
     assert records[0]["pr_number"] == 77 and records[0]["run_id"] == records[1]["run_id"]
@@ -15435,12 +15339,12 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
         pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "abc123"},
     )
     config = make_config(tmp_path, max_rounds=3)
-    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "merge_pr", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *_a, **_k: None)
     seen = {}
-    real_pr_loop = orchestrator_module.run_pr_loop
+    real_pr_loop = pr_loop.run_pr_loop
 
     def observed(*args, **kwargs):
         try:
@@ -15448,7 +15352,7 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
         finally:
             seen["after_nested"] = dict(runner.telemetry_attribution)
 
-    monkeypatch.setattr(orchestrator_module, "run_pr_loop", observed)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop", observed)
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True) == 0
 
     assert real_launches and real_launches[0][0] == 0 and "outcome=passed" in real_launches[0][1]
@@ -15483,7 +15387,7 @@ def test_pr_loop_writes_run_end_when_managed_label_cleanup_raises(tmp_path, monk
         calls.append(1)
         raise RuntimeError("label cleanup interrupted")
 
-    monkeypatch.setattr(orchestrator_module, "release_adopted_managed_ci", boom)
+    monkeypatch.setattr(pr_loop, "release_adopted_managed_ci", boom)
 
     with pytest.raises(RuntimeError, match="label cleanup interrupted"):
         _m1047_run_pr_loop(runner, pr_number=77, config=config)
@@ -15593,7 +15497,7 @@ def test_issue_edit_with_blocking_primary_opens_no_panel(tmp_path):
         codex_outputs=codex,
         claude_outputs=claude,
     )
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
         run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
     # Two new blocking rounds ran under the new text, then the stop re-tripped.
     assert _m1103_agent_calls(rerun) == ["codex", "claude", "codex", "claude"]
@@ -15620,7 +15524,7 @@ def test_unchanged_issue_with_new_comment_still_stops(tmp_path):
         config,
         comments=[{"author": "operator", "body": "Please narrow the scope."}],
     )
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert _m1103_agent_calls(rerun) == []
     assert "a comment alone does not" in str(error)
     assert len(_plan_round_records(rerun)) == before
@@ -15628,7 +15532,7 @@ def test_unchanged_issue_with_new_comment_still_stops(tmp_path):
 
 def test_legacy_undigested_rounds_keep_counting_and_name_the_reset_flag(tmp_path):
     """`legacy-undigested`."""
-    with patch.object(orchestrator_module, "plan_issue_text_digest", lambda _ctx: None):
+    with patch_object_in((panel_evidence, plan_first_loop_module, issue_loop), "plan_issue_text_digest", lambda _ctx: None):
         runner, config, _error = _m1103_stalled_runner(tmp_path, threshold=2)
     history = list(runner.issue_comments)
     assert all(
@@ -15638,7 +15542,7 @@ def test_legacy_undigested_rounds_keep_counting_and_name_the_reset_flag(tmp_path
     rerun, error = _m1112_rerun(
         history, config, issue_payload={"body": "Edited after the stall."}
     )
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert _m1103_agent_calls(rerun) == []
     assert "predate issue-text tracking" in str(error)
     assert "--plan-reset-stall-streak" in str(error)
@@ -15647,7 +15551,7 @@ def test_legacy_undigested_rounds_keep_counting_and_name_the_reset_flag(tmp_path
 def _m1112_crash_at_checkpoint(history, config, *, after_post):
     """A flagged run killed at its first scheduler checkpoint post."""
     runner = _FakeRunner(issue_comments=list(history), **_m1112_approvals())
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def crashing_post(*args, **kwargs):
         if "Plan review scheduling audit" in str(kwargs.get("body", "")):
@@ -15656,7 +15560,7 @@ def _m1112_crash_at_checkpoint(history, config, *, after_post):
             raise KeyboardInterrupt("simulated crash at the prelaunch checkpoint")
         return real_post(*args, **kwargs)
 
-    with patch.object(orchestrator_module, "post_issue_comment", crashing_post):
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", crashing_post):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     return runner
@@ -15682,7 +15586,7 @@ def test_reset_flag_durably_retires_the_streak(tmp_path):
     flagged = _FakeRunner(
         issue_comments=list(history), codex_outputs=codex, claude_outputs=claude
     )
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
         run_issue_loop(
             flagged,
             issue_number=56,
@@ -15700,7 +15604,7 @@ def test_reset_flag_durably_retires_the_streak(tmp_path):
     # A flagless rerun of that history stops again only because N new blocking
     # rounds followed the reset checkpoint, never the two older ones.
     later = _FakeRunner(issue_comments=list(flagged.issue_comments))
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
         run_issue_loop(later, issue_number=56, config=config, plan_first=True)
     assert _m1103_agent_calls(later) == []
 
@@ -15716,7 +15620,7 @@ def test_reset_interrupted_before_checkpoint_stops_again(tmp_path):
     assert not any(r.scheduler_stall_reset for r in _plan_round_records(crashed))
 
     rerun, error = _m1112_rerun(crashed.issue_comments, config)
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert "blocked 2" in str(error)
     assert _m1103_agent_calls(rerun) == []
 
@@ -15734,7 +15638,7 @@ def test_reset_interrupted_after_checkpoint_resumes_the_primary_review(tmp_path)
 
     rerun, error = _m1112_rerun(crashed.issue_comments, config, **_m1112_approvals())
     assert not (
-        isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+        isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
         and "blocked" in str(error)
     )
     assert "codex" in _m1103_agent_calls(rerun)
@@ -15760,7 +15664,7 @@ def test_streak_ends_at_a_digest_mismatch_and_reaccumulates():
     for number, digest in ((1, "a" * 16), (2, "a" * 16), (3, "b" * 16), (4, "b" * 16)):
         records.append(_m1112_digest_record(len(records), number, digest))
         records.append(_m1103_review(len(records), number, "blocking"))
-    detail = orchestrator_module.plan_primary_blocking_streak_detail
+    detail = panel_evidence.plan_primary_blocking_streak_detail
     assert detail(records, primary="Codex", current_issue_digest="b" * 16).count == 2
     assert detail(records, primary="Codex", current_issue_digest="a" * 16).count == 0
     # No current digest: nothing can mismatch.
@@ -15770,7 +15674,7 @@ def test_streak_ends_at_a_digest_mismatch_and_reaccumulates():
 
 def test_absent_digest_counts_and_is_flagged_legacy():
     records = _m1103_rounds("blocking", "blocking")
-    detail = orchestrator_module.plan_primary_blocking_streak_detail(
+    detail = panel_evidence.plan_primary_blocking_streak_detail(
         records, primary="Codex", current_issue_digest="c" * 16
     )
     assert detail.count == 2 and detail.legacy_undigested
@@ -15778,7 +15682,7 @@ def test_absent_digest_counts_and_is_flagged_legacy():
 
 def test_mixed_history_flags_legacy_only_when_the_newest_round_is_undigested():
     """An edit ends the streak at a newer digested round; no reset is needed."""
-    detail = orchestrator_module.plan_primary_blocking_streak_detail
+    detail = panel_evidence.plan_primary_blocking_streak_detail
     old = _m1103_rounds("blocking", "blocking")
     records = list(old)
     records.append(_m1112_digest_record(len(records), 3, "a" * 16))
@@ -15801,8 +15705,8 @@ def test_mixed_history_flags_legacy_only_when_the_newest_round_is_undigested():
 
 def test_mixed_history_warns_only_when_undigested_rounds_alone_reach_threshold():
     """Older digested round then a newer undigested one: an edit still clears."""
-    detail = orchestrator_module.plan_primary_blocking_streak_detail
-    message = orchestrator_module.plan_primary_stall_message
+    detail = panel_evidence.plan_primary_blocking_streak_detail
+    message = panel_evidence.plan_primary_stall_message
     threshold = 2
     records = [
         _m1112_digest_record(0, 1, "a" * 16),
@@ -15875,7 +15779,7 @@ def test_reset_checkpoint_is_a_boundary_with_or_without_a_review():
 
 
 def test_stall_message_names_every_working_remedy():
-    message = orchestrator_module.plan_primary_stall_message(
+    message = panel_evidence.plan_primary_stall_message(
         streak=8, threshold=8, plan_chars=90212
     )
     for needle in (
@@ -15888,12 +15792,12 @@ def test_stall_message_names_every_working_remedy():
     ):
         assert needle in message
     assert "predate issue-text tracking" not in message
-    legacy = orchestrator_module.plan_primary_stall_message(
+    legacy = panel_evidence.plan_primary_stall_message(
         streak=8, threshold=8, plan_chars=1, legacy_undigested=True
     )
     assert "predate issue-text tracking" in legacy
     assert "Plan step-back did not apply" not in message
-    suffixed = orchestrator_module.plan_primary_stall_message(
+    suffixed = panel_evidence.plan_primary_stall_message(
         streak=8, threshold=8, plan_chars=1, step_back_status="plan-growth gate is off"
     )
     assert suffixed.endswith(" Plan step-back did not apply: plan-growth gate is off.")
@@ -16068,7 +15972,7 @@ def _issue_level_run_1229(tmp_path, outputs, **config_overrides):
         tmp_path, execution_strategy_contract_required=True, quiet=False, **config_overrides
     )
     repair_calls = []
-    real_repair = orchestrator_module._run_structured_repair
+    real_repair = validated_agent_module._run_structured_repair
 
     def spy(*args, **kwargs):
         repair_calls.append(args)
@@ -16082,14 +15986,14 @@ def _run_issue_level_1229(tmp_path, monkeypatch, outputs, retries=0):
         tmp_path, outputs, agent_max_retries=retries
     )
     posted = []
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def capture(_runner, *, config, issue_number, body):
         posted.append(str(body))
         return real_post(_runner, config=config, issue_number=issue_number, body=body)
 
-    monkeypatch.setattr(orchestrator_module, "_run_structured_repair", spy)
-    monkeypatch.setattr(orchestrator_module, "post_issue_comment", capture)
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair", spy)
+    patch_attr_in(monkeypatch, (architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", capture)
     # Later stages have no scripted output; only the planning turn is under test.
     with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
@@ -16273,36 +16177,31 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
         pytest.fail("a citation re-ask must not invoke structured repair")
 
     run_pr_calls = []
-    monkeypatch.setattr(orchestrator_module, "run_agent_result", fake_run_agent_result)
-    monkeypatch.setattr(orchestrator_module, "_run_structured_repair", forbid_repair)
-    monkeypatch.setattr(
-        orchestrator_module, "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (validated_agent_module, response_validation), "run_agent_result", fake_run_agent_result)
+    patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop_module), "_run_structured_repair", forbid_repair)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "sync_coder_base_before_implementation", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "validate_assigned_head_advanced", lambda **_k: None
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "validate_assigned_head_advanced", lambda **_k: None
     )
-    monkeypatch.setattr(
-        orchestrator_module, "run_pr_loop",
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop",
         lambda *_a, **kwargs: run_pr_calls.append(kwargs) or 0,
     )
     monkeypatch.setattr(
-        orchestrator_module, "reconcile_test_observations",
+        response_validation, "reconcile_test_observations",
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
     monkeypatch.setattr(
-        orchestrator_module, "stable_tracked_tree_snapshot",
+        response_validation, "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head="abc123", tracked_digest="tree-current", complete=True,
             stable=True, status_clean=True,
         ),
     )
-    result = orchestrator_module._implement_approved_issue(
+    result = issue_implementation._implement_approved_issue(
         runner,
         issue_number=56,
         approved_plan=approved_plan,
@@ -16310,7 +16209,7 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
         memory=None,
         issue_context=issue_context,
         coder_session_id=None,
-        usage_context=orchestrator_module._new_usage_context(config),
+        usage_context=validated_agent_module._new_usage_context(config),
         approved_plan_context=plan_context,
     )
 
@@ -16445,7 +16344,7 @@ def test_crossed_plan_gets_the_step_back_prompt_at_exactly_the_kth_new_block(tmp
         tmp_path, last_round=5, max_rounds=5, plan_step_back_escalation_rounds=5
     )
 
-    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     planner = _m1251_prompts(runner, "claude")
     # fresh plan, then the revisions after rounds 1, 2, 3 and 4.
     assert len(planner) == 5
@@ -16484,7 +16383,7 @@ def test_crossed_plan_gets_the_step_back_prompt_under_review_parallel(tmp_path):
         review_parallel=True,
     )
 
-    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     records = _plan_round_records(runner)
     # The primary's reviewer records really take the parallel (provisional) path.
     primary = [r for r in records if r.role == "reviewer" and r.agent == "Codex"]
@@ -16566,7 +16465,7 @@ def test_zero_step_back_rounds_restores_todays_behaviour(tmp_path):
         plan_step_back_escalation_rounds=1,
     )
 
-    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert not any(_STEP_BACK_MARKER in prompt for prompt in _m1251_prompts(runner, "claude"))
     assert all(record.step_back_entries == () for record in _plan_round_records(runner))
 
@@ -16575,7 +16474,7 @@ def test_a_rejected_step_back_stops_for_a_human_decision_before_the_stall_limit(
     """`plan-escalation-m-blocks`: the M-th block stops with no further planner turn."""
     runner, error = _m1251_run(tmp_path, last_round=6, max_rounds=8)
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     message = str(error)
     assert message.startswith("human decision required")
     assert "stepped back at round 5" in message
@@ -16607,7 +16506,7 @@ def test_m_equal_one_stops_as_soon_as_the_step_back_candidate_is_rejected(tmp_pa
         tmp_path, last_round=5, max_rounds=8, plan_step_back_escalation_rounds=1
     )
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert "blocked 1 round(s)" in str(error)
     assert _m1103_agent_calls(runner)[-2:] == ["claude", "codex"]
     assert len(_m1251_prompts(runner, "claude")) == 5
@@ -16622,7 +16521,7 @@ def test_an_active_step_back_episode_defers_the_stall_stop_until_the_escalation_
         plan_step_back_escalation_rounds=5,
     )
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert "human decision required" in str(error)
     assert "blocked 5 round(s)" in str(error)
     assert "blocked 5 consecutive primary-phase" not in str(error)
@@ -16641,7 +16540,7 @@ def _m1275_history(tmp_path):
     runner, error = _m1251_run(
         tmp_path, last_round=4, max_rounds=8, plan_step_back_rounds=3
     )
-    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert not any(
         record.step_back_entries for record in _plan_round_records(runner)
     )
@@ -16702,7 +16601,7 @@ def test_stalled_step_back_eligible_history_gets_its_step_back_on_resume(
         plan_primary_stall_rounds=stall_rounds,
     )
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert "human decision required" in str(error)
     assert "blocked 2 round(s)" in str(error)
     assert any("stall stop deferred: pending plan step-back" in m for m in messages)
@@ -16747,13 +16646,13 @@ def test_resume_with_a_rejected_episode_stops_with_the_human_decision(tmp_path):
     first, first_error = _m1251_run(
         tmp_path, last_round=6, max_rounds=8, plan_step_back_escalation_rounds=5
     )
-    assert not isinstance(first_error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(first_error, plan_first_loop_module.PlanPrePanelSafetyError)
     rerun, error, _messages = _m1275_resume(
         tmp_path, list(first.issue_comments), plan_primary_stall_rounds=4,
         max_rounds=8,
     )
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert "human decision required" in str(error)
     assert "consecutive primary-phase" not in str(error)
     assert _m1103_agent_calls(rerun) == []
@@ -16766,7 +16665,7 @@ def test_resume_without_a_crossing_keeps_the_stall_stop_and_names_the_reason(tmp
         tmp_path, history, plan_primary_stall_rounds=4, plan_growth_max_revisions=99,
     )
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert "blocked 4 consecutive primary-phase" in str(error)
     assert (
         "Plan step-back did not apply: the current candidate crosses no plan-growth "
@@ -16805,7 +16704,7 @@ def test_a_spent_deferral_is_not_granted_again(tmp_path):
             tmp_path, history, plan_primary_stall_rounds=4, plan_step_back_rounds=2,
         )
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert "blocked 4 consecutive primary-phase" in str(error)
     assert "already deferred at round 4" in str(error)
     assert _m1103_agent_calls(rerun) == []
@@ -16827,7 +16726,7 @@ def test_a_crash_after_the_deferred_review_resumes_into_the_step_back(tmp_path):
         plan_primary_stall_rounds=4,
     )
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert _m1103_agent_calls(resumed)[0] == "claude"
     assert _STEP_BACK_MARKER in _m1251_prompts(resumed, "claude")[0]
     assert _m1251_coder_record(resumed, 6).step_back_entries
@@ -16869,7 +16768,7 @@ def test_a_reached_stall_names_why_the_step_back_did_not_apply(
             tmp_path, history, plan_primary_stall_rounds=4, **overrides
         )
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert "blocked 4 consecutive primary-phase" in str(error)
     assert f"Plan step-back did not apply: {reason}" in str(error)
     assert _m1103_agent_calls(rerun) == []
@@ -16882,7 +16781,7 @@ def test_resume_after_the_step_back_turn_issues_no_second_step_back_and_keeps_th
     """`plan-resume-after-step-back`, `plan-episode-new-repeat-new` (resume)."""
     # The first process dies before the round-5 review of the step-back candidate.
     first, first_error = _m1251_run(tmp_path, last_round=4, max_rounds=8)
-    assert not isinstance(first_error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(first_error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert _m1251_coder_record(first, 5).step_back_entries
     history = list(first.issue_comments)
 
@@ -16896,7 +16795,7 @@ def test_resume_after_the_step_back_turn_issues_no_second_step_back_and_keeps_th
     config = _staged_plan_config(
         tmp_path, max_rounds=8, plan_growth_max_chars=4500, plan_growth_max_revisions=3
     )
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
 
     # Round 5's block is the first since the step-back and round 6's the second.
@@ -16935,7 +16834,7 @@ def test_step_back_state_is_suppressed_for_a_malformed_entry_without_crashing(tm
             tmp_path, last_round=5, max_rounds=5, plan_step_back_escalation_rounds=1
         )
 
-    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert not any(_STEP_BACK_MARKER in prompt for prompt in _m1251_prompts(runner, "claude"))
     assert any("step-back suppressed" in str(call.args[-1]) for call in logged.call_args_list)
 
@@ -16982,7 +16881,7 @@ def test_the_mth_block_at_max_rounds_still_posts_the_human_decision_diagnostic(t
     """The stop is evaluated before the generic max-rounds exit."""
     runner, error = _m1251_run(tmp_path, last_round=6, max_rounds=6)
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     assert str(error).startswith("human decision required")
     assert "stepped back at round 5" in str(error)
     # No planner turn after the M-th block, and the plain diagnostic was posted.
@@ -17001,7 +16900,7 @@ def test_round_start_step_back_stop_is_independent_of_the_stall_threshold(tmp_pa
         tmp_path, last_round=6, max_rounds=8, plan_primary_stall_rounds=0,
         plan_step_back_escalation_rounds=5,
     )
-    assert not isinstance(first_error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(first_error, plan_first_loop_module.PlanPrePanelSafetyError)
     # Rounds 5 and 6 blocked since the step-back; candidate 7 is published unreviewed.
     history = list(first.issue_comments)
     assert _m1251_coder_record(first, 7)
@@ -17011,7 +16910,7 @@ def test_round_start_step_back_stop_is_independent_of_the_stall_threshold(tmp_pa
         tmp_path, max_rounds=8, plan_growth_max_chars=4500, plan_growth_max_revisions=3,
         plan_primary_stall_rounds=0, plan_step_back_escalation_rounds=2,
     )
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
 
     assert "blocked 2 round(s)" in str(excinfo.value)
@@ -17055,7 +16954,7 @@ def test_new_repeat_new_after_a_step_back_counts_all_three_blocks_live(tmp_path)
     """`plan-episode-new-repeat-new` (live): one step-back, stop on the third block."""
     claude, codex = _m1251_new_repeat_new_script()
     runner = _FakeRunner(claude_outputs=claude, codex_outputs=codex)
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         run_issue_loop(
             runner, issue_number=56, config=_m1251_new_repeat_new_config(tmp_path),
             plan_first=True,
@@ -17091,7 +16990,7 @@ def test_new_repeat_new_after_a_step_back_counts_all_three_blocks_on_resume(tmp_
         issue_comments=list(first.issue_comments), claude_outputs=claude[6:],
         codex_outputs=codex[5:],
     )
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         run_issue_loop(
             rerun, issue_number=56, config=_m1251_new_repeat_new_config(tmp_path),
             plan_first=True,
@@ -17162,7 +17061,7 @@ def _m1251_edit_resume(tmp_path, *, drop_round5_checkpoint):
         tmp_path, max_rounds=8, plan_growth_max_chars=4500, plan_growth_max_revisions=3,
         plan_step_back_escalation_rounds=1, plan_resume_keep_on_issue_edit=True,
     )
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
     return rerun, str(excinfo.value)
 
@@ -17265,7 +17164,7 @@ def test_staged_plan_under_plan_only_stops_on_round_one(tmp_path, policy):
         else make_config(tmp_path, reviewer=("codex", "gemini"))
     )
 
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     message = str(excinfo.value)
@@ -17284,7 +17183,7 @@ def test_staged_plan_under_implement_one_shot_stops_with_the_phase_remedies(tmp_
         tmp_path, reviewer=("codex", "gemini"), plan_execution_mode="implement-one-shot"
     )
 
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert "implement-by-phase" in str(excinfo.value)
@@ -17367,7 +17266,7 @@ def test_narrow_staged_blocking_primary_reaches_a_directive_revision_then_stops(
         tmp_path, max_rounds=8, plan_primary_stall_rounds=1, plan_narrow_staged=True
     )
 
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="staged plan under"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="staged plan under"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
 
     assert _m1103_agent_calls(runner) == ["claude", "codex", "claude"]
@@ -17478,7 +17377,7 @@ def _m1268_stalled_staged_history(tmp_path, *, record_mode):
     config = _staged_plan_config(
         tmp_path, max_rounds=8, plan_primary_stall_rounds=2, plan_execution_mode="decompose-only"
     )
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     return _m1268_rewrite_modes(list(runner.issue_comments), record_mode), config
 
@@ -17553,7 +17452,7 @@ def test_resume_under_a_changed_mode_retires_the_stall_streak(tmp_path):
 def test_resume_without_a_mode_change_still_stalls(tmp_path):
     history, config = _m1268_stalled_staged_history(tmp_path, record_mode="decompose-only")
     rerun = _FakeRunner(issue_comments=list(history))
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="blocked 2"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="blocked 2"):
         run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
     assert _m1103_agent_calls(rerun) == []
 
@@ -17563,7 +17462,7 @@ def test_resume_over_legacy_unrecorded_history_names_the_reset_flag(tmp_path):
     history, config = _m1268_stalled_staged_history(tmp_path, record_mode=None)
 
     rerun = _FakeRunner(issue_comments=list(history))
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError) as excinfo:
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError) as excinfo:
         run_issue_loop(rerun, issue_number=56, config=config, plan_first=True)
     assert "--plan-reset-stall-streak" in str(excinfo.value)
     assert _m1103_agent_calls(rerun) == []
@@ -17618,7 +17517,7 @@ def test_staged_candidate_with_a_carried_primary_approval_stops_without_new_reco
     resumed = _FakeRunner(issue_comments=list(history))
     config = _staged_plan_config(tmp_path, max_rounds=8)
 
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="staged plan under"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="staged plan under"):
         run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
 
     assert _m1103_agent_calls(resumed) == []
@@ -17636,7 +17535,7 @@ def test_narrow_staged_with_a_carried_primary_approval_schedules_no_panel(tmp_pa
     )
     config = _staged_plan_config(tmp_path, max_rounds=8, plan_narrow_staged=True)
 
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="staged plan under"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="staged plan under"):
         run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
 
     # Only the narrowing revision ran: no reviewer, then the still-staged stop.
@@ -17657,7 +17556,7 @@ def test_narrow_staged_with_carried_complete_approvals_does_not_approve(tmp_path
     )
     config = _staged_plan_config(tmp_path, max_rounds=8, plan_narrow_staged=True)
 
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="staged plan under"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="staged plan under"):
         run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
 
     assert _m1103_agent_calls(resumed) == ["claude"]
@@ -17678,7 +17577,7 @@ def test_streak_ends_at_an_execution_mode_mismatch_and_missing_modes_count():
             )
         )
         records.append(_m1103_review(len(records), number, "blocking"))
-    detail = orchestrator_module.plan_primary_blocking_streak_detail
+    detail = panel_evidence.plan_primary_blocking_streak_detail
     # Newest first: round 4 (no mode) counts, round 3 matches, round 2 ends it.
     assert detail(records, primary="Codex", current_execution_mode="decompose-only").count == 2
     assert detail(records, primary="Codex", current_execution_mode="plan-only").count == 1
@@ -17717,7 +17616,7 @@ def test_narrow_staged_flat_board_resume_over_complete_approvals_does_not_approv
     )
     config = make_config(tmp_path, reviewer=("codex", "gemini"), plan_narrow_staged=True)
 
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError, match="staged plan under"):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError, match="staged plan under"):
         run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
 
     # The flat board re-reviews every round (nothing is carried); the approving
@@ -18018,7 +17917,7 @@ def test_episode_anchor_reaches_reviewer_and_planner_prompts_after_the_step_back
         tmp_path, last_round=7, max_rounds=9, plan_step_back_escalation_rounds=5
     )
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError) or error
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError) or error
     planner = _m1251_prompts(runner, "claude")
     codex = _m1251_prompts(runner, "codex")
     # Planner: fresh, p1, justification, p3, step-back turn (no anchor), then anchored.
@@ -18051,7 +17950,7 @@ def test_prompts_carry_no_anchor_without_a_step_back_episode(tmp_path):
 def test_post_review_stop_reports_the_anchor_and_truthful_timing(tmp_path):
     runner, error = _m1251_run(tmp_path, last_round=6, max_rounds=8)
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     message = str(error)
     assert "Dissolved by the step-back:" in message
     assert "none declared (undeclared reintroductions are not detected)" in message
@@ -18080,7 +17979,7 @@ def test_post_review_stop_lists_a_declared_reintroduction(tmp_path):
         claude_transform=declare,
     )
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     message = str(error)
     assert "[item-4] at round 7 (needs a synchronous close)" in message
     assert "none declared" not in message
@@ -18111,7 +18010,7 @@ def test_round_start_stop_after_a_post_review_stop_reports_the_declaration(tmp_p
         tmp_path, last_round=7, max_rounds=12, plan_step_back_escalation_rounds=9,
         claude_transform=_m1278_declaring_transform,
     )
-    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     history = list(first.issue_comments)
     before = len(_plan_round_records(first))
 
@@ -18119,7 +18018,7 @@ def test_round_start_stop_after_a_post_review_stop_reports_the_declaration(tmp_p
         tmp_path, history, plan_step_back_escalation_rounds=2, max_rounds=12,
     )
 
-    assert isinstance(stop, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(stop, plan_first_loop_module.PlanPrePanelSafetyError)
     message = str(stop)
     assert "[item-4] at round 7 (needs a synchronous close)" in message
     assert "No reviewer and no planner turn were invoked." in message
@@ -18133,7 +18032,7 @@ def _m1278_episode_history(tmp_path):
     first, error = _m1251_run(
         tmp_path, last_round=7, max_rounds=12, plan_step_back_escalation_rounds=9,
     )
-    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     return list(first.issue_comments)
 
 
@@ -18307,7 +18206,7 @@ def test_post_review_stop_keeps_its_checkpoint_and_writes_nothing_later(tmp_path
     """`stop-post-review-with-reintroduction`: checkpoint present, nothing after it."""
     runner, error = _m1251_run(tmp_path, last_round=6, max_rounds=8)
 
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     records = _plan_round_records(runner)
     assert any(
         r.phase == "scheduler-prelaunch" and r.round_number == 6 for r in records
@@ -18386,7 +18285,7 @@ def test_stall_escalated_stop_reports_the_declared_reversal_before_launch(tmp_pa
         tmp_path, last_round=7, max_rounds=12, plan_step_back_escalation_rounds=9,
         claude_transform=_m1278_declaring_transform,
     )
-    assert not isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert not isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
     history = list(first.issue_comments)
     before = len(_plan_round_records(first))
 
@@ -18406,7 +18305,7 @@ def test_stall_escalated_stop_reports_the_declared_reversal_before_launch(tmp_pa
             plan_primary_stall_rounds=2, max_rounds=12,
         )
 
-    assert isinstance(stop, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(stop, plan_first_loop_module.PlanPrePanelSafetyError)
     message = str(stop)
     assert "[item-4] at round 7 (needs a synchronous close)" in message
     assert "No reviewer and no planner turn were invoked." in message
@@ -18655,7 +18554,7 @@ def test_inherited_guard_revision_after_an_episode_closed_by_approval_has_no_anc
         codex_outputs=[_m936_cpp.structured_plan_review(state="approved")],
         gemini_outputs=[approve_gemini],
     )
-    assert orchestrator_module.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         first, issue_number=56, config=config(), plan_first=True
     ) == 0
     history = _m1278_inject_step_back_entry(list(first.issue_comments))
@@ -18685,7 +18584,7 @@ def test_inherited_guard_revision_after_an_episode_closed_by_approval_has_no_anc
     with patch.object(
         plan_first_loop_module, "log", wraps=plan_first_loop_module.log
     ) as logged:
-        assert orchestrator_module.run_issue_loop(
+        assert issue_loop.run_issue_loop(
             resumed, issue_number=56, config=config(), plan_first=True
         ) == 0
 
@@ -18711,17 +18610,16 @@ def test_staged_direct_child_rerun_after_interrupted_integration_close_finishes_
     def forbidden(*_a, **_k):
         raise AssertionError("no agent, memory, dispatch or review may start")
 
-    monkeypatch.setattr(
-        orchestrator_module, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 42 else parent,
     )
-    monkeypatch.setattr(orchestrator_module, "validate_open_issue", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator_module, "ensure_agent_workdirs", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator_module, "_freeze_prompt_architecture", lambda _r, config: config)
-    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: fresh)
-    monkeypatch.setattr(orchestrator_module, "prepare_agent_memory", forbidden)
-    monkeypatch.setattr(orchestrator_module, "_dispatch_decomposition_child", forbidden)
-    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", forbidden)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "validate_open_issue", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "ensure_agent_workdirs", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (architecture_contract, pr_loop, issue_implementation, issue_loop), "_freeze_prompt_architecture", lambda _r, config: config)
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop), "_resolve_fresh_child_provenance", lambda **_: fresh)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", forbidden)
+    patch_attr_in(monkeypatch, (plan_first_loop_module, issue_loop), "_dispatch_decomposition_child", forbidden)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", forbidden)
     monkeypatch.setattr(
         handoff_module, "authenticate_canonical_issue_pr",
         lambda *a, **k: SimpleNamespace(pr_number=7, state="MERGED"),
@@ -18846,10 +18744,10 @@ def test_workflow_managed_ci_authenticates_before_reask_and_again_before_publica
         events.append(("authenticate", kwargs["metadata"].head_sha))
         return handoff
 
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
-    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", authenticate)
     monkeypatch.setattr(
-        orchestrator_module, "publish_issue_created_authorization",
+        issue_implementation, "publish_issue_created_authorization",
         lambda *_a, **kwargs: events.append(("publish", kwargs["metadata"].head_sha)) or handoff,
     )
 
@@ -18882,10 +18780,10 @@ def test_workflow_managed_ci_auth_failure_blocks_any_coverage_invocation(tmp_pat
     def reject(*_a, **_k):
         raise AgentLoopError("managed handoff rejected")
 
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
-    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", reject)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", reject)
     monkeypatch.setattr(
-        orchestrator_module, "publish_issue_created_authorization",
+        issue_implementation, "publish_issue_created_authorization",
         lambda *_a, **_k: published.append(1),
     )
     h.script = [h.response(response_text(claims=[claim("row-wf")]))]
@@ -18927,7 +18825,7 @@ def test_workflow_every_real_acceptance_path_reaches_the_single_coverage_reask(t
     h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, claude_outputs=outputs)
     if path == "repair":
         monkeypatch.setattr(
-            orchestrator_module, "attempt_repair",
+            validated_agent_module, "attempt_repair",
             lambda raw, *a, **k: repair_calls.append(k.get("expected_kind")) or incomplete,
         )
     if path == "failed-exit-artifact":
@@ -19049,10 +18947,10 @@ def test_workflow_discarded_or_failed_reask_after_mutation_publishes_only_refres
             events.append(("authenticate", head))
             return replace(_managed_issue_handoff(nonce=nonce), head_sha=head)
 
-        monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
-        monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
+        patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+        patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", authenticate)
         monkeypatch.setattr(
-            orchestrator_module, "publish_issue_created_authorization",
+            issue_implementation, "publish_issue_created_authorization",
             lambda *_a, **kw: events.append(("publish", kw["metadata"].head_sha)) or kw["handoff"],
         )
 
@@ -19096,9 +18994,9 @@ def test_workflow_refreshed_guard_failure_fails_closed_for_managed_ci(tmp_path, 
             raise AgentLoopError("refreshed managed handoff rejected")
         return _managed_issue_handoff(nonce=nonce)
 
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
-    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", authenticate)
-    monkeypatch.setattr(orchestrator_module, "publish_issue_created_authorization", lambda *_a, **_k: published.append(1))
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", authenticate)
+    monkeypatch.setattr(issue_implementation, "publish_issue_created_authorization", lambda *_a, **_k: published.append(1))
     h.script = [h.response(response_text(claims=[claim("row-wf")])), lambda harness: harness.response(response_text(claims=[claim("row-wf")]))]
     with pytest.raises(AgentLoopError, match="refreshed managed handoff rejected"):
         h.run()
@@ -19186,7 +19084,7 @@ def test_workflow_envelope_normalization_reaches_the_single_coverage_reask(tmp_p
     h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, claude_outputs=[reversed_envelope, ok, ok])
     repair_calls = []
     monkeypatch.setattr(
-        orchestrator_module, "attempt_repair",
+        validated_agent_module, "attempt_repair",
         lambda raw, *a, **k: repair_calls.append(1) or incomplete,
     )
     normalized = []
@@ -19355,13 +19253,13 @@ def test_issue_changes_during_acknowledgement_repair_never_reach_approval(
         serve_rest_issue_comments=True, authenticated_actor=("agent-loop", 4242),
     )
     requirements = [requirement]
-    real_get_issue_context = orchestrator_module.get_issue_context
+    real_get_issue_context = discuss_loop.get_issue_context
 
     def _patched(runner_arg, *, config, issue_number):
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=tuple(requirements))
 
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
 
     def operator_comment(body):
         runner.issue_comments.append({
@@ -19405,7 +19303,7 @@ def test_issue_changes_during_acknowledgement_repair_never_reach_approval(
         tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
         agent_max_retries=0, agent_retry_backoff_seconds=0,
     )
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
         with pytest.raises(AgentLoopError, match=refusal):
             run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     codex_records = [
@@ -19426,7 +19324,7 @@ def test_issue_changes_during_acknowledgement_repair_never_reach_approval(
         # repairs, so this one-round rerun then stops at its round budget.)
         event = "none"
         start_commands, start_comments = len(runner.commands), len(runner.issue_comments)
-        with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake_repair):
+        with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
             with pytest.raises(AgentLoopError):
                 run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
         assert not any(
@@ -19915,7 +19813,7 @@ def _m1390_staged_stalled_history(tmp_path):
     codex, claude, _base = _m1103_blocking_chain(1, 2, base=base)
     runner = _m1390_runner(claude_outputs=[fresh, *claude], codex_outputs=codex)
     config = _staged_plan_config(tmp_path, max_rounds=8, plan_primary_stall_rounds=2)
-    with pytest.raises(orchestrator_module.PlanPrePanelSafetyError):
+    with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     return list(runner.issue_comments), config
 
@@ -19933,7 +19831,7 @@ def test_m1390_rescope_isolates_staged_scheduler_history(tmp_path):
     assert archived_avoided >= 2
     # Without the rescope, the archived streak trips the stall stop at once.
     stalled, error, _messages = _m1390_rerun(tmp_path, history, config=config)
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
 
     runner, result, messages = _m1390_rerun(
         tmp_path, history, config=config, issue_payload=_M1390_EDIT,
@@ -20129,13 +20027,13 @@ def test_m1390_below_floor_board_is_refused_before_the_boundary(tmp_path):
     # Plan startup refuses on its own too, before posting the boundary.
     loop_runner = _m1390_runner(history, issue_payload=_M1390_EDIT)
     with pytest.raises(AgentLoopError, match="plan reviewer board"):
-        orchestrator_module._run_plan_first_loop(
+        plan_first_loop_module._run_plan_first_loop(
             loop_runner,
             issue_number=56,
             config=shrunk,
             memory=None,
             issue_context=get_issue_context(loop_runner, config=shrunk, issue_number=56),
-            usage_context=orchestrator_module._new_usage_context(shrunk),
+            usage_context=validated_agent_module._new_usage_context(shrunk),
         )
     assert _m1390_boundaries(loop_runner) == []
     assert _m1103_agent_calls(loop_runner) == []
@@ -20328,7 +20226,7 @@ def test_m1390_rescope_never_inherits_archived_step_back_stall_or_growth_count(t
         plan_step_back_escalation_rounds=1, plan_primary_stall_rounds=3,
     )
     stopped, error, _messages = _m1390_rerun(tmp_path, history, config=config)
-    assert isinstance(error, orchestrator_module.PlanPrePanelSafetyError)
+    assert isinstance(error, plan_first_loop_module.PlanPrePanelSafetyError)
 
     runner, result, _messages = _m1390_rerun(
         tmp_path, history, config=config, issue_payload=_M1390_EDIT,
@@ -20379,7 +20277,7 @@ def test_m1390_pending_amendment_activates_at_the_fresh_scope_start(tmp_path):
     pending = _m1390_runner(list(history_runner.issue_comments))
     _m943_post_amendment(pending, effective_from_round=4)
     history = list(pending.issue_comments)
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def stop_after_audit(*args, **kwargs):
         result = real_post(*args, **kwargs)
@@ -20388,7 +20286,7 @@ def test_m1390_pending_amendment_activates_at_the_fresh_scope_start(tmp_path):
         return result
 
     crashed = _m1390_runner(history, issue_payload=_M1390_EDIT)
-    with patch.object(orchestrator_module, "post_issue_comment", side_effect=stop_after_audit):
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", side_effect=stop_after_audit):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(crashed, issue_number=56, config=reduced, plan_first=True)
     assert len(_m1390_boundaries(crashed)) == 1
@@ -20420,7 +20318,7 @@ def test_m1390_amendment_used_before_the_edit_stays_active_and_is_not_pending(tm
     """`board-lineage-survives` (active signed amendment)."""
     runner = _m943_interrupted_history(tmp_path)
     _m943_post_amendment(runner, effective_from_round=3)
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def stop_after_amended_checkpoint(*args, **kwargs):
         result = real_post(*args, **kwargs)
@@ -20429,7 +20327,7 @@ def test_m1390_amendment_used_before_the_edit_stays_active_and_is_not_pending(tm
             raise KeyboardInterrupt
         return result
 
-    with patch.object(orchestrator_module, "post_issue_comment", side_effect=stop_after_amended_checkpoint):
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", side_effect=stop_after_amended_checkpoint):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(runner, issue_number=56, config=_m943_reduced_config(tmp_path), plan_first=True)
     history = list(runner.issue_comments)
@@ -20480,7 +20378,7 @@ def test_m1390_active_primary_changing_link_governs_the_fresh_scope(tmp_path):
             )
         ],
     )
-    real_post = orchestrator_module.post_issue_comment
+    real_post = architecture_contract.post_issue_comment
 
     def stop_after_new_primary_review(*args, **kwargs):
         result = real_post(*args, **kwargs)
@@ -20489,7 +20387,7 @@ def test_m1390_active_primary_changing_link_governs_the_fresh_scope(tmp_path):
             raise KeyboardInterrupt
         return result
 
-    with patch.object(orchestrator_module, "post_issue_comment", side_effect=stop_after_new_primary_review):
+    with patch_object_in((architecture_contract, validated_agent_module, response_validation, discuss_loop, execution_policy, child_plan_binding, plan_first_loop_module), "post_issue_comment", side_effect=stop_after_new_primary_review):
         with pytest.raises(KeyboardInterrupt):
             run_issue_loop(changed, issue_number=56, config=swapped, plan_first=True)
     links = _m1390_link_comments(changed)
@@ -20680,27 +20578,27 @@ def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
         allow_unprotected_managed_ci=True,
     )
     dispatches = []
-    monkeypatch.setattr(orchestrator_module, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
-    monkeypatch.setattr(orchestrator_module, "authenticate_issue_created_handoff", lambda *_a, **_k: handoff)
-    monkeypatch.setattr(orchestrator_module, "publish_issue_created_authorization", lambda *_a, **_k: handoff)
-    monkeypatch.setattr(orchestrator_module, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "authenticate_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(issue_implementation, "publish_issue_created_authorization", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
     monkeypatch.setattr(
-        orchestrator_module, "activate_managed_ci",
+        pr_loop, "activate_managed_ci",
         lambda *_a, **_k: ManagedCiContract(protocol_version=2, issue_created_pr=True),
     )
-    monkeypatch.setattr(orchestrator_module, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
-    monkeypatch.setattr(orchestrator_module, "managed_label_present", lambda *_a, **_k: True)
-    monkeypatch.setattr(orchestrator_module, "publish_round_readiness", lambda *_a, **_k: None)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "publish_round_readiness", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        orchestrator_module, "dispatch_final_qualification",
+        pr_loop, "dispatch_final_qualification",
         lambda *_a, **kwargs: dispatches.append(kwargs),
     )
     monkeypatch.setattr(
-        orchestrator_module, "wait_for_final_qualification",
+        pr_loop, "wait_for_final_qualification",
         lambda *_a, **_k: ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
-    monkeypatch.setattr(orchestrator_module, "prepare_v2_merge", lambda *_a, **_k: None)
-    monkeypatch.setattr(orchestrator_module, "merge_pr", lambda *_a, **_k: None)
+    monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *_a, **_k: None)
+    monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *_a, **_k: None)
 
     if reject:
         with pytest.raises(AgentLoopError) as rejected:
@@ -21430,14 +21328,14 @@ def test_a_repaired_re_emission_is_marked_and_not_counted(tmp_path, monkeypatch,
         human_requirement_dispositions=dispositions,
     )
     runner = _FakeRunner(claude_outputs=[plan_output, patch1], codex_outputs=[round1, round2])
-    real_get_issue_context = orchestrator_module.get_issue_context
+    real_get_issue_context = discuss_loop.get_issue_context
 
     def _patched(runner_arg, *, config, issue_number):
         context = real_get_issue_context(runner_arg, config=config, issue_number=issue_number)
         return replace(context, human_requirements=(requirement,))
 
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", _patched)
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=repaired):
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop), "get_issue_context", _patched)
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=repaired):
         with patch.object(
             plan_first_loop_module, "log", wraps=plan_first_loop_module.log
         ) as logged:

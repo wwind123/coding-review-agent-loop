@@ -1077,7 +1077,7 @@ def test_codex_backend_dry_run_sets_message_text_without_response_file(tmp_path)
 
 
 def test_codex_backend_dry_run_honors_implementation_role_effort(tmp_path):
-    from coding_review_agent_loop.orchestrator import _approved_implementation_config
+    from coding_review_agent_loop.issue_implementation import _approved_implementation_config
 
     config = make_config(
         tmp_path,
@@ -1408,7 +1408,7 @@ def test_sandboxed_codex_nonzero_exit_artifact_is_salvaged(
     tmp_path, monkeypatch, returncode, stub_checkout_fingerprint
 ):
     from coding_review_agent_loop import agent_permissions
-    from coding_review_agent_loop.orchestrator import _run_validated_agent
+    from coding_review_agent_loop.validated_agent import _run_validated_agent
     import tempfile as tempfile_module
 
     monkeypatch.setattr(tempfile_module, "tempdir", str(tmp_path))
@@ -1442,7 +1442,7 @@ def test_sandboxed_codex_timeout_without_artifact_is_not_salvaged(
 ):
     from coding_review_agent_loop import agent_permissions
     from coding_review_agent_loop.errors import AgentInvocationError
-    from coding_review_agent_loop.orchestrator import _run_validated_agent
+    from coding_review_agent_loop.validated_agent import _run_validated_agent
     import tempfile as tempfile_module
 
     monkeypatch.setattr(tempfile_module, "tempdir", str(tmp_path))

@@ -26,6 +26,10 @@ from coding_review_agent_loop.issue_pr_handoff import (
     require_pr_metadata_for_handoff,
 )
 from agent_loop_helpers import FakeRunner, make_config, structured_plan_state
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.pr_loop as pr_loop_module
+import coding_review_agent_loop.pr_loop_support as pr_loop_support_module
+from agent_loop_helpers import patch_attr_in
 
 
 def _staged_plan_checkpoint(binding, names, primary, round_number=1):
@@ -737,7 +741,6 @@ def test_unversioned_keyless_plan_is_never_recovered_even_without_requirements(t
 def test_rootless_plan_change_digest_never_verifies_on_legacy_paths(tmp_path, monkeypatch, entry):
     """Item-15: a board-change digest without a plan root or link fails closed at
     managed-CI fresh authorization, ordinary recovery and strict qualification."""
-    import coding_review_agent_loop.orchestrator as orchestrator
     from coding_review_agent_loop.cli import run_pr_loop
     from coding_review_agent_loop.decomposition import approved_plan_hash
 
@@ -763,21 +766,21 @@ def test_rootless_plan_change_digest_never_verifies_on_legacy_paths(tmp_path, mo
     )
     reached = []
     monkeypatch.setattr(
-        orchestrator, "authorize_fresh_issue_created_resume",
+        pr_loop_module, "authorize_fresh_issue_created_resume",
         lambda *_a, **_k: reached.append("fresh") or (_ for _ in ()).throw(_ScopeCaptured()),
     )
     if entry == "fresh":
         managed.update(managed_ci_fresh_authorization=True, managed_ci_issue_number=56)
     else:
-        handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+        handoff = pr_loop_support_module.AuthenticatedIssueCreatedHandoff(
             pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
             head_sha="abc123", branch="agent-loop/managed-56",
             trusted_actor_login="agent-loop", trusted_actor_id=1,
             protection_mode="voluntary", override_nonce="opening-nonce",
         )
-        monkeypatch.setattr(orchestrator, "recover_issue_created_handoff", lambda *_a, **_k: handoff)
+        monkeypatch.setattr(pr_loop_module, "recover_issue_created_handoff", lambda *_a, **_k: handoff)
         monkeypatch.setattr(
-            orchestrator, "revalidate_issue_created_handoff",
+            pr_loop_module, "revalidate_issue_created_handoff",
             lambda *_a, **_k: reached.append("ordinary") or (_ for _ in ()).throw(_ScopeCaptured()),
         )
     runner = FakeRunner(
@@ -845,7 +848,6 @@ class _ScopeCaptured(Exception):
 
 def test_managed_ci_recovery_verifies_plan_board_not_pr_board(tmp_path, monkeypatch):
     """handoff-plan-verification-recovery: fresh authorization and ordinary resume."""
-    import coding_review_agent_loop.orchestrator as orchestrator
     from coding_review_agent_loop.cli import run_pr_loop
 
     plan = "Approved plan.\n\n### Plan steps\n1. Preserve the trust boundary."
@@ -860,30 +862,30 @@ def test_managed_ci_recovery_verifies_plan_board_not_pr_board(tmp_path, monkeypa
         raise _ScopeCaptured
 
     # Fresh authorization: plan approved by Codex; the PR board is different.
-    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", capture)
+    monkeypatch.setattr(pr_loop_module, "authorize_fresh_issue_created_resume", capture)
     runner = _managed_plan_issue_runner(plan, (("Codex", "approved"),))
     with pytest.raises(_ScopeCaptured):
         run_pr_loop(runner, pr_number=77, config=make_config(
             tmp_path, managed_ci_fresh_authorization=True, managed_ci_issue_number=56,
             **managed,
         ))
-    assert captured["approved_plan_hash"] == orchestrator.approved_plan_hash(plan)
+    assert captured["approved_plan_hash"] == panel_evidence.approved_plan_hash(plan)
     assert _agent_commands(runner) == []
 
     # Ordinary resume without an issue-side handoff.
-    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+    handoff = pr_loop_support_module.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
         head_sha="abc123", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="voluntary", override_nonce="opening-nonce",
     )
-    monkeypatch.setattr(orchestrator, "recover_issue_created_handoff", lambda *_a, **_k: handoff)
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", capture)
+    monkeypatch.setattr(pr_loop_module, "recover_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(pr_loop_module, "revalidate_issue_created_handoff", capture)
     captured.clear()
     runner = _managed_plan_issue_runner(plan, (("Codex", "approved"),))
     with pytest.raises(_ScopeCaptured):
         run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, **managed))
-    assert captured["handoff"].approved_plan_hash == orchestrator.approved_plan_hash(plan)
+    assert captured["handoff"].approved_plan_hash == panel_evidence.approved_plan_hash(plan)
 
     # The plan board's own blocking verdict still fails closed.
     runner = _managed_plan_issue_runner(plan, (("Codex", "blocking"),))
@@ -2122,7 +2124,6 @@ def _real_staged_plan_comments(tmp_path, *, gemini_state="approved"):
 
 def _strict_managed_pr_run(tmp_path, monkeypatch, issue_comments, *, entry, pr_outputs):
     """A strictly protected managed PR resumed by board B, driven to the merge gate."""
-    import coding_review_agent_loop.orchestrator as orchestrator
     from coding_review_agent_loop.cli import run_pr_loop
     from coding_review_agent_loop.managed_ci import (
         AuthenticatedIssueCreatedHandoff, ManagedCiContract, ManagedCiOutcome,
@@ -2133,20 +2134,19 @@ def _strict_managed_pr_run(tmp_path, monkeypatch, issue_comments, *, entry, pr_o
         head_sha="abc123", branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
         trusted_actor_id=1, protection_mode="strict", override_nonce=None,
     )
-    monkeypatch.setattr(orchestrator, "recover_issue_created_handoff", lambda *a, **k: handoff)
-    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff)
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", lambda *a, **k: handoff)
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: ManagedCiContract())
-    monkeypatch.setattr(orchestrator, "merge_pr", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *a, **k: None)
+    monkeypatch.setattr(pr_loop_module, "recover_issue_created_handoff", lambda *a, **k: handoff)
+    monkeypatch.setattr(pr_loop_module, "authorize_fresh_issue_created_resume", lambda *a, **k: handoff)
+    monkeypatch.setattr(pr_loop_module, "revalidate_issue_created_handoff", lambda *a, **k: handoff)
+    monkeypatch.setattr(pr_loop_module, "activate_managed_ci", lambda *a, **k: ManagedCiContract())
+    monkeypatch.setattr(pr_loop_support_module, "merge_pr", lambda *a, **k: None)
+    monkeypatch.setattr(pr_loop_module, "dispatch_final_qualification", lambda *a, **k: None)
     monkeypatch.setattr(
-        orchestrator, "wait_for_final_qualification",
+        pr_loop_module, "wait_for_final_qualification",
         lambda *a, **k: ManagedCiOutcome(status="passed", head_sha="abc123"),
     )
-    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *a, **k: None)
+    monkeypatch.setattr(pr_loop_module, "prepare_v2_merge", lambda *a, **k: None)
     merges = []
-    monkeypatch.setattr(
-        orchestrator, "_merge_with_exact_head_proof", lambda *a, **k: merges.append(k),
+    patch_attr_in(monkeypatch, (pr_loop_support_module, pr_loop_module), "_merge_with_exact_head_proof", lambda *a, **k: merges.append(k),
     )
     runner = FakeRunner(
         issue_comments=issue_comments,
@@ -2184,20 +2184,19 @@ def test_staged_plan_by_board_a_qualifies_strict_pr_reviewed_by_board_b(
     tmp_path, monkeypatch, entry
 ):
     """handoff-plan-verification-recovery and handoff-plan-binding-preserved, to the merge."""
-    import coding_review_agent_loop.orchestrator as orchestrator
 
     plan_comments = _real_staged_plan_comments(tmp_path)
     runner, config, merges, run_pr_loop = _strict_managed_pr_run(
         tmp_path, monkeypatch, plan_comments, entry=entry, pr_outputs=_board_b_outputs(),
     )
-    real_verify = orchestrator._verify_strict_managed_plan_binding
+    real_verify = pr_loop_support_module._verify_strict_managed_plan_binding
     strict_checks = []
 
     def spy(**kwargs):
         strict_checks.append(tuple(kwargs["config"].reviewer))
         return real_verify(**kwargs)
 
-    monkeypatch.setattr(orchestrator, "_verify_strict_managed_plan_binding", spy)
+    monkeypatch.setattr(pr_loop_support_module, "_verify_strict_managed_plan_binding", spy)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     # The real strict binding ran at qualification with the PR config; the
     # plan board came from issue history, so board B never verified the plan.
@@ -2241,18 +2240,17 @@ def test_strict_recovery_refuses_a_plan_board_a_did_not_fully_approve(
 
 def test_strict_qualification_refuses_a_changed_plan_identity(tmp_path, monkeypatch):
     """A stale or mismatched plan identity is refused at the final gate."""
-    import coding_review_agent_loop.orchestrator as orchestrator
 
     plan_comments = _real_staged_plan_comments(tmp_path)
     runner, config, merges, run_pr_loop = _strict_managed_pr_run(
         tmp_path, monkeypatch, plan_comments, entry="ordinary", pr_outputs=_board_b_outputs(),
     )
-    real_verify = orchestrator._verify_strict_managed_plan_binding
+    real_verify = pr_loop_support_module._verify_strict_managed_plan_binding
 
     def stale_identity(**kwargs):
         return real_verify(**{**kwargs, "expected_plan_hash": "0" * 16})
 
-    monkeypatch.setattr(orchestrator, "_verify_strict_managed_plan_binding", stale_identity)
+    monkeypatch.setattr(pr_loop_support_module, "_verify_strict_managed_plan_binding", stale_identity)
     with pytest.raises(AgentLoopError, match="canonical approved plan changed"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert merges == []
@@ -2555,12 +2553,11 @@ def test_staged_approvals_before_a_model_transition_never_qualify(tmp_path, mode
 
 def test_recovery_refuses_approvals_superseded_by_a_model_round_trip(tmp_path, monkeypatch):
     """item-2 on managed-CI fresh authorization: A -> B -> A without fresh reviews."""
-    import coding_review_agent_loop.orchestrator as orchestrator
     from coding_review_agent_loop.cli import run_pr_loop
 
     history = _with_checkpoint_rebinds(_bound_staged_plan(tmp_path), "gpt-b", "gpt-a")
     monkeypatch.setattr(
-        orchestrator, "authorize_fresh_issue_created_resume",
+        pr_loop_module, "authorize_fresh_issue_created_resume",
         lambda *a, **k: pytest.fail("authorization must not run on superseded approvals"),
     )
     runner = FakeRunner(

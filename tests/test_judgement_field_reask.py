@@ -3,7 +3,6 @@ from unittest.mock import patch
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.errors import (
     AgentLoopError,
     MissingJudgementFieldError,
@@ -12,6 +11,10 @@ from coding_review_agent_loop.errors import (
 from coding_review_agent_loop.protocol import parse_architecture_impact
 from coding_review_agent_loop.repair_preservation import validate_repair_preservation
 from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_object_in
 
 HEADING = "## Previous response not accepted: required judgement field"
 CTX = "plan_review.architecture_impact"
@@ -96,7 +99,7 @@ def _validate(text):
 
 
 def _run(runner, config, *, judgement=True, omission=False, kind="pr_review"):
-    return orchestrator._run_validated_agent(
+    return validated_agent._run_validated_agent(
         runner,
         agent="codex",
         config=config,
@@ -129,7 +132,7 @@ def test_invalid_status_is_reasked_once_and_accepted(tmp_path):
     runner = FakeRunner(codex_outputs=[BAD, GOOD])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         response = _run(runner, config)
     assert "GOOD" in response.text
     commands = _codex(runner)
@@ -144,7 +147,7 @@ def test_second_invalid_status_stops_without_repair(tmp_path):
     runner = FakeRunner(codex_outputs=[BAD, BAD, BAD, BAD])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         with pytest.raises(AgentLoopError, match="status"):
             _run(runner, config)
     assert len(_codex(runner)) == 2
@@ -155,7 +158,7 @@ def test_flag_off_has_no_reask_and_review_skips_repair(tmp_path):
     runner = FakeRunner(codex_outputs=[BAD, BAD, BAD, BAD])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         with pytest.raises(AgentLoopError):
             _run(runner, config, judgement=False)
     assert all(HEADING not in cmd for cmd in _codex(runner))
@@ -166,7 +169,7 @@ def test_flag_off_has_no_reask_and_review_skips_repair(tmp_path):
 def test_single_slot_is_shared(tmp_path, first, second):
     runner = FakeRunner(codex_outputs=[first, second, GOOD, GOOD])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder([])):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder([])):
         with pytest.raises(AgentLoopError):
             _run(runner, config, omission=True)
     assert len(_codex(runner)) == 2
@@ -258,7 +261,7 @@ def _real_pr_validators(reviewer="OpenAI Codex"):
 
 
 def _run_real(runner, config, *, judgement=True, agent="codex"):
-    return orchestrator._run_validated_agent(
+    return validated_agent._run_validated_agent(
         runner,
         agent=agent,
         config=config,
@@ -285,7 +288,7 @@ def test_terminal_diagnostic_names_field_and_repair_refusal(tmp_path, status, ju
     runner = FakeRunner(codex_outputs=[bad, bad, bad, bad])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         with pytest.raises(AgentLoopError) as info:
             _run_real(runner, config, judgement=judgement)
     message = str(info.value)
@@ -301,7 +304,7 @@ def test_real_validator_reasks_out_of_enum_status_once(tmp_path):
     )
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         response = _run_real(runner, config)
     assert "GOOD" in response.text
     commands = _codex(runner)
@@ -324,7 +327,7 @@ def test_mixed_defect_goes_to_repair_without_spending_the_reask(tmp_path, status
     runner = FakeRunner(codex_outputs=[bad, bad, bad, bad])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         with pytest.raises(AgentLoopError):
             _run_real(runner, config)
     assert len(repairs) >= 1
@@ -357,7 +360,7 @@ def test_invented_status_from_repair_is_never_accepted(tmp_path, drop_kind, sour
         calls.append(raw)
         return fabricated
 
-    with patch.object(orchestrator, "attempt_repair", fake_attempt):
+    with patch.object(validated_agent, "attempt_repair", fake_attempt):
         with pytest.raises(AgentLoopError) as info:
             _run_real(runner, config)
     assert calls, "repair was never attempted"
@@ -380,7 +383,7 @@ def test_control_masked_source_with_declared_status_is_repaired(tmp_path, drop_k
     fixed = _with_impact(structured_pr_review(summary="Masked."), _imp("unchanged"))
     runner = FakeRunner(codex_outputs=[bad])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
-    with patch.object(orchestrator, "attempt_repair", lambda raw, cmd, **kw: fixed):
+    with patch.object(validated_agent, "attempt_repair", lambda raw, cmd, **kw: fixed):
         response = _run_real(runner, config)
     assert "Masked." in response.text
 
@@ -418,7 +421,7 @@ def test_pr_loop_parallel_worker_reasks_invalid_status_without_repair(tmp_path):
         tmp_path, reviewer=("codex", "gemini"), review_parallel=True, agent_max_retries=0
     )
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
     commands = _codex(runner)
     assert len(commands) == 3
@@ -435,8 +438,8 @@ def test_antigravity_reask_stays_on_the_same_model(tmp_path):
         antigravity_models=("ModelA", "ModelB", "ModelC"),
     )
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)), \
-            patch.object(orchestrator.time, "sleep", side_effect=AssertionError("slept")):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)), \
+            patch.object(validated_agent.time, "sleep", side_effect=AssertionError("slept")):
         response = _run_real(runner, config, agent="antigravity")
     assert "GOOD" in response.text
     commands = [cmd for cmd, _ in runner.commands if cmd[:1] == ["agy"]]
@@ -495,7 +498,7 @@ def test_plan_review_reask_keeps_frozen_prompt_and_publishes_nothing_between_tur
         tmp_path, reviewer=("codex", "gemini"), review_parallel=parallel, agent_max_retries=0
     )
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     first, reask = runner.codex_prompts[0], runner.codex_prompts[1]
     marker = "PUBLIC RESPONSE FILE"
@@ -565,7 +568,7 @@ def _issue_validators_1330():
 
 
 def _run_issue_1330(runner, config):
-    return orchestrator._run_validated_agent(
+    return validated_agent._run_validated_agent(
         runner,
         agent="claude",
         config=config,
@@ -590,7 +593,7 @@ def test_seam_accepts_declared_changed_with_object_entries_without_repair_1330(t
     runner = FakeRunner(claude_outputs=[text])
     config = make_config(tmp_path, agent_max_retries=0)
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         response = _run_issue_1330(runner, config)
     assert repairs == []
     assert len(_claude(runner)) == 1
@@ -609,7 +612,7 @@ def test_seam_accepts_corroborated_modified_with_object_entries_1330(tmp_path):
     runner = FakeRunner(claude_outputs=[text])
     config = make_config(tmp_path, agent_max_retries=0)
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         response = _run_issue_1330(runner, config)
     assert repairs == []
     assert len(_claude(runner)) == 1
@@ -636,7 +639,7 @@ def test_seam_still_refuses_modified_with_empty_evidence_1330(tmp_path):
     runner = FakeRunner(claude_outputs=[text])
     config = make_config(tmp_path, agent_max_retries=0)
     repairs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repairs)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repairs)):
         with pytest.raises(AgentInvocationError) as error:
             _run_issue_1330(runner, config)
     preserved = error.value.preserved_unsatisfied_response

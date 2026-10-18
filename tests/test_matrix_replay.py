@@ -5,13 +5,29 @@ from unittest.mock import patch
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.errors import AgentInvocationError, AgentLoopError
 from coding_review_agent_loop.protocol import (
     validate_structured_plan_revision,
     validate_structured_plan_state,
 )
 from agent_loop_helpers import FakeRunner, make_config, structured_plan_revision, structured_v1_plan_state
+import coding_review_agent_loop.agent_failure as agent_failure
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.integration_close as integration_close
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.review_rounds as review_rounds
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent_module
+from agent_loop_helpers import patch_object_in
 
 HEADING = "## Previous response not accepted: risk_test_matrix"
 PLAN_FOOTER = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
@@ -76,12 +92,12 @@ def _validate_revision(text):
 def _run(runner, config, texts_kind="plan_state"):
     logs: list[str] = []
     exhaustions = []
-    with patch.object(orchestrator, "_run_structured_repair", wraps=orchestrator._run_structured_repair) as spy, \
-            patch.object(orchestrator, "log", lambda _c, m: logs.append(m)), \
+    with patch_object_in((validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", wraps=validated_agent_module._run_structured_repair) as spy, \
+            patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "log", lambda _c, m: logs.append(m)), \
             patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
-            patch.object(orchestrator.time, "sleep", lambda *_a: None):
+            patch.object(validated_agent_module.time, "sleep", lambda *_a: None):
         try:
-            response = orchestrator._run_validated_agent(
+            response = validated_agent_module._run_validated_agent(
                 runner,
                 agent=_AGENT[0],
                 config=config,
@@ -225,7 +241,7 @@ def test_execution_integrity_refusal_keeps_ordinary_budget(tmp_path):
 def test_repair_guard_logs_its_own_normalization(tmp_path):
     logs: list[str] = []
     with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
-        _, _, attempts = orchestrator._run_structured_repair(
+        _, _, attempts = validated_agent_module._run_structured_repair(
             _state(_row(forbidden_side_effects="Slip", related_scope_item_ids="")),
             runner=FakeRunner(),
             config=_config(tmp_path, "codex", 0),
@@ -293,7 +309,7 @@ def _run_noskip(runner, config):
     logs: list[str] = []
     with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)):
         try:
-            response = orchestrator._run_validated_agent(
+            response = validated_agent_module._run_validated_agent(
                 runner, agent=_AGENT[0], config=config, prompt="ORIGINAL PROMPT",
                 session_id=None,
                 marker_description="<!-- AGENT_PLAN_STATE: approved|blocking -->",

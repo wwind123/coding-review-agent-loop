@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from agent_loop_helpers import FakeRunner, make_config, structured_v1_plan_state
 from coding_review_agent_loop.cli import run_pr_loop
 from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
@@ -29,6 +28,11 @@ from coding_review_agent_loop.plan_growth import (
 )
 from coding_review_agent_loop.protocol import validate_structured_plan_state
 from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+from agent_loop_helpers import patch_attr_in
 
 FOOTER = "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
 PR_URL = "https://github.com/OWNER/REPO/pull/77"
@@ -168,14 +172,14 @@ def test_verdict_for_hash_measures_the_authenticated_candidate(tmp_path):
     parsed = validate_structured_plan_state(structured_v1_plan_state())
     payload = structured_plan_revision_to_payload(parsed)
     canonical = render_canonical_plan_state(parsed)
-    plan_hash = orchestrator.approved_plan_hash(canonical)
+    plan_hash = panel_evidence.approved_plan_hash(canonical)
     comments = [_plan_record(canonical, payload)]
 
-    compliant = orchestrator._plan_growth_verdict_for_hash(
+    compliant = panel_evidence._plan_growth_verdict_for_hash(
         make_config(tmp_path), plan_hash=plan_hash, comment_sources=(comments,)
     )
     assert (compliant.gate, compliant.status) == ("enforce", "compliant")
-    off_low = orchestrator._plan_growth_verdict_for_hash(
+    off_low = panel_evidence._plan_growth_verdict_for_hash(
         make_config(tmp_path, plan_growth_gate="off", plan_growth_max_scope_items=1),
         plan_hash=plan_hash,
         # A missing first source falls through to the one holding the plan.
@@ -184,7 +188,7 @@ def test_verdict_for_hash_measures_the_authenticated_candidate(tmp_path):
     assert (off_low.gate, off_low.status, off_low.crossed_signals) == (
         "off", "non-compliant", ("scope-items",)
     )
-    missing = orchestrator._plan_growth_verdict_for_hash(
+    missing = panel_evidence._plan_growth_verdict_for_hash(
         make_config(tmp_path), plan_hash="0" * 16, comment_sources=(comments,)
     )
     assert missing.status == "not-applicable"
@@ -194,7 +198,7 @@ def test_verdict_for_hash_measures_the_authenticated_candidate(tmp_path):
 
 
 def _plan_comments(plan):
-    subject = orchestrator._plan_subject(plan)
+    subject = panel_evidence._plan_subject(plan)
     return [
         {
             "author": {"login": "coding-review-agent-loop"},
@@ -230,7 +234,7 @@ def _runner(verdict, **pr_payload):
     handoff = {
         "author": {"login": "coding-review-agent-loop"},
         "createdAt": "2026-05-01T00:02:00Z",
-        "body": _handoff(orchestrator.approved_plan_hash(PLAN), verdict),
+        "body": _handoff(panel_evidence.approved_plan_hash(PLAN), verdict),
     }
     return FakeRunner(
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
@@ -277,8 +281,7 @@ _MANAGED_PR = {"headRefName": "agent-loop/managed-56", "headRefOid": "abc123", "
 
 
 def _no_retired_plans(monkeypatch):
-    monkeypatch.setattr(
-        orchestrator, "_managed_ci_retired_plan_hashes",
+    patch_attr_in(monkeypatch, (child_plan_binding, pr_loop), "_managed_ci_retired_plan_hashes",
         lambda *_a, **kwargs: (frozenset(), kwargs.get("parent_issue_context")),
     )
 
@@ -290,7 +293,7 @@ def test_managed_fresh_authorization_applies_the_recorded_verdict(
     runner = _runner(verdict, **_MANAGED_PR)
     _no_retired_plans(monkeypatch)
     monkeypatch.setattr(
-        orchestrator, "authorize_fresh_issue_created_resume",
+        pr_loop, "authorize_fresh_issue_created_resume",
         lambda *_a, **_k: (_ for _ in ()).throw(_Reached()),
     )
     config = _managed_config(
@@ -309,16 +312,16 @@ def test_managed_ordinary_resume_applies_the_recorded_verdict(
     tmp_path, monkeypatch, verdict, refused
 ):
     runner = _runner(verdict, **_MANAGED_PR)
-    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+    handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
         head_sha="abc123", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="voluntary", override_nonce="opening-nonce",
     )
-    monkeypatch.setattr(orchestrator, "recover_issue_created_handoff", lambda *_a, **_k: handoff)
+    monkeypatch.setattr(pr_loop, "recover_issue_created_handoff", lambda *_a, **_k: handoff)
     _no_retired_plans(monkeypatch)
     monkeypatch.setattr(
-        orchestrator, "revalidate_issue_created_handoff",
+        pr_loop, "revalidate_issue_created_handoff",
         lambda *_a, **_k: (_ for _ in ()).throw(_Reached()),
     )
     expected = (

@@ -13,6 +13,10 @@ from coding_review_agent_loop.unresolved_items import (
     _is_disputed_item,
     format_coder_followup_context,
 )
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_object_in
 
 
 def test_structured_plan_review_preserves_human_requirements_resolution_marker():
@@ -979,7 +983,6 @@ def test_followup_overlong_refs_through_validated_agent_never_repairs_1300(tmp_p
     """#1300: the pr_loop validated-agent seam accepts an 11-ref claim on the first pass."""
     from unittest.mock import patch
 
-    import coding_review_agent_loop.orchestrator as orchestrator
     from coding_review_agent_loop.protocol import validate_structured_coder_followup
 
     refs = [f"turn:observation-{i}" for i in range(9)] + ["turn:observation-0", "turn:observation-1"]
@@ -999,8 +1002,8 @@ def test_followup_overlong_refs_through_validated_agent_never_repairs_1300(tmp_p
 
     runner = FakeRunner(codex_outputs=[text])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
-    with patch.object(orchestrator, "_run_structured_repair", fake_repair):
-        response = orchestrator._run_validated_agent(
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", fake_repair):
+        response = validated_agent._run_validated_agent(
             runner,
             agent="codex",
             config=config,
@@ -1039,7 +1042,7 @@ from coding_review_agent_loop.local_test_evidence import (  # noqa: E402
     LocalTestObservation as _Observation,
     TreeAttribution as _Attribution,
 )
-from coding_review_agent_loop.orchestrator import make_approved_plan_context as _plan_context  # noqa: E402
+from coding_review_agent_loop.execution_policy import make_approved_plan_context as _plan_context  # noqa: E402
 from coding_review_agent_loop.protocol import (  # noqa: E402
     PREDECESSOR_HEAD_UNMOVED_MESSAGE as _UNMOVED,
     SemanticRiskCoverageClaim as _Claim,
@@ -1229,7 +1232,6 @@ def _malformed_1388(payload_text):
 
 
 def _run_repair_1388(tmp_path, *, malformed, repaired, items, optional_ids=(), resolved_ids=()):
-    import coding_review_agent_loop.orchestrator as orchestrator
 
     real_attempt_repair = _repair_module_1388.attempt_repair
     prompts = []
@@ -1248,8 +1250,8 @@ def _run_repair_1388(tmp_path, *, malformed, repaired, items, optional_ids=(), r
 
     runner = FakeRunner(claude_outputs=[malformed])
     config = make_config(tmp_path, coder="claude", agent_max_retries=0)
-    with _patch1388.object(orchestrator, "attempt_repair", through_real_attempt):
-        response = orchestrator._run_validated_agent(
+    with _patch1388.object(validated_agent, "attempt_repair", through_real_attempt):
+        response = validated_agent._run_validated_agent(
             runner,
             agent="claude",
             config=config,

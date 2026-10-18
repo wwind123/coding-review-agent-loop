@@ -13,7 +13,6 @@ from coding_review_agent_loop.comment_rendering import (
     render_public_agent_comment,
     render_risk_test_matrix_section,
 )
-import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.local_test_evidence import LocalTestObservation, TreeAttribution
 from coding_review_agent_loop.protocol import (
@@ -44,6 +43,9 @@ from coding_review_agent_loop.round_transport import (
     risk_test_matrix_section_boundary,
 )
 from agent_loop_helpers import structured_coder_followup
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 
 def _row(row_id: str = "row-ordinary") -> dict[str, object]:
@@ -319,7 +321,7 @@ def test_correction_keeps_the_original_dropped_row_audit_record() -> None:
     assert original.risk_test_matrix_claims.dropped_row_ids == ("row-sibling",)
     catalog = [_derived_observation(execution_ref="turn:observation-1", receipt_id="receipt-1")]
 
-    corrected = orchestrator_module._parse_fresh_correction_claims(
+    corrected = response_validation._parse_fresh_correction_claims(
         _followup_with_claims_920([
             {"row_id": "row-ordinary", "execution_refs": ["turn:observation-1"]},
         ]),
@@ -332,7 +334,7 @@ def test_correction_keeps_the_original_dropped_row_audit_record() -> None:
     assert [claim.row_id for claim in corrected.risk_test_matrix_claims.claims] == ["row-ordinary"]
     assert corrected.risk_test_matrix_claims.dropped_row_ids == ("row-sibling",)
     # The audit record neither triggers nor fails the bounded correction.
-    assert "unapproved-row-claim" in orchestrator_module._NON_ACTIONABLE_RISK_DIAGNOSTICS
+    assert "unapproved-row-claim" in response_validation._NON_ACTIONABLE_RISK_DIAGNOSTICS
 
 
 @pytest.mark.parametrize(
@@ -523,7 +525,7 @@ def test_orchestrator_derivation_ignores_prior_turn_failure(monkeypatch, tmp_pat
     )))
 
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "stable_tracked_tree_snapshot",
         lambda _cwd: SimpleNamespace(
             head="head-current", tracked_digest="tree-current", complete=True,
@@ -531,7 +533,7 @@ def test_orchestrator_derivation_ignores_prior_turn_failure(monkeypatch, tmp_pat
         ),
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "reconcile_test_observations",
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
@@ -539,7 +541,7 @@ def test_orchestrator_derivation_ignores_prior_turn_failure(monkeypatch, tmp_pat
         local_test_observations=lambda: (prior_failure, current_pass),
     )
 
-    derived, result = orchestrator_module._derive_authenticated_risk_evidence_for_coder(
+    derived, result = response_validation._derive_authenticated_risk_evidence_for_coder(
         parsed,
         approved_plan_context=plan_context,
         runner=runner,
@@ -604,7 +606,7 @@ def test_orchestrator_derivation_excludes_out_of_checkout_broker_runs(
         ),
     )))
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "stable_tracked_tree_snapshot",
         lambda _cwd: SimpleNamespace(
             head="head-current", tracked_digest="tree-current", complete=True,
@@ -612,14 +614,14 @@ def test_orchestrator_derivation_excludes_out_of_checkout_broker_runs(
         ),
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "reconcile_test_observations",
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
     catalog = (baseline, failing_baseline, in_checkout)
     runner = SimpleNamespace(local_test_observations=lambda: catalog)
 
-    derived, result = orchestrator_module._derive_authenticated_risk_evidence_for_coder(
+    derived, result = response_validation._derive_authenticated_risk_evidence_for_coder(
         parsed,
         approved_plan_context=plan_context,
         runner=runner,
@@ -698,7 +700,7 @@ def test_orchestrator_derivation_keeps_unvalidatable_failures_in_journal(
         ),
     )))
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "stable_tracked_tree_snapshot",
         lambda _cwd: SimpleNamespace(
             head="head-current", tracked_digest="tree-current", complete=True,
@@ -706,14 +708,14 @@ def test_orchestrator_derivation_keeps_unvalidatable_failures_in_journal(
         ),
     )
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "reconcile_test_observations",
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
     catalog = (unvalidatable_failure, in_checkout_pass)
     runner = SimpleNamespace(local_test_observations=lambda: catalog)
 
-    derived, result = orchestrator_module._derive_authenticated_risk_evidence_for_coder(
+    derived, result = response_validation._derive_authenticated_risk_evidence_for_coder(
         parsed,
         approved_plan_context=plan_context,
         runner=runner,
@@ -959,7 +961,7 @@ def test_current_turn_catalog_filters_a_misbehaving_cumulative_provider() -> Non
         current_test_turn_observations=lambda: (old, current),
     )
 
-    assert orchestrator_module._current_test_turn_observations(runner) == (current,)
+    assert response_validation._current_test_turn_observations(runner) == (current,)
 
 
 def test_derived_matrix_evidence_cannot_resolve_a_cross_turn_selector_from_the_journal() -> None:
@@ -1123,7 +1125,7 @@ def test_post_authentication_head_race_downgrades_correction_output(monkeypatch,
             return (observation,)
 
     monkeypatch.setattr(
-        orchestrator_module,
+        response_validation,
         "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
             head="head-other",
@@ -1133,16 +1135,14 @@ def test_post_authentication_head_race_downgrades_correction_output(monkeypatch,
             status_clean=True,
         ),
     )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "run_agent_result",
+    patch_attr_in(monkeypatch, (validated_agent, response_validation), "run_agent_result",
         lambda *_args, **_kwargs: SimpleNamespace(
             text=json.dumps(corrected_payload)
             + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
         ),
     )
 
-    corrected, result = orchestrator_module._derive_authenticated_risk_evidence_for_coder(
+    corrected, result = response_validation._derive_authenticated_risk_evidence_for_coder(
         parsed,
         approved_plan_context=context,
         runner=FakeRunner(),
@@ -2660,7 +2660,7 @@ def test_correction_keeps_claim_degradation_records_926() -> None:
     )
     assert len(original.risk_test_matrix_claims.degradations) == 1
 
-    corrected = orchestrator_module._parse_fresh_correction_claims(
+    corrected = response_validation._parse_fresh_correction_claims(
         _followup_with_claims_920([_claim_926("row-ordinary")]),
         original,
         row_ids=("row-ordinary",),
@@ -2668,7 +2668,7 @@ def test_correction_keeps_claim_degradation_records_926() -> None:
     )
 
     assert corrected.risk_test_matrix_claims.degradations == original.risk_test_matrix_claims.degradations
-    assert "degraded-row-claim" in orchestrator_module._NON_ACTIONABLE_RISK_DIAGNOSTICS
+    assert "degraded-row-claim" in response_validation._NON_ACTIONABLE_RISK_DIAGNOSTICS
 
 
 def test_degraded_row_claim_is_rendered_as_a_dropped_claim_926() -> None:
@@ -2773,7 +2773,7 @@ def test_correction_keeps_distinct_drops_at_the_same_index_926() -> None:
         delivered_risk_test_matrix_row_ids=("row-ordinary",),
         execution_catalog=catalog,
     )
-    corrected = orchestrator_module._parse_fresh_correction_claims(
+    corrected = response_validation._parse_fresh_correction_claims(
         _followup_with_claims_920([_claim_926(second_id)]),
         original,
         row_ids=("row-ordinary",),

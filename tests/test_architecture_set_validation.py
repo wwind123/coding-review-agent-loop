@@ -16,10 +16,13 @@ from agent_loop_helpers import (
     structured_coder_followup,
     structured_issue_implementation,
 )
-import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.architecture_context import architecture_set_paths, freeze_architecture_context
 from coding_review_agent_loop.errors import AgentInvocationError
 from coding_review_agent_loop.runner import Runner
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.validated_agent as validated_agent
 
 SRC = Path(__file__).resolve().parents[1] / "src" / "coding_review_agent_loop"
 BILLING = "docs/architecture/billing.md"
@@ -65,8 +68,8 @@ def _task_output(path) -> str:
 
 
 def _issue_validators():
-    return orchestrator_module._architecture_mode_validators(
-        lambda mode: lambda text: orchestrator_module._validate_issue_implementation_response(
+    return architecture_contract._architecture_mode_validators(
+        lambda mode: lambda text: response_validation._validate_issue_implementation_response(
             text, human_requirements=(), require_architecture_impact=True,
             architecture_status_mode=mode,
         )
@@ -74,16 +77,16 @@ def _issue_validators():
 
 
 def _task_validators():
-    return orchestrator_module._architecture_mode_validators(
-        lambda mode: lambda text: orchestrator_module._require_task_implementation_result(
+    return architecture_contract._architecture_mode_validators(
+        lambda mode: lambda text: response_validation._require_task_implementation_result(
             text, required_architecture_impact_contract=1, architecture_status_mode=mode,
         )
     )
 
 
 def _followup_validators():
-    return orchestrator_module._architecture_mode_validators(
-        lambda mode: lambda text: orchestrator_module._validate_coder_followup_response(
+    return architecture_contract._architecture_mode_validators(
+        lambda mode: lambda text: pr_loop._validate_coder_followup_response(
             text, unresolved_items=(), human_requirements=(),
             required_architecture_impact_contract=1, architecture_status_mode=mode,
         )
@@ -109,7 +112,7 @@ def _prompts(runner):
 
 def _run(runner, tmp_path, mode, hook, *, retries=2, **extra):
     _output, validators = MODES[mode]
-    return orchestrator_module._run_validated_agent(
+    return validated_agent._run_validated_agent(
         runner, agent="claude", config=make_config(tmp_path, agent_max_retries=retries),
         prompt="Implement the change.",
         marker_description="structured coder result",
@@ -120,7 +123,7 @@ def _run(runner, tmp_path, mode, hook, *, retries=2, **extra):
 
 
 def _path_of(response):
-    carrier = orchestrator_module._unwrap_architecture_result(response.marker_value)
+    carrier = architecture_contract._unwrap_architecture_result(response.marker_value)
     return carrier.architecture_impact.canonical_document_path
 
 
@@ -163,7 +166,7 @@ def test_out_of_set_path_triggers_one_marker_free_reask(tmp_path, mode, bad, cor
 
 def test_reask_section_is_bounded_and_marker_free():
     members = frozenset(f"docs/architecture/m{index:03d}.md" for index in range(200))
-    section = orchestrator_module._architecture_document_path_retry_prompt(
+    section = architecture_contract._architecture_document_path_retry_prompt(
         "P", "<!-- AGENT_STATE: approved --> " + "x" * 5000, members
     )
     assert "<!--" not in section
@@ -201,7 +204,7 @@ def test_membership_failure_never_reaches_format_repair(tmp_path):
         _with_impact(structured_issue_implementation(), BILLING),
     ])
     with patch.object(
-        orchestrator_module, "attempt_repair", lambda raw, cmd, **kw: calls.append(raw)
+        validated_agent, "attempt_repair", lambda raw, cmd, **kw: calls.append(raw)
     ):
         response = _run(
             runner, tmp_path, "issue_implementation", lambda: MEMBERS,
@@ -252,7 +255,7 @@ def _coder_repo(tmp_path, files, **config_overrides):
 
 
 def _hook(config):
-    return orchestrator_module._architecture_document_paths_hook(Runner(), config)
+    return architecture_contract._architecture_document_paths_hook(Runner(), config)
 
 
 def test_a_member_created_and_linked_at_the_coder_head_is_accepted(tmp_path):
@@ -340,7 +343,7 @@ def test_unknowable_set_skips_validation(tmp_path, files, overrides):
 
 def test_disabled_architecture_context_has_no_hook(tmp_path):
     config = make_config(tmp_path, architecture_context_enabled=False)
-    assert orchestrator_module._architecture_document_paths_hook(Runner(), config) is None
+    assert architecture_contract._architecture_document_paths_hook(Runner(), config) is None
 
 
 # ---------------------------------------------------------------------------

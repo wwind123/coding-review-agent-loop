@@ -6,10 +6,7 @@ from dataclasses import replace
 import pytest
 
 from coding_review_agent_loop.errors import AgentLoopError
-from coding_review_agent_loop.orchestrator import (
-    _round_limit_diagnostic,
-    _sub_item_progress_block,
-)
+from coding_review_agent_loop.pr_loop_support import _round_limit_diagnostic, _sub_item_progress_block
 from coding_review_agent_loop.protocol import (
     ReviewItemDisposition,
     ReviewSubItem,

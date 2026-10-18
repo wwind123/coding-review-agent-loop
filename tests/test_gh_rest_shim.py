@@ -934,7 +934,7 @@ def test_commit_provenance_graphql_mode_does_not_fall_back(tmp_path, monkeypatch
 
 def test_discussion_agenda_tokens_ignore_the_rest_bot_suffix():
     from coding_review_agent_loop.github import IssueContext
-    from coding_review_agent_loop.orchestrator import _build_discuss_agenda_support_corpus
+    from coding_review_agent_loop.discuss_loop import _build_discuss_agenda_support_corpus
 
     def corpus(author):
         context = IssueContext(

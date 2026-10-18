@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import pytest
 
 import coding_review_agent_loop.issue_loop as issue_loop_module
-import coding_review_agent_loop.orchestrator as orchestrator_module
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 import coding_review_agent_loop.triage as triage_module
 from agent_loop_helpers import FakeRunner, make_config
@@ -48,6 +47,13 @@ from coding_review_agent_loop.triage import (
 )
 from coding_review_agent_loop.usage import RunUsageContext
 from coding_review_agent_loop.validated_agent import _new_usage_context
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+from agent_loop_helpers import patch_attr_in
 
 FIXTURES = Path(__file__).parent / "fixtures" / "triage"
 UTC = datetime.timezone.utc
@@ -95,12 +101,11 @@ class _StopAtFirstTurn(Exception):
 
 
 def _patch_issue_startup(monkeypatch, issue_context):
-    monkeypatch.setattr(orchestrator_module, "validate_open_issue", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator_module, "get_issue_context", lambda *a, **k: issue_context)
-    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator_module, "prepare_agent_memory", lambda *a, **k: None)
-    monkeypatch.setattr(
-        orchestrator_module, "sync_coder_base_before_implementation", lambda *a, **k: None
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module), "validate_open_issue", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop_module), "get_issue_context", lambda *a, **k: issue_context)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop_module), "resolve_canonical_pr_for_issue", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module), "prepare_agent_memory", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (issue_implementation, issue_loop_module), "sync_coder_base_before_implementation", lambda *a, **k: None
     )
 
 
@@ -697,7 +702,7 @@ def _fresh_child(disposition, *, handoff=None):
         covered_scope_item_ids=("scope-1",), execution_disposition=disposition,
         disposition_rationale="Reviewed route.",
     )
-    route = orchestrator_module.resolve_child_execution_route(
+    route = execution_policy.resolve_child_execution_route(
         phase, topology_source="approved-plan-v1", recorded_handoff=handoff
     )
     issue = _issue(title="Child", body="How should the child work?", url="child-url")
@@ -739,13 +744,12 @@ def test_recorded_staged_child_route_wins_without_a_triage_call(
     tmp_path, monkeypatch, capsys, disposition, plan_first, seam
 ):
     fresh, issue, parent = _fresh_child(disposition, handoff=_recorded_handoff(disposition))
-    monkeypatch.setattr(
-        orchestrator_module, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop_module, issue_loop_module), "get_issue_context",
         lambda _runner, *, config, issue_number: issue if issue_number == 56 else parent,
     )
-    monkeypatch.setattr(orchestrator_module, "_resolve_fresh_child_provenance", lambda **_: fresh)
-    monkeypatch.setattr(orchestrator_module, "prepare_agent_memory", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator_module, "resolve_canonical_pr_for_issue", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, issue_loop_module), "_resolve_fresh_child_provenance", lambda **_: fresh)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop_module), "prepare_agent_memory", lambda *a, **k: None)
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop_module), "resolve_canonical_pr_for_issue", lambda *a, **k: None)
     runner = FakeRunner(codex_outputs=[_triage_output("discuss-first")])
     seen: list[dict] = []
     monkeypatch.setattr(issue_loop_module, seam, _record_dispatch(seen, runner, raise_stop=False))
@@ -792,16 +796,16 @@ def _guarded_run(tmp_path, monkeypatch, *, plan_first=False, **config_overrides)
 
 
 @pytest.mark.parametrize(
-    ("plan_first", "patch_target", "patch_name"),
+    ("plan_first", "patch_targets", "patch_name"),
     [
-        (False, orchestrator_module, "validate_open_issue"),
-        (False, orchestrator_module, "_refuse_plain_mode_over_planning"),
-        (False, issue_loop_module, "preflight_managed_ci_creation"),
-        (True, plan_first_loop_module, "_ensure_parallel_reviewer_workdirs"),
+        (False, (discuss_loop, pr_loop, issue_loop_module), "validate_open_issue"),
+        (False, (execution_policy, issue_loop_module), "_refuse_plain_mode_over_planning"),
+        (False, (issue_loop_module,), "preflight_managed_ci_creation"),
+        (True, (plan_first_loop_module,), "_ensure_parallel_reviewer_workdirs"),
     ],
     ids=["closed-issue", "plain-mode-over-planning", "managed-ci-preflight", "review-parallel-workdirs"],
 )
-def test_refusals_precede_triage(tmp_path, monkeypatch, plan_first, patch_target, patch_name):
+def test_refusals_precede_triage(tmp_path, monkeypatch, plan_first, patch_targets, patch_name):
     overrides = {}
     if patch_name == "preflight_managed_ci_creation":
         monkeypatch.setattr(issue_loop_module, "_freeze_prompt_architecture", lambda _runner, config: config)
@@ -809,7 +813,7 @@ def test_refusals_precede_triage(tmp_path, monkeypatch, plan_first, patch_target
     if patch_name == "_ensure_parallel_reviewer_workdirs":
         overrides = {"review_parallel": True}
     runner, config, usage, seen = _guarded_run(tmp_path, monkeypatch, plan_first=plan_first, **overrides)
-    monkeypatch.setattr(patch_target, patch_name, _refuse(patch_name))
+    patch_attr_in(monkeypatch, patch_targets, patch_name, _refuse(patch_name))
     with pytest.raises(AgentLoopError, match=f"refused by {patch_name}"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=plan_first, usage_context=usage)
     assert seen == []

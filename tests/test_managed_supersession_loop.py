@@ -4,18 +4,20 @@ from types import SimpleNamespace
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.ci_health import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import PullRequestMergeability, get_pr_checks
 from coding_review_agent_loop.managed_ci import FINAL_CONTEXT, ManagedCiContract, ManagedCiOutcome
-from coding_review_agent_loop.orchestrator import run_pr_loop
+from coding_review_agent_loop.pr_loop import run_pr_loop
 
 from coding_review_agent_loop.round_state import _extract_round_metadata_records
 
 from agent_loop_helpers import FakeRunner, make_config, structured_coder_followup, structured_pr_review
 from test_ci_health import NOW, _StubGhRunner, _metadata, _run
 from test_orchestrator_pr import _carried_ci_obligations, _carried_ci_review_comment
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+from agent_loop_helpers import patch_attr_in
 
 H = "abc123"
 
@@ -85,17 +87,17 @@ class _Effects:
 
 def _install(monkeypatch, outcome, *, mergeability=None):
     effects = _Effects()
-    monkeypatch.setattr(orchestrator, "activate_managed_ci", lambda *a, **k: ManagedCiContract())
-    monkeypatch.setattr(orchestrator, "dispatch_final_qualification", lambda *a, **k: None)
-    monkeypatch.setattr(orchestrator, "wait_for_final_qualification", lambda *a, **k: outcome)
-    monkeypatch.setattr(orchestrator, "prepare_v2_merge", lambda *a, **k: effects.prepares.append(k))
-    monkeypatch.setattr(orchestrator, "_merge_with_exact_head_proof", lambda *a, **k: effects.merges.append(k))
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: ManagedCiContract())
+    monkeypatch.setattr(pr_loop, "dispatch_final_qualification", lambda *a, **k: None)
+    monkeypatch.setattr(pr_loop, "wait_for_final_qualification", lambda *a, **k: outcome)
+    monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *a, **k: effects.prepares.append(k))
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_merge_with_exact_head_proof", lambda *a, **k: effects.merges.append(k))
     monkeypatch.setattr(
-        orchestrator, "publish_manual_v2_qualification",
+        pr_loop, "publish_manual_v2_qualification",
         lambda *a, **k: effects.publishes.append(k) or H,
     )
 
-    real = orchestrator._mergeability_for_unreadable_protection
+    real = pr_loop_support._mergeability_for_unreadable_protection
 
     def read_mergeability(runner, **k):
         # Count only the supersession read, which happens for forbidden protection.
@@ -104,7 +106,7 @@ def _install(monkeypatch, outcome, *, mergeability=None):
         effects.mergeability_reads += 1
         return mergeability
 
-    monkeypatch.setattr(orchestrator, "_mergeability_for_unreadable_protection", read_mergeability)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_mergeability_for_unreadable_protection", read_mergeability)
     return effects
 
 

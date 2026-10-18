@@ -4,7 +4,6 @@ import json
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.plan_review_scheduling import PlanPrePanelSafetyError
 from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
@@ -23,13 +22,9 @@ from coding_review_agent_loop.github import (
     validate_pr_body_does_not_close_issue,
 )
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
-from coding_review_agent_loop.orchestrator import (
-    PostedRoundMetadata,
-    _attach_round_metadata,
-    _handle_plan_first_split_scope,
-    _log_typed_plan_stage_dispositions,
-    _plan_subject,
-)
+from coding_review_agent_loop.panel_evidence import PostedRoundMetadata, _plan_subject
+from coding_review_agent_loop.discuss_loop import _attach_round_metadata
+from coding_review_agent_loop.execution_policy import _handle_plan_first_split_scope, _log_typed_plan_stage_dispositions
 from coding_review_agent_loop.comment_rendering import render_typed_plan_stages_section
 from coding_review_agent_loop.protocol import DeferredStage, TypedPlanStages
 from coding_review_agent_loop.split_materialization import (
@@ -50,10 +45,14 @@ from agent_loop_helpers import (
     structured_pr_review,
 )
 from coding_review_agent_loop.protocol import validate_structured_plan_state
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+from agent_loop_helpers import patch_attr_in
 
 
 def test_v1_recommendation_rejects_legacy_typed_split_input():
-    from coding_review_agent_loop.orchestrator import _extract_current_child_stages
+    from coding_review_agent_loop.execution_policy import _extract_current_child_stages
 
     plan = structured_v1_plan_state(
         legacy_child_stages=[{"title": "Legacy split", "summary": "Explicit legacy path."}]
@@ -66,7 +65,7 @@ def test_v1_recommendation_rejects_legacy_typed_split_input():
 
 
 def test_unversioned_plan_keeps_legacy_typed_split_input():
-    from coding_review_agent_loop.orchestrator import _extract_current_child_stages
+    from coding_review_agent_loop.execution_policy import _extract_current_child_stages
 
     stages = _extract_current_child_stages(
         structured_plan_state(
@@ -231,8 +230,8 @@ def test_fresh_v1_recommendation_is_inert_through_plan_first_modes(
         events.append("implement")
         return 0
 
-    monkeypatch.setattr(orchestrator_module, "_decompose_approved_plan", fake_decompose)
-    monkeypatch.setattr(orchestrator_module, "_implement_approved_issue", fake_implement)
+    patch_attr_in(monkeypatch, (issue_implementation, plan_first_loop), "_decompose_approved_plan", fake_decompose)
+    patch_attr_in(monkeypatch, (issue_implementation, plan_first_loop), "_implement_approved_issue", fake_implement)
 
     compatible = (
         execution_mode == "plan-only" and strategy == "one-shot"
@@ -322,7 +321,7 @@ def test_one_shot_recommendation_keeps_legacy_split_materialization_live(
     )
     recommendation = validate_structured_plan_state(plan).execution_recommendation
     assert recommendation is not None
-    resolved = orchestrator_module._resolve_execution_policy(
+    resolved = execution_policy._resolve_execution_policy(
         config,
         requested_policy=execution_mode,
         recommendation=recommendation,

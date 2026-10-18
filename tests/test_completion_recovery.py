@@ -14,12 +14,8 @@ import pytest
 
 from coding_review_agent_loop.cli import run_issue_loop
 from coding_review_agent_loop.errors import AgentInvocationError, AgentLoopError
-from coding_review_agent_loop.orchestrator import (
-    CompletionRecoveryPolicy,
-    ValidatedAgentResponse,
-    _attempt_claude_completion_recovery,
-    _new_usage_context,
-)
+from coding_review_agent_loop.validated_agent import CompletionRecoveryPolicy, _attempt_claude_completion_recovery, _new_usage_context
+from coding_review_agent_loop.agent_failure import ValidatedAgentResponse
 from coding_review_agent_loop.protocol import (
     AgentUnavailable,
     StructuredIssueImplementation,

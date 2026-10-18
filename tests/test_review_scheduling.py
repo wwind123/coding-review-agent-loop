@@ -8,6 +8,18 @@ from agent_loop_helpers import (
 )
 from coding_review_agent_loop.github import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence_module
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 
 def test_named_pr_primary_runs_before_same_backend_panel(tmp_path):
@@ -35,7 +47,6 @@ def test_named_pr_primary_runs_before_same_backend_panel(tmp_path):
 def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
     tmp_path, monkeypatch, capsys,
 ):
-    import coding_review_agent_loop.orchestrator as orchestrator
     from coding_review_agent_loop.round_state import _extract_round_metadata_records
 
     seats = tuple(
@@ -77,8 +88,8 @@ def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
             branch_protection_status="configured", check_query_status="ok",
         )
 
-    monkeypatch.setattr(orchestrator, "get_pr_checks", checks)
-    original_invoke = orchestrator._run_validated_agent
+    monkeypatch.setattr(pr_loop, "get_pr_checks", checks)
+    original_invoke = validated_agent._run_validated_agent
     interrupted = False
 
     def records():
@@ -99,9 +110,9 @@ def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
         return original_invoke(*args, **kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(orchestrator, "_run_validated_agent", interrupt_before_second_new_head_review)
+        patch_attr_in(patch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", interrupt_before_second_new_head_review)
         with pytest.raises(KeyboardInterrupt):
-            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+            pr_loop.run_pr_loop(runner, pr_number=77, config=config)
 
     assert interrupted
     assert runner.pr_payload["headRefOid"] != "abc123"
@@ -117,7 +128,7 @@ def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
     assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 3
     assert "PR #77 approved by" not in capsys.readouterr().out
 
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
     assert "PR #77 approved by" in capsys.readouterr().out
     approvals = [
         record.metadata for record in records()
@@ -130,16 +141,14 @@ def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
 
 
 def test_named_selective_pr_keeps_same_backend_seats_distinct(tmp_path, monkeypatch):
-    import coding_review_agent_loop.orchestrator as orchestrator
     from agent_loop_helpers import structured_coder_followup
 
     flash = SeatAgent(ReviewerSeat("flash", "antigravity", ("Model A",)), tmp_path / "flash")
     opus = SeatAgent(ReviewerSeat("opus", "antigravity", ("Model B",)), tmp_path / "opus")
     flash.workdir.mkdir()
     opus.workdir.mkdir()
-    monkeypatch.setattr(
-        orchestrator, "_observe_pr_transition",
-        lambda *args, **kwargs: orchestrator.TransitionClassification("narrow", "worker-only fix"),
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_observe_pr_transition",
+        lambda *args, **kwargs: pr_loop_support.TransitionClassification("narrow", "worker-only fix"),
     )
     runner = FakeRunner(
         antigravity_outputs=[
@@ -164,7 +173,7 @@ def test_named_selective_pr_keeps_same_backend_seats_distinct(tmp_path, monkeypa
         pr_review_policy="selective-intermediate", pre_review_tests=False,
         agent_max_retries=0, max_rounds=3,
     )
-    original_post = orchestrator.post_pr_comment
+    original_post = pr_loop_support.post_pr_comment
     audits = 0
 
     def interrupt_after_second_audit(*args, **kwargs):
@@ -177,9 +186,9 @@ def test_named_selective_pr_keeps_same_backend_seats_distinct(tmp_path, monkeypa
         return result
 
     with monkeypatch.context() as patch:
-        patch.setattr(orchestrator, "post_pr_comment", interrupt_after_second_audit)
+        patch_attr_in(patch, (pr_loop_support, pr_loop, issue_loop), "post_pr_comment", interrupt_after_second_audit)
         with pytest.raises(KeyboardInterrupt):
-            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+            pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     assert audits == 2
     from coding_review_agent_loop.round_state import _extract_round_metadata_records
     interrupted_records = _extract_round_metadata_records(
@@ -196,7 +205,7 @@ def test_named_selective_pr_keeps_same_backend_seats_distinct(tmp_path, monkeypa
     assert any(name == "flash" for name, _ in checkpoint.scheduler_paused_reviewers)
     assert checkpoint.prior_items[0].reviewer == "opus"
     assert checkpoint.prior_items[0].resolution_owners == ("opus",)
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
     models = [cmd[cmd.index("--model") + 1] for cmd, _ in runner.commands
               if cmd and cmd[0] == "agy" and "--model" in cmd]
     assert models[:2] == ["Model A", "Model B"]
@@ -235,7 +244,7 @@ from coding_review_agent_loop.round_state import (
     _encode_round_metadata,
     _prior_item_ledger_signature,
 )
-from coding_review_agent_loop.orchestrator import (
+from coding_review_agent_loop.pr_loop_support import (
     _all_pending_resolution_owners_unavailable,
     _fresh_pr_qualification_snapshot,
     _observe_pr_transition,
@@ -245,7 +254,6 @@ from coding_review_agent_loop.orchestrator import (
     _reviewer_needs_fresh_context,
     _reviewer_diff_summary,
 )
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.architecture_context import ArchitectureSnapshot
 from coding_review_agent_loop.round_transport import decode_mapping
 from coding_review_agent_loop.unresolved_items import (
@@ -951,19 +959,17 @@ def test_architecture_revalidation_schedules_once_for_changed_identity(tmp_path,
     )
     config = make_config(tmp_path, architecture_context=old, architecture_context_enabled=True)
     metadata = SimpleNamespace(base_branch="main", head_sha="head")
-    monkeypatch.setattr(
-        orchestrator,
-        "_freeze_prompt_architecture",
+    patch_attr_in(monkeypatch, (architecture_contract, pr_loop, issue_implementation, issue_loop), "_freeze_prompt_architecture",
         lambda runner, config, **kwargs: dataclasses.replace(
             config, architecture_context=new
         ),
     )
 
-    fresh, changed = orchestrator._revalidate_pr_architecture_identity(
+    fresh, changed = architecture_contract._revalidate_pr_architecture_identity(
         FakeRunner(), config=config, metadata=metadata, stored_identity=old.identity()
     )
     assert fresh == new and changed is True
-    _fresh, repeated = orchestrator._revalidate_pr_architecture_identity(
+    _fresh, repeated = architecture_contract._revalidate_pr_architecture_identity(
         FakeRunner(), config=config, metadata=metadata, stored_identity=new.identity()
     )
     assert repeated is False
@@ -1663,11 +1669,11 @@ def _staged_record(index, *, role="summary", agent="Orchestrator", subject="h1",
         scheduler_primary_reviewer="Codex",
         scheduler_approved_reviewers=tuple(approved),
     )
-    return orchestrator.PostedRoundRecord(index=index, metadata=metadata, body="")
+    return response_validation.PostedRoundRecord(index=index, metadata=metadata, body="")
 
 
 def _evidence(records):
-    return orchestrator._derive_pr_panel_evidence(
+    return panel_evidence_module._derive_pr_panel_evidence(
         records, primary_reviewer="Codex", required_reviewers=("Codex", "Gemini", "Antigravity")
     )
 
@@ -1724,7 +1730,7 @@ def test_secondary_approval_counts_only_after_qualified_opening():
     evidence = _evidence([premature_secondary, primary_approval, audit, post_secondary])
 
     def qualified(record, *, operator=False, current=evidence):
-        return orchestrator._pr_record_is_panel_qualified(
+        return panel_evidence_module._pr_record_is_panel_qualified(
             record, current, primary_reviewer="Codex", operator_force_full=operator
         )
 
@@ -1752,13 +1758,13 @@ def test_superseded_prepanel_review_context_is_built_from_the_record():
         status="blocking", fix_scope=("src/worker.py",),
     )
     record = _staged_record(5, role="reviewer", agent="Gemini", state="blocking", new_items=(item,))
-    superseded = orchestrator._superseded_prepanel_review(record)
+    superseded = panel_evidence_module._superseded_prepanel_review(record)
     assert superseded.reviewer == "Gemini"
     assert superseded.claims == ("premature cache race",)
     assert superseded.item_ids == ("item-4",)
-    assert orchestrator._superseded_prepanel_review(None) is None
+    assert panel_evidence_module._superseded_prepanel_review(None) is None
     assert "Gemini (round 1, head h1, state blocking; items: item-4)" == (
-        orchestrator._describe_superseded_prepanel_review(record)
+        panel_evidence_module._describe_superseded_prepanel_review(record)
     )
 
 

@@ -22,6 +22,7 @@ from coding_review_agent_loop.agents.antigravity import (
 from coding_review_agent_loop.agents.base import AgentResult
 from coding_review_agent_loop.errors import AgentLoopError, CheckoutVerificationError
 from coding_review_agent_loop.runner import Runner
+import coding_review_agent_loop.validated_agent as validated_agent
 
 GIT_ENV = {
     **os.environ,
@@ -961,7 +962,6 @@ def test_antigravity_normal_cleanup_keeps_an_originally_empty_tracked_file(tmp_p
 
 import shutil  # noqa: E402
 
-from coding_review_agent_loop import orchestrator  # noqa: E402
 from coding_review_agent_loop.runner import CommandResult  # noqa: E402
 
 
@@ -1001,7 +1001,7 @@ def _loop(tmp_path, repo, monkeypatch, *, agent, script, **config_kwargs):
     cv.establish_initial_baseline(config, runner, repo)
 
     def run_it():
-        return orchestrator._run_validated_agent(
+        return validated_agent._run_validated_agent(
             runner, agent=agent, config=config, prompt="p",
             marker_description="VALID",
             validate=lambda text: text if text == "VALID" else (_ for _ in ()).throw(AgentLoopError("invalid")),
@@ -1096,7 +1096,7 @@ def test_orchestrator_antigravity_fallback_refuses_foreign_change(tmp_path, repo
         antigravity_models=("model-one", "model-two"), agent_max_retries=0,
     )
     _foreign_between_attempts(
-        runner, repo, monkeypatch, orchestrator, "classify_antigravity_capacity"
+        runner, repo, monkeypatch, validated_agent, "classify_antigravity_capacity"
     )
     with pytest.raises(CheckoutVerificationError, match="foreign.txt"):
         run_it()

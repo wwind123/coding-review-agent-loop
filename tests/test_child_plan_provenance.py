@@ -6,7 +6,6 @@ import re
 import pytest
 
 from agent_loop_helpers import FakeRunner, make_config, structured_v1_plan_state
-from coding_review_agent_loop import orchestrator
 from coding_review_agent_loop.comment_rendering import render_execution_recommendation_section
 from coding_review_agent_loop.decomposition import (
     CreatedPhaseIssue, PlanPhase, TopologyCheckpoint, approved_plan_hash,
@@ -25,6 +24,17 @@ from coding_review_agent_loop.github import HumanReviewRequirement, IssueComment
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
 from coding_review_agent_loop.protocol import parse_risk_test_matrix
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 
 def plan_record(plan):
@@ -39,7 +49,7 @@ def comment(body):
 
 
 def replace_phase_plan_hash(body, plan_hash):
-    marker = orchestrator.PHASE_IDENTITY_MARKER_RE.search(body)
+    marker = execution_policy.PHASE_IDENTITY_MARKER_RE.search(body)
     assert marker is not None
     payload = json.loads(
         base64.urlsafe_b64decode(marker.group("payload").encode("ascii")).decode("utf-8")
@@ -220,7 +230,7 @@ def fresh_child_contexts(
     )
     assert recommendation is not None
     normalized, retained = normalize_execution_recommendation(
-        recommendation, approved_plan=plan, plan_subject=orchestrator._plan_subject(plan)
+        recommendation, approved_plan=plan, plan_subject=panel_evidence._plan_subject(plan)
     )
     phase = normalized.phases[0]
     parent_hash = approved_plan_hash(plan)
@@ -243,7 +253,7 @@ def fresh_child_contexts(
         inherited_matrix_row_ids=inherited_matrix_row_ids,
     )
     if stable_stage_id != phase.stage_id:
-        marker = orchestrator.PHASE_IDENTITY_MARKER_RE.search(child_body)
+        marker = execution_policy.PHASE_IDENTITY_MARKER_RE.search(child_body)
         assert marker is not None
         marker_payload = json.loads(
             base64.urlsafe_b64decode(marker.group("payload").encode("ascii")).decode("utf-8")
@@ -276,7 +286,7 @@ def fresh_child_contexts(
         retained_parent_scope=retained, final_integration_work=normalized.final_integration_work,
         strategy="staged", execution_strategy_contract_version=1,
         recommendation_digest=normalized.recommendation_digest,
-        plan_subject=orchestrator._plan_subject(plan),
+        plan_subject=panel_evidence._plan_subject(plan),
         inherited_matrix_row_ids=inherited_matrix_row_ids,
     )
     handoff = format_phase_implementation_handoff_comment(
@@ -284,7 +294,7 @@ def fresh_child_contexts(
         phase_index=1, created=parent_children[0], strategy="staged",
         topology_source="approved-plan-v1", execution_strategy_contract_version=1,
         recommendation_digest=normalized.recommendation_digest,
-        plan_subject=orchestrator._plan_subject(plan),
+        plan_subject=panel_evidence._plan_subject(plan),
         inherited_matrix_row_ids=inherited_matrix_row_ids,
         execution_disposition=handoff_execution_disposition,
         override_digest=handoff_override_digest,
@@ -355,7 +365,7 @@ def test_separately_planned_child_preserves_both_plan_bindings(tmp_path, monkeyp
         comments=tuple([comment(plan_record(parent_plan))] +
                        ([] if fault == "parent_checkpoint" else [comment(checkpoint)])),
     )
-    monkeypatch.setattr(orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
                         lambda runner, *, config, issue_number: child if issue_number == 56 else parent)
     runner = FakeRunner(
         pr_payload={"number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77"},
@@ -365,8 +375,8 @@ def test_separately_planned_child_preserves_both_plan_bindings(tmp_path, monkeyp
 
     def run():
         if entry == "issue":
-            return orchestrator.run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-        return orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+            return issue_loop.run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        return pr_loop.run_pr_loop(runner, pr_number=77, config=config)
 
     if fault:
         with pytest.raises(AgentLoopError):
@@ -389,9 +399,7 @@ def test_cli_run_pr_loop_validates_fresh_child_phase_identity(
 ):
     plan = fresh_staged_plan()
     child, parent = fresh_child_contexts(plan, stable_stage_id=stable_stage_id)
-    monkeypatch.setattr(
-        orchestrator,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -406,10 +414,10 @@ def test_cli_run_pr_loop_validates_fresh_child_phase_identity(
 
     if should_fail:
         with pytest.raises(AgentLoopError, match="stable ID disagrees with its ordinal"):
-            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+            pr_loop.run_pr_loop(runner, pr_number=77, config=config)
         assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
     else:
-        assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
         assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
@@ -437,9 +445,7 @@ def test_cli_run_pr_loop_validates_parent_handoff_after_decompose_only_transitio
             comments=parent.comments[:-1]
             + (comment(replace_phase_handoff_payload(parent.comments[-1].body, **handoff_updates)),),
         )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -454,10 +460,10 @@ def test_cli_run_pr_loop_validates_parent_handoff_after_decompose_only_transitio
 
     if handoff_updates:
         with pytest.raises(AgentLoopError, match="implementation handoff"):
-            orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+            pr_loop.run_pr_loop(runner, pr_number=77, config=config)
         assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
     else:
-        assert orchestrator.run_pr_loop(runner, pr_number=77, config=config) == 0
+        assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
         assert any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
@@ -470,9 +476,7 @@ def test_cli_run_pr_loop_rejects_mismatched_parent_handoff_after_decompose_only_
         summary_mode="decompose-only",
         handoff_mode="decompose-only",
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -486,7 +490,7 @@ def test_cli_run_pr_loop_rejects_mismatched_parent_handoff_after_decompose_only_
     config = make_config(tmp_path)
 
     with pytest.raises(AgentLoopError, match="implementation handoff"):
-        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
@@ -502,9 +506,7 @@ def test_cli_run_pr_loop_requires_child_plan_without_parent_phase_handoff(
     # The child handoff deliberately carries the parent topology hash, but the
     # parent phase handoff is absent and the child has no approved plan.
     parent = dataclasses.replace(parent, comments=parent.comments[:-1])
-    monkeypatch.setattr(
-        orchestrator,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -518,7 +520,7 @@ def test_cli_run_pr_loop_requires_child_plan_without_parent_phase_handoff(
     config = make_config(tmp_path)
 
     with pytest.raises(AgentLoopError, match="approved child plan"):
-        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
@@ -547,8 +549,7 @@ def test_planning_handoff_pr_binds_to_distinct_reviewed_child_plan(
         )
     elif fault == "missing_child_plan":
         child = dataclasses.replace(child, comments=child.comments[1:])
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -560,12 +561,12 @@ def test_planning_handoff_pr_binds_to_distinct_reviewed_child_plan(
     )
     if fault == "parent_hash_copy":
         with pytest.raises(AgentLoopError, match="parent phase hash"):
-            orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+            pr_loop.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
     elif fault == "missing_child_plan":
         with pytest.raises(AgentLoopError, match="no reviewed approved child plan"):
-            orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+            pr_loop.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
     else:
-        assert orchestrator.run_pr_loop(
+        assert pr_loop.run_pr_loop(
             runner, pr_number=77, config=make_config(tmp_path)
         ) == 0
         prompt = next(
@@ -599,13 +600,12 @@ def test_direct_and_legacy_handoff_pr_still_require_parent_phase_hash(
             flow="approved-plan-implementation", plan_hash="wrong-child-hash",
         )),),
     )
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(pr_payload={"number": 77, "body": "Fixes #56", "url": "pr-url"})
     with pytest.raises(AgentLoopError, match="implementation handoff disagrees"):
-        orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+        pr_loop.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
@@ -617,8 +617,7 @@ def test_contradictory_unbound_handoff_fails_closed_in_workflow_paths(
     child, parent = fresh_child_contexts(
         plan, handoff_execution_disposition="requires-child-planning"
     )
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -628,11 +627,11 @@ def test_contradictory_unbound_handoff_fails_closed_in_workflow_paths(
     )
     with pytest.raises(AgentLoopError, match="carries no override digest"):
         if entry == "issue":
-            orchestrator.run_issue_loop(
+            issue_loop.run_issue_loop(
                 runner, issue_number=56, config=make_config(tmp_path)
             )
         else:
-            orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+            pr_loop.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
     assert not any(command[:1] == ["claude"] for command, _cwd in runner.commands)
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
     assert runner.issue_comments == []
@@ -686,24 +685,21 @@ def test_override_bound_handoff_survives_child_entry_and_pr_validation(
             normalized.phases[1], "https://github.com/OWNER/REPO/issues/57", 57
         ),
     )
-    monkeypatch.setattr(
-        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, _m1278_plan_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
-    monkeypatch.setattr(
-        orchestrator, "create_decomposition_child_issues",
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
     )
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
-    assert orchestrator._preflight_fresh_staged_topology(
+    assert execution_policy._preflight_fresh_staged_topology(
         FakeRunner(), issue_number=55, approved_plan=plan,
         config=make_config(tmp_path), issue_context=parent,
         mode="implement-by-phase", normalized_topology=(normalized, retained),
     ) == created
 
-    resolved = orchestrator._resolve_fresh_child_provenance(
+    resolved = execution_policy._resolve_fresh_child_provenance(
         issue_context=child, parent_issue_context=parent
     )
     assert resolved is not None
@@ -714,13 +710,13 @@ def test_override_bound_handoff_survives_child_entry_and_pr_validation(
         pr_payload={"number": 77, "body": "Fixes #56", "url": "pr-url"},
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
     )
-    assert orchestrator.run_pr_loop(
+    assert pr_loop.run_pr_loop(
         runner, pr_number=77, config=make_config(tmp_path)
     ) == 0
 
     without_record = dataclasses.replace(parent, comments=parent.comments[:-1])
     with pytest.raises(AgentLoopError, match="undiscoverable"):
-        orchestrator._resolve_fresh_child_provenance(
+        execution_policy._resolve_fresh_child_provenance(
             issue_context=child, parent_issue_context=without_record
         )
 
@@ -733,26 +729,24 @@ def test_legacy_ambiguous_child_workflow_plans_unless_legacy_handoff_exists(
     child, parent = fresh_child_contexts(plan)
     if not with_legacy_handoff:
         parent = dataclasses.replace(parent, comments=parent.comments[:-1])
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     dispatched = []
-    monkeypatch.setattr(orchestrator, "prepare_agent_memory", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        orchestrator, "_dispatch_decomposition_child",
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "prepare_agent_memory", lambda *_args, **_kwargs: None)
+    patch_attr_in(monkeypatch, (_m1278_plan_loop, issue_loop), "_dispatch_decomposition_child",
         lambda *_args, **kwargs: dispatched.append(kwargs) or 0,
     )
     runner = FakeRunner()
     if with_legacy_handoff:
-        assert orchestrator.run_issue_loop(
+        assert issue_loop.run_issue_loop(
             runner, issue_number=56, config=make_config(tmp_path)
         ) == 0
         assert dispatched and dispatched[0]["route"].is_direct
         assert dispatched[0]["existing_handoff"].execution_disposition is None
     else:
         with pytest.raises(AgentLoopError, match="--plan-first"):
-            orchestrator.run_issue_loop(
+            issue_loop.run_issue_loop(
                 runner, issue_number=56, config=make_config(tmp_path)
             )
         assert dispatched == []
@@ -837,9 +831,7 @@ def test_m780_12_generated_child_dispatch_enforces_owned_rows_and_keeps_later_ro
     child, parent = fresh_child_contexts(
         plan, inherited_matrix_row_ids=("row-stage-one",)
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -849,7 +841,7 @@ def test_m780_12_generated_child_dispatch_enforces_owned_rows_and_keeps_later_ro
         },
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
     )
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     assert "- [ ] row-stage-one:" in prompt
     assert "Row row-stage-two" in prompt
@@ -896,9 +888,7 @@ def test_m780_12_separately_planned_child_requires_parent_row_and_uses_child_pro
         comments=(comment(plan_record(child_plan)), comment(child_handoff)),
     )
     parent = dataclasses.replace(parent, comments=parent.comments[:-1])
-    monkeypatch.setattr(
-        orchestrator,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -908,7 +898,7 @@ def test_m780_12_separately_planned_child_requires_parent_row_and_uses_child_pro
         },
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
     )
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     assert "- [ ] row-stage-one:" in prompt
     assert "Risk-matrix coverage obligations" in prompt
@@ -980,15 +970,13 @@ def test_rerun_preflight_reconciles_a_published_shortened_retained_excerpt(
         url="https://github.com/OWNER/REPO/issues/55",
         comments=(comment(plan_record(plan)), comment(summary)),
     )
-    monkeypatch.setattr(
-        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, _m1278_plan_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
-    monkeypatch.setattr(
-        orchestrator, "create_decomposition_child_issues",
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
     )
 
-    assert orchestrator._preflight_fresh_staged_topology(
+    assert execution_policy._preflight_fresh_staged_topology(
         FakeRunner(), issue_number=55, approved_plan=plan,
         config=make_config(tmp_path), issue_context=parent,
         mode="implement-by-phase", normalized_topology=(normalized, retained),
@@ -1036,16 +1024,14 @@ def test_rerun_preflight_still_rejects_a_foreign_retained_excerpt(tmp_path, monk
         url="https://github.com/OWNER/REPO/issues/55",
         comments=(comment(plan_record(plan)), comment(summary)),
     )
-    monkeypatch.setattr(
-        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, _m1278_plan_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
-    monkeypatch.setattr(
-        orchestrator, "create_decomposition_child_issues",
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
     )
 
     with pytest.raises(AgentLoopError, match="disagrees with the approved normalized topology"):
-        orchestrator._preflight_fresh_staged_topology(
+        execution_policy._preflight_fresh_staged_topology(
             FakeRunner(), issue_number=55, approved_plan=plan,
             config=make_config(tmp_path), issue_context=parent,
             mode="implement-by-phase", normalized_topology=(normalized, retained),
@@ -1095,16 +1081,14 @@ def test_rerun_preflight_rejects_an_appended_retained_excerpt(tmp_path, monkeypa
         url="https://github.com/OWNER/REPO/issues/55",
         comments=(comment(plan_record(plan)), comment(summary)),
     )
-    monkeypatch.setattr(
-        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, _m1278_plan_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
-    monkeypatch.setattr(
-        orchestrator, "create_decomposition_child_issues",
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation), "create_decomposition_child_issues",
         lambda *_args, **_kwargs: created,
     )
 
     with pytest.raises(AgentLoopError, match="disagrees with the approved normalized topology"):
-        orchestrator._preflight_fresh_staged_topology(
+        execution_policy._preflight_fresh_staged_topology(
             FakeRunner(), issue_number=55, approved_plan=plan,
             config=make_config(tmp_path), issue_context=parent,
             mode="implement-by-phase", normalized_topology=(normalized, retained),
@@ -1138,12 +1122,12 @@ def managed_ci_resume(
         fetched.append(issue_number)
         return child if issue_number == child.number else parent
 
-    monkeypatch.setattr(orchestrator, "get_issue_context", fake_get_issue_context)
-    monkeypatch.setattr(orchestrator, "validate_open_issue", lambda *_a, **_k: None)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context", fake_get_issue_context)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "validate_open_issue", lambda *_a, **_k: None)
     monkeypatch.setattr(
-        orchestrator,
+        pr_loop,
         "recover_issue_created_handoff",
-        lambda *_a, **_k: orchestrator.AuthenticatedIssueCreatedHandoff(
+        lambda *_a, **_k: pr_loop_support.AuthenticatedIssueCreatedHandoff(
             pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
             head_sha="abc123", branch="agent-loop/managed-56",
             trusted_actor_login="agent-loop", trusted_actor_id=1,
@@ -1156,7 +1140,7 @@ def managed_ci_resume(
         captured.update(kwargs)
         raise _ManagedResumeCaptured
 
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", revalidate)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", revalidate)
     runner = FakeRunner(
         pr_payload={
             "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
@@ -1170,7 +1154,7 @@ def managed_ci_resume(
     )
 
     def run():
-        return orchestrator.run_pr_loop(
+        return pr_loop.run_pr_loop(
             runner, pr_number=77, config=config,
             parent_issue_context=parent_issue_context,
             approved_plan_context=approved_plan_context,
@@ -1246,8 +1230,7 @@ def test_staged_child_pr_audits_divergent_parent_plan_seat_board(
             )),
         ))
         child = dataclasses.replace(child, comments=(comment(child_record),) + child.comments)
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(pr_payload={"body": "Fixes #56"})
@@ -1259,7 +1242,7 @@ def test_staged_child_pr_audits_divergent_parent_plan_seat_board(
     # No reviewer output is scripted: the run stops at the first reviewer,
     # after the audit record was posted.
     with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
-        orchestrator.run_pr_loop(
+        pr_loop.run_pr_loop(
             runner, pr_number=77, config=config,
             issue_context=child, parent_issue_context=parent,
         )
@@ -1274,7 +1257,7 @@ def test_managed_ci_resume_refreshes_stale_parent_snapshot_once(tmp_path, monkey
     plan = fresh_staged_plan()
     child, parent = fresh_child_contexts(plan)
     stale_parent = dataclasses.replace(parent, comments=parent.comments[1:])
-    assert orchestrator.recover_approved_plan_context(
+    assert execution_policy.recover_approved_plan_context(
         stale_parent.comments, expected_hash=approved_plan_hash(plan)
     ).is_available is False
     run, runner, captured, fetched = managed_ci_resume(
@@ -1339,7 +1322,7 @@ def test_managed_ci_resume_subject_rejected_child_record_permits_parent_fallback
         comments=(comment(legacy_plan_record(plan, subject="divergent-subject")),)
         + child.comments,
     )
-    child_only = orchestrator.recover_approved_plan_context(
+    child_only = execution_policy.recover_approved_plan_context(
         child.comments, expected_hash=approved_plan_hash(plan)
     )
     assert not child_only.is_available
@@ -1365,14 +1348,14 @@ def test_managed_ci_resume_divergent_child_records_never_consult_parent(
 
     def divergent(comments, **kwargs):
         seen.append(comments)
-        return orchestrator.ApprovedPlanContext(
+        return validated_agent.ApprovedPlanContext(
             plan_hash=kwargs["expected_hash"],
             availability="mismatched",
             has_matching_candidate=True,
             diagnostic="Multiple divergent canonical plan records match handoff hash.",
         )
 
-    monkeypatch.setattr(orchestrator, "recover_approved_plan_context", divergent)
+    patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop), "recover_approved_plan_context", divergent)
     run, runner, _captured, _fetched = managed_ci_resume(
         tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=parent
     )
@@ -1393,7 +1376,7 @@ def test_managed_ci_resume_rejects_supplied_scope_conflicting_with_parent_plan(
 ):
     plan = fresh_staged_plan()
     child, parent = fresh_child_contexts(plan)
-    supplied = orchestrator.make_approved_plan_context(
+    supplied = execution_policy.make_approved_plan_context(
         "Different plan.\n\n### Plan steps\n1. Change the boundary.",
         source_locator="test",
     )
@@ -1416,9 +1399,7 @@ def _capture_child_planning_config(tmp_path, monkeypatch, capsys, **config_overr
     )
     captured = {}
 
-    monkeypatch.setattr(
-        orchestrator,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda runner, *, config, issue_number: IssueContext(
             number=issue_number, repo="OWNER/REPO", title="Child",
             body="Child", url="child-url", comments=(),
@@ -1429,13 +1410,13 @@ def _capture_child_planning_config(tmp_path, monkeypatch, capsys, **config_overr
         captured["config"] = kwargs["config"]
         return 0
 
-    monkeypatch.setattr(orchestrator, "_run_plan_first_loop", fake_plan_first_loop)
+    patch_attr_in(monkeypatch, (_m1278_plan_loop, issue_loop), "_run_plan_first_loop", fake_plan_first_loop)
 
-    assert orchestrator._run_child_planning_cycle(
+    assert _m1278_plan_loop._run_child_planning_cycle(
         FakeRunner(),
         config=parent_config,
         memory=None,
-        usage_context=orchestrator._new_usage_context(parent_config),
+        usage_context=validated_agent._new_usage_context(parent_config),
         parent_issue=55,
         child_issue_number=56,
     ) == 0
@@ -1821,10 +1802,8 @@ class _ChildPlanningRunner(FakeRunner):
 
 def _bind_child_planning(monkeypatch, binding=None):
     """Run the plan-first loop as the child cycle of a bound stage."""
-    real = orchestrator._run_plan_first_loop
-    monkeypatch.setattr(
-        orchestrator,
-        "_run_plan_first_loop",
+    real = _m1278_plan_loop._run_plan_first_loop
+    patch_attr_in(monkeypatch, (_m1278_plan_loop, issue_loop), "_run_plan_first_loop",
         lambda runner, **kwargs: real(
             runner, **{**kwargs, "inherited_matrix_binding": binding or _binding()}
         ),
@@ -1833,7 +1812,7 @@ def _bind_child_planning(monkeypatch, binding=None):
     def forbid_repair(*args, **kwargs):
         raise AssertionError("a rejected inherited candidate must never reach the repair model")
 
-    monkeypatch.setattr(orchestrator, "_run_structured_repair", forbid_repair)
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", forbid_repair)
 
 
 def _agent_prompts(runner, agent):
@@ -1862,7 +1841,7 @@ def test_m931_weakened_fresh_candidate_is_replanned_before_publication(tmp_path,
         ],
         codex_outputs=[structured_plan_review(state="approved")],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
     ) == 0
 
@@ -1928,7 +1907,7 @@ def test_m931_weakened_revision_candidate_is_replanned_over_the_unchanged_base(
         good = _semantic_patch(fresh, None, summary="Corrected revision.")
     else:
         # Without an assembled sidecar the revision uses the full-state form.
-        monkeypatch.setattr(orchestrator, "make_assembled_plan_sidecar", lambda *a, **k: None)
+        monkeypatch.setattr(_m1278_plan_loop, "make_assembled_plan_sidecar", lambda *a, **k: None)
         weak = _revision_payload(
             _weak_child_row(), summary=WEAK_SUMMARY,
             changes=[{"operation": "change", "row_ids": ["row-owned"], "rationale": "Trim."}],
@@ -1944,7 +1923,7 @@ def test_m931_weakened_revision_candidate_is_replanned_over_the_unchanged_base(
             ),
         ],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
     ) == 0
 
@@ -1994,7 +1973,7 @@ def test_m976_top_level_row_bound_overflow_is_replanned_instead_of_fatal(tmp_pat
     def forbid_repair(*args, **kwargs):
         raise AssertionError("a deterministic assembly rejection must never reach the repair model")
 
-    monkeypatch.setattr(orchestrator, "_run_structured_repair", forbid_repair)
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", forbid_repair)
     fresh = _m976_full_plan_state()
     overflow = _m976_patch(fresh, summary=WEAK_SUMMARY, add_row=True)
     consolidated = _m976_patch(fresh, summary="Consolidated revision.")
@@ -2008,7 +1987,7 @@ def test_m976_top_level_row_bound_overflow_is_replanned_instead_of_fatal(tmp_pat
             ),
         ],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
     ) == 0
 
@@ -2035,7 +2014,7 @@ def test_m976_top_level_row_bound_overflow_exhausts_as_deterministic_failure(tmp
         codex_outputs=[structured_plan_review(state="blocking", blocking_plan_issues=["Add coverage."])],
     )
     with pytest.raises(AgentInvocationError, match="fail deterministic plan assembly") as error:
-        orchestrator.run_issue_loop(
+        issue_loop.run_issue_loop(
             runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
         )
     assert error.value.failure_category == "deterministic"
@@ -2053,7 +2032,7 @@ def _m979_patch_with_unknown_disposition(base_plan_text, *, summary):
 
 
 def _m979_carried_item():
-    return orchestrator.UnresolvedReviewItem(
+    return response_validation.UnresolvedReviewItem(
         item_id="item-1", reviewer="OpenAI Codex", source_round=1,
         text="Add coverage.", status="blocking", source_status="blocking",
     )
@@ -2073,7 +2052,7 @@ def _m979_forbid_repair(*args, **kwargs):
 
 def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monkeypatch):
     """#979: repair pins the patch payload, so a payload rejection replans instead."""
-    monkeypatch.setattr(orchestrator, "_run_structured_repair", _m979_forbid_repair)
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
     rejected = _m979_patch_with_unknown_disposition(fresh, summary=WEAK_SUMMARY)
     corrected = _m976_patch(fresh, summary="Corrected revision.")
@@ -2087,7 +2066,7 @@ def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monk
             ),
         ],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
     ) == 0
 
@@ -2108,7 +2087,7 @@ def test_m979_patch_payload_rejection_is_replanned_without_repair(tmp_path, monk
 
 
 def test_m979_patch_payload_rejection_exhausts_as_deterministic_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr(orchestrator, "_run_structured_repair", _m979_forbid_repair)
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
     rejected = _m979_patch_with_unknown_disposition(fresh, summary=WEAK_SUMMARY)
     runner = _ChildPlanningRunner(
@@ -2118,14 +2097,14 @@ def test_m979_patch_payload_rejection_exhausts_as_deterministic_failure(tmp_path
     with pytest.raises(
         AgentInvocationError, match="fail semantic patch payload validation"
     ) as error:
-        orchestrator.run_issue_loop(
+        issue_loop.run_issue_loop(
             runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
         )
     assert error.value.failure_category == "deterministic"
     exhaustion = error.value.plan_validation_exhaustion
     assert exhaustion is not None and exhaustion.candidate_kind == "plan_revision"
     assert "item-43" in exhaustion.diagnostic
-    assert len(_agent_prompts(runner, "claude")) == orchestrator.MAX_INHERITED_MATRIX_REPLANS + 2
+    assert len(_agent_prompts(runner, "claude")) == child_plan_binding.MAX_INHERITED_MATRIX_REPLANS + 2
     assert WEAK_SUMMARY not in _published(runner)
 
 
@@ -2140,7 +2119,7 @@ def test_m979_patch_envelope_defect_still_routes_to_repair(tmp_path, monkeypatch
         repair_calls.append((raw, repair_kwargs["expected_kind"]))
         return corrected, validate(corrected), []
 
-    monkeypatch.setattr(orchestrator, "_run_structured_repair", envelope_repair)
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", envelope_repair)
     runner = _ChildPlanningRunner(
         claude_outputs=[fresh, missing_footer],
         codex_outputs=[
@@ -2151,7 +2130,7 @@ def test_m979_patch_envelope_defect_still_routes_to_repair(tmp_path, monkeypatch
             ),
         ],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
     ) == 0
     assert repair_calls == [(missing_footer, "plan_revision_patch")]
@@ -2167,18 +2146,18 @@ def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
     carried = (_m979_carried_item(),)
 
     def validate(text):
-        return orchestrator._validate_plan_revision_patch_response(
+        return response_validation._validate_plan_revision_patch_response(
             text, unresolved_items=carried
         )
 
     def classify(text, normalized=None):
         with pytest.raises(AgentLoopError) as error:
             validate(text)
-        return orchestrator._semantic_patch_payload_rejection(
+        return validated_agent._semantic_patch_payload_rejection(
             error.value,
             text=text,
             normalized=normalized,
-            payload_validator=lambda payload: orchestrator._validate_plan_revision_patch_payload(
+            payload_validator=lambda payload: response_validation._validate_plan_revision_patch_payload(
                 payload, unresolved_items=carried
             ),
         )
@@ -2191,7 +2170,7 @@ def test_m979_payload_rejection_classifier_matches_what_repair_may_change():
     # An envelope defect hiding a payload defect is still unsatisfiable once
     # the envelope is normalized.
     prose_wrapped = "Here it is:\n" + unknown
-    normalized = orchestrator.attempt_envelope_normalization(
+    normalized = validated_agent.attempt_envelope_normalization(
         prose_wrapped, expected_kind="plan_revision_patch"
     )
     assert normalized is not None
@@ -2234,15 +2213,15 @@ def test_m979_envelope_error_does_not_mask_a_payload_disposition_defect():
     }])
     carried = (_m979_carried_item(),)
     with pytest.raises(AgentLoopError) as error:
-        orchestrator._validate_plan_revision_patch_response(
+        response_validation._validate_plan_revision_patch_response(
             combined, unresolved_items=carried, human_requirements=(requirement,),
         )
-    assert not isinstance(error.value, orchestrator.SemanticPatchPayloadRejection)
-    rejection = orchestrator._semantic_patch_payload_rejection(
+    assert not isinstance(error.value, validated_agent.SemanticPatchPayloadRejection)
+    rejection = validated_agent._semantic_patch_payload_rejection(
         error.value,
         text=combined,
         normalized=None,
-        payload_validator=lambda payload: orchestrator._validate_plan_revision_patch_payload(
+        payload_validator=lambda payload: response_validation._validate_plan_revision_patch_payload(
             payload, unresolved_items=carried, human_requirements=(requirement,),
         ),
     )
@@ -2262,7 +2241,7 @@ def test_m979_strict_patch_schema_failure_is_replanned_without_repair(
     tmp_path, monkeypatch, defect, expected
 ):
     """#979 item: a parse-level payload error uses the bounded replan, not repair."""
-    monkeypatch.setattr(orchestrator, "_run_structured_repair", _m979_forbid_repair)
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _m979_forbid_repair)
     fresh = _m976_full_plan_state()
     if defect == "empty-operations":
         rejected = _m979_patch_with(fresh, operations=[], summary=WEAK_SUMMARY)
@@ -2286,7 +2265,7 @@ def test_m979_strict_patch_schema_failure_is_replanned_without_repair(
             ),
         ],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         runner, issue_number=56, config=_plan_config(tmp_path, plan_growth_gate="off"), plan_first=True
     ) == 0
     planner_prompts = _agent_prompts(runner, "claude")
@@ -2305,14 +2284,14 @@ def test_m931_replan_exhaustion_persists_one_record_and_resume_feeds_the_next_tu
     weak = _child_plan_state(_weak_child_row(), summary=WEAK_SUMMARY)
     runner = _ChildPlanningRunner(claude_outputs=[weak] * 5)
     with pytest.raises(AgentInvocationError) as error:
-        orchestrator.run_issue_loop(
+        issue_loop.run_issue_loop(
             runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
         )
     assert error.value.failure_category == "deterministic"
     exhaustion = error.value.plan_validation_exhaustion
     assert exhaustion is not None and exhaustion.candidate_kind == "plan_state"
     assert "row-owned: forbidden_side_effects dropped" in exhaustion.diagnostic
-    assert len(_agent_prompts(runner, "claude")) == orchestrator.MAX_INHERITED_MATRIX_REPLANS + 1 == 3
+    assert len(_agent_prompts(runner, "claude")) == child_plan_binding.MAX_INHERITED_MATRIX_REPLANS + 1 == 3
     assert _agent_prompts(runner, "codex") == []
     assert len(runner.diagnostic_posts) == 1
     assert WEAK_SUMMARY not in runner.diagnostic_posts[0]
@@ -2328,9 +2307,7 @@ def test_m931_replan_exhaustion_persists_one_record_and_resume_feeds_the_next_tu
         claude_outputs=[weak, _child_plan_state(_child_row())],
         codex_outputs=[structured_plan_review(state="approved")],
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda r, *, config, issue_number: IssueContext(
             number=56, repo="OWNER/REPO", title="Child", body="Child", url="child-url",
             comments=(IssueComment(
@@ -2339,7 +2316,7 @@ def test_m931_replan_exhaustion_persists_one_record_and_resume_feeds_the_next_tu
             ),),
         ),
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         resumed, issue_number=56, config=_plan_config(tmp_path), plan_first=True
     ) == 0
     resumed_prompts = _agent_prompts(resumed, "claude")
@@ -2353,13 +2330,13 @@ def test_m931_over_cap_delta_set_rejects_the_candidate_into_the_replan_loop(
     tmp_path, monkeypatch
 ):
     _bind_child_planning(monkeypatch)
-    monkeypatch.setattr(orchestrator, "INHERITED_COVERAGE_DELTA_MAX_BYTES", 64)
+    monkeypatch.setattr(_m1278_plan_loop, "INHERITED_COVERAGE_DELTA_MAX_BYTES", 64)
     extended = _child_row(event=_parent_row()["event"] + " " + "with detail " * 20)
     runner = _ChildPlanningRunner(
         claude_outputs=[_child_plan_state(extended, summary=WEAK_SUMMARY), _child_plan_state(_child_row())],
         codex_outputs=[structured_plan_review(state="approved")],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
     ) == 0
     planner_prompts = _agent_prompts(runner, "claude")
@@ -2370,10 +2347,10 @@ def test_m931_over_cap_delta_set_rejects_the_candidate_into_the_replan_loop(
 
 def test_m931_oversized_inherited_obligations_stop_before_any_planner_turn(tmp_path, monkeypatch):
     _bind_child_planning(monkeypatch)
-    monkeypatch.setattr(orchestrator, "INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES", 32)
+    monkeypatch.setattr(_m1278_plan_loop, "INHERITED_OBLIGATIONS_ENFORCEABLE_MAX_BYTES", 32)
     runner = _ChildPlanningRunner(claude_outputs=[_child_plan_state(_child_row())])
-    with pytest.raises(orchestrator.PlanPrePanelSafetyError) as error:
-        orchestrator.run_issue_loop(
+    with pytest.raises(_m1278_plan_loop.PlanPrePanelSafetyError) as error:
+        issue_loop.run_issue_loop(
             runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
         )
     text = str(error.value)
@@ -2387,7 +2364,7 @@ def test_m931_ordinary_plan_first_issue_is_unchanged(tmp_path):
         claude_outputs=[_child_plan_state(_weak_child_row())],
         codex_outputs=[structured_plan_review(state="approved")],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         runner, issue_number=56, config=_plan_config(tmp_path), plan_first=True
     ) == 0
     assert len(_agent_prompts(runner, "claude")) == 1
@@ -2408,14 +2385,14 @@ def test_m931_resumed_review_round_recomputes_the_identical_delta_block(tmp_path
         claude_outputs=[_child_plan_state(refined)],
         codex_outputs=[structured_plan_review(state="approved")],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         first, issue_number=56, config=_plan_config(tmp_path), plan_first=True
     ) == 0
     resumed = _ChildPlanningRunner(
         issue_comments=[first.issue_comments[0]],
         codex_outputs=[structured_plan_review(state="approved")],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         resumed, issue_number=56, config=_plan_config(tmp_path), plan_first=True
     ) == 0
     assert _agent_prompts(resumed, "claude") == []
@@ -2433,7 +2410,7 @@ def test_m931_historical_weakened_plan_is_blocked_in_review_and_never_approved(
         claude_outputs=[_child_plan_state(_weak_child_row())],
         codex_outputs=[structured_plan_review(state="approved")],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         first, issue_number=56, config=_plan_config(tmp_path), plan_first=True
     ) == 0
     _bind_child_planning(monkeypatch)
@@ -2444,7 +2421,7 @@ def test_m931_historical_weakened_plan_is_blocked_in_review_and_never_approved(
     # The weakened plan is never approved for implementation: the guard sends
     # it to an enforced revision turn (#936), which this script does not supply.
     with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
-        orchestrator.run_issue_loop(
+        issue_loop.run_issue_loop(
             resumed, issue_number=56, config=_plan_config(tmp_path), plan_first=True
         )
     review_prompt = _agent_prompts(resumed, "codex")[0]
@@ -2459,9 +2436,7 @@ def test_m931_parent_dispatch_and_direct_child_entry_bind_the_inherited_rows(
     tmp_path, monkeypatch
 ):
     captured = []
-    monkeypatch.setattr(
-        orchestrator,
-        "_run_plan_first_loop",
+    patch_attr_in(monkeypatch, (_m1278_plan_loop, issue_loop), "_run_plan_first_loop",
         lambda runner, **kwargs: captured.append(kwargs["inherited_matrix_binding"]) or 0,
     )
     plan = fresh_staged_matrix_plan().replace(
@@ -2475,24 +2450,22 @@ def test_m931_parent_dispatch_and_direct_child_entry_bind_the_inherited_rows(
         handoff_execution_disposition="requires-child-planning",
     )
     child = dataclasses.replace(child, comments=())
-    monkeypatch.setattr(
-        orchestrator,
-        "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     # Direct child `--plan-first` entry.
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         FakeRunner(), issue_number=56, config=make_config(tmp_path), plan_first=True
     ) == 0
     # Parent dispatch entry.
-    fresh_child = orchestrator._resolve_fresh_child_provenance(
+    fresh_child = execution_policy._resolve_fresh_child_provenance(
         issue_context=child, parent_issue_context=parent
     )
     assert fresh_child is not None and fresh_child.route.is_planning
     config = make_config(tmp_path)
-    assert orchestrator._dispatch_decomposition_child(
+    assert _m1278_plan_loop._dispatch_decomposition_child(
         FakeRunner(), config=config, memory=None,
-        usage_context=orchestrator._new_usage_context(config),
+        usage_context=validated_agent._new_usage_context(config),
         parent_issue=55, approved_plan=fresh_child.approved_plan,
         plan_hash=fresh_child.plan_hash, plan_subject=fresh_child.plan_subject,
         recommendation=fresh_child.recommendation,
@@ -2538,8 +2511,7 @@ def test_m931_open_child_pr_is_readmitted_or_rejected_identically_on_both_paths(
         inherited_matrix_row_ids=("row-stage-one",), child_plan=child_plan,
     )
     parent = dataclasses.replace(parent, comments=parent.comments[:-1])
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     runner = FakeRunner(
@@ -2550,8 +2522,8 @@ def test_m931_open_child_pr_is_readmitted_or_rejected_identically_on_both_paths(
 
     def run():
         if entry == "issue":
-            return orchestrator.run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
-        return orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+            return issue_loop.run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+        return pr_loop.run_pr_loop(runner, pr_number=77, config=config)
 
     if variant == "weakened":
         with pytest.raises(AgentLoopError, match="row-stage-one: entry_path_or_mode replaced"):
@@ -2655,7 +2627,7 @@ class _M936World:
         history_config = _plan_config(
             tmp_path, **(history_board or (_M936_STAGED if staged else {}))
         )
-        assert orchestrator.run_issue_loop(
+        assert issue_loop.run_issue_loop(
             history, issue_number=56, config=history_config, plan_first=True
         ) == 0
         plan_comments = [comment(str(item["body"])) for item in history.issue_comments]
@@ -2677,12 +2649,12 @@ class _M936World:
         if signed:
             self.comments.append(comment(self.signed_record()))
         self.runner = None
-        monkeypatch.setattr(orchestrator, "get_issue_context", self._issue_context)
+        patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context", self._issue_context)
 
         def forbid_repair(*args, **kwargs):
             raise AssertionError("the repair model must never see an inherited-row rejection")
 
-        monkeypatch.setattr(orchestrator, "_run_structured_repair", forbid_repair)
+        patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", forbid_repair)
 
     def signed_record(self, **overrides):
         fields = dict(
@@ -2724,7 +2696,7 @@ class _M936World:
             },
             **outputs,
         )
-        return orchestrator.run_issue_loop(
+        return issue_loop.run_issue_loop(
             self.runner, issue_number=56, config=config or self.config(), plan_first=True
         )
 
@@ -2736,7 +2708,7 @@ class _M936World:
             },
             **outputs,
         )
-        return orchestrator.run_pr_loop(self.runner, pr_number=77, config=self.config())
+        return pr_loop.run_pr_loop(self.runner, pr_number=77, config=self.config())
 
     def good_patch(self, *, summary="Inherited rows restored."):
         return _m936_patch(self.old_state, _m936_inherited_row(), summary=summary)
@@ -2917,7 +2889,7 @@ def test_m1013_expansion_notice_failure_never_blocks_the_run(tmp_path, monkeypat
     def broken_shape(*args, **kwargs):
         raise AgentLoopError("sidecar unreadable")
 
-    monkeypatch.setattr(orchestrator, "_plan_contract_shape", broken_shape)
+    monkeypatch.setattr(child_plan_binding, "_plan_contract_shape", broken_shape)
     assert world.run_issue(
         claude_outputs=[_m1013_expanding_patch(world, extra_steps=["Add parser mode."])],
         codex_outputs=[structured_plan_review(state="approved"), PR_APPROVAL],
@@ -3049,7 +3021,7 @@ def test_m886_growth_advisory_failure_never_blocks_the_rebind(tmp_path, monkeypa
     def broken(*args, **kwargs):
         raise AgentLoopError("assessment unavailable")
 
-    monkeypatch.setattr(orchestrator, "_render_rebind_growth_advisory", broken)
+    monkeypatch.setattr(child_plan_binding, "_render_rebind_growth_advisory", broken)
     assert world.run_issue(
         config=world.config(plan_growth_gate="off", plan_growth_max_scope_items=1),
         claude_outputs=[_m936_patch(world.old_state, None, summary="Unjustified summary.")],
@@ -3060,18 +3032,18 @@ def test_m886_growth_advisory_failure_never_blocks_the_rebind(tmp_path, monkeypa
 
 
 def test_m1013_step_identity_compares_full_text_not_the_clipped_prefix():
-    shape = orchestrator._PlanContractShape
+    shape = child_plan_binding._PlanContractShape
     prefix = "Wire the parser mode through the acceptance boundary. " * 4
     old = shape(steps=(prefix + "Part one.",), matrix_row_ids=(), strategy="one-shot")
     grown = shape(
         steps=(prefix + "Part one.", prefix + "Part two."), matrix_row_ids=(), strategy="one-shot"
     )
-    expansion = orchestrator._plan_contract_expansion(old, grown)
+    expansion = child_plan_binding._plan_contract_expansion(old, grown)
     assert expansion and expansion[0][0].startswith("1 plan step(s) not in the superseded plan")
     assert expansion[0][1] == [prefix + "Part two."]
     # A duplicated step is still a new required step.
     doubled = shape(steps=old.steps * 2, matrix_row_ids=(), strategy="one-shot")
-    assert orchestrator._plan_contract_expansion(old, doubled)
+    assert child_plan_binding._plan_contract_expansion(old, doubled)
 
 
 def test_m1013_new_recommendation_commitments_are_an_expansion():
@@ -3090,14 +3062,14 @@ def test_m1013_new_recommendation_commitments_are_an_expansion():
         {"scope_item_id": "scope-b", "requirement": "Do B.", "acceptance_criteria": ["B works."]}
     )
     grown["one_shot_delivery"]["acceptance_criteria"].append("B works end to end.")
-    shape = orchestrator._PlanContractShape
+    shape = child_plan_binding._PlanContractShape
     old = shape(
         steps=("Do it.",), matrix_row_ids=("row-a",), strategy="one-shot",
-        commitments=orchestrator._recommendation_commitments(base),
+        commitments=child_plan_binding._recommendation_commitments(base),
     )
-    new = dataclasses.replace(old, commitments=orchestrator._recommendation_commitments(grown))
-    assert orchestrator._plan_contract_expansion(old, old) == []
-    expansion = orchestrator._plan_contract_expansion(old, new)
+    new = dataclasses.replace(old, commitments=child_plan_binding._recommendation_commitments(grown))
+    assert child_plan_binding._plan_contract_expansion(old, old) == []
+    expansion = child_plan_binding._plan_contract_expansion(old, new)
     assert len(expansion) == 1
     summary, items = expansion[0]
     assert summary.startswith("3 new or changed execution-recommendation value(s)")
@@ -3107,15 +3079,15 @@ def test_m1013_new_recommendation_commitments_are_an_expansion():
 
 
 def _m1013_expansion_for(base, changed):
-    shape = orchestrator._PlanContractShape
+    shape = child_plan_binding._PlanContractShape
     old = shape(
         steps=("Do it.",), matrix_row_ids=("row-a",), strategy=base["strategy"],
-        commitments=orchestrator._recommendation_commitments(base),
+        commitments=child_plan_binding._recommendation_commitments(base),
     )
     new = dataclasses.replace(
-        old, commitments=orchestrator._recommendation_commitments(changed)
+        old, commitments=child_plan_binding._recommendation_commitments(changed)
     )
-    return orchestrator._plan_contract_expansion(old, new)
+    return child_plan_binding._plan_contract_expansion(old, new)
 
 
 def test_m1013_new_coupling_constraint_alone_is_an_expansion():
@@ -3214,7 +3186,7 @@ def test_m1013_any_single_stage_field_change_is_an_expansion(field, value, label
 def test_m1013_notice_shows_the_changed_part_of_multiline_and_long_prefix_items(
     tmp_path, monkeypatch
 ):
-    shape = orchestrator._PlanContractShape
+    shape = child_plan_binding._PlanContractShape
     shared = "Validate every parser mode against the single acceptance boundary " * 4
     old_outcome = shared + "for fresh responses."
     new_outcome = shared + "for fresh responses and for retried repair responses."
@@ -3230,8 +3202,8 @@ def test_m1013_notice_shows_the_changed_part_of_multiline_and_long_prefix_items(
             matrix_row_values=(("row-a", (label + new_outcome,)),),
         ),
     }
-    monkeypatch.setattr(orchestrator, "_plan_contract_shape", lambda _comments, key: shapes[key])
-    notice = orchestrator._rebind_contract_expansion_notice(
+    monkeypatch.setattr(child_plan_binding, "_plan_contract_shape", lambda _comments, key: shapes[key])
+    notice = child_plan_binding._rebind_contract_expansion_notice(
         config=make_config(tmp_path), issue_number=56, comments=(), pr_number=77,
         superseded_hash="old", plan_hash="new",
     )
@@ -3240,11 +3212,11 @@ def test_m1013_notice_shows_the_changed_part_of_multiline_and_long_prefix_items(
     # A long shared prefix is elided so the divergent tail is named.
     row_line = next(line for line in notice.splitlines() if "expected_outcome" in line)
     assert " … " in row_line and "and for retried repair responses." in row_line
-    assert len(row_line) <= orchestrator._REBIND_EXPANSION_ITEM_CHARS + len("  - ")
+    assert len(row_line) <= child_plan_binding._REBIND_EXPANSION_ITEM_CHARS + len("  - ")
 
 
 def test_m1013_notice_escapes_quoted_record_text(tmp_path, monkeypatch):
-    shape = orchestrator._PlanContractShape
+    shape = child_plan_binding._PlanContractShape
     shapes = {
         "old": shape(steps=("Do A.",), matrix_row_ids=(), strategy="one-shot"),
         "new": shape(
@@ -3255,8 +3227,8 @@ def test_m1013_notice_escapes_quoted_record_text(tmp_path, monkeypatch):
             matrix_row_ids=(), strategy="one-shot",
         ),
     }
-    monkeypatch.setattr(orchestrator, "_plan_contract_shape", lambda _comments, key: shapes[key])
-    notice = orchestrator._rebind_contract_expansion_notice(
+    monkeypatch.setattr(child_plan_binding, "_plan_contract_shape", lambda _comments, key: shapes[key])
+    notice = child_plan_binding._rebind_contract_expansion_notice(
         config=make_config(tmp_path), issue_number=56, comments=(), pr_number=77,
         superseded_hash="old", plan_hash="new",
     )
@@ -3266,21 +3238,21 @@ def test_m1013_notice_escapes_quoted_record_text(tmp_path, monkeypatch):
 
 
 def test_m1013_contract_expansion_names_new_rows_and_a_changed_strategy():
-    shape = orchestrator._PlanContractShape
+    shape = child_plan_binding._PlanContractShape
     old = shape(steps=("Do A.",), matrix_row_ids=("row-a",), strategy="one-shot")
-    assert orchestrator._plan_contract_expansion(old, old) == []
+    assert child_plan_binding._plan_contract_expansion(old, old) == []
     # Dropped steps or rows alone are not an expansion.
     narrower = shape(steps=(), matrix_row_ids=(), strategy="one-shot")
-    assert orchestrator._plan_contract_expansion(old, narrower) == []
+    assert child_plan_binding._plan_contract_expansion(old, narrower) == []
     # A replaced step is, even at the same count.
     replaced = shape(steps=("Do B.",), matrix_row_ids=("row-a",), strategy="one-shot")
-    assert orchestrator._plan_contract_expansion(old, replaced) == [
+    assert child_plan_binding._plan_contract_expansion(old, replaced) == [
         ("1 plan step(s) not in the superseded plan (steps: 1 before, 1 after):", ["Do B."])
     ]
     grown = shape(steps=("Do A.",), matrix_row_ids=("row-a", "row-b"), strategy="staged")
     expansion = "\n".join(
         "\n".join([summary, *items])
-        for summary, items in orchestrator._plan_contract_expansion(old, grown)
+        for summary, items in child_plan_binding._plan_contract_expansion(old, grown)
     )
     assert "1 new risk/test matrix row(s)" in expansion and "`row-b`" in expansion
     assert "`row-a`" not in expansion
@@ -3351,7 +3323,7 @@ def test_m936_pr_mode_names_the_issue_route_and_proceeds_after_a_rebind(tmp_path
     assert world.agent_calls("codex") == [] and world.agent_calls("claude") == []
     assert world.posted() == []
     # A PR approval recorded under the old plan, before the rebind.
-    old_context = orchestrator.recover_approved_plan_context(
+    old_context = execution_policy.recover_approved_plan_context(
         world.comments, expected_hash=world.old_hash
     )
     stale_approval = _attach_round_metadata(PR_APPROVAL, PostedRoundMetadata(
@@ -3371,7 +3343,7 @@ def test_m936_pr_mode_names_the_issue_route_and_proceeds_after_a_rebind(tmp_path
     assert len(world.agent_calls("codex")) == 1
     from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
 
-    new_context = orchestrator.recover_approved_plan_context(
+    new_context = execution_policy.recover_approved_plan_context(
         world.all_comments(),
         expected_hash=find_latest_issue_pr_handoff(
             world.all_comments(), issue_number=56, repo="OWNER/REPO"
@@ -3393,11 +3365,11 @@ def _m936_unbound_round(world, plan_state, *, number, digest=None):
     """A genuine generation-1 plan round that did not come from the authorized re-plan."""
     base = _extract_round_metadata_records(world.comments, flow="plan")[0].metadata
     structured = validate_structured_plan_state(plan_state)
-    plan = orchestrator.render_canonical_plan_state(structured, world.config())
-    sidecar = orchestrator.make_assembled_plan_sidecar(
+    plan = _m1278_plan_loop.render_canonical_plan_state(structured, world.config())
+    sidecar = _m1278_plan_loop.make_assembled_plan_sidecar(
         structured, round_number=number, response_form="fresh-plan-state", rendered_plan=plan
     )
-    identity = orchestrator.risk_test_matrix_identity(
+    identity = _m1278_plan_loop.risk_test_matrix_identity(
         structured.risk_test_matrix, structured.risk_test_matrix_changes
     )
     return comment(_attach_round_metadata(plan, dataclasses.replace(
@@ -3502,7 +3474,7 @@ def _m936_snapshot(world, *, binding, approved_plan_context):
         "number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77",
     })
     child = world._issue_context(None, config=None, issue_number=56)
-    return orchestrator._fresh_pr_qualification_snapshot(
+    return pr_loop_support._fresh_pr_qualification_snapshot(
         world.runner, config=world.config(), pr_number=77, issue_context=child,
         parent_issue_context=world.parent, approved_plan_context=approved_plan_context,
         allow_plan_handoff_change=True, planning_child_binding=binding,
@@ -3510,10 +3482,10 @@ def _m936_snapshot(world, *, binding, approved_plan_context):
 
 
 def _m936_binding(world):
-    parent_plan = orchestrator.recover_approved_plan_context(
+    parent_plan = execution_policy.recover_approved_plan_context(
         world.parent.comments, expected_hash=approved_plan_hash(_m936_parent_plan())
     )
-    return orchestrator._PlanningChildBinding(
+    return child_plan_binding._PlanningChildBinding(
         child_issue=56, parent_issue=55, stage_id="stage-one", parent_plan_context=parent_plan
     )
 
@@ -3524,7 +3496,7 @@ def test_m936_mid_run_plan_adoption_is_verified_for_planning_children(
 ):
     world = _m936_rebound_world(tmp_path, monkeypatch)
     # The PR run started under the old plan; the rebind arrived while it was active.
-    old_context = orchestrator.recover_approved_plan_context(
+    old_context = execution_policy.recover_approved_plan_context(
         world.comments, expected_hash=world.old_hash
     )
     new_hash = find_latest_issue_pr_handoff(
@@ -3550,11 +3522,11 @@ def test_m936_mid_run_plan_adoption_is_verified_for_planning_children(
 
 def test_m936_mid_run_adoption_rejects_an_inadmissible_replacement(tmp_path, monkeypatch):
     world = _m936_rebound_world(tmp_path, monkeypatch)
-    old_context = orchestrator.recover_approved_plan_context(
+    old_context = execution_policy.recover_approved_plan_context(
         world.comments, expected_hash=world.old_hash
     )
     monkeypatch.setattr(
-        orchestrator, "_child_plan_admissibility_failure",
+        child_plan_binding, "_child_plan_admissibility_failure",
         lambda *args, **kwargs: "row-stage-one: entry_path_or_mode replaced",
     )
     with pytest.raises(AgentLoopError, match="replacement plan is itself inadmissible"):
@@ -3578,7 +3550,7 @@ def test_m936_closing_superset_after_a_rebind_never_hides_an_unverifiable_rebind
 ):
     world = _m936_rebound_world(tmp_path, monkeypatch)
     _m936_append_closing_superset(world)
-    lineage = orchestrator.resolve_issue_pr_handoff_lineage(
+    lineage = child_plan_binding.resolve_issue_pr_handoff_lineage(
         world.comments, issue_number=56, repo="OWNER/REPO"
     )
     assert lineage.closing_base is lineage.latest and lineage.replaced is not None
@@ -3596,7 +3568,7 @@ def test_m936_intact_rebind_still_verifies_after_a_closing_superset(tmp_path, mo
     world = _m936_rebound_world(tmp_path, monkeypatch)
     _m936_append_closing_superset(world)
     parent_plan = _m936_binding(world).parent_plan_context
-    verified = orchestrator.verify_child_plan_rebind(
+    verified = child_plan_binding.verify_child_plan_rebind(
         world.comments, repo="OWNER/REPO", parent_plan_context=parent_plan,
         child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
     )
@@ -3644,14 +3616,14 @@ def test_m936_verified_replacement_that_became_inadmissible_can_still_be_superse
         world.comments, issue_number=56, repo="OWNER/REPO"
     ).plan_hash
     # The contract tightens again: the legitimately rebound plan is now inadmissible.
-    real = orchestrator._child_plan_admissibility_failure
+    real = child_plan_binding._child_plan_admissibility_failure
 
     def tightened(parent_plan_context, child_plan_context, *, stage_id):
         if child_plan_context.plan_hash == rebound_hash:
             return "row-stage-one: entry_path_or_mode replaced"
         return real(parent_plan_context, child_plan_context, stage_id=stage_id)
 
-    monkeypatch.setattr(orchestrator, "_child_plan_admissibility_failure", tightened)
+    monkeypatch.setattr(child_plan_binding, "_child_plan_admissibility_failure", tightened)
     # Provenance verifies, so the route is the signed-record template, not human repair.
     with pytest.raises(AgentLoopError) as excinfo:
         world.run_issue()
@@ -3684,7 +3656,7 @@ def test_m936_full_board_latch_survives_a_restart_after_the_digest_bound_round(
     with pytest.raises(AgentInvocationError, match="scripted agent output exhausted"):
         world.run_issue(config=_m936_staged_config(world), claude_outputs=[world.good_patch()])
     _m936_truncate_after_latest_coder_round(world)
-    assert orchestrator._resumed_inherited_replan_force_full(world.comments)
+    assert child_plan_binding._resumed_inherited_replan_force_full(world.comments)
     assert world.run_issue(
         config=_m936_staged_config(world, plan_execution_mode="plan-only"),
         codex_outputs=[structured_plan_review(state="approved")],
@@ -3765,7 +3737,7 @@ def test_m948_oversized_child_revision_posts_digest_and_resumes_losslessly(
             "operations": [{"op": "replace", "field": "summary", "value": "Revised child plan."}],
         }) + PLAN_FOOTER
     else:
-        monkeypatch.setattr(orchestrator, "make_assembled_plan_sidecar", lambda *a, **k: None)
+        monkeypatch.setattr(_m1278_plan_loop, "make_assembled_plan_sidecar", lambda *a, **k: None)
         revised = {**fresh_payload, "kind": "plan_revision", "summary": "Revised child plan."}
         revised["prior_plan_item_dispositions"] = [
             {"item_id": "item-1", "disposition": "resolved", "note": "Addressed."}
@@ -3781,7 +3753,7 @@ def test_m948_oversized_child_revision_posts_digest_and_resumes_losslessly(
         ],
     )
     with pytest.raises(Exception):
-        orchestrator.run_issue_loop(
+        issue_loop.run_issue_loop(
             first, issue_number=56, config=_plan_config(tmp_path), plan_first=True
         )
 
@@ -3812,7 +3784,7 @@ def test_m948_oversized_child_revision_posts_digest_and_resumes_losslessly(
     assert f"Step 299: {_m948_noise(299)}" in canonical_plan
     assert all(row_id in canonical_plan for row_id in M948_ROW_IDS)
     assert COMPACT_PLAN_DIGEST_NOTICE not in canonical_plan
-    assert hydrated["subject"] == orchestrator._plan_subject(canonical_plan)
+    assert hydrated["subject"] == panel_evidence._plan_subject(canonical_plan)
 
     # Resume: no planner turn, the reviewer sees the full plan, same subject.
     second = _ChildPlanningRunner(
@@ -3825,7 +3797,7 @@ def test_m948_oversized_child_revision_posts_digest_and_resumes_losslessly(
             ),
         ],
     )
-    assert orchestrator.run_issue_loop(
+    assert issue_loop.run_issue_loop(
         second, issue_number=56, config=_plan_config(tmp_path), plan_first=True
     ) == 0
     assert _agent_prompts(second, "claude") == []
@@ -3917,7 +3889,7 @@ def test_m985_pr_mode_refuses_to_review_under_a_pending_signed_replan(tmp_path, 
 
 def test_m985_qualification_rechecks_a_signed_record_posted_during_review(tmp_path, monkeypatch):
     world = _M936World(tmp_path, monkeypatch, weak=False, signed=False)
-    old_context = orchestrator.recover_approved_plan_context(
+    old_context = execution_policy.recover_approved_plan_context(
         world.comments, expected_hash=world.old_hash
     )
     # Without a record the unchanged binding qualifies.
@@ -3948,7 +3920,7 @@ def test_m985_record_posted_during_default_policy_review_blocks_approval(tmp_pat
             return dataclasses.replace(context, comments=(*context.comments, record))
         return context
 
-    monkeypatch.setattr(orchestrator, "get_issue_context", issue_context)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context", issue_context)
     config = world.config()
     assert not config.auto_merge
     with pytest.raises(AgentLoopError) as excinfo:
@@ -4029,9 +4001,9 @@ def test_m988_run_after_a_rebind_proceeds_past_the_superseded_decision(tmp_path,
         world.comments, issue_number=56, repo="OWNER/REPO"
     ).plan_hash
     assert new_hash != world.old_hash
-    retired = orchestrator.verified_retired_child_plan_hashes(
+    retired = child_plan_binding.verified_retired_child_plan_hashes(
         world.comments, repo="OWNER/REPO",
-        parent_plan_context=orchestrator.make_approved_plan_context(
+        parent_plan_context=execution_policy.make_approved_plan_context(
             _m936_parent_plan(), source_locator="parent"
         ),
         child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
@@ -4109,20 +4081,20 @@ def _m988_earlier_rebind_section(world):
 
 def _m988_accept_earlier_lineage(monkeypatch, world):
     """Treat the earlier edge's re-plan lineage as verified, isolating the handoff check."""
-    original = orchestrator.authorized_replan_lineage
+    original = child_plan_binding.authorized_replan_lineage
 
     def lineage(comments, *, superseded_hash, **kwargs):
         if superseded_hash == _M988_EARLIER:
             return AuthorizedReplanLineage(round_numbers=(1,), latest_plan_hash=world.old_hash)
         return original(comments, superseded_hash=superseded_hash, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "authorized_replan_lineage", lineage)
+    monkeypatch.setattr(child_plan_binding, "authorized_replan_lineage", lineage)
 
 
 def _m988_retired(world):
-    return orchestrator.verified_retired_child_plan_hashes(
+    return child_plan_binding.verified_retired_child_plan_hashes(
         world.comments, repo="OWNER/REPO",
-        parent_plan_context=orchestrator.make_approved_plan_context(
+        parent_plan_context=execution_policy.make_approved_plan_context(
             _m936_parent_plan(), source_locator="parent"
         ),
         child_issue=56, parent_issue=55, stage_id="stage-one", pr_number=77,
@@ -4205,7 +4177,7 @@ def _m993_fresh_scope(world, monkeypatch):
         captured.update(kwargs)
         raise _M993Captured
 
-    monkeypatch.setattr(orchestrator, "authorize_fresh_issue_created_resume", authorize)
+    monkeypatch.setattr(pr_loop, "authorize_fresh_issue_created_resume", authorize)
     world.settle()
     world.runner = _ChildPlanningRunner(
         pr_payload={
@@ -4220,7 +4192,7 @@ def _m993_fresh_scope(world, monkeypatch):
         managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
     )
     with pytest.raises(_M993Captured):
-        orchestrator.run_pr_loop(world.runner, pr_number=77, config=config)
+        pr_loop.run_pr_loop(world.runner, pr_number=77, config=config)
     return captured
 
 
@@ -4251,14 +4223,14 @@ def test_m993_fresh_authorization_without_a_rebind_retires_nothing(tmp_path, mon
 
 def _m993_ordinary_scope(world, monkeypatch):
     """Run the PR-mode ordinary managed resume and capture the bound handoff."""
-    handoff = orchestrator.AuthenticatedIssueCreatedHandoff(
+    handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
         head_sha="abc123", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="voluntary", override_nonce="opening-nonce",
     )
     monkeypatch.setattr(
-        orchestrator, "recover_issue_created_handoff", lambda *_a, **_k: handoff
+        pr_loop, "recover_issue_created_handoff", lambda *_a, **_k: handoff
     )
     captured = {}
 
@@ -4266,7 +4238,7 @@ def _m993_ordinary_scope(world, monkeypatch):
         captured.update(kwargs)
         raise _M993Captured
 
-    monkeypatch.setattr(orchestrator, "revalidate_issue_created_handoff", revalidate)
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", revalidate)
     world.settle()
     world.runner = _ChildPlanningRunner(
         pr_payload={
@@ -4280,7 +4252,7 @@ def _m993_ordinary_scope(world, monkeypatch):
         managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
     )
     with pytest.raises(_M993Captured):
-        orchestrator.run_pr_loop(world.runner, pr_number=77, config=config)
+        pr_loop.run_pr_loop(world.runner, pr_number=77, config=config)
     return captured["handoff"]
 
 
@@ -4318,7 +4290,7 @@ def test_m1068_supersession_posted_during_review_stops_before_an_evidence_freeze
             return dataclasses.replace(context, comments=(*context.comments, record))
         return context
 
-    monkeypatch.setattr(orchestrator, "get_issue_context", issue_context)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context", issue_context)
     review = {
         "schema_version": 1, "kind": "pr_review", "state": "approved",
         "summary": "Code is complete.", "blocking_items": [], "same_pr_followups": [],
@@ -4411,11 +4383,10 @@ def test_rerun_preflight_finds_children_with_truncated_titles(
     runner, plan, parent, normalized, retained, created = _long_title_rerun_1207(
         tmp_path, bodyless_search=bodyless_search
     )
-    monkeypatch.setattr(
-        orchestrator, "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
+    patch_attr_in(monkeypatch, (execution_policy, issue_implementation, _m1278_plan_loop, issue_loop), "resolve_canonical_pr_for_issue", lambda *_args, **_kwargs: None
     )
 
-    result = orchestrator._preflight_fresh_staged_topology(
+    result = execution_policy._preflight_fresh_staged_topology(
         runner, issue_number=55, approved_plan=plan,
         config=make_config(tmp_path), issue_context=parent,
         mode="implement-by-phase", normalized_topology=(normalized, retained),
@@ -4525,8 +4496,7 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
     child, parent = fresh_child_contexts(
         parent_plan, handoff_execution_disposition="requires-child-planning", child_plan=child_plan,
     )
-    monkeypatch.setattr(
-        orchestrator, "get_issue_context",
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, _m1278_plan_loop, issue_loop), "get_issue_context",
         lambda _runner, *, config, issue_number: child if issue_number == 56 else parent,
     )
     blocking = structured_pr_review(
@@ -4563,11 +4533,11 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
         ))
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
     with pytest.raises(AgentLoopError) as raised:
-        orchestrator.run_pr_loop(runner, pr_number=77, config=config)
+        pr_loop.run_pr_loop(runner, pr_number=77, config=config)
     message = str(raised.value)
     from coding_review_agent_loop.pr_loop import _child_resume_hint
 
-    hint = _child_resume_hint(56, orchestrator.EXECUTION_DISPOSITION_PLANNING)
+    hint = _child_resume_hint(56, execution_policy.EXECUTION_DISPOSITION_PLANNING)
     route = (
         " If the blocking finding requires re-planning the child plan, post the signed "
         f"child-plan supersession record on child issue #56 and rerun `{hint}`."
@@ -4608,7 +4578,7 @@ def test_m1333_patch_with_tool_owned_key_validates_without_replan_routing(caplog
     accepted = _m1333_patch(fresh, recommendation_extra={"topology_source": "model"})
 
     with caplog.at_level("WARNING", logger="coding_review_agent_loop.protocol"):
-        parsed = orchestrator._validate_plan_revision_patch_response(
+        parsed = response_validation._validate_plan_revision_patch_response(
             accepted, unresolved_items=carried
         )
     assert "topology_source" not in parsed.operations[-1].value.to_payload()
@@ -4624,14 +4594,14 @@ def test_m1333_patch_with_tool_owned_key_validates_without_replan_routing(caplog
     # candidate goes to envelope repair rather than the bounded replan.
     missing_footer = accepted.split("\n<!--", 1)[0]
     with pytest.raises(AgentLoopError) as error:
-        orchestrator._validate_plan_revision_patch_response(
+        response_validation._validate_plan_revision_patch_response(
             missing_footer, unresolved_items=carried
         )
-    assert orchestrator._semantic_patch_payload_rejection(
+    assert validated_agent._semantic_patch_payload_rejection(
         error.value,
         text=missing_footer,
         normalized=None,
-        payload_validator=lambda payload: orchestrator._validate_plan_revision_patch_payload(
+        payload_validator=lambda payload: response_validation._validate_plan_revision_patch_payload(
             payload, unresolved_items=carried
         ),
     ) is None
@@ -4644,16 +4614,16 @@ def test_m1333_patch_with_non_tool_unknown_key_still_routes_to_replan(caplog):
     rejected = _m1333_patch(fresh, recommendation_extra={"extra_note": "x"})
     with caplog.at_level("WARNING", logger="coding_review_agent_loop.protocol"):
         with pytest.raises(AgentLoopError) as error:
-            orchestrator._validate_plan_revision_patch_response(
+            response_validation._validate_plan_revision_patch_response(
                 rejected, unresolved_items=carried
             )
     assert "has unknown field(s): extra_note" in str(error.value)
     assert not [r for r in caplog.records if "dropped tool-owned key" in r.getMessage()]
-    rejection = orchestrator._semantic_patch_payload_rejection(
+    rejection = validated_agent._semantic_patch_payload_rejection(
         error.value,
         text=rejected,
         normalized=None,
-        payload_validator=lambda payload: orchestrator._validate_plan_revision_patch_payload(
+        payload_validator=lambda payload: response_validation._validate_plan_revision_patch_payload(
             payload, unresolved_items=carried
         ),
     )
@@ -4669,7 +4639,7 @@ def test_m1333_patch_with_non_tool_unknown_key_still_routes_to_replan(caplog):
 
 _M1377_ACTOR = ("agent", 7)
 # The #936 world forbids repair; the requirement-acknowledgement path needs it.
-_M1377_REAL_REPAIR = orchestrator._run_structured_repair
+_M1377_REAL_REPAIR = validated_agent._run_structured_repair
 _M1377_PARENT_RULE = HumanReviewRequirement(
     source_type="Issue body", author="maintainer", created_at="2026-05-17T08:00:00Z",
     url="https://github.com/OWNER/REPO/issues/55", body="Preserve the parent audit trail.",
@@ -4737,7 +4707,7 @@ class _M1377World(_M936World):
             issue_comments=list(self.durable), authenticated_actor=_M1377_ACTOR,
             serve_rest_issue_comments=True, **outputs,
         )
-        return orchestrator.run_issue_loop(
+        return issue_loop.run_issue_loop(
             self.runner, issue_number=56, config=config or self.config(), plan_first=True
         )
 
@@ -4842,7 +4812,7 @@ def test_m1377_real_child_public_entry_after_parent_requirement_addition_and_wit
     the requirement is then withdrawn, that approval is stale again: the entry
     goes back to fresh review and managed recovery refuses to bind it."""
     world = _M1377World(tmp_path, monkeypatch, weak=False, signed=False, handoff=False)
-    monkeypatch.setattr(orchestrator, "_run_structured_repair", _M1377_REAL_REPAIR)
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, _m1278_plan_loop), "_run_structured_repair", _M1377_REAL_REPAIR)
     config = world.config(plan_execution_mode=mode)
     approvals_before = sum(1 for r in world.plan_records() if r.metadata.role == "reviewer")
 

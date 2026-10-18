@@ -4,7 +4,6 @@ from unittest.mock import patch
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import run_pr_loop
 from coding_review_agent_loop.errors import AgentLoopError, MissingPriorItemDispositionError
 from coding_review_agent_loop.protocol import UnresolvedReviewItem
@@ -17,6 +16,23 @@ from agent_loop_helpers import (
     structured_coder_followup,
     structured_pr_review,
 )
+import coding_review_agent_loop.agent_failure as agent_failure
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.child_plan_binding as child_plan_binding
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy
+import coding_review_agent_loop.integration_close as integration_close
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.panel_evidence as panel_evidence
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.response_validation as response_validation
+import coding_review_agent_loop.review_rounds as review_rounds
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_object_in
 
 ADDENDUM_HEADING = "## Previous response not accepted: prior item dispositions"
 OMITTED = structured_pr_review(summary="COMPLETE-NOT Approves without dispositions.")
@@ -43,7 +59,7 @@ def _repair_recorder(calls):
 
 
 def _run(runner, config, *, reask=True):
-    return orchestrator._run_validated_agent(
+    return validated_agent._run_validated_agent(
         runner,
         agent="codex",
         config=config,
@@ -84,10 +100,10 @@ def test_omission_is_reasked_once_on_same_model_and_accepted(tmp_path, backend):
         binary = "agy"
     repair_calls: list[str] = []
     logs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repair_calls)), \
-            patch.object(orchestrator, "log", lambda _cfg, msg: logs.append(msg)), \
-            patch.object(orchestrator.time, "sleep", side_effect=AssertionError("slept")):
-        response = orchestrator._run_validated_agent(
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repair_calls)), \
+            patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "log", lambda _cfg, msg: logs.append(msg)), \
+            patch.object(validated_agent.time, "sleep", side_effect=AssertionError("slept")):
+        response = validated_agent._run_validated_agent(
             runner,
             agent="codex" if backend == "codex" else "antigravity",
             config=config,
@@ -121,7 +137,7 @@ def test_second_omission_follows_existing_path_with_no_third_invocation(tmp_path
     runner = FakeRunner(codex_outputs=[OMITTED, OMITTED, OMITTED, OMITTED])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     repair_calls: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repair_calls)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repair_calls)):
         with pytest.raises(AgentLoopError, match="did not evaluate all prior unresolved items: item-4"):
             _run(runner, config)
 
@@ -135,7 +151,7 @@ def test_malformed_response_goes_to_repair_without_reask(tmp_path):
     runner = FakeRunner(codex_outputs=["not json at all", "not json at all"])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
     repair_calls: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repair_calls)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repair_calls)):
         with pytest.raises(AgentLoopError):
             _run(runner, config)
 
@@ -147,7 +163,7 @@ def test_malformed_response_goes_to_repair_without_reask(tmp_path):
 def test_flag_off_does_not_reask(tmp_path):
     runner = FakeRunner(codex_outputs=[OMITTED, OMITTED, OMITTED])
     config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder([])):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder([])):
         with pytest.raises(AgentLoopError):
             _run(runner, config, reask=False)
 
@@ -253,7 +269,7 @@ def _run_reask_loop(tmp_path, parallel):
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), review_parallel=parallel, agent_max_retries=0
     )
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support.post_pr_comment
     real_store = ReviewRoundSpool.store
 
     def recording_post(*args, **kwargs):
@@ -264,7 +280,7 @@ def _run_reask_loop(tmp_path, parallel):
         runner.events.append(("spool", reviewer_name))
         return real_store(self, reviewer_name, fields)
 
-    with patch.object(orchestrator, "post_pr_comment", side_effect=recording_post), \
+    with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment", side_effect=recording_post), \
             patch.object(ReviewRoundSpool, "store", recording_store):
         assert run_pr_loop(runner, pr_number=77, config=config) == 0
     return runner
@@ -358,8 +374,8 @@ def test_parallel_worker_reasks_with_real_validator_without_repair_or_fallback(t
     ])
     repair_calls: list[str] = []
     logs: list[str] = []
-    with patch.object(orchestrator, "_run_structured_repair", _repair_recorder(repair_calls)), \
-            patch.object(orchestrator, "log", lambda _cfg, msg: logs.append(msg)):
+    with patch_object_in((validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _repair_recorder(repair_calls)), \
+            patch_object_in((agent_failure, integration_close, architecture_contract, validated_agent, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "log", lambda _cfg, msg: logs.append(msg)):
         assert run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, target)) == 0
 
     commands = _target_commands(runner, target)
@@ -390,7 +406,7 @@ def test_parallel_worker_second_omission_stops_and_repair_cannot_fabricate(tmp_p
             summary="Still omits item-1.", prior_item_dispositions=_ITEM1_DISPOSED
         )
 
-    with patch.object(orchestrator, "attempt_repair", fabricating_repair):
+    with patch.object(validated_agent, "attempt_repair", fabricating_repair):
         with pytest.raises(AgentLoopError, match="did not evaluate all prior unresolved items: item-1"):
             run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, "codex"))
 
@@ -410,7 +426,7 @@ def test_parallel_worker_malformed_review_goes_to_repair_without_reask(tmp_path)
         repair_calls.append(raw)
         return None
 
-    with patch.object(orchestrator, "attempt_repair", recording_repair):
+    with patch.object(validated_agent, "attempt_repair", recording_repair):
         with pytest.raises(AgentLoopError):
             run_pr_loop(runner, pr_number=77, config=_panel_config(tmp_path, "codex"))
 

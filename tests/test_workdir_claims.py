@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from coding_review_agent_loop import orchestrator, workdir_claims
+from coding_review_agent_loop import workdir_claims
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.config import ensure_agent_workdirs
 from coding_review_agent_loop.workdir_claims import (
@@ -26,6 +26,19 @@ from coding_review_agent_loop.workdir_claims import (
     workdir_claim_scope,
 )
 from agent_loop_helpers import make_config
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+from agent_loop_helpers import patch_attr_in
+
+_LOOP_ENTRY_OWNERS = {
+    "run_issue_loop": issue_loop,
+    "run_task_loop": issue_loop,
+    "run_pr_loop": pr_loop,
+    "run_discuss_loop": discuss_loop,
+}
 
 HOLDER = r"""
 import sys
@@ -325,7 +338,7 @@ def test_run_loops_refuse_before_any_runner_call(tmp_path, fn):
     }[fn]
     try:
         with pytest.raises(WorkdirClaimedError):
-            getattr(orchestrator, fn)(runner, config=config, **kwargs)
+            getattr(_LOOP_ENTRY_OWNERS[fn], fn)(runner, config=config, **kwargs)
         assert runner.method_calls == []
         assert workdir_claims._registry == {}
     finally:
@@ -360,8 +373,8 @@ def test_claimed_run_binds_identity_and_nested_joins(tmp_path, command, param, e
 
 
 def test_all_run_loops_are_claimed():
-    for fn in (orchestrator.run_issue_loop, orchestrator.run_task_loop,
-               orchestrator.run_pr_loop, orchestrator.run_discuss_loop):
+    for fn in (issue_loop.run_issue_loop, issue_loop.run_task_loop,
+               pr_loop.run_pr_loop, discuss_loop.run_discuss_loop):
         assert hasattr(fn, "__wrapped__")
 
 
@@ -542,9 +555,9 @@ def test_run_loops_hold_claims_during_run_and_release_on_raise(tmp_path, monkeyp
         runner.held.append(len(workdir_claims._registry))
         raise _Boom("resolve_base_branch")
 
-    monkeypatch.setattr(orchestrator, "resolve_base_branch", observe)
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "resolve_base_branch", observe)
     with pytest.raises(BaseException):
-        getattr(orchestrator, fn)(runner, config=config, **kwargs)
+        getattr(_LOOP_ENTRY_OWNERS[fn], fn)(runner, config=config, **kwargs)
     assert runner.held and set(runner.held) == {2}
     assert workdir_claims._registry == {}
     assert not list(claim_root().glob("*.json"))
@@ -565,7 +578,7 @@ def test_run_task_loop_holds_claims_during_run_and_releases_on_return(tmp_path):
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
         pr_payload={"number": 91, "state": "OPEN", "url": "https://github.com/OWNER/REPO/pull/91"},
     )
-    assert orchestrator.run_task_loop(runner, task_text="Add a thing.", config=make_config(tmp_path)) == 0
+    assert issue_loop.run_task_loop(runner, task_text="Add a thing.", config=make_config(tmp_path)) == 0
     assert held and set(held) == {2}
     assert workdir_claims._registry == {}
     assert claim_once(tmp_path / "claude")
@@ -704,8 +717,8 @@ def test_cli_real_pr_loop_keeps_cli_identity_and_releases(tmp_path, monkeypatch,
 
         return hook
 
-    monkeypatch.setattr(orchestrator, "resolve_base_branch", stop_here("base"))
-    monkeypatch.setattr(orchestrator, "ensure_agent_workdirs", stop_here("prep"))
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "resolve_base_branch", stop_here("base"))
+    patch_attr_in(monkeypatch, (discuss_loop, pr_loop, issue_loop), "ensure_agent_workdirs", stop_here("prep"))
     monkeypatch.setattr(cli, "resolve_base_branch", lambda c, r: c)
     with pytest.raises(_Boom):
         cli.main(argv)
@@ -730,7 +743,7 @@ def test_run_issue_loop_success_holds_claims_and_releases(tmp_path):
         pr_payload={"body": "Fixes #56"},
     )
     config = make_config(tmp_path, test_command=("pytest", "x"), pre_review_tests=False)
-    assert orchestrator.run_issue_loop(runner, issue_number=56, config=config) == 0
+    assert issue_loop.run_issue_loop(runner, issue_number=56, config=config) == 0
     assert held and set(held) == {2}
     assert workdir_claims._registry == {}
     assert not list(claim_root().glob("*.json"))
@@ -748,7 +761,7 @@ def test_run_pr_loop_workdirs_ready_success_claims_then_releases(tmp_path):
 
     runner = Observing(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
     config = make_config(tmp_path, coder="claude", reviewer="codex", agent_memory=False)
-    assert orchestrator.run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True) == 0
+    assert pr_loop.run_pr_loop(runner, pr_number=77, config=config, workdirs_ready=True) == 0
     assert held and set(held) == {2}
     assert workdir_claims._registry == {}
     assert claim_once(tmp_path / "claude")
@@ -912,7 +925,7 @@ def test_cli_allow_shared_dir_claims_once_and_still_refuses_other_process(tmp_pa
 def test_nested_pr_loop_under_issue_and_task_keeps_outer_identity(tmp_path, monkeypatch):
     from agent_loop_helpers import FakeRunner
 
-    real_pr_loop = orchestrator.run_pr_loop
+    real_pr_loop = pr_loop.run_pr_loop
     nested = []
 
     def spy(*args, **kwargs):
@@ -920,14 +933,14 @@ def test_nested_pr_loop_under_issue_and_task_keeps_outer_identity(tmp_path, monk
         nested.append((owner.command, owner.number, owner.target, len(workdir_claims._registry)))
         return real_pr_loop(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "run_pr_loop", spy)
+    patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop, issue_loop), "run_pr_loop", spy)
     runner = FakeRunner(
         claude_outputs=["Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"],
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
         pr_payload={"body": "Fixes #56"},
     )
     config = make_config(tmp_path, test_command=("pytest", "x"), pre_review_tests=False)
-    assert orchestrator.run_issue_loop(runner, issue_number=56, config=config) == 0
+    assert issue_loop.run_issue_loop(runner, issue_number=56, config=config) == 0
     assert nested and all(item == ("issue", 56, "issue #56", 2) for item in nested)
     assert workdir_claims._registry == {}
 

@@ -2,12 +2,12 @@
 import re
 from unittest.mock import patch
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import run_pr_loop
 from coding_review_agent_loop.github import HumanReviewRequirement
 from coding_review_agent_loop.prompts import build_merge_conflict_prompt
 
 from agent_loop_helpers import FakeRunner, command_index, make_config
+import coding_review_agent_loop.pr_loop as pr_loop
 
 
 def _codex_exec_commands(runner):
@@ -115,9 +115,9 @@ def test_conflict_after_review_before_merge_blocks_watcher_and_merge(tmp_path):
     config = make_config(tmp_path, auto_merge=True)
 
     with patch(
-        "coding_review_agent_loop.orchestrator.watch_pr_checks",
-        wraps=orchestrator.watch_pr_checks,
-    ) as watch_spy, patch("coding_review_agent_loop.orchestrator.merge_pr") as merge_spy:
+        "coding_review_agent_loop.pr_loop.watch_pr_checks",
+        wraps=pr_loop.watch_pr_checks,
+    ) as watch_spy, patch("coding_review_agent_loop.pr_loop_support.merge_pr") as merge_spy:
         result = run_pr_loop(runner, pr_number=77, config=config)
 
     assert result == 0

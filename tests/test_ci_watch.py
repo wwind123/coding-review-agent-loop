@@ -342,7 +342,7 @@ from coding_review_agent_loop.github import (
     rerun_ordinary_failed_jobs,
 )
 from coding_review_agent_loop.managed_ci import plumbing_check_names
-from coding_review_agent_loop.orchestrator import run_pr_loop
+from coding_review_agent_loop.pr_loop import run_pr_loop
 
 from agent_loop_helpers import FakeRunner, structured_coder_followup, structured_pr_review
 
@@ -1131,7 +1131,6 @@ def test_loop_dry_run_preview_never_reruns(tmp_path, monkeypatch, capsys):
 
 from coding_review_agent_loop.ci_health import CiInfrastructureStall, StalledCheck  # noqa: E402
 from coding_review_agent_loop.github import CiWatchOutcome  # noqa: E402
-import coding_review_agent_loop.orchestrator as orchestrator  # noqa: E402
 
 
 @pytest.mark.parametrize(
@@ -1309,7 +1308,7 @@ def test_ordinary_terminal_reports_name_the_final_context_state(tmp_path, monkey
         config = _loop_config(tmp_path, auto_merge=True)
         monkeypatch.setattr(pr_loop_module, "_merge_with_exact_head_proof", lambda *a, **k: None)
     monkeypatch.setattr(pr_loop_module, "get_pr_checks", lambda *_a, **_k: _board(_tests("in_progress")))
-    monkeypatch.setattr(orchestrator, "watch_pr_checks", lambda *a, **k: outcome)
+    monkeypatch.setattr(pr_loop_module, "watch_pr_checks", lambda *a, **k: outcome)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -1375,7 +1374,7 @@ def test_loop_budget_exhausted_by_earlier_rounds_names_the_final_context_state(t
     monkeypatch.setattr(pr_loop_module, "get_pr_checks", lambda *_a, **_k: snapshot)
     failing = _board(_tests("failure"), required=("tests",))
     monkeypatch.setattr(
-        orchestrator, "watch_pr_checks",
+        pr_loop_module, "watch_pr_checks",
         lambda *a, **k: CiWatchOutcome(
             status="failed", pr_checks=failing, failed_checks=failing.failing,
             head_sha=HEAD, attempts_used=1,

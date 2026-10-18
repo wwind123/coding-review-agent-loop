@@ -8,6 +8,8 @@ from coding_review_agent_loop.protocol import validate_structured_task_result
 from coding_review_agent_loop.repair import _build_repair_prompt
 from coding_review_agent_loop.repair_preservation import validate_repair_preservation
 from agent_loop_helpers import structured_v1_plan_state
+import coding_review_agent_loop.architecture_contract as architecture_contract
+import coding_review_agent_loop.validated_agent as validated_agent
 
 
 def check(source, target):
@@ -2029,7 +2031,6 @@ from agent_loop_helpers import (  # noqa: E402
     structured_issue_implementation as _deg_issue_implementation,
     structured_pr_review as _deg_pr_review,
 )
-from coding_review_agent_loop import orchestrator as _deg_orchestrator  # noqa: E402
 from coding_review_agent_loop.protocol import (  # noqa: E402
     validate_structured_issue_implementation as _deg_validate_issue_implementation,
     parse_structured_pr_review as _deg_parse_pr_review,
@@ -2151,7 +2152,7 @@ def _deg_run_repair(tmp_path, source, repaired, *, path, required=True, kind="is
     refusals = []
 
     def contract_refusal(parsed, text, records):
-        diagnostic = _deg_orchestrator._architecture_contract_diagnostic(parsed)
+        diagnostic = architecture_contract._architecture_contract_diagnostic(parsed)
         refusals.append((parsed, text, records, diagnostic))
         return diagnostic
 
@@ -2175,8 +2176,8 @@ def _deg_run_repair(tmp_path, source, repaired, *, path, required=True, kind="is
     extra["degrade_architecture_impact"] = True
     if path == "legacy":
         config = _deg_make_config(tmp_path)
-        with patch.object(_deg_orchestrator, "attempt_repair", lambda raw, cmd, **kw: repaired):
-            result = _deg_orchestrator._run_structured_repair(
+        with patch.object(validated_agent, "attempt_repair", lambda raw, cmd, **kw: repaired):
+            result = validated_agent._run_structured_repair(
                 source, runner=None, config=config, usage_context=None,
                 validate=validate, repair_kwargs={"expected_kind": kind}, **extra,
             )
@@ -2188,9 +2189,9 @@ def _deg_run_repair(tmp_path, source, repaired, *, path, required=True, kind="is
         # conftest replaces attempt_repair globally; restore the original so
         # _run_structured_repair takes the real execute_repair path.
         with patch.object(
-            _deg_orchestrator, "attempt_repair", _deg_orchestrator._ORIGINAL_ATTEMPT_REPAIR
+            validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR
         ), patch("coding_review_agent_loop.repair.AntigravityBackend.discover_models"):
-            result = _deg_orchestrator._run_structured_repair(
+            result = validated_agent._run_structured_repair(
                 source, runner=runner, config=config, usage_context=None,
                 validate=validate, repair_kwargs={"expected_kind": kind}, **extra,
             )

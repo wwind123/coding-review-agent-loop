@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from agent_loop_helpers import (
     FakeRunner,
     make_config,
@@ -43,6 +42,14 @@ from coding_review_agent_loop.round_state import (
     _attach_round_metadata,
     _extract_round_metadata_records,
 )
+import coding_review_agent_loop.child_plan_binding as child_plan_binding_module
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.execution_policy as execution_policy_module
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
+import coding_review_agent_loop.pr_loop as pr_loop_module
+import coding_review_agent_loop.pr_loop_support as pr_loop_support_module
+from agent_loop_helpers import patch_attr_in
 
 _AGENTS = {"codex", "claude", "agy", "gemini"}
 _ACTOR_ID = 424242  # FakeRunner's default authenticated PR actor
@@ -166,7 +173,7 @@ def _board_state(runner, config):
 
 def _qualify(runner, config):
     """The qualification gate's fresh-comment snapshot (every policy)."""
-    return orchestrator._fresh_pr_qualification_snapshot(
+    return pr_loop_support_module._fresh_pr_qualification_snapshot(
         runner, config=config, pr_number=77, issue_context=None, parent_issue_context=None,
     )
 
@@ -478,14 +485,14 @@ def _gemini_blocker_history(*, evidence=()):
 
 
 def _crash_after_link(monkeypatch):
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support_module.post_pr_comment
 
     def post(*args, **kwargs):
         real_post(*args, **kwargs)
         if str(kwargs["body"]).startswith(BOARD_CHANGE_LINK_HEADING):
             raise KeyboardInterrupt
 
-    monkeypatch.setattr(orchestrator, "post_pr_comment", post)
+    patch_attr_in(monkeypatch, (pr_loop_support_module, pr_loop_module, issue_loop), "post_pr_comment", post)
 
 
 @pytest.mark.parametrize("activation", ["immediate", "after-crash"])
@@ -957,7 +964,7 @@ def test_prelaunch_only_anchor_round_keeps_its_round_and_ledger(tmp_path, monkey
     config = make_config(
         tmp_path, reviewer=("codex", "gemini"), pr_review_policy="selective-intermediate",
     )
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support_module.post_pr_comment
     prelaunches = []
 
     def interrupt_round_two_prelaunch(*args, **kwargs):
@@ -968,7 +975,7 @@ def test_prelaunch_only_anchor_round_keeps_its_round_and_ledger(tmp_path, monkey
                 raise KeyboardInterrupt
 
     with monkeypatch.context() as patch:
-        patch.setattr(orchestrator, "post_pr_comment", interrupt_round_two_prelaunch)
+        patch_attr_in(patch, (pr_loop_support_module, pr_loop_module, issue_loop), "post_pr_comment", interrupt_round_two_prelaunch)
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=config)
     highest = board_anchor(_records(runner))
@@ -1672,7 +1679,7 @@ def test_frozen_evidence_is_answered_by_the_new_board_after_a_change(
         gemini_outputs=[_evidence_review(reviewer="Google Gemini", evidence=[_LIVE_SUITE])],
     )
     original = make_config(tmp_path, reviewer=("codex", "gemini"))
-    with pytest.raises(orchestrator.HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head abc123"):
         run_pr_loop(runner, pr_number=77, config=original)
     runner.pr_payload["comments"].append(
         _signed("Live suite and deploy log at abc123: 11 passed, deploy healthy.", 1)
@@ -1686,7 +1693,7 @@ def test_frozen_evidence_is_answered_by_the_new_board_after_a_change(
     runner.gemini_outputs.append(_evidence_review(
         reviewer="Google Gemini", dispositions=resolved, evidence=[_LIVE_SUITE], hr=True,
     ))
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support_module.post_pr_comment
 
     def stop_after_gemini(*args, **kwargs):
         real_post(*args, **kwargs)
@@ -1698,7 +1705,7 @@ def test_frozen_evidence_is_answered_by_the_new_board_after_a_change(
                 raise KeyboardInterrupt
 
     with monkeypatch.context() as patch:
-        patch.setattr(orchestrator, "post_pr_comment", stop_after_gemini)
+        patch_attr_in(patch, (pr_loop_support_module, pr_loop_module, issue_loop), "post_pr_comment", stop_after_gemini)
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=original)
     anchor = board_anchor(_records(runner))
@@ -1770,7 +1777,7 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
         gemini_outputs=[_evidence_review(reviewer="Google Gemini", evidence=[_LIVE_SUITE])],
     )
     original = make_config(tmp_path, reviewer=("codex", "gemini"))
-    with pytest.raises(orchestrator.HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head abc123"):
         run_pr_loop(runner, pr_number=77, config=original)
     runner.pr_payload["comments"].append(
         _signed("Live suite and deploy log at abc123: 11 passed, deploy healthy.", 1)
@@ -1784,7 +1791,7 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
     runner.gemini_outputs.append(_evidence_review(
         reviewer="Google Gemini", dispositions=resolved, evidence=[_LIVE_SUITE], hr=True,
     ))
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support_module.post_pr_comment
 
     def stop_after_release(*args, **kwargs):
         real_post(*args, **kwargs)
@@ -1795,7 +1802,7 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
             raise KeyboardInterrupt
 
     with monkeypatch.context() as patch:
-        patch.setattr(orchestrator, "post_pr_comment", stop_after_release)
+        patch_attr_in(patch, (pr_loop_support_module, pr_loop_module, issue_loop), "post_pr_comment", stop_after_release)
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=original)
     (release,) = [r.metadata for r in _records(runner) if r.metadata.phase == "evidence-release"]
@@ -1827,7 +1834,7 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
         # At def456 Codex, the retained requester, asks for its evidence again.
         runner.codex_outputs.append(_evidence_review(evidence=[_LIVE_LOG], hr=True))
         runner.antigravity_outputs.append(_evidence_review(reviewer="Antigravity", hr=True))
-        with pytest.raises(orchestrator.HumanDecisionRequiredError, match="frozen at head def456"):
+        with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head def456"):
             run_pr_loop(runner, pr_number=77, config=swapped)
     (payload,) = _link_payloads(runner)
     assert payload["anchor_round"] == anchor.round_number and payload["advance"] is True
@@ -1860,8 +1867,7 @@ def _staged_panel_history(tmp_path, monkeypatch):
     from test_orchestrator_pr import _staged_config, _staged_review
     from coding_review_agent_loop.review_scheduling import TransitionClassification
 
-    monkeypatch.setattr(
-        orchestrator, "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support_module, pr_loop_module), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     runner = FakeRunner(
@@ -1923,7 +1929,7 @@ def test_unqualified_secondary_item_still_stops_after_a_primary_change(tmp_path,
     _rewrite_pr_metadata(runner, drop_opening)
     changed = _staged_config(tmp_path, primary_reviewer="antigravity", pre_review_tests=False)
     start = len(runner.commands)
-    with pytest.raises(orchestrator.PrePanelSafetyError, match="item-1"):
+    with pytest.raises(pr_loop_module.PrePanelSafetyError, match="item-1"):
         run_pr_loop(runner, pr_number=77, config=changed)
     assert _agents(runner, start) == []
 
@@ -2053,8 +2059,7 @@ def test_primary_seat_backend_change_restarts_the_primary_phase(tmp_path, monkey
     from test_orchestrator_pr import _audit_phases, _staged_review
     from coding_review_agent_loop.review_scheduling import TransitionClassification
 
-    monkeypatch.setattr(
-        orchestrator, "_observe_pr_transition",
+    patch_attr_in(monkeypatch, (pr_loop_support_module, pr_loop_module), "_observe_pr_transition",
         lambda *args, **kwargs: TransitionClassification("narrow", "scoped fix"),
     )
     p = _seat(tmp_path, "p", "codex", "gpt-p")
@@ -2202,7 +2207,7 @@ def test_further_change_after_prelaunch_only_activation_takes_effect_next_round(
     runner = _legacy_runner(_selective_prelaunch_history())
     first = make_config(tmp_path, reviewer=("codex", "antigravity"),
                         pr_review_policy="selective-intermediate")
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support_module.post_pr_comment
 
     def stop_after_prelaunch(*args, **kwargs):
         real_post(*args, **kwargs)
@@ -2213,7 +2218,7 @@ def test_further_change_after_prelaunch_only_activation_takes_effect_next_round(
             raise KeyboardInterrupt
 
     with monkeypatch.context() as patch:
-        patch.setattr(orchestrator, "post_pr_comment", stop_after_prelaunch)
+        patch_attr_in(patch, (pr_loop_support_module, pr_loop_module, issue_loop), "post_pr_comment", stop_after_prelaunch)
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=first)
     (link_one,) = _link_payloads(runner)
@@ -2421,7 +2426,7 @@ def test_signed_first_upgrade_initializes_bindings_through_a_crash_then_links_a_
     ])
     _append(runner, _signed_body(("Codex", "Gemini"), removed=("Gemini",), round_number=2))
     reduced = make_config(tmp_path, reviewer=("codex",), min_reviewers=2)
-    real_post = orchestrator.post_pr_comment
+    real_post = pr_loop_support_module.post_pr_comment
 
     def crash_after_first_record(*args, **kwargs):
         real_post(*args, **kwargs)
@@ -2430,7 +2435,7 @@ def test_signed_first_upgrade_initializes_bindings_through_a_crash_then_links_a_
 
     runner.codex_outputs.append(structured_pr_review())
     with monkeypatch.context() as patch:
-        patch.setattr(orchestrator, "post_pr_comment", crash_after_first_record)
+        patch_attr_in(patch, (pr_loop_support_module, pr_loop_module, issue_loop), "post_pr_comment", crash_after_first_record)
         with pytest.raises(KeyboardInterrupt):
             run_pr_loop(runner, pr_number=77, config=reduced)
     (first,) = [r.metadata for r in _records(runner) if r.metadata.pr_board_root is not None]
@@ -3250,7 +3255,7 @@ def test_supersession_inherited_failure_and_mode_guard_are_never_approved(tmp_pa
 
 
 def _patch_requirements(monkeypatch, requirements):
-    real = orchestrator.get_issue_context
+    real = discuss_loop.get_issue_context
 
     def patched(runner_arg, *, config, issue_number):
         context = real(runner_arg, config=config, issue_number=issue_number)
@@ -3258,7 +3263,7 @@ def _patch_requirements(monkeypatch, requirements):
             return context
         return dataclasses.replace(context, human_requirements=tuple(requirements))
 
-    monkeypatch.setattr(orchestrator, "get_issue_context", patched)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy_module, child_plan_binding_module, pr_loop_support_module, pr_loop_module, plan_first_loop_module, issue_loop), "get_issue_context", patched)
 
 
 def _signed_requirement():
@@ -3793,7 +3798,7 @@ def test_staged_child_public_entry_merges_parent_requirements(tmp_path, monkeypa
             lambda context: 55 if context.number == 56 else None,
         )
     monkeypatch.setattr(execution_policy, "_resolve_fresh_child_provenance", lambda **_kw: None)
-    real = orchestrator.get_issue_context
+    real = discuss_loop.get_issue_context
 
     def with_parent(runner_arg, *, config, issue_number):
         if issue_number == 55:
@@ -3805,7 +3810,7 @@ def test_staged_child_public_entry_merges_parent_requirements(tmp_path, monkeypa
 
     import coding_review_agent_loop.github as github
 
-    monkeypatch.setattr(orchestrator, "get_issue_context", with_parent)
+    patch_attr_in(monkeypatch, (discuss_loop, execution_policy_module, child_plan_binding_module, pr_loop_support_module, pr_loop_module, plan_first_loop_module, issue_loop), "get_issue_context", with_parent)
     monkeypatch.setattr(github, "get_issue_context", with_parent)
     runner, config = _approved_plain_plan(tmp_path, requirement=parent_requirement)
     parent_id = parent_requirement.requirement_id

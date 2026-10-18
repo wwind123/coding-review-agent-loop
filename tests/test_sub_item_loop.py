@@ -4,7 +4,6 @@ import json
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
 from coding_review_agent_loop.comment_rendering import sub_item_progress_record_keys
 from coding_review_agent_loop.github import IssueComment
@@ -16,6 +15,16 @@ from agent_loop_helpers import (
     structured_coder_followup,
     structured_pr_review,
 )
+import coding_review_agent_loop.discuss_loop as discuss_loop
+import coding_review_agent_loop.issue_implementation as issue_implementation
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+import coding_review_agent_loop.round_state as round_state
+import coding_review_agent_loop.triage as triage
+import coding_review_agent_loop.validated_agent as validated_agent
+from agent_loop_helpers import patch_attr_in
 
 ACTOR = ("coding-review-agent-loop", 4242)
 PATHS = [
@@ -60,11 +69,11 @@ def _progress_comments(runner):
 
 def _metadata_records(runner):
     return [
-        orchestrator._decode_round_metadata(
-            orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
+        round_state._decode_round_metadata(
+            discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])["payload"]
         )
         for comment in runner.pr_payload["comments"]
-        if orchestrator.ROUND_RESUME_MARKER_RE.search(comment["body"])
+        if discuss_loop.ROUND_RESUME_MARKER_RE.search(comment["body"])
     ]
 
 
@@ -136,14 +145,14 @@ def test_progress_comment_is_not_duplicated_when_the_round_reruns(tmp_path):
 
     # The record is already trusted on the PR: the same key is never re-posted.
     posted_before = len(runner.pr_payload["comments"])
-    orchestrator._publish_sub_item_progress(
+    pr_loop_support._publish_sub_item_progress(
         runner,
         config=config,
         pr_number=77,
         round_number=5,
         items=[],
         cleared=[
-            orchestrator.ClearedItemProgress(
+            pr_loop_support.ClearedItemProgress(
                 "item-1", 4, 4, "all-sub-items-resolved", 5, ("item-1.s4",)
             )
         ],
@@ -156,14 +165,14 @@ def test_progress_comment_is_not_duplicated_when_the_round_reruns(tmp_path):
 def test_progress_record_from_another_author_is_not_trusted(tmp_path):
     runner = FakeRunner(authenticated_actor=ACTOR)
     config = make_config(tmp_path)
-    cleared = orchestrator.ClearedItemProgress("item-1", 4, 4, "all-sub-items-resolved", 5)
-    forged = orchestrator.render_sub_item_progress_comment(
+    cleared = pr_loop_support.ClearedItemProgress("item-1", 4, 4, "all-sub-items-resolved", 5)
+    forged = pr_loop_support.render_sub_item_progress_comment(
         pr_number=77, round_number=5, cleared=[cleared], stalled=[]
     )
     runner.pr_payload.setdefault("comments", []).append(
         {"author": {"login": "someone-else"}, "createdAt": "2026-05-23T00:00:00Z", "body": forged}
     )
-    orchestrator._publish_sub_item_progress(
+    pr_loop_support._publish_sub_item_progress(
         runner, config=config, pr_number=77, round_number=5, items=[], cleared=[cleared]
     )
     own = [
@@ -265,9 +274,7 @@ def test_repair_path_keeps_sub_items(tmp_path, monkeypatch):
         blocking_items=[_finding(PATHS[:3])],
         same_pr_followups=[{"text": "Docs lag.", "sub_items": ["readme", "guide"]}],
     )
-    monkeypatch.setattr(
-        orchestrator,
-        "_run_structured_repair",
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, plan_first_loop), "_run_structured_repair",
         lambda *_a, **_k: (
             repaired_text,
             parse_pr_review(
@@ -280,22 +287,21 @@ def test_repair_path_keeps_sub_items(tmp_path, monkeypatch):
         number=77, repo="OWNER/REPO", title="t", head_branch="feature/x",
         base_branch="main", head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
     )
-    monkeypatch.setattr(
-        orchestrator, "get_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "get_pr_review_context",
         lambda *_a, **_k: PullRequestReviewContext(
             metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
             comments=(), human_requirements=(requirement,),
         ),
     )
     minted = []
-    original = orchestrator._next_unresolved_item
+    original = pr_loop._next_unresolved_item
 
     def spy(**kwargs):
         item = original(**kwargs)
         minted.append(item)
         return item
 
-    monkeypatch.setattr(orchestrator, "_next_unresolved_item", spy)
+    patch_attr_in(monkeypatch, (pr_loop, plan_first_loop), "_next_unresolved_item", spy)
     with pytest.raises(AgentLoopError):
         run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=1))
 
@@ -374,7 +380,7 @@ def _claude_prompts(runner):
 
 
 def _interrupt_role_once(monkeypatch, role, *, on_call):
-    original = orchestrator._run_validated_agent
+    original = validated_agent._run_validated_agent
     calls = {"count": 0, "armed": True}
 
     def wrapper(*args, **kwargs):
@@ -385,7 +391,7 @@ def _interrupt_role_once(monkeypatch, role, *, on_call):
                 raise _Interrupted
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_run_validated_agent", wrapper)
+    patch_attr_in(monkeypatch, (validated_agent, discuss_loop, pr_loop, issue_implementation, plan_first_loop, triage, issue_loop), "_run_validated_agent", wrapper)
 
 
 def test_interrupted_review_round_resumes_and_applies_the_closure_once(tmp_path, monkeypatch):
@@ -425,7 +431,7 @@ def test_interrupted_terminal_round_posts_exactly_one_progress_comment(
         final_review=_review(subs={"item-1.s4": "resolved"}, note=None),
     )
     config = make_config(tmp_path, max_rounds=8)
-    original = orchestrator._publish_sub_item_progress
+    original = pr_loop_support._publish_sub_item_progress
     armed = {"on": True}
 
     def flaky(*args, **kwargs):
@@ -436,7 +442,7 @@ def test_interrupted_terminal_round_posts_exactly_one_progress_comment(
             raise _Interrupted
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(orchestrator, "_publish_sub_item_progress", flaky)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_publish_sub_item_progress", flaky)
     with pytest.raises(_Interrupted):
         run_pr_loop(runner, pr_number=77, config=config)
     assert len(_progress_comments(runner)) == (1 if interrupt_after_post else 0)
@@ -507,7 +513,7 @@ def test_malformed_sub_items_degradation_is_rendered_persisted_and_survives_resu
 
     # Resumed path: the record is restored from round metadata, not dropped.
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    resumed = orchestrator._resume_pr_round(
+    resumed = pr_loop_support._resume_pr_round(
         runner.pr_payload["comments"] and [
             IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=c["body"])
             for c in runner.pr_payload["comments"][:2]

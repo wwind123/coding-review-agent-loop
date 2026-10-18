@@ -5,11 +5,10 @@ import re
 
 import pytest
 
-from coding_review_agent_loop import orchestrator
 from coding_review_agent_loop.ci_health import PullRequestCheck, PullRequestChecks
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.github import PullRequestMergeability
-from coding_review_agent_loop.orchestrator import (
+from coding_review_agent_loop.pr_loop_support import (
     _ensure_finalization_ready,
     _finalization_obligation_predicate,
     _ordinary_checks_snapshot_is_authoritative,
@@ -22,6 +21,10 @@ from agent_loop_helpers import make_config
 from coding_review_agent_loop.unresolved_items import (
     _machine_obligation_is_revalidation_candidate,
 )
+import coding_review_agent_loop.issue_loop as issue_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+import coding_review_agent_loop.pr_loop_support as pr_loop_support
+from agent_loop_helpers import patch_attr_in
 
 
 HEAD = "head-cur"
@@ -210,7 +213,7 @@ def test_untrusted_text_cannot_forge_lines_and_logs_one_line_per_blocker(tmp_pat
 
 def test_logs_each_blocker_without_posting(tmp_path, capsys, monkeypatch):
     posted = []
-    monkeypatch.setattr(orchestrator, "post_pr_comment", lambda *a, **k: posted.append(k))
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_loop), "post_pr_comment", lambda *a, **k: posted.append(k))
     items = [reviewer_item(), machine("github-pr-checks", "qualifying", candidate=HEAD)]
     _raise(items, config=make_config(tmp_path, quiet=False))
     err_lines = [l for l in capsys.readouterr().err.splitlines() if l.strip()]

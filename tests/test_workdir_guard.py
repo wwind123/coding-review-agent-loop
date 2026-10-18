@@ -15,7 +15,7 @@ from coding_review_agent_loop.workdir_guard import (
     read_workdir_head,
     WorkdirSnapshot,
 )
-from coding_review_agent_loop.orchestrator import _read_assigned_workdir_head
+from coding_review_agent_loop.pr_loop_support import _read_assigned_workdir_head
 from coding_review_agent_loop.workdir_guard import validate_test_commands_within_workdir
 
 

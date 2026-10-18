@@ -43,19 +43,18 @@ from coding_review_agent_loop.protocol import (
     ParsedDiscussReview,
     ParsedDiscussRoundSynthesis,
 )
-from coding_review_agent_loop.orchestrator import (
-    HUMAN_REQUIREMENTS_ACK_ITEM_ID,
+from coding_review_agent_loop.pr_loop import HUMAN_REQUIREMENTS_ACK_ITEM_ID
+from coding_review_agent_loop.comment_rendering import (
     ITEM_SUMMARY_LIMIT,
-    _extract_current_deferred_stages,
     _format_unresolved_item_label,
     _render_public_review_comment,
     _review_freeform_summary_text,
-    _TerminalIssueImplementationConflict,
-    _validate_issue_implementation_response,
-    render_canonical_plan_revision,
     render_canonical_plan_steps,
-    render_public_agent_comment,
 )
+from coding_review_agent_loop.execution_policy import _extract_current_deferred_stages
+from coding_review_agent_loop.architecture_contract import _TerminalIssueImplementationConflict
+from coding_review_agent_loop.response_validation import _validate_issue_implementation_response, render_public_agent_comment
+from coding_review_agent_loop.plan_first_loop import render_canonical_plan_revision
 from coding_review_agent_loop.protocol import (
     ChildStage,
     DeferredStage,
@@ -85,6 +84,7 @@ from agent_loop_helpers import (
     structured_v1_plan_state,
     structured_pr_review,
 )
+import coding_review_agent_loop.architecture_contract as architecture_contract
 
 
 def test_execution_recommendation_rendering_round_trips_with_all_review_fields_visible():
@@ -2355,7 +2355,6 @@ def _deg_review_text(rendered):
 
 
 def test_degraded_review_carriers_reach_round_metadata_and_summary():
-    import coding_review_agent_loop.orchestrator as orchestrator_module
     from types import SimpleNamespace
     from agent_loop_helpers import structured_plan_review, structured_pr_review
     from coding_review_agent_loop.protocol import (
@@ -2380,7 +2379,7 @@ def test_degraded_review_carriers_reach_round_metadata_and_summary():
         ), "plan"),
     ):
         (record,) = parsed.architecture_impact_degradations
-        fields = orchestrator_module._architecture_metadata_fields(config, result=parsed)
+        fields = architecture_contract._architecture_metadata_fields(config, result=parsed)
         # The parser-only degraded status never reaches durable metadata.
         assert fields["architecture_impact"] is None
         metadata = PostedRoundMetadata(

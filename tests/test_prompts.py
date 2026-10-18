@@ -40,6 +40,7 @@ from coding_review_agent_loop.protocol import (
     parse_risk_test_matrix_changes,
     risk_test_matrix_prompt_examples,
 )
+import coding_review_agent_loop.response_validation as response_validation
 
 _EXPECTED_UNRESOLVED_ITEMS_GUIDANCE = """Prior unresolved items are present. Disposition every listed
 item in the JSON `prior_item_dispositions` array — do not add a separate prose section
@@ -4104,7 +4105,6 @@ def test_semantic_claim_schema_is_shared_by_every_prompt_and_repair_surface():
     """#849: every coder, correction, and repair surface shows the exact claim keys."""
     from types import SimpleNamespace as _Namespace
 
-    import coding_review_agent_loop.orchestrator as orchestrator_module
     import coding_review_agent_loop.repair as repair_module
     from coding_review_agent_loop.protocol import (
         SEMANTIC_RISK_CLAIM_KEYS,
@@ -4123,7 +4123,7 @@ def test_semantic_claim_schema_is_shared_by_every_prompt_and_repair_surface():
         "coder-followup": prompts_module._structured_coder_followup_guidance(
             reviewer_name="Reviewer", human_requirements_context=context, coder_signature="-- Coder"
         ),
-        "correction": orchestrator_module._post_auth_correction_prompt(
+        "correction": response_validation._post_auth_correction_prompt(
             _Namespace(kind="issue_implementation"),
             matrix_row_ids=("row-1",),
             diagnostics=(),
@@ -4168,7 +4168,6 @@ def test_selector_guidance_forbids_command_strings_in_coder_and_correction_promp
     """#859: execution_refs are run-tests selectors only; omit rather than invent."""
     from types import SimpleNamespace as _Namespace
 
-    import coding_review_agent_loop.orchestrator as orchestrator_module
     from coding_review_agent_loop.protocol import semantic_risk_claim_example_json
 
     context = prompts_module.CoderHumanRequirementsPromptContext(
@@ -4181,7 +4180,7 @@ def test_selector_guidance_forbids_command_strings_in_coder_and_correction_promp
         "coder-followup": prompts_module._structured_coder_followup_guidance(
             reviewer_name="Reviewer", human_requirements_context=context, coder_signature="-- Coder"
         ),
-        "correction": orchestrator_module._post_auth_correction_prompt(
+        "correction": response_validation._post_auth_correction_prompt(
             _Namespace(kind="issue_implementation"),
             matrix_row_ids=("row-1",),
             diagnostics=(),

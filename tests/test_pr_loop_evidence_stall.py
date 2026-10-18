@@ -6,7 +6,6 @@ import json
 
 import pytest
 
-import coding_review_agent_loop.orchestrator as orchestrator
 from coding_review_agent_loop.cli import build_parser, run_pr_loop
 from coding_review_agent_loop.config import config_from_args
 from coding_review_agent_loop.errors import AgentLoopError, HumanDecisionRequiredError
@@ -16,6 +15,7 @@ from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_s
 from coding_review_agent_loop.round_state import _extract_round_metadata_records
 
 from agent_loop_helpers import FakeRunner, make_config, structured_coder_followup
+import coding_review_agent_loop.execution_policy as execution_policy
 
 
 def _row(row_id: str) -> dict:
@@ -40,7 +40,7 @@ def _plan_context(*row_ids: str):
         {"applicability": "applicable", "rows": [_row(r) for r in row_ids], "important_exclusions": []}
     )
     identity = risk_test_matrix_identity(matrix)
-    return orchestrator.make_approved_plan_context(
+    return execution_policy.make_approved_plan_context(
         "Approved plan.\n\n" + render_risk_test_matrix_section(matrix),
         source_locator="test approved plan",
         risk_test_matrix_contract_version=1,
@@ -227,7 +227,7 @@ def test_changed_approved_matrix_identity_unbinds_evidence_and_resets_the_window
     matrix_obj = parse_risk_test_matrix(matrix)
     identity = risk_test_matrix_identity(matrix_obj)
     assert identity != changed.risk_test_matrix_identity
-    other = orchestrator.make_approved_plan_context(
+    other = execution_policy.make_approved_plan_context(
         "Approved plan.\n\n" + render_risk_test_matrix_section(matrix_obj),
         source_locator="test approved plan",
         risk_test_matrix_contract_version=1,
