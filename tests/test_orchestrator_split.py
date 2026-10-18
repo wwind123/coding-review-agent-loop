@@ -1,7 +1,5 @@
-"""Pure-move guards and patch-propagation shim for the orchestrator split (#1181, #1189)."""
-import sys
+"""Pure-move and facade-use guards for the orchestrator split (#1181, #1189, #1186)."""
 import types
-from unittest.mock import patch
 
 import pytest
 
@@ -39,22 +37,23 @@ def test_baseline_no_longer_freezes_definition_digests():
 
 
 def test_registered_modules_bind_the_facades_objects():
-    # Checked in a fresh interpreter: in this process the shim and the autouse
-    # repair stub would overwrite a divergent binding before it is observed.
+    # Checked in a fresh interpreter: in this process the autouse repair stub
+    # and per-test patches rewrite owned names before a divergence is observed.
     registered = [f"{guard.PACKAGE}.{name}" for name in guard.registered_module_names()]
     assert guard.fresh_incoherent_bindings(registered) == []
 
 
-def test_coherence_guard_rejects_divergent_binding_hidden_by_the_repair_stub(tmp_path, monkeypatch):
+def test_coherence_guard_rejects_divergent_binding_hidden_by_a_test_patch(tmp_path, monkeypatch):
     (tmp_path / "split_probe_consumer.py").write_text(
         "def attempt_repair(*args, **kwargs):\n    return None\n", encoding="utf-8"
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     import split_probe_consumer
 
-    monkeypatch.setattr(guard, "registered_modules", lambda: [split_probe_consumer])
-    monkeypatch.setattr(orchestrator, "attempt_repair", lambda *args, **kwargs: None)
-    # Under a propagated patch the divergent binding looks coherent in-process...
+    stub = lambda *args, **kwargs: None  # noqa: E731
+    monkeypatch.setattr(orchestrator, "attempt_repair", stub)
+    monkeypatch.setattr(split_probe_consumer, "attempt_repair", stub)
+    # Under a test patch of both bindings the divergence looks coherent in-process...
     assert guard.incoherent_bindings(orchestrator, [split_probe_consumer]) == []
     # ...but the pristine fresh-interpreter check still rejects it.
     assert guard.fresh_incoherent_bindings(["split_probe_consumer"], extra_path=tmp_path) == [
@@ -91,48 +90,19 @@ def test_registered_modules_import_alone_in_a_fresh_interpreter():
     assert [problem for problem in problems if problem] == []
 
 
-def test_orchestrator_facade_has_the_propagation_shim_installed():
-    assert isinstance(orchestrator, guard.PatchPropagatingModule)
-
-
-def test_facade_patch_reaches_a_registered_module_on_the_real_package(monkeypatch):
-    import coding_review_agent_loop.github as github
-    import coding_review_agent_loop.round_state as round_state
-
-    monkeypatch.setattr(guard, "EXTRACTED_MODULES", ("github", "round_state"))
-    original = github.merge_pr
-    assert orchestrator.merge_pr is original
-    assert "merge_pr" not in vars(round_state)
-
-    def fake(*args, **kwargs):
-        return None
-
-    with patch("coding_review_agent_loop.orchestrator.merge_pr", fake):
-        assert github.merge_pr is fake
-        assert "merge_pr" not in vars(round_state)
-    assert github.merge_pr is original
-    assert orchestrator.merge_pr is original
-
-
-def test_autouse_repair_stub_reaches_the_moved_validated_agent():
-    # tests/conftest.py stubs attempt_repair on the facade for every test; the
-    # moved repair path in validated_agent must see that stub, never the real
-    # repair CLI, and a nested facade patch must restore the stub on exit.
+def test_autouse_repair_stub_is_bound_on_validated_agent():
+    # tests/conftest.py stubs attempt_repair on validated_agent, the only
+    # module that binds it, so the repair path never reaches the real CLI.
     import coding_review_agent_loop.repair as repair
     import coding_review_agent_loop.validated_agent as validated_agent
 
-    stub = orchestrator.attempt_repair
-    assert stub is not repair.attempt_repair
-    assert validated_agent.attempt_repair is stub
+    assert validated_agent.attempt_repair is not repair.attempt_repair
     assert validated_agent._ORIGINAL_ATTEMPT_REPAIR is repair.attempt_repair
+    assert validated_agent.attempt_repair(raw="x", gemini_cmd="gemini") is None
 
-    def fake(*args, **kwargs):
-        return None
 
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", fake):
-        assert validated_agent.attempt_repair is fake
-    assert validated_agent.attempt_repair is stub
-    assert orchestrator.attempt_repair is stub
+def test_no_test_file_imports_or_patches_the_orchestrator_facade():
+    assert guard.tests_facade_use_problems() == []
 
 
 def test_split_source_paths_follow_the_registry(monkeypatch):
@@ -250,128 +220,90 @@ def test_fresh_import_guard_accepts_a_standalone_module_and_rejects_a_facade_imp
     assert "does not import alone" in guard.fresh_import_problem("no_such_module_for_split_guard")
 
 
-# --- Patch propagation on synthetic modules ------------------------------------
+# --- Facade-use guard on synthetic sources -------------------------------------
 
 
-@pytest.fixture
-def synthetic(monkeypatch):
-    """A facade, two consumers that bind ``target`` and one that never did."""
-    original = lambda: "original"  # noqa: E731
-    facade = types.ModuleType("synthetic_split_facade")
-    facade.target = original
-    owner_a = types.ModuleType("synthetic_split_owner_a")
-    owner_a.target = original
-    exec("def call():\n    return target()\n", vars(owner_a))
-    owner_b = types.ModuleType("synthetic_split_owner_b")
-    owner_b.target = original
-    bystander = types.ModuleType("synthetic_split_bystander")
-    outside = types.ModuleType("synthetic_split_outside")
-    outside.target = original
-    guard.install_patch_propagation(facade, registry=lambda: [owner_a, owner_b, bystander])
-    monkeypatch.setitem(sys.modules, facade.__name__, facade)
-    return types.SimpleNamespace(
-        original=original, facade=facade, owners=(owner_a, owner_b),
-        bystander=bystander, outside=outside,
+@pytest.mark.parametrize(
+    ("source", "expected", "line"),
+    [
+        ("import coding_review_agent_loop.orchestrator\n", "imports the orchestrator facade", 1),
+        ("import coding_review_agent_loop.orchestrator as orch\n", "imports the orchestrator facade", 1),
+        ("import os, coding_review_agent_loop.orchestrator.sub\n", "imports the orchestrator facade", 1),
+        ("from coding_review_agent_loop import orchestrator\n", "imports the orchestrator facade", 1),
+        ("from coding_review_agent_loop import github, orchestrator as o\n", "imports the orchestrator facade", 1),
+        ("def f():\n    from coding_review_agent_loop.orchestrator import run_pr_loop\n",
+         "imports the orchestrator facade", 2),
+        ("patch('coding_review_agent_loop.orchestrator.attempt_repair')\n",
+         "names the orchestrator facade in a string such as a patch target", 1),
+        ("monkeypatch.setattr('coding_review_agent_loop.orchestrator.log', fake)\n",
+         "names the orchestrator facade in a string such as a patch target", 1),
+    ],
+    ids=["import", "import-as", "import-submodule", "from-package", "from-package-aliased",
+         "nested-from-import", "patch-string", "setattr-string"],
+)
+def test_facade_use_guard_rejects_each_banned_form(source, expected, line):
+    assert guard.facade_use_problems(source, "test_synthetic.py") == [f"test_synthetic.py line {line} {expected}"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "importlib.import_module('coding_review_agent_loop.orchestrator')\n",
+        "import_module('coding_review_agent_loop.orchestrator')\n",
+        "importlib.import_module(name='coding_review_agent_loop.orchestrator')\n",
+    ],
+    ids=["importlib-attribute", "bare-import-module", "name-keyword"],
+)
+def test_facade_use_guard_rejects_import_module_of_the_facade(source):
+    assert guard.facade_use_problems(source, "test_synthetic.py") == [
+        "test_synthetic.py line 1 imports the orchestrator facade through import_module",
+        "test_synthetic.py line 1 names the orchestrator facade in a string such as a patch target",
+    ]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "importlib.import_module('.orchestrator', 'coding_review_agent_loop')",
+        "importlib.import_module('.orchestrator', package='coding_review_agent_loop')",
+        "importlib.import_module(name='.orchestrator', package='coding_review_agent_loop')",
+        "importlib.import_module(package='coding_review_agent_loop', name='.orchestrator')",
+        "import_module(name='.orchestrator', package='coding_review_agent_loop')",
+    ],
+    ids=["positional", "package-keyword", "both-keywords", "keywords-reordered", "bare-both-keywords"],
+)
+def test_facade_use_guard_rejects_relative_import_module_of_the_facade(call):
+    source = call + "\n"
+    assert guard.facade_use_problems(source, "test_synthetic.py") == [
+        "test_synthetic.py line 1 imports the orchestrator facade through import_module"
+    ]
+
+
+def test_facade_use_guard_accepts_owning_modules_and_lookalike_names():
+    source = (
+        "import coding_review_agent_loop.validated_agent as validated_agent\n"
+        "from coding_review_agent_loop import pr_loop\n"
+        "from coding_review_agent_loop.orchestrator_extra import helper\n"
+        "import orchestrator_split_guard\n"
+        "importlib.import_module('coding_review_agent_loop.issue_loop')\n"
+        "patch('coding_review_agent_loop.validated_agent.attempt_repair')\n"
+        "note = 'orchestrator.py lines 577-581'\n"
     )
+    assert guard.facade_use_problems(source, "test_synthetic.py") == []
 
 
-def _fake():
-    return "fake"
+def test_facade_use_guard_scans_only_test_files_outside_the_allowlist(tmp_path):
+    banned = "import coding_review_agent_loop.orchestrator\n"
+    (tmp_path / "test_banned.py").write_text(banned, encoding="utf-8")
+    (tmp_path / "conftest.py").write_text("patch('coding_review_agent_loop.orchestrator.x')\n", encoding="utf-8")
+    (tmp_path / "test_allowed.py").write_text(banned, encoding="utf-8")
+    (tmp_path / "notes.txt").write_text(banned, encoding="utf-8")
+    assert guard.tests_facade_use_problems(tmp_path, allowlist={"test_allowed.py"}) == [
+        "conftest.py line 1 names the orchestrator facade in a string such as a patch target",
+        "test_banned.py line 1 imports the orchestrator facade",
+    ]
 
 
-def _assert_restored(s):
-    assert s.facade.target is s.original
-    for owner in s.owners:
-        assert owner.target is s.original
-    assert "target" not in vars(s.bystander)
-    assert s.outside.target is s.original
-    assert guard.pending_restores(s.facade) == {}
-
-
-def test_monkeypatch_setattr_on_facade_reaches_owners_and_undo_restores(synthetic):
-    s = synthetic
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(s.facade, "target", _fake)
-        assert s.owners[0].call() == "fake"
-        assert all(owner.target is _fake for owner in s.owners)
-        assert "target" not in vars(s.bystander)
-        assert s.outside.target is s.original
-    _assert_restored(s)
-
-
-def test_dotted_string_patch_reaches_owners_and_restores(synthetic):
-    s = synthetic
-    with patch("synthetic_split_facade.target", _fake):
-        assert s.owners[0].call() == "fake"
-        assert s.owners[1].target is _fake
-        assert "target" not in vars(s.bystander)
-    _assert_restored(s)
-
-
-def test_patch_object_reaches_owners_and_restores(synthetic):
-    s = synthetic
-    with patch.object(s.facade, "target", _fake):
-        assert s.owners[0].call() == "fake"
-        assert s.owners[1].target is _fake
-    _assert_restored(s)
-
-
-def test_patch_of_a_name_no_registered_module_owns_stays_on_the_facade(synthetic):
-    s = synthetic
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(s.facade, "brand_new", _fake, raising=False)
-        assert s.facade.brand_new is _fake
-        for module in (*s.owners, s.bystander):
-            assert "brand_new" not in vars(module)
-    assert "brand_new" not in vars(s.facade)
-    _assert_restored(s)
-
-
-def _assert_deleted(s):
-    assert "target" not in vars(s.facade)
-    for owner in s.owners:
-        assert "target" not in vars(owner)
-    assert "target" not in vars(s.bystander)
-    assert s.outside.target is s.original
-    assert guard.pending_restores(s.facade) == {"target": {owner.__name__ for owner in s.owners}}
-
-
-def _assert_later_patch_propagates_and_restores(s):
-    with patch.object(s.facade, "target", _fake):
-        assert all(owner.target is _fake for owner in s.owners)
-        assert "target" not in vars(s.bystander)
-    _assert_restored(s)
-
-
-def test_monkeypatch_delattr_then_undo_restores_every_owner(synthetic):
-    s = synthetic
-    with pytest.MonkeyPatch.context() as mp:
-        mp.delattr(s.facade, "target")
-        _assert_deleted(s)
-    _assert_restored(s)
-    _assert_later_patch_propagates_and_restores(s)
-
-
-def test_plain_delattr_then_setattr_restores_every_owner(synthetic):
-    s = synthetic
-    delattr(s.facade, "target")
-    _assert_deleted(s)
-    setattr(s.facade, "target", s.original)
-    _assert_restored(s)
-    _assert_later_patch_propagates_and_restores(s)
-
-
-def test_delete_of_a_missing_name_touches_no_owner(synthetic):
-    s = synthetic
-    with pytest.raises(AttributeError):
-        delattr(s.facade, "absent")
-    assert guard.pending_restores(s.facade) == {}
-    _assert_restored(s)
-
-
-def test_install_is_idempotent(synthetic):
-    s = synthetic
-    guard.install_patch_propagation(s.facade, registry=lambda: [])
-    with patch.object(s.facade, "target", _fake):
-        assert s.owners[0].target is _fake
-    _assert_restored(s)
+def test_facade_use_allowlist_is_the_split_guard_and_its_tests():
+    assert guard.FACADE_USE_ALLOWLIST == {"test_orchestrator_split.py", "orchestrator_split_guard.py"}
+    assert guard.TESTS_DIR == guard.REPO_ROOT / "tests"

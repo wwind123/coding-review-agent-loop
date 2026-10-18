@@ -4,13 +4,6 @@ from unittest.mock import patch
 
 import pytest
 
-from orchestrator_split_guard import install_patch_propagation
-
-# Patches set on the orchestrator facade must keep reaching code that the
-# split (#1181) moves into extracted modules; installed once per process, so
-# every xdist worker gets it too.
-install_patch_propagation()
-
 
 def _release_specific_interpreter_paths():
     # Only a path naming this exact patch release (a hosted toolcache path such
@@ -44,12 +37,13 @@ def pytest_collection_modifyitems(config, items):
 def _no_real_repair():
     """Prevent attempt_repair from calling the real Gemini CLI in all tests.
 
-    Tests that explicitly test repair behaviour patch the orchestrator-level
-    import themselves, which takes precedence over this fixture.  Unit tests
-    for attempt_repair itself patch subprocess.run directly, so they are
-    unaffected here.
+    The stub sits on ``validated_agent``, the only module that binds
+    ``attempt_repair`` (#1186).  Tests that explicitly test repair behaviour
+    patch that binding themselves, which takes precedence over this fixture.
+    Unit tests for attempt_repair itself patch subprocess.run directly, so
+    they are unaffected here.
     """
-    with patch("coding_review_agent_loop.orchestrator.attempt_repair", return_value=None):
+    with patch("coding_review_agent_loop.validated_agent.attempt_repair", return_value=None):
         yield
 
 
