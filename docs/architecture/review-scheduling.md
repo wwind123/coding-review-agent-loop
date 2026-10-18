@@ -2,7 +2,7 @@
 
 How reviewers are chosen for each PR head and each candidate plan: the shared pre-round snapshot and no-execution policy, selective intermediate and `primary-then-panel` PR review, signed board amendments, staged issue plan review with its exact-plan candidate key and reviewer-only phase-advance round, the transition classifier, the primary-phase stall stop, the staged-plan mode conflict, the plan step-back episode, planning scheduler metadata, frozen policy evaluation and the shared reviewer exhaustiveness rule.
 
-Source paths: `src/coding_review_agent_loop/review_scheduling.py`, `src/coding_review_agent_loop/plan_review_scheduling.py`, `src/coding_review_agent_loop/review_rounds.py`, `src/coding_review_agent_loop/board_amendment.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/review_evaluation.py`, `src/coding_review_agent_loop/prompts.py`, `tests/test_review_scheduling.py`, `tests/test_plan_review_scheduling.py`, `tests/test_review_step_back.py`, `tests/test_review_evaluation.py`.
+Source paths: `src/coding_review_agent_loop/review_scheduling.py`, `src/coding_review_agent_loop/plan_review_scheduling.py`, `src/coding_review_agent_loop/review_rounds.py`, `src/coding_review_agent_loop/board_amendment.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/review_evaluation.py`, `src/coding_review_agent_loop/prompts.py`, `tests/test_review_scheduling.py`, `tests/test_plan_review_scheduling.py`, `tests/test_review_step_back.py`, `tests/test_review_evaluation.py`, `tests/test_pr_loop_review_scheduling.py`.
 
 ## Reviewer selection and scheduling
 
