@@ -58,7 +58,7 @@ def _reconciled_secondary_audit(tmp_path, **overrides):
         antigravity_outputs=[_staged_review(reviewer="Antigravity")],
     )
     assert run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, **overrides)) == 0
-    assert _agent_sequence(runner) == ["codex", "gemini", "agy"]
+    assert _primary_then_panel(_agent_sequence(runner))
     checkpoint = next(
         record.metadata for record in _records(runner)
         if record.metadata.round_number == 2 and record.metadata.phase == "scheduler-prelaunch"
@@ -128,6 +128,11 @@ def _append_stray_checkpoint(runner, **changes):
     return stray
 
 
+def _primary_then_panel(sequence):
+    # Parallel panel reviewers launch in completion-independent order.
+    return sequence[:1] == ["codex"] and sorted(sequence[1:]) == ["agy", "gemini"]
+
+
 def _records_after(runner, index):
     return [record for record in _records(runner) if record.index > index]
 
@@ -153,7 +158,7 @@ def test_1553_reconciled_round_rolls_over_after_signed_change_request(tmp_path, 
     assert first_checkpoint.round_number == 3
     assert first_checkpoint.scheduler_selected_reviewers == ("Codex",)
     # The primary remediates first, then the panel follows as usual.
-    assert _agent_sequence(runner)[3:] == ["codex", "gemini", "agy"]
+    assert _primary_then_panel(_agent_sequence(runner)[3:])
     assert not any("partially published" in comment for comment in runner.comments)
     assert not any("Delete these" in comment for comment in runner.comments)
 
@@ -179,7 +184,7 @@ def test_1553_stray_post_reconciliation_checkpoint_resumes_into_the_next_round(t
     assert later[0].metadata.round_number == 3
     checkpoint = next(record.metadata for record in later if record.metadata.phase == "scheduler-prelaunch")
     assert checkpoint.scheduler_selected_reviewers == ("Codex",)
-    assert _agent_sequence(runner)[3:] == ["codex", "gemini", "agy"]
+    assert _primary_then_panel(_agent_sequence(runner)[3:])
     assert not any("partially published" in comment for comment in runner.comments)
 
 
