@@ -1,6 +1,7 @@
 """Tests for opt-in parallel plan/PR reviewer execution (#594)."""
 import dataclasses
 import json
+import stat
 import re
 import threading
 import time
@@ -1709,8 +1710,16 @@ def _published_count(runner, marker):
 
 
 def _spool_files(config):
+    # The spool root is non-listable (0o300, #1560); list it owner-side.
     root = review_rounds.review_spool_root(config.agent_memory_dir)
-    return sorted(root.rglob("*.json")) if root.exists() else []
+    if not root.exists():
+        return []
+    mode = root.stat().st_mode
+    root.chmod(0o700)
+    try:
+        return sorted(root.rglob("*.json"))
+    finally:
+        root.chmod(stat.S_IMODE(mode))
 
 
 def test_pr_parallel_interruption_between_publications_replays_withheld_review(tmp_path):

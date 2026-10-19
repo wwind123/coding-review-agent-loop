@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterable, Mapping
 
 from .errors import AgentLoopError
-from .scratch import mkdir_private
+from .scratch import make_private_dirs, mkdir_private
 
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
@@ -133,6 +133,325 @@ def response_root(config: AgentLoopConfig) -> Path:
         / "responses"
         / _safe_repo_slug(config.repo)
     )
+
+
+# ------------------------------------------------- non-listable response tree
+#
+# Every agent turn writes inside a fresh ``turn-<uuid4 hex>`` directory (mode
+# 0700).  The shared ancestors (``responses/``, ``<repo>/`` and every
+# ``<agent-or-seat>/``) are mode 0300: write and search for the owner, no read
+# bit, so a same-user agent's ``ls ..``, ``find`` or glob cannot enumerate peer
+# reviewers' responses (#1560).  agent-loop itself still creates and opens
+# known child paths.  Mode bits only stop incidental discovery; they are not a
+# sandbox against a deliberately adversarial same-UID agent or root.
+
+UNLISTABLE_DIR_MODE = 0o300
+TURN_DIR_PREFIX = "turn-"
+RESPONSE_FILE_NAME = "response.md"
+_ROOT_WARNED: set[str] = set()
+_LISTING_ATTEMPTS = 3
+
+
+def _current_euid() -> int | None:
+    return os.geteuid() if hasattr(os, "geteuid") else None
+
+
+def ensure_unlistable_dir(
+    path: Path | str,
+    *,
+    create: bool = True,
+    error: type[AgentLoopError] = AgentLoopError,
+    remode_group_writable: bool = False,
+) -> None:
+    """Make ``path`` a real, owned directory of mode exactly ``0o300``.
+
+    A missing directory is created umask-safely through
+    :func:`scratch.mkdir_private` when ``create`` is set.  A symlink, a
+    non-directory or a foreign-owned directory is refused with ``error``; it
+    is never followed or re-moded.  A group/world-writable directory is
+    refused too, unless ``remode_group_writable`` is set for a legacy
+    directory that older versions created with the process umask.
+    """
+    text = str(path)
+    if create:
+        try:
+            mkdir_private(text)
+        except OSError as exc:
+            raise error(f"Could not create private directory {text}: {exc}") from exc
+    try:
+        info = os.lstat(text)
+    except OSError as exc:
+        raise error(f"Private directory {text} is missing: {exc}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise error(
+            f"Private directory {text} is not a real directory (symlinks are refused). "
+            "Remove it, or set TMPDIR to a private directory."
+        )
+    euid = _current_euid()
+    if euid is not None and info.st_uid != euid:
+        raise error(
+            f"Private directory {text} is owned by uid {info.st_uid}, not the current user. "
+            "Remove it, or set TMPDIR to a private directory."
+        )
+    if info.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not remode_group_writable:
+        raise error(
+            f"Private directory {text} is group- or world-writable "
+            f"(mode {stat.S_IMODE(info.st_mode):o}). Run `chmod 0300 {shlex.quote(text)}`."
+        )
+    if stat.S_IMODE(info.st_mode) != UNLISTABLE_DIR_MODE:
+        try:
+            os.chmod(text, UNLISTABLE_DIR_MODE)
+        except OSError as exc:
+            raise error(f"Could not make private directory {text} non-listable: {exc}") from exc
+
+
+def is_listable_directory(path: Path | str) -> bool:
+    """Whether a reviewer following ``path`` as ``ls`` would could list a directory.
+
+    Decided from inode mode bits and ownership only, never ``os.access``:
+    under euid 0, access(2) grants read on every directory, which would make
+    every root run look unhardened.  A symlink is judged by its target; a
+    dangling symlink or a non-directory is not listable.
+    """
+    try:
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            info = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    euid = _current_euid()
+    if euid is not None and info.st_uid != euid:
+        return True
+    return bool(info.st_mode & 0o444)
+
+
+def _list_unlistable(path: str) -> list[str]:
+    """Owner-side listing of a 0o300 directory: briefly 0o700, then restored."""
+    last: OSError | None = None
+    for _attempt in range(_LISTING_ATTEMPTS):
+        try:
+            os.chmod(path, 0o700)
+            try:
+                return os.listdir(path)
+            finally:
+                os.chmod(path, UNLISTABLE_DIR_MODE)
+        except PermissionError as exc:
+            # A concurrent invocation restored 0o300 between our chmod and
+            # listdir; retry the owner-side listing.
+            last = exc
+    assert last is not None
+    raise last
+
+
+def harden_response_tree(
+    config: AgentLoopConfig,
+    *,
+    root: Path | None = None,
+    error: type[AgentLoopError] = AgentLoopError,
+    hide_parent: bool = True,
+) -> None:
+    """Make every guessable directory of the repo response tree non-listable.
+
+    ``hide_parent`` also hides the root's parent (the shared ``responses/``
+    directory).  A backend-specific root inside a checkout's git directory
+    (Gemini's) passes False: its parent is git-owned state.
+
+    Runs before any agent of an invocation is spawned and again at each
+    review-round start.  Every immediate child of the repo response root is
+    hardened, including seats this invocation does not configure and
+    directories older versions created, so hiding never waits for this
+    invocation to allocate there.  Child files are left alone: legacy flat
+    responses stay readable by their known paths but can no longer be listed.
+    A child still listable afterwards refuses the launch with ``error``.
+    """
+    repo_root = Path(root) if root is not None else response_root(config)
+    # Sandboxed mode keeps refusing a group-writable component (its boundary
+    # contract); default mode re-modes one an older release left behind.
+    remode = not issubclass(error, SandboxBoundaryError)
+    base = repo_root.parent.parent if hide_parent else repo_root.parent
+    try:
+        make_private_dirs(base)
+    except OSError as exc:
+        raise error(f"Could not create response directory {base}: {exc}") from exc
+    if hide_parent:
+        ensure_unlistable_dir(repo_root.parent, error=error, remode_group_writable=remode)
+    ensure_unlistable_dir(repo_root, error=error, remode_group_writable=remode)
+    try:
+        names = sorted(_list_unlistable(str(repo_root)))
+    except OSError as exc:
+        raise error(f"Could not inspect response directory {repo_root}: {exc}") from exc
+    euid = _current_euid()
+    offenders: list[str] = []
+    # A concurrent invocation's umask-safe mkdir restores 0700 just after
+    # creating a child, so a listable child is re-moded and re-checked a few
+    # times before the post-condition refuses.
+    for _attempt in range(_LISTING_ATTEMPTS):
+        for name in names:
+            child = repo_root / name
+            try:
+                info = os.lstat(child)
+            except OSError:
+                continue
+            if (
+                stat.S_ISDIR(info.st_mode)
+                and (euid is None or info.st_uid == euid)
+                and stat.S_IMODE(info.st_mode) != UNLISTABLE_DIR_MODE
+            ):
+                try:
+                    os.chmod(child, UNLISTABLE_DIR_MODE)
+                except OSError:
+                    # The post-condition below names it.
+                    pass
+        offenders = [str(repo_root / name) for name in names if is_listable_directory(repo_root / name)]
+        if not offenders:
+            break
+    if offenders:
+        paths = " ".join(shlex.quote(path) for path in offenders)
+        raise error(
+            "Response directories remain listable after hardening, so a reviewer could read "
+            f"peer responses: {', '.join(offenders)}. Run `chmod 0300 {paths}` (or remove "
+            "them) and rerun; no agent was started."
+        )
+    if euid == 0 and str(repo_root) not in _ROOT_WARNED:
+        _ROOT_WARNED.add(str(repo_root))
+        from .logging import log
+
+        log(
+            config,
+            "Warning: agent-loop runs as root, so non-listable response directories do not hide "
+            "peer reviewer responses from agents (root bypasses directory read permission).",
+        )
+
+
+def _gemini_response_roots(config: AgentLoopConfig) -> list[Path]:
+    """Gemini's git-dir response roots: the configured checkout and every Gemini seat."""
+    from .agents.gemini import _gemini_public_response_root
+
+    checkouts = [Path(config.gemini_dir)]
+    for seat in getattr(config, "reviewer_seats", ()) or ():
+        if getattr(seat, "backend", None) == "gemini" and getattr(seat, "workdir", None) is not None:
+            checkouts.append(Path(seat.workdir))
+    roots: list[Path] = []
+    for checkout in checkouts:
+        root = _gemini_public_response_root(checkout)
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def harden_backend_response_roots(
+    config: AgentLoopConfig, *, error: type[AgentLoopError] = AgentLoopError
+) -> None:
+    """Harden every existing backend-specific response root (Gemini's) like the shared one.
+
+    Absent roots are left absent; the first Gemini turn creates and hardens
+    its own.
+    """
+    for root in _gemini_response_roots(config):
+        if os.path.lexists(root):
+            harden_response_tree(config, root=root, error=error, hide_parent=False)
+
+
+def release_unlistable_tree(root: Path | str) -> None:
+    """Give the owner rwx back on every real directory at and below ``root``.
+
+    Only for a tree that is about to be removed: recursive deletion
+    (``shutil.rmtree``, ``git worktree remove``/``prune``) must list each
+    directory, which a 0o300 directory refuses.  Symlinks are never followed.
+    """
+    pending = [str(root)]
+    euid = _current_euid()
+    while pending:
+        current = pending.pop()
+        try:
+            info = os.lstat(current)
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            continue
+        if (euid is None or info.st_uid == euid) and (info.st_mode & 0o700) != 0o700:
+            try:
+                os.chmod(current, stat.S_IMODE(info.st_mode) | 0o700)
+            except OSError:
+                continue
+        try:
+            names = os.listdir(current)
+        except OSError:
+            continue
+        pending.extend(os.path.join(current, name) for name in names)
+
+
+def release_checkout_response_roots(checkout: Path | str) -> None:
+    """Make a checkout's private Gemini response root removable before deleting it."""
+    from .agents.gemini import _gemini_public_response_root
+
+    checkout = Path(checkout)
+    candidates = {
+        _gemini_public_response_root(checkout),
+        checkout / ".git" / "agent-loop" / "responses",
+        checkout / ".agent-loop-responses",
+    }
+    for root in candidates:
+        if os.path.lexists(root):
+            release_unlistable_tree(root)
+
+
+def remove_checkout_tree(path: Path | str, *, ignore_errors: bool = False) -> None:
+    """Recursively delete a checkout-like directory that may hold a hidden response root.
+
+    Every recursive deletion of a directory an agent ran in goes through
+    here: a Gemini response root inside it is non-listable (0o300), which
+    ``shutil.rmtree`` cannot enumerate, so it is released first (#1560).
+    """
+    try:
+        release_checkout_response_roots(path)
+    except OSError:
+        if not ignore_errors:
+            raise
+    shutil.rmtree(path, ignore_errors=ignore_errors)
+
+
+def release_orphaned_admin_response_roots(store: Path | str) -> None:
+    """Before ``git worktree prune``, release the response roots of admin dirs whose worktree is gone.
+
+    A live worktree's root stays hidden; only an admin directory git is about
+    to delete is made removable.
+    """
+    admins = Path(store) / ".git" / "worktrees"
+    try:
+        names = os.listdir(admins)
+    except OSError:
+        return
+    for name in names:
+        admin = admins / name
+        try:
+            gitdir = (admin / "gitdir").read_text(encoding="utf-8").strip()
+        except OSError:
+            gitdir = ""
+        if gitdir and os.path.lexists(gitdir):
+            continue
+        root = admin / "agent-loop" / "responses"
+        if os.path.lexists(root):
+            release_unlistable_tree(root)
+
+
+def allocate_turn_directory(parent: Path | str) -> Path:
+    """Exclusively create a fresh ``turn-<uuid4 hex>`` directory of mode 0700."""
+    path = Path(parent) / f"{TURN_DIR_PREFIX}{uuid.uuid4().hex}"
+    if not mkdir_private(path):
+        raise FileExistsError(f"Per-turn response directory {path} already exists.")
+    return path
+
+
+def default_response_parent(config: AgentLoopConfig, component: str) -> Path:
+    """The hardened ``<responses>/<repo>/<component>`` parent of default-mode turns."""
+    repo_root = response_root(config)
+    make_private_dirs(repo_root.parent.parent)
+    for directory in (repo_root.parent, repo_root, repo_root / component):
+        ensure_unlistable_dir(directory, remode_group_writable=True)
+    return repo_root / component
 
 
 # --------------------------------------------------------------- selections
@@ -298,6 +617,9 @@ class _ComponentRecord:
     path: str
     dev: int
     ino: int
+    # ``responses/``, ``<repo>/`` and provider directories are kept at 0o300
+    # so peers' turn directories cannot be listed (#1560).
+    unlistable: bool = False
 
 
 @dataclass(frozen=True)
@@ -501,16 +823,25 @@ def _check_overlap(resolved_root: Path, record: _CheckoutRecord) -> None:
         )
 
 
+def _unlistable_components(resolved_root: Path, component_paths: list[str]) -> set[str]:
+    # Everything from ``responses/`` down; the shared scratch root above it
+    # holds unrelated agent-loop state and keeps its mode.
+    responses = str(resolved_root.parent)
+    return {path for path in component_paths if _is_within(path, responses)}
+
+
 def establish_response_root_boundary(config: AgentLoopConfig) -> SandboxState:
     """Create and validate the response root and record the checkout set."""
     resolved_root, component_paths = _response_component_paths(config)
+    unlistable = _unlistable_components(resolved_root, component_paths)
     with _STATE_LOCK:
         writable: list[tuple[str, int]] = []
-        components = tuple(
-            _check_component(path, create=True, writable=writable) for path in component_paths
-        )
+        checked = [_check_component(path, create=True, writable=writable) for path in component_paths]
         if writable:
             raise _writable_components_error(writable)
+        components = tuple(
+            dataclasses.replace(record, unlistable=record.path in unlistable) for record in checked
+        )
         state = SandboxState(
             lexical_root=_state_key(config),
             resolved_root=resolved_root,
@@ -526,6 +857,9 @@ def establish_response_root_boundary(config: AgentLoopConfig) -> SandboxState:
             _check_overlap(resolved_root, record)
             state.checkouts[record.stored] = record
             state.persistent.add(record.stored)
+        # Hide every pre-existing provider and seat directory before any agent
+        # of this invocation spawns; a child left listable refuses the run.
+        harden_response_tree(config, root=resolved_root, error=SandboxBoundaryError)
         previous = _STATES.get(state.lexical_root)
         if previous is not None:
             state.provenance = previous.provenance
@@ -572,6 +906,9 @@ def verify_response_boundary(config: AgentLoopConfig) -> SandboxState:
                 )
         if writable:
             raise _writable_components_error(writable)
+        for component in state.components:
+            if component.unlistable:
+                _reverify_unlistable_component(component.path)
         current_checkouts = configured_checkouts(config)
         for stored in list(state.checkouts):
             if stored not in state.persistent and stored not in current_checkouts:
@@ -613,11 +950,59 @@ def verify_response_boundary(config: AgentLoopConfig) -> SandboxState:
     return state
 
 
+def _reverify_unlistable_component(path: str) -> None:
+    """A lone owner read bit is re-moded to 0o300; group/other bits refuse."""
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise SandboxBoundaryError(f"Sandboxed response directory {path} is missing: {exc}") from exc
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        raise SandboxBoundaryError(
+            f"Sandboxed response directory component {path} regained group or other permissions "
+            f"(mode {mode:o}). Run `chmod 0300 {shlex.quote(path)}`."
+        )
+    if mode != UNLISTABLE_DIR_MODE:
+        try:
+            os.chmod(path, UNLISTABLE_DIR_MODE)
+        except OSError as exc:
+            raise SandboxBoundaryError(
+                f"Could not make sandboxed response directory {path} non-listable: {exc}"
+            ) from exc
+
+
 def prepare_response_file(config: AgentLoopConfig, provider: str) -> Path:
-    """Re-verify the boundary, then exclusively create this invocation's file."""
+    """Re-verify the boundary, then exclusively create this invocation's file.
+
+    The file lives in a fresh per-turn directory (exactly 0700) under the
+    physically validated provider component, and is itself exactly 0600
+    whatever the umask, so the CLI can reopen it and agent-loop can read it.
+    """
+    from .agents.base import register_turn_directory
+
     state = verify_response_boundary(config)
-    directory = state.resolved_root / provider
-    path = directory / f"{uuid.uuid4().hex}.md"
+    try:
+        directory = allocate_turn_directory(state.resolved_root / provider)
+    except OSError as exc:
+        raise SandboxBoundaryError(
+            f"Could not create a sandboxed per-turn response directory: {exc}"
+        ) from exc
+    register_turn_directory(directory)
+    try:
+        info = os.lstat(directory)
+    except OSError as exc:
+        raise SandboxBoundaryError(f"Sandboxed per-turn directory {directory} is missing: {exc}") from exc
+    euid = _current_euid()
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or (euid is not None and info.st_uid != euid)
+        or stat.S_IMODE(info.st_mode) != 0o700
+    ):
+        raise SandboxBoundaryError(
+            f"Sandboxed per-turn directory {directory} is not a private directory owned by the current user."
+        )
+    path = directory / RESPONSE_FILE_NAME
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags, 0o600)
@@ -625,7 +1010,12 @@ def prepare_response_file(config: AgentLoopConfig, provider: str) -> Path:
         raise SandboxBoundaryError(
             f"Could not exclusively create sandboxed response file {path}: {exc}"
         ) from exc
-    os.close(fd)
+    try:
+        if hasattr(os, "fchmod"):
+            # The umask can clear the requested 0600 down to 000.
+            os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
     return path
 
 
@@ -941,8 +1331,14 @@ def neutralized_git_env() -> dict[str, str]:
 def establish_sandboxed_run(
     config: AgentLoopConfig, *, command: str, plan_first: bool = False
 ) -> None:
-    """Fail-fast startup for sandboxed mode, before any agent is spawned."""
+    """Fail-fast startup before any agent is spawned.
+
+    Every mode hardens the response tree first (#1560); sandboxed mode does so
+    inside its physical boundary check.
+    """
     if not is_sandboxed(config):
+        harden_response_tree(config)
+        harden_backend_response_roots(config)
         return
     validate_sandboxed_selections(config)
     validate_sandboxed_flow(config, command=command, plan_first=plan_first)
@@ -980,8 +1376,19 @@ def coder_test_invocation(config: AgentLoopConfig, agent: str = "claude") -> str
     return resolve_coder_test_invocation(config, agent=agent)
 
 
-def role_permission_args(config: AgentLoopConfig, provider: str, role: str | None) -> tuple[str, ...]:
-    """CLI permission args for one invocation; empty outside sandboxed mode."""
+def role_permission_args(
+    config: AgentLoopConfig,
+    provider: str,
+    role: str | None,
+    *,
+    response_dir: Path | None = None,
+) -> tuple[str, ...]:
+    """CLI permission args for one invocation; empty outside sandboxed mode.
+
+    ``response_dir`` is the invocation's own per-turn directory.  When given,
+    every Claude ``--add-dir`` and response-path Write/Edit rule names only it,
+    never the shared (non-listable) response root or peers' directories.
+    """
     if not is_sandboxed(config):
         return ()
     permission_class = permission_class_for_role(role)
@@ -997,7 +1404,7 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
             "--agent-permissions sandboxed cannot run Codex as a committing coder "
             "(its sandbox keeps .git read-only); use --coder claude."
         )
-    root = sandboxed_response_root(config)
+    root = response_dir if response_dir is not None else sandboxed_response_root(config)
     if provider == "claude":
         prefix = inspect_prefix(config)
         if permission_class == PERMISSION_CLASS_READ_ONLY:
@@ -1031,6 +1438,10 @@ def role_permission_args(config: AgentLoopConfig, provider: str, role: str | Non
             for checkout in coder_checkout_paths(config)
             for rule in (_claude_path_rule("Write", checkout), _claude_path_rule("Edit", checkout))
         ]
+        # The public response file lies outside the checkout, so it needs its
+        # own rule under this exclusive allowlist, scoped like the read-only
+        # branch to the turn's own directory (#1560).
+        rules += [_claude_path_rule("Write", root), _claude_path_rule("Edit", root)]
         rules += ["Bash(git *)", *(f"Bash({sub} *)" for sub in CODER_GH_SUBCOMMANDS), f"Bash({prefix} *)"]
         test_invocation = coder_test_invocation(config, provider)
         if test_invocation:

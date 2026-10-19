@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-import uuid
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+import os
+import shutil
+import stat
+from typing import TYPE_CHECKING, Callable, Iterator, Literal, Protocol, cast
 
 from ..runner import CommandResult, Runner
-from ..scratch import make_private_dirs
 from ..containment import ContainmentEvidence
 from ..usage import UsageMetadata
 
@@ -108,21 +111,101 @@ def public_response_path(
     *,
     root: Path | None = None,
 ) -> Path:
-    # Every invocation gets a new path.  Backends read only this path after
-    # their command returns, so an artifact from an earlier invocation cannot
-    # be mistaken for the current response.  Sandboxed Claude and Codex spawns
-    # use agent_permissions.prepare_response_file instead, which pre-creates
-    # the file under the physically validated root.
-    from ..agent_permissions import response_root
-
-    base_dir = root if root is not None else response_root(config)
-    path = (
-        base_dir
-        / (config.active_reviewer_seat_id or agent)
-        / f"{uuid.uuid4().hex}.md"
+    # Every invocation gets a fresh, exclusively created ``turn-<uuid4 hex>``
+    # directory (exactly 0700) holding ``response.md``, so an artifact from an
+    # earlier invocation cannot be mistaken for the current response and no
+    # peer's response sits beside this one (#1560).  The shared ancestors of
+    # the default root are non-listable (0o300).  Sandboxed Claude and Codex
+    # spawns use agent_permissions.prepare_response_file instead, which
+    # pre-creates the file under the physically validated root.
+    from ..agent_permissions import (
+        RESPONSE_FILE_NAME,
+        allocate_turn_directory,
+        default_response_parent,
+        ensure_unlistable_dir,
+        harden_response_tree,
     )
-    make_private_dirs(path.parent)
-    return path
+
+    component = config.active_reviewer_seat_id or agent
+    if root is None:
+        parent = default_response_parent(config, component)
+    else:
+        # A backend-specific root (Gemini's git-dir root) is hardened the same
+        # way, except that its git-owned parent keeps its mode.  Worktree
+        # removal releases it first (agent_permissions.release_*).
+        harden_response_tree(config, root=root, hide_parent=False)
+        parent = root / component
+        ensure_unlistable_dir(parent, remode_group_writable=True)
+    turn_dir = allocate_turn_directory(parent)
+    register_turn_directory(turn_dir)
+    return turn_dir / RESPONSE_FILE_NAME
+
+
+# Per-turn directories allocated inside the current validated agent turn.
+_TURN_DIRECTORIES: ContextVar[list[Path] | None] = ContextVar(
+    "agent_loop_turn_directories", default=None
+)
+
+
+def register_turn_directory(path: Path) -> None:
+    """Record a per-turn response directory for cleanup by the enclosing scope."""
+    directories = _TURN_DIRECTORIES.get()
+    if directories is not None:
+        directories.append(path)
+
+
+def remove_turn_directory(path: Path, *, on_error: Callable[[str], None] | None = None) -> bool:
+    """Best-effort removal of one ``turn-*`` directory; never anything else."""
+    from ..agent_permissions import TURN_DIR_PREFIX
+
+    if not path.name.startswith(TURN_DIR_PREFIX):
+        return False
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        if on_error is not None:
+            on_error(f"Could not inspect per-turn response directory {path}: {exc}")
+        return False
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return False
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        if on_error is not None:
+            on_error(f"Could not remove per-turn response directory {path}: {exc}")
+        return False
+    return True
+
+
+@contextmanager
+def response_turn_scope(
+    on_error: Callable[[str], None] | None = None, *, reuse_enclosing: bool = False
+) -> Iterator[list[Path]]:
+    """Remove every per-turn directory allocated inside the scope when it ends.
+
+    A validated agent turn opens the outer scope, so cleanup runs only after
+    acceptance, repair, completion recovery and failure diagnostics have
+    finished with ``response_file_path``.  Every backend invocation also runs
+    inside a scope with ``reuse_enclosing``: inside a validated turn it defers
+    to that turn's scope, and a direct invocation (outside any validated
+    turn) gets its own scope, which ends once the backend has captured the
+    response text.  A cleanup failure is reported through ``on_error`` and
+    never changes the turn's outcome.
+    """
+    enclosing = _TURN_DIRECTORIES.get()
+    if reuse_enclosing and enclosing is not None:
+        yield enclosing
+        return
+    directories: list[Path] = []
+    token = _TURN_DIRECTORIES.set(directories)
+    try:
+        yield directories
+    finally:
+        _TURN_DIRECTORIES.reset(token)
+        for directory in directories:
+            remove_turn_directory(directory, on_error=on_error)
 
 
 def with_public_response_file_instruction(prompt: str, response_path: Path) -> str:

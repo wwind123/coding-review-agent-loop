@@ -1699,7 +1699,9 @@ def ensure_temp_checkout(path: Path, *, agent: AgentName, config: AgentLoopConfi
     verify_before_sync(config, runner, path=path, label=f"Default {agent} workdir")
     if _is_stale_default_workdir(path):
         log(config, f"Stale default {agent} workdir detected (no checkout, only logs remain); recreating: {path}")
-        shutil.rmtree(path)
+        from .agent_permissions import remove_checkout_tree
+
+        remove_checkout_tree(path)
         forget_checkout(path)  # verified above; the tool itself removed it
 
     if not path.exists():

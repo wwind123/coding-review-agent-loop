@@ -1466,3 +1466,62 @@ def test_sandboxed_codex_timeout_without_artifact_is_not_salvaged(
             )
     finally:
         agent_permissions.reset_sandbox_state()
+
+
+@pytest.mark.parametrize("mask", [0o022, 0o700, 0o777], ids=["umask-022", "umask-700", "umask-777"])
+def test_default_public_response_path_allocates_private_turn_directories(tmp_path, monkeypatch, mask):
+    """Each default-mode turn gets its own 0700 directory under 0o300 ancestors (#1560)."""
+    import os
+    import stat
+    import tempfile as tempfile_module
+
+    from coding_review_agent_loop.agent_permissions import response_root
+    from coding_review_agent_loop.agents.base import public_response_path
+
+    private_tmp = tmp_path / "private-tmp"
+    private_tmp.mkdir()
+    monkeypatch.setattr(tempfile_module, "tempdir", str(private_tmp))
+    config = make_config(tmp_path)
+    root = response_root(config)
+    # A legacy layout: 0700 ancestors and an old flat response file.
+    (root / "claude").mkdir(parents=True)
+    for directory in (root.parent, root, root / "claude"):
+        directory.chmod(0o700)
+    legacy = root / "claude" / "0123456789abcdef0123456789abcdef.md"
+    legacy.write_text("legacy", encoding="utf-8")
+
+    previous = os.umask(mask)
+    try:
+        first = public_response_path(config, "claude")
+        second = public_response_path(config, "claude")
+    finally:
+        os.umask(previous)
+    # In default mode the agent CLI creates response.md itself.
+    first.write_text("first", encoding="utf-8")
+
+    assert first.name == second.name == "response.md"
+    assert first.parent != second.parent
+    for path in (first, second):
+        assert path.parent.name.startswith("turn-")
+        assert len(path.parent.name) == len("turn-") + 32
+        assert path.parent.parent == root / "claude"
+        assert stat.S_IMODE(os.lstat(path.parent).st_mode) == 0o700
+    for ancestor in (root.parent, root, root / "claude"):
+        assert stat.S_IMODE(os.lstat(ancestor).st_mode) == 0o300
+    assert first.read_text(encoding="utf-8") == "first"
+    assert legacy.read_text(encoding="utf-8") == "legacy"
+
+
+def test_seat_turn_directory_lives_under_the_seat_component(tmp_path, monkeypatch):
+    import dataclasses
+    import tempfile as tempfile_module
+
+    from coding_review_agent_loop.agent_permissions import response_root
+    from coding_review_agent_loop.agents.base import public_response_path
+
+    private_tmp = tmp_path / "private-tmp"
+    private_tmp.mkdir()
+    monkeypatch.setattr(tempfile_module, "tempdir", str(private_tmp))
+    config = dataclasses.replace(make_config(tmp_path), active_reviewer_seat_id="seat-a")
+    path = public_response_path(config, "codex")
+    assert path.parent.parent == response_root(config) / "seat-a"

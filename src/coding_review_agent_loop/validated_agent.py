@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace as dataclasses_replace
 
-from .agents.base import AgentName, AgentResult
+from .agents.base import AgentName, AgentResult, response_turn_scope
 from .agents.antigravity import AntigravityAttemptState
 from .agents.registry import agent_display_name, agent_signature, run_agent_result
 from .config import AgentLoopConfig
@@ -590,7 +590,25 @@ def _synthesized_completion_recovery_unavailable(
     return unavailable, render_agent_unavailable_comment(unavailable, signature=signature)
 
 
-def _attempt_claude_completion_recovery(
+def _attempt_claude_completion_recovery(*args, **kwargs):
+    """Run completion recovery inside a response-turn scope.
+
+    The recovery writes its terminal text to the recovery attempt's response
+    file after the backend returns, so its per-turn directory must outlive
+    the backend invocation: inside a validated turn this defers to that
+    turn's scope, and a direct call gets its own (#1560).
+    """
+    config = kwargs.get("config")
+
+    def report(message: str) -> None:
+        if config is not None:
+            log(config, message)
+
+    with response_turn_scope(on_error=report, reuse_enclosing=True):
+        return _attempt_claude_completion_recovery_in_scope(*args, **kwargs)
+
+
+def _attempt_claude_completion_recovery_in_scope(
     runner: Runner,
     *,
     config: AgentLoopConfig,
@@ -1036,7 +1054,25 @@ def _history_strip_allowed(
     )
 
 
-def _run_validated_agent(
+def _run_validated_agent(*args, **kwargs):
+    """Run one validated agent turn, then remove its per-turn response directories.
+
+    Every backend invocation inside the turn (the first attempt, format
+    repairs, retries and completion recovery) allocates its own private
+    directory; they are all removed once the turn has finished with them,
+    whatever its outcome (#1560).  A cleanup failure is only logged.
+    """
+    config = kwargs.get("config")
+
+    def report(message: str) -> None:
+        if config is not None:
+            log(config, message)
+
+    with response_turn_scope(on_error=report):
+        return _run_validated_agent_in_scope(*args, **kwargs)
+
+
+def _run_validated_agent_in_scope(
     runner: Runner,
     *,
     agent: AgentName,

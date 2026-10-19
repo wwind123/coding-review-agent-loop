@@ -202,3 +202,212 @@ def test_post_round_resolved_history_ids_exclude_actively_disputed_and_carried_i
         reconciliation_mode="aggregate",
         same_status="same-plan",
     ) == ()
+
+
+# --- Review-round spool location, migration and placement (#1560) -----------
+
+import json as _spool_json
+import os as _spool_os
+import stat as _spool_stat
+import tempfile as _spool_tempfile
+
+from coding_review_agent_loop.agent_permissions import configured_checkouts, response_root
+from coding_review_agent_loop.errors import AgentLoopError as _SpoolError
+from coding_review_agent_loop.review_spool import (
+    ReviewRoundSpool,
+    legacy_review_spool_root,
+    review_spool_root,
+)
+from agent_loop_helpers import make_config as _make_spool_config
+
+_NON_ROOT_SPOOL = pytest.mark.skipif(
+    not hasattr(_spool_os, "geteuid") or _spool_os.geteuid() == 0,
+    reason="root bypasses directory read permission",
+)
+_SPOOL_FIELDS = {"text": "Codex approves.", "model_used": "m"}
+
+
+@pytest.fixture
+def spool_config(tmp_path, monkeypatch):
+    private = tmp_path / "private-tmp"
+    private.mkdir()
+    monkeypatch.setattr(_spool_tempfile, "tempdir", str(private))
+    return _make_spool_config(tmp_path)
+
+
+def _spool_mode(path):
+    return _spool_stat.S_IMODE(_spool_os.lstat(path).st_mode)
+
+
+def _round_spool(config, *, number=7, round_number=1, subject="abc"):
+    return review_rounds._review_round_spool(
+        config, surface="pr", number=number, round_number=round_number, subject=subject
+    )
+
+
+def _legacy_round(config, kind, *, number=7, round_number=1, subject="abc"):
+    """A round spooled by an older version at the legacy sibling-of-memory root."""
+    legacy = ReviewRoundSpool(
+        root=legacy_review_spool_root(config.agent_memory_dir), repo=config.repo, surface="pr",
+        number=number, round_number=round_number, subject=subject,
+    )
+    legacy.store("Codex", _SPOOL_FIELDS)
+    if kind == "carrier":
+        legacy.store_publication("Codex", {"frozen": True})
+    elif kind == "malformed":
+        path = legacy.directory / "Codex.json"
+        payload = _spool_json.loads(path.read_text(encoding="utf-8"))
+        payload["publication"] = "not-a-mapping"
+        path.write_text(_spool_json.dumps(payload), encoding="utf-8")
+    return legacy
+
+
+@pytest.mark.parametrize("mask", [0o022, 0o700, 0o777], ids=["umask-022", "umask-700", "umask-777"])
+def test_spool_lands_in_private_root_outside_reachable_trees(spool_config, mask):
+    config = spool_config
+    previous = _spool_os.umask(mask)
+    try:
+        spool = _round_spool(config)
+        spool.store("Codex", _SPOOL_FIELDS)
+    finally:
+        _spool_os.umask(previous)
+
+    root = review_spool_root(config.agent_memory_dir)
+    assert spool.root == root
+    assert root == config.agent_memory_dir.parent / "private" / "review-round-spool"
+    assert root.parent != config.agent_memory_dir.parent  # not beside the memory dir
+    assert not legacy_review_spool_root(config.agent_memory_dir).exists()
+    resolved = _spool_os.path.realpath(root)
+    for tree in (str(response_root(config)), *configured_checkouts(config)):
+        tree = _spool_os.path.realpath(tree)
+        assert not resolved.startswith(tree + _spool_os.sep) and not tree.startswith(resolved + _spool_os.sep)
+    assert _spool_mode(root.parent) == 0o300
+    assert _spool_mode(root) == 0o300
+    assert _spool_mode(spool.directory) == 0o700
+    record = spool.directory / "Codex.json"
+    assert _spool_mode(record) == 0o600
+    assert spool.publication_state("Codex") == ("fresh", None)
+    assert spool.load("Codex")["text"] == "Codex approves."
+
+
+@pytest.mark.parametrize("kind", ["fresh", "carrier", "malformed"])
+def test_legacy_round_is_migrated_with_unchanged_classification(spool_config, kind):
+    config = spool_config
+    legacy = _legacy_round(config, kind)
+    before = legacy.publication_state("Codex")
+    loaded_before = legacy.load("Codex")
+    legacy_directory = legacy.directory
+
+    spool = _round_spool(config)
+    assert spool.has_records()  # the rerun's first spool use migrates the round
+    assert not legacy_directory.exists()
+    assert (spool.root / legacy_directory.name).is_dir()
+    assert spool.publication_state("Codex") == before
+    assert spool.load("Codex") == loaded_before
+    assert before[0] == kind
+
+
+def test_round_present_in_both_locations_fails_closed(spool_config):
+    config = spool_config
+    legacy = _legacy_round(config, "carrier")
+    spool = _round_spool(config)
+    (spool.root / legacy.directory.name).mkdir()
+    legacy_dir = legacy.directory
+    with pytest.raises(_SpoolError) as info:
+        spool.has_records()
+    assert str(legacy_dir) in str(info.value)
+    assert str(spool.root / legacy_dir.name) in str(info.value)
+    with pytest.raises(_SpoolError):
+        spool.publication_state("Codex")
+    # Neither directory is discarded.
+    assert (legacy_dir / "Codex.json").exists()
+    assert (spool.root / legacy_dir.name).is_dir()
+
+
+@_NON_ROOT_SPOOL
+@pytest.mark.parametrize("legacy_mode", [0o755, 0o775], ids=["mode-755", "umask-002-mode-775"])
+def test_retained_legacy_round_is_hidden_but_still_migrates(spool_config, legacy_mode):
+    config = spool_config
+    retained = _legacy_round(config, "carrier", number=99, subject="retained")
+    legacy_root = retained.root
+    # Older versions created the root with the process umask.
+    legacy_root.chmod(legacy_mode)
+    before = retained.publication_state("Codex")
+
+    # A new, unrelated round starts and hardens the legacy root first.
+    _round_spool(config, number=7)
+    with pytest.raises(PermissionError):
+        _spool_os.listdir(legacy_root)
+    assert _spool_mode(legacy_root) == 0o300
+    record = legacy_root / retained.digest / "Codex.json"
+    assert _spool_json.loads(record.read_text(encoding="utf-8"))["publication"] == {"frozen": True}
+
+    # Later, a rerun of the retained round migrates it with its classification.
+    rerun = _round_spool(config, number=99, subject="retained")
+    assert rerun.publication_state("Codex") == before == ("carrier", {"frozen": True})
+    assert not (legacy_root / retained.digest).exists()
+
+
+def test_symlinked_legacy_spool_root_is_refused_before_any_reviewer(tmp_path, spool_config):
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    target.chmod(0o755)
+    legacy_review_spool_root(spool_config.agent_memory_dir).parent.mkdir(parents=True)
+    legacy_review_spool_root(spool_config.agent_memory_dir).symlink_to(target)
+    with pytest.raises(_SpoolError, match="not a real directory"):
+        _round_spool(spool_config)
+    assert _spool_mode(target) == 0o755
+    assert legacy_review_spool_root(spool_config.agent_memory_dir).is_symlink()
+
+
+def test_legacy_spool_root_is_never_created(spool_config):
+    _round_spool(spool_config)
+    assert not legacy_review_spool_root(spool_config.agent_memory_dir).exists()
+
+
+def _assert_refused_without_spool_state(config, fragment):
+    with pytest.raises(_SpoolError, match="overlaps") as info:
+        _round_spool(config)
+    assert fragment in str(info.value)
+    assert not (config.agent_memory_dir.parent / "private").exists()
+
+
+def test_spool_inside_a_named_seat_workdir_is_refused(tmp_path, spool_config):
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat, SeatAgent
+
+    seat_dir = tmp_path / "seat-checkout"
+    seat = SeatAgent(ReviewerSeat("seat-a", "codex", ("Model A",)), seat_dir)
+    config = _make_spool_config(
+        tmp_path, reviewer=(seat,), reviewer_seats=(seat,),
+        agent_memory_dir=seat_dir / "cache" / "memory",
+    )
+    _assert_refused_without_spool_state(config, "reviewer seat seat-a workdir")
+
+
+def test_spool_inside_the_repository_checkout_is_refused(tmp_path, spool_config, monkeypatch):
+    repository = tmp_path / "orchestrator-repo"
+    (repository / ".git").mkdir(parents=True)
+    monkeypatch.chdir(repository)
+    config = _make_spool_config(tmp_path, agent_memory_dir=repository / "cache" / "memory")
+    _assert_refused_without_spool_state(config, "repository checkout")
+
+
+def test_spool_inside_a_provider_checkout_is_refused(tmp_path, spool_config):
+    config = _make_spool_config(tmp_path, agent_memory_dir=tmp_path / "codex" / ".agent-loop" / "memory")
+    _assert_refused_without_spool_state(config, "agent checkout")
+
+
+def test_spool_inside_the_response_root_is_refused(tmp_path, spool_config):
+    memory = response_root(spool_config) / "cache" / "memory"
+    config = _make_spool_config(tmp_path, agent_memory_dir=memory)
+    _assert_refused_without_spool_state(config, "response root")
+
+
+def test_legacy_spool_root_overlapping_a_checkout_is_refused(tmp_path, spool_config):
+    # The new root avoids the checkout, but the legacy root (beside memory)
+    # would be the checkout itself.
+    config = _make_spool_config(
+        tmp_path, codex_dir=tmp_path / "review-round-spool" / "review-round-spool",
+        agent_memory_dir=tmp_path / "review-round-spool" / "memory",
+    )
+    _assert_refused_without_spool_state(config, "agent checkout")

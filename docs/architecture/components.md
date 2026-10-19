@@ -40,7 +40,7 @@ flowchart LR
   `coder` role gets the coder grant (Claude only; a committing Codex coder is
   rejected because its sandbox keeps `.git` read-only), and every other or
   missing role fails closed to read-only. Claude non-coders run with
-  `--restricted`, writes limited to the response root, and a single shell
+  `--restricted`, writes limited to the turn's own response directory, and a single shell
   grant, `agent-loop inspect`; Codex non-coders run in the read-only sandbox,
   with no network, and the Codex CLI writes their response. Gemini and
   Antigravity, and every pass-through `--<agent>-arg`, are rejected at config
@@ -48,8 +48,38 @@ flowchart LR
 - The sandboxed response root is a physically validated boundary: created as
   private, non-symlink components, checked not to overlap any agent checkout in
   either direction, and re-verified (components, checkout identities, overlap)
-  immediately before every sandboxed spawn; the per-invocation file is created
-  exclusively without following symlinks.
+  immediately before every sandboxed spawn. The per-invocation file is
+  `response.md` (exactly 0600) inside a fresh, exclusively created per-turn
+  directory (exactly 0700); neither is ever followed through a symlink. Every
+  sandboxed Claude `--add-dir` and response-path Write/Edit rule names only that
+  per-turn directory, never the shared root or a peer's directory. The
+  re-verification re-modes an ancestor that regained the owner read bit and
+  refuses one that gained group or other bits.
+- Reviewers judge independently, so peer responses are not discoverable by
+  listing (#1560). In every permission mode each agent turn writes into its own
+  `turn-<uuid4 hex>` directory (0700), and the shared ancestors (`responses/`,
+  `<repo>/` and every provider or seat directory) are mode 0300: writable and
+  searchable by the owner, never listable. Before any agent of an invocation
+  spawns, and again at each review-round start, every immediate child of the
+  repo response root (including seats this run does not configure and
+  directories older versions created) is re-moded to 0300; a child still
+  listable afterwards, judged from inode mode bits and ownership rather than
+  `os.access`, refuses the launch. Every backend invocation runs through
+  `run_agent_result`, which scopes its per-turn directories: inside a validated
+  agent turn they are removed once acceptance, repair, completion recovery and
+  diagnostics are done with them, and a direct invocation (evidence
+  correction, semantic dedupe) removes its own once the backend has captured
+  the response text; a cleanup failure is only logged. Legacy flat response
+  files stay readable by known path but are hidden, not swept. Gemini's
+  git-dir response root (`<git dir>/agent-loop/responses/`) gets the same
+  hardening, except that its git-owned parent keeps its mode; before worktree
+  removal, `git worktree prune` of an orphaned admin directory, or any
+  recursive deletion of a directory an agent ran in (a stale checkout or store,
+  the semantic-dedupe isolated workdir), agent-loop restores owner access on
+  that tree (`remove_checkout_tree`) so the recursive delete can list it. Residual: mode bits stop incidental discovery (`ls ..`,
+  `find`, globbing) by a same-UID agent, not a deliberate one that re-modes the
+  ancestors, and give no protection under euid 0, where a run proceeds with one
+  warning; real isolation needs an OS-level filesystem sandbox.
 - `agent-loop inspect` (`inspect_tool.py`, standard library only) is the
   read-only git/gh boundary for Claude non-coders. Its argument allowlist,
   forced git config, closed environment allowlist with a `PATH` built from the

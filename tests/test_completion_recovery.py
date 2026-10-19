@@ -26,6 +26,19 @@ from coding_review_agent_loop.protocol import (
 from agent_loop_helpers import FakeRunner, make_config, structured_issue_implementation
 
 
+@pytest.fixture(autouse=True)
+def _enclosing_validated_turn_scope():
+    """In production the helper runs inside a validated turn's response scope.
+
+    These tests inspect response files after the helper returns, which that
+    enclosing scope allows; the scope removes them afterwards (#1560).
+    """
+    from coding_review_agent_loop.agents.base import response_turn_scope
+
+    with response_turn_scope():
+        yield
+
+
 def _validate_structured_implementation_result(text):
     parsed = validate_structured_issue_implementation(text)
     if parsed is None:

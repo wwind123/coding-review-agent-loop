@@ -787,7 +787,9 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help=(
                 "Directory for repo memory. Defaults to a repo-scoped user cache; "
-                "relative explicit paths are resolved inside an explicit coder checkout, or under the repo-keyed user cache when the coder uses a default per-run worktree."
+                "relative explicit paths are resolved inside an explicit coder checkout, or under the repo-keyed user cache when the coder uses a default per-run worktree. "
+                "Review rounds refuse a memory directory whose review-round spool would lie inside any agent checkout, reviewer seat workdir, "
+                "the repository checkout or the response directory, so with an explicit checkout use an absolute path outside every checkout."
             ),
         )
         subparser.add_argument(

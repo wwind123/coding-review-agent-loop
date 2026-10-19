@@ -1555,3 +1555,20 @@ def test_docs_describe_the_architecture_set_layout_and_size_budget():
     assert "--architecture-exclude" in help_text
     assert "--no-default-architecture-excludes" in help_text
     assert "split it" in help_text
+
+
+def test_agent_memory_dir_guidance_documents_the_spool_overlap_refusal():
+    """A relative memory dir inside an explicit checkout is refused at review rounds (#1560)."""
+    parser = build_parser()
+    pr_parser = next(
+        action for action in parser._subparsers._group_actions[0].choices.values()
+        if any("--agent-memory-dir" in a.option_strings for a in action._actions)
+    )
+    help_text = next(
+        a.help for a in pr_parser._actions if "--agent-memory-dir" in a.option_strings
+    )
+    assert "refuse" in help_text and "outside every checkout" in help_text
+    doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    assert "--agent-memory-dir .cache/agent-loop-memory" not in doc
+    assert "is refused at the first review round" in doc
+    assert "<agent-memory-dir>/../private/review-round-spool/" in doc

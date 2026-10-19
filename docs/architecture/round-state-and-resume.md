@@ -13,7 +13,8 @@ between GitHub and local artifacts:
 | --- | --- |
 | Source and candidate identity | Git commits/branches and live GitHub PR metadata. |
 | Cross-invocation workflow history | GitHub comments with round metadata, canonical issue/PR handoffs, plan identities, and managed-CI intents; oversized payloads use sidecar comments. |
-| Invocation results | Unique response files and external subprocess logs; validate the current attempt before accepting an artifact. |
+| Invocation results | Unique response files, each in a private per-turn directory removed after the validated turn ingests it, and external subprocess logs; validate the current attempt before accepting an artifact. |
+| Parallel review-round spool | `<agent-memory-dir>/../private/review-round-spool/<round digest>/`; settled outcomes withheld until the round publishes (#1025, #1258). |
 | Work in progress | Tool-owned per-run worktrees (removed at run end) or explicitly supplied checkouts; run artifacts (a relative `--log-dir`) live under `<cache>/run-artifacts/OWNER-REPO/<run-token>/`, a relative `--agent-memory-dir` under `<cache>/repos/OWNER-REPO/`, and worktree owner records under the host lock root; tracked diffs can be preserved as salvage on supported failure paths. |
 | Local evidence | Test observations/receipts, runtime recommendations, usage summaries, and containment evidence. |
 | Evidence-conversion authority | Capture classifications, conversion audits, attempt pairings and signed-evidence references in round metadata; admitted only from comments authored by the authenticated orchestrator actor, with REST identity hydration on resume and on every rereading consumer. |
@@ -42,6 +43,26 @@ any other state ends the run so a rerun re-executes every merge gate.
 Ambiguous-write recovery is distinct from cross-invocation spool replay, which
 republishes a preserved reviewer acquisition from a frozen carrier. See
 `docs/local_agent_loop.md` ("Transient GitHub failures").
+
+The review-round spool is kept out of reviewer reach (#1560). Its root is
+`private/review-round-spool/` beside the agent memory directory, not a direct
+sibling of the prompt-advertised memory directory; `private/` and the root are
+mode 0300 (never listable), round directories 0700 and record files exactly
+0600 whatever the umask, so a record never reads back as malformed. At each
+review-round start, before any spool state is created or migrated, both the new
+root and the legacy root (`<agent-memory-dir>/../review-round-spool/`) are
+checked not to overlap, in either direction, the response root, any provider
+checkout, any named reviewer seat's workdir, or the repository checkout; an
+overlap raises. An existing legacy root is then re-moded to 0300 so retained
+rounds cannot be listed (including the group-writable mode older releases
+created under `umask 002`; a symlinked or foreign-owned legacy root raises),
+and it is never created. A round directory found at
+the legacy location is atomically renamed into the new root before its first
+use and keeps its publication classification (fresh, carrier, legacy,
+malformed). If both locations hold the round, or the rename fails, the run
+fails closed instead of treating a possibly frozen carrier as absent. Residual:
+these are same-UID mode bits that stop incidental discovery, not an
+adversarial agent that computes the digest path from source.
 
 Some hosts append a fixed footer to every posted comment (Claude Code cloud
 sessions). The one byte-exact suffix `KNOWN_HOST_COMMENT_FOOTER` in

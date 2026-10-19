@@ -6776,3 +6776,72 @@ def test_issue_resume_prompt_retains_configured_command_when_wrapper_probe_fails
     prompt = build_issue_prompt(764, config, memory=memory)
     assert "pytest tests/test_protocol.py -q" in prompt
     assert "no wrapper candidate verified" in prompt
+
+
+# --- Issue #1560: complete, valid schema examples and reviewer independence ---
+
+from coding_review_agent_loop.prompts import (  # noqa: E402
+    REVIEW_INDEPENDENCE_RULE,
+    build_plan_decomposition_prompt,
+)
+
+
+def _schema_example_blocks(prompt):
+    """Every multi-line JSON example: a line ``{`` through the next line ``}``."""
+    lines = prompt.splitlines()
+    blocks = []
+    index = 0
+    while index < len(lines):
+        if lines[index] == "{":
+            end = index + 1
+            while end < len(lines) and lines[end] != "}":
+                end += 1
+            blocks.append("\n".join(lines[index : end + 1]))
+            index = end
+        index += 1
+    return blocks
+
+
+def _schema_prompts(config):
+    return {
+        "plan_review": build_plan_review_prompt(56, 1, "Plan.", config, reviewer="codex"),
+        "plan_review_compact": build_plan_review_prompt(
+            56, 1, "Plan.", config, reviewer="codex", compact_context=True
+        ),
+        "pr_review": build_review_prompt(77, 1, config, reviewer="codex"),
+        "pr_review_compact": build_review_prompt(77, 1, config, reviewer="codex", compact_context=True),
+        "plan_revision": build_plan_revision_prompt(783, 2, "Previous plan", "Blocking review", config),
+        "plan": build_issue_plan_prompt(56, config),
+        "decomposition": build_plan_decomposition_prompt(56, "Approved plan.", config),
+    }
+
+
+def test_every_rendered_schema_example_is_valid_json(tmp_path):
+    config = make_config(tmp_path, reviewer="codex")
+    for label, prompt in _schema_prompts(config).items():
+        blocks = _schema_example_blocks(prompt)
+        assert blocks, label
+        for block in blocks:
+            assert "{{" not in block and "}}" not in block, label
+            json.loads(block)
+
+
+def test_plan_review_schema_example_uses_single_braces_for_architecture_impact(tmp_path):
+    config = make_config(tmp_path, reviewer="codex")
+    prompt = build_plan_review_prompt(56, 1, "Plan.", config, reviewer="codex")
+    example = next(
+        json.loads(block)
+        for block in _schema_example_blocks(prompt)
+        if '"kind": "plan_review"' in block
+    )
+    assert example["architecture_impact"]["status"] == "unchanged"
+    assert '"architecture_impact": {{' not in prompt
+
+
+def test_reviewer_prompts_forbid_searching_for_examples_or_peer_responses(tmp_path):
+    config = make_config(tmp_path, reviewer="codex")
+    prompts = _schema_prompts(config)
+    for label in ("plan_review", "plan_review_compact", "pr_review", "pr_review_compact"):
+        assert REVIEW_INDEPENDENCE_RULE in prompts[label], label
+    assert "other reviewers' responses" in REVIEW_INDEPENDENCE_RULE
+    assert "review spool" in REVIEW_INDEPENDENCE_RULE

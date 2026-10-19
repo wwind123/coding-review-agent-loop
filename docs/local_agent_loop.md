@@ -3255,7 +3255,14 @@ Execution model:
   - Before the first post, every settled outcome (validated response, or a
     failure that settles the reviewer as unavailable) is written to a private
     per-round spool under the repo cache
-    (`<agent-memory-dir>/../review-round-spool/`). If the run stops between two
+    (`<agent-memory-dir>/../private/review-round-spool/`, whose ancestors
+    are not listable). A round left at the pre-#1560 location
+    (`<agent-memory-dir>/../review-round-spool/`) is moved into it on first use;
+    if both locations hold the round, the run stops and names both paths. The
+    spool must not overlap the response directory, any agent checkout, any
+    reviewer seat workdir, or the repository checkout agent-loop runs from, so a
+    relative `--agent-memory-dir` that resolves inside an explicit checkout is
+    refused at the first review round. If the run stops between two
     posts, a rerun -- with or without `--review-parallel` -- replays the
     unpublished outcomes through the same validator instead of re-invoking
     those reviewers. The spool is deleted once every post succeeds.
@@ -5522,18 +5529,30 @@ Use these flags to control it:
 agent-loop pr 123 --repo OWNER/REPO --no-agent-memory
 agent-loop pr 123 --repo OWNER/REPO --refresh-agent-memory
 agent-loop pr 123 --repo OWNER/REPO --refresh-test-profile
-agent-loop pr 123 --repo OWNER/REPO --agent-memory-dir .cache/agent-loop-memory
+agent-loop pr 123 --repo OWNER/REPO --agent-memory-dir "$HOME/.cache/agent-loop-memory/OWNER-REPO/memory"
 ```
 
+The review-round spool lives beside the memory directory, under
+`<agent-memory-dir>/../private/review-round-spool/`. Review rounds therefore
+refuse, with an error naming the overlapping path, any memory directory whose
+spool would lie inside an agent checkout, a reviewer seat workdir, the
+repository checkout agent-loop runs from, or the response directory (#1560):
+a reviewer working in that tree could otherwise read the withheld round
+results. Use an absolute path outside every checkout, as in the example above.
+
 Relative `--agent-memory-dir` values are resolved inside the active coder
-checkout when that checkout is an explicit directory; for a default per-run
-worktree they resolve under the repo-keyed user cache
-(`<user cache>/coding-review-agent-loop/repos/OWNER-REPO/<value>`) so memory
-survives worktree removal. Use `--no-agent-memory` or a custom short-lived
-`--agent-memory-dir` for sensitive repositories where local cache retention is
-undesirable. If a custom memory directory uses the repo-local `.agent-loop`
-parent, that parent is ignored automatically so generated memory files are not
-accidentally committed. If the previous memory commit cannot be diffed against
+checkout when that checkout is an explicit directory, so with an explicit
+`--claude-dir`/`--codex-dir` checkout a relative value lands inside that
+checkout and is refused at the first review round (in an issue run, that is
+after the coder has already implemented and pushed). For a default per-run
+worktree, relative values resolve under the repo-keyed user cache
+(`<user cache>/coding-review-agent-loop/repos/OWNER-REPO/<value>`), outside
+every checkout, so they keep working and memory survives worktree removal. Use
+`--no-agent-memory` or a custom short-lived `--agent-memory-dir` for sensitive
+repositories where local cache retention is undesirable. If a custom memory
+directory outside every checkout uses an `.agent-loop` parent, that parent is
+ignored automatically so generated memory files are not accidentally
+committed. If the previous memory commit cannot be diffed against
 the current commit, the loop logs the git failure and treats all tracked files
 as changed for that refresh.
 
@@ -7517,7 +7536,8 @@ its role (implemented in `agent_permissions.py`):
 - A Claude coder gets `--permission-mode acceptEdits`, `--setting-sources
   user` (so checkout `.claude/settings*.json` cannot widen later grants),
   path-scoped `Write`/`Edit` rules for its assigned checkout (the configured
-  path and, when it differs, its resolved path), `Bash(git *)`, the gh subcommands coder prompts use, the read-only inspector,
+  path and, when it differs, its resolved path), `Write`/`Edit` rules and
+  `--add-dir` for its own per-turn response directory only, `Bash(git *)`, the gh subcommands coder prompts use, the read-only inspector,
   and one exact, wildcard-free rule for the resolved `agent-loop run-tests`
   invocation, which is the same string the coder prompt shows. The invocation
   uses `--test-command`, else the first verified test-profile command, and the
@@ -7526,7 +7546,7 @@ its role (implemented in `agent_permissions.py`):
 - A Claude non-coder gets `--restricted`, `--tools
   Read,Grep,Glob,Write,Edit,Bash`, an empty `--strict-mcp-config`,
   `--permission-mode dontAsk`, `--permission-prompts none`, `Write`/`Edit`
-  rules for the validated response root only, and one Bash rule: the pinned
+  rules for the turn's own per-turn response directory only, and one Bash rule: the pinned
   `agent-loop inspect` prefix. It also gets `--disallowedTools` for `git` and
   `gh`: Claude Code auto-approves some read-only commands (`git status` among
   them) whatever the allow list says, so omitting a program does not refuse it,
@@ -7603,8 +7623,9 @@ its role (implemented in `agent_permissions.py`):
   before every sandboxed spawn those components, every recorded checkout's
   resolved target and device/inode (for a not-yet-created checkout, the
   location its nearest existing ancestor resolves to), and the overlap are
-  re-verified, and the per-invocation file is
-  created with `O_CREAT|O_EXCL|O_NOFOLLOW`. Before every read-only Claude spawn
+  re-verified, and the per-invocation `response.md` is created with
+  `O_CREAT|O_EXCL|O_NOFOLLOW` (exactly 0600) inside a fresh 0700 per-turn
+  directory. Before every read-only Claude spawn
   the inspector's interpreter, package files, and pinned git and gh are
   re-fingerprinted. Any mismatch reports agent-unavailable (`environment`)
   without spawning.
@@ -8865,7 +8886,18 @@ output and may include CLI status text or tool narration. For Claude and
 Gemini, prompts also include a public response-file path under
 `/tmp/coding-review-agent-loop/responses/`; when that file exists and is
 non-empty, the loop validates and posts the file contents to GitHub instead of
-stdout. Codex also receives a response-file instruction, and separately uses
+stdout. Each turn gets its own `turn-<uuid4 hex>/response.md` in a 0700
+directory that is removed after the turn is validated; the shared
+`responses/`, repository and agent or seat directories are mode `0300`, so an
+agent cannot list peer reviewers' responses (#1560). Before any agent starts,
+and at each review round, agent-loop re-modes every such directory, including
+ones older versions left; if one stays listable (for example a symlink to a
+listable directory, or a directory owned by someone else) the run refuses
+with the exact `chmod 0300` fix. In default mode a group-writable directory
+an older release left is re-moded too; sandboxed mode still refuses it. Under
+root the mode bits hide nothing and a warning is logged. Gemini's git-dir response root is hidden the same
+way; agent-loop restores owner access on it just before removing a worktree
+or stale checkout, so recursive deletion still works. Codex also receives a response-file instruction, and separately uses
 `--output-last-message` so the loop can fall back to the last Codex message
 instead of raw JSON event logs. Gemini response files live inside Gemini's git
 directory because Gemini can only write trusted workspace paths; Gemini stdout

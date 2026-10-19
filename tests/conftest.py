@@ -222,3 +222,46 @@ def _round_publication_needs_an_actor_surface(monkeypatch):
 
     monkeypatch.setattr(pr_loop, "round_publication", maybe)
     monkeypatch.setattr(plan_first_loop, "round_publication", maybe)
+
+
+import os as _os
+import stat as _stat
+
+# Captured at import: a test's monkeypatched os functions are still active
+# while this cleanup runs.
+_REAL_LSTAT, _REAL_CHMOD, _REAL_LISTDIR = _os.lstat, _os.chmod, _os.listdir
+
+
+def _restore_owner_listing(root):
+    """Give the owner read+search back on every directory below ``root``.
+
+    agent-loop makes response and spool ancestors non-listable (0o300, #1560);
+    pytest's own tmp_path cleanup cannot descend into them.
+    """
+    pending = [str(root)]
+    while pending:
+        current = pending.pop()
+        try:
+            info = _REAL_LSTAT(current)
+        except OSError:
+            continue
+        if _stat.S_ISLNK(info.st_mode) or not _stat.S_ISDIR(info.st_mode):
+            continue
+        if (info.st_mode & 0o700) != 0o700:
+            try:
+                _REAL_CHMOD(current, _stat.S_IMODE(info.st_mode) | 0o700)
+            except OSError:
+                continue
+        try:
+            names = _REAL_LISTDIR(current)
+        except OSError:
+            continue
+        pending.extend(_os.path.join(current, name) for name in names)
+
+
+@pytest.fixture(autouse=True)
+def _tmp_path_stays_removable(request):
+    root = request.getfixturevalue("tmp_path") if "tmp_path" in request.fixturenames else None
+    yield
+    if root is not None:
+        _restore_owner_listing(root)

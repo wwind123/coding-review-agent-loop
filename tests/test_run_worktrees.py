@@ -833,3 +833,52 @@ def test_every_import_call_site_forwards_identity_and_shared_roots(tmp_path, mon
                               trusted_local_origin=env.bare)
     run_worktrees._fetch_and_pin(store, "main", config=doubles, runner=Runner(), free=False)
     assert calls == [("refs/heads/main", None, ())]
+
+
+def _gemini_turn_in(config, checkout):
+    """Allocate a Gemini-style response turn in ``checkout``'s git directory."""
+    from coding_review_agent_loop.agents.base import public_response_path
+    from coding_review_agent_loop.agents.gemini import _gemini_public_response_root
+
+    root = _gemini_public_response_root(checkout)
+    path = public_response_path(config, "gemini", root=root)
+    path.write_text("gemini response", encoding="utf-8")
+    legacy = root / "gemini" / "0123456789abcdef.md"
+    legacy.write_text("legacy", encoding="utf-8")
+    return root
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory read permission")
+def test_hidden_gemini_response_root_does_not_block_worktree_removal_or_prune(tmp_path, monkeypatch):
+    """A non-listable response root in a worktree admin dir is released before removal (#1560)."""
+    env = Env(tmp_path, monkeypatch)
+    store = default_agent_workdir("OWNER/REPO", "claude").resolve()
+
+    config = env.config()
+    with workdir_claim_scope(command="task"):
+        claim_agent_workdirs(config)
+        ensure_agent_workdirs(config, Runner())
+        path = config.claude_dir
+        root = _gemini_turn_in(config, path)
+        admin = root.parent.parent
+        assert admin.parent == store / ".git" / "worktrees"
+        for hidden in (root, root / "gemini"):
+            with pytest.raises(PermissionError):
+                os.listdir(hidden)
+    # Run end removed the worktree and git's admin directory despite the 0o300 tree.
+    assert not path.exists()
+    assert not admin.exists()
+    assert str(path) not in git(store, "worktree", "list", "--porcelain")
+
+    # A worktree that vanished without cleanup is pruned at the next startup.
+    orphan_config = env.config()
+    with workdir_claim_scope(command="task"):
+        claim_agent_workdirs(orphan_config)
+        ensure_agent_workdirs(orphan_config, Runner())
+        orphan = orphan_config.claude_dir
+        orphan_root = _gemini_turn_in(orphan_config, orphan)
+        orphan_admin = orphan_root.parent.parent
+        shutil.rmtree(orphan)
+    assert orphan_admin.exists()
+    prepare(env.config(), Runner())
+    assert not orphan_admin.exists()

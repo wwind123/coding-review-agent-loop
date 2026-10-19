@@ -3,6 +3,7 @@
 import dataclasses
 import datetime
 import json
+import os
 import re
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1047,3 +1048,284 @@ def test_owning_pr_loop_writes_run_end_on_exception(tmp_path, monkeypatch):
     assert [r["record"] for r in records] == ["run-start", "run-end"]
     assert records[0]["pr_number"] == 77 and records[0]["run_id"] == records[1]["run_id"]
     assert runner.telemetry_attribution is None
+
+
+# --- Per-turn response directory cleanup (#1560) ----------------------------
+
+
+@pytest.fixture
+def turn_dirs(tmp_path, monkeypatch):
+    """Record every per-turn response directory, under a private TMPDIR."""
+    import tempfile as tempfile_module
+
+    from coding_review_agent_loop import agent_permissions
+
+    private = tmp_path / "private-tmp"
+    private.mkdir()
+    monkeypatch.setattr(tempfile_module, "tempdir", str(private))
+    allocated = []
+    real_allocate = agent_permissions.allocate_turn_directory
+
+    def allocate(parent):
+        path = real_allocate(parent)
+        allocated.append(path)
+        return path
+
+    monkeypatch.setattr(agent_permissions, "allocate_turn_directory", allocate)
+    return allocated
+
+
+def _run_validated(runner, config, validate):
+    from coding_review_agent_loop.validated_agent import _run_validated_agent
+
+    return _run_validated_agent(
+        runner, agent="codex", config=config, prompt="Review.",
+        marker_description="VALID", validate=validate, role="reviewer",
+    )
+
+
+def _validate_exact(expected):
+    def validate(text):
+        if text != expected:
+            raise AgentLoopError("invalid response")
+        return text
+
+    return validate
+
+
+def test_validated_turn_removes_its_turn_directory_after_success(tmp_path, turn_dirs):
+    config = make_config(tmp_path, agent_max_retries=0)
+    seen = []
+    runner = FakeRunner(codex_outputs=[{"public_response": "VALID", "stdout": "", "returncode": 0}])
+
+    def validate(text):
+        # The file is still readable while the turn validates it.
+        seen.append([path.exists() for path in turn_dirs])
+        return _validate_exact("VALID")(text)
+
+    response = _run_validated(runner, config, validate)
+    assert response.text == "VALID"
+    assert seen and all(all(flags) for flags in seen)
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)
+    # Only the per-turn directory is removed; its parent stays.
+    assert all(path.parent.is_dir() for path in turn_dirs)
+
+
+def test_validated_turn_removes_its_turn_directories_after_failure(tmp_path, turn_dirs, monkeypatch):
+    import coding_review_agent_loop.agent_failure as agent_failure_module
+    from coding_review_agent_loop.errors import AgentInvocationError
+
+    diagnosed = []
+    real_diagnostic = agent_failure_module._public_response_file_diagnostic
+
+    def diagnostic(*, result, **kwargs):
+        path = result.response_file_path if result is not None else None
+        diagnosed.append(path is not None and path.parent.is_dir())
+        return real_diagnostic(result=result, **kwargs)
+
+    monkeypatch.setattr(agent_failure_module, "_public_response_file_diagnostic", diagnostic)
+    config = make_config(tmp_path, agent_max_retries=1, agent_retry_backoff_seconds=(0, 0))
+    runner = FakeRunner(codex_outputs=[
+        {"public_response": "nonsense one", "stdout": "", "returncode": 0},
+        {"public_response": "nonsense two", "stdout": "", "returncode": 0},
+    ])
+    with pytest.raises(AgentInvocationError) as info:
+        _run_validated(runner, config, _validate_exact("VALID"))
+    # Diagnostics read the response file before cleanup.
+    assert "Reason: invalid response" in str(info.value)
+    # Failure diagnostics ran while the turn directory still existed.
+    assert diagnosed and all(diagnosed)
+    assert len(turn_dirs) >= 1
+    assert all(not path.exists() for path in turn_dirs)
+
+
+def test_turn_directory_cleanup_failure_is_logged_without_changing_outcome(tmp_path, turn_dirs, monkeypatch):
+    import coding_review_agent_loop.agents.base as base_module
+    import coding_review_agent_loop.validated_agent as validated_agent_module
+
+    config = make_config(tmp_path, agent_max_retries=0)
+    messages = []
+    monkeypatch.setattr(validated_agent_module, "log", lambda _config, message: messages.append(message))
+
+    def failing_rmtree(path, *args, **kwargs):
+        raise OSError("device busy")
+
+    monkeypatch.setattr(base_module.shutil, "rmtree", failing_rmtree)
+    runner = FakeRunner(codex_outputs=[{"public_response": "VALID", "stdout": "", "returncode": 0}])
+    response = _run_validated(runner, config, _validate_exact("VALID"))
+    assert response.text == "VALID"
+    assert any("Could not remove per-turn response directory" in message for message in messages)
+    assert all(path.exists() for path in turn_dirs)
+
+
+def test_completion_recovery_terminal_write_precedes_turn_cleanup(tmp_path, turn_dirs, monkeypatch):
+    from coding_review_agent_loop.errors import AgentInvocationError
+    import coding_review_agent_loop.validated_agent as validated_agent_module
+
+    written = []
+    real_post = validated_agent_module._post_completion_recovery_terminal_comment
+
+    def post(runner, *, recovery_result, terminal_text, **kwargs):
+        real_post(runner, recovery_result=recovery_result, terminal_text=terminal_text, **kwargs)
+        path = recovery_result.response_file_path
+        written.append((path, path.read_text(encoding="utf-8") if path is not None else None))
+
+    monkeypatch.setattr(validated_agent_module, "_post_completion_recovery_terminal_comment", post)
+    runner = FakeRunner(claude_outputs=[
+        json.dumps({"result": "I'll wait for the background test run to finish.", "session_id": "sess-1"}),
+        ("", 1),
+    ])
+    config = make_config(tmp_path)
+    with pytest.raises(AgentInvocationError) as info:
+        run_issue_loop(runner, issue_number=56, config=config)
+    terminal = info.value.terminal_public_response
+    assert terminal is not None
+    assert written and written[0][1] == terminal
+    assert written[0][0].parent in turn_dirs
+    assert all(not path.exists() for path in turn_dirs)
+
+
+# Generalization (#1560 review item-3): every backend invocation goes through
+# run_agent_result, which scopes its per-turn directory.  Inside a validated
+# turn the outer scope defers cleanup past diagnostics; a direct invocation
+# (post-authentication evidence correction, semantic dedupe) is cleaned up as
+# soon as the backend has captured its response text.
+
+
+@pytest.mark.parametrize("outcome", ["success", "nonzero-exit", "backend-raises"])
+def test_direct_backend_invocation_removes_its_turn_directory(tmp_path, turn_dirs, monkeypatch, outcome):
+    from coding_review_agent_loop.agents.codex import BACKEND as CODEX_BACKEND
+    from coding_review_agent_loop.agents.registry import run_agent_result
+
+    config = make_config(tmp_path, agent_max_retries=0)
+    returncode = 0 if outcome == "success" else 1
+    runner = FakeRunner(codex_outputs=[{"public_response": "DIRECT", "stdout": "", "returncode": returncode}])
+    if outcome == "backend-raises":
+        real_run = CODEX_BACKEND.run
+
+        def raising_run(*args, **kwargs):
+            real_run(*args, **kwargs)
+            raise RuntimeError("provider crashed after allocating its response file")
+
+        monkeypatch.setattr(CODEX_BACKEND, "run", raising_run)
+        with pytest.raises(RuntimeError, match="provider crashed"):
+            run_agent_result(runner, agent="codex", config=config, prompt="Correct.", role="coder")
+    else:
+        result = run_agent_result(runner, agent="codex", config=config, prompt="Correct.", role="coder")
+        # The backend captured the text before the directory was removed.
+        assert result.text == "DIRECT"
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)
+    assert all(path.parent.is_dir() for path in turn_dirs)
+
+
+def test_semantic_dedupe_transport_removes_its_turn_directory(tmp_path, turn_dirs):
+    from coding_review_agent_loop.semantic_dedupe import default_semantic_transport
+
+    config = make_config(tmp_path, semantic_followup_backend="codex", semantic_followup_model="m")
+    runner = FakeRunner(codex_outputs=[{"public_response": '{"matches": []}', "stdout": "", "returncode": 0}])
+    result = default_semantic_transport("Compare.", runner, config, 30.0)
+    assert result.text == '{"matches": []}'
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)
+
+
+def test_evidence_correction_turn_directory_is_removed_after_ingestion(tmp_path, turn_dirs):
+    """The post-authentication correction coder runs outside any validated turn."""
+    import coding_review_agent_loop.response_validation as response_validation_module
+    from coding_review_agent_loop.agents.registry import run_agent_result
+
+    # response_validation calls the shared, scoped entry point.
+    assert response_validation_module.run_agent_result is run_agent_result
+    config = make_config(tmp_path, agent_max_retries=0)
+    runner = FakeRunner(codex_outputs=[{"public_response": "CORRECTED", "stdout": "", "returncode": 0}])
+    result = response_validation_module.run_agent_result(
+        runner, agent="codex", config=config, prompt="Correct.", role="coder",
+        label="semantic-evidence-correction",
+    )
+    assert result.text == "CORRECTED"
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)
+
+
+def test_direct_completion_recovery_writes_terminal_text_before_cleanup(tmp_path, turn_dirs, monkeypatch):
+    """Called outside a validated turn, recovery still writes before its own scope cleans up."""
+    import coding_review_agent_loop.validated_agent as validated_agent_module
+
+    written = []
+    real_post = validated_agent_module._post_completion_recovery_terminal_comment
+
+    def post(runner, *, recovery_result, terminal_text, **kwargs):
+        real_post(runner, recovery_result=recovery_result, terminal_text=terminal_text, **kwargs)
+        written.append(recovery_result.response_file_path.read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(validated_agent_module, "_post_completion_recovery_terminal_comment", post)
+    runner = FakeRunner(claude_outputs=[("", 1)])
+    config = make_config(tmp_path, coder="claude")
+    outcome = validated_agent_module._attempt_claude_completion_recovery(
+        runner, config=config,
+        completion_recovery=validated_agent_module.CompletionRecoveryPolicy(issue_number=56),
+        session_id="sess-1", validate=lambda text: text,
+        usage_context=validated_agent_module._new_usage_context(config),
+        run_id="run-1", role=None, label=None, timeout_seconds=None,
+    )
+    assert outcome.terminal_public_response is not None
+    assert written == [outcome.terminal_public_response]
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)
+
+
+# Generalization (#1560 review item-4): every recursive deletion of a directory
+# an agent ran in goes through agent_permissions.remove_checkout_tree, which
+# releases a hidden Gemini response root first.  The semantic-dedupe isolated
+# workdir is one such directory.
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root bypasses directory read permission")
+@pytest.mark.parametrize("backend", ["gemini", "codex"])
+@pytest.mark.parametrize("outcome", ["success", "nonzero-exit", "backend-raises"])
+def test_semantic_dedupe_transport_removes_its_whole_isolated_workdir(
+    tmp_path, turn_dirs, monkeypatch, backend, outcome
+):
+    import coding_review_agent_loop.semantic_dedupe as semantic_dedupe_module
+    from coding_review_agent_loop.agents.registry import get_backend
+
+    isolated_dirs = []
+    real_isolated = semantic_dedupe_module._isolated_provider_config
+
+    def isolated(*args, **kwargs):
+        config, directory = real_isolated(*args, **kwargs)
+        isolated_dirs.append(directory)
+        return config, directory
+
+    monkeypatch.setattr(semantic_dedupe_module, "_isolated_provider_config", isolated)
+    returncode = 0 if outcome == "success" else 1
+    output = '{"matches": []}'
+    runner = FakeRunner(
+        gemini_outputs=[(output, returncode)],
+        codex_outputs=[{"public_response": output, "stdout": "", "returncode": returncode}],
+    )
+    hidden_while_running = []
+    backend_impl = get_backend(backend)
+    real_run = backend_impl.run
+
+    def run(*args, **kwargs):
+        result = real_run(*args, **kwargs)
+        # The response root inside the isolated workdir is non-listable.
+        component = result.response_file_path.parent.parent
+        hidden_while_running.append(
+            (str(component).startswith(str(kwargs.get("config", args[1]).gemini_dir)), oct(os.lstat(component).st_mode & 0o777))
+        )
+        if outcome == "backend-raises":
+            raise RuntimeError("provider crashed")
+        return result
+
+    monkeypatch.setattr(backend_impl, "run", run)
+    config = make_config(tmp_path, semantic_followup_backend=backend, semantic_followup_model="m")
+    if outcome == "backend-raises":
+        with pytest.raises(RuntimeError, match="provider crashed"):
+            semantic_dedupe_module.default_semantic_transport("Compare.", runner, config, 30.0)
+    else:
+        semantic_dedupe_module.default_semantic_transport("Compare.", runner, config, 30.0)
+    if backend == "gemini":
+        # Gemini's response root lives inside the isolated workdir and is hidden.
+        assert hidden_while_running == [(True, oct(0o300))]
+    assert hidden_while_running
+    assert isolated_dirs and all(not os.path.lexists(path) for path in isolated_dirs)
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)

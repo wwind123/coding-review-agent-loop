@@ -14,6 +14,13 @@ that reviewer has completed an independent turn.  A rerun replays a spooled
 outcome instead of re-invoking that reviewer, and the round's spool is
 discarded once every publication succeeded.  The spool is local,
 operator-private state; it is never posted and never shown in a prompt.
+
+The spool root lives under a non-listable ``private/`` directory beside the
+agent memory directory, never directly beside it, so a reviewer that
+explores the prompt-advertised memory directory's parent cannot enumerate
+round records (#1560).  A round directory left at the legacy location by an
+older version is migrated by an atomic rename before first use; when both
+locations hold the round, the spool fails closed.
 """
 
 from __future__ import annotations
@@ -26,6 +33,9 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from .errors import AgentLoopError
+from .scratch import make_private_dirs, mkdir_private
 
 SPOOL_SCHEMA_VERSION = 1
 
@@ -67,6 +77,9 @@ class ReviewRoundSpool:
     number: int
     round_number: int
     subject: str
+    # The pre-#1560 root.  A round directory found there is migrated into
+    # ``root`` before any use.
+    legacy_root: Path | None = None
 
     def _identity(self) -> dict[str, object]:
         return {
@@ -78,11 +91,42 @@ class ReviewRoundSpool:
         }
 
     @property
-    def directory(self) -> Path:
-        digest = hashlib.sha256(
+    def digest(self) -> str:
+        return hashlib.sha256(
             json.dumps(self._identity(), sort_keys=True).encode("utf-8")
         ).hexdigest()[:32]
-        return self.root / digest
+
+    @property
+    def directory(self) -> Path:
+        directory = self.root / self.digest
+        self._migrate_legacy(directory)
+        return directory
+
+    def _migrate_legacy(self, directory: Path) -> None:
+        """Move this round's legacy directory into ``root``; fail closed on conflict.
+
+        A legacy record may be a frozen publication carrier, so it is never
+        ignored: both locations present, or a failed rename, raises instead
+        of falling back to a fresh reviewer turn (#1258 semantics).
+        """
+        if self.legacy_root is None:
+            return
+        legacy = self.legacy_root / self.digest
+        if not os.path.lexists(legacy):
+            return
+        if os.path.lexists(directory):
+            raise AgentLoopError(
+                f"Review-round spool for this round exists at both {legacy} (legacy) and "
+                f"{directory}. Inspect both, keep the one holding the round's records, and "
+                "remove the other before rerunning."
+            )
+        try:
+            make_private_dirs(self.root)
+            os.rename(legacy, directory)
+        except OSError as exc:
+            raise AgentLoopError(
+                f"Could not migrate the legacy review-round spool {legacy} to {directory}: {exc}"
+            ) from exc
 
     def _path(self, reviewer_name: str) -> Path:
         slug = _UNSAFE_NAME_RE.sub("-", reviewer_name).strip("-") or "reviewer"
@@ -187,13 +231,14 @@ class ReviewRoundSpool:
 
     def _replace(self, reviewer_name: str, payload: dict[str, object]) -> None:
         directory = self.directory
-        directory.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(directory, 0o700)
-        except OSError:
-            pass
+        make_private_dirs(self.root)
+        mkdir_private(directory)
         handle, temp_name = tempfile.mkstemp(dir=directory, prefix=".spool-", suffix=".tmp")
         try:
+            if hasattr(os, "fchmod"):
+                # Exactly 0600 whatever the umask: a mode-000 record would
+                # read back as malformed.
+                os.fchmod(handle, 0o600)
             with os.fdopen(handle, "w", encoding="utf-8") as stream:
                 json.dump(payload, stream, sort_keys=True)
             os.replace(temp_name, self._path(reviewer_name))
@@ -252,6 +297,19 @@ class ReviewRoundSpool:
         shutil.rmtree(self.directory, ignore_errors=True)
 
 
+SPOOL_DIR_NAME = "review-round-spool"
+PRIVATE_DIR_NAME = "private"
+
+
 def review_spool_root(agent_memory_dir: Path) -> Path:
-    """Repo-scoped spool root beside, not inside, the agent memory directory."""
-    return agent_memory_dir.parent / "review-round-spool"
+    """Repo-scoped spool root under a non-listable ``private/`` directory.
+
+    It sits beside, not inside, the agent memory directory, and is no longer a
+    direct sibling of it (#1560).
+    """
+    return agent_memory_dir.parent / PRIVATE_DIR_NAME / SPOOL_DIR_NAME
+
+
+def legacy_review_spool_root(agent_memory_dir: Path) -> Path:
+    """The pre-#1560 spool root, a direct sibling of the memory directory."""
+    return agent_memory_dir.parent / SPOOL_DIR_NAME
