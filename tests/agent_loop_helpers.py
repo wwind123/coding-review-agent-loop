@@ -2092,7 +2092,7 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
         "agent_retry_backoff_seconds": (1, 1),
         "agent_memory": True,
         "refresh_agent_memory": False,
-        "agent_memory_dir": tmp_path / "claude" / ".agent-loop" / "memory",
+        "agent_memory_dir": tmp_path / "agent-cache" / "memory",
         "refresh_test_profile": False,
         # These fixtures exercise historical unversioned plans.  Production
         # CLI/skill configurations retain the generation-1 default.

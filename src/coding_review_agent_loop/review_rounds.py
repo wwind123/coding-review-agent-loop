@@ -7,6 +7,7 @@ orchestrator re-exports every name defined here.
 from __future__ import annotations
 
 import contextvars
+import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,7 +44,13 @@ from .round_state import (
 )
 from .partial_round_recovery import PartialRoundRecovery, RecoveryTarget
 from .publication_resume import PublicationResumeStop
-from .review_spool import ReviewRoundSpool, review_spool_root
+from .scratch import make_private_dirs
+from .review_spool import (
+    PRIVATE_DIR_NAME,
+    ReviewRoundSpool,
+    legacy_review_spool_root,
+    review_spool_root,
+)
 from .agent_failure import ValidatedAgentResponse
 from .architecture_contract import (
     _with_validation_context,
@@ -630,16 +637,102 @@ class _ReviewerTurnResult:
     error: AgentLoopError | None = None
 
 
+def _spool_overlap_set(config: AgentLoopConfig) -> list[tuple[str, str]]:
+    """Every reviewer-reachable tree the review spool must stay outside of."""
+    from .agent_permissions import configured_checkouts, repository_checkout, response_root
+
+    entries: list[tuple[str, str]] = [("response root", str(response_root(config)))]
+    entries += [("agent checkout", path) for path in configured_checkouts(config)]
+    for seat in getattr(config, "reviewer_seats", ()) or ():
+        workdir = getattr(seat, "workdir", None)
+        if workdir is not None:
+            entries.append((f"reviewer seat {seat} workdir", os.path.abspath(str(workdir))))
+    repository = repository_checkout()
+    if repository is not None:
+        entries.append(("repository checkout", repository))
+    return entries
+
+
+def _resolved(path: str | Path) -> str:
+    return os.path.realpath(os.path.abspath(str(path)))
+
+
+def _validate_spool_placement(config: AgentLoopConfig, roots: Sequence[Path]) -> None:
+    """Refuse a spool root that overlaps, either way, a reviewer-reachable tree."""
+    from .agent_permissions import _overlaps
+
+    for root in roots:
+        for spool_path in {os.path.abspath(str(root)), _resolved(root)}:
+            for label, path in _spool_overlap_set(config):
+                for candidate in {os.path.abspath(path), _resolved(path)}:
+                    if _overlaps(spool_path, candidate):
+                        raise AgentLoopError(
+                            f"The review-round spool {root} overlaps the {label} {path}, where a "
+                            "reviewer could read it. Use an --agent-memory-dir outside every "
+                            "agent checkout, reviewer seat workdir and the response directory."
+                        )
+
+
+def _harden_legacy_spool_root(legacy_root: Path) -> None:
+    """Hide retained legacy rounds from listing; never create the legacy root.
+
+    Older versions created this root with ``mkdir(parents=True)``, so under a
+    common ``umask 002`` it is group-writable; an owned, real directory is
+    re-moded to 0o300 rather than refused.  A symlink, non-directory or
+    foreign-owned root still raises before any reviewer launches.
+    """
+    from .agent_permissions import ensure_unlistable_dir
+
+    if not os.path.lexists(legacy_root):
+        return
+    ensure_unlistable_dir(legacy_root, create=False, remode_group_writable=True)
+
+
+def prepare_review_round_spool_roots(config: AgentLoopConfig) -> tuple[Path, Path]:
+    """Validate and harden the spool roots and the response tree at a round start.
+
+    Runs before any reviewer of the round launches: the response tree is
+    re-hardened (#1560), the new and legacy spool roots are checked against
+    every reviewer-reachable tree before any spool state is created or
+    migrated, the private spool ancestors are made non-listable, and an
+    existing legacy root is hidden while staying migratable.
+    """
+    from .agent_permissions import ensure_unlistable_dir, harden_response_tree, is_sandboxed
+
+    root = review_spool_root(config.agent_memory_dir)
+    legacy_root = legacy_review_spool_root(config.agent_memory_dir)
+    _validate_spool_placement(config, (root, legacy_root))
+    if is_sandboxed(config):
+        from .agent_permissions import SandboxBoundaryError, sandboxed_response_root
+
+        harden_response_tree(
+            config, root=sandboxed_response_root(config), error=SandboxBoundaryError
+        )
+    else:
+        harden_response_tree(config)
+    _harden_legacy_spool_root(legacy_root)
+    private = config.agent_memory_dir.parent / PRIVATE_DIR_NAME
+    try:
+        make_private_dirs(private.parent)
+    except OSError as exc:
+        raise AgentLoopError(f"Could not create the review-round spool parent {private.parent}: {exc}") from exc
+    ensure_unlistable_dir(private)
+    ensure_unlistable_dir(root)
+    return root, legacy_root
+
+
 def _review_round_spool(
     config: AgentLoopConfig, *, surface: str, number: int, round_number: int, subject: str
 ) -> ReviewRoundSpool:
+    root, legacy_root = prepare_review_round_spool_roots(config)
     return ReviewRoundSpool(
-        root=review_spool_root(config.agent_memory_dir),
+        root=root,
         repo=config.repo,
         surface=surface,
         number=number,
         round_number=round_number,
         subject=subject,
+        legacy_root=legacy_root,
     )
 
 

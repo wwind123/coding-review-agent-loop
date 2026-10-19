@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace as dataclasses_replace
 
-from .agents.base import AgentName, AgentResult
+from .agents.base import AgentName, AgentResult, response_turn_scope
 from .agents.antigravity import AntigravityAttemptState
 from .agents.registry import agent_display_name, agent_signature, run_agent_result
 from .config import AgentLoopConfig
@@ -1036,7 +1036,25 @@ def _history_strip_allowed(
     )
 
 
-def _run_validated_agent(
+def _run_validated_agent(*args, **kwargs):
+    """Run one validated agent turn, then remove its per-turn response directories.
+
+    Every backend invocation inside the turn (the first attempt, format
+    repairs, retries and completion recovery) allocates its own private
+    directory; they are all removed once the turn has finished with them,
+    whatever its outcome (#1560).  A cleanup failure is only logged.
+    """
+    config = kwargs.get("config")
+
+    def report(message: str) -> None:
+        if config is not None:
+            log(config, message)
+
+    with response_turn_scope(on_error=report):
+        return _run_validated_agent_in_scope(*args, **kwargs)
+
+
+def _run_validated_agent_in_scope(
     runner: Runner,
     *,
     agent: AgentName,

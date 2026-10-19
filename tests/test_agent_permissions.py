@@ -379,7 +379,10 @@ def test_response_root_is_created_private_and_granted(tmp_path, sandbox):
         "coding-review-agent-loop/responses/OWNER-REPO"
     )
     path = ap.prepare_response_file(config, "claude")
-    assert path.parent == state.resolved_root / "claude"
+    assert path.name == "response.md"
+    assert path.parent.name.startswith("turn-")
+    assert path.parent.parent == state.resolved_root / "claude"
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
     assert path.read_text() == ""
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
@@ -422,6 +425,7 @@ def test_component_swapped_for_symlink_blocks_next_spawn(tmp_path, sandbox):
     config = sandboxed_config(tmp_path)
     state = ap.establish_response_root_boundary(config)
     provider_dir = state.resolved_root / "codex"
+    provider_dir.chmod(0o700)
     shutil.rmtree(provider_dir)
     provider_dir.symlink_to(config.claude_dir)
     with pytest.raises(ap.SandboxBoundaryError):
@@ -477,13 +481,14 @@ def test_lazily_created_checkout_and_register_checkout(tmp_path, sandbox):
 def test_preexisting_symlink_at_file_path_fails_closed(tmp_path, sandbox, monkeypatch):
     config = sandboxed_config(tmp_path)
     state = ap.establish_response_root_boundary(config)
-    victim = config.claude_dir / "victim.md"
+    victim = config.claude_dir / "victim"
+    victim.mkdir()
     fixed = "0" * 32
-    (state.resolved_root / "claude" / f"{fixed}.md").symlink_to(victim)
+    (state.resolved_root / "claude" / f"turn-{fixed}").symlink_to(victim)
     monkeypatch.setattr(ap.uuid, "uuid4", lambda: type("U", (), {"hex": fixed})())
-    with pytest.raises(ap.SandboxBoundaryError, match="exclusively create"):
+    with pytest.raises(ap.SandboxBoundaryError, match="per-turn response directory"):
         ap.prepare_response_file(config, "claude")
-    assert not victim.exists()
+    assert list(victim.iterdir()) == []
 
 
 def test_system_symlink_base_is_accepted(tmp_path, monkeypatch):
@@ -599,7 +604,8 @@ def test_scratch_creation_restores_owner_access_under_restrictive_umask(tmp_path
     for path in (tmp_path / "scratch", tmp_path / "scratch" / "a", created):
         assert stat.S_IMODE(path.stat().st_mode) == 0o700
     for component in state.components:
-        assert stat.S_IMODE(Path(component.path).stat().st_mode) == 0o700
+        expected = 0o300 if component.unlistable else 0o700
+        assert stat.S_IMODE(Path(component.path).stat().st_mode) == expected
     ap.prepare_response_file(config, "claude")
 
 
@@ -1002,7 +1008,7 @@ def test_claude_reviewer_backend_argv_and_spawn_order(tmp_path, sandbox, monkeyp
     assert events == [("prepare", "claude"), ("spawn", "claude")]
     argv = runner.argv_commands[-1][0]
     assert "--restricted" in argv
-    assert result.response_file_path.parent == ap.sandboxed_response_root(config) / "claude"
+    assert result.response_file_path.parent.parent == ap.sandboxed_response_root(config) / "claude"
 
 
 def test_codex_reviewer_backend_writes_response_via_last_message(tmp_path, sandbox, monkeypatch):
@@ -1018,7 +1024,7 @@ def test_codex_reviewer_backend_writes_response_via_last_message(tmp_path, sandb
     argv = runner.argv_commands[-1][0]
     assert events == ["codex"]
     target = argv[argv.index("--output-last-message") + 1]
-    assert Path(target).parent == ap.sandboxed_response_root(config) / "codex"
+    assert Path(target).parent.parent == ap.sandboxed_response_root(config) / "codex"
     assert argv[argv.index("--sandbox") + 1] == "read-only"
     assert 'approval_policy="never"' in argv
     for forbidden in ("workspace-write", "--add-dir", "--dangerously-bypass-approvals-and-sandbox"):
@@ -1038,7 +1044,7 @@ def test_codex_dry_run_sandboxed_argv(tmp_path, sandbox):
     CODEX_BACKEND.run(runner, config, "Plan.", run_id="r", role=None)
     argv = runner.argv_commands[-1][0]
     assert argv[argv.index("--sandbox") + 1] == "read-only"
-    assert Path(argv[argv.index("--output-last-message") + 1]).parent.name == "codex"
+    assert Path(argv[argv.index("--output-last-message") + 1]).parent.parent.name == "codex"
 
 
 def test_empty_precreated_file_is_no_response(tmp_path, sandbox):
@@ -1451,3 +1457,349 @@ def test_test_command_keeps_precedence_over_test_python_in_the_sandbox(tmp_path,
     worker_guidance = prompts.parallel_test_worker_guidance(config)
     assert str(python) not in worker_guidance
     assert "does not use it" in worker_guidance
+
+
+# ------------------------------------- non-listable response tree (#1560)
+
+_NON_ROOT = pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root bypasses directory read permission"
+)
+
+
+def _mode(path):
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+def _legacy_response_tree(config):
+    """A pre-#1560 layout: 0700 ancestors holding listable peer and seat directories."""
+    root = ap.response_root(config)
+    root.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
+    root.parent.chmod(0o700)
+    legacy = {}
+    for name in ("codex", "old-seat"):
+        directory = root / name
+        directory.mkdir(mode=0o700)
+        directory.chmod(0o700)
+        legacy[name] = directory / "0123456789abcdef.md"
+        legacy[name].write_text(f"{name} legacy response", encoding="utf-8")
+    return root, legacy
+
+
+@_NON_ROOT
+@pytest.mark.parametrize("mode", ["default", "sandboxed"])
+def test_peer_responses_are_not_reachable_by_listing(tmp_path, sandbox, mode):
+    if mode == "sandboxed":
+        config = sandboxed_config(tmp_path)
+        ap.establish_response_root_boundary(config)
+        peer = ap.prepare_response_file(config, "codex")
+        current = ap.prepare_response_file(config, "claude")
+    else:
+        from coding_review_agent_loop.agents.base import public_response_path
+
+        config = make_config(tmp_path)
+        peer = public_response_path(config, "codex")
+        peer.write_text("peer review", encoding="utf-8")
+        current = public_response_path(config, "claude")
+    legacy = ap.response_root(config) / "claude" / "legacy.md" if mode == "default" else None
+    if legacy is not None:
+        legacy.write_text("legacy", encoding="utf-8")
+    for ancestor in (current.parent.parent, current.parent.parent.parent, current.parent.parent.parent.parent):
+        with pytest.raises(PermissionError):
+            os.listdir(ancestor)
+    # The turn directory itself holds only this turn's file.
+    assert os.listdir(current.parent) in ([], ["response.md"])
+    assert peer.parent != current.parent
+    assert peer.read_text(encoding="utf-8") in ("", "peer review")
+
+
+@_NON_ROOT
+@pytest.mark.parametrize("mode", ["default", "sandboxed"])
+def test_legacy_peer_and_seat_directories_are_hardened_before_any_launch(tmp_path, sandbox, mode):
+    from coding_review_agent_loop.agents.base import public_response_path
+
+    if mode == "sandboxed":
+        config = sandboxed_config(tmp_path)
+        root = Path(os.path.realpath(sandbox["tmp"])) / "coding-review-agent-loop/responses/OWNER-REPO"
+        root.mkdir(parents=True)
+        for directory in (root.parent.parent, root.parent, root):
+            directory.chmod(0o700)
+        legacy = {}
+        for name in ("codex", "old-seat"):
+            (root / name).mkdir(mode=0o700)
+            legacy[name] = root / name / "0123456789abcdef.md"
+            legacy[name].write_text(f"{name} legacy response", encoding="utf-8")
+    else:
+        config = make_config(tmp_path, reviewer=("antigravity",))
+        root, legacy = _legacy_response_tree(config)
+    dangling = root / "dangling-link"
+    dangling.symlink_to(tmp_path / "nowhere")
+
+    if mode == "sandboxed":
+        ap.establish_response_root_boundary(config)
+    else:
+        ap.establish_sandboxed_run(config, command="pr")
+        path = public_response_path(config, "antigravity")
+        assert path.parent.parent == root / "antigravity"
+
+    assert _mode(root) == 0o300 and _mode(root.parent) == 0o300
+    for name, file in legacy.items():
+        assert _mode(root / name) == 0o300
+        with pytest.raises(PermissionError):
+            os.listdir(root / name)
+        # Legacy files stay readable by their known path and are not rewritten.
+        assert file.read_text(encoding="utf-8") == f"{name} legacy response"
+    assert dangling.is_symlink() and os.readlink(dangling) == str(tmp_path / "nowhere")
+
+
+def _failing_chmod_for(monkeypatch, target):
+    real_chmod = os.chmod
+
+    def chmod(path, mode, *args, **kwargs):
+        if os.path.abspath(str(path)) == os.path.abspath(str(target)):
+            raise PermissionError(f"Operation not permitted: {path}")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", chmod)
+
+
+@pytest.mark.parametrize("mode", ["default", "sandboxed"])
+@pytest.mark.parametrize("entry", ["invocation-start", "round-start"])
+def test_peer_directory_left_listable_refuses_every_launch(tmp_path, sandbox, monkeypatch, mode, entry):
+    from coding_review_agent_loop import review_rounds
+
+    if mode == "sandboxed":
+        config = sandboxed_config(tmp_path)
+        root = Path(os.path.realpath(sandbox["tmp"])) / "coding-review-agent-loop/responses/OWNER-REPO"
+        root.mkdir(parents=True)
+        (root / "codex").mkdir()
+        (root / "codex").chmod(0o700)
+        expected = ap.SandboxBoundaryError
+    else:
+        config = make_config(tmp_path, reviewer=("antigravity",))
+        root, _legacy = _legacy_response_tree(config)
+        expected = AgentLoopError
+    if entry == "round-start" and mode == "sandboxed":
+        ap.establish_response_root_boundary(config)
+        (root / "codex").chmod(0o700)
+    elif entry == "round-start":
+        ap.establish_sandboxed_run(config, command="pr")
+        (root / "codex").chmod(0o700)
+    _failing_chmod_for(monkeypatch, root / "codex")
+    runner = FakeRunner(antigravity_outputs=[("unused", 0)])
+    with pytest.raises(expected) as info:
+        if entry == "round-start":
+            review_rounds._review_round_spool(
+                config, surface="pr", number=7, round_number=1, subject="abc"
+            )
+        elif mode == "sandboxed":
+            ap.establish_response_root_boundary(config)
+        else:
+            ap.establish_sandboxed_run(config, command="pr")
+    if mode == "default":
+        assert not isinstance(info.value, ap.SandboxBoundaryError)
+    message = str(info.value)
+    assert str(root / "codex") in message
+    assert "chmod 0300" in message
+    assert runner.commands == []
+
+
+@pytest.mark.parametrize("mode", ["default", "sandboxed"])
+def test_symlinked_listable_child_refuses_launch_without_modifying_it(tmp_path, sandbox, mode):
+    target = tmp_path / "listable-target"
+    target.mkdir()
+    target.chmod(0o755)
+    if mode == "sandboxed":
+        config = sandboxed_config(tmp_path)
+        root = Path(os.path.realpath(sandbox["tmp"])) / "coding-review-agent-loop/responses/OWNER-REPO"
+        root.mkdir(parents=True)
+        expected = ap.SandboxBoundaryError
+    else:
+        config = make_config(tmp_path, reviewer=("antigravity",))
+        root, _legacy = _legacy_response_tree(config)
+        expected = AgentLoopError
+    (root / "linked").symlink_to(target)
+    with pytest.raises(expected, match="linked"):
+        if mode == "sandboxed":
+            ap.establish_response_root_boundary(config)
+        else:
+            ap.establish_sandboxed_run(config, command="pr")
+    assert (root / "linked").is_symlink()
+    assert _mode(target) == 0o755
+
+
+def _with_uid(info, uid):
+    values = list(info)
+    values[4] = uid
+    return os.stat_result(values)
+
+
+def _patch_owner(monkeypatch, *, uid, paths=None):
+    """Report ``uid`` as the owner of ``paths`` (every path when None)."""
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def matches(path):
+        return paths is None or os.path.abspath(str(path)) in paths
+
+    monkeypatch.setattr(os, "lstat", lambda path, *a, **k: _with_uid(real_lstat(path, *a, **k), uid) if matches(path) else real_lstat(path, *a, **k))
+    monkeypatch.setattr(os, "stat", lambda path, *a, **k: _with_uid(real_stat(path, *a, **k), uid) if matches(path) else real_stat(path, *a, **k))
+
+
+@pytest.mark.parametrize("mode", ["default", "sandboxed"])
+def test_root_run_hardening_verdict_uses_mode_bits_not_access(tmp_path, sandbox, monkeypatch, mode):
+    from coding_review_agent_loop import logging as logging_module
+
+    if mode == "sandboxed":
+        config = sandboxed_config(tmp_path)
+        ap.establish_response_root_boundary(config)
+        root = ap.sandboxed_response_root(config)
+    else:
+        config = make_config(tmp_path, reviewer=("antigravity",))
+        root, _legacy = _legacy_response_tree(config)
+        ap.establish_sandboxed_run(config, command="pr")
+    # The successful-upgrade layout is in place; now run as euid 0.
+    monkeypatch.setattr(ap, "_ROOT_WARNED", set())
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    if hasattr(os, "getuid"):
+        monkeypatch.setattr(os, "getuid", lambda: 0)
+    _patch_owner(monkeypatch, uid=0)
+    access_calls = []
+    monkeypatch.setattr(os, "access", lambda *args, **kwargs: access_calls.append(args) or True)
+    warnings = []
+    monkeypatch.setattr(logging_module, "log", lambda _config, message: warnings.append(message))
+    error = ap.SandboxBoundaryError if mode == "sandboxed" else AgentLoopError
+
+    ap.harden_response_tree(config, root=root, error=error)
+    ap.harden_response_tree(config, root=root, error=error)
+    if mode == "sandboxed":
+        # Launch proceeds to the pre-spawn checks and the response file.
+        assert ap.prepare_response_file(config, "codex").exists()
+    else:
+        from coding_review_agent_loop.agents.base import public_response_path
+
+        assert public_response_path(config, "antigravity").parent.is_dir()
+    assert access_calls == []
+    assert len([message for message in warnings if "runs as root" in message]) == 1
+
+    # Any read bit still refuses, even for root.
+    (root / "codex").chmod(0o700) if (root / "codex").exists() else (root / "codex").mkdir(mode=0o700)
+    _failing_chmod_for(monkeypatch, root / "codex")
+    with pytest.raises(error, match="remain listable"):
+        ap.harden_response_tree(config, root=root, error=error)
+
+
+@pytest.mark.parametrize("mode", ["default", "sandboxed"])
+def test_foreign_owned_child_directory_refuses_launch(tmp_path, sandbox, monkeypatch, mode):
+    if mode == "sandboxed":
+        config = sandboxed_config(tmp_path)
+        root = Path(os.path.realpath(sandbox["tmp"])) / "coding-review-agent-loop/responses/OWNER-REPO"
+        root.mkdir(parents=True)
+        expected = ap.SandboxBoundaryError
+    else:
+        config = make_config(tmp_path, reviewer=("antigravity",))
+        root, _legacy = _legacy_response_tree(config)
+        expected = AgentLoopError
+    foreign = root / "someone-else"
+    foreign.mkdir(mode=0o700)
+    foreign.chmod(0o300)
+    _patch_owner(monkeypatch, uid=os.geteuid() + 4242, paths={os.path.abspath(str(foreign))})
+    with pytest.raises(expected, match="someone-else"):
+        if mode == "sandboxed":
+            ap.establish_response_root_boundary(config)
+        else:
+            ap.establish_sandboxed_run(config, command="pr")
+
+
+@pytest.mark.parametrize("mask", [0o022, 0o700, 0o777], ids=["umask-022", "umask-700", "umask-777"])
+def test_sandboxed_turn_directory_and_scoped_grants(tmp_path, sandbox, mask):
+    from coding_review_agent_loop.agents.base import read_public_response_file
+
+    config = sandboxed_config(tmp_path)
+    sandbox["establish"](config)
+    root = ap.sandboxed_response_root(config)
+    previous = os.umask(mask)
+    try:
+        paths = {
+            provider: ap.prepare_sandboxed_spawn(config, provider, "reviewer")
+            for provider in ("claude", "codex")
+        }
+        coder_path = ap.prepare_sandboxed_spawn(config, "claude", "coder")
+    finally:
+        os.umask(previous)
+    for provider, path in (*paths.items(), ("claude", coder_path)):
+        turn = path.parent
+        assert turn.parent == root / provider
+        assert turn.name.startswith("turn-") and not turn.is_symlink()
+        assert _mode(turn) == 0o700
+        assert _mode(path) == 0o600 and not path.is_symlink()
+        # The CLI reopens the pre-created file; the orchestrator reads it back.
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(f"{provider} response")
+        assert read_public_response_file(path) == f"{provider} response"
+    assert paths["claude"].parent != coder_path.parent
+
+    root_rules = {f"Write(/{root}/**)", f"Edit(/{root}/**)"}
+    for role, path in (("reviewer", paths["claude"]), ("coder", coder_path)):
+        turn = path.parent
+        scoped = list(ap.role_permission_args(config, "claude", role, response_dir=turn))
+        unscoped = list(ap.role_permission_args(config, "claude", role))
+        add_dirs = [scoped[index + 1] for index, item in enumerate(scoped) if item == "--add-dir"]
+        assert add_dirs == [str(turn)]
+        assert str(root) not in scoped
+        assert not root_rules & set(scoped)
+        response_rules = [rule for rule in _allowed_tools(scoped) if str(root) in rule]
+        # The coder's response access comes from --add-dir alone.
+        expected_rules = [f"Write(/{turn}/**)", f"Edit(/{turn}/**)"] if role == "reviewer" else []
+        assert response_rules == expected_rules
+        # Without response_dir both classes still name the root.
+        assert unscoped[unscoped.index("--add-dir") + 1] == str(root)
+        if role == "reviewer":
+            assert root_rules <= set(_allowed_tools(unscoped))
+        # Checkout rules (coder) and every other rule are unchanged.
+        assert [rule for rule in _allowed_tools(scoped) if str(root) not in rule] == [
+            rule for rule in _allowed_tools(unscoped) if str(root) not in rule
+        ]
+
+
+def test_sandboxed_ancestor_regaining_read_bits_is_remoded_or_refused(tmp_path, sandbox):
+    config = sandboxed_config(tmp_path)
+    sandbox["establish"](config)
+    root = ap.sandboxed_response_root(config)
+    root.chmod(0o700)
+    ap.verify_response_boundary(config)
+    assert _mode(root) == 0o300
+
+    (root / "claude").chmod(0o750)
+    with pytest.raises(ap.SandboxBoundaryError, match="regained group or other"):
+        ap.verify_response_boundary(config)
+    runner = FakeRunner(claude_outputs=[json.dumps({"result": "unused"})])
+    result = CLAUDE_BACKEND.run(runner, config, "Review.", run_id="r", role="reviewer")
+    unavailable = parse_agent_unavailable(result.text)
+    assert unavailable is not None
+    assert runner.argv_commands == []
+
+    (root / "claude").chmod(0o770)
+    with pytest.raises(ap.SandboxBoundaryError, match="group- or world-writable"):
+        ap.verify_response_boundary(config)
+
+
+def test_default_mode_remodes_a_group_writable_tree_left_by_an_older_release(tmp_path):
+    from coding_review_agent_loop.agents.base import public_response_path
+
+    config = make_config(tmp_path, reviewer=("antigravity",))
+    root, _legacy = _legacy_response_tree(config)
+    for directory in (root.parent, root, root / "codex"):
+        directory.chmod(0o775)
+    ap.establish_sandboxed_run(config, command="pr")
+    public_response_path(config, "antigravity")
+    for directory in (root.parent, root, root / "codex", root / "antigravity"):
+        assert _mode(directory) == 0o300
+
+
+def test_sandboxed_mode_still_refuses_a_group_writable_response_component(tmp_path, sandbox):
+    config = sandboxed_config(tmp_path)
+    root = Path(os.path.realpath(sandbox["tmp"])) / "coding-review-agent-loop/responses/OWNER-REPO"
+    root.mkdir(parents=True)
+    root.chmod(0o775)
+    with pytest.raises(ap.SandboxBoundaryError, match="group- or world-writable"):
+        ap.establish_response_root_boundary(config)

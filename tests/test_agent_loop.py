@@ -386,11 +386,13 @@ def test_quota_reset_exceeded_error_exit_code():
 
 def test_agent_memory_default_parent_ignores_generated_contents(tmp_path):
     runner = FakeRunner(codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
-    config = make_config(tmp_path)
+    # The memory directory stays outside every checkout: the review-round
+    # spool beside it must not be reviewer-reachable (#1560).
+    config = make_config(tmp_path, agent_memory_dir=tmp_path / "outside" / ".agent-loop" / "memory")
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    gitignore = tmp_path / "claude" / ".agent-loop" / ".gitignore"
+    gitignore = tmp_path / "outside" / ".agent-loop" / ".gitignore"
     assert gitignore.read_text(encoding="utf-8") == "*\n!.gitignore\n"
 
 

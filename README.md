@@ -373,8 +373,9 @@ Requirements and limitations of sandboxed mode:
   if the real `gh` sits in the same directory as the pinned `git`, because the
   shim finds the real `gh` on the inspector's constructed `PATH`.
 - **`TMPDIR` must resolve outside every checkout**, including the repository
-  checkout you run agent-loop from. Responses go to a private directory under
-  `${TMPDIR:-/tmp}/coding-review-agent-loop/responses/`, whose
+  checkout you run agent-loop from. Responses go to a private per-turn directory under
+  `${TMPDIR:-/tmp}/coding-review-agent-loop/responses/` (the shared ancestors
+  are mode `0300`, so agents cannot list peer responses), whose
   agent-loop-created components must be real directories owned by you that
   are not group- or world-writable (no symlinks). agent-loop creates its
   scratch directories with mode `700` whatever your umask; a component left

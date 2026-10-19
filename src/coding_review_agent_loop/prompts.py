@@ -933,6 +933,16 @@ QUOTED_COMMAND_REVIEW_RULE = (
     "structured response instead of deferring to a background task."
 )
 
+# Issue #1560: reviewers unsure of the schema went looking for worked examples
+# and found peer reviewers' responses on the host.
+REVIEW_INDEPENDENCE_RULE = (
+    "The response schema example in this prompt is complete and authoritative. "
+    "Do not search the filesystem, response directories, the review spool, logs, "
+    "or other checkouts for worked examples or for other reviewers' responses; "
+    "judge independently from this prompt, the assigned checkout, and the "
+    "permitted GitHub reads."
+)
+
 
 def _review_command_policy(
     config: AgentLoopConfig, pr_metadata: PullRequestMetadata | None = None
@@ -969,7 +979,7 @@ def _review_command_policy(
             "and direct file reads. "
             + (f"{diff_guidance} " if diff_guidance else "")
             + "Do not fetch, checkout, reset, clean, write files other than the "
-            f"public response, or change repository state during review. {QUOTED_COMMAND_REVIEW_RULE}\n"
+            f"public response, or change repository state during review. {QUOTED_COMMAND_REVIEW_RULE} {REVIEW_INDEPENDENCE_RULE}\n"
         )
     return (
         "Do not run tests, builds, compilation, source or worktree mutation, "
@@ -981,7 +991,7 @@ def _review_command_policy(
         + "Prefer the verified local checkout and direct file reads "
         "over web search, remote PR diff retrieval, or branch discovery. Do not "
         "fetch, checkout, reset, clean, write files, or change repository state "
-        f"during review. {QUOTED_COMMAND_REVIEW_RULE}\n"
+        f"during review. {QUOTED_COMMAND_REVIEW_RULE} {REVIEW_INDEPENDENCE_RULE}\n"
     )
 
 
@@ -2630,7 +2640,7 @@ Use this mandatory structured JSON response format:
     {"item_id": "item-1", "disposition": "resolved", "note": "Covered by the revised tests."}
   ],
   "human_requirement_dispositions": [],
-  "architecture_impact": {{"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}}
+  "architecture_impact": {"status":"unchanged","rationale":"No architectural contract changed.","affected_components":[],"dependencies":[],"execution_data_flows":[],"persistence":[],"public_contracts":[],"security_boundaries":[],"canonical_document_action":"no-change","canonical_document_path":null,"canonical_document_rationale":""}
 }
 <!-- AGENT_PLAN_STATE: approved -->
 -- reviewer signature shown in the volatile tail
@@ -4694,7 +4704,7 @@ exactly one top-level JSON object and no prose or code fences before it:
 {{
   "schema_version": 1,
   "kind": "pr_review",
-  "state": "approved" | "blocking",
+  "state": "blocking",
   "summary": "short reviewer summary",
   "blocking_items": ["render-only blocking bullet", "..."],
   "same_pr_followups": ["same-PR fix still required", "..."],
@@ -4707,6 +4717,7 @@ exactly one top-level JSON object and no prose or code fences before it:
   ]
 }}
 
+`state` is either `approved` or `blocking`.
 `blocking_items`, `same_pr_followups`, and `future_followups` have distinct
 roles. `blocking_items` are merge-blocking defects, missing requirements,
 regressions, security issues, or consistency gaps. `same_pr_followups` are
@@ -5446,7 +5457,7 @@ exactly one top-level JSON object and no prose or code fences before it:
 {{
   "schema_version": 1,
   "kind": "pr_review",
-  "state": "approved" | "blocking",
+  "state": "blocking",
   "summary": "short reviewer summary",
   "blocking_items": ["render-only blocking bullet", "..."],
   "same_pr_followups": ["same-PR fix still required", "..."],
@@ -5459,6 +5470,7 @@ exactly one top-level JSON object and no prose or code fences before it:
   ]
 }}
 
+`state` is either `approved` or `blocking`.
 `blocking_items`, `same_pr_followups`, and `future_followups` have distinct
 roles. `blocking_items` are merge-blocking defects, missing requirements,
 regressions, security issues, or consistency gaps. `same_pr_followups` are

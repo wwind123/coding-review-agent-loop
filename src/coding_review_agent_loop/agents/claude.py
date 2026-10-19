@@ -218,7 +218,9 @@ class ClaudeBackend:
                 # read-only turns) the pinned inspect provenance immediately
                 # before spawning; a mismatch is never retried with this grant.
                 response_path = prepare_sandboxed_spawn(config, "claude", role)
-                permission_args = role_permission_args(config, "claude", role)
+                permission_args = role_permission_args(
+                    config, "claude", role, response_dir=response_path.parent
+                )
             except SandboxBoundaryError as exc:
                 log(config, f"Claude sandboxed spawn refused: {exc}")
                 text = boundary_unavailable_text(self.signature, exc)
