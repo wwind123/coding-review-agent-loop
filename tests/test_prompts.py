@@ -5853,6 +5853,164 @@ def test_prompts_state_the_current_digest_only_rerun_rule(tmp_path):
         assert "labelled historical and is not an outstanding obligation" in coder_prompt
 
 
+
+# --- #1568: managed receipts are direct runs; unproducible evidence never blocks ---
+
+_MANAGED_RECEIPT_1568 = "Never reject or discount a receipt only because its outer command is `agent-loop run-tests`"
+_UNPRODUCIBLE_1568 = "evidence the loop cannot produce by construction is never a blocking finding"
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_pr_review_prompt_treats_managed_receipts_as_direct_runs_1568(tmp_path, compact):
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    review = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact)
+    flat = " ".join(review.split())
+    assert review.count(prompts_module.MANAGED_RECEIPT_REVIEWER_GUIDANCE) == 1
+    assert _MANAGED_RECEIPT_1568 in flat
+    assert "not to the loop's own capture runner" in flat
+    # All receipt rules sit together.
+    assert (
+        f"{prompts_module.PRE_COLLECTION_REVIEWER_GUIDANCE}\n"
+        f"{prompts_module.MANAGED_RECEIPT_REVIEWER_GUIDANCE}"
+    ) in review
+    guidance = prompts_module._reviewer_unproducible_evidence_guidance("pr")
+    assert review.count(guidance) == 1
+    assert _UNPRODUCIBLE_1568 in flat
+    assert "Do not put such a request in `blocking_items` or `same_pr_followups`" in flat
+    assert "a missing or failing receipt, keep the existing rules" in flat
+    # Directly after the blocking-scope criteria.
+    assert prompts_module._reviewer_blocking_scope_guidance("pr") + guidance in review
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_plan_review_prompt_states_plan_flow_receipt_and_unproducible_rules_1568(tmp_path, compact):
+    config = make_config(tmp_path)
+    prompt = build_plan_review_prompt(1568, 1, "Plan.", config, reviewer="codex", compact_context=compact)
+    flat = " ".join(prompt.split())
+    guidance = prompts_module._reviewer_unproducible_evidence_guidance("plan")
+    assert prompts_module._reviewer_blocking_scope_guidance("plan") + guidance in prompt
+    assert prompt.count(guidance) == 1
+    assert _UNPRODUCIBLE_1568 in flat
+    assert "Do not put such a request in `blocking_plan_issues` or `same_plan_followups`" in flat
+    assert "requires plain or no-wrapper test runs is satisfied by managed `agent-loop run-tests` receipts" in flat
+    assert "do not require it to state otherwise" in flat
+    assert "blocking_items" not in guidance
+    assert "no-wrapper" not in prompts_module._reviewer_unproducible_evidence_guidance("pr")
+
+
+def test_planner_prompts_phrase_captured_evidence_through_run_tests_1568(tmp_path):
+    config = make_config(tmp_path)
+    rule = prompts_module.PLANNER_CAPTURED_EVIDENCE_RULE
+    assert "`agent-loop run-tests -- <command>`" in rule
+    prompts = {
+        "issue-plan": build_issue_plan_prompt(1568, config),
+        "revision": build_plan_revision_prompt(1568, 2, "Plan.", "Blocking review", config),
+        "revision-compact": build_plan_revision_prompt(
+            1568, 2, "Plan.", "Blocking review", config, compact_context=True,
+        ),
+        "matrix-less": build_plan_revision_prompt(
+            1568, 2, "Plan.", "Blocking review", config,
+            require_risk_test_matrix_contract=False,
+        ),
+        "matrix-less-compact": build_plan_revision_prompt(
+            1568, 2, "Plan.", "Blocking review", config,
+            compact_context=True, require_risk_test_matrix_contract=False,
+        ),
+    }
+    for name, prompt in prompts.items():
+        assert prompt.count(rule) == 1, name
+    assert "Historical matrix-less revision contract" in prompts["matrix-less"]
+    for include in (True, False):
+        assert rule in prompts_module._execution_strategy_contract_guidance(
+            include_risk_test_matrix_contract=include
+        )
+
+
+def test_coder_prompts_dispute_unproducible_evidence_with_the_receipt_1568(tmp_path):
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    for coder_prompt in (
+        build_issue_implementation_prompt(56, "1. Fix it.", config),
+        prompts_module.build_followup_prompt(77, 1, "Fix it.", config),
+    ):
+        assert "dispute that item by citing the managed receipt" in coder_prompt
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_pr_review_with_local_receipts_carries_receipt_guidance_1568(tmp_path, compact):
+    """Regression for #1568: receipts in coder context arrive with the reviewer rules."""
+    from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
+    from coding_review_agent_loop.pr_loop_support import _coder_followup_review_context
+
+    evidence = bounded_evidence_for_round({"observations": [{
+        "command": ["agent-loop", "run-tests", "--", "pytest", "tests/test_x.py"],
+        "outcome": "passed",
+        "provenance": "parent-observed",
+        "receipt_id": "receipt-1568",
+        "turn_id": "coder-turn",
+        "environment": "identity-unknown",
+        "attribution": {"state": "current-head", "head": "abc123"},
+    }]})
+    output = structured_coder_followup(
+        summary="Ran the plain commands through the capture runner.",
+        disputed_items=["item-2"],
+        dispute_evidence={"item-2": "A direct run has no receipt; the managed receipt is the capture."},
+    )
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=3,
+        subject="abc123", local_test_evidence=evidence,
+    )
+    context = _coder_followup_review_context(output, metadata, head_sha="abc123")
+    assert "receipt-1568" in context and "local_test_evidence" in context
+
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    kwargs = {}
+    if compact:
+        kwargs["compact_tail"] = CompactPrReviewTailContext(
+            head_sha="abc123", round_number=3, action="Review the PR.",
+        )
+    prompt = build_review_prompt(
+        77, 3, config, reviewer="codex", compact_context=compact,
+        coder_followup_context=context, **kwargs,
+    )
+    assert "receipt-1568" in prompt
+    assert "A direct run has no receipt" in prompt
+    if compact:
+        stable, tail = prompt.split(COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER, 1)
+    else:
+        stable, tail = prompt, ""
+    for text in (
+        prompts_module.MANAGED_RECEIPT_REVIEWER_GUIDANCE,
+        prompts_module._reviewer_unproducible_evidence_guidance("pr"),
+    ):
+        assert text in stable
+        assert text not in tail
+
+
+def test_compact_stable_prefixes_keep_unproducible_guidance_head_independent_1568(tmp_path):
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    pr_guidance = prompts_module._reviewer_unproducible_evidence_guidance("pr")
+    plan_guidance = prompts_module._reviewer_unproducible_evidence_guidance("plan")
+    pr_prefixes, plan_prefixes = [], []
+    for head in ("aaa111", "bbb222"):
+        prompt = build_review_prompt(
+            77, 2, config, reviewer="codex", compact_context=True,
+            compact_tail=CompactPrReviewTailContext(head_sha=head, round_number=2, action=f"Review {head}."),
+        )
+        prefix, tail = prompt.split(COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER, 1)
+        assert pr_guidance in prefix and pr_guidance not in tail
+        assert prompts_module.MANAGED_RECEIPT_REVIEWER_GUIDANCE in prefix
+        pr_prefixes.append(prefix)
+        plan_prompt = build_plan_review_prompt(
+            1568, 2, f"Plan {head}.", config, reviewer="codex", compact_context=True,
+            compact_tail=CompactPlanTailContext(subject=f"subject-{head}", action=f"Review {head}."),
+        )
+        prefix, tail = plan_prompt.split(COMPACT_PLANNING_VOLATILE_TAIL_MARKER, 1)
+        assert plan_guidance in prefix and plan_guidance not in tail
+        plan_prefixes.append(prefix)
+    assert pr_prefixes[0] == pr_prefixes[1]
+    assert plan_prefixes[0] == plan_prefixes[1]
+
+
 # --- #1324: evidence-only row tag guidance -------------------------------------
 
 def test_pr_review_prompts_carry_evidence_row_tag_guidance_only_with_an_applicable_matrix(tmp_path):

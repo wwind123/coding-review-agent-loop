@@ -1822,6 +1822,22 @@ history for coders and reviewers, including same-head and changed-head resume;
 it cannot replace GitHub CI, override configured gates, or turn every
 historical intermediate failure into a permanent blocker.
 
+#### Managed receipts and evidence the loop cannot produce
+
+Reviewer prompts treat a managed `agent-loop run-tests` receipt as the
+captured form of the exact command it ran (issue #1568). A repository or plan
+rule such as "run pytest directly" or "no wrapper" refers to the test command
+itself, not to the loop's capture runner, so a receipt is never rejected only
+because its outer command is `agent-loop run-tests`. Evidence the loop cannot
+produce by construction (a capture of a command run without the capture
+runner, a reviewer-side test run when reviewers may not execute commands) is
+never blocking: reviewers accept the closest producible form or record the
+gap as a non-blocking note for a human, and an accurate coder dispute on that
+basis is dispositioned `resolved` or `future`. A missing or failing receipt
+the loop can produce keeps the existing rules. Planner prompts phrase
+verification rows that need captured evidence as
+`agent-loop run-tests -- <command>`.
+
 #### Multi-process fixtures (`run-tests --fixture`)
 
 Some suites need long-lived helper processes, such as a web server, a worker,
