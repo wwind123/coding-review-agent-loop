@@ -363,7 +363,11 @@ def _remove_owned_locked(store: Path, path: Path, *, config: Any, runner: Any) -
         log(config, f"Leaving run worktree untouched: {exc}")
         return False
     admin_name = str(record_admin_name(store, path))
-    from .agent_permissions import release_checkout_response_roots, release_orphaned_admin_response_roots
+    from .agent_permissions import (
+        release_checkout_response_roots,
+        release_orphaned_admin_response_roots,
+        remove_checkout_tree,
+    )
 
     # A Gemini response root inside the admin dir is non-listable (#1560);
     # git's recursive delete must be able to list it.
@@ -375,7 +379,7 @@ def _remove_owned_locked(store: Path, path: Path, *, config: Any, runner: Any) -
         if identify_owned_worktree(store, runs_root, path) is None:
             log(config, f"Leaving run worktree untouched (identity changed during removal): {path}")
             return False
-        shutil.rmtree(path)
+        remove_checkout_tree(path)
     release_orphaned_admin_response_roots(store)
     _git(runner, store, "worktree", "prune", check=False)
     if _admin_registered(store, admin_name):
@@ -441,7 +445,7 @@ def _linked_worktrees(store: Path, runner: Any) -> list[dict[str, str]]:
 def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) -> None:
     from .config import _is_stale_default_workdir, _validate_repo_remote
 
-    from .agent_permissions import release_checkout_response_roots, release_orphaned_admin_response_roots
+    from .agent_permissions import release_orphaned_admin_response_roots, remove_checkout_tree
 
     has_git = store.is_dir() and (store / ".git").exists()
     if has_git:
@@ -457,10 +461,9 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
             log(config, f"Stale shared store detected; recreating: {store}")
             from .agent_permissions import release_unlistable_tree
 
-            release_checkout_response_roots(store)
             if (store / ".git" / "worktrees").is_dir():
                 release_unlistable_tree(store / ".git" / "worktrees")
-            shutil.rmtree(store)
+            remove_checkout_tree(store)
             forget_checkout(store)
     if not store.exists():
         if not free:

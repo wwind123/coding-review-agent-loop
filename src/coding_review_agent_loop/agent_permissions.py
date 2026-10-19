@@ -398,6 +398,21 @@ def release_checkout_response_roots(checkout: Path | str) -> None:
             release_unlistable_tree(root)
 
 
+def remove_checkout_tree(path: Path | str, *, ignore_errors: bool = False) -> None:
+    """Recursively delete a checkout-like directory that may hold a hidden response root.
+
+    Every recursive deletion of a directory an agent ran in goes through
+    here: a Gemini response root inside it is non-listable (0o300), which
+    ``shutil.rmtree`` cannot enumerate, so it is released first (#1560).
+    """
+    try:
+        release_checkout_response_roots(path)
+    except OSError:
+        if not ignore_errors:
+            raise
+    shutil.rmtree(path, ignore_errors=ignore_errors)
+
+
 def release_orphaned_admin_response_roots(store: Path | str) -> None:
     """Before ``git worktree prune``, release the response roots of admin dirs whose worktree is gone.
 

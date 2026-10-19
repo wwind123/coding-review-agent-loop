@@ -258,9 +258,9 @@ def _isolated_provider_config(config: "AgentLoopConfig", backend: AgentName, mod
             ) from exc
     except Exception:
         if isolated is not None:
-            import shutil
+            from .agent_permissions import remove_checkout_tree
 
-            shutil.rmtree(isolated, ignore_errors=True)
+            remove_checkout_tree(isolated, ignore_errors=True)
         raise
 
 
@@ -310,10 +310,12 @@ def default_semantic_transport(
         # The directory is outside the repository and contains no durable
         # orchestration state.  Best-effort cleanup is deliberately omitted
         # from exception handling so provider/control-flow errors propagate.
-        import shutil
+        from .agent_permissions import remove_checkout_tree
 
         if isolated_dir is not None:
-            shutil.rmtree(isolated_dir, ignore_errors=True)
+            # A Gemini response root inside the isolated workdir is hidden
+            # (0o300) and must be released before the recursive delete.
+            remove_checkout_tree(isolated_dir, ignore_errors=True)
 
 
 class SemanticDedupeMatcher:
@@ -377,7 +379,9 @@ class SemanticDedupeMatcher:
             return False
         finally:
             if isolated_dir is not None:
-                shutil.rmtree(isolated_dir, ignore_errors=True)
+                from .agent_permissions import remove_checkout_tree
+
+                remove_checkout_tree(isolated_dir, ignore_errors=True)
         return True
 
     def match(

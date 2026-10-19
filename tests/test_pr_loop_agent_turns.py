@@ -3,6 +3,7 @@
 import dataclasses
 import datetime
 import json
+import os
 import re
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1267,4 +1268,64 @@ def test_direct_completion_recovery_writes_terminal_text_before_cleanup(tmp_path
     )
     assert outcome.terminal_public_response is not None
     assert written == [outcome.terminal_public_response]
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)
+
+
+# Generalization (#1560 review item-4): every recursive deletion of a directory
+# an agent ran in goes through agent_permissions.remove_checkout_tree, which
+# releases a hidden Gemini response root first.  The semantic-dedupe isolated
+# workdir is one such directory.
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root bypasses directory read permission")
+@pytest.mark.parametrize("backend", ["gemini", "codex"])
+@pytest.mark.parametrize("outcome", ["success", "nonzero-exit", "backend-raises"])
+def test_semantic_dedupe_transport_removes_its_whole_isolated_workdir(
+    tmp_path, turn_dirs, monkeypatch, backend, outcome
+):
+    import coding_review_agent_loop.semantic_dedupe as semantic_dedupe_module
+    from coding_review_agent_loop.agents.registry import get_backend
+
+    isolated_dirs = []
+    real_isolated = semantic_dedupe_module._isolated_provider_config
+
+    def isolated(*args, **kwargs):
+        config, directory = real_isolated(*args, **kwargs)
+        isolated_dirs.append(directory)
+        return config, directory
+
+    monkeypatch.setattr(semantic_dedupe_module, "_isolated_provider_config", isolated)
+    returncode = 0 if outcome == "success" else 1
+    output = '{"matches": []}'
+    runner = FakeRunner(
+        gemini_outputs=[(output, returncode)],
+        codex_outputs=[{"public_response": output, "stdout": "", "returncode": returncode}],
+    )
+    hidden_while_running = []
+    backend_impl = get_backend(backend)
+    real_run = backend_impl.run
+
+    def run(*args, **kwargs):
+        result = real_run(*args, **kwargs)
+        # The response root inside the isolated workdir is non-listable.
+        component = result.response_file_path.parent.parent
+        hidden_while_running.append(
+            (str(component).startswith(str(kwargs.get("config", args[1]).gemini_dir)), oct(os.lstat(component).st_mode & 0o777))
+        )
+        if outcome == "backend-raises":
+            raise RuntimeError("provider crashed")
+        return result
+
+    monkeypatch.setattr(backend_impl, "run", run)
+    config = make_config(tmp_path, semantic_followup_backend=backend, semantic_followup_model="m")
+    if outcome == "backend-raises":
+        with pytest.raises(RuntimeError, match="provider crashed"):
+            semantic_dedupe_module.default_semantic_transport("Compare.", runner, config, 30.0)
+    else:
+        semantic_dedupe_module.default_semantic_transport("Compare.", runner, config, 30.0)
+    if backend == "gemini":
+        # Gemini's response root lives inside the isolated workdir and is hidden.
+        assert hidden_while_running == [(True, oct(0o300))]
+    assert hidden_while_running
+    assert isolated_dirs and all(not os.path.lexists(path) for path in isolated_dirs)
     assert turn_dirs and all(not path.exists() for path in turn_dirs)

@@ -73,9 +73,10 @@ flowchart LR
   files stay readable by known path but are hidden, not swept. Gemini's
   git-dir response root (`<git dir>/agent-loop/responses/`) gets the same
   hardening, except that its git-owned parent keeps its mode; before worktree
-  removal, `git worktree prune` of an orphaned admin directory, or deletion of
-  a stale checkout or store, agent-loop restores owner access on that tree so
-  the recursive delete can list it. Residual: mode bits stop incidental discovery (`ls ..`,
+  removal, `git worktree prune` of an orphaned admin directory, or any
+  recursive deletion of a directory an agent ran in (a stale checkout or store,
+  the semantic-dedupe isolated workdir), agent-loop restores owner access on
+  that tree (`remove_checkout_tree`) so the recursive delete can list it. Residual: mode bits stop incidental discovery (`ls ..`,
   `find`, globbing) by a same-UID agent, not a deliberate one that re-modes the
   ancestors, and give no protection under euid 0, where a run proceeds with one
   warning; real isolation needs an OS-level filesystem sandbox.
