@@ -1182,3 +1182,63 @@ def test_completion_recovery_terminal_write_precedes_turn_cleanup(tmp_path, turn
     assert written and written[0][1] == terminal
     assert written[0][0].parent in turn_dirs
     assert all(not path.exists() for path in turn_dirs)
+
+
+# Generalization (#1560 review item-3): every backend invocation goes through
+# run_agent_result, which scopes its per-turn directory.  Inside a validated
+# turn the outer scope defers cleanup past diagnostics; a direct invocation
+# (post-authentication evidence correction, semantic dedupe) is cleaned up as
+# soon as the backend has captured its response text.
+
+
+@pytest.mark.parametrize("outcome", ["success", "nonzero-exit", "backend-raises"])
+def test_direct_backend_invocation_removes_its_turn_directory(tmp_path, turn_dirs, monkeypatch, outcome):
+    from coding_review_agent_loop.agents.codex import BACKEND as CODEX_BACKEND
+    from coding_review_agent_loop.agents.registry import run_agent_result
+
+    config = make_config(tmp_path, agent_max_retries=0)
+    returncode = 0 if outcome == "success" else 1
+    runner = FakeRunner(codex_outputs=[{"public_response": "DIRECT", "stdout": "", "returncode": returncode}])
+    if outcome == "backend-raises":
+        real_run = CODEX_BACKEND.run
+
+        def raising_run(*args, **kwargs):
+            real_run(*args, **kwargs)
+            raise RuntimeError("provider crashed after allocating its response file")
+
+        monkeypatch.setattr(CODEX_BACKEND, "run", raising_run)
+        with pytest.raises(RuntimeError, match="provider crashed"):
+            run_agent_result(runner, agent="codex", config=config, prompt="Correct.", role="coder")
+    else:
+        result = run_agent_result(runner, agent="codex", config=config, prompt="Correct.", role="coder")
+        # The backend captured the text before the directory was removed.
+        assert result.text == "DIRECT"
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)
+    assert all(path.parent.is_dir() for path in turn_dirs)
+
+
+def test_semantic_dedupe_transport_removes_its_turn_directory(tmp_path, turn_dirs):
+    from coding_review_agent_loop.semantic_dedupe import default_semantic_transport
+
+    config = make_config(tmp_path, semantic_followup_backend="codex", semantic_followup_model="m")
+    runner = FakeRunner(codex_outputs=[{"public_response": '{"matches": []}', "stdout": "", "returncode": 0}])
+    result = default_semantic_transport("Compare.", runner, config, 30.0)
+    assert result.text == '{"matches": []}'
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)
+
+
+def test_evidence_correction_turn_directory_is_removed_after_ingestion(tmp_path, turn_dirs):
+    """The post-authentication correction coder runs outside any validated turn."""
+    import coding_review_agent_loop.response_validation as response_validation_module
+    from coding_review_agent_loop.agents.registry import run_agent_result
+
+    # response_validation calls the shared, scoped entry point.
+    assert response_validation_module.run_agent_result is run_agent_result
+    config = make_config(tmp_path, agent_max_retries=0)
+    runner = FakeRunner(codex_outputs=[{"public_response": "CORRECTED", "stdout": "", "returncode": 0}])
+    result = response_validation_module.run_agent_result(
+        runner, agent="codex", config=config, prompt="Correct.", role="coder",
+        label="semantic-evidence-correction",
+    )
+    assert result.text == "CORRECTED"
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)

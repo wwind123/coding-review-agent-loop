@@ -1748,13 +1748,11 @@ def test_sandboxed_turn_directory_and_scoped_grants(tmp_path, sandbox, mask):
         assert str(root) not in scoped
         assert not root_rules & set(scoped)
         response_rules = [rule for rule in _allowed_tools(scoped) if str(root) in rule]
-        # The coder's response access comes from --add-dir alone.
-        expected_rules = [f"Write(/{turn}/**)", f"Edit(/{turn}/**)"] if role == "reviewer" else []
-        assert response_rules == expected_rules
+        # Both classes get response-path Write/Edit grants for their own turn.
+        assert response_rules == [f"Write(/{turn}/**)", f"Edit(/{turn}/**)"]
         # Without response_dir both classes still name the root.
         assert unscoped[unscoped.index("--add-dir") + 1] == str(root)
-        if role == "reviewer":
-            assert root_rules <= set(_allowed_tools(unscoped))
+        assert root_rules <= set(_allowed_tools(unscoped))
         # Checkout rules (coder) and every other rule are unchanged.
         assert [rule for rule in _allowed_tools(scoped) if str(root) not in rule] == [
             rule for rule in _allowed_tools(unscoped) if str(root) not in rule
@@ -1803,3 +1801,69 @@ def test_sandboxed_mode_still_refuses_a_group_writable_response_component(tmp_pa
     root.chmod(0o775)
     with pytest.raises(ap.SandboxBoundaryError, match="group- or world-writable"):
         ap.establish_response_root_boundary(config)
+
+
+# Generalization (#1560 review item-1): every response root, the shared one and
+# Gemini's git-dir root, is hardened before launch and hides turns and legacy
+# files the same way; only Gemini's git-owned parent keeps its mode.
+
+
+def _response_root_for(config, kind):
+    if kind == "shared":
+        return ap.response_root(config), "codex"
+    from coding_review_agent_loop.agents.gemini import _gemini_public_response_root
+
+    (config.gemini_dir / ".git").mkdir(parents=True, exist_ok=True)
+    return _gemini_public_response_root(config.gemini_dir), "gemini"
+
+
+@_NON_ROOT
+@pytest.mark.parametrize("kind", ["shared", "gemini"])
+def test_every_response_root_hides_turns_and_legacy_files(tmp_path, kind):
+    from coding_review_agent_loop.agents.base import public_response_path
+
+    config = make_config(tmp_path, reviewer=("gemini",) if kind == "gemini" else ("codex",))
+    root, component = _response_root_for(config, kind)
+    # A listable layout left by an older version.
+    (root / component).mkdir(parents=True)
+    (root / "old-seat").mkdir()
+    for directory in (root, root / component, root / "old-seat"):
+        directory.chmod(0o700)
+    legacy = root / component / "0123456789abcdef.md"
+    legacy.write_text("legacy", encoding="utf-8")
+    parent_mode = _mode(root.parent)
+
+    # Invocation start hides every existing root before any agent spawns.
+    ap.establish_sandboxed_run(config, command="pr")
+    for directory in (root, root / component, root / "old-seat"):
+        assert _mode(directory) == 0o300
+        with pytest.raises(PermissionError):
+            os.listdir(directory)
+
+    path = public_response_path(config, component, root=None if kind == "shared" else root)
+    assert path.parent.parent == root / component
+    assert _mode(path.parent) == 0o700
+    assert legacy.read_text(encoding="utf-8") == "legacy"
+    if kind == "gemini":
+        # The git-owned parent (.git/agent-loop) keeps its mode.
+        assert _mode(root.parent) == parent_mode
+
+
+@pytest.mark.parametrize("kind", ["shared", "gemini"])
+def test_every_response_root_is_released_for_removal(tmp_path, kind):
+    from coding_review_agent_loop.agents.base import public_response_path
+
+    config = make_config(tmp_path)
+    root, component = _response_root_for(config, kind)
+    public_response_path(config, component, root=None if kind == "shared" else root)
+    ap.release_unlistable_tree(root)
+    shutil.rmtree(root)
+    assert not root.exists()
+
+
+def test_absent_gemini_response_root_is_not_created_at_startup(tmp_path):
+    from coding_review_agent_loop.agents.gemini import _gemini_public_response_root
+
+    config = make_config(tmp_path)
+    ap.establish_sandboxed_run(config, command="pr")
+    assert not os.path.lexists(_gemini_public_response_root(config.gemini_dir))

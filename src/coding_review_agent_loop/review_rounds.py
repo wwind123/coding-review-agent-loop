@@ -709,7 +709,10 @@ def prepare_review_round_spool_roots(config: AgentLoopConfig) -> tuple[Path, Pat
             config, root=sandboxed_response_root(config), error=SandboxBoundaryError
         )
     else:
+        from .agent_permissions import harden_backend_response_roots
+
         harden_response_tree(config)
+        harden_backend_response_roots(config)
     _harden_legacy_spool_root(legacy_root)
     private = config.agent_memory_dir.parent / PRIVATE_DIR_NAME
     try:

@@ -250,8 +250,13 @@ def harden_response_tree(
     *,
     root: Path | None = None,
     error: type[AgentLoopError] = AgentLoopError,
+    hide_parent: bool = True,
 ) -> None:
     """Make every guessable directory of the repo response tree non-listable.
+
+    ``hide_parent`` also hides the root's parent (the shared ``responses/``
+    directory).  A backend-specific root inside a checkout's git directory
+    (Gemini's) passes False: its parent is git-owned state.
 
     Runs before any agent of an invocation is spawned and again at each
     review-round start.  Every immediate child of the repo response root is
@@ -265,11 +270,13 @@ def harden_response_tree(
     # Sandboxed mode keeps refusing a group-writable component (its boundary
     # contract); default mode re-modes one an older release left behind.
     remode = not issubclass(error, SandboxBoundaryError)
+    base = repo_root.parent.parent if hide_parent else repo_root.parent
     try:
-        make_private_dirs(repo_root.parent.parent)
+        make_private_dirs(base)
     except OSError as exc:
-        raise error(f"Could not create response directory {repo_root.parent.parent}: {exc}") from exc
-    ensure_unlistable_dir(repo_root.parent, error=error, remode_group_writable=remode)
+        raise error(f"Could not create response directory {base}: {exc}") from exc
+    if hide_parent:
+        ensure_unlistable_dir(repo_root.parent, error=error, remode_group_writable=remode)
     ensure_unlistable_dir(repo_root, error=error, remode_group_writable=remode)
     try:
         names = sorted(_list_unlistable(str(repo_root)))
@@ -316,6 +323,103 @@ def harden_response_tree(
             "Warning: agent-loop runs as root, so non-listable response directories do not hide "
             "peer reviewer responses from agents (root bypasses directory read permission).",
         )
+
+
+def _gemini_response_roots(config: AgentLoopConfig) -> list[Path]:
+    """Gemini's git-dir response roots: the configured checkout and every Gemini seat."""
+    from .agents.gemini import _gemini_public_response_root
+
+    checkouts = [Path(config.gemini_dir)]
+    for seat in getattr(config, "reviewer_seats", ()) or ():
+        if getattr(seat, "backend", None) == "gemini" and getattr(seat, "workdir", None) is not None:
+            checkouts.append(Path(seat.workdir))
+    roots: list[Path] = []
+    for checkout in checkouts:
+        root = _gemini_public_response_root(checkout)
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def harden_backend_response_roots(
+    config: AgentLoopConfig, *, error: type[AgentLoopError] = AgentLoopError
+) -> None:
+    """Harden every existing backend-specific response root (Gemini's) like the shared one.
+
+    Absent roots are left absent; the first Gemini turn creates and hardens
+    its own.
+    """
+    for root in _gemini_response_roots(config):
+        if os.path.lexists(root):
+            harden_response_tree(config, root=root, error=error, hide_parent=False)
+
+
+def release_unlistable_tree(root: Path | str) -> None:
+    """Give the owner rwx back on every real directory at and below ``root``.
+
+    Only for a tree that is about to be removed: recursive deletion
+    (``shutil.rmtree``, ``git worktree remove``/``prune``) must list each
+    directory, which a 0o300 directory refuses.  Symlinks are never followed.
+    """
+    pending = [str(root)]
+    euid = _current_euid()
+    while pending:
+        current = pending.pop()
+        try:
+            info = os.lstat(current)
+        except OSError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            continue
+        if (euid is None or info.st_uid == euid) and (info.st_mode & 0o700) != 0o700:
+            try:
+                os.chmod(current, stat.S_IMODE(info.st_mode) | 0o700)
+            except OSError:
+                continue
+        try:
+            names = os.listdir(current)
+        except OSError:
+            continue
+        pending.extend(os.path.join(current, name) for name in names)
+
+
+def release_checkout_response_roots(checkout: Path | str) -> None:
+    """Make a checkout's private Gemini response root removable before deleting it."""
+    from .agents.gemini import _gemini_public_response_root
+
+    checkout = Path(checkout)
+    candidates = {
+        _gemini_public_response_root(checkout),
+        checkout / ".git" / "agent-loop" / "responses",
+        checkout / ".agent-loop-responses",
+    }
+    for root in candidates:
+        if os.path.lexists(root):
+            release_unlistable_tree(root)
+
+
+def release_orphaned_admin_response_roots(store: Path | str) -> None:
+    """Before ``git worktree prune``, release the response roots of admin dirs whose worktree is gone.
+
+    A live worktree's root stays hidden; only an admin directory git is about
+    to delete is made removable.
+    """
+    admins = Path(store) / ".git" / "worktrees"
+    try:
+        names = os.listdir(admins)
+    except OSError:
+        return
+    for name in names:
+        admin = admins / name
+        try:
+            gitdir = (admin / "gitdir").read_text(encoding="utf-8").strip()
+        except OSError:
+            gitdir = ""
+        if gitdir and os.path.lexists(gitdir):
+            continue
+        root = admin / "agent-loop" / "responses"
+        if os.path.lexists(root):
+            release_unlistable_tree(root)
 
 
 def allocate_turn_directory(parent: Path | str) -> Path:
@@ -1219,6 +1323,7 @@ def establish_sandboxed_run(
     """
     if not is_sandboxed(config):
         harden_response_tree(config)
+        harden_backend_response_roots(config)
         return
     validate_sandboxed_selections(config)
     validate_sandboxed_flow(config, command=command, plan_first=plan_first)
@@ -1318,6 +1423,10 @@ def role_permission_args(
             for checkout in coder_checkout_paths(config)
             for rule in (_claude_path_rule("Write", checkout), _claude_path_rule("Edit", checkout))
         ]
+        # The public response file lies outside the checkout, so it needs its
+        # own rule under this exclusive allowlist, scoped like the read-only
+        # branch to the turn's own directory (#1560).
+        rules += [_claude_path_rule("Write", root), _claude_path_rule("Edit", root)]
         rules += ["Bash(git *)", *(f"Bash({sub} *)" for sub in CODER_GH_SUBCOMMANDS), f"Bash({prefix} *)"]
         test_invocation = coder_test_invocation(config, provider)
         if test_invocation:

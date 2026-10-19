@@ -7524,7 +7524,8 @@ its role (implemented in `agent_permissions.py`):
 - A Claude coder gets `--permission-mode acceptEdits`, `--setting-sources
   user` (so checkout `.claude/settings*.json` cannot widen later grants),
   path-scoped `Write`/`Edit` rules for its assigned checkout (the configured
-  path and, when it differs, its resolved path), `Bash(git *)`, the gh subcommands coder prompts use, the read-only inspector,
+  path and, when it differs, its resolved path), `Write`/`Edit` rules and
+  `--add-dir` for its own per-turn response directory only, `Bash(git *)`, the gh subcommands coder prompts use, the read-only inspector,
   and one exact, wildcard-free rule for the resolved `agent-loop run-tests`
   invocation, which is the same string the coder prompt shows. The invocation
   uses `--test-command`, else the first verified test-profile command, and the
@@ -8882,7 +8883,9 @@ ones older versions left; if one stays listable (for example a symlink to a
 listable directory, or a directory owned by someone else) the run refuses
 with the exact `chmod 0300` fix. In default mode a group-writable directory
 an older release left is re-moded too; sandboxed mode still refuses it. Under
-root the mode bits hide nothing and a warning is logged. Codex also receives a response-file instruction, and separately uses
+root the mode bits hide nothing and a warning is logged. Gemini's git-dir response root is hidden the same
+way; agent-loop restores owner access on it just before removing a worktree
+or stale checkout, so recursive deletion still works. Codex also receives a response-file instruction, and separately uses
 `--output-last-message` so the loop can fall back to the last Codex message
 instead of raw JSON event logs. Gemini response files live inside Gemini's git
 directory because Gemini can only write trusted workspace paths; Gemini stdout

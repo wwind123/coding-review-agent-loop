@@ -12,7 +12,6 @@ import stat
 from typing import TYPE_CHECKING, Callable, Iterator, Literal, Protocol, cast
 
 from ..runner import CommandResult, Runner
-from ..scratch import make_private_dirs
 from ..containment import ContainmentEvidence
 from ..usage import UsageMetadata
 
@@ -123,17 +122,20 @@ def public_response_path(
         RESPONSE_FILE_NAME,
         allocate_turn_directory,
         default_response_parent,
+        ensure_unlistable_dir,
+        harden_response_tree,
     )
 
     component = config.active_reviewer_seat_id or agent
     if root is None:
         parent = default_response_parent(config, component)
     else:
-        # A backend-specific root (Gemini's git-dir root) lives inside that
-        # backend's own checkout and holds no other provider's responses.
-        # Its ancestors keep mode 0700: a non-listable directory under a
-        # worktree admin directory would make worktree removal fail.
-        parent = make_private_dirs(root / component)
+        # A backend-specific root (Gemini's git-dir root) is hardened the same
+        # way, except that its git-owned parent keeps its mode.  Worktree
+        # removal releases it first (agent_permissions.release_*).
+        harden_response_tree(config, root=root, hide_parent=False)
+        parent = root / component
+        ensure_unlistable_dir(parent, remode_group_writable=True)
     turn_dir = allocate_turn_directory(parent)
     register_turn_directory(turn_dir)
     return turn_dir / RESPONSE_FILE_NAME
@@ -178,14 +180,24 @@ def remove_turn_directory(path: Path, *, on_error: Callable[[str], None] | None 
 
 
 @contextmanager
-def response_turn_scope(on_error: Callable[[str], None] | None = None) -> Iterator[list[Path]]:
+def response_turn_scope(
+    on_error: Callable[[str], None] | None = None, *, reuse_enclosing: bool = False
+) -> Iterator[list[Path]]:
     """Remove every per-turn directory allocated inside the scope when it ends.
 
-    The scope wraps a whole validated agent turn, so cleanup runs only after
+    A validated agent turn opens the outer scope, so cleanup runs only after
     acceptance, repair, completion recovery and failure diagnostics have
-    finished with ``response_file_path``.  A cleanup failure is reported
-    through ``on_error`` and never changes the turn's outcome.
+    finished with ``response_file_path``.  Every backend invocation also runs
+    inside a scope with ``reuse_enclosing``: inside a validated turn it defers
+    to that turn's scope, and a direct invocation (outside any validated
+    turn) gets its own scope, which ends once the backend has captured the
+    response text.  A cleanup failure is reported through ``on_error`` and
+    never changes the turn's outcome.
     """
+    enclosing = _TURN_DIRECTORIES.get()
+    if reuse_enclosing and enclosing is not None:
+        yield enclosing
+        return
     directories: list[Path] = []
     token = _TURN_DIRECTORIES.set(directories)
     try:

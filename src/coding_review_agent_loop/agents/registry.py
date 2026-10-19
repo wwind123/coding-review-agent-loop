@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from .base import AgentBackend, AgentName, AgentResult
+from .base import AgentBackend, AgentName, AgentResult, response_turn_scope
 from .antigravity import BACKEND as ANTIGRAVITY_BACKEND
 from .claude import BACKEND as CLAUDE_BACKEND
 from .codex import BACKEND as CODEX_BACKEND
@@ -216,12 +216,20 @@ def run_agent_result(
             config, runner, path=checkout, agent=agent, purpose=f"{role or 'agent'} turn"
         )
     try:
-        result = get_backend(backend_agent).run(
-            runner,
-            config,
-            prompt,
-            **kwargs,
-        )
+        # A direct invocation outside a validated turn (for example the
+        # post-authentication evidence correction or semantic dedupe) removes
+        # its per-turn response directory here, once the backend has captured
+        # the response text; inside a validated turn, that turn's scope does
+        # it after diagnostics (#1560).
+        with response_turn_scope(
+            on_error=lambda message: log(config, message), reuse_enclosing=True
+        ):
+            result = get_backend(backend_agent).run(
+                runner,
+                config,
+                prompt,
+                **kwargs,
+            )
     finally:
         if checked:
             checkout_verification.record_checkout_baseline(
