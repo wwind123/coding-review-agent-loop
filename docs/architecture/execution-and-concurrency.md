@@ -158,6 +158,16 @@ access to `GEMINI.md` goes through one fd-relative accessor that touches only a
 regular, non-symlink file, and stale recovery takes the backend's non-blocking
 `GEMINI.md` lock first.
 
+Subprocess capture roots live outside managed checkouts and each holds a
+lifetime `flock` lease. Capture-root retention is operator-configured
+(`--subprocess-log-retention-days`, default 14 days, `0` disables pruning). A
+sweep in the `subprocess-logs/<slug>/` layout considers only real
+(non-symlink), marked, expired and unlocked roots; leased roots are never
+pruned. An eligible root is removed whole without following symlinks, with the
+marker and lease removed last so a partial failure leaves the root marked and
+expired for a later retry. See
+[`--subprocess-log-retention-days`](../local_agent_loop.md).
+
 On supported Linux/systemd/cgroup-v2 hosts, containment bounds aggregate and
 role-specific process trees. The portable process-group fallback can terminate
 descendants but does not impose memory ceilings. Test-wrapper lane locks prevent

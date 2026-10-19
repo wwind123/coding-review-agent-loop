@@ -739,6 +739,16 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--subprocess-log-retention-days",
+            default=None,
+            metavar="N",
+            help=(
+                "Days to keep old subprocess capture directories under the agent-loop cache's "
+                "subprocess-logs/<slug>/ layout before best-effort pruning (default: 14; also "
+                "AGENT_LOOP_SUBPROCESS_LOG_RETENTION_DAYS). 0 or never disables pruning."
+            ),
+        )
+        subparser.add_argument(
             "--progress-interval-seconds",
             type=int,
             default=30,

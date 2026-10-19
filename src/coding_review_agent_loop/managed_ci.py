@@ -4654,6 +4654,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--ci-poll-interval-seconds", "--ci-startup-timeout-seconds",
     "--ci-queued-grace-seconds", "--mergeability-poll-attempts",
     "--mergeability-poll-interval-seconds", "--log-dir", "--subprocess-log-dir",
+    "--subprocess-log-retention-days",
     "--progress-interval-seconds", "--agent-max-retries", "--agent-retry-backoff-seconds",
     "--agent-memory-dir", "--salvage-comment-patch-max-bytes", "--planning-context-mode",
     "--pr-review-context-mode", "--pr-review-policy", "--pr-review-broad-rule",
