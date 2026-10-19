@@ -1242,3 +1242,29 @@ def test_evidence_correction_turn_directory_is_removed_after_ingestion(tmp_path,
     )
     assert result.text == "CORRECTED"
     assert turn_dirs and all(not path.exists() for path in turn_dirs)
+
+
+def test_direct_completion_recovery_writes_terminal_text_before_cleanup(tmp_path, turn_dirs, monkeypatch):
+    """Called outside a validated turn, recovery still writes before its own scope cleans up."""
+    import coding_review_agent_loop.validated_agent as validated_agent_module
+
+    written = []
+    real_post = validated_agent_module._post_completion_recovery_terminal_comment
+
+    def post(runner, *, recovery_result, terminal_text, **kwargs):
+        real_post(runner, recovery_result=recovery_result, terminal_text=terminal_text, **kwargs)
+        written.append(recovery_result.response_file_path.read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(validated_agent_module, "_post_completion_recovery_terminal_comment", post)
+    runner = FakeRunner(claude_outputs=[("", 1)])
+    config = make_config(tmp_path, coder="claude")
+    outcome = validated_agent_module._attempt_claude_completion_recovery(
+        runner, config=config,
+        completion_recovery=validated_agent_module.CompletionRecoveryPolicy(issue_number=56),
+        session_id="sess-1", validate=lambda text: text,
+        usage_context=validated_agent_module._new_usage_context(config),
+        run_id="run-1", role=None, label=None, timeout_seconds=None,
+    )
+    assert outcome.terminal_public_response is not None
+    assert written == [outcome.terminal_public_response]
+    assert turn_dirs and all(not path.exists() for path in turn_dirs)

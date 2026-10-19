@@ -590,7 +590,25 @@ def _synthesized_completion_recovery_unavailable(
     return unavailable, render_agent_unavailable_comment(unavailable, signature=signature)
 
 
-def _attempt_claude_completion_recovery(
+def _attempt_claude_completion_recovery(*args, **kwargs):
+    """Run completion recovery inside a response-turn scope.
+
+    The recovery writes its terminal text to the recovery attempt's response
+    file after the backend returns, so its per-turn directory must outlive
+    the backend invocation: inside a validated turn this defers to that
+    turn's scope, and a direct call gets its own (#1560).
+    """
+    config = kwargs.get("config")
+
+    def report(message: str) -> None:
+        if config is not None:
+            log(config, message)
+
+    with response_turn_scope(on_error=report, reuse_enclosing=True):
+        return _attempt_claude_completion_recovery_in_scope(*args, **kwargs)
+
+
+def _attempt_claude_completion_recovery_in_scope(
     runner: Runner,
     *,
     config: AgentLoopConfig,
