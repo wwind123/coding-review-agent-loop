@@ -2241,6 +2241,8 @@ def config_from_args(
     if local_origin is not None and getattr(args, "trusted_origin_protocol", "https") != "https":
         raise AgentLoopError("--trusted-origin-protocol cannot be combined with --trusted-local-origin.")
     git_ssh_identity = resolve_git_ssh_identity(args, local_origin=local_origin)
+    # Validate before any capture directory is created or pruned (#1572).
+    subprocess_log_retention_days = resolve_subprocess_log_retention_days(args)
 
     named_seats = resolve_reviewer_seats(args)
     legacy_reviewers = tuple(args.reviewer or (["codex"] if not named_seats else ()))
@@ -2508,7 +2510,7 @@ def config_from_args(
             primary_dir=primary_dir,
             managed_roots=(claude_dir, codex_dir, gemini_dir, antigravity_dir, *store_roots),
         ),
-        subprocess_log_retention_days=resolve_subprocess_log_retention_days(args),
+        subprocess_log_retention_days=subprocess_log_retention_days,
         progress_interval_seconds=args.progress_interval_seconds,
         agent_max_retries=args.agent_max_retries,
         agent_retry_backoff_seconds=tuple(args.agent_retry_backoff_seconds),

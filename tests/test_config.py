@@ -280,8 +280,9 @@ def test_retention_flag_reaches_the_config_from_the_cli(tmp_path, monkeypatch):
     assert config_from_args(parser.parse_args(argv), FakeRunner()).subprocess_log_retention_days == 0
 
 
+@pytest.mark.parametrize("source", ["cli", "env"])
 @pytest.mark.parametrize("value", ["-1", "1.5", "abc", ""])
-def test_invalid_retention_fails_config_before_any_pruning(tmp_path, monkeypatch, value):
+def test_invalid_retention_fails_config_before_any_pruning(tmp_path, monkeypatch, value, source):
     import coding_review_agent_loop.logging as logging_module
     from coding_review_agent_loop.cli import build_parser
     from coding_review_agent_loop.config import config_from_args
@@ -289,10 +290,22 @@ def test_invalid_retention_fails_config_before_any_pruning(tmp_path, monkeypatch
     monkeypatch.delenv(RETENTION_ENV, raising=False)
     calls = []
     monkeypatch.setattr(logging_module, "_prune_capture_roots", lambda *a, **k: calls.append(a))
-    args = build_parser().parse_args([*_retention_argv(tmp_path), RETENTION_FLAG, value])
-    with pytest.raises(AgentLoopError, match=re.escape(RETENTION_FLAG)):
+    argv = _retention_argv(tmp_path)
+    capture_root = tmp_path / "subprocess-logs"
+    if source == "cli":
+        argv = [*argv, RETENTION_FLAG, value]
+        expected = RETENTION_FLAG
+    else:
+        if value == "":
+            pytest.skip("an empty env value means unset and falls back to the default")
+        monkeypatch.setenv(RETENTION_ENV, value)
+        expected = RETENTION_ENV
+    args = build_parser().parse_args(argv)
+    with pytest.raises(AgentLoopError, match=re.escape(expected)):
         config_from_args(args, FakeRunner())
     assert calls == []
+    # Validation runs before the capture directory is created.
+    assert not capture_root.exists()
 
 
 def test_retention_flag_is_a_recovery_value_option():
