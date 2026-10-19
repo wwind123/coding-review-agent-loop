@@ -1572,3 +1572,15 @@ def test_agent_memory_dir_guidance_documents_the_spool_overlap_refusal():
     assert "--agent-memory-dir .cache/agent-loop-memory" not in doc
     assert "is refused at the first review round" in doc
     assert "<agent-memory-dir>/../private/review-round-spool/" in doc
+
+
+def test_local_agent_loop_doc_states_managed_receipt_and_unproducible_evidence_rules():
+    """Issue #1568: receipts are direct runs; unproducible evidence never blocks."""
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    section = text.split("#### Managed receipts and evidence the loop cannot produce\n", 1)[1].split("\n#", 1)[0]
+    flat = " ".join(section.split())
+    assert "never rejected only because its outer command is `agent-loop run-tests`" in flat
+    assert "Evidence the loop cannot produce by construction" in flat
+    assert "is never blocking" in flat
+    assert "A missing or failing receipt the loop can produce keeps the existing rules" in flat
+    assert "`agent-loop run-tests -- <command>`" in flat

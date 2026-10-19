@@ -529,12 +529,24 @@ PRE_COLLECTION_REVIEWER_GUIDANCE = (
     "parent-observed passing rerun of the same command. Do not require supersession of "
     "historical receipts; you may still require current-tree evidence on the merits."
 )
+MANAGED_RECEIPT_REVIEWER_GUIDANCE = (
+    "A managed `agent-loop run-tests` receipt is the parent-observed capture of the exact "
+    "test command it ran, so it counts as a direct run of that command. A repository, "
+    "AGENTS.md, or approved-plan rule against wrappers (for example 'run pytest directly' or "
+    "'no wrapper') refers to the test command itself, such as custom shell scripts, env-var "
+    "prefixes, or alternative runners, not to the loop's own capture runner. Never reject or "
+    "discount a receipt only because its outer command is `agent-loop run-tests`; judge the "
+    "inner command against the rule."
+)
 PRE_COLLECTION_CODER_GUIDANCE = (
     "If `agent-loop run-tests` reports a pre-collection launch failure (no test ran, so the run "
     "is not evidence), fix the interpreter or flags and rerun; do not argue the receipt. A "
     "genuine test failure is still cleared only by a passing rerun of the same command. Only a "
     "failure at the current tracked digest needs that rerun; a failure recorded at an earlier "
-    "tracked tree is labelled historical and is not an outstanding obligation."
+    "tracked tree is labelled historical and is not an outstanding obligation. If a "
+    "reviewer asks for evidence the loop cannot produce, such as a capture of a command run "
+    "without `agent-loop run-tests`, dispute that item by citing the managed receipt rather "
+    "than re-running uncaptured commands."
 )
 FIXTURE_CODER_GUIDANCE = (
     "When a suite needs long-lived helper processes, put them in a committed executable "
@@ -922,6 +934,50 @@ def _reviewer_blocking_scope_guidance(flow: str) -> str:
         f"`{blocking_list}` or `{followup_list}`, and disposition a carried item that "
         "is not eligible as `future` (or `resolved` when nothing remains) rather than "
         "keeping it active.\n"
+    )
+
+
+def _reviewer_unproducible_evidence_guidance(flow: str) -> str:
+    """Return the static unproducible-evidence rule for one review flow (#1568).
+
+    Like ``_reviewer_blocking_scope_guidance`` the text depends only on
+    ``flow``, so it is safe inside the compact stable prefixes.
+    """
+    blocking_list, followup_list, _same_status, change = _REVIEWER_BLOCKING_SCOPE_FLOWS[flow]
+    plan_wrapper_rule = (
+        "A plan verification step or matrix row that requires plain or no-wrapper test "
+        "runs is satisfied by managed `agent-loop run-tests` receipts of those commands: a "
+        "managed receipt is the captured form of the command it ran, and the wrapper rule "
+        "refers to the test command itself, not to the loop's capture runner. Do not block "
+        "the plan for relying on such receipts, and do not require it to state otherwise. "
+        if flow == "plan" else ""
+    )
+    # The PR flow already has a dedicated human-only evidence channel; the
+    # unproducible-evidence rule must not divert it (#1568 review item-1).
+    exact_head_carve_out = (
+        "Exception: evidence that only a human can supply and that an approved contract "
+        "requires at the exact reviewed head still goes only in "
+        "`exact_head_evidence_requests`, as described in the evidence-request rules; "
+        "never move it to `summary` or `future_followups` under this rule. "
+        if flow == "pr" else ""
+    )
+    return (
+        "Unproducible evidence: evidence the loop cannot produce by construction is never "
+        "a blocking finding. Examples are a tool-captured observation of a command run "
+        "without the capture runner, a reviewer-side test run when reviewers may not "
+        "execute commands, or a receipt for an environment the loop has no access to. "
+        f"Do not put such a request in `{blocking_list}` or `{followup_list}`, and do not "
+        "keep a carried item active on that basis alone. Either accept the closest form the "
+        "loop can produce, such as the managed receipt, or name the gap in `summary` or as "
+        "a non-blocking note or `future_followups` entry for a human. When a coder disputes "
+        "an item because the requested evidence cannot be produced, and the dispute is "
+        "accurate, disposition it as `resolved` (when the producible evidence satisfies the "
+        "intent) or `future` rather than keeping it blocking. "
+        f"{exact_head_carve_out}"
+        f"{plan_wrapper_rule}"
+        "This narrows evidence requests only: the "
+        f"{change} itself, and evidence the loop can produce such as a missing or failing "
+        "receipt, keep the existing rules.\n"
     )
 
 
@@ -2658,7 +2714,7 @@ provisioning, or other named integration artifact in the plan; an `admin.html`
 view alone is not coverage. If the plan cannot satisfy the request, record a
 visible `blocked` or `not-applicable` reason and approve only if you accept it.
 
-""" + _reviewer_exhaustiveness_guidance("plan") + _reviewer_blocking_scope_guidance("plan") + """Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
+""" + _reviewer_exhaustiveness_guidance("plan") + _reviewer_blocking_scope_guidance("plan") + _reviewer_unproducible_evidence_guidance("plan") + """Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
 follow-ups are small current-plan refinements that must be incorporated before
 implementation starts; they may appear only in blocking plan reviews. Future
 follow-ups are independent later work that remains valid after the current
@@ -2739,6 +2795,15 @@ proportionate non-applicable rationale; do not demand a Cartesian product.
 """
 
 
+PLANNER_CAPTURED_EVIDENCE_RULE = (
+    "Captured test evidence: a verification step or risk-matrix row that needs captured "
+    "or parent-observed evidence should name the command as run through "
+    "`agent-loop run-tests -- <command>`. Repository rules such as 'run pytest directly' "
+    "or 'no wrapper' apply to the inner command, so do not require an uncaptured direct "
+    "run as the evidence of record."
+)
+
+
 def _execution_strategy_contract_guidance(
     *, include_risk_test_matrix_contract: bool = True
 ) -> str:
@@ -2810,7 +2875,7 @@ legacy typed categories are omitted):
 }
 ```
 
-"""
+""" + PLANNER_CAPTURED_EVIDENCE_RULE + "\n"
     if not include_risk_test_matrix_contract:
         return execution_guidance + """
 Historical matrix-less revision contract:
@@ -3697,7 +3762,7 @@ the issue's scope, test strategy, and ambiguity. Use this mandatory structured J
 <!-- AGENT_PLAN_STATE: approved -->
 -- {reviewer_signature}
 
-{_reviewer_exhaustiveness_guidance('plan')}{_reviewer_blocking_scope_guidance('plan')}Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
+{_reviewer_exhaustiveness_guidance('plan')}{_reviewer_blocking_scope_guidance('plan')}{_reviewer_unproducible_evidence_guidance('plan')}Blocking plan issues and Same-plan follow-ups both prevent approval. Same-plan
 follow-ups are small current-plan refinements that must be incorporated before
 implementation starts; they may appear only in blocking plan reviews. Future
 follow-ups are independent later work that remains valid after the current
@@ -4770,13 +4835,14 @@ the pull request to be considered approved.
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
 review step; report blocking findings if {coder_name} needs to fix anything.
-{_reviewer_exhaustiveness_guidance('pr')}{_reviewer_blocking_scope_guidance('pr')}Treat the GitHub PR checks block in the volatile tail as authoritative for current CI state.
+{_reviewer_exhaustiveness_guidance('pr')}{_reviewer_blocking_scope_guidance('pr')}{_reviewer_unproducible_evidence_guidance('pr')}Treat the GitHub PR checks block in the volatile tail as authoritative for current CI state.
 Do not say or imply that tests passed globally unless the GitHub PR checks
 state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.
 Do not defer your review to wait for CI checks to finish. Review the PR now.
 Failing GitHub checks may justify a blocking review and a `blocking_items` entry.
 {PRE_COLLECTION_REVIEWER_GUIDANCE}
+{MANAGED_RECEIPT_REVIEWER_GUIDANCE}
 Pending or unavailable GitHub checks are an external wait state: mention them
 only in `summary`, never in `blocking_items`, and never as the sole reason to
 return `state: "blocking"` — only failing checks or real code-level findings
@@ -5414,13 +5480,14 @@ already available, or produce a blocking review explaining the limitation.
 Focus on correctness, security, test coverage, and maintainability. Review the
 full diff and any existing PR discussion. Do not make code changes in this
 review step; report blocking findings if {coder_name} needs to fix anything.
-{_reviewer_exhaustiveness_guidance('pr')}{_reviewer_blocking_scope_guidance('pr')}Treat the GitHub PR checks block above as authoritative for current CI state.
+{_reviewer_exhaustiveness_guidance('pr')}{_reviewer_blocking_scope_guidance('pr')}{_reviewer_unproducible_evidence_guidance('pr')}Treat the GitHub PR checks block above as authoritative for current CI state.
 Do not say or imply that tests passed globally unless the GitHub PR checks
 state is `passing` or `no_checks`. If only a local subset passed while GitHub
 checks are `failing`, `pending`, or `unavailable`, say that explicitly.
 Do not defer your review to wait for CI checks to finish. Review the PR now.
 Failing GitHub checks may justify a blocking review and a `blocking_items` entry.
 {PRE_COLLECTION_REVIEWER_GUIDANCE}
+{MANAGED_RECEIPT_REVIEWER_GUIDANCE}
 Pending or unavailable GitHub checks are an external wait state: mention them
 only in `summary`, never in `blocking_items`, and never as the sole reason to
 return `state: "blocking"` — only failing checks or real code-level findings
