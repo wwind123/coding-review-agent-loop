@@ -197,3 +197,105 @@ def test_sweep_flags_reach_the_config_from_the_cli(tmp_path):
     assert (config.plan_sweep_rounds, config.plan_sweep_reasoning_effort) == (1, "high")
     with pytest.raises(AgentLoopError, match="--plan-sweep-rounds must be"):
         config_from_args(parser.parse_args([*base_argv, "--plan-sweep-rounds", "-1"]), _FakeRunner())
+
+
+RETENTION_FLAG = "--subprocess-log-retention-days"
+RETENTION_ENV = "AGENT_LOOP_SUBPROCESS_LOG_RETENTION_DAYS"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"), [("14", 14), ("0", 0), ("never", 0), ("NEVER", 0), (" 7 ", 7)]
+)
+def test_retention_parser_accepts_days_and_never(raw, expected):
+    from coding_review_agent_loop.config import parse_subprocess_log_retention_days
+
+    assert parse_subprocess_log_retention_days(raw, source=RETENTION_FLAG) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ("-1", "must not be negative"),
+        ("1.5", "must be a non-negative integer number of days or 'never'"),
+        ("abc", "must be a non-negative integer number of days or 'never'"),
+        ("", "must be a non-negative integer number of days or 'never'"),
+        ("1e3", "must be a non-negative integer number of days or 'never'"),
+    ],
+)
+@pytest.mark.parametrize("source", [RETENTION_FLAG, RETENTION_ENV])
+def test_retention_parser_rejects_invalid_values(raw, message, source):
+    from coding_review_agent_loop.config import parse_subprocess_log_retention_days
+
+    with pytest.raises(AgentLoopError, match=re.escape(f"{source} {message}")):
+        parse_subprocess_log_retention_days(raw, source=source)
+
+
+def test_retention_precedence_is_cli_then_env_then_default(monkeypatch):
+    import argparse
+
+    from coding_review_agent_loop.config import resolve_subprocess_log_retention_days
+
+    monkeypatch.delenv(RETENTION_ENV, raising=False)
+    assert resolve_subprocess_log_retention_days(argparse.Namespace()) == 14
+    monkeypatch.setenv(RETENTION_ENV, "")
+    assert resolve_subprocess_log_retention_days(argparse.Namespace()) == 14
+    monkeypatch.setenv(RETENTION_ENV, "30")
+    assert resolve_subprocess_log_retention_days(argparse.Namespace()) == 30
+    cli = argparse.Namespace(subprocess_log_retention_days="never")
+    assert resolve_subprocess_log_retention_days(cli) == 0
+    monkeypatch.setenv(RETENTION_ENV, "abc")
+    with pytest.raises(AgentLoopError, match=RETENTION_ENV):
+        resolve_subprocess_log_retention_days(argparse.Namespace())
+    # An explicit (valid) CLI value wins even over an invalid env value.
+    assert resolve_subprocess_log_retention_days(
+        argparse.Namespace(subprocess_log_retention_days="5")
+    ) == 5
+    with pytest.raises(AgentLoopError, match=re.escape(RETENTION_FLAG)):
+        resolve_subprocess_log_retention_days(
+            argparse.Namespace(subprocess_log_retention_days="")
+        )
+
+
+def _retention_argv(tmp_path):
+    return [
+        "issue", "56", "--repo", "OWNER/REPO",
+        "--reviewer", "codex",
+        "--codex-dir", str(tmp_path / "codex"),
+        "--dangerous-agent-permissions",
+        "--subprocess-log-dir", str(tmp_path / "subprocess-logs" / "owner-repo" / "run"),
+    ]
+
+
+def test_retention_flag_reaches_the_config_from_the_cli(tmp_path, monkeypatch):
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.config import config_from_args
+
+    monkeypatch.delenv(RETENTION_ENV, raising=False)
+    parser = build_parser()
+    argv = _retention_argv(tmp_path)
+    assert config_from_args(parser.parse_args(argv), FakeRunner()).subprocess_log_retention_days == 14
+    config = config_from_args(parser.parse_args([*argv, RETENTION_FLAG, "45"]), FakeRunner())
+    assert config.subprocess_log_retention_days == 45
+    monkeypatch.setenv(RETENTION_ENV, "never")
+    assert config_from_args(parser.parse_args(argv), FakeRunner()).subprocess_log_retention_days == 0
+
+
+@pytest.mark.parametrize("value", ["-1", "1.5", "abc", ""])
+def test_invalid_retention_fails_config_before_any_pruning(tmp_path, monkeypatch, value):
+    import coding_review_agent_loop.logging as logging_module
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.config import config_from_args
+
+    monkeypatch.delenv(RETENTION_ENV, raising=False)
+    calls = []
+    monkeypatch.setattr(logging_module, "_prune_capture_roots", lambda *a, **k: calls.append(a))
+    args = build_parser().parse_args([*_retention_argv(tmp_path), RETENTION_FLAG, value])
+    with pytest.raises(AgentLoopError, match=re.escape(RETENTION_FLAG)):
+        config_from_args(args, FakeRunner())
+    assert calls == []
+
+
+def test_retention_flag_is_a_recovery_value_option():
+    from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS
+
+    assert RETENTION_FLAG in _RECOVERY_VALUE_OPTIONS

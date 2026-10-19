@@ -8936,7 +8936,31 @@ cache, outside managed checkouts. `--subprocess-log-dir` selects an explicit
 capture root; relative values are resolved from the primary agent directory,
 and paths equal to or beneath a managed checkout are rejected.
 Invocation directories hold a lifetime lease; cleanup removes only old,
-unlocked directories on a best-effort basis. `--log-dir` remains the legacy
+unlocked directories on a best-effort basis.
+
+`--subprocess-log-retention-days N` (or the
+`AGENT_LOOP_SUBPROCESS_LOG_RETENTION_DAYS` environment variable; the flag wins)
+sets how many days old capture directories are kept. The default is 14 days;
+`0` or `never` disables pruning entirely. Negative, fractional, non-numeric or
+empty values are rejected at startup, before any capture directory is touched.
+Pruning runs only for invocation directories in the
+`subprocess-logs/<slug>/<invocation>/` cache layout, and only touches real
+(non-symlink) directories that carry the capture marker, are older than the
+retention period, and are not leased by a live invocation. Such a directory is
+removed whole, including subdirectories, without following symlinks; the marker
+and lease file are removed last, so a partially failed removal is retried by a
+later sweep. Pruning is a no-op on platforms without `fcntl`.
+
+The setting governs only this tool's own pruning. Operators who want long-term
+retention should archive the captures elsewhere, for example with a separate
+scheduled job that copies them to private storage. Captures can contain
+anything an agent read or printed, including secrets from files or command
+output, so restrict access to both the cache and any archive. Directories left
+behind by the pruner before #1572 lost their capture marker when only their
+top-level files were removed; they are deliberately not removed automatically,
+and an operator may delete them manually once they are no longer needed.
+
+`--log-dir` remains the legacy
 root for usage summaries and salvage artifacts, and old checkout-resident logs
 are not migrated or rediscovered as active captures.
 

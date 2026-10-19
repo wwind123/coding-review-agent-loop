@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -77,6 +78,8 @@ DEFAULT_ANTIGRAVITY_MODELS: tuple[str, ...] = (
 DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS = 600
 MAX_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS = 3600
 DEFAULT_MAX_ROUNDS = 10
+# Capture-root retention in days; 0 disables pruning (#1572).
+DEFAULT_SUBPROCESS_LOG_RETENTION_DAYS = 14
 # Primary-phase plan stall stop threshold (#1103); 0 disables it.
 DEFAULT_PLAN_PRIMARY_STALL_ROUNDS = 8
 DEFAULT_PLAN_STEP_BACK_ROUNDS = 2
@@ -359,6 +362,8 @@ class AgentLoopConfig:
     # Active subprocess capture is kept outside mutable agent checkouts.  The
     # legacy log_dir remains the home for salvage and usage artifacts.
     subprocess_log_dir: Path | None = None
+    # Days before old capture roots are pruned; 0 disables pruning (#1572).
+    subprocess_log_retention_days: int = DEFAULT_SUBPROCESS_LOG_RETENTION_DAYS
     # Optional analyzer agent for discuss mode (#467). None keeps plain
     # direct deliberation unchanged. May coincide with a reviewer.
     discuss_analyzer: AgentName | None = None
@@ -1397,6 +1402,38 @@ def default_subprocess_log_dir(repo: str) -> Path:
         default_cache_root() / "subprocess-logs" / repo_cache_slug(repo)
         / f"{datetime_stamp()}-{uuid.uuid4().hex}"
     )
+
+
+_SUBPROCESS_LOG_RETENTION_ENV = "AGENT_LOOP_SUBPROCESS_LOG_RETENTION_DAYS"
+
+
+def parse_subprocess_log_retention_days(raw: str, *, source: str) -> int:
+    """Parse a retention value: a non-negative integer of days, or ``never`` (0)."""
+    value = str(raw).strip()
+    if value.lower() == "never":
+        return 0
+    if value.startswith("-") and re.fullmatch(r"[0-9]+", value[1:]):
+        raise AgentLoopError(
+            f"{source} must not be negative; use 0 or 'never' to disable pruning (got {raw!r})"
+        )
+    if not re.fullmatch(r"[0-9]+", value):
+        raise AgentLoopError(
+            f"{source} must be a non-negative integer number of days or 'never' (got {raw!r})"
+        )
+    return int(value)
+
+
+def resolve_subprocess_log_retention_days(args: argparse.Namespace) -> int:
+    """--subprocess-log-retention-days, then the env var, then 14 days (#1572)."""
+    value = getattr(args, "subprocess_log_retention_days", None)
+    if value is not None:
+        return parse_subprocess_log_retention_days(
+            value, source="--subprocess-log-retention-days"
+        )
+    raw = os.environ.get(_SUBPROCESS_LOG_RETENTION_ENV, "")
+    if raw:
+        return parse_subprocess_log_retention_days(raw, source=_SUBPROCESS_LOG_RETENTION_ENV)
+    return DEFAULT_SUBPROCESS_LOG_RETENTION_DAYS
 
 
 def default_agent_memory_dir(repo: str) -> Path:
@@ -2471,6 +2508,7 @@ def config_from_args(
             primary_dir=primary_dir,
             managed_roots=(claude_dir, codex_dir, gemini_dir, antigravity_dir, *store_roots),
         ),
+        subprocess_log_retention_days=resolve_subprocess_log_retention_days(args),
         progress_interval_seconds=args.progress_interval_seconds,
         agent_max_retries=args.agent_max_retries,
         agent_retry_backoff_seconds=tuple(args.agent_retry_backoff_seconds),

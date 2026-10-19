@@ -10,3 +10,4 @@ never rewritten or deleted. The detail doc describes the current design.
 - Same-UID live races against `~/.ssh` are left out of scope for the SSH transport (#1371).
 - Antigravity tracks quota exhaustion per quota group for the logical run, so a verified exhaustion skips the whole group with no retry instead of retrying each model (#1236).
 - The Antigravity `semantic-dedupe` turn reuses the isolated `repair` path (sibling GEMINI lock, no checkout snapshot, strict empty allowlist) with a stdout-only classification contract, so a classifier never creates git metadata in its temporary directory or reads a stale response file (#1472).
+- Capture-root retention is an operator setting (default 14 days, 0 disables); pruning never follows symlinks, removes expired roots whole, and deletes the marker and lease last so partial failures are retried (#1572).
