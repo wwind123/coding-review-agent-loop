@@ -5882,6 +5882,25 @@ def test_pr_review_prompt_treats_managed_receipts_as_direct_runs_1568(tmp_path, 
     assert prompts_module._reviewer_blocking_scope_guidance("pr") + guidance in review
 
 
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_pr_unproducible_rule_defers_human_only_evidence_to_exact_head_requests_1568(tmp_path, compact):
+    """Review item-1: the new rule must not divert the exact-head evidence channel."""
+    config = make_config(tmp_path, coder="claude", reviewer="codex")
+    review = build_review_prompt(77, 1, config, reviewer="codex", compact_context=compact)
+    flat = " ".join(review.split())
+    carve_out = (
+        "Exception: evidence that only a human can supply and that an approved contract "
+        "requires at the exact reviewed head still goes only in `exact_head_evidence_requests`"
+    )
+    assert carve_out in flat
+    assert "never move it to `summary` or `future_followups` under this rule" in flat
+    assert prompts_module.PR_REVIEW_EVIDENCE_REQUEST_GUIDANCE in review
+    pr_guidance = prompts_module._reviewer_unproducible_evidence_guidance("pr")
+    # The carve-out sits inside the rule, before its non-blocking fallback ends.
+    assert "exact_head_evidence_requests" in pr_guidance
+    assert "exact_head_evidence_requests" not in prompts_module._reviewer_unproducible_evidence_guidance("plan")
+
 @pytest.mark.parametrize("compact", [False, True])
 def test_plan_review_prompt_states_plan_flow_receipt_and_unproducible_rules_1568(tmp_path, compact):
     config = make_config(tmp_path)

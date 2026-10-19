@@ -952,6 +952,15 @@ def _reviewer_unproducible_evidence_guidance(flow: str) -> str:
         "the plan for relying on such receipts, and do not require it to state otherwise. "
         if flow == "plan" else ""
     )
+    # The PR flow already has a dedicated human-only evidence channel; the
+    # unproducible-evidence rule must not divert it (#1568 review item-1).
+    exact_head_carve_out = (
+        "Exception: evidence that only a human can supply and that an approved contract "
+        "requires at the exact reviewed head still goes only in "
+        "`exact_head_evidence_requests`, as described in the evidence-request rules; "
+        "never move it to `summary` or `future_followups` under this rule. "
+        if flow == "pr" else ""
+    )
     return (
         "Unproducible evidence: evidence the loop cannot produce by construction is never "
         "a blocking finding. Examples are a tool-captured observation of a command run "
@@ -964,6 +973,7 @@ def _reviewer_unproducible_evidence_guidance(flow: str) -> str:
         "an item because the requested evidence cannot be produced, and the dispute is "
         "accurate, disposition it as `resolved` (when the producible evidence satisfies the "
         "intent) or `future` rather than keeping it blocking. "
+        f"{exact_head_carve_out}"
         f"{plan_wrapper_rule}"
         "This narrows evidence requests only: the "
         f"{change} itself, and evidence the loop can produce such as a missing or failing "

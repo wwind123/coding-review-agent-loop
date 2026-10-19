@@ -1834,7 +1834,9 @@ runner, a reviewer-side test run when reviewers may not execute commands) is
 never blocking: reviewers accept the closest producible form or record the
 gap as a non-blocking note for a human, and an accurate coder dispute on that
 basis is dispositioned `resolved` or `future`. A missing or failing receipt
-the loop can produce keeps the existing rules. Planner prompts phrase
+the loop can produce keeps the existing rules, and in PR review, human-only
+evidence that an approved contract requires at the exact reviewed head still
+goes only in `exact_head_evidence_requests`. Planner prompts phrase
 verification rows that need captured evidence as
 `agent-loop run-tests -- <command>`.
 
