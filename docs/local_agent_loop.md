@@ -5529,18 +5529,30 @@ Use these flags to control it:
 agent-loop pr 123 --repo OWNER/REPO --no-agent-memory
 agent-loop pr 123 --repo OWNER/REPO --refresh-agent-memory
 agent-loop pr 123 --repo OWNER/REPO --refresh-test-profile
-agent-loop pr 123 --repo OWNER/REPO --agent-memory-dir .cache/agent-loop-memory
+agent-loop pr 123 --repo OWNER/REPO --agent-memory-dir "$HOME/.cache/agent-loop-memory/OWNER-REPO/memory"
 ```
 
+The review-round spool lives beside the memory directory, under
+`<agent-memory-dir>/../private/review-round-spool/`. Review rounds therefore
+refuse, with an error naming the overlapping path, any memory directory whose
+spool would lie inside an agent checkout, a reviewer seat workdir, the
+repository checkout agent-loop runs from, or the response directory (#1560):
+a reviewer working in that tree could otherwise read the withheld round
+results. Use an absolute path outside every checkout, as in the example above.
+
 Relative `--agent-memory-dir` values are resolved inside the active coder
-checkout when that checkout is an explicit directory; for a default per-run
-worktree they resolve under the repo-keyed user cache
-(`<user cache>/coding-review-agent-loop/repos/OWNER-REPO/<value>`) so memory
-survives worktree removal. Use `--no-agent-memory` or a custom short-lived
-`--agent-memory-dir` for sensitive repositories where local cache retention is
-undesirable. If a custom memory directory uses the repo-local `.agent-loop`
-parent, that parent is ignored automatically so generated memory files are not
-accidentally committed. If the previous memory commit cannot be diffed against
+checkout when that checkout is an explicit directory, so with an explicit
+`--claude-dir`/`--codex-dir` checkout a relative value lands inside that
+checkout and is refused at the first review round (in an issue run, that is
+after the coder has already implemented and pushed). For a default per-run
+worktree, relative values resolve under the repo-keyed user cache
+(`<user cache>/coding-review-agent-loop/repos/OWNER-REPO/<value>`), outside
+every checkout, so they keep working and memory survives worktree removal. Use
+`--no-agent-memory` or a custom short-lived `--agent-memory-dir` for sensitive
+repositories where local cache retention is undesirable. If a custom memory
+directory outside every checkout uses an `.agent-loop` parent, that parent is
+ignored automatically so generated memory files are not accidentally
+committed. If the previous memory commit cannot be diffed against
 the current commit, the loop logs the git failure and treats all tracked files
 as changed for that refresh.
 
