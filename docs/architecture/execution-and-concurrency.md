@@ -37,7 +37,20 @@ any worktree. The outermost `workdir_claim_scope` runs registered finalizers
 failure. At startup a run prunes worktrees whose owner record matches and whose
 claim lock is free; unrecognized entries are logged and left untouched.
 
-**Pack compaction.** Each import writes one pack and the hardened config keeps
+**Incremental import.** `import_ref` exports only objects not reachable from
+destination ref tips that the private fetch repository also holds as commits:
+those tips are passed to `pack-objects --revs --thin` as negative revs and the
+confined `index-pack --fix-thin` completes the thin pack. When the fetched
+commit is already a ref tip whose closure is complete, no pack is written.
+Destination tips are exclusion hints only, never proof of completeness: every
+path verifies the fetched commit's full reachable closure in the destination
+(`rev-list --objects --missing=error`, no history excluded) before the
+tracking-ref compare-and-swap, and an incomplete closure or a failed
+incremental export falls back once to a full export, which repairs missing
+history. If that also fails, the fixed import error is raised and the ref is
+not moved. The network fetch into a fresh private repository is unchanged.
+
+**Pack compaction.** Each import writes at most one pack and the hardened config keeps
 `gc.auto=0`, so after the last import in each locked fetch (`prepare_store`,
 `pin_pr_head`, and the explicit-checkout base and PR syncs in `config.py`)
 `compact_packs_if_needed` runs while the store or checkout `flock` is still
@@ -49,6 +62,8 @@ into a private scratch directory; `git repack` cannot be used because it execs
 only then are the snapshot packs deleted. Kept, promisor and post-snapshot
 packs are never touched and nothing is pruned, so SHA-pinned PR heads survive.
 A missing lock raises; any other failure is logged and never fails the fetch.
+Incremental imports shrink each pack, but compaction remains the bound on
+pack count.
 
 **Agent-loop-owned Git boundary (`secure_git.py`, `git_transport.py`).** Every
 local text, binary, and cancellable Git call that can read an agent checkout
