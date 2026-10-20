@@ -449,3 +449,21 @@ def test_dependency_error_message_lists_each_prerequisite():
     assert "- #62 (stage s2, phase 2; earlier stage in the recorded order" in text
     assert error.EXIT_CODE == 5
     assert _phase_progress.STATUS_NOT_DISPATCHED == "not-dispatched"
+
+
+def test_open_dependency_with_verified_integration_merge_proceeds_to_dispatch(
+    tmp_path, monkeypatch
+):
+    """Row dep-integration-verified through child entry: dispatch proceeds, no close."""
+    scenario = GuardScenario(
+        phases=_two_stage(), stage_id="s2", handoffs=(handoff_for("s1"),),
+        child_states={61: "OPEN"}, canonical_prs={61: (71, "MERGED")},
+        verifications={61: IntegrationMergeVerification(
+            "integration-verified", base_ref="integration/x")},
+    )
+    runner = install(monkeypatch, scenario)
+    # install() makes close_child_after_integration_merge raise if called.
+    assert run_cli(monkeypatch, tmp_path, runner, scenario) == 23
+    assert ("verify", 61) in scenario.reads
+    assert scenario.events == ["memory", "dispatch"]
+    assert comment_writes(runner) == []
