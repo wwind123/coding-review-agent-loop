@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -25,6 +26,8 @@ import shutil
 import stat
 import subprocess
 import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -594,6 +597,109 @@ class _CompactionSkip(Exception):
     """A fixed, stderr-free reason why compaction was abandoned."""
 
 
+class _CompactionTimeout(_CompactionSkip):
+    """A confined compaction command exceeded its timeout; starts a backoff (#1580)."""
+
+
+# A store whose compaction keeps timing out would otherwise hold the store
+# flock for the full timeout on every locked fetch.  A timeout records a
+# private per-store marker beside the lock file, and later fetches skip the
+# expensive pack commands until its deadline: 1 h, doubling per consecutive
+# timeout, capped at 24 h.  Any marker that is not plainly valid fails open.
+PACK_COMPACTION_BACKOFF_BASE_SECONDS = 3600
+PACK_COMPACTION_BACKOFF_MAX_SECONDS = 86400
+PACK_COMPACTION_BACKOFF_MAX_FAILURES = 1000
+_BACKOFF_SATURATION_EXPONENT = 5  # 3600 * 2**5 already exceeds the cap.
+_BACKOFF_MARKER_MAX_BYTES = 4096
+_now = time.time
+
+
+def _backoff_delay(failures: int) -> int:
+    exponent = min(max(failures, 1) - 1, _BACKOFF_SATURATION_EXPONENT)
+    return min(PACK_COMPACTION_BACKOFF_BASE_SECONDS * 2 ** exponent, PACK_COMPACTION_BACKOFF_MAX_SECONDS)
+
+
+def _backoff_marker_path(checkout: Path) -> Path:
+    return store_lock_root() / f"{store_key(checkout)}.compaction-backoff"
+
+
+def _read_backoff(checkout: Path, now: float) -> tuple[int, float] | None:
+    """``(failures, next_attempt_at)`` from a valid marker, else None (fail open)."""
+    try:
+        path = _backoff_marker_path(checkout)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(path, flags)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                return None
+            raw = os.read(descriptor, _BACKOFF_MARKER_MAX_BYTES + 1)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return None
+    if len(raw) > _BACKOFF_MARKER_MAX_BYTES:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None
+    failures, deadline = data.get("failures"), data.get("next_attempt_at")
+    if not isinstance(failures, int) or isinstance(failures, bool):
+        return None
+    if not 1 <= failures <= PACK_COMPACTION_BACKOFF_MAX_FAILURES:
+        return None
+    if not isinstance(deadline, (int, float)) or isinstance(deadline, bool) or not math.isfinite(deadline):
+        return None
+    # A deadline beyond the cap cannot come from a valid write (clock skew or
+    # forgery); reject it rather than clamping it against a moving clock.
+    if deadline > now + PACK_COMPACTION_BACKOFF_MAX_SECONDS:
+        return None
+    return failures, float(deadline)
+
+
+def _write_backoff(checkout: Path, failures: int, now: float) -> tuple[int, float]:
+    failures = min(failures, PACK_COMPACTION_BACKOFF_MAX_FAILURES)
+    deadline = now + _backoff_delay(failures)
+    path = _backoff_marker_path(checkout)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "failures": failures, "next_attempt_at": deadline}, handle)
+        # os.replace swaps out even a planted FIFO or symlink without opening it.
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
+    return failures, deadline
+
+
+def _clear_backoff(checkout: Path) -> None:
+    # Clearing is best effort: a leftover marker still expires within 24 h.
+    with contextlib.suppress(OSError):
+        _backoff_marker_path(checkout).unlink()
+
+
+def _manual_repack_hint(checkout: Path) -> str:
+    return (f"to compact manually run `git -C {checkout} repack -a -d --keep-unreachable` "
+            "while no agent-loop run uses this store")
+
+
+def _utc_iso(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _format_duration(seconds: int) -> str:
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600} h"
+    return f"{seconds} s"
+
+
 def _compaction_log(config: Any, message: str) -> None:
     if not getattr(config, "quiet", False):
         log(config, message)
@@ -631,7 +737,7 @@ def _confined_run(args: tuple[str, ...], *, checkout: Path, timeout: int, label:
                                 check=False, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         # subprocess.run has already killed and reaped the child.
-        raise _CompactionSkip(f"{label} timed out") from exc
+        raise _CompactionTimeout(f"{label} timed out") from exc
     if result.returncode != 0:
         raise _CompactionSkip(f"{label} failed (exit {result.returncode})")
     return result.stdout or b""
@@ -671,7 +777,17 @@ def _compact(checkout: Path, *, config: Any, runner: Any) -> None:
     packdir = _pack_directory(checkout, runner)
     snapshot = _snapshot_packs(packdir)
     if len(snapshot) <= PACK_COMPACTION_THRESHOLD:
+        # At or below the threshold (for example after a manual repack): no
+        # backoff should outlive the condition that caused it.
+        _clear_backoff(checkout)
         return
+    backoff = _read_backoff(checkout, now := _now())
+    if backoff is not None and now < backoff[1]:
+        failures, deadline = backoff
+        raise _CompactionSkip(
+            f"backoff after {failures} consecutive timeout(s); next attempt after "
+            f"{_utc_iso(deadline)}; {_manual_repack_hint(checkout)}"
+        )
     inventory: set[str] = set()
     for pack in snapshot.values():
         inventory |= _pack_index_ids(pack.with_suffix(".idx"), checkout=checkout)
@@ -715,10 +831,34 @@ def _compact(checkout: Path, *, config: Any, runner: Any) -> None:
         for suffix in (".idx", *_PACK_SIDECARS):
             with contextlib.suppress(FileNotFoundError):
                 pack.with_suffix(suffix).unlink()
+    _clear_backoff(checkout)
     _compaction_log(
         config,
         f"Compacted {len(snapshot)} packs into one for {checkout} "
         f"({len(_snapshot_packs(packdir))} non-kept packs remain).",
+    )
+
+
+def _record_timeout(checkout: Path, *, config: Any, reason: str) -> None:
+    """Start or extend the backoff after a timeout; a write failure is only logged."""
+    # This runs inside an ``except`` clause, so nothing may escape it.
+    try:
+        now = _now()
+        previous = _read_backoff(checkout, now)
+        failures = min((previous[0] if previous else 0) + 1, PACK_COMPACTION_BACKOFF_MAX_FAILURES)
+        failures, _deadline = _write_backoff(checkout, failures, now)
+    except Exception:
+        _compaction_log(
+            config,
+            f"Pack compaction for {checkout} skipped: {reason}; backoff marker not written; "
+            f"{_manual_repack_hint(checkout)}",
+        )
+        return
+    _compaction_log(
+        config,
+        f"Pack compaction for {checkout} skipped: {reason}; backing off "
+        f"{_format_duration(_backoff_delay(failures))} (consecutive timeouts: {failures}); "
+        f"{_manual_repack_hint(checkout)}",
     )
 
 
@@ -734,6 +874,8 @@ def compact_packs_if_needed(checkout: Path, *, config: Any, runner: Any) -> None
         return
     try:
         _compact(checkout, config=config, runner=runner)
+    except _CompactionTimeout as exc:
+        _record_timeout(checkout, config=config, reason=str(exc))
     except _CompactionSkip as exc:
         _compaction_log(config, f"Pack compaction for {checkout} skipped: {exc}")
     except Exception as exc:

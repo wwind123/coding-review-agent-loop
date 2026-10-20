@@ -64,7 +64,23 @@ only then are the snapshot packs deleted. Kept, promisor and post-snapshot
 packs are never touched and nothing is pruned, so SHA-pinned PR heads survive.
 A missing lock raises; any other failure is logged and never fails the fetch.
 Incremental imports shrink each pack, but compaction remains the bound on
-pack count.
+pack count. A timeout of `pack-objects`, `index-pack` or `show-index` (and
+only a timeout) records a private backoff marker for the store beside its
+lock file in the per-user store-lock root, keyed by the same store key, so no
+checkout can plant or remove it. While its deadline is ahead, later locked
+fetches still run the cheap `rev-parse --git-common-dir` lookup and pack
+listing but none of the expensive pack commands, so the flock is not held for
+the full timeout on every fetch. The window is 1 h, doubles per consecutive
+timeout and is capped at 24 h; the exponent saturates and the failure count
+is bounded. A successful compaction, or a pack count at or below the
+threshold (for example after a manual repack), clears the marker. The marker
+is opened non-blocking without following symlinks and validated by `fstat`
+(regular, owned by the user) before reading; an unreadable, non-regular,
+oversized, malformed, out-of-range or more-than-24-h-future marker fails open
+to a normal attempt, so no marker suppresses compaction for more than 24 h.
+Both the timeout log and the backoff skip log carry a fixed hint to run
+`git -C <checkout> repack -a -d --keep-unreachable` while no run uses the
+store.
 
 **Agent-loop-owned Git boundary (`secure_git.py`, `git_transport.py`).** Every
 local text, binary, and cancellable Git call that can read an agent checkout
