@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import threading
 from pathlib import Path
@@ -91,8 +92,9 @@ def unreferenced_commit(repo: Path, name: str) -> str:
 class Repo:
     """A checkout with one pack per commit and a packed, now-unreferenced PR head."""
 
-    def __init__(self, tmp_path: Path, *, packs: int = THRESHOLD + 2, bitmap: bool = False):
-        self.path = tmp_path / "checkout"
+    def __init__(self, tmp_path: Path, *, packs: int = THRESHOLD + 2, bitmap: bool = False,
+                 name: str = "checkout"):
+        self.path = tmp_path / name
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.path)], check=True)
         self.commits: list[str] = []
         for index in range(packs):
@@ -306,7 +308,7 @@ def test_command_failure_is_logged_and_keeps_old_packs(tmp_path, monkeypatch, lo
 
 
 def _hint(checkout: Path) -> str:
-    return (f"to compact manually run `git -C {checkout} repack -a -d --keep-unreachable` "
+    return (f"to compact manually run `git -C {shlex.quote(str(checkout))} repack -a -d --keep-unreachable` "
             "while no agent-loop run uses this store")
 
 
@@ -328,6 +330,20 @@ def test_timeout_records_backoff_and_logs_the_manual_repack_hint(tmp_path, monke
     info = marker(repo.path).lstat()
     assert (info.st_mode & 0o777) == 0o600 and info.st_uid == os.getuid()
     assert [name for name in os.listdir(marker(repo.path).parent) if name.endswith(".tmp")] == []
+
+
+@pytest.mark.parametrize("name", ["my store", "it's $(touch pwned); `id` & x"],
+                         ids=["space", "metacharacters"])
+def test_manual_repack_hint_shell_quotes_the_checkout_in_both_logs(tmp_path, monkeypatch, logs, clock, name):
+    repo = Repo(tmp_path, name=name)
+    _failing_subprocess(monkeypatch, command="pack-objects", mode="timeout")
+    repo.compact()
+    repo.compact()
+
+    assert len(logs) == 2 and "backing off" in logs[0] and "backoff after" in logs[1]
+    for message in logs:
+        command = message.split("to compact manually run `", 1)[1].rsplit("` while no agent-loop run", 1)[0]
+        assert shlex.split(command) == ["git", "-C", str(repo.path), "repack", "-a", "-d", "--keep-unreachable"]
 
 
 def test_skip_while_backoff_is_active_runs_no_pack_command(tmp_path, monkeypatch, logs, clock):
@@ -436,8 +452,14 @@ def _in_window(now: float) -> dict:
     {"version": 1, "failures": 1, "next_attempt_at": float("nan")},
     # Ten years ahead: clock skew or forgery, never a valid write.
     {"version": 1, "failures": 1, "next_attempt_at": 1_800_000_000.0 + 10 * 365 * 86400},
+    # An integer deadline too large for a float raises OverflowError on conversion.
+    '{"version": 1, "failures": 1, "next_attempt_at": 1' + "0" * 400 + "}",
+    # Deep nesting under the byte cap raises RecursionError inside json.loads.
+    "[" * 1500 + "]" * 1500,
+    '{"version": 1, "failures": 1, "next_attempt_at": ' + "[" * 1500 + "]" * 1500 + "}",
 ], ids=["truncated", "non-utf8", "oversized", "list", "version", "no-version", "bool-failures",
-        "bool-deadline", "string-failures", "string-deadline", "zero", "too-many", "inf", "nan", "far-future"])
+        "bool-deadline", "string-failures", "string-deadline", "zero", "too-many", "inf", "nan", "far-future",
+        "overflowing-deadline", "deep-list", "deep-deadline"])
 def test_invalid_marker_fails_open(tmp_path, monkeypatch, logs, clock, payload):
     repo = Repo(tmp_path)
     plant_marker(repo.path, payload)

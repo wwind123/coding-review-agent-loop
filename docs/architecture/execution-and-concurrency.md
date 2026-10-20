@@ -76,9 +76,11 @@ is bounded. A successful compaction, or a pack count at or below the
 threshold (for example after a manual repack), clears the marker. The marker
 is opened non-blocking without following symlinks and validated by `fstat`
 (regular, owned by the user) before reading; an unreadable, non-regular,
-oversized, malformed, out-of-range or more-than-24-h-future marker fails open
+oversized, malformed (including any parse failure such as deep nesting or an
+overflowing number), out-of-range or more-than-24-h-future marker fails open
 to a normal attempt, so no marker suppresses compaction for more than 24 h.
-Both the timeout log and the backoff skip log carry a fixed hint to run
+Both the timeout log and the backoff skip log carry a fixed hint, with the
+checkout shell-quoted, to run
 `git -C <checkout> repack -a -d --keep-unreachable` while no run uses the
 store.
 

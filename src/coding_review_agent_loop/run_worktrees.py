@@ -22,6 +22,7 @@ import math
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -640,10 +641,17 @@ def _read_backoff(checkout: Path, now: float) -> tuple[int, float] | None:
         return None
     if len(raw) > _BACKOFF_MARKER_MAX_BYTES:
         return None
+    # Any failure to decode or validate the untrusted bytes, including
+    # RecursionError from deep nesting and OverflowError from a huge integer
+    # deadline, is an invalid marker: it must fail open, never skip compaction.
     try:
-        data = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+        return _parse_backoff(raw, now)
+    except Exception:
         return None
+
+
+def _parse_backoff(raw: bytes, now: float) -> tuple[int, float] | None:
+    data = json.loads(raw.decode("utf-8"))
     if not isinstance(data, dict) or data.get("version") != 1:
         return None
     failures, deadline = data.get("failures"), data.get("next_attempt_at")
@@ -651,13 +659,16 @@ def _read_backoff(checkout: Path, now: float) -> tuple[int, float] | None:
         return None
     if not 1 <= failures <= PACK_COMPACTION_BACKOFF_MAX_FAILURES:
         return None
-    if not isinstance(deadline, (int, float)) or isinstance(deadline, bool) or not math.isfinite(deadline):
+    if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+        return None
+    deadline = float(deadline)
+    if not math.isfinite(deadline):
         return None
     # A deadline beyond the cap cannot come from a valid write (clock skew or
     # forgery); reject it rather than clamping it against a moving clock.
     if deadline > now + PACK_COMPACTION_BACKOFF_MAX_SECONDS:
         return None
-    return failures, float(deadline)
+    return failures, deadline
 
 
 def _write_backoff(checkout: Path, failures: int, now: float) -> tuple[int, float]:
@@ -686,7 +697,7 @@ def _clear_backoff(checkout: Path) -> None:
 
 
 def _manual_repack_hint(checkout: Path) -> str:
-    return (f"to compact manually run `git -C {checkout} repack -a -d --keep-unreachable` "
+    return (f"to compact manually run `git -C {shlex.quote(str(checkout))} repack -a -d --keep-unreachable` "
             "while no agent-loop run uses this store")
 
 
