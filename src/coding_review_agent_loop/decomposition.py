@@ -237,6 +237,50 @@ def handoff_effective_disposition(handoff: PhaseImplementationHandoffMetadata) -
     return handoff.execution_disposition or EXECUTION_DISPOSITION_DIRECT
 
 
+def _child_resume_hint(child_issue_number: int, disposition: str) -> str:
+    """Return the command that starts or resumes a child on its routed path.
+
+    There is no ``--direct`` flag: a direct-implementation child is entered
+    with the plain issue command, and every other agent route plans first.
+    """
+    if disposition == EXECUTION_DISPOSITION_PLANNING:
+        return f"agent-loop issue {child_issue_number} --plan-first --plan-execution-mode auto"
+    return f"agent-loop issue {child_issue_number}"
+
+
+def child_relaunch_command(phase: PlanPhase | RecordedPhase, issue_number: int | None) -> str:
+    """Map one materialized phase to its relaunch instruction (#1331).
+
+    Direct-implementation children use the plain issue command; reviewed
+    child planning and legacy-ambiguous children (``None``, which the routing
+    seam fails closed to planning) use the planning command; human-owned
+    stages name no agent-loop command at all.
+    """
+    automation = phase.automation
+    if automation != "agent-pr":
+        child = f"#{issue_number}" if issue_number is not None else "its child issue"
+        return (
+            f"human-owned ({automation}): no agent-loop command; close child {child} "
+            "when the work is done"
+        )
+    if issue_number is None:
+        return "relaunch command unavailable: no child issue number was recorded"
+    disposition = getattr(phase, "execution_disposition", None)
+    if disposition == EXECUTION_DISPOSITION_DIRECT:
+        return f"`{_child_resume_hint(issue_number, EXECUTION_DISPOSITION_DIRECT)}`"
+    return f"`{_child_resume_hint(issue_number, EXECUTION_DISPOSITION_PLANNING)}`"
+
+
+def child_relaunch_line(
+    index: int, phase: PlanPhase | RecordedPhase, issue_number: int | None
+) -> str:
+    """Render one per-child relaunch line for summaries and stdout (#1331)."""
+    return (
+        f"{index}. {sanitize_historical_text(phase.title)}: "
+        f"{child_relaunch_command(phase, issue_number)}"
+    )
+
+
 @dataclass(frozen=True)
 class OneShotImplementationHandoffMetadata:
     parent_issue: int
@@ -3112,6 +3156,22 @@ def _render_decomposition_parent_summary(
                 f"- {index}. {sanitize_historical_text(item.phase.title)}: "
                 f"{sanitize_historical_text(disposition or 'legacy-ambiguous (routes to child planning)')}"
             )
+    if topology_source == EXECUTION_TOPOLOGY_SOURCE:
+        # Advisory operator guidance only (#1331): it carries no protocol
+        # authority and is not part of the encoded record payload.
+        lines.extend(["", "Relaunch commands:"])
+        for index, item in enumerate(created, start=1):
+            lines.append(f"- {child_relaunch_line(index, item.phase, item.issue_number)}")
+        lines.extend(
+            [
+                "",
+                "These commands reflect each child's reviewed disposition at decomposition "
+                "time; a signed child-disposition override posted before dispatch changes "
+                "the route. Staged children are delivered in order: a later child refuses "
+                "to start until every earlier one is complete. Append your own reviewer, "
+                "model and permission flags.",
+            ]
+        )
     lines.extend(
         [
             "",

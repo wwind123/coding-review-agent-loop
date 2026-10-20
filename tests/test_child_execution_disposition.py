@@ -710,3 +710,36 @@ def test_override_parser_ignores_unsigned_and_malformed_records():
     )
     assert records == ()
     assert ignored and "schema_version must be 1" in ignored[0]
+
+
+def test_planning_route_child_with_open_dependency_pr_stops_before_handoff(
+    tmp_path, monkeypatch, capsys
+):
+    """Row dep-open-planning-blocks (#1331): no planning handoff, no planner turn."""
+    from dependency_guard_helpers import (
+        GuardScenario,
+        comment_writes,
+        handoff_for,
+        install,
+        plan_phase,
+        run_cli,
+    )
+
+    phases = (
+        plan_phase("s1"),
+        plan_phase("s2", disposition=EXECUTION_DISPOSITION_PLANNING, depends_on=("s1",)),
+    )
+    scenario = GuardScenario(
+        phases=phases, stage_id="s2", handoffs=(handoff_for("s1"),),
+        canonical_prs={61: (71, "OPEN")},
+    )
+    runner = install(monkeypatch, scenario)
+    assert run_cli(monkeypatch, tmp_path, runner, scenario, plan_first=True) == 5
+    err = capsys.readouterr().err
+    assert "dependency #61 (stage s1) is not merged" in err
+    assert "PR #71 is OPEN" in err
+    assert err.rstrip().endswith(
+        "Then rerun: `agent-loop issue 62 --plan-first --plan-execution-mode auto`"
+    )
+    assert scenario.events == []
+    assert comment_writes(runner) == []

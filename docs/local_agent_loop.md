@@ -222,6 +222,55 @@ validation applies the same comparison on parent dispatch, direct child
 invocation, and skill mode, so an already approved child plan that satisfies
 these rules resumes PR review without replanning.
 
+#### Relaunch commands and staged order
+
+The approved-plan-v1 decomposition summary on the parent, and the parent's
+decompose-only and implement-by-phase stdout, list one relaunch command per
+child, derived from that child's reviewed disposition:
+
+- `direct-implementation`: `agent-loop issue <child>` (there is no `--direct`
+  flag).
+- `requires-child-planning`, or a legacy-ambiguous child without a recorded
+  disposition: `agent-loop issue <child> --plan-first --plan-execution-mode auto`.
+- `human-owned` stages: no agent-loop command; close the child once the work
+  is done.
+
+The commands reflect the reviewed disposition at decomposition time; a signed
+override posted before dispatch changes the route. Append your own reviewer,
+model and permission flags. The `--implementation-coder*` flags require
+`--plan-first`, so they apply only to planning children.
+
+Staged children are started in recorded order. Before direct child entry
+posts any handoff or invokes a coder or planner, it checks every earlier stage
+of the recorded order, not only the declared `depends_on_stage_ids`. It uses
+the parent's own staged-progress rules, read-only: an agent stage counts only
+with an authenticated MERGED canonical PR, and a child left open after an
+integration-branch merge counts only when that merge passes the same base and
+trust verification the parent's closure uses. A human-owned stage counts once
+its child is closed. The first undelivered stage stops the run with
+`dependency #M (stage k) is not merged`, a recovery line for each undelivered
+stage, and the command to rerun. A stage that was never started gets its own
+relaunch command. Broken dependency provenance (a declared stage missing from
+the summary, or a child without an issue number) is an ordinary failure
+(exit code 1).
+
+#### Issue command exit codes
+
+`agent-loop issue` exits with:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | The run finished. |
+| 1 | An orchestration failure; read the diagnostic and repair before rerunning. |
+| 2 | Argument errors, a worker-budget refusal, or a staged outcome that needs a human decision (printed as JSON). |
+| 3 | A rate-limit reset is beyond the auto-retry threshold; retry later. |
+| 4 | The run reached a human decision boundary. |
+| 5 | A decomposition prerequisite is not merged: an earlier stage of this child's parent topology is not delivered yet. Finish that stage, then rerun. |
+
+These codes apply to the `issue` command. `agent-loop run-tests` passes through
+the wrapped command's own exit status, so pytest's exit code 5 (no tests
+collected) can appear there with a different meaning.
+
 ### Re-planning an approved child plan
 
 The planning-time check above prevents a *new* child plan from being approved

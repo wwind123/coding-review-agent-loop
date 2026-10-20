@@ -357,6 +357,7 @@ from .execution_policy import (
     resolve_child_execution_route,
     _fresh_phase_marker_payload,
     _child_resume_hint,
+    child_relaunch_line,
     _post_child_planning_handoff,
     _print_staged_phase_progress,
     _print_staged_terminal_report,
@@ -4816,6 +4817,12 @@ def _run_plan_first_loop_body(
                             "Remaining child work after the first phase: "
                             f"{', '.join(remaining_stage_ids) or 'none'}"
                         )
+                    # One relaunch line per child, by its reviewed route (#1331).
+                    print("Relaunch commands:")
+                    for line in _staged_child_relaunch_lines(
+                        normalized_topology[0], staged_outcome
+                    ):
+                        print(f"  {line}")
                 if mode == "decompose-only":
                     print(f"Issue #{issue_number} approved plan decomposed into child issues.")
                     return 0
@@ -5800,4 +5807,22 @@ def _run_plan_first_loop_body(
     raise AgentLoopError(
         f"Reached max planning rounds ({plan_budget_label()}) for issue #{issue_number}; "
         "human review required."
+    )
+
+
+def _staged_child_relaunch_lines(decomposition, outcome) -> tuple[str, ...]:
+    """Per-child relaunch lines for the parent's stdout report (#1331).
+
+    The route comes from the reviewed topology phase, which carries the
+    execution disposition an adopted ``RecordedPhase`` does not; the child
+    number comes from the materialized outcome at the same index.
+    """
+    phases = decomposition.phases
+    return tuple(
+        child_relaunch_line(
+            index,
+            phases[index - 1] if index <= len(phases) else created.phase,
+            created.issue_number,
+        )
+        for index, created in enumerate(outcome.created, start=1)
     )

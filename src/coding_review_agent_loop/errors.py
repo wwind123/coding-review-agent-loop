@@ -27,6 +27,69 @@ class HumanDecisionRequiredError(AgentLoopError):
     EXIT_CODE = 4
 
 
+@dataclass(frozen=True)
+class UnmetDependency:
+    """One earlier staged phase that is not delivered (#1331)."""
+
+    issue_number: int | None
+    stage_id: str
+    phase_index: int
+    declared: bool
+    status: str
+    child_state: str | None
+    pr_number: int | None
+    pr_state: str | None
+    recovery: str
+
+
+class DependencyNotMergedError(AgentLoopError):
+    """A decomposition child's earlier stage is not delivered yet (#1331).
+
+    Raised by direct child entry before any handoff, planner or coder turn.
+    Exit code 5 distinguishes "wait for (or finish) the earlier stage" from a
+    generic failure (exit code 1).
+    """
+
+    EXIT_CODE = 5
+
+    def __init__(
+        self,
+        *,
+        child_issue: int,
+        stage_id: str,
+        relaunch_command: str,
+        prerequisites: tuple[UnmetDependency, ...],
+    ) -> None:
+        if not prerequisites:
+            raise ValueError("DependencyNotMergedError needs at least one prerequisite")
+        self.child_issue = child_issue
+        self.stage_id = stage_id
+        self.relaunch_command = relaunch_command
+        self.prerequisites = tuple(prerequisites)
+        first = self.prerequisites[0]
+        lines = [
+            f"Issue #{child_issue} (stage {stage_id}) cannot start: dependency "
+            f"#{_issue_label(first.issue_number)} (stage {first.stage_id}) is not merged.",
+            "Unmet prerequisites:",
+        ]
+        for item in self.prerequisites:
+            edge = (
+                "declared dependency"
+                if item.declared
+                else "earlier stage in the recorded order (staged phases are delivered in order)"
+            )
+            lines.append(
+                f"- #{_issue_label(item.issue_number)} (stage {item.stage_id}, phase "
+                f"{item.phase_index}; {edge}): {item.recovery}"
+            )
+        lines.append(f"Then rerun: {relaunch_command}")
+        super().__init__("\n".join(lines))
+
+
+def _issue_label(number: int | None) -> str:
+    return str(number) if number is not None else "?"
+
+
 class WorkflowTransactionError(AgentLoopError):
     """A cross-surface workflow transaction is missing, partial, or contradictory (#827).
 

@@ -40,7 +40,7 @@ from .github import (
     resolve_authenticated_github_actor,
     strip_bot_login_suffix,
 )
-from .integration_close import close_child_after_integration_merge
+from .integration_close import close_child_after_integration_merge, verify_integration_merge
 from .issue_pr_handoff import authenticate_canonical_issue_pr
 from .protocol import ExecutionAllocation
 from .protocol_markers import TrustedBody
@@ -97,6 +97,11 @@ class PhaseProgress:
     pr_number: int | None
     pr_state: str | None
     status: str
+    # Read-only resolution only (#1331): the integration-merge verifier's
+    # outcome and reason for an OPEN child whose canonical PR is MERGED.
+    integration_outcome: str | None = None
+    integration_reason: str | None = None
+    integration_base: str | None = None
 
     @property
     def is_human(self) -> bool:
@@ -128,8 +133,13 @@ def _reconcile(
     handoffs: Sequence[PhaseImplementationHandoffMetadata],
     *,
     parent_issue: int,
+    through_phase_index: int | None = None,
 ) -> dict[int, PhaseImplementationHandoffMetadata]:
-    """Fail closed on any disagreement between the topology and its records."""
+    """Fail closed on any disagreement between the topology and its records.
+
+    With ``through_phase_index=k`` only handoff records for phases ``1..k-1``
+    are reconciled; records at ``k`` or later are ignored.
+    """
     phase_count = len(outcome.created)
     if phase_count == 0:
         raise AgentLoopError(
@@ -163,6 +173,8 @@ def _reconcile(
     by_index: dict[int, PhaseImplementationHandoffMetadata] = {}
     for handoff in handoffs:
         index = handoff.phase_index
+        if through_phase_index is not None and index >= through_phase_index:
+            continue
         if index < 1 or index > phase_count:
             raise AgentLoopError(
                 f"Issue #{parent_issue} carries a phase handoff record for phase {index}, "
@@ -262,6 +274,17 @@ def _read_child_issue_state(
         return get_issue_state(runner, config=config, issue_number=child_issue_number)
 
 
+@dataclass(frozen=True)
+class _AgentPhaseResolution:
+    status: str
+    child_state: str
+    pr_number: int | None
+    pr_state: str | None
+    integration_outcome: str | None = None
+    integration_reason: str | None = None
+    integration_base: str | None = None
+
+
 def _resolve_agent_phase(
     runner: Runner,
     *,
@@ -271,13 +294,21 @@ def _resolve_agent_phase(
     stage_id: str,
     child_issue_number: int,
     just_merged: tuple[int, int] | None = None,
-) -> tuple[str, str, int | None, str | None]:
-    """Authenticate one recorded agent phase; returns (status, child, pr, pr state).
+    read_only: bool = False,
+) -> _AgentPhaseResolution:
+    """Authenticate one recorded agent phase.
 
     ``just_merged`` is the ``(child issue, PR)`` pair the caller itself merged
     moments ago.  GitHub closes the child from the PR's closing reference
     asynchronously, so for that exact pair an OPEN child with its canonical PR
     MERGED is complete rather than an inconsistent record (#1018).
+
+    ``read_only`` (#1331) resolves an OPEN child whose canonical PR is MERGED
+    through ``verify_integration_merge`` instead of closing it: a verified
+    integration merge (or an already-closed child) is complete, exactly the
+    state the closure-capable path would close and count complete, while a
+    default-branch merge whose auto-close is not yet observed, or an
+    unresolved verification, is reported incomplete instead of raising.
     """
     with _phase_read_context(
         parent_issue=parent_issue,
@@ -299,8 +330,27 @@ def _resolve_agent_phase(
     pr_state = authenticated.state if authenticated is not None else None
     if child_state == "OPEN":
         if authenticated is None or pr_state == "OPEN":
-            return STATUS_IN_PROGRESS, child_state, pr_number, pr_state
-        if pr_state == "MERGED" and pr_number is not None:
+            return _AgentPhaseResolution(STATUS_IN_PROGRESS, child_state, pr_number, pr_state)
+        if read_only and pr_state == "MERGED" and pr_number is not None:
+            verification = verify_integration_merge(
+                runner, config=config, issue_context=child_context, pr_number=pr_number
+            )
+            status = (
+                STATUS_COMPLETE
+                if verification.outcome in {"integration-verified", "already-closed"}
+                else STATUS_IN_PROGRESS
+            )
+            if verification.outcome != "not-merged":
+                return _AgentPhaseResolution(
+                    status,
+                    child_state,
+                    pr_number,
+                    pr_state,
+                    integration_outcome=verification.outcome,
+                    integration_reason=verification.reason,
+                    integration_base=verification.base_ref,
+                )
+        elif pr_state == "MERGED" and pr_number is not None:
             outcome = close_child_after_integration_merge(
                 runner, config=config, issue_context=child_context, pr_number=pr_number
             )
@@ -308,14 +358,14 @@ def _resolve_agent_phase(
                 # An authenticated MERGED non-default-base PR whose child was
                 # left open by an interrupted completion: closure retried, no
                 # merge replay.
-                return STATUS_COMPLETE, "CLOSED", pr_number, pr_state
+                return _AgentPhaseResolution(STATUS_COMPLETE, "CLOSED", pr_number, pr_state)
             # The #1018 just-merged tolerance (GitHub closes the child
             # asynchronously) holds only for a *confirmed* default-branch merge,
             # never for unknown or unauthenticated integration evidence.
             if outcome == "default-branch" and _just_merged_matches(
                 just_merged, child_issue_number=child_issue_number, pr_number=pr_number
             ):
-                return STATUS_COMPLETE, child_state, pr_number, pr_state
+                return _AgentPhaseResolution(STATUS_COMPLETE, child_state, pr_number, pr_state)
         raise AgentLoopError(
             f"Issue #{parent_issue} phase {phase_index} (`{stage_id}`) child issue "
             f"#{child_issue_number} is OPEN but its canonical implementation PR "
@@ -325,7 +375,7 @@ def _resolve_agent_phase(
             "merged, then rerun the parent."
         )
     if pr_state == "MERGED":
-        return STATUS_COMPLETE, child_state, pr_number, pr_state
+        return _AgentPhaseResolution(STATUS_COMPLETE, child_state, pr_number, pr_state)
     observed = f"PR #{pr_number} is {pr_state}" if authenticated is not None else (
         "no canonical issue-to-PR handoff record exists"
     )
@@ -346,6 +396,8 @@ def resolve_staged_phase_progress(
     parent_comments: Sequence[object],
     outcome: StagedTopologyOutcome,
     just_merged: tuple[int, int] | None = None,
+    read_only: bool = False,
+    through_phase_index: int | None = None,
 ) -> tuple[PhaseProgress, ...]:
     """Resolve per-phase progress for a staged parent, in topology order.
 
@@ -361,6 +413,14 @@ def resolve_staged_phase_progress(
     is read for a human stage.  The ordered-prefix invariant is enforced across
     every later phase from the recorded comments alone.  ``just_merged`` is
     forwarded to the per-phase authentication; see ``_resolve_agent_phase``.
+
+    ``read_only`` and ``through_phase_index`` serve direct child entry's
+    prerequisite check (#1331).  ``read_only`` never writes: see
+    ``_resolve_agent_phase``.  ``through_phase_index=k`` resolves only phases
+    ``1..k-1`` and ignores handoff records at ``k`` or later, both for the
+    ordered-prefix rule and for reconciliation, so a dependent child's own
+    (possibly out-of-order) handoff cannot replace the prerequisite stop with
+    a different error.  Default arguments keep the parent path unchanged.
     """
     handoffs = _filter_outcome_handoffs(
         find_phase_implementation_handoffs_for_parent(
@@ -368,12 +428,16 @@ def resolve_staged_phase_progress(
         ),
         outcome=outcome,
     )
-    by_index = _reconcile(outcome, handoffs, parent_issue=parent_issue)
+    by_index = _reconcile(
+        outcome, handoffs, parent_issue=parent_issue, through_phase_index=through_phase_index
+    )
 
     progress: list[PhaseProgress] = []
     settled = False
     first_incomplete: tuple[int, str] | None = None
     for index, created in enumerate(outcome.created, start=1):
+        if through_phase_index is not None and index >= through_phase_index:
+            break
         stage_id = outcome.stage_ids[index - 1]
         automation = outcome.automations[index - 1]
         handoff = by_index.get(index)
@@ -469,7 +533,7 @@ def resolve_staged_phase_progress(
                 )
             )
         else:
-            status, child_state, pr_number, pr_state = _resolve_agent_phase(
+            resolution = _resolve_agent_phase(
                 runner,
                 config=config,
                 parent_issue=parent_issue,
@@ -477,6 +541,7 @@ def resolve_staged_phase_progress(
                 stage_id=stage_id,
                 child_issue_number=child_issue_number,
                 just_merged=just_merged,
+                read_only=read_only,
             )
             progress.append(
                 PhaseProgress(
@@ -486,16 +551,93 @@ def resolve_staged_phase_progress(
                     created=created,
                     handoff=handoff,
                     child_issue_number=child_issue_number,
-                    child_state=child_state,
-                    pr_number=pr_number,
-                    pr_state=pr_state,
-                    status=status,
+                    child_state=resolution.child_state,
+                    pr_number=resolution.pr_number,
+                    pr_state=resolution.pr_state,
+                    status=resolution.status,
+                    integration_outcome=resolution.integration_outcome,
+                    integration_reason=resolution.integration_reason,
+                    integration_base=resolution.integration_base,
                 )
             )
         if progress[-1].status != STATUS_COMPLETE:
             settled = True
             first_incomplete = (index, stage_id)
     return tuple(progress)
+
+
+@dataclass(frozen=True)
+class UnmetPhasePrerequisite:
+    """An earlier phase that blocks direct entry of a later phase (#1331).
+
+    ``declared`` is ``True`` when the dependent phase names this stage in its
+    reviewed ``depends_on_stage_ids``; otherwise the edge comes from the
+    recorded stage order, which the parent's ordered-prefix rule enforces.
+    """
+
+    progress: PhaseProgress
+    declared: bool
+
+
+def unmet_phase_prerequisites(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    parent_issue: int,
+    parent_comments: Sequence[object],
+    outcome: StagedTopologyOutcome,
+    phase_index: int,
+    declared_stage_ids: Sequence[str],
+) -> tuple[UnmetPhasePrerequisite, ...]:
+    """Return every earlier phase that is not complete, read-only (#1331).
+
+    Every earlier phase in the recorded order must be complete - a superset
+    of the declared dependencies - because the parent's ordered-prefix rule
+    rejects any handoff recorded while an earlier phase is incomplete.
+    Completion is the parent's own staged progress resolution run with
+    ``read_only=True`` over phases ``1..phase_index-1``, so no decision here
+    is weaker than the parent's and nothing is written.  A declared stage id
+    that is absent from the recorded order, or not earlier than the
+    dependent phase, is a provenance defect and fails closed.
+    """
+    stage_ids = tuple(outcome.stage_ids)
+    if phase_index < 1 or phase_index > len(stage_ids):
+        raise AgentLoopError(
+            f"Issue #{parent_issue} staged topology has no phase {phase_index}; repair the "
+            "child's phase provenance or the decomposition summary before rerunning."
+        )
+    for declared in declared_stage_ids:
+        if declared not in stage_ids:
+            raise AgentLoopError(
+                f"Issue #{parent_issue} phase {phase_index} (`{stage_ids[phase_index - 1]}`) "
+                f"declares a dependency on stage `{declared}`, which the recorded "
+                "decomposition summary does not contain; repair the decomposition summary "
+                "or the approved topology before rerunning."
+            )
+        if stage_ids.index(declared) + 1 >= phase_index:
+            raise AgentLoopError(
+                f"Issue #{parent_issue} phase {phase_index} (`{stage_ids[phase_index - 1]}`) "
+                f"declares a dependency on stage `{declared}`, which is not an earlier phase "
+                "in the recorded order; repair the decomposition summary or the approved "
+                "topology before rerunning."
+            )
+    if phase_index == 1:
+        return ()
+    progress = resolve_staged_phase_progress(
+        runner,
+        config=config,
+        parent_issue=parent_issue,
+        parent_comments=parent_comments,
+        outcome=outcome,
+        read_only=True,
+        through_phase_index=phase_index,
+    )
+    declared_set = set(declared_stage_ids)
+    return tuple(
+        UnmetPhasePrerequisite(progress=phase, declared=phase.stage_id in declared_set)
+        for phase in progress
+        if phase.status != STATUS_COMPLETE
+    )
 
 
 def select_current_phase(progress: Sequence[PhaseProgress]) -> PhaseProgress | None:

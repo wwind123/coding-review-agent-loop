@@ -785,3 +785,81 @@ def test_staged_completion_guard_accepts_default_merge_with_unset_actor_variable
         runner, config=config, issue_context=_issue_context(), pr_number=7
     )
     assert not runner.commands_matching("gh", "issue", "close")
+
+
+# --- read-only integration-merge verifier (#1331) ------------------------------------
+
+
+def _verifier_cases():
+    return {
+        "integration-verified": dict(),
+        "already-closed": dict(issue_state="closed"),
+        "default-branch": dict(authorized="main", pr={
+            "merged": True, "merged_at": "t", "body": "Closes #42",
+            "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}},
+        }),
+        "not-merged": dict(merged=False),
+        "unresolved": dict(pr={
+            "merged": True, "merged_at": "t", "body": "Refs #42",
+            "base": {"ref": "refactor/1181", "repo": {"full_name": "OWNER/REPO"}},
+        }),
+    }
+
+
+@pytest.mark.parametrize("expected", sorted(_verifier_cases()))
+def test_verifier_never_writes_and_matches_the_close_path(tmp_path, expected):
+    from coding_review_agent_loop.integration_close import verify_integration_merge
+
+    cfg, ctx = _config(tmp_path), _issue_context()
+    runner = ScriptRunner(**_verifier_cases()[expected])
+    verification = verify_integration_merge(runner, config=cfg, issue_context=ctx, pr_number=7)
+    assert verification.outcome == expected
+    assert not runner.commands_matching("gh", "issue", "close")
+    assert not [c for c in runner.commands if "POST" in c or "PATCH" in c]
+    # The close path closes exactly where the verifier reports integration-verified.
+    close_runner = ScriptRunner(**_verifier_cases()[expected])
+    outcome = close_child_after_integration_merge(
+        close_runner, config=cfg, issue_context=ctx, pr_number=7
+    )
+    assert outcome == ("closed" if expected == "integration-verified" else expected)
+    assert bool(close_runner.commands_matching("gh", "issue", "close")) == (
+        expected == "integration-verified"
+    )
+
+
+@pytest.mark.parametrize(
+    ("merged_base", "variable", "recorded"),
+    [
+        ("refactor/other", "refactor/*", "refactor/1181"),
+        ("feature/x", "refactor/*", None),
+        ("refactor/1181", None, None),
+    ],
+)
+def test_verifier_checks_base_agreement_and_trust(tmp_path, merged_base, variable, recorded):
+    from coding_review_agent_loop.integration_close import verify_integration_merge
+
+    pr = {
+        "merged": True, "merged_at": "t", "body": "Closes #42",
+        "base": {"ref": merged_base, "repo": {"full_name": "OWNER/REPO"}},
+    }
+    runner = ScriptRunner(pr=pr, variable=variable)
+    verification = verify_integration_merge(
+        runner, config=_config(tmp_path, base="refactor/1181", base_provenance="explicit"),
+        issue_context=_issue_context(), pr_number=7, expected_base=recorded,
+    )
+    assert verification.outcome == "unresolved"
+    assert verification.reason
+    assert not runner.commands_matching("gh", "issue", "close")
+
+
+def test_verifier_runs_under_dry_run_because_it_never_writes(tmp_path):
+    from coding_review_agent_loop.integration_close import verify_integration_merge
+
+    runner = ScriptRunner()
+    cfg = _config(tmp_path, dry_run=True)
+    assert verify_integration_merge(
+        runner, config=cfg, issue_context=_issue_context(), pr_number=7
+    ).outcome == "integration-verified"
+    assert close_child_after_integration_merge(
+        runner, config=cfg, issue_context=_issue_context(), pr_number=7
+    ) == "skipped"

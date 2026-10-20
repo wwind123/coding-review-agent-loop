@@ -149,6 +149,7 @@ from .execution_policy import (
     _resolve_execution_policy,
     _resolve_fresh_child_provenance,
     _child_resume_hint,
+    require_fresh_child_prerequisites,
     _refuse_plain_mode_over_planning,
     _post_child_planning_handoff,
     _print_dry_run_execution_preview,
@@ -311,6 +312,14 @@ def run_issue_loop(
                         "`--plan-first`, or (before dispatch) post a signed "
                         "child-execution-disposition-override record on the parent issue."
                     )
+                # Before any handoff write or agent turn (#1331): every earlier
+                # stage in the recorded order must already be delivered.
+                require_fresh_child_prerequisites(
+                    runner,
+                    config=config,
+                    fresh_child=fresh_child,
+                    parent_issue_context=parent_issue_context,
+                )
                 memory = prepare_agent_memory(runner, config)
                 return _dispatch_decomposition_child(
                     runner,
@@ -342,6 +351,12 @@ def run_issue_loop(
                     "(before dispatch) post a signed child-execution-disposition-override record "
                     "on the parent issue."
                 )
+            require_fresh_child_prerequisites(
+                runner,
+                config=config,
+                fresh_child=fresh_child,
+                parent_issue_context=parent_issue_context,
+            )
             if fresh_child.handoff is None and not config.dry_run:
                 # Post the planning handoff before any planning agent runs,
                 # using the same identity and override-digest rules as

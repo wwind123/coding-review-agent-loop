@@ -16,10 +16,14 @@ from .agents.registry import agent_display_name, get_backend
 from .workdirs import agent_workdir
 from .config import AgentLoopConfig, phased_delivery_guard_active, reviewers
 from .decomposition import (
+    _child_resume_hint,
     _decode_json_payload,
+    child_relaunch_command,
+    child_relaunch_line,
     EXECUTION_DECISION_MARKER_RE,
     issue_execution_decision_evidence,
     CreatedPhaseIssue,
+    DecompositionMetadata,
     PlanDecomposition,
     RecordedPhase,
     approved_plan_hash,
@@ -52,7 +56,7 @@ from .decomposition import (
 )
 from .protocol import EXECUTION_DISPOSITION_DIRECT, EXECUTION_DISPOSITION_PLANNING
 from .child_topology import NeedsHumanDecision, parent_child_search_queries
-from .errors import AgentLoopError
+from .errors import AgentLoopError, DependencyNotMergedError, UnmetDependency
 from .integration_close import require_child_closed_or_report
 from .github import (
     _REST_ISSUE_COMMENT_PAGE_SIZE,
@@ -73,7 +77,10 @@ from .issue_pr_handoff import (
 )
 from .issue_pr_provenance import IssuePrProvenanceScope
 from .phase_progress import (
+    STATUS_NOT_DISPATCHED,
     PhaseProgress,
+    UnmetPhasePrerequisite,
+    unmet_phase_prerequisites,
     StagedTopologyOutcome,
     record_staged_completion,
     render_phase_status_line,
@@ -633,6 +640,8 @@ class _FreshChildProvenance:
     handoff: PhaseImplementationHandoffMetadata | None
     overrides: tuple[ChildDispositionOverride, ...]
     route: ChildExecutionRoute
+    # The canonical parent topology summary the child was bound to (#1331).
+    summary: DecompositionMetadata | None = None
 
 
 def _resolve_fresh_child_provenance(
@@ -791,13 +800,8 @@ def _resolve_fresh_child_provenance(
         handoff=handoff,
         overrides=overrides,
         route=route,
+        summary=summary,
     )
-
-
-def _child_resume_hint(child_issue_number: int, disposition: str) -> str:
-    if disposition == EXECUTION_DISPOSITION_PLANNING:
-        return f"agent-loop issue {child_issue_number} --plan-first --plan-execution-mode auto"
-    return f"agent-loop issue {child_issue_number}"
 
 
 def _projection_may_carry_planning_record(comments: Sequence[object]) -> bool:
@@ -1094,6 +1098,19 @@ def _recorded_staged_outcome_for_child(
     )
     if existing is None:
         return None
+    return staged_outcome_from_summary(existing, mode=mode)
+
+
+def staged_outcome_from_summary(
+    summary: DecompositionMetadata, *, mode: str
+) -> StagedTopologyOutcome:
+    """Adopt a recorded decomposition summary as a staged topology outcome.
+
+    Children pair with the summary's recorded automation and stage ids;
+    ``_reconcile`` later validates their alignment.  ``mode`` is the mode the
+    phase handoffs were recorded under, which is not always the summary's
+    own mode: direct child entry always records ``implement-by-phase``.
+    """
     adopted = tuple(
         CreatedPhaseIssue(
             phase=RecordedPhase(title=title, automation=automation),
@@ -1101,18 +1118,136 @@ def _recorded_staged_outcome_for_child(
             issue_number=number,
         )
         for (title, url, number), automation in zip(
-            existing.children, existing.automation, strict=False
+            summary.children, summary.automation, strict=False
         )
     )
     return StagedTopologyOutcome(
         created=adopted,
-        stage_ids=_resolved_stage_ids(adopted, recorded_stage_ids=existing.stage_ids),
+        stage_ids=_resolved_stage_ids(adopted, recorded_stage_ids=summary.stage_ids),
         automations=tuple(item.phase.automation for item in adopted),
-        plan_hash=plan_hash,
+        plan_hash=summary.plan_hash,
         mode=mode,
-        topology_source=existing.topology_source,
-        retained_parent_scope=existing.retained_parent_scope,
-        final_integration_work=existing.final_integration_work,
+        topology_source=summary.topology_source,
+        retained_parent_scope=summary.retained_parent_scope,
+        final_integration_work=summary.final_integration_work,
+    )
+
+
+def _prerequisite_recovery(
+    prerequisite: UnmetPhasePrerequisite, *, dependency_relaunch: str
+) -> str:
+    """Status-specific recovery for one unmet prerequisite (#1331).
+
+    Never advises merging a PR that does not exist: a not-dispatched stage
+    is told how to start, and only an observed PR is named.
+    """
+    phase = prerequisite.progress
+    stage = phase.stage_id
+    child = f"#{phase.child_issue_number}"
+    if phase.is_human:
+        return (
+            f"{child} is a human-owned {phase.automation} stage; close it once its work "
+            "is done"
+        )
+    if phase.status == STATUS_NOT_DISPATCHED:
+        return f"stage {stage} has not been started; start it with {dependency_relaunch}"
+    if phase.integration_outcome == "default-branch":
+        return (
+            f"PR #{phase.pr_number} merged but GitHub has not closed {child} yet; "
+            "rerun shortly"
+        )
+    if phase.integration_outcome is not None:
+        return (
+            f"PR #{phase.pr_number} merged into {phase.integration_base or 'an unknown base'} "
+            "but the integration merge could not be verified "
+            f"({phase.integration_reason or phase.integration_outcome}); repair the recorded "
+            f"base or trust, or close {child} once verified"
+        )
+    if phase.pr_number is None:
+        return (
+            f"stage {stage} is in progress with no PR yet; resume it with "
+            f"{dependency_relaunch}"
+        )
+    return (
+        f"PR #{phase.pr_number} is {phase.pr_state}; finish and merge PR "
+        f"#{phase.pr_number} for {child}"
+    )
+
+
+def require_fresh_child_prerequisites(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    fresh_child: _FreshChildProvenance,
+    parent_issue_context: IssueContext,
+) -> None:
+    """Stop direct child entry while an earlier stage is undelivered (#1331).
+
+    Runs before any handoff write or agent turn and performs no writes, so it
+    also applies under ``--dry-run``.  Every earlier phase in the recorded
+    order must be complete; the first unmet one is named in the
+    ``DependencyNotMergedError`` (exit code 5).
+    """
+    if fresh_child.phase_index <= 1:
+        return
+    summary = fresh_child.summary
+    if summary is None:
+        raise AgentLoopError(
+            f"Issue #{fresh_child.created.issue_number} has no recovered parent topology "
+            f"summary on #{fresh_child.parent_issue}; repair the decomposition record before "
+            "rerunning."
+        )
+    outcome = staged_outcome_from_summary(summary, mode="implement-by-phase")
+    phase = fresh_child.decomposition.phases[fresh_child.phase_index - 1]
+    unmet = unmet_phase_prerequisites(
+        runner,
+        config=config,
+        parent_issue=fresh_child.parent_issue,
+        parent_comments=parent_issue_context.comments,
+        outcome=outcome,
+        phase_index=fresh_child.phase_index,
+        declared_stage_ids=tuple(getattr(phase, "depends_on_stage_ids", ()) or ()),
+    )
+    if not unmet:
+        return
+    reviewed_phases = fresh_child.decomposition.phases
+    dependencies: list[UnmetDependency] = []
+    for item in unmet:
+        progress = item.progress
+        index = progress.phase_index
+        reviewed = reviewed_phases[index - 1] if index <= len(reviewed_phases) else None
+        if reviewed is None or (reviewed.stage_id or str(index)) != progress.stage_id:
+            raise AgentLoopError(
+                f"Issue #{fresh_child.parent_issue} phase {index} is recorded as stage "
+                f"`{progress.stage_id}` but the approved topology names "
+                f"`{getattr(reviewed, 'stage_id', None)}`; repair the decomposition summary "
+                "before rerunning."
+            )
+        dependencies.append(
+            UnmetDependency(
+                issue_number=progress.child_issue_number,
+                stage_id=progress.stage_id,
+                phase_index=index,
+                declared=item.declared,
+                status=progress.status,
+                child_state=progress.child_state,
+                pr_number=progress.pr_number,
+                pr_state=progress.pr_state,
+                recovery=_prerequisite_recovery(
+                    item,
+                    dependency_relaunch=child_relaunch_command(
+                        reviewed, progress.child_issue_number
+                    ),
+                ),
+            )
+        )
+    raise DependencyNotMergedError(
+        child_issue=fresh_child.created.issue_number,
+        stage_id=fresh_child.stage_id,
+        relaunch_command=(
+            f"`{_child_resume_hint(fresh_child.created.issue_number, fresh_child.route.disposition)}`"
+        ),
+        prerequisites=tuple(dependencies),
     )
 
 
