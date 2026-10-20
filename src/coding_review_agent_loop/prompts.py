@@ -654,8 +654,21 @@ def _coder_local_test_scope_guidance(
         )
         + ". Reserve agent-unavailable for a genuine environment/tooling "
         "failure, not an ordinary slow test.\n"
+        + _coder_shell_stdin_guidance()
         + containment_prompt_guidance(config)
         + parallel_test_worker_guidance(config)
+    )
+
+
+def _coder_shell_stdin_guidance() -> str:
+    """Coder rule against shell commands that read an unspecified stdin (#1546)."""
+    return (
+        "Never run a shell command that may read standard input without an "
+        "explicit input source, such as a bare `cat > file`, `python -`, "
+        "`sed`/`grep` without a file operand, or an interactive prompt. Give "
+        "the input with a heredoc or a file, or redirect `< /dev/null`, because "
+        "a stray stdin read can stall the turn until the long Bash or turn "
+        "limit.\n"
     )
 
 
