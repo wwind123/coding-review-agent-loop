@@ -19,8 +19,8 @@ Named seats with no explicit `--seat-dir` use the same per-run worktree lifecycl
 with a separate shared store and finalizer keyed by each seat ID.
 
 **Per-run worktrees (`run_worktrees.py`).** Store mutations (initialization,
-private fetch and pack import, local-base fast-forward, administrative link
-creation, prune, remove) run under a short,
+private fetch and pack import, local-base fast-forward, pack compaction,
+administrative link creation, prune, remove) run under a short,
 non-reentrant host `flock` (`<lock root>/workdir-stores/`) that is never held
 across an agent turn; a nested acquisition fails fast. A probe of the store
 path's own run claim (`workdir_claims.probe_free_claim`) interlocks with an
@@ -36,6 +36,19 @@ any worktree. The outermost `workdir_claim_scope` runs registered finalizers
 (identity-verified worktree removal) before releasing claims, on success and
 failure. At startup a run prunes worktrees whose owner record matches and whose
 claim lock is free; unrecognized entries are logged and left untouched.
+
+**Pack compaction.** Each import writes one pack and the hardened config keeps
+`gc.auto=0`, so after the last import in each locked fetch (`prepare_store`,
+`pin_pr_head`, and the explicit-checkout base and PR syncs in `config.py`)
+`compact_packs_if_needed` runs while the store or checkout `flock` is still
+held. Above 50 non-kept packs it writes one replacement pack with a single
+confined `git pack-objects --stdout --no-use-bitmap-index --keep-unreachable`
+into a private scratch directory; `git repack` cannot be used because it execs
+`pack-objects`, which the guard denies. A confined `index-pack` indexes it,
+`show-index` verifies that it holds every object of the snapshot packs, and
+only then are the snapshot packs deleted. Kept, promisor and post-snapshot
+packs are never touched and nothing is pruned, so SHA-pinned PR heads survive.
+A missing lock raises; any other failure is logged and never fails the fetch.
 
 **Agent-loop-owned Git boundary (`secure_git.py`, `git_transport.py`).** Every
 local text, binary, and cancellable Git call that can read an agent checkout

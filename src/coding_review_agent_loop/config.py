@@ -1645,7 +1645,7 @@ def _sync_base_branch(
         refresh_after_sync(config, runner, path)
         return
     from .git_transport import import_ref
-    from .run_worktrees import store_lock
+    from .run_worktrees import compact_packs_if_needed, store_lock
 
     with store_lock(path):
         sha = import_ref(
@@ -1655,6 +1655,7 @@ def _sync_base_branch(
             ssh_identity=config.git_ssh_identity,
             forbidden_roots=config.transport_forbidden_roots,
         )
+        compact_packs_if_needed(path, config=config, runner=runner)
         current = _run_git(runner, path, ("rev-parse", "--verify", f"refs/heads/{config.base}"), check=False)
         if current.returncode == 0:
             ancestor = _run_git(runner, path, ("merge-base", "--is-ancestor", current.stdout.strip(), sha), check=False)
@@ -1923,7 +1924,7 @@ def sync_checkout_to_pr(
         _run_git(runner, path, ("checkout", "--detach", pinned))
     else:
         from .git_transport import import_ref
-        from .run_worktrees import store_lock
+        from .run_worktrees import compact_packs_if_needed, store_lock
 
         with store_lock(path):
             if config.base:
@@ -1941,6 +1942,7 @@ def sync_checkout_to_pr(
                 ssh_identity=config.git_ssh_identity,
                 forbidden_roots=config.transport_forbidden_roots,
             )
+            compact_packs_if_needed(path, config=config, runner=runner)
             require_advertised_head(pinned)
             if default_owned:
                 _clean_or_reject_checkout(
