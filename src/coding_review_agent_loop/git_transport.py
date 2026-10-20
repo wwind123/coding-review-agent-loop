@@ -659,11 +659,113 @@ def _origin_from_checkout(destination: Path, runner: Any) -> str:
     return result.stdout.strip()
 
 
+def _destination_tips(destination: Path, runner: Any) -> list[str]:
+    """Return the destination's distinct well-formed ref tips (exclusion hints only)."""
+    try:
+        listed = runner.run(("git", "for-each-ref", "--format=%(objectname)"),
+                            cwd=destination, check=False)
+    except AgentLoopError:
+        return []
+    if listed.returncode:
+        return []
+    return list(dict.fromkeys(line.strip() for line in listed.stdout.splitlines()
+                              if _SHA.fullmatch(line.strip())))
+
+
+def _private_commits(private: Path, env: dict[str, str], candidates: list[str]) -> list[str]:
+    """Keep only candidates the private repository holds as commits.
+
+    ``pack-objects --revs`` fails on a negative it cannot resolve, so a
+    local-only commit, tag or tree is never passed.
+    """
+    if not candidates:
+        return []
+    try:
+        report = _private_git(("cat-file", "--batch-check"), cwd=private, env=env,
+                              input_bytes="".join(f"{tip}\n" for tip in candidates).encode("ascii"))
+    except AgentLoopError:
+        return []
+    kept = []
+    for line in report.decode("ascii", "replace").splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[1] == "commit" and fields[0] in candidates:
+            kept.append(fields[0])
+    return kept
+
+
+def _closure_complete(destination: Path, sha: str, scratch: Path) -> bool:
+    """Return True only when destination holds every object reachable from sha.
+
+    No history is excluded: destination refs are hints, never proof of
+    completeness, so this is the single gate before the tracking-ref CAS.
+    The walk also ignores the destination's shallow file, grafts and replace
+    refs, which would otherwise end or redirect it above missing objects.
+    ``scratch`` is a private directory; the absent files named in it stand
+    in for the destination's shallow and graft files.
+    """
+    argv, local_env, pass_fds = local_command(
+        ("rev-list", "--objects", "--missing=error", "--quiet", sha), checkout=destination
+    )
+    absent = str(scratch / "agent-loop-absent")
+    local_env.update({"GIT_SHALLOW_FILE": absent, "GIT_GRAFT_FILE": absent,
+                      "GIT_NO_REPLACE_OBJECTS": "1"})
+    try:
+        walked = subprocess.run(argv, cwd=destination, env=local_env, pass_fds=pass_fds,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, check=False, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return walked.returncode == 0
+
+
+def _stream_pack(private: Path, env: dict[str, str], destination: Path,
+                 revs: tuple[str, ...], *, thin: bool) -> bool:
+    """Stream ``pack-objects`` for revs from private into a confined ``index-pack``."""
+    local_argv, local_env, pass_fds = local_command(
+        ("index-pack", "--stdin", "--fix-thin"), checkout=destination
+    )
+    export = subprocess.Popen(
+        (_git_path(), "pack-objects", "--stdout", "--revs", *(("--thin",) if thin else ())),
+        cwd=private, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        assert export.stdin is not None and export.stdout is not None
+        export.stdin.write("".join(f"{rev}\n" for rev in revs).encode("ascii"))
+        export.stdin.close()
+        imported = subprocess.run(local_argv, cwd=destination, env=local_env,
+                                  pass_fds=pass_fds, stdin=export.stdout,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  check=False, timeout=90)
+        export.stdout.close()
+        export.wait(timeout=90)
+    finally:
+        if export.poll() is None:
+            export.kill()
+            export.wait()
+    return not (imported.returncode or export.returncode)
+
+
+def _imported(private: Path, env: dict[str, str], destination: Path,
+              revs: tuple[str, ...], *, thin: bool) -> bool:
+    """Stream one pack and verify sha's full closure; any failure returns False."""
+    try:
+        return (_stream_pack(private, env, destination, revs, thin=thin)
+                and _closure_complete(destination, revs[0], private))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def import_ref(destination: Path, source_ref: str, tracking_ref: str, *,
                repo: str, runner: Any, gh_cmd: str | None = None,
                local_origin: Path | None = None, ssh_identity: Path | None = None,
                forbidden_roots: tuple[Path, ...] = ()) -> str:
     """Fetch one ref, stream its pack into destination, then CAS tracking_ref.
+
+    The pack excludes history reachable from destination ref tips that the
+    fetched history also holds, and is skipped when sha is already a ref tip.
+    Every path verifies sha's complete closure before the CAS and falls back
+    once to a full export when the incremental import is incomplete.
 
     ``forbidden_roots`` names every agent-controlled checkout, store and run
     root; SSH config, identity and known-hosts files there are refused.
@@ -701,29 +803,16 @@ def import_ref(destination: Path, source_ref: str, tracking_ref: str, *,
                            cwd=private, env=env).decode("ascii").strip()
         if not _SHA.fullmatch(sha):
             raise AgentLoopError("Trusted fetch returned an invalid commit identity.")
-        local_argv, local_env, pass_fds = local_command(
-            ("index-pack", "--stdin", "--fix-thin"), checkout=destination
-        )
-        export = subprocess.Popen(
-            (_git_path(), "pack-objects", "--stdout", "--revs"), cwd=private,
-            env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            assert export.stdin is not None and export.stdout is not None
-            export.stdin.write((sha + "\n").encode("ascii"))
-            export.stdin.close()
-            imported = subprocess.run(local_argv, cwd=destination, env=local_env,
-                                      pass_fds=pass_fds, stdin=export.stdout,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                      check=False, timeout=90)
-            export.stdout.close()
-            export.wait(timeout=90)
-        finally:
-            if export.poll() is None:
-                export.kill()
-                export.wait()
-        if imported.returncode or export.returncode:
+        tips = _destination_tips(destination, runner)
+        # An existing complete ref tip needs no pack; otherwise try a thin
+        # pack excluding usable tips, then fall back once to a full export.
+        complete = sha in tips and _closure_complete(destination, sha, private)
+        if not complete and sha not in tips:
+            negatives = _private_commits(private, env, tips)
+            if negatives:
+                revs = (sha, *(f"^{tip}" for tip in negatives))
+                complete = _imported(private, env, destination, revs, thin=True)
+        if not complete and not _imported(private, env, destination, (sha,), thin=False):
             raise AgentLoopError("Verified object-pack import failed.")
         verified = runner.run(("git", "rev-parse", "--verify", f"{sha}^{{commit}}"),
                               cwd=destination)

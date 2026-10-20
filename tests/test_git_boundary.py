@@ -148,6 +148,251 @@ def test_private_import_rejects_tracking_ref_race(repositories):
     assert git(checkout, "show-ref", "--verify", tracking, check=False) == ""
 
 
+def _commit(repo: Path, message: str, files: dict[str, str | None]) -> str:
+    for name, text in files.items():
+        if text is None:
+            git(repo, "rm", "-q", name)
+        else:
+            (repo / name).write_text(text)
+            git(repo, "add", name)
+    git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", message)
+    return git(repo, "rev-parse", "HEAD")
+
+
+def _packs(checkout: Path) -> set[Path]:
+    return set((checkout / ".git" / "objects" / "pack").glob("*.pack"))
+
+
+def _pack_objects(pack: Path) -> set[str]:
+    listed = git(pack.parent, "verify-pack", "-v", str(pack.with_suffix(".idx")))
+    return {line.split()[0] for line in listed.splitlines()
+            if line and line.split()[1:2] and line.split()[1] in {"commit", "tree", "blob", "tag"}}
+
+
+def _spy_streams(monkeypatch, fail_thin: bool = False, fail_full: bool = False,
+                 failure: str = "return") -> list:
+    from coding_review_agent_loop import git_transport
+
+    real = git_transport._stream_pack
+    calls = []
+
+    def spy(private, env, destination, revs, *, thin):
+        calls.append((thin, revs))
+        if (fail_thin and thin) or (fail_full and not thin):
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(("index-pack",), 90)
+            if failure == "oserror":
+                raise BrokenPipeError("pack stream closed")
+            return False
+        return real(private, env, destination, revs, thin=thin)
+
+    monkeypatch.setattr(git_transport, "_stream_pack", spy)
+    return calls
+
+
+def _import_main(checkout: Path, origin: Path, runner: Runner | None = None) -> str:
+    return import_ref(checkout, "refs/heads/main", "refs/remotes/origin/main",
+                      repo="OWNER/REPO", runner=runner or Runner(), local_origin=origin)
+
+
+def _closure(checkout: Path, sha: str) -> bool:
+    """Walk sha's full closure, ignoring shallow, graft and replace state."""
+    absent = str(checkout.parent / "absent-history-file")
+    env = {**os.environ, "GIT_SHALLOW_FILE": absent, "GIT_GRAFT_FILE": absent,
+           "GIT_NO_REPLACE_OBJECTS": "1"}
+    return subprocess.run(("git", "-C", str(checkout), "rev-list", "--objects",
+                           "--missing=error", "--quiet", sha),
+                          capture_output=True, env=env, check=False).returncode == 0
+
+
+def test_unchanged_complete_ref_reimport_writes_no_pack(repositories, monkeypatch):
+    from coding_review_agent_loop import git_transport
+
+    origin, _, checkout = repositories
+    first = _import_main(checkout, origin)
+    calls = _spy_streams(monkeypatch)
+    checked = []
+    real_closure = git_transport._closure_complete
+    monkeypatch.setattr(git_transport, "_closure_complete",
+                        lambda *a: checked.append(a[1]) or real_closure(*a))
+    before = _packs(checkout)
+    second = _import_main(checkout, origin)
+    assert second == first == git(checkout, "rev-parse", "refs/remotes/origin/main")
+    assert _packs(checkout) == before
+    assert calls == [] and checked == [first]
+
+
+def test_new_upstream_commit_imports_thin_incremental_pack(repositories, monkeypatch):
+    origin, seed, checkout = repositories
+    lines = [f"line {index} of a delta-friendly blob with some padding text\n"
+             for index in range(3000)]
+    _commit(seed, "big", {"big.txt": "".join(lines)})
+    git(seed, "push", "-q", str(origin), "main")
+    previous = _import_main(checkout, origin)
+    lines[1500] = "changed line\n"
+    new = _commit(seed, "change", {"big.txt": "".join(lines)})
+    git(seed, "push", "-q", str(origin), "main")
+    calls = _spy_streams(monkeypatch)
+    before = _packs(checkout)
+    assert _import_main(checkout, origin) == new
+    assert git(checkout, "rev-parse", "refs/remotes/origin/main") == new
+    assert [thin for thin, _ in calls] == [True]
+    assert f"^{previous}" in calls[0][1]
+    added = _packs(checkout) - before
+    assert len(added) == 1
+    contents = _pack_objects(added.pop())
+    new_objects = {line.split()[0] for line in
+                   git(checkout, "rev-list", "--objects", new, "--not", previous).splitlines()}
+    full_history = git(checkout, "rev-list", "--objects", new).splitlines()
+    assert new_objects <= contents
+    assert len(contents) < len(full_history)
+    assert _closure(checkout, new)
+
+
+def _loose_history_with_lost_blob(origin: Path, checkout: Path) -> tuple[str, str]:
+    """Build A0 -> A in the destination with loose objects and drop A0's only blob."""
+    _commit(checkout, "A0", {"only.txt": "only in A0\n"})
+    blob = git(checkout, "rev-parse", "HEAD:only.txt")
+    tip = _commit(checkout, "A", {"only.txt": None, "b.txt": "b\n"})
+    git(checkout, "push", "-q", "origin", "main")
+    assert git(checkout, "rev-parse", "refs/remotes/origin/main") == tip
+    (checkout / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+    assert not _closure(checkout, tip)
+    return tip, blob
+
+
+def test_missing_object_below_excluded_tip_is_repaired_by_full_export(
+        repositories, monkeypatch, tmp_path):
+    origin, _, checkout = repositories
+    tip, blob = _loose_history_with_lost_blob(origin, checkout)
+    other = tmp_path / "other"
+    subprocess.run(("git", "clone", "-q", str(origin), str(other)), check=True)
+    descendant = _commit(other, "B", {"c.txt": "c\n"})
+    git(other, "push", "-q", "origin", "main")
+    calls = _spy_streams(monkeypatch)
+    assert _import_main(checkout, origin) == descendant
+    assert [thin for thin, _ in calls] == [True, False]
+    assert calls[0][1] == (descendant, f"^{tip}")
+    assert git(checkout, "cat-file", "-t", blob) == "blob"
+    assert _closure(checkout, descendant)
+    assert git(checkout, "rev-parse", "refs/remotes/origin/main") == descendant
+
+
+def test_missing_object_below_unchanged_tip_is_repaired(repositories, monkeypatch):
+    origin, _, checkout = repositories
+    tip, blob = _loose_history_with_lost_blob(origin, checkout)
+    calls = _spy_streams(monkeypatch)
+    assert _import_main(checkout, origin) == tip
+    assert calls == [(False, (tip,))]
+    assert git(checkout, "cat-file", "-t", blob) == "blob"
+    assert _closure(checkout, tip)
+    assert git(checkout, "rev-parse", "refs/remotes/origin/main") == tip
+
+
+def _mask_history(checkout: Path, tip: str, mask: str) -> None:
+    """Make tip look like a root commit through destination-side history state."""
+    if mask == "shallow":
+        (checkout / ".git" / "shallow").write_text(f"{tip}\n")
+    elif mask == "graft":
+        (checkout / ".git" / "info").mkdir(exist_ok=True)
+        (checkout / ".git" / "info" / "grafts").write_text(f"{tip}\n")
+    else:
+        git(checkout, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "replace", "--graft", tip)
+
+
+@pytest.mark.parametrize("advance", [False, True], ids=["unchanged-tip", "advancing-tip"])
+@pytest.mark.parametrize("mask", ["shallow", "graft", "replace"])
+def test_closure_gate_ignores_destination_history_substitution(
+        repositories, monkeypatch, tmp_path, mask, advance):
+    origin, _, checkout = repositories
+    tip, blob = _loose_history_with_lost_blob(origin, checkout)
+    _mask_history(checkout, tip, mask)
+    # The destination's own walk now stops at tip and misses the lost blob.
+    assert subprocess.run(("git", "-C", str(checkout), "rev-list", "--objects",
+                           "--missing=error", "--quiet", tip),
+                          capture_output=True, check=False).returncode == 0
+    expected = tip
+    if advance:
+        other = tmp_path / "other"
+        subprocess.run(("git", "clone", "-q", str(origin), str(other)), check=True)
+        expected = _commit(other, "B", {"c.txt": "c\n"})
+        git(other, "push", "-q", "origin", "main")
+    calls = _spy_streams(monkeypatch)
+    assert _import_main(checkout, origin) == expected
+    assert [thin for thin, _ in calls] == ([True, False] if advance else [False])
+    assert calls[-1][1] == (expected,)
+    assert git(checkout, "cat-file", "-t", blob) == "blob"
+    assert _closure(checkout, expected)
+    assert git(checkout, "rev-parse", "refs/remotes/origin/main") == expected
+
+
+def test_local_only_and_non_commit_tips_are_never_negative_revs(repositories, monkeypatch):
+    origin, seed, checkout = repositories
+    base = git(checkout, "rev-parse", "HEAD")
+    git(checkout, "checkout", "-q", "-b", "local")
+    local = _commit(checkout, "local only", {"local.txt": "local\n"})
+    git(checkout, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+        "tag", "-a", "-m", "annotated", "annotated", base)
+    tag = git(checkout, "rev-parse", "refs/tags/annotated")
+    tree = git(checkout, "rev-parse", "HEAD^{tree}")
+    git(checkout, "update-ref", "refs/misc/tree", tree)
+    new = _commit(seed, "upstream", {"a.txt": "two\n"})
+    git(seed, "push", "-q", str(origin), "main")
+    calls = _spy_streams(monkeypatch)
+    assert _import_main(checkout, origin) == new
+    assert calls == [(True, (new, f"^{base}"))]
+    assert not {f"^{local}", f"^{tag}", f"^{tree}"} & set(calls[0][1])
+    assert _closure(checkout, new)
+
+
+def test_incremental_failure_falls_back_once_to_full_export(repositories, monkeypatch):
+    origin, seed, checkout = repositories
+    new = _commit(seed, "upstream", {"a.txt": "two\n"})
+    git(seed, "push", "-q", str(origin), "main")
+    calls = _spy_streams(monkeypatch, fail_thin=True)
+    assert _import_main(checkout, origin) == new
+    assert [thin for thin, _ in calls] == [True, False]
+    assert calls[1][1] == (new,)
+    assert _closure(checkout, new)
+    assert git(checkout, "rev-parse", "refs/remotes/origin/main") == new
+
+
+@pytest.mark.parametrize("failure", ["return", "timeout", "oserror"])
+def test_failed_full_export_raises_fixed_error_without_moving_ref(
+        repositories, monkeypatch, failure):
+    origin, seed, checkout = repositories
+    previous = git(checkout, "rev-parse", "refs/remotes/origin/main")
+    _commit(seed, "upstream", {"a.txt": "two\n"})
+    git(seed, "push", "-q", str(origin), "main")
+    calls = _spy_streams(monkeypatch, fail_thin=True, fail_full=True, failure=failure)
+    with pytest.raises(AgentLoopError) as caught:
+        _import_main(checkout, origin)
+    assert str(caught.value) == "Verified object-pack import failed."
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert [thin for thin, _ in calls] == [True, False]
+    assert git(checkout, "rev-parse", "refs/remotes/origin/main") == previous
+
+
+def test_private_import_rejects_tracking_ref_race_on_pack_path(repositories, monkeypatch):
+    origin, seed, checkout = repositories
+    tracking = "refs/remotes/origin/main"
+    _commit(seed, "upstream", {"a.txt": "two\n"})
+    git(seed, "push", "-q", str(origin), "main")
+    calls = _spy_streams(monkeypatch)
+
+    class MoveRef(Runner):
+        def run(self, args, *, cwd, **kwargs):
+            if tuple(args[:3]) == ("git", "update-ref", tracking):
+                git(checkout, "update-ref", "-d", tracking)
+            return super().run(args, cwd=cwd, **kwargs)
+
+    with pytest.raises(AgentLoopError, match="Command failed"):
+        _import_main(checkout, origin, MoveRef())
+    assert [thin for thin, _ in calls] == [True]
+    assert git(checkout, "show-ref", "--verify", tracking, check=False) == ""
+
+
 def test_wrong_origin_is_rejected_before_private_fetch(repositories, monkeypatch, tmp_path):
     origin, _, checkout = repositories
     marker = tmp_path / "transport-started"
