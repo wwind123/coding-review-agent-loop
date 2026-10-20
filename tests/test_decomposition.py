@@ -4578,3 +4578,162 @@ def test_dry_run_recovery_makes_no_issue_view_reads_or_adoptions(tmp_path):
     assert all(item.origin != "adopted" for item in recovered)
     assert not any(cmd[:3] == ["gh", "issue", "view"] for cmd, _cwd in runner.commands)
     assert not runner.issues
+
+
+# ---------------------------------------------------------------------------
+# Per-child relaunch commands in the decomposition summary (#1331)
+# ---------------------------------------------------------------------------
+
+# Encoded record payload of the v1 case below, rendered by the summary code
+# before #1331 added relaunch lines: the record payload must not change.
+_PRE_1331_V1_PAYLOAD = (
+    "v1_eNqllNtunDAQhl-l8vWu1vgMr9HLqkI-DLtuwVBs0kRR3r2DdxNtGlW5qC-Q7Zn5ML__4ZnYrcyTLXFOpPtG7BlSOS4rOfxjetkmm47W14LvB-IvcQwr7MXPJG2Tg5V0qjmQEssIpCNfC1Z_yQ3WbuuIG5dSltydTvBop2WEU8x5g3xSDXk53CHYBwT7FMHeI_gHBP8Uwd8jxAeE-BQhyAsKE2Je5hx3nfKubIgr-HKMe-qEcl4lP5AVfm0Yyseq5HEZbUoxnckhbeNYHwiDR_DbXtDnstoC56fezwmnvvQPsOZ6eyj6EJMd-5gwY60v6H_P60_SPRPrPSzFJg-9X2OBNVo81X6BMwIg9NnPC_QYmfoY8jUWYIwYtW6E207Gc284J2lOgFKRaQ67OG-fdXRPx-ViM-CnLRaNUfqqC-mkxJ09gkffUiGdeF3HgGmoVH0JkV5r2bLWD9Bo56gdDGVaAtOi4S0djBZSKq-Y08GZQDmXwpsgmVLGs7C7BKRmA28EF44JYXAudOt5O2jjHGjqmReUN164NnCnhZChlcH4EJhpBu4RobwPvFGK24YBbRqgQUsLRuhGty33frBMMoMsYxxtWwG0DZRSqYZ2kEYiwhgQgYYBCUrbQQ40WOkorhyVwvIAQqlBM-FV0yqmpBmUZw11VGuLzL29rgJVC1Zx7rrprivu3P3m0r0YvdQj4IIXZP8a5BbOm_uBvsQM95-jetnPE7ogXL0X4hnyjvb_OSq62JjQpzdTVbuSrjbJ7soz3GxLqjhVlirIVYrXtsHD1OSAkTIv8zhjK-V5W_3uYrssK7bDtQuPD_hH-gPdgbEC"
+)
+
+# A model-source (legacy) summary rendered before #1331; it must stay byte-identical.
+_PRE_1331_LEGACY_BODY = (
+    "Approved plan decomposed for issue #55.\n\nMode: decompose-only\nTopology source: model\n\n"
+    "| Phase | Automation | Child issue | Risk |\n| --- | --- | --- | --- |\n"
+    "| 1. Schema helpers | agent-pr | https://example/issues/61 | recorded |\n"
+    "| 2. Ops rollout | human-action | #62 | recorded Human remark and closure required. |\n\n"
+    "Every phase above has a GitHub child issue; this table is only a summary.\n\n"
+    "<!-- AGENT_PLAN_DECOMPOSITION: v1_eNplj8FqwzAMhl-l6JwQWmgPfokddhwjaI6oA7JlbBlWSt59craysvlm-ff_fboDNpWIukoC9wZ4paRjLjBAaBHTiH5_eh_Ah5WXQj12h9TiBxVwl-MAuioTOHj1gSIeAnGmUq2hFbZxUM3VTRN9YsxM01prozpdjrANT0Wn36KXXA9FmKXpoyU15s0koiw9sZCXmKXSKIlvFspoZjrv3eDOZ5sErDR7aUnBnR73HVH7pv9sn6lGyoxptj_BcPjnWLqQ4ppomX_I1Uumb09bRLKwXG9zlVZ8F-7eDNsXYIJ_iw== -->\n"
+    "-- coding-review-agent-loop"
+)
+
+
+def _relaunch_phase(stage_id, position, disposition, automation="agent-pr"):
+    return PlanPhase(
+        title=f"Stage {stage_id}", scope="Implement the stage.", non_goals="None.",
+        dependency_notes="None.", rollout_risk="low", validation="Run tests.",
+        parent_context="Approved slice.", automation=automation, stage_id=stage_id,
+        position=position, deliverables=("Stage",), acceptance_criteria=("Tests pass",),
+        execution_disposition=disposition,
+    )
+
+
+def _relaunch_summary_kwargs(**overrides):
+    phases = (
+        _relaunch_phase("s1", 1, EXECUTION_DISPOSITION_DIRECT),
+        _relaunch_phase("s2", 2, EXECUTION_DISPOSITION_PLANNING),
+        _relaunch_phase("s3", 3, None),
+        _relaunch_phase("s4", 4, None, automation="human-action"),
+    )
+    created = tuple(
+        CreatedPhaseIssue(
+            phase=phase, issue_url=f"https://example/issues/{60 + index}",
+            issue_number=60 + index,
+        )
+        for index, phase in enumerate(phases, start=1)
+    )
+    kwargs = dict(
+        parent_issue=55, mode="implement-by-phase", plan_hash="a" * 16, created=created,
+        topology_source="approved-plan-v1", strategy="staged",
+        execution_strategy_contract_version=1, recommendation_digest="c" * 64,
+        plan_subject="b" * 64,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+@pytest.mark.parametrize("mode", ["implement-by-phase", "decompose-only"])
+def test_v1_summary_prints_one_relaunch_line_per_child_route(mode):
+    """Row summary-route-lines."""
+    body = format_decomposition_parent_summary(**_relaunch_summary_kwargs(mode=mode))
+    section = body.split("Relaunch commands:\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    assert section == [
+        "- 1. Stage s1: `agent-loop issue 61`",
+        "- 2. Stage s2: `agent-loop issue 62 --plan-first --plan-execution-mode auto`",
+        "- 3. Stage s3: `agent-loop issue 63 --plan-first --plan-execution-mode auto`",
+        "- 4. Stage s4: human-owned (human-action): no agent-loop command; close child #64 "
+        "when the work is done",
+    ]
+    assert "--direct" not in body
+    assert "agent-loop issue 64" not in body
+    assert "a later child refuses to start until every earlier one is complete" in body
+
+
+def test_v1_summary_record_payload_is_unchanged_and_still_matches():
+    """Row summary-legacy-unchanged (v1 rerun matching)."""
+    body = format_decomposition_parent_summary(**_relaunch_summary_kwargs())
+    payload = re.search(r"AGENT_PLAN_DECOMPOSITION: (\S+) -->", body).group(1)
+    assert payload == _PRE_1331_V1_PAYLOAD
+    restored = find_existing_decomposition(
+        [IssueComment(author="bot", created_at=None, body=body)],
+        parent_issue=55, plan_hash="a" * 16, strategy="staged",
+        topology_source="approved-plan-v1", recommendation_digest="c" * 64,
+        plan_subject="b" * 64,
+    )
+    assert restored == _decode_metadata(_PRE_1331_V1_PAYLOAD)
+    assert [number for _title, _url, number in restored.children] == [61, 62, 63, 64]
+
+
+def test_legacy_model_summary_is_byte_identical():
+    """Row summary-legacy-unchanged (legacy topology)."""
+    created = (
+        CreatedPhaseIssue(
+            phase=RecordedPhase(title="Schema helpers", automation="agent-pr"),
+            issue_url="https://example/issues/61", issue_number=61,
+        ),
+        CreatedPhaseIssue(
+            phase=RecordedPhase(title="Ops rollout", automation="human-action"),
+            issue_url=None, issue_number=62,
+        ),
+    )
+    body = format_decomposition_parent_summary(
+        parent_issue=55, mode="decompose-only", plan_hash="a" * 16, created=created
+    )
+    assert body == _PRE_1331_LEGACY_BODY
+    assert "Relaunch commands" not in body
+
+
+def test_oversized_v1_summary_with_relaunch_lines_still_fits():
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    excerpt = " ".join(f"word{index}" for index in range(30000))
+    body = format_decomposition_parent_summary(
+        **_relaunch_summary_kwargs(
+            retained_parent_scope=RetainedParentScope(
+                plan_subject="b" * 64, plan_hash="a" * 16, excerpt=excerpt,
+            )
+        )
+    )
+    assert len(body) <= MAX_GITHUB_BODY_CHARS
+    assert "- 1. Stage s1: `agent-loop issue 61`" in body
+
+
+def test_relaunch_line_without_child_number_names_no_placeholder():
+    from coding_review_agent_loop.decomposition import child_relaunch_line
+
+    line = child_relaunch_line(1, _relaunch_phase("s1", 1, EXECUTION_DISPOSITION_DIRECT), None)
+    assert line == "1. Stage s1: relaunch command unavailable: no child issue number was recorded"
+
+
+def test_parent_stdout_relaunch_lines_use_reviewed_routes_for_adopted_children():
+    """Decompose-only and implement-by-phase stdout share one per-child rendering."""
+    import coding_review_agent_loop.plan_first_loop as plan_first_loop
+    from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
+
+    kwargs = _relaunch_summary_kwargs()
+    phases = tuple(item.phase for item in kwargs["created"])
+    # A rerun adopts children from the summary as RecordedPhase, which carries
+    # no disposition; the route must still come from the reviewed topology.
+    adopted = tuple(
+        CreatedPhaseIssue(
+            phase=RecordedPhase(title=item.phase.title, automation=item.phase.automation),
+            issue_url=item.issue_url, issue_number=item.issue_number,
+        )
+        for item in kwargs["created"]
+    )
+    outcome = StagedTopologyOutcome(
+        created=adopted, stage_ids=("s1", "s2", "s3", "s4"),
+        automations=tuple(phase.automation for phase in phases), plan_hash="a" * 16,
+        mode="decompose-only", topology_source="approved-plan-v1",
+    )
+    lines = plan_first_loop._staged_child_relaunch_lines(
+        PlanDecomposition(phases=phases), outcome
+    )
+    body = format_decomposition_parent_summary(**kwargs)
+    assert [f"- {line}" for line in lines] == (
+        body.split("Relaunch commands:\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    )

@@ -5410,3 +5410,28 @@ def test_plan_resume_keep_on_issue_edit_is_reset_in_derived_configs(tmp_path):
             preserve_managed_options=True,
         )
         assert "--plan-resume-keep-on-issue-edit" not in rendered
+
+
+def test_cli_maps_dependency_not_merged_to_exit_5_and_generic_error_to_1(capsys):
+    """Row cli-exit-mapping (#1331)."""
+    from coding_review_agent_loop.errors import DependencyNotMergedError, UnmetDependency
+
+    error = DependencyNotMergedError(
+        child_issue=62, stage_id="s2", relaunch_command="`agent-loop issue 62`",
+        prerequisites=(
+            UnmetDependency(61, "s1", 1, True, "not-dispatched", None, None, None,
+                            "stage s1 has not been started; start it with `agent-loop issue 61`"),
+        ),
+    )
+    with patch.object(cli_module, "run_pr_loop", side_effect=error):
+        assert main(["pr", "77", "--repo", "OWNER/REPO"]) == 5
+    stderr = capsys.readouterr().err
+    assert "agent-loop: DEPENDENCY NOT MERGED" in stderr
+    assert "dependency #61 (stage s1) is not merged" in stderr
+
+    with patch.object(cli_module, "run_pr_loop", side_effect=AgentLoopError("boom")):
+        assert main(["pr", "77", "--repo", "OWNER/REPO"]) == 1
+    # Existing distinct codes are unchanged.
+    assert HumanDecisionRequiredError.EXIT_CODE == 4
+    assert QuotaResetExceededError.EXIT_CODE == 3
+    assert DependencyNotMergedError.EXIT_CODE == 5

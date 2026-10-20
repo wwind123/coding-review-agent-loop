@@ -395,6 +395,14 @@ existing stop. A planning child that recommends another staged topology stops
 before decision persistence or decomposition because hierarchical execution is
 owned by separate work (see Decisions).
 
+Direct child entry enforces the parent's staged order before it posts any
+handoff or starts an agent turn. It runs the parent's staged-progress
+resolution read-only over the earlier phases only, with the same completion
+and integration-base verification minus the closure write; an undelivered
+earlier phase stops the run with `DependencyNotMergedError` (exit code 5).
+The decomposition summary's per-child relaunch lines are advisory operator
+guidance and carry no protocol authority.
+
 ## Decisions
 
 [Decision log](decisions/planning.md)

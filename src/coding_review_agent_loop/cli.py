@@ -50,7 +50,12 @@ from .config import (
     reviewers,
     validate_sandboxed_args,
 )
-from .errors import AgentLoopError, HumanDecisionRequiredError, QuotaResetExceededError
+from .errors import (
+    AgentLoopError,
+    DependencyNotMergedError,
+    HumanDecisionRequiredError,
+    QuotaResetExceededError,
+)
 from .managed_ci import (
     PREFLIGHT_INDETERMINATE,
     PREFLIGHT_KNOWN_NOT_READY,
@@ -2933,6 +2938,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 discuss_max_rounds=getattr(args, "discuss_max_rounds", 2),
             )
         parser.error(f"unknown command: {args.command}")
+    except DependencyNotMergedError as exc:
+        print(f"agent-loop: DEPENDENCY NOT MERGED\n{exc}", file=sys.stderr)
+        return DependencyNotMergedError.EXIT_CODE
     except HumanDecisionRequiredError as exc:
         print(f"agent-loop: HUMAN DECISION REQUIRED\n{exc}", file=sys.stderr)
         return HumanDecisionRequiredError.EXIT_CODE

@@ -11,6 +11,7 @@ later run finds the PR already MERGED.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Literal
 
 from .config import AgentLoopConfig
@@ -128,31 +129,53 @@ def _authorized_base(runner: Runner, config: AgentLoopConfig, pr_number: int) ->
     return next(iter(bases))
 
 
-def close_child_after_integration_merge(
+VerifyOutcome = Literal[
+    "not-merged",
+    "unresolved",
+    "default-branch",
+    "already-closed",
+    "integration-verified",
+]
+
+
+@dataclass(frozen=True)
+class IntegrationMergeVerification:
+    """Read-only result of authenticating a PR's integration merge (#1331).
+
+    ``base_ref`` is the observed merge target when one was read; ``reason``
+    names why an ``unresolved`` verification could not be completed.
+    """
+
+    outcome: VerifyOutcome
+    base_ref: str | None = None
+    reason: str | None = None
+    default_branch: str | None = None
+
+
+def verify_integration_merge(
     runner: Runner,
     *,
     config: AgentLoopConfig,
-    issue_context: IssueContext | None,
+    issue_context: IssueContext,
     pr_number: int,
     expected_base: str | None = None,
-) -> CloseOutcome:
-    """Close the closing-referenced child of a MERGED non-default-base PR.
+) -> IntegrationMergeVerification:
+    """Authenticate a MERGED PR's integration merge without writing anything.
 
-    The merge is authenticated first: the PR must be MERGED into this
-    repository, its base must equal the recorded base (``expected_base`` or the
-    run's explicit ``--base``) and still be trusted by the repository
-    variable, and its body must carry the closing reference to the child.
-    Any mismatch or unreadable evidence is ``unresolved`` and mutates nothing.
-    ``default-branch`` and ``not-merged`` are confirmed states, never inferred
-    from a failed read.
+    Holds every check ``close_child_after_integration_merge`` performs before
+    its closure write: the PR is MERGED into this repository, its base equals
+    the recorded base (``expected_base`` or the run's explicit ``--base``) and
+    is still trusted by the repository variable, and its body carries the
+    closing reference to the child.  ``integration-verified`` is exactly the
+    state in which the close path would close an OPEN child.  Any mismatch or
+    unreadable evidence is ``unresolved``; ``default-branch`` and
+    ``not-merged`` are confirmed states, never inferred from a failed read.
     """
-    if issue_context is None or config.dry_run:
-        return "skipped"
     pr = _api(runner, config, f"repos/{config.repo}/pulls/{pr_number}")
     if pr is None:
-        return "unresolved"
+        return IntegrationMergeVerification("unresolved", reason="the PR could not be read")
     if pr.get("merged") is False:
-        return "not-merged"
+        return IntegrationMergeVerification("not-merged")
     base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
     base_repo = base.get("repo") if isinstance(base.get("repo"), dict) else {}
     base_ref = base.get("ref")
@@ -163,32 +186,49 @@ def close_child_after_integration_merge(
         or not base_ref
         or str(base_repo.get("full_name", "")).casefold() != config.repo.casefold()
     ):
-        return "unresolved"
+        return IntegrationMergeVerification(
+            "unresolved", reason="the PR merge into this repository could not be confirmed"
+        )
     repo = _api(runner, config, f"repos/{config.repo}")
     default_branch = repo.get("default_branch") if repo else None
     if not isinstance(default_branch, str) or not default_branch:
-        return "unresolved"
+        return IntegrationMergeVerification(
+            "unresolved", base_ref=base_ref, reason="the default branch could not be read"
+        )
     try:
         authorized = _authorized_base(runner, config, pr_number)
     except _RecordedBaseUnavailable as exc:
         log(config, f"Issue #{issue_context.number}: recorded base not authenticated ({exc})")
-        return "unresolved"
+        return IntegrationMergeVerification(
+            "unresolved", base_ref=base_ref, reason=f"recorded base not authenticated: {exc}"
+        )
     # Every explicit statement of the recorded base must agree with the
     # authenticated evidence and the actual merge target, before any mutation.
     claimed = {b for b in (expected_base, config.base if config.base_provenance == "explicit" else None) if b}
     if authorized is not None and claimed - {authorized}:
-        return "unresolved"
+        return IntegrationMergeVerification(
+            "unresolved", base_ref=base_ref,
+            reason=f"the claimed base disagrees with the authorized base {authorized}",
+        )
     if authorized is None and not (claimed <= {base_ref}):
-        return "unresolved"
+        return IntegrationMergeVerification(
+            "unresolved", base_ref=base_ref, reason="the claimed base disagrees with the merge target"
+        )
     if authorized is not None and authorized != base_ref:
         log(config, f"Issue #{issue_context.number}: PR #{pr_number} merged into {base_ref}, not the authorized base {authorized}")
-        return "unresolved"
+        return IntegrationMergeVerification(
+            "unresolved", base_ref=base_ref,
+            reason=f"merged into {base_ref}, not the authorized base {authorized}",
+        )
     if base_ref == default_branch:
-        return "default-branch"
+        return IntegrationMergeVerification("default-branch", base_ref=base_ref)
     if authorized is None:
         # A non-default merge with no authenticated authorization is never closed.
         log(config, f"Issue #{issue_context.number}: no authenticated authorization for base {base_ref}")
-        return "unresolved"
+        return IntegrationMergeVerification(
+            "unresolved", base_ref=base_ref,
+            reason=f"no authenticated authorization for base {base_ref}",
+        )
     from .managed_ci import trusted_base_problem
 
     if trusted_base_problem(
@@ -196,18 +236,54 @@ def close_child_after_integration_merge(
         base=base_ref, default_branch=default_branch, require_marker=False,
     ) is not None:
         log(config, f"Issue #{issue_context.number}: PR #{pr_number} merged into untrusted base {base_ref}")
-        return "unresolved"
+        return IntegrationMergeVerification(
+            "unresolved", base_ref=base_ref, reason=f"base {base_ref} is not trusted"
+        )
     body = pr.get("body") if isinstance(pr.get("body"), str) else ""
     if not parse_strong_issue_reference_evidence(
         body, repo=config.repo, issue_number=issue_context.number
     ):
-        return "unresolved"
+        return IntegrationMergeVerification(
+            "unresolved", base_ref=base_ref,
+            reason=f"the PR body carries no closing reference to #{issue_context.number}",
+        )
     issue = _api(runner, config, f"repos/{config.repo}/issues/{issue_context.number}")
     state = str(issue.get("state", "")).lower() if issue else ""
     if state == "closed":
-        return "already-closed"
+        return IntegrationMergeVerification("already-closed", base_ref=base_ref)
     if state != "open":
-        return "unresolved"
+        return IntegrationMergeVerification(
+            "unresolved", base_ref=base_ref, reason="the child issue state could not be read"
+        )
+    return IntegrationMergeVerification(
+        "integration-verified", base_ref=base_ref, default_branch=default_branch
+    )
+
+
+def close_child_after_integration_merge(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_context: IssueContext | None,
+    pr_number: int,
+    expected_base: str | None = None,
+) -> CloseOutcome:
+    """Close the closing-referenced child of a MERGED non-default-base PR.
+
+    The merge is authenticated first by ``verify_integration_merge``; the
+    closure write happens only when it returns ``integration-verified``.
+    Any mismatch or unreadable evidence is ``unresolved`` and mutates nothing.
+    """
+    if issue_context is None or config.dry_run:
+        return "skipped"
+    verification = verify_integration_merge(
+        runner, config=config, issue_context=issue_context, pr_number=pr_number,
+        expected_base=expected_base,
+    )
+    if verification.outcome != "integration-verified":
+        return verification.outcome
+    base_ref = verification.base_ref
+    default_branch = verification.default_branch
     comment = (
         f"Closing: PR #{pr_number} merged into `{base_ref}`. GitHub only auto-closes a "
         f"closing-referenced issue on the default branch (`{default_branch}`), so "
