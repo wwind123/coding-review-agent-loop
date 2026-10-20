@@ -6,8 +6,8 @@ CLI run with an omitted ``--<agent>-dir`` gets its own detached
 ``git worktree`` under ``<scratch>/OWNER-REPO/<agent>/runs/<run-token>``,
 protected by the usual #1127 run claim and removed when the run ends.
 
-Store mutations (initialization, import+pin, local-base fast-forward, link creation, prune
-and remove) are serialized by a short, **non-reentrant** host flock that is
+Store mutations (initialization, import+pin, local-base fast-forward, pack
+compaction, link creation, prune and remove) are serialized by a short, **non-reentrant** host flock that is
 never held across an agent turn.  Every worktree created here has a durable
 owner record under the private host lock root; removal and pruning delete only
 a directory whose record still matches its creation identity.
@@ -20,8 +20,10 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
+import subprocess
 import threading
 from pathlib import Path
 from typing import Any, Iterator
@@ -30,6 +32,7 @@ from .checkout_verification import _refuse_untrusted_root, forget_checkout
 from .errors import AgentLoopError, CheckoutVerificationError
 from .logging import log
 from .scratch import make_private_dirs
+from .secure_git import local_command
 from .test_workers import _write_reservation, host_lock_root
 from .workdir_claims import probe_free_claim
 
@@ -547,7 +550,9 @@ def prepare_store(store: Path, *, config: Any, runner: Any) -> str:
     with store_lock(store):
         with probe_free_claim(store) as free:
             _prepare_store_locked(store, free=free, config=config, runner=runner)
-            return _fetch_and_pin(store, config.base, config=config, runner=runner, free=free)
+            sha = _fetch_and_pin(store, config.base, config=config, runner=runner, free=free)
+        compact_packs_if_needed(store, config=config, runner=runner)
+        return sha
 
 
 def pin_pr_head(store: Path, pr_number: int, *, config: Any, runner: Any) -> str:
@@ -558,12 +563,181 @@ def pin_pr_head(store: Path, pr_number: int, *, config: Any, runner: Any) -> str
 
         if config.base:
             _fetch_and_pin(store, config.base, config=config, runner=runner, free=False)
-        return import_ref(
+        sha = import_ref(
             store, f"refs/pull/{pr_number}/head", pr_ref,
             repo=config.repo, runner=runner, gh_cmd=config.gh_cmd,
             local_origin=config.trusted_local_origin,
             **_transport_options(config),
         )
+        compact_packs_if_needed(store, config=config, runner=runner)
+        return sha
+
+
+# --- pack compaction (#1578) -----------------------------------------------
+#
+# ``gc.auto=0`` stays in the hardened Git config, and ``git repack`` cannot run
+# under the exec guard (it execs ``pack-objects``).  Every import writes one
+# pack, so a long-lived checkout is compacted here instead: one confined
+# ``pack-objects --stdout`` writes a replacement pack into a private scratch
+# directory, Python verifies it holds every snapshot object, and only then are
+# the snapshot packs removed.  Nothing is ever pruned.
+
+PACK_COMPACTION_THRESHOLD = 50
+PACK_COMPACTION_TIMEOUT_SECONDS = 900
+PACK_INDEX_TIMEOUT_SECONDS = 300
+_PACK_NAME_RE = re.compile(r"^pack-([0-9a-f]{40}(?:[0-9a-f]{24})?)\.pack$")
+_PACK_HASH_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_PACK_SIDECARS = (".pack", ".rev", ".bitmap", ".mtimes")
+
+
+class _CompactionSkip(Exception):
+    """A fixed, stderr-free reason why compaction was abandoned."""
+
+
+def _compaction_log(config: Any, message: str) -> None:
+    if not getattr(config, "quiet", False):
+        log(config, message)
+
+
+def _is_regular(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _snapshot_packs(packdir: Path) -> dict[str, Path]:
+    """Every non-kept, non-promisor pack with an index, keyed by pack hash."""
+    packs: dict[str, Path] = {}
+    for name in sorted(os.listdir(packdir)):
+        match = _PACK_NAME_RE.fullmatch(name)
+        if match is None:
+            continue
+        pack = packdir / name
+        if not _is_regular(pack) or not _is_regular(pack.with_suffix(".idx")):
+            continue
+        if os.path.lexists(pack.with_suffix(".keep")) or os.path.lexists(pack.with_suffix(".promisor")):
+            continue
+        packs[match.group(1)] = pack
+    return packs
+
+
+def _confined_run(args: tuple[str, ...], *, checkout: Path, timeout: int, label: str,
+                  stdin: Any = subprocess.DEVNULL, stdout: Any = subprocess.PIPE) -> bytes:
+    argv, env, pass_fds = local_command(args, checkout=checkout)
+    try:
+        result = subprocess.run(argv, cwd=checkout, env=env, pass_fds=pass_fds,
+                                stdin=stdin, stdout=stdout, stderr=subprocess.DEVNULL,
+                                check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        # subprocess.run has already killed and reaped the child.
+        raise _CompactionSkip(f"{label} timed out") from exc
+    if result.returncode != 0:
+        raise _CompactionSkip(f"{label} failed (exit {result.returncode})")
+    return result.stdout or b""
+
+
+def _pack_index_ids(idx: Path, *, checkout: Path) -> set[str]:
+    """Object IDs listed by one pack index, read through builtin ``show-index``."""
+    with open(idx, "rb") as handle:
+        output = _confined_run(("show-index",), checkout=checkout, stdin=handle,
+                               timeout=PACK_INDEX_TIMEOUT_SECONDS, label="show-index")
+    ids: set[str] = set()
+    for line in output.decode("ascii", "replace").splitlines():
+        fields = line.split()
+        if len(fields) < 2 or not _PACK_HASH_RE.fullmatch(fields[1]):
+            raise _CompactionSkip("show-index output unrecognized")
+        ids.add(fields[1])
+    return ids
+
+
+def _pack_directory(checkout: Path, runner: Any) -> Path:
+    common = runner.run(("git", "rev-parse", "--git-common-dir"), cwd=checkout).stdout.strip()
+    if not common:
+        raise _CompactionSkip("no git directory")
+    common_path = Path(common)
+    if not common_path.is_absolute():
+        common_path = checkout / common_path
+    packdir = common_path / "objects" / "pack"
+    try:
+        if not stat.S_ISDIR(packdir.lstat().st_mode):
+            raise _CompactionSkip("pack directory is not a directory")
+    except FileNotFoundError:
+        raise _CompactionSkip("no pack directory") from None
+    return packdir
+
+
+def _compact(checkout: Path, *, config: Any, runner: Any) -> None:
+    packdir = _pack_directory(checkout, runner)
+    snapshot = _snapshot_packs(packdir)
+    if len(snapshot) <= PACK_COMPACTION_THRESHOLD:
+        return
+    inventory: set[str] = set()
+    for pack in snapshot.values():
+        inventory |= _pack_index_ids(pack.with_suffix(".idx"), checkout=checkout)
+    scratch = packdir / f".agent-loop-compact-{secrets.token_hex(8)}"
+    os.mkdir(scratch, 0o700)
+    try:
+        new_pack, new_idx, new_rev = scratch / "new.pack", scratch / "new.idx", scratch / "new.rev"
+        descriptor = os.open(new_pack, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            # --no-use-bitmap-index: a bitmap walk returns before
+            # --keep-unreachable adds unreferenced objects such as pinned PR
+            # heads, and it overrides any pack.useBitmaps in repository config.
+            _confined_run(
+                ("pack-objects", "--stdout", "--no-use-bitmap-index", "--all", "--reflog",
+                 "--indexed-objects", "--keep-unreachable", "--keep-true-parents",
+                 "--non-empty", "--revs"),
+                checkout=checkout, stdout=handle,
+                timeout=PACK_COMPACTION_TIMEOUT_SECONDS, label="pack-objects",
+            )
+        digest = _confined_run(
+            ("index-pack", "--rev-index", "-o", str(new_idx), str(new_pack)),
+            checkout=checkout, timeout=PACK_COMPACTION_TIMEOUT_SECONDS, label="index-pack",
+        ).decode("ascii", "replace").strip()
+        if not _PACK_HASH_RE.fullmatch(digest):
+            raise _CompactionSkip("index-pack output unrecognized")
+        if not inventory <= _pack_index_ids(new_idx, checkout=checkout):
+            raise _CompactionSkip("verification mismatch")
+        target = packdir / f"pack-{digest}"
+        if not os.path.lexists(target.with_suffix(".idx")):
+            # Git's own order: the index last, so readers never see a pack without data.
+            for source, suffix in ((new_pack, ".pack"), (new_rev, ".rev"), (new_idx, ".idx")):
+                if source.exists():
+                    os.chmod(source, 0o444)
+                    os.replace(source, target.with_suffix(suffix))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    for pack_hash, pack in snapshot.items():
+        if pack_hash == digest:
+            continue
+        # The index first, so new readers stop finding the pack before its data goes.
+        for suffix in (".idx", *_PACK_SIDECARS):
+            with contextlib.suppress(FileNotFoundError):
+                pack.with_suffix(suffix).unlink()
+    _compaction_log(
+        config,
+        f"Compacted {len(snapshot)} packs into one for {checkout} "
+        f"({len(_snapshot_packs(packdir))} non-kept packs remain).",
+    )
+
+
+def compact_packs_if_needed(checkout: Path, *, config: Any, runner: Any) -> None:
+    """Merge a checkout's packs once there are more than the threshold.
+
+    The caller must hold ``store_lock(checkout)``; that check and the dry-run
+    return run outside the log-and-continue block, so a missing lock still
+    raises.  Any other failure is logged and never fails the fetch path.
+    """
+    _require_lock_held(checkout)
+    if getattr(runner, "dry_run", False):
+        return
+    try:
+        _compact(checkout, config=config, runner=runner)
+    except _CompactionSkip as exc:
+        _compaction_log(config, f"Pack compaction for {checkout} skipped: {exc}")
+    except Exception as exc:
+        _compaction_log(config, f"Pack compaction for {checkout} skipped: unexpected {type(exc).__name__}")
 
 
 # --- pruning ---------------------------------------------------------------
