@@ -44,11 +44,12 @@ confined `index-pack --fix-thin` completes the thin pack. When the fetched
 commit is already a ref tip whose closure is complete, no pack is written.
 Destination tips are exclusion hints only, never proof of completeness: every
 path verifies the fetched commit's full reachable closure in the destination
-(`rev-list --objects --missing=error`, no history excluded) before the
+(`rev-list --objects --missing=error`, no history excluded, with the
+destination's shallow file, grafts and replace refs ignored) before the
 tracking-ref compare-and-swap, and an incomplete closure or a failed
 incremental export falls back once to a full export, which repairs missing
-history. If that also fails, the fixed import error is raised and the ref is
-not moved. The network fetch into a fresh private repository is unchanged.
+history. If that also fails or raises, the fixed import error is raised and
+the ref is not moved. The network fetch into a fresh private repository is unchanged.
 
 **Pack compaction.** Each import writes at most one pack and the hardened config keeps
 `gc.auto=0`, so after the last import in each locked fetch (`prepare_store`,

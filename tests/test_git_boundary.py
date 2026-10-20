@@ -169,7 +169,8 @@ def _pack_objects(pack: Path) -> set[str]:
             if line and line.split()[1:2] and line.split()[1] in {"commit", "tree", "blob", "tag"}}
 
 
-def _spy_streams(monkeypatch, fail_thin: bool = False, fail_full: bool = False) -> list:
+def _spy_streams(monkeypatch, fail_thin: bool = False, fail_full: bool = False,
+                 failure: str = "return") -> list:
     from coding_review_agent_loop import git_transport
 
     real = git_transport._stream_pack
@@ -178,6 +179,10 @@ def _spy_streams(monkeypatch, fail_thin: bool = False, fail_full: bool = False) 
     def spy(private, env, destination, revs, *, thin):
         calls.append((thin, revs))
         if (fail_thin and thin) or (fail_full and not thin):
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(("index-pack",), 90)
+            if failure == "oserror":
+                raise BrokenPipeError("pack stream closed")
             return False
         return real(private, env, destination, revs, thin=thin)
 
@@ -191,9 +196,13 @@ def _import_main(checkout: Path, origin: Path, runner: Runner | None = None) -> 
 
 
 def _closure(checkout: Path, sha: str) -> bool:
+    """Walk sha's full closure, ignoring shallow, graft and replace state."""
+    absent = str(checkout.parent / "absent-history-file")
+    env = {**os.environ, "GIT_SHALLOW_FILE": absent, "GIT_GRAFT_FILE": absent,
+           "GIT_NO_REPLACE_OBJECTS": "1"}
     return subprocess.run(("git", "-C", str(checkout), "rev-list", "--objects",
                            "--missing=error", "--quiet", sha),
-                          capture_output=True, check=False).returncode == 0
+                          capture_output=True, env=env, check=False).returncode == 0
 
 
 def test_unchanged_complete_ref_reimport_writes_no_pack(repositories, monkeypatch):
@@ -280,6 +289,44 @@ def test_missing_object_below_unchanged_tip_is_repaired(repositories, monkeypatc
     assert git(checkout, "rev-parse", "refs/remotes/origin/main") == tip
 
 
+def _mask_history(checkout: Path, tip: str, mask: str) -> None:
+    """Make tip look like a root commit through destination-side history state."""
+    if mask == "shallow":
+        (checkout / ".git" / "shallow").write_text(f"{tip}\n")
+    elif mask == "graft":
+        (checkout / ".git" / "info").mkdir(exist_ok=True)
+        (checkout / ".git" / "info" / "grafts").write_text(f"{tip}\n")
+    else:
+        git(checkout, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+            "replace", "--graft", tip)
+
+
+@pytest.mark.parametrize("advance", [False, True], ids=["unchanged-tip", "advancing-tip"])
+@pytest.mark.parametrize("mask", ["shallow", "graft", "replace"])
+def test_closure_gate_ignores_destination_history_substitution(
+        repositories, monkeypatch, tmp_path, mask, advance):
+    origin, _, checkout = repositories
+    tip, blob = _loose_history_with_lost_blob(origin, checkout)
+    _mask_history(checkout, tip, mask)
+    # The destination's own walk now stops at tip and misses the lost blob.
+    assert subprocess.run(("git", "-C", str(checkout), "rev-list", "--objects",
+                           "--missing=error", "--quiet", tip),
+                          capture_output=True, check=False).returncode == 0
+    expected = tip
+    if advance:
+        other = tmp_path / "other"
+        subprocess.run(("git", "clone", "-q", str(origin), str(other)), check=True)
+        expected = _commit(other, "B", {"c.txt": "c\n"})
+        git(other, "push", "-q", "origin", "main")
+    calls = _spy_streams(monkeypatch)
+    assert _import_main(checkout, origin) == expected
+    assert [thin for thin, _ in calls] == ([True, False] if advance else [False])
+    assert calls[-1][1] == (expected,)
+    assert git(checkout, "cat-file", "-t", blob) == "blob"
+    assert _closure(checkout, expected)
+    assert git(checkout, "rev-parse", "refs/remotes/origin/main") == expected
+
+
 def test_local_only_and_non_commit_tips_are_never_negative_revs(repositories, monkeypatch):
     origin, seed, checkout = repositories
     base = git(checkout, "rev-parse", "HEAD")
@@ -311,15 +358,18 @@ def test_incremental_failure_falls_back_once_to_full_export(repositories, monkey
     assert git(checkout, "rev-parse", "refs/remotes/origin/main") == new
 
 
-def test_failed_full_export_raises_fixed_error_without_moving_ref(repositories, monkeypatch):
+@pytest.mark.parametrize("failure", ["return", "timeout", "oserror"])
+def test_failed_full_export_raises_fixed_error_without_moving_ref(
+        repositories, monkeypatch, failure):
     origin, seed, checkout = repositories
     previous = git(checkout, "rev-parse", "refs/remotes/origin/main")
     _commit(seed, "upstream", {"a.txt": "two\n"})
     git(seed, "push", "-q", str(origin), "main")
-    calls = _spy_streams(monkeypatch, fail_thin=True, fail_full=True)
+    calls = _spy_streams(monkeypatch, fail_thin=True, fail_full=True, failure=failure)
     with pytest.raises(AgentLoopError) as caught:
         _import_main(checkout, origin)
     assert str(caught.value) == "Verified object-pack import failed."
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
     assert [thin for thin, _ in calls] == [True, False]
     assert git(checkout, "rev-parse", "refs/remotes/origin/main") == previous
 

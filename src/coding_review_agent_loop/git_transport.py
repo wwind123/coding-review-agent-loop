@@ -693,16 +693,27 @@ def _private_commits(private: Path, env: dict[str, str], candidates: list[str]) 
     return kept
 
 
-def _closure_complete(destination: Path, sha: str, runner: Any) -> bool:
+def _closure_complete(destination: Path, sha: str, scratch: Path) -> bool:
     """Return True only when destination holds every object reachable from sha.
 
     No history is excluded: destination refs are hints, never proof of
     completeness, so this is the single gate before the tracking-ref CAS.
+    The walk also ignores the destination's shallow file, grafts and replace
+    refs, which would otherwise end or redirect it above missing objects.
+    ``scratch`` is a private directory; the absent files named in it stand
+    in for the destination's shallow and graft files.
     """
+    argv, local_env, pass_fds = local_command(
+        ("rev-list", "--objects", "--missing=error", "--quiet", sha), checkout=destination
+    )
+    absent = str(scratch / "agent-loop-absent")
+    local_env.update({"GIT_SHALLOW_FILE": absent, "GIT_GRAFT_FILE": absent,
+                      "GIT_NO_REPLACE_OBJECTS": "1"})
     try:
-        walked = runner.run(("git", "rev-list", "--objects", "--missing=error", "--quiet", sha),
-                            cwd=destination, check=False)
-    except AgentLoopError:
+        walked = subprocess.run(argv, cwd=destination, env=local_env, pass_fds=pass_fds,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, check=False, timeout=600)
+    except (OSError, subprocess.TimeoutExpired):
         return False
     return walked.returncode == 0
 
@@ -733,6 +744,16 @@ def _stream_pack(private: Path, env: dict[str, str], destination: Path,
             export.kill()
             export.wait()
     return not (imported.returncode or export.returncode)
+
+
+def _imported(private: Path, env: dict[str, str], destination: Path,
+              revs: tuple[str, ...], *, thin: bool) -> bool:
+    """Stream one pack and verify sha's full closure; any failure returns False."""
+    try:
+        return (_stream_pack(private, env, destination, revs, thin=thin)
+                and _closure_complete(destination, revs[0], private))
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def import_ref(destination: Path, source_ref: str, tracking_ref: str, *,
@@ -785,19 +806,13 @@ def import_ref(destination: Path, source_ref: str, tracking_ref: str, *,
         tips = _destination_tips(destination, runner)
         # An existing complete ref tip needs no pack; otherwise try a thin
         # pack excluding usable tips, then fall back once to a full export.
-        complete = sha in tips and _closure_complete(destination, sha, runner)
+        complete = sha in tips and _closure_complete(destination, sha, private)
         if not complete and sha not in tips:
             negatives = _private_commits(private, env, tips)
             if negatives:
                 revs = (sha, *(f"^{tip}" for tip in negatives))
-                try:
-                    complete = (_stream_pack(private, env, destination, revs, thin=True)
-                                and _closure_complete(destination, sha, runner))
-                except (OSError, subprocess.TimeoutExpired):
-                    complete = False
-        if not complete and not (
-                _stream_pack(private, env, destination, (sha,), thin=False)
-                and _closure_complete(destination, sha, runner)):
+                complete = _imported(private, env, destination, revs, thin=True)
+        if not complete and not _imported(private, env, destination, (sha,), thin=False):
             raise AgentLoopError("Verified object-pack import failed.")
         verified = runner.run(("git", "rev-parse", "--verify", f"{sha}^{{commit}}"),
                               cwd=destination)
