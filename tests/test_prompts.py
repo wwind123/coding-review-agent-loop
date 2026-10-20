@@ -2515,6 +2515,47 @@ def test_coder_prompts_require_focused_bounded_local_tests(tmp_path, builder):
     assert "Reserve agent-unavailable for a genuine environment/tooling failure" in prompt
 
 
+@pytest.mark.parametrize("coder", ["claude", "codex", "antigravity"])
+@pytest.mark.parametrize(
+    "builder",
+    [
+        lambda config: build_issue_prompt(56, config),
+        lambda config: build_issue_implementation_prompt(56, "1. Fix it.", config),
+        lambda config: build_completion_recovery_prompt(config),
+        lambda config: build_task_prompt("Fix the bug.", config),
+        lambda config: build_task_clarification_prompt("Fix the bug.", [], config),
+        lambda config: build_followup_prompt(77, 1, "Needs tests.", config),
+        lambda config: build_same_pr_followup_prompt(77, 1, "Tighten docs.", config),
+        lambda config: build_merge_conflict_prompt(
+            77,
+            1,
+            "Resolve the conflict.",
+            config,
+            base_branch="main",
+            head_sha="deadbeef",
+            merge_state_detail="mergeable=CONFLICTING",
+        ),
+    ],
+)
+def test_coder_prompts_forbid_unspecified_stdin_reads(tmp_path, builder, coder):
+    """#1546: a bare stdin read can stall a coder turn until the Bash limit."""
+    prompt = " ".join(builder(make_config(tmp_path, coder=coder)).split())
+
+    assert "Never run a shell command that may read standard input" in prompt
+    assert "bare `cat > file`" in prompt
+    assert "heredoc or a file" in prompt
+    assert "`< /dev/null`" in prompt
+
+
+def test_reviewer_and_planner_prompts_omit_coder_stdin_guidance(tmp_path):
+    config = make_config(tmp_path)
+    for prompt in (
+        build_review_prompt(77, 1, config, reviewer="codex"),
+        build_issue_plan_prompt(56, config),
+    ):
+        assert "may read standard input" not in " ".join(prompt.split())
+
+
 def test_coder_prompts_render_a_configured_non_default_timeout_policy(tmp_path):
     config = make_config(tmp_path, coder_test_command_timeout_seconds=7200)
     prompt = " ".join(build_issue_prompt(56, config).split())

@@ -3889,6 +3889,29 @@ def test_runner_pty_preserves_bytes_and_reports_unexpected_master_read_failure(
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell stdin semantics")
+@pytest.mark.parametrize("input_text", ["prompt", None])
+def test_runner_non_pty_child_stdin_reaches_end_of_file(tmp_path, input_text):
+    """#1546: a non-PTY agent child never inherits an open, silent stdin.
+
+    The prompt arrives from a regular file (or DEVNULL without input), so a
+    child that reads stdin to the end, then reads it again, finishes promptly.
+    """
+    result = Runner().run_with_log(
+        ["sh", "-c", "cat >/dev/null; cat; echo done"],
+        cwd=tmp_path,
+        log_path=tmp_path / "logs" / "stdin-eof.log",
+        label="StdinEofProbe",
+        progress_interval_seconds=999,
+        check=False,
+        input_text=input_text,
+        timeout_seconds=20,
+    )
+
+    assert result.returncode == 0
+    assert "done" in result.stdout
+
+
 def test_runner_keeps_output_when_capture_path_is_unlinked(tmp_path):
     """An open capture descriptor survives cleanup unlinking its pathname."""
     program = (
