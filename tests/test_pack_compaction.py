@@ -29,6 +29,13 @@ def _git_identity(monkeypatch):
         ("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@example.com"),
         ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@example.com"),
         ("GIT_CONFIG_GLOBAL", os.devnull), ("GIT_CONFIG_SYSTEM", os.devnull),
+        # Newer Git (2.55 on CI) runs auto maintenance after porcelain commands
+        # such as commit, which repacks fixture packs before the test starts.
+        # Only the fixture's unconfined git sees this; confined calls rebuild
+        # their environment from an allowlist.
+        ("GIT_CONFIG_COUNT", "2"),
+        ("GIT_CONFIG_KEY_0", "gc.auto"), ("GIT_CONFIG_VALUE_0", "0"),
+        ("GIT_CONFIG_KEY_1", "maintenance.auto"), ("GIT_CONFIG_VALUE_1", "false"),
     ):
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(run_worktrees, "PACK_COMPACTION_THRESHOLD", THRESHOLD)
@@ -100,6 +107,10 @@ class Repo:
         if bitmap:
             write_pack(self.path, extra=("--all", "--write-bitmap-index"))
             assert any(name.endswith(".bitmap") for name in os.listdir(pack_dir(self.path)))
+        # One pack per commit plus the PR pack (the bitmapped pack has the same
+        # content, so the same name, as the last commit's pack): fail setup
+        # loudly if anything merged them behind the fixture's back.
+        assert len(non_kept_packs(self.path)) == packs + 1
 
     def objects(self) -> set[str]:
         ids: set[str] = set()
