@@ -69,6 +69,7 @@ from .pr_board_state import (
 from .round_state import (
     canonical_deferred_history_items,
     drop_inert_post_reconciliation_checkpoints,
+    startup_force_full_latch,
     reset_pr_board_stamp,
     set_pr_board_stamp,
 )
@@ -2698,13 +2699,15 @@ def run_pr_loop(
                     ),
                 )
         # A checkpoint posted into an already reconciled round is inert for
-        # every scheduler reader (#1553).
+        # every scheduler reader (#1553), except that a lineage-visible
+        # amendment activation still carries the monotonic force-full latch
+        # (#1559): a run interrupted after an activation-only record keeps it.
+        restored_operator, restored_automatic = startup_force_full_latch(
+            startup_records, requires_primary=scheduler_capabilities.requires_primary
+        )
+        scheduler_operator_force_full = scheduler_operator_force_full or restored_operator
+        scheduler_force_full = scheduler_force_full or restored_automatic
         for record in drop_inert_post_reconciliation_checkpoints(startup_records):
-            if record.metadata.scheduler_force_full:
-                if record.metadata.scheduler_force_full_source == "operator":
-                    scheduler_operator_force_full = True
-                elif not scheduler_capabilities.requires_primary:
-                    scheduler_force_full = True
             if record.metadata.scheduler_calls_avoided is not None:
                 scheduler_calls_avoided = max(
                     scheduler_calls_avoided, record.metadata.scheduler_calls_avoided

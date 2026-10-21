@@ -16,7 +16,11 @@ import coding_review_agent_loop.pr_loop as pr_loop
 import coding_review_agent_loop.review_rounds as review_rounds
 from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
 from coding_review_agent_loop.protocol import ReviewItemDisposition, UnresolvedReviewItem
-from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata
+from coding_review_agent_loop.round_state import (
+    PostedRoundMetadata,
+    _attach_round_metadata,
+    startup_force_full_latch,
+)
 from coding_review_agent_loop.unresolved_items import _upsert_converted_evidence_obligation
 
 from agent_loop_helpers import FakeRunner, make_config, structured_pr_review
@@ -713,3 +717,94 @@ def test_1553_prelaunch_classification_helper():
     assert classify(
         "Codex", **dict(common, prior_approval=approval, human_requirements=(object(),))
     ) == "turn"
+
+
+# --- #1559: an amendment activation still carries the force-full latch ----------------
+
+
+def _interrupted_after_activation(tmp_path, **rollover_overrides):
+    """A rollover run, truncated right after its round-2 activation-only record."""
+    runner, reconciliation = _amendment_ready_round(tmp_path)
+    _sign(runner)
+    _queue_resolved_board(runner)
+    assert run_pr_loop(
+        runner, pr_number=77, config=_staged_config(tmp_path, **rollover_overrides)
+    ) == 0
+    activation = next(
+        r for r in _records_after(runner, reconciliation)
+        if r.metadata.round_number == 2 and r.metadata.phase == "scheduler-prelaunch"
+    )
+    assert activation.metadata.reviewer_board_amendment_digest is not None
+    del runner.pr_payload["comments"][activation.index + 1:]
+    assert _records(runner)[-1].index == activation.index
+    return runner, activation
+
+
+def _resumed_round_three_checkpoint(runner, tmp_path, **overrides):
+    _queue_resolved_board(runner)
+    before = len(runner.pr_payload["comments"])
+    assert run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path, **overrides)) == 0
+    later = [r.metadata for r in _records(runner) if r.index >= before]
+    # Nothing further is posted into the reconciled round.
+    assert later and all(m.round_number >= 3 for m in later)
+    return next(m for m in later if m.phase == "scheduler-prelaunch")
+
+
+def test_1559_activation_only_operator_latch_survives_resume(tmp_path):
+    """Row activation-operator-latch-resume: round 3 keeps the operator latch."""
+    runner, activation = _interrupted_after_activation(tmp_path, pr_review_force_full=True)
+    assert activation.metadata.scheduler_force_full is True
+    assert activation.metadata.scheduler_force_full_source == "operator"
+
+    checkpoint = _resumed_round_three_checkpoint(runner, tmp_path, pr_review_force_full=False)
+
+    assert checkpoint.round_number == 3
+    assert checkpoint.scheduler_force_full is True
+    assert checkpoint.scheduler_force_full_source == "operator"
+    # The complete amended board: Antigravity was removed by the amendment.
+    assert sorted(checkpoint.scheduler_selected_reviewers) == ["Codex", "Gemini"]
+    assert tuple(checkpoint.scheduler_contract["required_reviewers"]) == ("Codex", "Gemini")
+    assert not any("Delete these" in comment for comment in runner.comments)
+
+
+def test_1559_activation_without_latch_does_not_latch_on_resume(tmp_path):
+    """Row activation-no-latch-control: no latch on the activation, none after resume."""
+    runner, activation = _interrupted_after_activation(tmp_path)
+    assert not activation.metadata.scheduler_force_full
+
+    checkpoint = _resumed_round_three_checkpoint(runner, tmp_path)
+
+    assert checkpoint.round_number == 3
+    assert not checkpoint.scheduler_force_full
+    assert checkpoint.scheduler_force_full_source is None
+    assert checkpoint.scheduler_selected_reviewers == ("Codex",)
+
+
+@pytest.mark.parametrize("staged", [True, False])
+def test_1559_automatic_latch_on_activation_follows_policy(tmp_path, staged):
+    """Row activation-automatic-latch-policy: only non-staged policies restore it."""
+    runner, activation = _interrupted_after_activation(tmp_path)
+
+    def automatic(payload):
+        if payload.get("reviewer_board_amendment_digest") is None:
+            return None
+        if payload.get("round_number") != 2 or payload.get("phase") != "scheduler-prelaunch":
+            return None
+        return dict(
+            payload, scheduler_force_full=True, scheduler_force_full_source="automatic"
+        )
+
+    _rewrite_pr_metadata(runner, automatic)
+    rewritten = next(r for r in _records(runner) if r.index == activation.index)
+    assert rewritten.metadata.scheduler_force_full_source == "automatic"
+
+    # The reconstruction pr_loop runs at startup, under each policy shape.
+    assert startup_force_full_latch(_records(runner), requires_primary=staged) == (
+        False, not staged,
+    )
+    if staged:
+        # The staged resume raises no automatic latch from the activation.
+        checkpoint = _resumed_round_three_checkpoint(runner, tmp_path)
+        assert not checkpoint.scheduler_force_full
+        assert checkpoint.scheduler_force_full_source is None
+        assert checkpoint.scheduler_selected_reviewers == ("Codex",)

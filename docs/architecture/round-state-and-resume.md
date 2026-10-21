@@ -144,7 +144,13 @@ and pre-panel history recovery resumes keep their own routes. A
 `scheduler-prelaunch` record posted into a reconciled round (a stray checkpoint
 from an older tool version, or an amendment activation) is inert: resume anchor
 selection, visibility, panel evidence and every scheduler-state reader ignore
-it, and only the amendment-lineage reader counts it. A conversion repeat or a
+it, and only the amendment-lineage reader counts it. One exception keeps the
+monotonic force-full latch: the startup latch reconstruction still reads a
+lineage-visible amendment activation, the earliest record carrying its
+amendment digest, so an operator latch recorded only on an activation-only
+record survives a resume without the flag (#1559). A stray, whose digest is
+null or repeats an earlier carrier, stays fully inert, and calls-avoided still
+ignores every inert record. A conversion repeat or a
 head-review recovery handoff reopens the round, so a checkpoint after one is
 not inert. Nothing is deleted, so such PRs resume into round N+1 as they are.
 
