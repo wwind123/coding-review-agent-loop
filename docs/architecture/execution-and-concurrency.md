@@ -83,6 +83,18 @@ Both the timeout log and the backoff skip log carry a fixed hint, with the
 checkout shell-quoted, to run
 `git -C <checkout> repack -a -d --keep-unreachable` while no run uses the
 store.
+A multi-pack-index written by an operator or `git maintenance` names the
+packs compaction deletes, so, as `git repack -d` does, once compaction passes
+the threshold and backoff checks it removes every multi-pack-index artifact
+(the `multi-pack-index` file, its `.bitmap` and `.rev` sidecars, and a
+`multi-pack-index.d/` chain) before the `show-index` inventory and before any
+pack is written, and therefore before any snapshot pack is deleted. Only
+exactly-named entries are removed, links are unlinked and never followed, and
+removal spawns no process. The multi-pack-index is never rewritten; Git
+rebuilds it on the next maintenance run. A removal failure writes no pack,
+runs no pack command, keeps the old packs, logs a fixed reason and starts no
+backoff, so a persistent failure repeats only the cheap listing and removal
+attempt. With no multi-pack-index present the command sequence is unchanged.
 
 **Agent-loop-owned Git boundary (`secure_git.py`, `git_transport.py`).** Every
 local text, binary, and cancellable Git call that can read an agent checkout

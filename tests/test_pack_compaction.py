@@ -680,3 +680,220 @@ def test_hardening_config_is_unchanged():
         "diff.ignoreSubmodules=all", "gc.auto=0", "credential.helper=",
         "trace2.eventTarget=", "trace2.perfTarget=", "trace2.normalTarget=",
     )
+
+
+# --- multi-pack-index (#1579) ---------------------------------------------------
+
+
+def _midx_names(packdir: Path) -> list[str]:
+    return sorted(name for name in os.listdir(packdir) if name.startswith("multi-pack-index"))
+
+
+def write_midx(repo: Path) -> bool:
+    """A real git-written MIDX, with a bitmap when this git supports it; True if bitmapped."""
+    result = subprocess.run(["git", "-C", str(repo), "multi-pack-index", "write", "--bitmap"],
+                            capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        git(repo, "multi-pack-index", "write")
+    assert (pack_dir(repo) / "multi-pack-index").is_file()
+    return result.returncode == 0
+
+
+def plant_chain(packdir: Path, *, unexpected: bool = False) -> Path:
+    chain = packdir / "multi-pack-index.d"
+    chain.mkdir()
+    layer = "multi-pack-index-" + "a" * 40
+    (chain / "multi-pack-index-chain").write_text("a" * 40 + "\n")
+    (chain / f"{layer}.midx").write_bytes(b"MIDX")
+    (chain / f"{layer}.bitmap").write_bytes(b"BITM")
+    if unexpected:
+        (chain / "operator-notes.txt").write_text("keep me\n")
+    return chain
+
+
+def _pack_files(repo: Path) -> dict[str, bytes]:
+    return {name: (pack_dir(repo) / name).read_bytes()
+            for name in sorted(os.listdir(pack_dir(repo))) if name.endswith((".pack", ".idx"))}
+
+
+def _midx_aware_spy(monkeypatch, packdir: Path) -> list[tuple[str, list[str]]]:
+    """Record each confined command with the MIDX artifacts present when it was built."""
+    calls: list[tuple[str, list[str]]] = []
+    real = run_worktrees.local_command
+
+    def spy(args, **kwargs):
+        calls.append((tuple(args)[0], _midx_names(packdir)))
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(run_worktrees, "local_command", spy)
+    return calls
+
+
+def test_real_midx_with_bitmap_is_removed_before_any_pack_command(tmp_path, monkeypatch, logs):
+    repo = Repo(tmp_path)
+    bitmapped = write_midx(repo.path)
+    packdir = pack_dir(repo.path)
+    assert _midx_names(packdir)
+    assert not bitmapped or any(name.endswith(".bitmap") for name in _midx_names(packdir))
+    before = repo.objects()
+    calls = _midx_aware_spy(monkeypatch, packdir)
+
+    repo.compact()
+
+    assert calls and calls[0][0] == "show-index"
+    assert all(present == [] for _command, present in calls), calls
+    assert {command for command, _present in calls} == {"show-index", "pack-objects", "index-pack"}
+    assert _midx_names(packdir) == []
+    assert len(non_kept_packs(repo.path)) == 1
+    git(repo.path, "fsck", "--no-dangling")
+    git(repo.path, "multi-pack-index", "verify")
+    repo.assert_all_present(before)
+    repo.assert_all_present([*repo.commits, repo.pr_head])
+    assert logs[0] == f"Removed stale multi-pack-index for {repo.path} before compaction"
+    assert logs[-1].startswith("Compacted") and not any("skipped" in message for message in logs), logs
+
+
+def test_no_midx_keeps_the_command_sequence_and_logs(tmp_path, monkeypatch, logs):
+    repo = Repo(tmp_path)
+    calls = _local_command_spy(monkeypatch)
+
+    repo.compact()
+
+    assert [call[0] for call in calls] == ["show-index"] * (THRESHOLD + 3) + ["pack-objects", "index-pack", "show-index"]
+    assert len(logs) == 1 and logs[0].startswith("Compacted"), logs
+
+
+def test_planted_symlink_chain_and_unrelated_names(tmp_path, monkeypatch, logs):
+    repo = Repo(tmp_path)
+    packdir = pack_dir(repo.path)
+    outside = tmp_path / "outside-midx"
+    outside.write_bytes(b"not yours")
+    (packdir / "multi-pack-index").symlink_to(outside)
+    sidecar_target = tmp_path / "outside-bitmap"
+    sidecar_target.write_bytes(b"bitmap target")
+    (packdir / f"multi-pack-index-{'b' * 40}.bitmap").symlink_to(sidecar_target)
+    (packdir / f"multi-pack-index-{'c' * 64}.rev").write_bytes(b"RIDX")
+    plant_chain(packdir)
+    unrelated = {
+        "multi-pack-index-foo.txt": b"foo",
+        "multi-pack-index.lock": b"lock",
+        f"multi-pack-index-{'d' * 40}.midx": b"top-level midx layer is not a sidecar",
+    }
+    for name, data in unrelated.items():
+        (packdir / name).write_bytes(data)
+    before = repo.objects()
+
+    repo.compact()
+
+    assert _midx_names(packdir) == sorted(unrelated)
+    for name, data in unrelated.items():
+        assert (packdir / name).read_bytes() == data
+    assert outside.read_bytes() == b"not yours"
+    assert sidecar_target.read_bytes() == b"bitmap target"
+    assert len(non_kept_packs(repo.path)) == 1
+    repo.assert_all_present(before)
+    assert logs[-1].startswith("Compacted"), logs
+
+
+def test_symlinked_chain_directory_is_unlinked_not_followed(tmp_path, monkeypatch, logs):
+    repo = Repo(tmp_path)
+    packdir = pack_dir(repo.path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "multi-pack-index-chain").write_text("x\n")
+    (packdir / "multi-pack-index.d").symlink_to(elsewhere)
+
+    repo.compact()
+
+    assert not os.path.lexists(packdir / "multi-pack-index.d")
+    assert (elsewhere / "multi-pack-index-chain").read_text() == "x\n"
+    assert logs[-1].startswith("Compacted"), logs
+
+
+def _assert_removal_failed_cleanly(repo: Repo, before: dict[str, bytes], objects, calls, logs) -> None:
+    assert _pack_files(repo.path) == before
+    assert calls == []
+    repo.assert_all_present(objects)
+    assert logs == [f"Pack compaction for {repo.path} skipped: multi-pack-index could not be removed; old packs kept"]
+    assert not marker(repo.path).exists()
+    assert not any(name.startswith(".agent-loop-compact-") for name in os.listdir(pack_dir(repo.path)))
+
+
+def test_unexpected_chain_entry_stops_before_any_pack_work(tmp_path, monkeypatch, logs):
+    repo = Repo(tmp_path)
+    chain = plant_chain(pack_dir(repo.path), unexpected=True)
+    before, objects = _pack_files(repo.path), repo.objects()
+    calls = _local_command_spy(monkeypatch)
+
+    repo.compact()
+
+    _assert_removal_failed_cleanly(repo, before, objects, calls, logs)
+    assert (chain / "operator-notes.txt").read_text() == "keep me\n"
+
+
+def test_unlink_failure_stops_before_any_pack_work(tmp_path, monkeypatch, logs):
+    repo = Repo(tmp_path)
+    write_midx(repo.path)
+    midx = pack_dir(repo.path) / "multi-pack-index"
+    before, objects = _pack_files(repo.path), repo.objects()
+    real_unlink = os.unlink
+
+    def refusing(path, *args, **kwargs):
+        if Path(path) == midx:
+            raise PermissionError("denied")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(run_worktrees.os, "unlink", refusing)
+    calls = _local_command_spy(monkeypatch)
+
+    repo.compact()
+
+    _assert_removal_failed_cleanly(repo, before, objects, calls, logs)
+    assert midx.is_file()
+    assert "denied" not in logs[0]
+
+
+def test_fetch_path_returns_its_sha_when_midx_removal_fails(tmp_path, monkeypatch, logs):
+    env = Env(tmp_path, monkeypatch)
+    config = env.config()
+    store = env.seed_store("claude").resolve()
+    shas = [run_worktrees.prepare_store(store, config=config, runner=Runner())]
+    packdir = Path(git(store, "rev-parse", "--absolute-git-dir")) / "objects" / "pack"
+    plant_chain(packdir, unexpected=True)
+    calls = _local_command_spy(monkeypatch)
+    logs.clear()
+    for index in range(THRESHOLD + 2):
+        shas.append(env.commit("a.txt", f"base{index}"))
+        assert run_worktrees.prepare_store(store, config=config, runner=Runner()) == shas[-1]
+    reason = f"Pack compaction for {store} skipped: multi-pack-index could not be removed; old packs kept"
+    assert reason in logs and not any(message.startswith("Compacted") for message in logs), logs
+    assert not any(call[0] in {"show-index", "pack-objects", "index-pack"} for call in calls), calls
+    assert len(non_kept_packs(store)) > THRESHOLD
+    assert not marker(store).exists()
+    for sha in shas:
+        git(store, "cat-file", "-e", sha)
+
+
+def test_midx_is_untouched_at_or_below_the_threshold(tmp_path, monkeypatch, logs):
+    repo = Repo(tmp_path, packs=THRESHOLD - 1)
+    write_midx(repo.path)
+    before = listing(repo.path)
+
+    repo.compact()
+
+    assert logs == []
+    assert listing(repo.path) == before
+
+
+def test_midx_is_untouched_while_a_backoff_is_active(tmp_path, monkeypatch, logs, clock):
+    repo = Repo(tmp_path)
+    write_midx(repo.path)
+    run_worktrees._write_backoff(repo.path, 1, clock[0])
+    before = listing(repo.path)
+    calls = _local_command_spy(monkeypatch)
+
+    repo.compact()
+
+    assert calls == []
+    assert len(logs) == 1 and "backoff after 1 consecutive timeout(s)" in logs[0], logs
+    assert listing(repo.path) == before
