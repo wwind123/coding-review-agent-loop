@@ -416,6 +416,34 @@ def test_successful_compaction_clears_the_marker(tmp_path, monkeypatch, logs, cl
     assert logs and logs[-1].startswith("Compacted"), logs
 
 
+def _refuse_marker_unlink(monkeypatch, checkout: Path) -> Path:
+    # Only the marker refuses; pack sidecar deletion keeps working.
+    path = marker(checkout)
+    real_unlink = Path.unlink
+
+    def refusing(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError("denied")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refusing)
+    return path
+
+
+def test_successful_compaction_logs_success_when_the_marker_cannot_be_cleared(tmp_path, monkeypatch, logs, clock):
+    repo = Repo(tmp_path)
+    run_worktrees._write_backoff(repo.path, 3, clock[0])
+    clock[0] += 14400
+    path = _refuse_marker_unlink(monkeypatch, repo.path)
+
+    repo.compact()
+
+    assert len(non_kept_packs(repo.path)) == 1
+    assert logs and logs[-1].startswith("Compacted"), logs
+    assert not any("skipped" in line or "unexpected" in line for line in logs), logs
+    assert path.exists()
+
+
 def test_at_or_below_threshold_clears_the_marker_without_compacting(tmp_path, monkeypatch, logs, clock):
     # A manual repack brings the store back under the threshold.
     repo = Repo(tmp_path, packs=THRESHOLD - 1)
@@ -428,6 +456,20 @@ def test_at_or_below_threshold_clears_the_marker_without_compacting(tmp_path, mo
     assert calls == [] and logs == []
     assert listing(repo.path) == before
     assert not marker(repo.path).exists()
+
+
+def test_at_or_below_threshold_tolerates_an_unclearable_marker(tmp_path, monkeypatch, logs, clock):
+    repo = Repo(tmp_path, packs=THRESHOLD - 1)
+    run_worktrees._write_backoff(repo.path, 4, clock[0])
+    path = _refuse_marker_unlink(monkeypatch, repo.path)
+    before = listing(repo.path)
+    calls = _local_command_spy(monkeypatch)
+
+    repo.compact()
+
+    assert calls == [] and logs == []
+    assert listing(repo.path) == before
+    assert path.exists()
 
 
 def _in_window(now: float) -> dict:
