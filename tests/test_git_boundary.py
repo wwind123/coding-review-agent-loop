@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from coding_review_agent_loop import secure_git
+from coding_review_agent_loop import git_transport, secure_git
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.git_transport import default_origin, import_ref, trusted_url
 from coding_review_agent_loop.local_test_evidence import SnapshotCancelled, _run_git
@@ -325,6 +325,52 @@ def test_closure_gate_ignores_destination_history_substitution(
     assert git(checkout, "cat-file", "-t", blob) == "blob"
     assert _closure(checkout, expected)
     assert git(checkout, "rev-parse", "refs/remotes/origin/main") == expected
+
+
+def _spy_closure_walk(monkeypatch, failure: BaseException | None = None) -> list:
+    """Capture rev-list walks while delegating every other subprocess.run call."""
+    real_run = git_transport.subprocess.run
+    walks = []
+
+    def spy(argv, *args, **kwargs):
+        if "rev-list" not in argv:
+            return real_run(argv, *args, **kwargs)
+        walks.append((tuple(argv), dict(kwargs["env"])))
+        if failure is not None:
+            raise failure
+        return real_run(argv, *args, **kwargs)
+
+    monkeypatch.setattr(git_transport.subprocess, "run", spy)
+    return walks
+
+
+def test_closure_walk_disables_destination_replace_graft_and_shallow(
+        repositories, monkeypatch, tmp_path):
+    _, _, checkout = repositories
+    sha = git(checkout, "rev-parse", "HEAD")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    walks = _spy_closure_walk(monkeypatch)
+    assert git_transport._closure_complete(checkout, sha, scratch) is True
+    assert len(walks) == 1
+    argv, env = walks[0]
+    rev_list = argv.index("rev-list")
+    assert argv[rev_list:rev_list + 4] == ("rev-list", "--objects", "--missing=error", "--quiet")
+    assert argv[-1] == sha
+    absent = str(scratch / "agent-loop-absent")
+    assert env["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert env["GIT_SHALLOW_FILE"] == absent
+    assert env["GIT_GRAFT_FILE"] == absent
+
+
+@pytest.mark.parametrize("failure", [OSError("walk"), subprocess.TimeoutExpired("git", 600)],
+                         ids=["oserror", "timeout"])
+def test_closure_walk_failure_is_incomplete(repositories, monkeypatch, tmp_path, failure):
+    _, _, checkout = repositories
+    sha = git(checkout, "rev-parse", "HEAD")
+    walks = _spy_closure_walk(monkeypatch, failure)
+    assert git_transport._closure_complete(checkout, sha, tmp_path) is False
+    assert len(walks) == 1
 
 
 def test_local_only_and_non_commit_tips_are_never_negative_revs(repositories, monkeypatch):
