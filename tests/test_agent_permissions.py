@@ -1867,3 +1867,89 @@ def test_absent_gemini_response_root_is_not_created_at_startup(tmp_path):
     config = make_config(tmp_path)
     ap.establish_sandboxed_run(config, command="pr")
     assert not os.path.lexists(_gemini_public_response_root(config.gemini_dir))
+
+
+# ------------------------------- startup review-spool placement (#1565)
+
+
+def _misplaced_spool_config(tmp_path, **overrides):
+    # The memory dir sits inside the Codex provider checkout.
+    return sandboxed_config(
+        tmp_path, agent_memory_dir=tmp_path / "codex" / ".agent-loop" / "memory", **overrides
+    )
+
+
+@pytest.mark.parametrize("command", sorted(ap.REVIEW_SPOOL_COMMANDS))
+def test_startup_refuses_misplaced_spool_before_hardening_default_mode(tmp_path, monkeypatch, command):
+    hardened = []
+    monkeypatch.setattr(ap, "harden_response_tree", lambda *a, **k: hardened.append("tree"))
+    monkeypatch.setattr(ap, "harden_backend_response_roots", lambda *a, **k: hardened.append("roots"))
+    config = _misplaced_spool_config(tmp_path, agent_permissions="default")
+    with pytest.raises(AgentLoopError, match="overlaps the agent checkout") as info:
+        ap.establish_sandboxed_run(config, command=command)
+    assert "invocation start" in str(info.value)
+    assert hardened == []
+    assert not (config.agent_memory_dir.parent / "private").exists()
+
+
+def test_startup_refuses_misplaced_spool_before_the_sandbox_boundary(tmp_path, sandbox, monkeypatch):
+    # Build the config first: its own construction validates the selections.
+    config = _misplaced_spool_config(tmp_path)
+    calls = []
+    for name in (
+        "validate_sandboxed_selections",
+        "establish_response_root_boundary",
+        "establish_inspect_provenance",
+    ):
+        monkeypatch.setattr(ap, name, lambda *a, _name=name, **k: calls.append(_name))
+    with pytest.raises(AgentLoopError, match="overlaps the agent checkout"):
+        ap.establish_sandboxed_run(config, command="pr")
+    assert calls == []
+    assert not (config.agent_memory_dir.parent / "private").exists()
+
+
+def test_startup_refuses_spool_inside_the_sandboxed_response_root_without_creating_it(
+    tmp_path, sandbox
+):
+    config = sandboxed_config(tmp_path)
+    memory = ap.response_root(config) / "cache" / "memory"
+    config = sandboxed_config(tmp_path, agent_memory_dir=memory)
+    with pytest.raises(AgentLoopError, match="overlaps the response root"):
+        ap.establish_sandboxed_run(config, command="issue", plan_first=True)
+    assert not ap.response_root(config).exists()
+
+
+def test_discuss_is_not_refused_on_spool_placement(tmp_path, monkeypatch):
+    monkeypatch.setattr(ap, "harden_response_tree", lambda *a, **k: None)
+    monkeypatch.setattr(ap, "harden_backend_response_roots", lambda *a, **k: None)
+    config = _misplaced_spool_config(tmp_path, agent_permissions="default")
+    ap.establish_sandboxed_run(config, command="discuss")
+
+
+def test_correctly_placed_spool_passes_startup_in_default_mode(tmp_path):
+    config = sandboxed_config(tmp_path, agent_permissions="default")
+    ap.establish_sandboxed_run(config, command="pr")
+    assert not (config.agent_memory_dir.parent / "private").exists()
+
+
+def test_correctly_placed_spool_passes_startup_in_sandboxed_mode(tmp_path, sandbox, monkeypatch):
+    monkeypatch.setattr(ap, "establish_inspect_provenance", lambda *a, **k: None)
+    config = sandboxed_config(tmp_path)
+    ap.establish_sandboxed_run(config, command="pr")
+    assert not (config.agent_memory_dir.parent / "private").exists()
+
+
+def test_home_exemption_does_not_apply_to_the_response_root_boundary(tmp_path, monkeypatch):
+    """A dotfiles home still bounds the sandboxed response root (#1565)."""
+    repository = tmp_path / "home"
+    (repository / ".git").mkdir(parents=True)
+    inside = repository / "tmp"
+    inside.mkdir()
+    monkeypatch.setenv("HOME", str(repository))
+    monkeypatch.chdir(repository)
+    monkeypatch.setattr(tempfile, "tempdir", str(inside))
+    ap.reset_sandbox_state()
+    config = sandboxed_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="overlaps repository checkout"):
+        ap.establish_response_root_boundary(config)
+    ap.reset_sandbox_state()

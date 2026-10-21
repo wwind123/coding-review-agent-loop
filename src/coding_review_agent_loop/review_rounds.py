@@ -648,9 +648,39 @@ def _spool_overlap_set(config: AgentLoopConfig) -> list[tuple[str, str]]:
         if workdir is not None:
             entries.append((f"reviewer seat {seat} workdir", os.path.abspath(str(workdir))))
     repository = repository_checkout()
-    if repository is not None:
+    if repository is not None and not _is_home_directory(repository):
         entries.append(("repository checkout", repository))
     return entries
+
+
+def _resolved_home_directory() -> str | None:
+    """The operator's home directory, or ``None`` when it cannot be resolved."""
+    try:
+        home = os.path.expanduser("~")
+    except Exception:  # noqa: BLE001 - any resolution failure keeps the member
+        return None
+    if not home or home == "~" or not os.path.isabs(home):
+        return None
+    return home
+
+
+def _is_home_directory(path: str) -> bool:
+    """Whether ``path`` is exactly the resolved home directory (a dotfiles work tree).
+
+    Fails closed: an unresolvable home, or one that resolves to the filesystem
+    root, never matches, so the repository checkout stays in the overlap set.
+    Only the home directory itself matches, never its ancestors.
+    """
+    try:
+        home = _resolved_home_directory()
+        if home is None:
+            return False
+        resolved_home = _resolved(home)
+    except Exception:  # noqa: BLE001 - fail closed on any resolution error
+        return False
+    if os.path.dirname(resolved_home) == resolved_home:
+        return False
+    return _resolved(path) == resolved_home
 
 
 def _resolved(path: str | Path) -> str:
@@ -669,8 +699,27 @@ def _validate_spool_placement(config: AgentLoopConfig, roots: Sequence[Path]) ->
                         raise AgentLoopError(
                             f"The review-round spool {root} overlaps the {label} {path}, where a "
                             "reviewer could read it. Use an --agent-memory-dir outside every "
-                            "agent checkout, reviewer seat workdir and the response directory."
+                            "agent checkout, reviewer seat workdir and the response directory. "
+                            "This is checked at invocation start, before any agent turn, and "
+                            "again at each review round."
                         )
+
+
+def validate_review_spool_placement(config: AgentLoopConfig) -> None:
+    """Refuse a misplaced review-round spool without creating or changing anything.
+
+    Checks the new and legacy spool roots against every reviewer-reachable
+    tree.  Used once at invocation start (``establish_sandboxed_run``) and at
+    each round start (``prepare_review_round_spool_roots``), so both share one
+    code path; it never creates, re-modes or migrates a directory.
+    """
+    _validate_spool_placement(
+        config,
+        (
+            review_spool_root(config.agent_memory_dir),
+            legacy_review_spool_root(config.agent_memory_dir),
+        ),
+    )
 
 
 def _harden_legacy_spool_root(legacy_root: Path) -> None:
@@ -701,7 +750,7 @@ def prepare_review_round_spool_roots(config: AgentLoopConfig) -> tuple[Path, Pat
 
     root = review_spool_root(config.agent_memory_dir)
     legacy_root = legacy_review_spool_root(config.agent_memory_dir)
-    _validate_spool_placement(config, (root, legacy_root))
+    validate_review_spool_placement(config)
     if is_sandboxed(config):
         from .agent_permissions import SandboxBoundaryError, sandboxed_response_root
 

@@ -1558,7 +1558,7 @@ def test_docs_describe_the_architecture_set_layout_and_size_budget():
 
 
 def test_agent_memory_dir_guidance_documents_the_spool_overlap_refusal():
-    """A relative memory dir inside an explicit checkout is refused at review rounds (#1560)."""
+    """A misplaced memory dir is refused at invocation start and each round (#1560, #1565)."""
     parser = build_parser()
     pr_parser = next(
         action for action in parser._subparsers._group_actions[0].choices.values()
@@ -1570,7 +1570,10 @@ def test_agent_memory_dir_guidance_documents_the_spool_overlap_refusal():
     assert "refuse" in help_text and "outside every checkout" in help_text
     doc = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
     assert "--agent-memory-dir .cache/agent-loop-memory" not in doc
-    assert "is refused at the first review round" in doc
+    assert "is refused at invocation start, before any coder turn" in doc
+    assert "is refused at the first review round" not in doc
+    assert "exactly the home directory (a dotfiles work tree) is exempt" in " ".join(doc.split())
+    assert "at startup and again at each review round" in help_text
     assert "<agent-memory-dir>/../private/review-round-spool/" in doc
 
 

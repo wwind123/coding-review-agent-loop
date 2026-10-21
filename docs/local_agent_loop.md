@@ -3329,7 +3329,10 @@ Execution model:
     spool must not overlap the response directory, any agent checkout, any
     reviewer seat workdir, or the repository checkout agent-loop runs from, so a
     relative `--agent-memory-dir` that resolves inside an explicit checkout is
-    refused at the first review round. If the run stops between two
+    refused at invocation start, before any coder turn, and the placement is
+    re-checked at every review round. A repository checkout that is exactly the
+    home directory (a dotfiles work tree) is exempt, so the default `~/.cache`
+    spool still works there (#1565). If the run stops between two
     posts, a rerun -- with or without `--review-parallel` -- replays the
     unpublished outcomes through the same validator instead of re-invoking
     those reviewers. The spool is deleted once every post succeeds.
@@ -5600,18 +5603,24 @@ agent-loop pr 123 --repo OWNER/REPO --agent-memory-dir "$HOME/.cache/agent-loop-
 ```
 
 The review-round spool lives beside the memory directory, under
-`<agent-memory-dir>/../private/review-round-spool/`. Review rounds therefore
-refuse, with an error naming the overlapping path, any memory directory whose
+`<agent-memory-dir>/../private/review-round-spool/`. agent-loop therefore
+refuses, with an error naming the overlapping path, any memory directory whose
 spool would lie inside an agent checkout, a reviewer seat workdir, the
 repository checkout agent-loop runs from, or the response directory (#1560):
 a reviewer working in that tree could otherwise read the withheld round
-results. Use an absolute path outside every checkout, as in the example above.
+results. The check runs at invocation start for `issue`, `task`, `pr` and
+`managed-pr` (before any agent turn, and before any directory is created) and
+again at each review round (#1565); `discuss` never creates a spool and is not
+checked. A repository checkout that is exactly the home directory (a dotfiles
+work tree) is exempt from the repository-checkout member, so the default
+`~/.cache` memory directory keeps working; a nested repository under home, or
+a provider checkout or seat workdir at home, is still refused. Use an absolute
+path outside every checkout, as in the example above.
 
 Relative `--agent-memory-dir` values are resolved inside the active coder
 checkout when that checkout is an explicit directory, so with an explicit
 `--claude-dir`/`--codex-dir` checkout a relative value lands inside that
-checkout and is refused at the first review round (in an issue run, that is
-after the coder has already implemented and pushed). For a default per-run
+checkout and is refused at invocation start, before any coder turn. For a default per-run
 worktree, relative values resolve under the repo-keyed user cache
 (`<user cache>/coding-review-agent-loop/repos/OWNER-REPO/<value>`), outside
 every checkout, so they keep working and memory survives worktree removal. Use

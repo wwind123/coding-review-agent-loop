@@ -1328,14 +1328,25 @@ def neutralized_git_env() -> dict[str, str]:
     return env
 
 
+# Commands whose flows can reach a review round and so create a review-round
+# spool.  ``discuss`` never creates one, so it is not refused on spool
+# placement at startup (#1565).
+REVIEW_SPOOL_COMMANDS = frozenset({"issue", "task", "pr", "managed-pr"})
+
+
 def establish_sandboxed_run(
     config: AgentLoopConfig, *, command: str, plan_first: bool = False
 ) -> None:
     """Fail-fast startup before any agent is spawned.
 
-    Every mode hardens the response tree first (#1560); sandboxed mode does so
-    inside its physical boundary check.
+    A misplaced review-round spool is refused first, before any directory is
+    created or hardened (#1565).  Every mode then hardens the response tree
+    (#1560); sandboxed mode does so inside its physical boundary check.
     """
+    if command in REVIEW_SPOOL_COMMANDS:
+        from .review_rounds import validate_review_spool_placement
+
+        validate_review_spool_placement(config)
     if not is_sandboxed(config):
         harden_response_tree(config)
         harden_backend_response_roots(config)
