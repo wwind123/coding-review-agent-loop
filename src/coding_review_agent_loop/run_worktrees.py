@@ -784,6 +784,63 @@ def _pack_directory(checkout: Path, runner: Any) -> Path:
     return packdir
 
 
+# A multi-pack-index written by an operator or ``git maintenance`` names the
+# packs compaction deletes.  Like ``git repack -d``, compaction removes every
+# MIDX artifact before it writes anything, so readers fall back to the
+# per-pack indexes and never see a MIDX naming a missing pack (#1579).  The
+# MIDX is never rewritten; Git rebuilds it on the next maintenance run.
+_MIDX_NAME = "multi-pack-index"
+_MIDX_CHAIN_DIR = "multi-pack-index.d"
+_MIDX_CHAIN_FILE = "multi-pack-index-chain"
+_MIDX_SIDECAR_RE = re.compile(r"^multi-pack-index-[0-9a-f]{40}(?:[0-9a-f]{24})?\.(?:bitmap|rev)$")
+_MIDX_LAYER_RE = re.compile(r"^multi-pack-index-[0-9a-f]{40}(?:[0-9a-f]{24})?\.(?:midx|bitmap|rev)$")
+_MIDX_REMOVAL_FAILED = "multi-pack-index could not be removed; old packs kept"
+
+
+def _midx_artifacts(packdir: Path) -> list[Path]:
+    """Exactly-named MIDX artifacts directly in ``packdir``, the top-level file first."""
+    names = os.listdir(packdir)
+    ordered = [name for name in names if name == _MIDX_NAME]
+    ordered += sorted(name for name in names if _MIDX_SIDECAR_RE.fullmatch(name))
+    ordered += [name for name in names if name == _MIDX_CHAIN_DIR]
+    return [packdir / name for name in ordered]
+
+
+def _unlink_entry(path: Path) -> None:
+    # os.unlink removes a symlink itself, never its target.
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+
+
+def _remove_midx_chain(chain: Path) -> None:
+    try:
+        info = chain.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        _unlink_entry(chain)
+        return
+    _unlink_entry(chain / _MIDX_CHAIN_FILE)
+    for name in sorted(os.listdir(chain)):
+        if _MIDX_LAYER_RE.fullmatch(name):
+            _unlink_entry(chain / name)
+    # Any unexpected entry left inside makes rmdir fail: a removal failure.
+    with contextlib.suppress(FileNotFoundError):
+        os.rmdir(chain)
+
+
+def _remove_midx_artifacts(packdir: Path) -> None:
+    """Remove every MIDX artifact without following links; raise a fixed skip on failure."""
+    try:
+        for path in _midx_artifacts(packdir):
+            if path.name == _MIDX_CHAIN_DIR:
+                _remove_midx_chain(path)
+            else:
+                _unlink_entry(path)
+    except OSError:
+        raise _CompactionSkip(_MIDX_REMOVAL_FAILED) from None
+
+
 def _compact(checkout: Path, *, config: Any, runner: Any) -> None:
     packdir = _pack_directory(checkout, runner)
     snapshot = _snapshot_packs(packdir)
@@ -799,6 +856,11 @@ def _compact(checkout: Path, *, config: Any, runner: Any) -> None:
             f"backoff after {failures} consecutive timeout(s); next attempt after "
             f"{_utc_iso(deadline)}; {_manual_repack_hint(checkout)}"
         )
+    if _midx_artifacts(packdir):
+        # Before any pack command, so a removal failure writes nothing and
+        # repeats only this cheap attempt on the next locked fetch.
+        _remove_midx_artifacts(packdir)
+        _compaction_log(config, f"Removed stale multi-pack-index for {checkout} before compaction")
     inventory: set[str] = set()
     for pack in snapshot.values():
         inventory |= _pack_index_ids(pack.with_suffix(".idx"), checkout=checkout)
