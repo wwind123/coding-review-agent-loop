@@ -3392,7 +3392,9 @@ Execution model:
     `--max-rounds`. A reviewer the scheduler paused in the closed round is
     therefore never treated as a missing withheld outcome. Scheduler
     checkpoints an older version posted into an already reconciled round are
-    ignored, so such a PR resumes as it is, with no comments to delete.
+    ignored, so such a PR resumes as it is, with no comments to delete. An
+    operator `--pr-review-force-full` latch recorded only on an amendment
+    activation in a reconciled round is still kept across resume (#1559).
 - The orchestrator still waits for every reviewer to settle before shared state
   changes: it aggregates outcomes, numbers unresolved items, and may begin
   coder work only in configured `--reviewer` order. It then posts a neutral

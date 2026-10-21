@@ -2005,3 +2005,93 @@ def test_1553_unreconciled_round_has_no_reconciliation_record():
     )
     assert resumed is not None and not resumed.reconciled
     assert resumed.reconciliation_record is None
+
+
+# --- #1559: an amendment activation still carries the force-full latch ----------------
+
+
+_DIGEST_A = "a" * 64
+_DIGEST_B = "b" * 64
+
+
+def test_1559_activation_classification_of_inert_records():
+    """Row activation-classifier-unit: only inert first carriers are activations."""
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
+        force_full_latch_records,
+        post_reconciliation_amendment_activation_indexes,
+    )
+
+    def summary(round_number, phase, digest=None):
+        return PostedRoundMetadata(
+            flow="pr", role="summary", agent="Orchestrator", round_number=round_number,
+            subject="head", phase=phase, reviewer_board_amendment_digest=digest,
+        )
+
+    history, _finding = _closed_round_history(stray=False)
+    history += [
+        summary(2, "scheduler-prelaunch", _DIGEST_A),  # 7: first carrier of A
+        summary(2, "scheduler-prelaunch"),  # 8: null-digest stray
+        summary(2, "scheduler-prelaunch", _DIGEST_A),  # 9: repeats A
+        summary(3, "scheduler-prelaunch", _DIGEST_A),  # 10: open round, not inert
+        summary(3, "reconciliation", _DIGEST_A),  # 11
+        summary(3, "scheduler-prelaunch", _DIGEST_B),  # 12: first carrier of B
+    ]
+    records = _extract_round_metadata_records(_comments(*history), flow="pr")
+    snapshot = list(records)
+
+    assert post_reconciliation_amendment_activation_indexes(records) == frozenset({7, 12})
+    assert [record.index for record in force_full_latch_records(records)] == [
+        0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12,
+    ]
+    assert list(records) == snapshot
+
+    # A digest first carried by an earlier non-inert record is not an activation.
+    early = list(history[:3]) + [summary(2, "scheduler-prelaunch", _DIGEST_A)] + list(history[4:7])
+    early.append(summary(2, "scheduler-prelaunch", _DIGEST_A))
+    records = _extract_round_metadata_records(_comments(*early), flow="pr")
+    assert post_reconciliation_amendment_activation_indexes(records) == frozenset()
+    assert [record.index for record in force_full_latch_records(records)] == list(range(7))
+
+
+def test_1559_helpers_return_input_unchanged_without_inert_records():
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
+        force_full_latch_records,
+        post_reconciliation_amendment_activation_indexes,
+    )
+
+    history, _finding = _closed_round_history(stray=False)
+    records = _extract_round_metadata_records(_comments(*history), flow="pr")
+    assert post_reconciliation_amendment_activation_indexes(records) == frozenset()
+    assert force_full_latch_records(records) == tuple(records)
+
+
+def test_1559_startup_latch_reads_activation_but_not_stray():
+    from coding_review_agent_loop.round_state import (
+        _extract_round_metadata_records,
+        startup_force_full_latch,
+    )
+
+    def latched(digest, source):
+        return _checkpoint(
+            subject="head", scheduler_current_sha="head",
+            reviewer_board_amendment_digest=digest,
+            scheduler_force_full=True, scheduler_force_full_source=source,
+        )
+
+    history, _finding = _closed_round_history(stray=False)
+    for source, staged, expected in (
+        ("operator", True, (True, False)),
+        ("operator", False, (True, False)),
+        ("automatic", True, (False, False)),
+        ("automatic", False, (False, True)),
+    ):
+        activation = _extract_round_metadata_records(
+            _comments(*history, latched(_DIGEST_A, source)), flow="pr"
+        )
+        assert startup_force_full_latch(activation, requires_primary=staged) == expected
+        stray = _extract_round_metadata_records(
+            _comments(*history, latched(None, source)), flow="pr"
+        )
+        assert startup_force_full_latch(stray, requires_primary=staged) == (False, False)

@@ -4267,7 +4267,9 @@ def inert_post_reconciliation_checkpoint_indexes(
     (a stray checkpoint written by an older tool version, or a signed
     board-amendment activation) is inert for resume anchor selection and for
     every scheduler reader.  Only the amendment-lineage reader, which reads
-    the comments itself, still sees it.  Nothing is deleted.
+    the comments itself, still sees it, and the startup force-full latch
+    still reads an amendment activation (#1559, see
+    ``force_full_latch_records``).  Nothing is deleted.
     """
     closed: set[tuple[int, str]] = set()
     inert: set[int] = set()
@@ -4304,6 +4306,70 @@ def drop_inert_post_reconciliation_checkpoints(
         record for record in records
         if not _is_inert_post_reconciliation_checkpoint(record, inert)
     )
+
+
+def post_reconciliation_amendment_activation_indexes(
+    records: Sequence[PostedRoundRecord],
+) -> frozenset[int]:
+    """Inert checkpoint indexes that are lineage-visible amendment activations (#1559).
+
+    An inert post-reconciliation checkpoint is an activation when it carries a
+    non-null reviewer-board amendment digest and is the earliest record, of
+    any role, carrying that digest: the record the amendment lineage counts
+    as the amendment's first use.  A stray copied from an earlier checkpoint
+    has a null or repeated digest and is not an activation.
+    """
+    inert = inert_post_reconciliation_checkpoint_indexes(records)
+    if not inert:
+        return frozenset()
+    seen: set[str] = set()
+    activations: set[int] = set()
+    for record in sorted(records, key=lambda item: item.index):
+        digest = record.metadata.reviewer_board_amendment_digest
+        if digest is None or digest in seen:
+            continue
+        seen.add(digest)
+        if record.index in inert:
+            activations.add(record.index)
+    return frozenset(activations)
+
+
+def force_full_latch_records(
+    records: Sequence[PostedRoundRecord],
+) -> tuple[PostedRoundRecord, ...]:
+    """Records the startup force-full latch reconstruction reads (#1559).
+
+    The non-inert records plus every inert amendment activation, in input
+    order.  A run interrupted right after an activation-only record keeps an
+    operator latch recorded only there; strays stay fully inert.
+    """
+    inert = inert_post_reconciliation_checkpoint_indexes(records)
+    if not inert:
+        return tuple(records)
+    activations = post_reconciliation_amendment_activation_indexes(records)
+    return tuple(
+        record for record in records
+        if record.index not in inert or record.index in activations
+    )
+
+
+def startup_force_full_latch(
+    records: Sequence[PostedRoundRecord], *, requires_primary: bool
+) -> tuple[bool, bool]:
+    """``(operator, automatic)`` force-full latches restored at PR startup.
+
+    An operator-sourced latch is always restored.  Any other latch (automatic
+    or legacy unsourced) is restored only for a policy that does not require
+    a primary; the staged policy re-derives it from qualified panel evidence.
+    """
+    operator = automatic = False
+    for record in force_full_latch_records(records):
+        if record.metadata.scheduler_force_full:
+            if record.metadata.scheduler_force_full_source == "operator":
+                operator = True
+            elif not requires_primary:
+                automatic = True
+    return operator, automatic
 
 
 def _pr_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
