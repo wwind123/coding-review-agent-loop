@@ -5435,3 +5435,24 @@ def test_cli_maps_dependency_not_merged_to_exit_5_and_generic_error_to_1(capsys)
     assert HumanDecisionRequiredError.EXIT_CODE == 4
     assert QuotaResetExceededError.EXIT_CODE == 3
     assert DependencyNotMergedError.EXIT_CODE == 5
+
+
+def test_issue_run_refuses_misplaced_spool_before_any_coder_turn(tmp_path, monkeypatch, capsys):
+    """#1565: a misplaced --agent-memory-dir stops an issue run at startup."""
+    import coding_review_agent_loop.agents.registry as registry_module
+
+    monkeypatch.setattr(cli_module, "run_issue_loop", lambda *a, **k: pytest.fail("issue loop ran"))
+    monkeypatch.setattr(registry_module, "run_agent_result", lambda *a, **k: pytest.fail("agent ran"))
+    codex = tmp_path / "codex"
+    claude = tmp_path / "claude"
+    codex.mkdir()
+    claude.mkdir()
+    assert cli_module.main([
+        "issue", "77", "--repo", "OWNER/REPO", "--coder", "claude", "--reviewer", "codex",
+        "--claude-dir", str(claude), "--codex-dir", str(codex),
+        "--agent-memory-dir", str(codex / ".agent-loop" / "memory"),
+    ]) == 1
+    error = capsys.readouterr().err
+    assert "overlaps the agent checkout" in error
+    assert "invocation start" in error
+    assert not (codex / ".agent-loop" / "private").exists()

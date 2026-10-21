@@ -48,12 +48,18 @@ The review-round spool is kept out of reviewer reach (#1560). Its root is
 `private/review-round-spool/` beside the agent memory directory, not a direct
 sibling of the prompt-advertised memory directory; `private/` and the root are
 mode 0300 (never listable), round directories 0700 and record files exactly
-0600 whatever the umask, so a record never reads back as malformed. At each
-review-round start, before any spool state is created or migrated, both the new
-root and the legacy root (`<agent-memory-dir>/../review-round-spool/`) are
-checked not to overlap, in either direction, the response root, any provider
-checkout, any named reviewer seat's workdir, or the repository checkout; an
-overlap raises. An existing legacy root is then re-moded to 0300 so retained
+0600 whatever the umask, so a record never reads back as malformed. Once at
+invocation start for `issue`, `task`, `pr` and `managed-pr` (in
+`establish_sandboxed_run`, before any agent turn or directory hardening) and
+again at each review-round start, before any spool state is created or
+migrated, both the new root and the legacy root
+(`<agent-memory-dir>/../review-round-spool/`) are checked not to overlap, in
+either direction, the response root, any provider checkout, any named reviewer
+seat's workdir, or the repository checkout; an overlap raises. Both checks share
+one read-only helper (#1565). A repository checkout that is exactly the
+resolved home directory (a dotfiles work tree) is not part of the spool overlap
+set; an unresolvable or root home keeps it, and the sandboxed response-root
+boundary still uses the unexempted repository checkout. An existing legacy root is then re-moded to 0300 so retained
 rounds cannot be listed (including the group-writable mode older releases
 created under `umask 002`; a symlinked or foreign-owned legacy root raises),
 and it is never created. A round directory found at

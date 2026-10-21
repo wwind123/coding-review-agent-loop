@@ -411,3 +411,141 @@ def test_legacy_spool_root_overlapping_a_checkout_is_refused(tmp_path, spool_con
         agent_memory_dir=tmp_path / "review-round-spool" / "memory",
     )
     _assert_refused_without_spool_state(config, "agent checkout")
+
+
+# --- Startup spool validation and the dotfiles home exemption (#1565) --------
+
+
+def _dotfiles_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".git").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+def test_validate_review_spool_placement_refuses_without_creating_anything(tmp_path, spool_config):
+    config = _make_spool_config(tmp_path, agent_memory_dir=tmp_path / "codex" / ".agent-loop" / "memory")
+    with pytest.raises(_SpoolError, match="overlaps") as info:
+        review_rounds.validate_review_spool_placement(config)
+    assert "agent checkout" in str(info.value)
+    assert "invocation start" in str(info.value)
+    private = config.agent_memory_dir.parent / "private"
+    assert not private.exists()
+    assert not review_spool_root(config.agent_memory_dir).exists()
+    assert not legacy_review_spool_root(config.agent_memory_dir).exists()
+
+
+def test_validate_review_spool_placement_accepts_without_creating_anything(spool_config):
+    review_rounds.validate_review_spool_placement(spool_config)
+    assert not (spool_config.agent_memory_dir.parent / "private").exists()
+    assert not review_spool_root(spool_config.agent_memory_dir).exists()
+    assert not legacy_review_spool_root(spool_config.agent_memory_dir).exists()
+
+
+def test_round_start_check_uses_the_shared_placement_helper(tmp_path, spool_config, monkeypatch):
+    calls = []
+    original = review_rounds.validate_review_spool_placement
+
+    def _spy(config):
+        calls.append(config)
+        return original(config)
+
+    monkeypatch.setattr(review_rounds, "validate_review_spool_placement", _spy)
+    config = _make_spool_config(tmp_path, agent_memory_dir=tmp_path / "codex" / ".agent-loop" / "memory")
+    with pytest.raises(_SpoolError, match="overlaps"):
+        _round_spool(config)
+    assert calls == [config]
+
+
+def test_dotfiles_home_accepts_the_default_spool(tmp_path, spool_config, monkeypatch):
+    home = _dotfiles_home(tmp_path, monkeypatch)
+    workdir = home / "work"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    config = _make_spool_config(
+        tmp_path, agent_memory_dir=home / ".cache" / "coding-review-agent-loop" / "memory"
+    )
+    labels = [label for label, _path in review_rounds._spool_overlap_set(config)]
+    assert "repository checkout" not in labels
+    assert "response root" in labels and "agent checkout" in labels
+    review_rounds.validate_review_spool_placement(config)
+    spool = _round_spool(config)
+    assert spool.root == review_spool_root(config.agent_memory_dir)
+
+
+def test_nested_repository_under_dotfiles_home_is_still_refused(tmp_path, spool_config, monkeypatch):
+    home = _dotfiles_home(tmp_path, monkeypatch)
+    project = home / "proj"
+    (project / ".git").mkdir(parents=True)
+    monkeypatch.chdir(project)
+    config = _make_spool_config(tmp_path, agent_memory_dir=project / "cache" / "memory")
+    with pytest.raises(_SpoolError, match="overlaps") as info:
+        review_rounds.validate_review_spool_placement(config)
+    assert "repository checkout" in str(info.value)
+    _assert_refused_without_spool_state(config, "repository checkout")
+
+
+def test_dotfiles_home_as_provider_checkout_is_still_refused(tmp_path, spool_config, monkeypatch):
+    home = _dotfiles_home(tmp_path, monkeypatch)
+    monkeypatch.chdir(home)
+    config = _make_spool_config(
+        tmp_path, codex_dir=home, agent_memory_dir=home / ".cache" / "agent-loop" / "memory"
+    )
+    with pytest.raises(_SpoolError, match="overlaps") as info:
+        review_rounds.validate_review_spool_placement(config)
+    assert "agent checkout" in str(info.value)
+
+
+def _raise_home():
+    raise RuntimeError("no home")
+
+
+@pytest.mark.parametrize(
+    "resolver",
+    [lambda: "~", lambda: "/", _raise_home],
+    ids=["unexpanded", "filesystem-root", "raises"],
+)
+def test_unresolvable_home_keeps_the_repository_member(tmp_path, spool_config, monkeypatch, resolver):
+    home = _dotfiles_home(tmp_path, monkeypatch)
+    monkeypatch.chdir(home)
+    monkeypatch.setattr(review_rounds, "_resolved_home_directory", resolver)
+    config = _make_spool_config(tmp_path, agent_memory_dir=home / ".cache" / "agent-loop" / "memory")
+    with pytest.raises(_SpoolError, match="overlaps") as info:
+        review_rounds.validate_review_spool_placement(config)
+    assert "repository checkout" in str(info.value)
+    assert not (config.agent_memory_dir.parent / "private").exists()
+
+
+@pytest.mark.parametrize(
+    "expanded",
+    ["~", "/", RuntimeError("no home")],
+    ids=["unexpanded", "filesystem-root", "raises"],
+)
+def test_unresolvable_expanduser_keeps_the_repository_member(tmp_path, spool_config, monkeypatch, expanded):
+    home = _dotfiles_home(tmp_path, monkeypatch)
+    monkeypatch.chdir(home)
+
+    def _expanduser(path):
+        if isinstance(expanded, Exception):
+            raise expanded
+        return expanded if path == "~" else path
+
+    config = _make_spool_config(tmp_path, agent_memory_dir=home / ".cache" / "agent-loop" / "memory")
+    monkeypatch.setattr(review_rounds.os.path, "expanduser", _expanduser)
+    labels = [label for label, _path in review_rounds._spool_overlap_set(config)]
+    assert "repository checkout" in labels
+    with pytest.raises(_SpoolError, match="repository checkout"):
+        review_rounds.validate_review_spool_placement(config)
+
+
+def test_home_exemption_does_not_cover_ancestors_of_home(tmp_path, spool_config, monkeypatch):
+    # A work tree above home (for example at the filesystem root) stays refused.
+    outer = tmp_path / "outer"
+    (outer / ".git").mkdir(parents=True)
+    home = outer / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(home)
+    config = _make_spool_config(tmp_path, agent_memory_dir=home / ".cache" / "agent-loop" / "memory")
+    with pytest.raises(_SpoolError, match="repository checkout"):
+        review_rounds.validate_review_spool_placement(config)
