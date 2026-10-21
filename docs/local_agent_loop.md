@@ -1993,7 +1993,12 @@ Cleanup is `confirmed` only when both of these hold:
   and the owned inventory. An entry that has already exited and only awaits
   reaping is not a live process and is skipped: both `stat` and the `status`
   `State:` line must report the same zombie or dead state (`Z`, `X` or `x`)
-  and `status` must report `Threads: 1`.
+  and `status` must report `Threads: 1`. The `status` state is the single
+  character in the second whitespace-separated field of the line keyed by
+  exactly `State:` (for example `State:\tZ (zombie)` gives `Z`); any other
+  shape, such as a multi-character value, a parenthesised description in that
+  position, a missing value or a prefix-only key such as `StateX:`, is
+  unparsable and keeps the entry flagged.
 
 A zombie thread-group leader whose other threads are still running
 (`Threads:` above 1), an entry with a missing or unparsable `State:` or

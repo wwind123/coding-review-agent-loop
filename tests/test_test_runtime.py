@@ -6313,7 +6313,9 @@ def _fx_fake_proc(root: Path, entries: dict[int, dict]) -> Path:
         (directory / "stat").write_text(f"{pid} ({info.get('comm', 'proc')}) " + " ".join(fields) + "\n")
         status = f"Name:\tproc\n"
         status_state = info.get("status_state", state)
-        if status_state is not None:
+        if "status_state_line" in info:
+            status += info["status_state_line"] + "\n"
+        elif status_state is not None:
             status += f"State:\t{status_state} (state)\n"
         status += f"Uid:\t{info.get('uid', 1000)}\t0\t0\t0\n"
         threads = info.get("threads", 1)
@@ -6421,6 +6423,47 @@ def test_fixture_census_flags_ambiguous_dead_entry(tmp_path, overrides):
     result = _fx_census(proc)
     assert result.cleanup == "escaped"
     assert [item["pid"] for item in result.escaped] == [200]
+
+
+@pytest.mark.parametrize(
+    "state_line",
+    [
+        "State:\t(zombie)",       # parenthesised description in the state position
+        "State:\tZZ (zombie)",    # multi-character token
+        "State:\tZombie",         # word, not a single character
+        "State:Z (zombie)",       # no separator, so no exact State: key
+        "State:",                 # no value
+        "StateX:\tZ (zombie)",    # prefix-keyed line, no real State: line
+    ],
+)
+def test_fixture_census_flags_malformed_status_state_line(tmp_path, state_line):
+    proc = _fx_fake_proc(tmp_path / "proc", {
+        100: {"start": 100},
+        200: {"start": 150, "state": "Z", "status_state_line": state_line},
+    })
+    result = _fx_census(proc)
+    assert result.cleanup == "escaped"
+    assert [item["pid"] for item in result.escaped] == [200]
+
+
+def test_fixture_census_status_state_reads_single_character_field():
+    assert fx_supervisor._status_state("Name:\tp\nState:\tZ (zombie)\n") == "Z"
+    assert fx_supervisor._status_state("Name:\tp\nState:\t(zombie)\n") is None
+    assert fx_supervisor._status_state("StateX:\tZ (zombie)\n") is None
+
+
+@pytest.mark.parametrize("state, line", [("Z", "State:\tZ (zombie)"), ("X", "State:\tX (dead)")])
+def test_fixture_census_skips_real_format_dead_state_line(tmp_path, monkeypatch, state, line):
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(fx_supervisor.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    proc = _fx_fake_proc(tmp_path / "proc", {
+        100: {"start": 100},
+        200: {"start": 150, "state": state, "status_state_line": line, "threads": 1},
+    })
+    result = _fx_census(proc)
+    assert result.cleanup == "confirmed"
+    assert result.escaped == []
+    assert signals == []
 
 
 def test_fixture_census_flags_live_stat_with_dead_status(tmp_path):

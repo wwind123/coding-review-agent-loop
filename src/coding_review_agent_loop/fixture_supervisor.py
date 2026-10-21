@@ -287,10 +287,16 @@ _DEAD_STATES = frozenset({"Z", "X", "x"})
 
 def _status_field(text: str, key: str) -> str | None:
     for line in text.splitlines():
-        if line.startswith(key):
-            parts = line.split()
+        parts = line.split()
+        if parts and parts[0] == key:
             return parts[1] if len(parts) > 1 else None
     return None
+
+
+def _status_state(text: str) -> str | None:
+    # The line reads `State:\t<char> (<description>)`; only that one character is the state.
+    value = _status_field(text, "State:")
+    return value if value is not None and len(value) == 1 else None
 
 
 def _is_reapable_dead(entry: ProcEntry, status_text: str) -> bool:
@@ -303,7 +309,7 @@ def _is_reapable_dead(entry: ProcEntry, status_text: str) -> bool:
     """
     if entry.state not in _DEAD_STATES:
         return False
-    if _status_field(status_text, "State:") != entry.state:
+    if _status_state(status_text) != entry.state:
         return False
     threads = _status_field(status_text, "Threads:")
     return threads is not None and threads.isdigit() and int(threads) == 1
