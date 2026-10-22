@@ -2984,7 +2984,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         claim_stack.close()
         if quota_wait_enabled:
             quota_wait.restore_sigterm_handler(previous_sigterm)
-            quota_wait.reset_wait_state()
+        # The cancel latch is process-level, and executors set it on any
+        # Ctrl-C even with the option off, so every exit leaves it clear for
+        # the next in-process command (#1607).
+        quota_wait.reset_wait_state()
     return 0
 
 
