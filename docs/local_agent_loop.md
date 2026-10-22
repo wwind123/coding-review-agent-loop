@@ -9142,6 +9142,9 @@ example `3600`, `90m`, `6h` or `1h30m`. It must be positive and no longer than
   and settings. That includes a corrective re-ask's prompt and session. A wait
   is neither a new round nor an ordinary retry: it never consumes
   `--agent-max-retries`, and it has its own attempt slots.
+- **Yearless dates.** A dated Codex reset without a year (`try again at <time>
+  on <day> <month>`) is read in the current local year, or in next year when
+  that instant is within 31 days; otherwise it has no parsed reset.
 - **When it stops as today.** The run stops when the reset is beyond the
   remaining budget, when there is no parsed reset (quota wording without a time
   keeps the ordinary bounded retry path), and for short resets (300 s or less,

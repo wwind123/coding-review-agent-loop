@@ -74,6 +74,10 @@ _MONTHS = {
     )
     for name in names
 }
+# A yearless date is read in the current local year first, and in next year
+# only when that instant is this near (#1606): "on 2 Jan" seen on 31 Dec rolls
+# forward, but a stale "on 21 Oct" seen on 22 Oct never becomes a ~year wait.
+_YEARLESS_ROLLOVER_HORIZON = datetime.timedelta(days=31)
 _LOCALTIME_PATH = "/etc/localtime"
 
 
@@ -173,16 +177,33 @@ def _parse_try_again_at_seconds(
     if month is None:
         return None
     day = int(m.group("day_a") or m.group("day_b"))
-    year = int(m.group("year_a")) if m.group("year_a") else today.year
-    try:
-        date = datetime.date(year, month, day)
-    except ValueError:
-        return None
-    # A dated time that is not in the future fails safe to None.
-    future = [t for t in _local_occurrences(date, hour, minute, tz) if t > now_utc]
-    if not future:
-        return None
-    return int((future[0] - now_utc).total_seconds())
+    if m.group("year_a"):
+        try:
+            date = datetime.date(int(m.group("year_a")), month, day)
+        except ValueError:
+            return None
+        # A dated time that is not in the future fails safe to None.
+        future = [t for t in _local_occurrences(date, hour, minute, tz) if t > now_utc]
+        if not future:
+            return None
+        return int((future[0] - now_utc).total_seconds())
+    # Yearless: this year, else next year within the horizon. A wall time in a
+    # spring-forward gap is None, never rolled to another year to dodge it.
+    for year in (today.year, today.year + 1):
+        try:
+            date = datetime.date(year, month, day)
+        except ValueError:
+            continue
+        occurrences = _local_occurrences(date, hour, minute, tz)
+        if not occurrences:
+            return None
+        future = [t for t in occurrences if t > now_utc]
+        if not future:
+            continue
+        if year != today.year and future[0] - now_utc > _YEARLESS_ROLLOVER_HORIZON:
+            return None
+        return int((future[0] - now_utc).total_seconds())
+    return None
 
 
 def _parse_absolute_reset_seconds(

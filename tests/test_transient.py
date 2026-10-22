@@ -950,6 +950,59 @@ def test_unreadable_localtime_returns_none(monkeypatch) -> None:
     ) is None
 
 
+def test_yearless_try_again_at_rolls_over_new_year() -> None:
+    now = _dt.datetime(2027, 1, 1, 4, 0, tzinfo=_UTC)  # 2026-12-31 20:00 PST
+    target = _dt.datetime(2027, 1, 2, 15, 5, tzinfo=_LA)
+    expected = int((target - now).total_seconds())
+    assert expected == 43 * 3600 + 5 * 60
+    assert _at("try again at 3:05 PM on 2 Jan", now) == expected
+
+
+def test_yearless_try_again_at_rollover_through_shared_parser(monkeypatch) -> None:
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    now = _dt.datetime(2027, 1, 1, 4, 0, tzinfo=_UTC)  # 2026-12-31 20:00 PST
+    text = "You've hit your usage limit. Try again at 3:05 PM on 2 Jan."
+    assert reset_parsing._parse_rate_limit_reset_seconds(text, now_utc=now) == _at(text, now)
+    assert _at(text, now) == 43 * 3600 + 5 * 60
+    # Earlier cascade forms still take precedence over the dated form.
+    assert reset_parsing._parse_rate_limit_reset_seconds(
+        "retry after 120. " + text, now_utc=now
+    ) == 120
+    assert reset_parsing._parse_rate_limit_reset_seconds(
+        "try again in 2m. " + text, now_utc=now
+    ) == 120
+
+
+def test_yearless_past_date_beyond_horizon_stays_none() -> None:
+    now = _dt.datetime(2026, 10, 22, 21, 0, tzinfo=_UTC)  # 14:00 PDT
+    assert _at("try again at 3:05 PM on 21 Oct", now) is None
+
+
+def test_yearless_rollover_horizon_boundary_is_inclusive() -> None:
+    target = _dt.datetime(2027, 1, 2, 15, 5, tzinfo=_LA)
+    at_horizon = target - reset_parsing._YEARLESS_ROLLOVER_HORIZON
+    assert reset_parsing._YEARLESS_ROLLOVER_HORIZON == _dt.timedelta(days=31)
+    assert _at("try again at 3:05 PM on 2 Jan", at_horizon) == 31 * 86400
+    beyond = at_horizon - _dt.timedelta(minutes=1)
+    assert _at("try again at 3:05 PM on 2 Jan", beyond) is None
+
+
+def test_explicit_year_past_date_never_rolls_over() -> None:
+    now = _dt.datetime(2027, 1, 3, 20, 0, tzinfo=_UTC)  # 2027-01-03 12:00 PST
+    assert _at("try again at Dec 30th, 2026 3:05 PM", now) is None
+
+
+def test_yearless_rollover_invalid_date_or_gap_is_none() -> None:
+    now = _dt.datetime(2026, 12, 31, 4, 0, tzinfo=_UTC)  # 2026-12-30 20:00 PST; 2027 not leap
+    assert _at("try again at 3:05 PM on 29 Feb", now) is None
+    gap_day = _dt.datetime(2026, 3, 8, 8, 0, tzinfo=_UTC)  # 00:00 PST, gap day
+    assert _at("try again at 2:30 AM on 8 Mar", gap_day) is None
+    # A current-year date already past whose next-year wall time is valid but
+    # far away also stays None rather than dodging to another year.
+    after_gap = _dt.datetime(2026, 3, 9, 8, 0, tzinfo=_UTC)
+    assert _at("try again at 2:30 AM on 8 Mar", after_gap) is None
+
+
 def test_bare_try_again_at_in_spring_forward_gap_is_none() -> None:
     now = _dt.datetime(2026, 3, 8, 8, 0, tzinfo=_UTC)  # 00:00 PST, gap day
     assert _at("try again at 2:30 AM", now) is None
