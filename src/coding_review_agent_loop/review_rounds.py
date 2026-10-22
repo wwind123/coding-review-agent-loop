@@ -645,9 +645,15 @@ def _spool_overlap_set(config: AgentLoopConfig) -> list[tuple[str, str]]:
     entries: list[tuple[str, str]] = [("response root", str(response_root(config)))]
     entries += [("agent checkout", path) for path in configured_checkouts(config)]
     for seat in getattr(config, "reviewer_seats", ()) or ():
+        # Production seats are SeatAgent values whose workdir is always resolved
+        # (the explicit --seat-dir or the default per-run worktree), so this skip
+        # only applies to test doubles and raw ReviewerSeat configs.
         workdir = getattr(seat, "workdir", None)
         if workdir is not None:
-            entries.append((f"reviewer seat {seat} workdir", os.path.abspath(str(workdir))))
+            # SeatAgent is a str whose value is the seat ID; a raw ReviewerSeat
+            # carries seat_id, and its dataclass repr must not leak into the label.
+            seat_id = getattr(seat, "seat_id", None) or str(seat)
+            entries.append((f"reviewer seat {seat_id} workdir", os.path.abspath(str(workdir))))
     repository = repository_checkout()
     if repository is not None and not _is_home_directory(repository):
         entries.append(("repository checkout", repository))
