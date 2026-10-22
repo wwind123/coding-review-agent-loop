@@ -67,6 +67,7 @@ from .repair_preservation import (
 from .runner import Runner
 from .salvage import SalvageContext
 from .transient import (
+    antigravity_log_quota_capacity,
     classify_antigravity_capacity,
     classify_antigravity_quota_exhaustion,
     looks_like_backgrounded_completion,
@@ -1586,6 +1587,8 @@ def _run_validated_agent_in_scope(
                 observation_provenance=result.observation_provenance,
                 containment=(result.containment.to_dict() if result.containment is not None else None),
             )
+            if result.antigravity_log_path is not None:
+                usage_record.agy_log_path = str(result.antigravity_log_path)
 
         # A backend always loads the uniquely assigned public response file.
         # On a timeout/nonzero exit, that artifact can still be a complete
@@ -1861,6 +1864,34 @@ def _run_validated_agent_in_scope(
             last_classification_text = ""
             last_failure_category = "timeout"
             break
+        elif (
+            backend_agent == "antigravity"
+            and antigravity_attempts is not None
+            and result.antigravity_log_quota_evidence is not None
+            and artifact_unavailable is None
+            and not target_exec_retryable
+            and not replacement_stability_failed
+            and not (result.command_result and result.command_result.capture_diagnostics)
+        ):
+            # agy printed nothing, but its own CLI log for this attempt shows
+            # the executor's RESOURCE_EXHAUSTED 429 (#1604). Route it into the
+            # quota path below: no format validation and no repair pass.
+            evidence = result.antigravity_log_quota_evidence
+            capacity = antigravity_log_quota_capacity(evidence.log_path, evidence.line)
+            provider_capacity = True
+            should_retry = True
+            last_failure_category = "transient"
+            last_error = (
+                f"Antigravity printed no output; agy log {evidence.log_path.name} shows "
+                "RESOURCE_EXHAUSTED (code 429)"
+            )
+            classification_text = evidence.line
+            last_classification_text = evidence.line
+            log(
+                config,
+                f"Antigravity printed no output; agy log {evidence.log_path.name} shows "
+                "RESOURCE_EXHAUSTED (code 429); treating as quota exhaustion",
+            )
         elif result.returncode != 0 and artifact_unavailable is None:
             last_error = f"agent command exited with {result.returncode}"
             classification_text, provider_verdict = _agent_failure_classification(
@@ -3200,6 +3231,8 @@ def _run_validated_agent_in_scope(
                 "unprotected fresh-authorization path is unavailable here; do not rerun "
                 "implementation to recreate the PR."
             )
+    if last_result is not None and last_result.antigravity_log_path is not None:
+        message += f" agy log: {last_result.antigravity_log_path}."
     message += diagnostics.format_for_error()
     if (
         last_failure_category not in {"deterministic", "fresh-contract-integrity"}

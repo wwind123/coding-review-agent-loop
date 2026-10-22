@@ -48,6 +48,16 @@ def _no_real_repair():
 
 
 @pytest.fixture(autouse=True)
+def _isolated_agy_log_dir(monkeypatch, tmp_path_factory):
+    """Never list or read the host's real agy CLI log directory (#1604)."""
+    from coding_review_agent_loop.agents import antigravity
+
+    log_dir = tmp_path_factory.mktemp("agy-cli-log")
+    monkeypatch.setattr(antigravity, "_antigravity_log_dir", lambda: log_dir)
+    return log_dir
+
+
+@pytest.fixture(autouse=True)
 def _no_real_github_backoff(monkeypatch):
     """The GitHub transient-retry backoff never really sleeps under test (#510).
 

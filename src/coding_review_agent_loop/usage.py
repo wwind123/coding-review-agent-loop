@@ -110,6 +110,8 @@ class UsageCallRecord:
     log_path: str | None = None
     fallback_planned: bool | None = None
     containment: dict[str, object] | None = None
+    # Antigravity silent attempts (#1604): the agy CLI log located for it.
+    agy_log_path: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -125,7 +127,7 @@ class UsageCallRecord:
         for key in (
             "backend", "role", "turn_role", "model", "configured_model", "configured_effort",
             "effort_source", "observed_model", "observed_effort", "observation_provenance",
-            "outcome", "log_path", "fallback_planned", "containment",
+            "outcome", "log_path", "fallback_planned", "containment", "agy_log_path",
         ):
             value = getattr(self, key)
             if value is not None:

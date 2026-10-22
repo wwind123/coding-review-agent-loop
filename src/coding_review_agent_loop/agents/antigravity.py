@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Callable
 from .base import (
     AgentName,
     AgentResult,
+    AntigravityLogQuotaEvidence,
     AgentTextSource,
     STDIN_PROMPT_THRESHOLD_BYTES,
     public_response_path,
@@ -1108,6 +1109,212 @@ def _antigravity_settings_path() -> Path:
     return Path.home() / ".gemini" / "antigravity-cli" / "settings.json"
 
 
+# --- Silent quota failures read from agy's own CLI log (#1604) ---------------
+#
+# agy sometimes ends a quota-exhausted turn with no output at all (only its own
+# "run ended with no output and no recorded error" warning) while its CLI log
+# records the executor's RESOURCE_EXHAUSTED 429.  These helpers locate the one
+# log written by this attempt and read that line; anything uncertain yields
+# no evidence, so the attempt keeps today's classification.
+_AGY_SILENT_WARNING_RE = re.compile(
+    r"(?i)^(?:warning:\s*)?run ended with no output and no recorded error\.?$"
+)
+_AGY_LOG_NAME_RE = re.compile(r"^cli-(\d{8}_\d{6})\.log$")
+_AGY_LOG_QUOTA_SEVERITY_RE = re.compile(r"^[EF]\d{4} ")
+_AGY_LOG_QUOTA_CONTEXT_RE = re.compile(r"(?i)agent executor error|generating and executing")
+_AGY_LOG_QUOTA_EXHAUSTED_RE = re.compile(r"(?i)resource[ _-]?exhausted")
+_AGY_LOG_QUOTA_429_RE = re.compile(r"(?<!\d)429(?!\d)")
+# The name stamp is written at agy start-up; the mtime by its last write.
+AGY_LOG_NAME_WINDOW_BEFORE_SECONDS = 2.0
+AGY_LOG_NAME_WINDOW_AFTER_SECONDS = 10.0
+AGY_LOG_MTIME_WINDOW_BEFORE_SECONDS = 1.0
+AGY_LOG_MTIME_WINDOW_AFTER_SECONDS = 2.0
+AGY_LOG_READ_LIMIT_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class AntigravityLogLookup:
+    """Outcome of one silent-attempt agy log lookup."""
+
+    log_path: Path | None
+    reason: str
+
+
+def _antigravity_log_dir() -> Path:
+    """Return ~/.gemini/antigravity-cli/log (patchable in tests)."""
+    return Path.home() / ".gemini" / "antigravity-cli" / "log"
+
+
+def is_silent_antigravity_attempt(
+    result: CommandResult, response_file_text: str | None
+) -> bool:
+    """True when agy exited without a response file and printed nothing useful.
+
+    A timeout (returncode None) is never silent: it stays a timeout.
+    """
+    if result.returncode is None or response_file_text is not None:
+        return False
+    for raw_line in strip_ansi(result.stdout or "").replace("\r", "\n").splitlines():
+        line = raw_line.strip()
+        if line and not _AGY_SILENT_WARNING_RE.match(line):
+            return False
+    return True
+
+
+def snapshot_antigravity_logs(log_dir: Path) -> frozenset[str] | None:
+    """Names of agy CLI logs present now; empty when the directory is missing.
+
+    None means no usable inventory, so no later log can be proven new.
+    """
+    try:
+        names = os.listdir(log_dir)
+    except FileNotFoundError:
+        return frozenset()
+    except OSError:
+        return None
+    return frozenset(name for name in names if _AGY_LOG_NAME_RE.match(name))
+
+
+def _agy_log_name_time(name: str) -> float | None:
+    match = _AGY_LOG_NAME_RE.match(name)
+    if match is None:
+        return None
+    try:
+        # agy names its log by local wall-clock time.
+        return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S").timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def find_antigravity_attempt_log(
+    log_dir: Path,
+    pre_existing: frozenset[str] | None,
+    spawn_wall_time: float,
+    exit_wall_time: float,
+) -> AntigravityLogLookup:
+    """The single agy log created by this attempt, or None with a reason.
+
+    Only names absent from the pre-spawn inventory qualify, so an earlier
+    attempt's log is never used however close its timestamps are; the time
+    windows only narrow among new files.
+    """
+    if pre_existing is None:
+        return AntigravityLogLookup(None, "no pre-spawn inventory")
+    try:
+        names = os.listdir(log_dir)
+    except FileNotFoundError:
+        return AntigravityLogLookup(None, "agy log directory is missing")
+    except OSError as exc:
+        return AntigravityLogLookup(None, f"agy log directory unreadable: {exc}")
+    candidates: list[Path] = []
+    for name in sorted(names):
+        if name in pre_existing:
+            continue
+        name_time = _agy_log_name_time(name)
+        if name_time is None:
+            continue
+        if not (
+            spawn_wall_time - AGY_LOG_NAME_WINDOW_BEFORE_SECONDS
+            <= name_time
+            <= spawn_wall_time + AGY_LOG_NAME_WINDOW_AFTER_SECONDS
+        ):
+            continue
+        path = log_dir / name
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if not stat_module.S_ISREG(info.st_mode):
+            continue
+        if not (
+            spawn_wall_time - AGY_LOG_MTIME_WINDOW_BEFORE_SECONDS
+            <= info.st_mtime
+            <= exit_wall_time + AGY_LOG_MTIME_WINDOW_AFTER_SECONDS
+        ):
+            continue
+        candidates.append(path)
+    if not candidates:
+        return AntigravityLogLookup(None, "no new agy log in this attempt's window")
+    if len(candidates) > 1:
+        return AntigravityLogLookup(
+            None, f"{len(candidates)} new agy logs in this attempt's window (ambiguous)"
+        )
+    return AntigravityLogLookup(candidates[0], "matched")
+
+
+def antigravity_log_quota_line(path: Path) -> str | None:
+    """First error-severity executor RESOURCE_EXHAUSTED 429 line in an agy log."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat_module.S_ISREG(info.st_mode):
+            return None
+        if info.st_size > AGY_LOG_READ_LIMIT_BYTES:
+            os.lseek(fd, info.st_size - AGY_LOG_READ_LIMIT_BYTES, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = AGY_LOG_READ_LIMIT_BYTES
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    text = b"".join(chunks).decode("utf-8", errors="replace")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if (
+            _AGY_LOG_QUOTA_SEVERITY_RE.match(line)
+            and _AGY_LOG_QUOTA_CONTEXT_RE.search(line)
+            and _AGY_LOG_QUOTA_EXHAUSTED_RE.search(line)
+            and _AGY_LOG_QUOTA_429_RE.search(line)
+        ):
+            return line[:2000]
+    return None
+
+
+def _silent_attempt_log_evidence(
+    config: AgentLoopConfig,
+    result: CommandResult,
+    response_file_text: str | None,
+    log_dir: Path,
+    pre_existing: frozenset[str] | None,
+) -> tuple[Path | None, AntigravityLogQuotaEvidence | None]:
+    """Locate and read this silent attempt's agy log; never raises."""
+    try:
+        if not is_silent_antigravity_attempt(result, response_file_text):
+            return None, None
+        observation = result.observation
+        if observation is None:
+            log(config, "Antigravity printed no output; no agy log lookup (no spawn observation)")
+            return None, None
+        spawn = observation.spawn_wall_time
+        lookup = find_antigravity_attempt_log(
+            log_dir, pre_existing, spawn, spawn + observation.elapsed_seconds
+        )
+        if lookup.log_path is None:
+            log(config, f"Antigravity printed no output; no new matching agy log ({lookup.reason})")
+            return None, None
+        line = antigravity_log_quota_line(lookup.log_path)
+        if line is None:
+            log(
+                config,
+                f"Antigravity printed no output; agy log {lookup.log_path.name} has no "
+                "RESOURCE_EXHAUSTED 429 line",
+            )
+            return lookup.log_path, None
+        return lookup.log_path, AntigravityLogQuotaEvidence(lookup.log_path, line)
+    except Exception as exc:  # noqa: BLE001 - the lookup must never fail the turn
+        log(config, f"Antigravity agy log lookup failed: {exc}")
+        return None, None
+
+
 def _strip_public_response_marker(raw: str) -> tuple[str, AgentTextSource]:
     if PUBLIC_RESPONSE_MARKER not in raw:
         return raw, "stdout"
@@ -1285,6 +1492,8 @@ class AntigravityBackend:
         candidate: WorkdirReplayEvidence | None = None
         response_file_text: str | None = None
         result: CommandResult | None = None
+        agy_log_dir = _antigravity_log_dir()
+        agy_log_inventory: frozenset[str] | None = None
 
         def strip_injected_prefix() -> None:
             # Only a verified header+body is removed; anything swapped or
@@ -1395,6 +1604,14 @@ class AntigravityBackend:
                         raise CheckoutVerificationError(
                             f"Refusing to start the Antigravity turn: {exc}"
                         ) from exc
+                    if role != _SEMANTIC_DEDUPE_ROLE:
+                        # Taken under the settings lock, which serializes
+                        # agent-loop agy turns host-wide, so a later silent
+                        # attempt can prove which agy log is its own (#1604).
+                        try:
+                            agy_log_inventory = snapshot_antigravity_logs(agy_log_dir)
+                        except Exception:  # noqa: BLE001
+                            agy_log_inventory = None
                     result = runner.run_with_log(
                         args,
                         cwd=config.antigravity_dir,
@@ -1488,6 +1705,12 @@ class AntigravityBackend:
             message_text, text_source = response_file_text, "response_file"
         else:
             message_text, text_source = _strip_public_response_marker(result.stdout)
+        agy_log_path: Path | None = None
+        agy_log_evidence: AntigravityLogQuotaEvidence | None = None
+        if role != _SEMANTIC_DEDUPE_ROLE:
+            agy_log_path, agy_log_evidence = _silent_attempt_log_evidence(
+                config, result, response_file_text, agy_log_dir, agy_log_inventory
+            )
         return AgentResult(
             text=message_text,
             raw_output=result.stdout,
@@ -1511,6 +1734,8 @@ class AntigravityBackend:
             self_update_replay_refusal_detail=(
                 candidate.replay_refusal_detail if candidate else None
             ),
+            antigravity_log_path=agy_log_path,
+            antigravity_log_quota_evidence=agy_log_evidence,
         )
 
     @staticmethod
