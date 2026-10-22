@@ -792,6 +792,31 @@ def test_transport_forbidden_roots_cover_every_agent_location(tmp_path, monkeypa
     assert len(roots) == len(config.transport_forbidden_roots)
 
 
+def test_spool_overlap_set_covers_defaulted_seat_workdirs(tmp_path, monkeypatch):
+    """#1566: a seat without --seat-dir contributes its default per-run worktree."""
+    from dataclasses import replace
+
+    from coding_review_agent_loop import review_rounds
+    from coding_review_agent_loop.config import default_run_worktree
+
+    env = Env(tmp_path, monkeypatch)
+    seat_dir = tmp_path / "seat-checkout"
+    config = env.config(extra=(
+        "--reviewer-seat", "audit=gemini", "--seat-model", "audit=gemini-test",
+        "--seat-dir", f"audit={seat_dir}",
+        "--reviewer-seat", "second=claude", "--seat-model", "second=claude-test",
+    ))
+    defaulted = default_run_worktree("OWNER/REPO", "second", config.run_token).resolve()
+    entries = review_rounds._spool_overlap_set(config)
+    assert ("reviewer seat second workdir", os.path.abspath(str(defaulted))) in entries
+    assert ("reviewer seat audit workdir", os.path.abspath(str(seat_dir.resolve()))) in entries
+
+    misplaced = replace(config, agent_memory_dir=defaulted / "cache" / "memory")
+    with pytest.raises(AgentLoopError, match="overlaps") as info:
+        review_rounds.validate_review_spool_placement(misplaced)
+    assert "reviewer seat second workdir" in str(info.value)
+
+
 def test_every_import_call_site_forwards_identity_and_shared_roots(tmp_path, monkeypatch):
     """Both run_worktrees.py and all three config.py import_ref sites forward both values."""
     from dataclasses import replace

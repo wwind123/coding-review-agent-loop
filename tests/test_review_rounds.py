@@ -384,6 +384,26 @@ def test_spool_inside_a_named_seat_workdir_is_refused(tmp_path, spool_config):
     _assert_refused_without_spool_state(config, "reviewer seat seat-a workdir")
 
 
+def test_raw_reviewer_seat_overlap_label_uses_the_seat_id(tmp_path, spool_config):
+    """#1566: a raw ReviewerSeat is labelled by its ID, never its dataclass repr."""
+    from coding_review_agent_loop.reviewer_seats import ReviewerSeat
+
+    seat_dir = tmp_path / "raw-seat-checkout"
+    seat = ReviewerSeat("seat-b", "codex", ("Model B",), workdir=seat_dir)
+    config = _make_spool_config(tmp_path, reviewer_seats=(seat,))
+    labels = [label for label, _ in review_rounds._spool_overlap_set(config)]
+    assert "reviewer seat seat-b workdir" in labels
+    assert not any("ReviewerSeat(" in label for label in labels)
+
+    config = _make_spool_config(
+        tmp_path, reviewer_seats=(seat,), agent_memory_dir=seat_dir / "cache" / "memory",
+    )
+    with pytest.raises(_SpoolError, match="overlaps") as info:
+        review_rounds.validate_review_spool_placement(config)
+    assert "reviewer seat seat-b workdir" in str(info.value)
+    assert "ReviewerSeat(" not in str(info.value)
+
+
 def test_spool_inside_the_repository_checkout_is_refused(tmp_path, spool_config, monkeypatch):
     repository = tmp_path / "orchestrator-repo"
     (repository / ".git").mkdir(parents=True)
