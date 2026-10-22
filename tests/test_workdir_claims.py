@@ -966,3 +966,91 @@ def test_managed_pr_handoff_reaches_real_pr_loop_with_outer_identity(tmp_path, m
     assert identities and all(i == ("managed-pr", None, "managed-pr from feat-x", 2) for i in identities)
     assert seen.get("prepared") is True  # managed-pr preparation ran under the claim
     assert workdir_claims._registry == {}
+
+
+# --- live-run count and first-run-start hooks (#1609) ---------------------------
+
+@pytest.fixture
+def hook_calls():
+    calls: list[str] = []
+    workdir_claims.register_first_run_start_hook("test-record", lambda: calls.append("hook"))
+    return calls
+
+
+def test_live_run_count_tracks_only_outermost_scopes(hook_calls):
+    assert workdir_claims.live_run_count() == 0
+    with workdir_claim_scope("issue", 1):
+        assert workdir_claims.live_run_count() == 1
+        with workdir_claim_scope("pr", 2):
+            assert workdir_claims.live_run_count() == 1
+    assert workdir_claims.live_run_count() == 0
+    assert hook_calls == ["hook"]
+
+
+def test_live_run_count_decrements_on_exception_and_raising_finalizer(hook_calls, capsys):
+    with pytest.raises(RuntimeError):
+        with workdir_claim_scope():
+            workdir_claims.register_run_finalizer("boom", lambda: 1 / 0)
+            raise RuntimeError("run failed")
+    assert workdir_claims.live_run_count() == 0
+    assert "run finalizer boom failed" in capsys.readouterr().err
+
+
+def test_first_run_hooks_skip_a_concurrent_second_run(hook_calls):
+    entered = threading.Event()
+    leave = threading.Event()
+
+    def other_run():
+        with workdir_claim_scope("pr", 2):
+            entered.set()
+            assert leave.wait(10)
+
+    with workdir_claim_scope("issue", 1):
+        thread = threading.Thread(target=other_run, daemon=True)
+        thread.start()
+        assert entered.wait(10)
+        assert workdir_claims.live_run_count() == 2
+        leave.set()
+        thread.join(10)
+    assert hook_calls == ["hook"]
+    with workdir_claim_scope():
+        pass
+    assert hook_calls == ["hook", "hook"]
+
+
+def test_first_run_hook_registration_is_idempotent_by_key(hook_calls):
+    assert workdir_claims.register_first_run_start_hook("test-record", lambda: None) is False
+    assert workdir_claims.register_first_run_start_hook("test-other", lambda: None) is True
+    with workdir_claim_scope():
+        pass
+    assert hook_calls == ["hook"]
+
+
+def test_raising_first_run_hook_is_reported_and_isolated(hook_calls, capsys):
+    def boom():
+        raise ValueError("hook broke")
+
+    workdir_claims.register_first_run_start_hook("test-boom", boom)
+    with workdir_claim_scope() as owner:
+        assert workdir_claims.current_claim_owner() is owner
+        assert workdir_claims.live_run_count() == 1
+    assert workdir_claims.current_claim_owner() is None
+    assert workdir_claims.live_run_count() == 0
+    assert "first-run-start hook test-boom failed: hook broke" in capsys.readouterr().err
+    with pytest.raises(KeyError):
+        with workdir_claim_scope():
+            raise KeyError("body")
+    assert workdir_claims.live_run_count() == 0
+    assert workdir_claims._registry == {}
+
+
+def test_keyboard_interrupt_in_a_first_run_hook_does_not_leak_the_count():
+    def interrupt():
+        raise KeyboardInterrupt
+
+    workdir_claims.register_first_run_start_hook("test-interrupt", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        with workdir_claim_scope():
+            pytest.fail("the scope body must not run")
+    assert workdir_claims.live_run_count() == 0
+    assert workdir_claims.current_claim_owner() is None

@@ -182,8 +182,13 @@ def _isolate_workdir_claims(tmp_path_factory):
     from coding_review_agent_loop import workdir_claims
 
     workdir_claims._set_claim_root_for_tests(tmp_path_factory.mktemp("workdir-claims"))
+    hooks = dict(workdir_claims._first_run_start_hooks)
     yield
     workdir_claims._set_claim_root_for_tests(None)
+    # Drop hooks a test registered and keep the production order (#1609).
+    workdir_claims._first_run_start_hooks.clear()
+    workdir_claims._first_run_start_hooks.update(hooks)
+    assert workdir_claims.live_run_count() == 0, "a test leaked a live workdir_claim_scope"
 
 
 @pytest.fixture(autouse=True)

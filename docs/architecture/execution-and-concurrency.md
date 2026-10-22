@@ -340,6 +340,16 @@ thread. There, a waiting main thread converts the interrupt to
 (`discuss_loop.py`) executors cancel waiting workers before terminating
 processes and joining. `cli.main` maps an interrupt that cancelled a wait to
 exit code 3. SIGTERM with no active wait keeps its previous behaviour.
+The cancel latch is process-level. A cancel always sets it, so a wait that is
+about to start in an interrupted run still stops. It persists while any logical
+run is live and is cleared when a new run starts after all runs ended with no
+active wait (#1609). `cli.main` also clears it on every exit.
+`workdir_claims` counts live outermost `workdir_claim_scope` runs and runs
+registered first-run-start hooks on the zero-to-one transition; `quota_wait`
+registers its stale-latch reset there. A run-lifecycle lock, separate from the
+claim registry lock, covers the increment, the hooks and the decrement, so no
+other run is admitted before the reset finishes. Waits outside any scope have
+no run boundary, so their callers call `reset_wait_state()` themselves.
 
 ## Other Entry Paths
 

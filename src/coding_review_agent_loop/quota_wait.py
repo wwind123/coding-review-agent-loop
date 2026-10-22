@@ -6,6 +6,13 @@ quota reset instead of stopping the run.  Waiting is bounded per logical run
 holds no agent subprocess or settings lock, and is interruptible: a process
 level waiter registry lets the main thread cancel waits running in reviewer
 or debater worker threads when SIGINT/SIGTERM arrives.
+
+The cancel latch is process-level.  It persists while any logical run (an
+outermost ``workdir_claim_scope``) is live, so a wait that is about to start in
+an interrupted run still stops, and it is cleared when the next run starts
+after all runs ended with no wait active (#1609).  ``cli.main`` also clears it
+on every exit; callers that wait outside any scope call
+:func:`reset_wait_state` themselves.
 """
 
 from __future__ import annotations
@@ -125,7 +132,8 @@ def cancel_active_waits() -> None:
     """Wake every active (and any about-to-start) wait; it raises a quota stop.
 
     Called from ordinary code (an executor's ``except KeyboardInterrupt``),
-    never from a signal handler.
+    never from a signal handler.  The event stays set while any logical run
+    is live and is cleared when the next run starts after all runs ended.
     """
     global _interrupted_message
     if _active_waits or _signal_cancel_requested:
@@ -148,12 +156,31 @@ def interrupted_message() -> str | None:
 
 
 def reset_wait_state() -> None:
-    """Clear cancellation state; the CLI calls it around each command."""
+    """Clear cancellation state; the CLI calls it around each command.
+
+    A new logical run clears stale state itself (see
+    :func:`_reset_stale_wait_state`); callers that wait outside any
+    ``workdir_claim_scope`` have no run boundary and call this directly.
+    """
     global _interrupted_message, _signal_cancel_requested
     with _waiters_lock:
         _interrupted_message = None
     _signal_cancel_requested = False
     _cancel_event.clear()
+
+
+def _reset_stale_wait_state() -> None:
+    """First-run-start hook: clear a latch no live run or active wait can own (#1609).
+
+    It runs only when the live-run count goes from zero to one; the active
+    wait guard covers waits that run outside any scope.
+    """
+    if _active_waits:
+        return
+    reset_wait_state()
+
+
+workdir_claims.register_first_run_start_hook("quota-wait-cancel-latch", _reset_stale_wait_state)
 
 
 def _interrupted_text(agent_name: str) -> str:

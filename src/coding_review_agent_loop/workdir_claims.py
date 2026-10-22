@@ -10,6 +10,11 @@ liveness test, so a crashed holder never blocks a later run.
 Claims belong to a logical-run :class:`ClaimOwner` created by the outermost
 :func:`workdir_claim_scope`; nested scopes join it and only the outermost scope
 releases.
+
+The module also counts live outermost scopes.  When the count goes from zero
+to one, registered first-run-start hooks run so process-level state left by
+earlier runs (for example the quota-wait cancel latch, #1609) can be cleared
+before the new run's body starts.
 """
 
 from __future__ import annotations
@@ -65,6 +70,14 @@ _registry: dict[str, _Claim] = {}
 _finalizers: dict[ClaimOwner, dict[str, Callable[[], None]]] = {}
 _registry_lock = threading.Lock()
 _active_owner: ContextVar[ClaimOwner | None] = ContextVar("workdir_claim_owner", default=None)
+
+# Live outermost scopes and first-run-start hooks (#1609).  The lifecycle lock
+# guards the counter and the hook registry and is held while the hooks run, so
+# another outermost scope cannot enter its body before the reset finishes.  It
+# is separate from ``_registry_lock``, which is never held while hooks run.
+_run_lifecycle_lock = threading.Lock()
+_live_runs = 0
+_first_run_start_hooks: dict[str, Callable[[], None]] = {}
 
 
 def _set_claim_root_for_tests(path: Path | None) -> None:
@@ -304,6 +317,55 @@ def register_run_finalizer(key: str, callback: Callable[[], None]) -> bool:
         return True
 
 
+def register_first_run_start_hook(key: str, callback: Callable[[], None]) -> bool:
+    """Run ``callback`` whenever the live-run count goes from zero to one.
+
+    Idempotent by ``key``; True when newly registered.  Hooks run in
+    registration order while the run-lifecycle lock is held, so they must be
+    short and must never open a :func:`workdir_claim_scope` (the lock is not
+    reentrant).
+    """
+    with _run_lifecycle_lock:
+        if key in _first_run_start_hooks:
+            return False
+        _first_run_start_hooks[key] = callback
+        return True
+
+
+def live_run_count() -> int:
+    """Number of live outermost :func:`workdir_claim_scope` runs."""
+    return _live_runs
+
+
+def _run_first_run_start_hooks() -> None:
+    for key, callback in list(_first_run_start_hooks.items()):
+        try:
+            callback()
+        except Exception as exc:  # noqa: BLE001 - never block the run from opening
+            print(f"[agent-loop] first-run-start hook {key} failed: {exc}", file=sys.stderr)
+
+
+def _enter_live_run() -> None:
+    global _live_runs
+    with _run_lifecycle_lock:
+        counted = False
+        try:
+            _live_runs += 1
+            counted = True
+            if _live_runs == 1:
+                _run_first_run_start_hooks()
+        except BaseException:
+            if counted:
+                _live_runs -= 1
+            raise
+
+
+def _exit_live_run() -> None:
+    global _live_runs
+    with _run_lifecycle_lock:
+        _live_runs -= 1
+
+
 def _run_finalizers(owner: ClaimOwner) -> None:
     with _registry_lock:
         bucket = _finalizers.pop(owner, {})
@@ -377,17 +439,21 @@ def workdir_claim_scope(
         number=number,
         target=_target_for(command, number, head),
     )
-    token = _active_owner.set(owner)
+    _enter_live_run()
     try:
-        yield owner
-    finally:
+        token = _active_owner.set(owner)
         try:
-            try:
-                _run_finalizers(owner)
-            finally:
-                release_workdir_claims(owner)
+            yield owner
         finally:
-            _active_owner.reset(token)
+            try:
+                try:
+                    _run_finalizers(owner)
+                finally:
+                    release_workdir_claims(owner)
+            finally:
+                _active_owner.reset(token)
+    finally:
+        _exit_live_run()
 
 
 def claimed_run(command: str, number_param: str | None = None) -> Callable:
