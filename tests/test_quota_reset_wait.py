@@ -429,6 +429,99 @@ def test_option_off_installs_no_sigterm_handler(monkeypatch):
     assert signal.getsignal(signal.SIGTERM) == previous
 
 
+# --- repeated in-process main() calls (#1607) -----------------------------------
+
+def test_repeated_main_after_cancelled_wait_waits_normally(tmp_path, monkeypatch, capsys):
+    runner = FakeRunner()
+    config = make_config(tmp_path, agent_max_retries=0, wait_for_quota_reset_seconds=SIX_HOURS)
+
+    def interrupted_pr_loop(*_a, **_k):
+        with patch.object(validated_agent, "run_agent_result", side_effect=[_claude_limit(), OK]):
+            validated_agent._run_validated_agent(
+                runner, agent="claude", config=config, prompt="P",
+                marker_description="none", validate=lambda t: t,
+            )
+        pytest.fail("the wait was not interrupted")
+
+    monkeypatch.setattr(cli, "run_pr_loop", interrupted_pr_loop)
+    firing = _signal_when_waiting(signal.SIGINT)
+    assert cli.main(PR_ARGS) == QuotaResetExceededError.EXIT_CODE
+    firing.join(5)
+    assert "quota reset wait interrupted" in capsys.readouterr().err
+
+    slept: list[float] = []
+    monkeypatch.setattr(quota_wait, "_sleeper", slept.append)
+    responses = []
+
+    def waiting_pr_loop(*_a, **_k):
+        with patch.object(validated_agent, "run_agent_result", side_effect=[_claude_limit(), OK]) as invoke:
+            responses.append(validated_agent._run_validated_agent(
+                runner, agent="claude", config=config, prompt="P",
+                marker_description="none", validate=lambda t: t,
+            ))
+        assert invoke.call_count == 2
+        return 0
+
+    monkeypatch.setattr(cli, "run_pr_loop", waiting_pr_loop)
+    assert cli.main(PR_ARGS) == 0
+    assert [r.text for r in responses] == ["fine"]
+    assert sum(slept) == 7200 + quota_wait.QUOTA_WAIT_MARGIN_SECONDS
+    assert "quota reset wait interrupted" not in capsys.readouterr().err
+
+
+def test_option_off_keyboard_interrupt_clears_cancel_latch(tmp_path, monkeypatch):
+    previous = signal.getsignal(signal.SIGTERM)
+    seen = []
+
+    def interrupted_pr_loop(*_a, **_k):
+        seen.append(signal.getsignal(signal.SIGTERM))
+        quota_wait.cancel_active_waits()  # what an executor does on Ctrl-C
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "run_pr_loop", interrupted_pr_loop)
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(["pr", "77", "--repo", "OWNER/REPO"])
+    assert seen == [previous]
+    assert signal.getsignal(signal.SIGTERM) == previous
+    # Checked in the test body, before the autouse fixture resets state.
+    assert not quota_wait._cancel_event.is_set()
+    assert not quota_wait.wait_was_interrupted()
+
+    slept: list[float] = []
+    monkeypatch.setattr(quota_wait, "_sleeper", slept.append)
+    reservation = quota_wait.QuotaWaitReservation(7200, 1, 2)
+    quota_wait.wait_for_reset(make_config(tmp_path), "Claude", reservation)
+    assert sum(slept) == reservation.sleep_seconds
+
+
+def test_main_chains_sigterm_to_host_python_handler(monkeypatch):
+    received = []
+
+    def host_handler(signum, _frame):
+        received.append(signum)
+
+    original = signal.signal(signal.SIGTERM, host_handler)
+    try:
+        installed = []
+
+        def pr_loop(*_a, **_k):
+            installed.append(signal.getsignal(signal.SIGTERM))
+            os.kill(os.getpid(), signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while not received and time.monotonic() < deadline:
+                time.sleep(0.01)
+            return 0
+
+        monkeypatch.setattr(cli, "run_pr_loop", pr_loop)
+        assert cli.main(PR_ARGS) == 0
+        assert installed and installed[0] is not host_handler  # main's handler chained
+        assert received == [signal.SIGTERM]
+        assert not quota_wait.wait_was_interrupted()
+        assert signal.getsignal(signal.SIGTERM) is host_handler
+    finally:
+        signal.signal(signal.SIGTERM, original)
+
+
 # --- signals at wait-lifecycle boundaries (subprocess: a deadlock times out) ----
 
 _BOUNDARY_SCRIPT = r"""
