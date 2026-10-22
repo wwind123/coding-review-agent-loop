@@ -148,7 +148,7 @@ _PROVIDER_DEFINITIVE_FAILURE_CATEGORIES = frozenset(
 _QUOTA_RATE_LIMIT_RE = re.compile(
     r"\b429\b|rate[- ]?limit(?:ed)?|"
     r"session[- ]?limit|too many sessions|"
-    r"resource[- ]?exhausted|\bquota\b|"
+    r"resource[- ]?exhausted|\bquota\b|usage[- _]?limit|"
     r"no capacity available|capacity.*(?:unavailable|exceeded)|"
     r"overloaded",
     re.I,

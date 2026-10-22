@@ -48,6 +48,10 @@ def is_transient_agent_output(text: str) -> bool:
 # One structured error is authoritative (#1280): the last turn.failed error, else
 # the last structured error occurrence. Only it decides the category and billing
 # flag; earlier errors (e.g. tool or MCP start-up warnings) are supporting context.
+# Its tiers (#1281): hard billing (402, insufficient_quota, payment required),
+# then a Codex plan usage limit (auth first, else transient quota exhaustion even
+# when it offers to sell credits), then the unchanged soft-billing, availability,
+# auth, transient and deterministic chain.
 
 _CODEX_EVENT_SHAPED_RE = re.compile(r'^\s*\{\s*"(?:type|id|item|thread_id)"\s*:')
 _CODEX_STDIN_BANNER = "Reading prompt from stdin..."
@@ -56,6 +60,14 @@ _CODEX_FIELDS = ("message", "code", "type", "status", "detail")
 _BILLING_GUARD_RE = re.compile(
     r"billing|credit|insufficient_quota|check your plan|payment required|\b402\b", re.I
 )
+_HARD_BILLING_RE = re.compile(r"insufficient_quota|payment required|\b402\b", re.I)
+# Codex plan usage limits (#1281), e.g. "You've hit your usage limit ... try
+# again at 3:05 PM". Deliberately narrow: generic "usage" or "limit" never match.
+_USAGE_LIMIT_RE = re.compile(
+    r"you'?ve hit your usage limit|usage[_ ]limit[_ ]reached|usage limit (?:reached|exceeded)",
+    re.I,
+)
+_DIRTY_CHECKOUT_RE = re.compile(r"dirty (?:checkout|workdir|working tree)", re.I)
 _AVAILABILITY_RE = re.compile(
     r"at capacity|no capacity|capacity|overloaded|model_capacity_exhausted|"
     r"Internal Server Error|Bad Gateway|Service Unavailable|Gateway Timeout|"
@@ -90,6 +102,9 @@ class ProviderFailureVerdict:
     billing: bool
     text: str
     source: Literal["structured", "stderr", "none"]
+    # Rendering of the authoritative structured error alone (#1281), so reset
+    # decisions never read supporting errors; empty for stderr and none sources.
+    authoritative_text: str = ""
 
 
 def _status_value(value: object) -> int | None:
@@ -192,7 +207,13 @@ def extract_codex_error_channel(raw_output: str) -> CodexErrorChannel | None:
 
 def _classify_structured_provider_error(err: CodexStructuredError) -> tuple[str, bool]:
     text = err.rendered
-    if 402 in err.statuses or _BILLING_GUARD_RE.search(text):
+    if 402 in err.statuses or _HARD_BILLING_RE.search(text):
+        return "non-retryable", True
+    if _USAGE_LIMIT_RE.search(text):
+        if any(s in (401, 403) for s in err.statuses) or _STRUCTURED_AUTH_RE.search(text):
+            return "non-retryable", False
+        return "transient", False
+    if _BILLING_GUARD_RE.search(text):
         return "non-retryable", True
     if any(s >= 500 or s == 429 for s in err.statuses) or _AVAILABILITY_RE.search(text):
         return "transient", False
@@ -224,13 +245,22 @@ def classify_codex_failure(raw_output: str) -> ProviderFailureVerdict | None:
             e for i, e in enumerate(channel.structured_errors) if i != index
         ]
         text = "\n".join(e.rendered for e in ordered)
-        return ProviderFailureVerdict(category, billing, text, "structured")
+        return ProviderFailureVerdict(
+            category, billing, text, "structured", authoritative.rendered
+        )
     if channel.stderr_lines:
         # Never truncate: consumers re-classify this text, so decisive evidence
         # in the middle must survive (the capture itself is already bounded).
         full = "\n".join(channel.stderr_lines)
         text = full
-        if NON_RETRYABLE_AGENT_OUTPUT_RE.search(full):
+        usage_limit = bool(_USAGE_LIMIT_RE.search(full))
+        if usage_limit and _STRUCTURED_AUTH_RE.search(full):
+            # Auth evidence (including a bare 401/403) beats usage-limit wording.
+            category = "non-retryable"
+        elif usage_limit and not _DIRTY_CHECKOUT_RE.search(full):
+            # Advisory only (#1281): retries key on structured verdicts.
+            category = "transient"
+        elif NON_RETRYABLE_AGENT_OUTPUT_RE.search(full):
             category = "non-retryable"
         elif TRANSIENT_AGENT_OUTPUT_RE.search(full):
             category = "transient"
