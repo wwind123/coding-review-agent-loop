@@ -592,6 +592,14 @@ def main() -> None:
         ) if agent_name == "antigravity" else None
         if capacity is not None and capacity.is_capacity and not mechanical_failure:
             transient = True
+        elif (
+            capacity is not None
+            and capacity.auth_failure
+            and not mechanical_failure
+            and not target_exec_retryable
+        ):
+            # Typed Antigravity auth verdict: no retry, no fallback (#1598).
+            transient = False
         quota = (
             classify_antigravity_quota_exhaustion(capacity)
             if capacity is not None and capacity.is_capacity and not mechanical_failure
@@ -606,10 +614,18 @@ def main() -> None:
                 file=sys.stderr,
             )
         if quota is not None:
+            previous_model = antigravity_attempts.models[antigravity_attempts.model_index]
             quota_transition = antigravity_attempts.next_after_quota_exhaustion(
                 quota, time.monotonic() - attempt_started_at
             )
             if quota_transition == "fallback":
+                if capacity.reason == "credits":
+                    next_model = antigravity_attempts.models[antigravity_attempts.model_index]
+                    print(
+                        f'run_external: Antigravity model "{previous_model}" out of credits; '
+                        f'falling back to "{next_model}"',
+                        file=sys.stderr,
+                    )
                 print(
                     "run_external: quota exhausted; skipping its quota group to the next "
                     "Antigravity model",

@@ -601,3 +601,165 @@ def test_exhausted_antigravity_is_marked_unavailable_not_fatal_in_a_pr_round(tmp
     # The round finished Codex's review and then stopped for the unavailable reviewer.
     assert any("Codex ok." in c for c in runner.comments)
     assert "unavailable" in str(excinfo.value).lower()
+
+
+# --- credits-balance exhaustion and auth precedence (#1598) -------------------
+
+CREDITS_OUTPUT = (
+    "error: Your AI credits balance is too low to continue.\n"
+    'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Resource has been exhausted '
+    '(e.g. check quota).","status":"RESOURCE_EXHAUSTED","error_code":429,'
+    '"code_kind":"http","retryable":true}'
+)
+RETRYABLE_429 = (
+    'AGY_ERROR: {"status":"RESOURCE_EXHAUSTED","error_code":429,'
+    '"message":"Resource has been exhausted","retryable":true}'
+)
+
+
+def _gemini_marked():
+    return agy.quota_memory_for_current_run().entry("gemini") is not None
+
+
+def test_credits_exhaustion_falls_back_to_next_group_without_sleep(tmp_path):
+    with workdir_claims.workdir_claim_scope():
+        response, error, models, sleeps, logs = _turn(
+            tmp_path, [_fail(CREDITS_OUTPUT), ("ok review", 0)],
+            antigravity_models=(GEM1, OPUS),
+        )
+        assert error is None and response.model_used == OPUS
+        assert models == [GEM1, OPUS]
+        assert sleeps == []
+        assert _gemini_marked()
+        assert agy.quota_memory_for_current_run().entry("gemini").source == "cooldown"
+    assert f'Antigravity model "{GEM1}" out of credits; falling back to "{OPUS}"' in logs
+    assert any("skipping quota group gemini" in line for line in logs)
+    assert not any("non-retryable" in line for line in logs)
+
+
+def test_credits_exhaustion_on_single_model_chain_is_transient_unavailable(tmp_path):
+    _r, error, models, sleeps, _logs = _turn(
+        tmp_path, [_fail(CREDITS_OUTPUT)], antigravity_models=(GEM1,)
+    )
+    assert type(error) is AgentInvocationError
+    assert error.failure_category == "transient"
+    assert str(error).startswith("Antigravity unavailable on all models")
+    assert "check credentials or billing" not in str(error)
+    assert models == [GEM1] and sleeps == []
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "error: invalid api key",
+        'AGY_ERROR: {"status":"X","error_code":401,"message":"nope"}',
+        'AGY_ERROR: {"status":"X","error_code":403,"message":"nope"}',
+        "Error: request timed out (code 429)\n"
+        'AGY_ERROR: {"status":"X","error_code":401,"message":"timeout"}',
+        "error: Your AI credits balance is too low to continue.\n"
+        'AGY_ERROR: {"status":"X","error_code":401,"retryable":true}',
+    ],
+)
+def test_auth_failure_is_one_invocation_without_fallback(tmp_path, output):
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, sleeps, logs = _turn(
+            tmp_path, [_fail(output), ("never", 0)],
+            agent_max_retries=2, antigravity_models=(GEM1, OPUS),
+        )
+        assert not _gemini_marked()
+        assert agy.quota_memory_for_current_run().entry("claude") is None
+    assert type(error) is AgentInvocationError
+    assert error.failure_category == "non-retryable"
+    assert models == [GEM1] and sleeps == []
+    assert not any("out of credits" in line for line in logs)
+
+
+def test_transcript_only_credits_wording_records_no_credits_cooldown(tmp_path):
+    output = (
+        "The issue quotes: Your AI credits balance is too low to continue.\n"
+        "Reviewing the classifier next.\n"
+        f"Error: high traffic\n{RETRYABLE_429}"
+    )
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, sleeps, logs = _turn(
+            tmp_path, [_fail(output), ("never", 0)], antigravity_models=(GEM1, OPUS),
+        )
+        assert not _gemini_marked()
+    assert error is not None and error.failure_category == "non-retryable"
+    assert models == [GEM1] and sleeps == []
+    assert not any("out of credits" in line for line in logs)
+
+
+def test_dirty_checkout_beats_credits_exemption_in_turn(tmp_path):
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, sleeps, logs = _turn(
+            tmp_path, [_fail(f"Error: dirty checkout\n{CREDITS_OUTPUT}"), ("never", 0)],
+            antigravity_models=(GEM1, OPUS),
+        )
+        assert not _gemini_marked()
+    assert error is not None and error.failure_category == "non-retryable"
+    assert models == [GEM1] and sleeps == []
+    assert not any("out of credits" in line for line in logs)
+
+
+def test_nonterminal_status_403_json_keeps_capacity_path(tmp_path):
+    output = "\n".join([
+        '{"message":"Resource not accessible","status":"403"}',
+        "Reading the diff to draft the review...",
+        "Checking tests next.",
+        "Still drafting.",
+        "Almost there.",
+        "Error: RESOURCE_EXHAUSTED",
+        RETRYABLE_429,
+    ])
+    with workdir_claims.workdir_claim_scope():
+        response, error, models, sleeps, logs = _turn(
+            tmp_path, [_fail(output), ("ok review", 0)], antigravity_models=(GEM1, OPUS),
+        )
+        assert _gemini_marked()
+    assert error is None and response.model_used == OPUS
+    assert models == [GEM1, OPUS] and sleeps == []
+    assert any("capacity failure after" in line for line in logs)
+
+
+@pytest.mark.parametrize(
+    "auth_text",
+    ["unauthorized", 'AGY_ERROR: {"status":"X","error_code":401,"message":"nope"}'],
+)
+def test_typed_target_exec_retry_outranks_antigravity_auth_verdict(tmp_path, auth_text):
+    from coding_review_agent_loop.agents.base import AgentResult
+    from coding_review_agent_loop.containment import ContainmentEvidence
+    from coding_review_agent_loop.runner import CommandResult
+
+    class TargetExecRunner(FakeRunner):
+        def target_exec_retry_decision(self, command, errno_value):
+            return True, "agy temporarily unavailable/being replaced after successful preflight"
+
+    failed = AgentResult(
+        text="",
+        raw_output=auth_text,
+        returncode=127,
+        model_used=GEM1,
+        command_result=CommandResult(["agy", "exec"], tmp_path, "", "", 127),
+        containment=ContainmentEvidence(
+            backend="systemd-cgroup-v2",
+            termination_cause="target-exec-error",
+            target_exec_errno=2,
+            cleanup_confirmed=True,
+            diagnostics=("target exec failed (2): missing",),
+        ),
+    )
+    ok = AgentResult(text="ok review", raw_output="ok review", returncode=0, model_used=GEM1)
+    from coding_review_agent_loop import response_validation
+
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=[failed, ok],
+    ) as run_mock:
+        response, error, _models, sleeps, logs = _turn(
+            tmp_path, [], runner=TargetExecRunner(), antigravity_models=(GEM1, OPUS),
+        )
+    assert error is None and response.text == "ok review"
+    assert run_mock.call_count == 2
+    assert len(sleeps) == 1
+    assert any("transient failure" in line for line in logs)
+    assert not any("non-retryable" in line for line in logs)

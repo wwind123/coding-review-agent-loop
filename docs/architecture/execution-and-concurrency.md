@@ -288,7 +288,13 @@ nested loops, and reached from reviewer threads because `review_rounds.py` and
 (library use, the skill helper process) the memory is local to one attempt
 state. Exhaustion is classified in `transient.py` only from the matched
 provider error frame, extracted from raw unstripped lines (never the whole
-transcript), with capacity wording taking precedence. `AntigravityAttemptState`
+transcript), with capacity wording taking precedence. Auth (auth words or a
+numeric 401/403 in a terminal frame) returns a typed `auth_failure` verdict that
+both callers enforce as non-retryable with no fallback, unless a typed runner
+retry decision applies; dirty checkouts stay non-retryable; billing wording is
+exempt only when agy's credits-balance error is correlated with a terminal
+retryable `429 RESOURCE_EXHAUSTED` frame, which then cools its group down like
+any other exhaustion. `AntigravityAttemptState`
 is the single policy shared by `validated_agent.py` and `helpers/run_external.py`:
 transient failures retry then fall back to a later eligible entry; a verified
 exhaustion skips the whole group with no retry or sleep and makes at most one

@@ -1833,6 +1833,17 @@ def _run_validated_agent_in_scope(
             if provider_capacity:
                 should_retry = True
                 last_failure_category = "transient"
+            elif (
+                capacity is not None
+                and capacity.auth_failure
+                and not target_exec_retryable
+                and not replacement_stability_failed
+                and not (result.command_result and result.command_result.capture_diagnostics)
+            ):
+                # A typed Antigravity auth verdict beats generic transient wording,
+                # but yields to typed runner retry decisions (#1226, #1598).
+                should_retry = False
+                last_failure_category = "non-retryable"
         elif not text.strip():
             last_error = "agent response was empty"
             classification_text, provider_verdict = _agent_failure_classification(
@@ -1862,6 +1873,13 @@ def _run_validated_agent_in_scope(
             if provider_capacity:
                 should_retry = True
                 last_failure_category = "transient"
+            elif (
+                capacity is not None
+                and capacity.auth_failure
+                and not replacement_stability_failed
+            ):
+                should_retry = False
+                last_failure_category = "non-retryable"
         else:
             response_file_pre_status = (
                 _response_file_structured_status(result.response_file_text)
@@ -2917,6 +2935,13 @@ def _run_validated_agent_in_scope(
                             quota, attempt_seconds
                         )
                         if quota_transition == "fallback":
+                            next_model = antigravity_attempts.models[antigravity_attempts.model_index]
+                            if capacity.reason == "credits":
+                                log(
+                                    config,
+                                    f'Antigravity model "{previous_model}" out of credits; '
+                                    f'falling back to "{next_model}"',
+                                )
                             log(
                                 config,
                                 f"{agent_name}: quota exhausted for {previous_model}; skipping quota "

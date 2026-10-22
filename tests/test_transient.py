@@ -511,3 +511,159 @@ def test_agent_failure_uses_authoritative_codex_error() -> None:
     text, verdict = agent_failure._agent_failure_classification(result, phase="command")
     assert verdict is not None and verdict.category == "transient"
     assert agent_failure._failure_category(text, provider_verdict=verdict) == "transient"
+
+
+# --- Antigravity credits-balance exhaustion (#1598) ---------------------------
+
+from coding_review_agent_loop.config import DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES  # noqa: E402
+
+_CREDITS_LINE = "error: Your AI credits balance is too low to continue."
+_CREDITS_AGY_ERROR = (
+    'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Resource has been exhausted '
+    '(e.g. check quota).","status":"RESOURCE_EXHAUSTED","error_code":429,'
+    '"code_kind":"http","retryable":true}'
+)
+CREDITS_ISSUE_OUTPUT = f"{_CREDITS_LINE}\n{_CREDITS_AGY_ERROR}"
+_RETRYABLE_429 = (
+    'AGY_ERROR: {"status":"RESOURCE_EXHAUSTED","error_code":429,'
+    '"message":"Resource has been exhausted","retryable":true}'
+)
+
+
+def _agy(text: str, *, returncode: int = 1) -> transient.AntigravityCapacityClassification:
+    return transient.classify_antigravity_capacity(
+        text,
+        returncode=returncode,
+        empty_response=False,
+        signatures=DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES,
+    )
+
+
+def test_antigravity_credits_issue_output_is_capacity_with_cooldown() -> None:
+    capacity = _agy(CREDITS_ISSUE_OUTPUT)
+    assert capacity.is_capacity and capacity.reason == "credits"
+    assert not capacity.auth_failure
+    assert "credits balance" in capacity.frame and "RESOURCE_EXHAUSTED" in capacity.frame
+    quota = transient.classify_antigravity_quota_exhaustion(capacity)
+    assert quota is not None
+    assert (quota.reset_seconds, quota.reset_source) == (None, "cooldown")
+
+
+def test_antigravity_credits_with_429_text_frame_but_no_json_is_capacity() -> None:
+    capacity = _agy(
+        f"{_CREDITS_LINE}\nAGY_ERROR: {{RESOURCE_EXHAUSTED (code 429) truncated"
+    )
+    assert capacity.is_capacity and capacity.reason == "credits"
+
+
+def test_antigravity_auth_beats_credits_exemption() -> None:
+    for text in (
+        f"{_CREDITS_LINE}\n"
+        'AGY_ERROR: {"status":"UNAUTHENTICATED","error_code":401,"retryable":true}',
+        f"{CREDITS_ISSUE_OUTPUT}\ninvalid api key",
+        "error: invalid api key",
+    ):
+        capacity = _agy(text)
+        assert not capacity.is_capacity and capacity.auth_failure, text
+        assert transient.classify_antigravity_quota_exhaustion(capacity) is None
+
+
+def test_antigravity_terminal_numeric_auth_frames_without_auth_words() -> None:
+    for text in (
+        'AGY_ERROR: {"status":"X","error_code":401,"message":"nope"}',
+        'AGY_ERROR: {"status":"X","error_code":403,"message":"nope"}',
+        'AGY_ERROR: {"error":{"code":"403","message":"nope"}}',
+        "Error: request failed (code 401), timed out after 429 retries",
+        "Error: HTTP 403 while contacting provider",
+    ):
+        capacity = _agy(text)
+        assert capacity.auth_failure and not capacity.is_capacity, text
+
+
+def test_antigravity_nonterminal_status_403_json_does_not_veto_capacity() -> None:
+    text = "\n".join(
+        [
+            '{"message":"Resource not accessible","status":"403"}',
+            "Reading the diff to draft the review...",
+            "Checking tests next.",
+            "Still drafting.",
+            "Almost there.",
+            "Error: RESOURCE_EXHAUSTED",
+            _RETRYABLE_429,
+        ]
+    )
+    capacity = _agy(text)
+    assert capacity.is_capacity
+    assert not capacity.auth_failure
+    assert capacity.reason == "capacity"
+
+
+def test_antigravity_dirty_checkout_beats_credits_exemption() -> None:
+    capacity = _agy(f"Error: dirty checkout\n{CREDITS_ISSUE_OUTPUT}")
+    assert not capacity.is_capacity
+    assert not capacity.auth_failure
+    assert transient.classify_antigravity_quota_exhaustion(capacity) is None
+
+
+def test_antigravity_credits_without_retryable_frame_is_not_capacity() -> None:
+    for text in (
+        _CREDITS_LINE,
+        "error: billing problem on your account\n"
+        'AGY_ERROR: {"status":"FAILED_PRECONDITION","error_code":400,"retryable":false}',
+        "error: billing problem on your account",
+    ):
+        capacity = _agy(text)
+        assert not capacity.is_capacity and not capacity.auth_failure, text
+
+
+def test_antigravity_transcript_only_credits_wording_gets_no_exemption() -> None:
+    text = "\n".join(
+        [
+            "The issue quotes: Your AI credits balance is too low to continue.",
+            "Reviewing the classifier next.",
+            "Error: high traffic",
+            _RETRYABLE_429,
+        ]
+    )
+    capacity = _agy(text)
+    assert capacity.reason != "credits"
+    assert not capacity.is_capacity
+    assert transient.classify_antigravity_quota_exhaustion(capacity) is None
+
+
+def test_antigravity_credits_correlated_with_capacity_only_wording_is_rejected() -> None:
+    capacity = _agy(f"error: credits balance too low; high traffic\n{_RETRYABLE_429}")
+    assert not capacity.is_capacity
+
+
+def test_antigravity_non_retryable_partition_matches_public_regex() -> None:
+    samples = (
+        "auth failed", "authentication required", "authorization denied", "unauthorized",
+        "forbidden", "invalid api key", "AI credits balance", "credit", "billing issue",
+        "dirty checkout", "dirty workdir", "dirty working tree",
+        "the plan looks good", "429 rate limit", "author wrote", "authored by",
+    )
+    partition = (
+        transient._ANTIGRAVITY_AUTH_RE,
+        transient._ANTIGRAVITY_DIRTY_CHECKOUT_RE,
+        transient._ANTIGRAVITY_BILLING_RE,
+    )
+    for sample in samples:
+        assert bool(transient.NON_RETRYABLE_AGENT_OUTPUT_RE.search(sample)) == any(
+            pattern.search(sample) for pattern in partition
+        ), sample
+
+
+def test_non_antigravity_credit_and_billing_classification_unchanged() -> None:
+    assert not transient.is_transient_agent_output(CREDITS_ISSUE_OUTPUT)
+    assert not transient.is_transient_agent_output("billing problem: 429 rate limit")
+    assert not transient.is_transient_agent_output("your credit card was declined; timed out")
+    # No Codex event stream: no structured verdict, so the text classifier decides.
+    assert transient.classify_codex_failure(CREDITS_ISSUE_OUTPUT) is None
+    from coding_review_agent_loop.agent_failure import _failure_category
+
+    assert _failure_category(CREDITS_ISSUE_OUTPUT) == "non-retryable"
+    billing = transient.classify_codex_failure(
+        _ev(type="turn.failed", error={"message": "billing hard limit reached"})
+    )
+    assert (billing.category, billing.billing) == ("non-retryable", True)
