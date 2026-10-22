@@ -311,14 +311,17 @@ finalizer, shared by nested loops and context-propagated reviewer threads, and
 local to the turn with no owner. `validated_agent.py` reserves from the budget
 at the long-reset raise sites and sleeps between invocations, outside
 `run_agent_result`, so no subprocess or settings lock is held. It then
-replays the frozen failed invocation (prompt, session, timeout and settings)
-in a dedicated attempt slot. For Antigravity it waits only when
+replays the frozen failed invocation (prompt, session, timeout and settings).
+Each wait extends the turn's attempt ceiling by the quota-failed dispatches it
+reopens, so the replay and any renewed Antigravity fallback never consume the
+ordinary allowance. For Antigravity it waits only when
 `stop_is_verified_long_reset()` holds and the latest group reset is within
 DURATION. A pre-dispatch all-exhausted wait builds the next invocation
 normally, and a post-failure wait replays the failed one. Waits sleep in
 slices of at most 30 s on a process-level cancel event in a waiter registry.
 The CLI installs a SIGTERM handler for the command only when the option is
-set. The handler, and SIGINT's own `KeyboardInterrupt`, reach the main
+set. The handler is lock-free (it reads the registry and sets a flag), because
+it may run while the main thread is inside the registry. The handler, and SIGINT's own `KeyboardInterrupt`, reach the main
 thread. There, a waiting main thread converts the interrupt to
 `QuotaResetExceededError`, and the reviewer (`review_rounds.py`) and debater
 (`discuss_loop.py`) executors cancel waiting workers before terminating

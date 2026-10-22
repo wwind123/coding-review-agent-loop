@@ -1257,9 +1257,6 @@ def _run_validated_agent_in_scope(
         # One dedicated planner replay for a fresh matrix integrity refusal;
         # never consumes agent_max_retries or Antigravity fallback state.
         max_attempts += 1
-    if config.wait_for_quota_reset_seconds is not None:
-        # Dedicated quota-wait replays never consume agent_max_retries (#1601).
-        max_attempts += quota_wait.QUOTA_WAIT_MAX_WAITS
     # Run-scoped wait budget, fetched lazily so an unset option never creates one.
     quota_wait_budget: quota_wait.QuotaWaitBudget | None = None
     # Only ever created from an invocation dispatched in this turn that then
@@ -1267,6 +1264,10 @@ def _run_validated_agent_in_scope(
     pending_quota_replay: _QuotaReplay | None = None
     last_dispatch: _QuotaReplay | None = None
     quota_replays_used = 0
+    # Quota-exhausted dispatches since the last wait.  Each wait renews them
+    # by extending the attempt ceiling, so a replay and any renewed Antigravity
+    # fallback never consume the ordinary allowance (#1601).
+    quota_dispatches_since_wait = 0
     last_error =f"{agent_name} produced no output."
     last_result: AgentResult | None = None
     last_classification_text = ""
@@ -1384,6 +1385,13 @@ def _run_validated_agent_in_scope(
             quota_wait_budget = quota_wait.quota_wait_budget_for_current_run(config)
         return quota_wait_budget.try_reserve(reset_secs)
 
+    def _wait_for_quota_reset(reservation: quota_wait.QuotaWaitReservation) -> None:
+        """Wait, then renew the attempts the wait reopens (bounded by the 2-wait budget)."""
+        nonlocal max_attempts, quota_dispatches_since_wait
+        quota_wait.wait_for_reset(config, agent_name, reservation)
+        max_attempts += quota_dispatches_since_wait
+        quota_dispatches_since_wait = 0
+
     def _antigravity_quota_wait() -> quota_wait.QuotaWaitReservation | None:
         """Reserve a wait only for a verified all-groups parsed long reset within DURATION."""
         state = antigravity_attempts
@@ -1409,7 +1417,10 @@ def _run_validated_agent_in_scope(
             state.unavailable_message(shared_limit), failure_category="transient"
         )
 
-    for attempt in range(1, max_attempts + 1):
+    attempt = 0
+    # A while loop: a quota wait may extend max_attempts mid-turn.
+    while attempt < max_attempts:
+        attempt += 1
         replacement_stability_failed = False
         if (
             antigravity_attempts is not None
@@ -1422,7 +1433,7 @@ def _run_validated_agent_in_scope(
             # Pre-dispatch: nothing failed in this attempt, so wait, re-check
             # and build the intended invocation normally -- never a replay,
             # and pending corrective context is left untouched (#1601).
-            quota_wait.wait_for_reset(config, agent_name, reservation)
+            _wait_for_quota_reset(reservation)
             if antigravity_attempts.ensure_eligible_before_attempt() == "all-exhausted":
                 raise _antigravity_stop_error(last_classification_text, shared_limit=False)
         attempt_started_at = time.monotonic()
@@ -3003,6 +3014,7 @@ def _run_validated_agent_in_scope(
                         capacity, threshold=LONG_RESET_THRESHOLD_SECONDS
                     )
                     if quota is not None:
+                        quota_dispatches_since_wait += 1
                         previous_model = antigravity_attempts.models[antigravity_attempts.model_index]
                         previous_group = antigravity_attempts.groups[antigravity_attempts.model_index]
                         quota_transition = antigravity_attempts.next_after_quota_exhaustion(
@@ -3031,7 +3043,7 @@ def _run_validated_agent_in_scope(
                             )
                         # Post-failure: replay the invocation that failed quota on
                         # the group that becomes eligible first (#1601).
-                        quota_wait.wait_for_reset(config, agent_name, reservation)
+                        _wait_for_quota_reset(reservation)
                         pending_quota_replay = last_dispatch
                         antigravity_attempts.exhaustion_jumps = 0
                         continue
@@ -3047,7 +3059,8 @@ def _run_validated_agent_in_scope(
                         raise _quota_reset_error(reset_secs, classification_text)
                     # Wait outside run_agent_result (no subprocess or settings
                     # lock held), then replay the same invocation (#1601).
-                    quota_wait.wait_for_reset(config, agent_name, reservation)
+                    quota_dispatches_since_wait += 1
+                    _wait_for_quota_reset(reservation)
                     pending_quota_replay = last_dispatch
                     continue
             transition = (

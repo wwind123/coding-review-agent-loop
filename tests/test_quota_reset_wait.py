@@ -427,3 +427,131 @@ def test_option_off_installs_no_sigterm_handler(monkeypatch):
     assert cli.main(PR_ARGS) == 0
     assert seen[-1] != previous
     assert signal.getsignal(signal.SIGTERM) == previous
+
+
+# --- signals at wait-lifecycle boundaries (subprocess: a deadlock times out) ----
+
+_BOUNDARY_SCRIPT = r"""
+import os, signal, sys, time
+from coding_review_agent_loop import quota_wait
+from coding_review_agent_loop.errors import QuotaResetExceededError
+
+boundary, signum = sys.argv[1], int(sys.argv[2])
+signal.signal(signal.SIGINT, signal.default_int_handler)
+quota_wait.install_sigterm_handler()
+fired = []
+
+def fire():
+    if not fired:
+        fired.append(True)
+        os.kill(os.getpid(), signum)
+        time.sleep(0)  # the handler runs at the next bytecode boundary
+
+class HookSet(set):
+    def add(self, item):
+        super().add(item)
+        if boundary == "registered":
+            fire()
+
+    def discard(self, item):
+        if boundary == "unregister" and item in self:
+            fire()  # still registered when the signal lands
+        super().discard(item)
+
+quota_wait._active_waits = HookSet()
+logs = []
+
+def log(_config, message):
+    logs.append(message)
+    if (boundary, len(logs)) in {("wait-log", 1), ("resume-log", 2)}:
+        fire()
+
+quota_wait.log = log
+quota_wait._sleeper = lambda seconds: None
+if boundary == "lock-held":
+    # The handler must not need the registry/latch lock held by the thread it interrupts.
+    quota_wait._active_waits.add(0)
+    try:
+        with quota_wait._waiters_lock:
+            fire()
+            time.sleep(20)
+    except KeyboardInterrupt:
+        sys.exit(130 if quota_wait.wait_was_interrupted() else 1)
+    sys.exit(2)
+try:
+    quota_wait.wait_for_reset(None, "Claude", quota_wait.QuotaWaitReservation(60, 1, 2))
+except QuotaResetExceededError as exc:
+    clean = "Claude quota reset wait interrupted" in str(exc) and not quota_wait._active_waits
+    sys.exit(3 if clean and quota_wait.wait_was_interrupted() else 4)
+sys.exit(0)
+"""
+
+
+def _run_boundary(boundary, signum):
+    src = Path(quota_wait.__file__).resolve().parents[1]
+    return subprocess.run(
+        [sys.executable, "-c", _BOUNDARY_SCRIPT, boundary, str(int(signum))],
+        env={**os.environ, "PYTHONPATH": str(src)}, timeout=60, capture_output=True, text=True,
+    )
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
+@pytest.mark.parametrize("boundary", ["registered", "wait-log", "resume-log", "unregister"])
+def test_signal_anywhere_in_the_registered_wait_is_a_clean_quota_stop(boundary, signum):
+    completed = _run_boundary(boundary, signum)
+    assert completed.returncode == 3, completed.stderr
+
+
+def test_sigterm_handler_never_blocks_on_a_lock_the_main_thread_holds():
+    completed = _run_boundary("lock-held", signal.SIGTERM)
+    assert completed.returncode == 130, completed.stderr
+
+
+# --- attempt ceiling renewed by each wait ----------------------------------------
+
+@pytest.mark.parametrize("backend", ["gemini", "antigravity"])
+def test_waits_renew_attempts_with_replacement_replay_and_renewed_fallbacks(tmp_path, monkeypatch, backend):
+    from coding_review_agent_loop.agents import antigravity as agy
+    from test_validated_agent_recovery import _observed_replacement_result
+
+    now = [1000.0]
+    slept = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(agy, "_now", lambda: now[0])
+    monkeypatch.setattr(quota_wait, "_sleeper", sleep)
+    quota = "Error: quota exceeded, try again in 10m"
+
+    def limit(model):
+        return AgentResult(text=quota, raw_output=quota, returncode=1, model_used=model)
+
+    replacement = _observed_replacement_result(
+        tmp_path, command="agy" if backend == "antigravity" else "gemini",
+        reason="executable changed during invocation", model_used="ModelA",
+    )
+    if backend == "antigravity":
+        # Replacement replay; A, B quota -> wait 1; A, B quota -> wait 2;
+        # A quota renews the fallback to B, which succeeds (7 dispatches).
+        results = [replacement, *(limit(m) for m in "ABABA"), AgentResult(text="done", returncode=0, model_used="B")]
+        extra = {"antigravity_models": ("ModelA", "ModelB")}
+    else:
+        # Replacement replay; quota -> wait 1; quota -> wait 2; success.
+        results = [replacement, limit("g"), limit("g"), AgentResult(text="done", returncode=0)]
+        extra = {}
+    runner = FakeRunner()
+    runner.wait_for_executable_stability = lambda command, *, deadline=None: True
+    config = make_config(tmp_path, agent_max_retries=0, wait_for_quota_reset_seconds=SIX_HOURS, **extra)
+    with workdir_claims.workdir_claim_scope(), patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = validated_agent._run_validated_agent(
+            runner, agent=backend, config=config, prompt="P", marker_description="none",
+            validate=lambda text: text,
+        )
+    assert response.text == "done"
+    assert invoke.call_count == len(results)
+    assert sum(slept) == 2 * (600 + quota_wait.QUOTA_WAIT_MARGIN_SECONDS)
+    assert _runner_sleeps(runner) == []  # no ordinary retry was spent

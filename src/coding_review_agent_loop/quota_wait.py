@@ -11,6 +11,7 @@ or debater worker threads when SIGINT/SIGTERM arrives.
 from __future__ import annotations
 
 import datetime
+import itertools
 import os
 import signal
 import threading
@@ -87,12 +88,20 @@ def quota_wait_budget_for_current_run(config) -> QuotaWaitBudget:
 
 
 # --- waiter registry -------------------------------------------------------
+#
+# The SIGTERM handler runs on the main thread between bytecodes, possibly while
+# that same thread is inside this module.  Everything the handler touches is
+# therefore lock-free: membership of ``_active_waits`` (single atomic set
+# operations under the GIL) and the ``_signal_cancel_requested`` flag.  Locks
+# and ``Event.set`` (which takes the event's internal lock) are only used from
+# ordinary code, never from the handler (#1601).
 
-_waiters_lock = threading.Lock()
+_waiters_lock = threading.Lock()  # guards only the interruption message
 _active_waits: set[int] = set()
-_next_wait_token = 0
+_wait_tokens = itertools.count(1)
 _cancel_event = threading.Event()
 _interrupted_message: str | None = None
+_signal_cancel_requested = False
 
 
 def _event_sleep(seconds: float) -> None:
@@ -105,34 +114,45 @@ _sleeper: Callable[[float], None] = _event_sleep
 
 
 def active_wait_count() -> int:
-    with _waiters_lock:
-        return len(_active_waits)
+    return len(_active_waits)
+
+
+def _cancelled() -> bool:
+    return _signal_cancel_requested or _cancel_event.is_set()
 
 
 def cancel_active_waits() -> None:
-    """Wake every active (and any about-to-start) wait; it raises a quota stop."""
+    """Wake every active (and any about-to-start) wait; it raises a quota stop.
+
+    Called from ordinary code (an executor's ``except KeyboardInterrupt``),
+    never from a signal handler.
+    """
     global _interrupted_message
-    with _waiters_lock:
-        if _active_waits and _interrupted_message is None:
-            _interrupted_message = _interrupted_text("agent")
+    if _active_waits or _signal_cancel_requested:
+        with _waiters_lock:
+            if _interrupted_message is None:
+                _interrupted_message = _interrupted_text("agent")
     _cancel_event.set()
 
 
 def wait_was_interrupted() -> bool:
-    with _waiters_lock:
-        return _interrupted_message is not None
+    return interrupted_message() is not None
 
 
 def interrupted_message() -> str | None:
     with _waiters_lock:
-        return _interrupted_message
+        if _interrupted_message is not None:
+            return _interrupted_message
+    # A SIGTERM that cancelled a wait but escaped before any latch ran.
+    return _interrupted_text("agent") if _signal_cancel_requested else None
 
 
 def reset_wait_state() -> None:
     """Clear cancellation state; the CLI calls it around each command."""
-    global _interrupted_message
+    global _interrupted_message, _signal_cancel_requested
     with _waiters_lock:
         _interrupted_message = None
+    _signal_cancel_requested = False
     _cancel_event.clear()
 
 
@@ -154,37 +174,37 @@ def _latch_interrupted(agent_name: str) -> str:
 
 
 def wait_for_reset(config, agent_name: str, reservation: QuotaWaitReservation) -> None:
-    """Sleep for the reserved wait, or raise QuotaResetExceededError when interrupted."""
-    global _next_wait_token
+    """Sleep for the reserved wait, or raise QuotaResetExceededError when interrupted.
+
+    An interrupt anywhere in the registered lifecycle -- registration, the
+    waiting log, the sleep, the resume log or unregistration -- becomes the
+    same resumable quota stop.
+    """
     sleep_seconds = reservation.sleep_seconds
     until = datetime.datetime.now().astimezone() + datetime.timedelta(seconds=sleep_seconds)
-    with _waiters_lock:
-        _next_wait_token += 1
-        token = _next_wait_token
-        _active_waits.add(token)
+    token = next(_wait_tokens)
     try:
-        log(
-            config,
-            f"{agent_name} quota exhausted; waiting until {until.strftime('%Y-%m-%d %H:%M %Z')} "
-            f"({_format_reset_duration(sleep_seconds)}) for reset "
-            f"(wait {reservation.wait_number} of {reservation.max_waits})",
-        )
-        remaining = float(sleep_seconds)
         try:
-            while remaining > 0:
-                if _cancel_event.is_set():
-                    break
+            _active_waits.add(token)
+            log(
+                config,
+                f"{agent_name} quota exhausted; waiting until {until.strftime('%Y-%m-%d %H:%M %Z')} "
+                f"({_format_reset_duration(sleep_seconds)}) for reset "
+                f"(wait {reservation.wait_number} of {reservation.max_waits})",
+            )
+            remaining = float(sleep_seconds)
+            while remaining > 0 and not _cancelled():
                 chunk = min(float(QUOTA_WAIT_SLICE_SECONDS), remaining)
                 _sleeper(chunk)
                 remaining -= chunk
-        except KeyboardInterrupt:
-            raise QuotaResetExceededError(_latch_interrupted(agent_name)) from None
-        if _cancel_event.is_set():
-            raise QuotaResetExceededError(_latch_interrupted(agent_name))
-        log(config, f"{agent_name} quota reset wait finished; retrying the same turn")
-    finally:
-        with _waiters_lock:
+            if _cancelled():
+                raise QuotaResetExceededError(_latch_interrupted(agent_name))
+            log(config, f"{agent_name} quota reset wait finished; retrying the same turn")
+        finally:
             _active_waits.discard(token)
+    except KeyboardInterrupt:
+        _active_waits.discard(token)
+        raise QuotaResetExceededError(_latch_interrupted(agent_name)) from None
 
 
 # --- CLI SIGTERM integration ----------------------------------------------
@@ -202,8 +222,10 @@ def install_sigterm_handler():
         previous = signal.SIG_DFL
 
     def _handler(signum, frame):
-        if active_wait_count():
-            cancel_active_waits()
+        # Lock-free: this may run while the main thread is inside this module.
+        global _signal_cancel_requested
+        if _active_waits:
+            _signal_cancel_requested = True
             raise KeyboardInterrupt
         if callable(previous):
             previous(signum, frame)
