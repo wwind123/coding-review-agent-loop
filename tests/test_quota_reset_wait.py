@@ -648,3 +648,148 @@ def test_waits_renew_attempts_with_replacement_replay_and_renewed_fallbacks(tmp_
     assert invoke.call_count == len(results)
     assert sum(slept) == 2 * (600 + quota_wait.QUOTA_WAIT_MARGIN_SECONDS)
     assert _runner_sleeps(runner) == []  # no ordinary retry was spent
+
+
+# --- cancel latch lifetime (#1609) --------------------------------------------
+
+RESERVATION = quota_wait.QuotaWaitReservation(90, 1, 2)
+
+
+def _wait(tmp_path):
+    quota_wait.wait_for_reset(make_config(tmp_path), "Claude", RESERVATION)
+
+
+def test_stale_latch_is_cleared_for_a_new_programmatic_run(tmp_path, slept, logs):
+    quota_wait.cancel_active_waits()  # e.g. an ordinary Ctrl-C with no wait active
+    assert quota_wait._cancel_event.is_set()
+    assert workdir_claims.live_run_count() == 0
+    with workdir_claims.workdir_claim_scope():
+        _wait(tmp_path)
+    assert sum(slept) == RESERVATION.sleep_seconds
+    assert not quota_wait.wait_was_interrupted()
+
+
+def test_about_to_start_wait_in_an_interrupted_run_is_still_cancelled(tmp_path, slept, logs):
+    with workdir_claims.workdir_claim_scope():
+        quota_wait.cancel_active_waits()
+        with pytest.raises(QuotaResetExceededError, match="interrupted"):
+            _wait(tmp_path)
+    assert slept == []
+
+
+def test_nested_scope_joins_without_clearing_the_latch(tmp_path, slept, logs):
+    with workdir_claims.workdir_claim_scope():
+        quota_wait.cancel_active_waits()
+        with workdir_claims.workdir_claim_scope():
+            assert workdir_claims.live_run_count() == 1
+            with pytest.raises(QuotaResetExceededError):
+                _wait(tmp_path)
+    assert slept == []
+
+
+def test_new_run_does_not_clear_while_a_wait_is_active():
+    quota_wait._active_waits.add(-1)
+    try:
+        quota_wait.cancel_active_waits()
+        with workdir_claims.workdir_claim_scope():
+            assert quota_wait._cancel_event.is_set()
+            assert quota_wait.wait_was_interrupted()
+    finally:
+        quota_wait._active_waits.discard(-1)
+
+
+def _in_thread(target):
+    errors: list[BaseException] = []
+
+    def run():
+        try:
+            target()
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the test
+            errors.append(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, errors
+
+
+def test_independent_run_cannot_clear_a_live_interrupted_runs_latch(tmp_path, slept, logs):
+    cancelled = threading.Event()
+    proceed = threading.Event()
+    outcome: list[str] = []
+
+    def run_a():
+        with workdir_claims.workdir_claim_scope("issue", 1):
+            quota_wait.cancel_active_waits()  # executor cancel before the worker registers
+            cancelled.set()
+            assert proceed.wait(10)
+            try:
+                _wait(tmp_path)
+            except QuotaResetExceededError:
+                outcome.append("stopped")
+
+    def run_b():
+        with workdir_claims.workdir_claim_scope("pr", 2):
+            assert workdir_claims.live_run_count() == 2
+
+    thread_a, errors_a = _in_thread(run_a)
+    assert cancelled.wait(10)
+    thread_b, errors_b = _in_thread(run_b)
+    thread_b.join(10)
+    assert not thread_b.is_alive() and errors_b == []
+    proceed.set()
+    thread_a.join(10)
+    assert not thread_a.is_alive() and errors_a == []
+    assert outcome == ["stopped"]
+    assert slept == []
+    # After every run ended, the next run starts with a clear latch.
+    with workdir_claims.workdir_claim_scope():
+        assert not quota_wait._cancel_event.is_set()
+        _wait(tmp_path)
+    assert sum(slept) == RESERVATION.sleep_seconds
+
+
+def test_concurrent_run_is_admitted_only_after_the_first_runs_reset(tmp_path, slept, logs):
+    in_hook = threading.Event()
+    release_hook = threading.Event()
+    b_entered = threading.Event()
+    outcome: list[str] = []
+
+    def pausing_hook():
+        if threading.current_thread().name == "run-a":
+            in_hook.set()
+            assert release_hook.wait(10)
+
+    # Run the pausing hook before the quota reset, so A's reset is still pending.
+    hooks = dict(workdir_claims._first_run_start_hooks)
+    workdir_claims._first_run_start_hooks.clear()
+    workdir_claims._first_run_start_hooks["test-pause"] = pausing_hook
+    workdir_claims._first_run_start_hooks.update(hooks)
+
+    a_done = threading.Event()
+
+    def run_a():
+        with workdir_claims.workdir_claim_scope("issue", 1):
+            assert a_done.wait(10)
+
+    def run_b():
+        with workdir_claims.workdir_claim_scope("pr", 2):
+            b_entered.set()
+            quota_wait.cancel_active_waits()
+            try:
+                _wait(tmp_path)
+            except QuotaResetExceededError:
+                outcome.append("stopped")
+
+    thread_a = threading.Thread(target=run_a, name="run-a", daemon=True)
+    thread_a.start()
+    assert in_hook.wait(10)
+    thread_b, errors_b = _in_thread(run_b)
+    assert not b_entered.wait(0.3)  # B blocks at scope entry
+    release_hook.set()
+    thread_b.join(10)
+    assert not thread_b.is_alive() and errors_b == []
+    assert outcome == ["stopped"]
+    assert slept == []
+    a_done.set()
+    thread_a.join(10)
+    assert not thread_a.is_alive()
