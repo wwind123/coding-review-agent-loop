@@ -966,3 +966,41 @@ def test_bare_try_again_at_gap_through_shared_parser(monkeypatch) -> None:
     assert reset_parsing._parse_rate_limit_reset_seconds(
         "You've hit your usage limit. Try again at 2:30 AM.", now_utc=now
     ) is None
+
+
+_AGY_LOG_LINE = (
+    "E1022 02:03:52.215232 12345 executor.go:88] agent executor error: generating and "
+    "executing: RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota)."
+)
+
+
+def test_agy_log_quota_capacity_is_cooldown_without_a_reset() -> None:
+    capacity = transient.antigravity_log_quota_capacity(Path("/x/cli-20261022_020350.log"), _AGY_LOG_LINE)
+    assert capacity.is_capacity and capacity.reason == "agy-log"
+    assert capacity.frame == _AGY_LOG_LINE
+    assert "cli-20261022_020350.log" in capacity.diagnostic
+    quota = transient.classify_antigravity_quota_exhaustion(capacity)
+    assert quota is not None
+    assert quota.reset_source == "cooldown" and quota.reset_seconds is None
+    assert quota.frame == _AGY_LOG_LINE
+
+
+def test_agy_log_quota_capacity_honours_parsed_resets() -> None:
+    long_reset = transient.antigravity_log_quota_capacity(
+        Path("/x/cli.log"), _AGY_LOG_LINE + " retryDelay: 14400s"
+    )
+    quota = transient.classify_antigravity_quota_exhaustion(long_reset)
+    assert quota is not None and quota.reset_source == "parsed" and quota.reset_seconds == 14400
+    short_reset = transient.antigravity_log_quota_capacity(
+        Path("/x/cli.log"), _AGY_LOG_LINE + " retryDelay: 30s"
+    )
+    assert transient.classify_antigravity_quota_exhaustion(short_reset) is None
+
+
+def test_agy_log_reason_leaves_existing_reasons_unchanged() -> None:
+    capacity_only = transient.AntigravityCapacityClassification(
+        True, "", "Error: high traffic, try again later (RESOURCE_EXHAUSTED)"
+    )
+    assert transient.classify_antigravity_quota_exhaustion(capacity_only) is None
+    credits = transient.AntigravityCapacityClassification(True, "", "credits too low", reason="credits")
+    assert transient.classify_antigravity_quota_exhaustion(credits).reset_source == "cooldown"

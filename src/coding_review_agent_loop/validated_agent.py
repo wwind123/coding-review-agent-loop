@@ -11,6 +11,7 @@ import hashlib
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace as dataclasses_replace
+from pathlib import Path
 
 from .agents.base import AgentName, AgentResult, response_turn_scope
 from .agents.antigravity import AntigravityAttemptState
@@ -67,6 +68,7 @@ from .repair_preservation import (
 from .runner import Runner
 from .salvage import SalvageContext
 from .transient import (
+    antigravity_log_quota_capacity,
     classify_antigravity_capacity,
     classify_antigravity_quota_exhaustion,
     looks_like_backgrounded_completion,
@@ -1270,6 +1272,12 @@ def _run_validated_agent_in_scope(
     quota_dispatches_since_wait = 0
     last_error =f"{agent_name} produced no output."
     last_result: AgentResult | None = None
+    # Every agy CLI log located for a silent Antigravity attempt in this turn
+    # (#1604); each terminal error names them so operators can find them.
+    agy_log_paths: list[Path] = []
+
+    def _agy_log_suffix() -> str:
+        return "".join(f" agy log: {path}." for path in agy_log_paths)
     last_classification_text = ""
     last_failure_category = "empty-response"
     # Set only by an exhausted completion-recovery attempt (#588): the
@@ -1374,6 +1382,7 @@ def _run_validated_agent_in_scope(
             marker_description=marker_description,
             result=last_result,
         )
+        message += _agy_log_suffix()
         message += diagnostics.format_for_error()
         return QuotaResetExceededError(message)
 
@@ -1414,7 +1423,8 @@ def _run_validated_agent_in_scope(
         # Transient, like the ordinary chain-exhausted failure it replaces: multi-reviewer
         # rounds then mark Antigravity unavailable instead of aborting the round.
         return AgentInvocationError(
-            state.unavailable_message(shared_limit), failure_category="transient"
+            state.unavailable_message(shared_limit) + _agy_log_suffix(),
+            failure_category="transient",
         )
 
     attempt = 0
@@ -1565,6 +1575,11 @@ def _run_validated_agent_in_scope(
         bounded_replan_rejection = None
         if result.log_path is not None:
             log_paths.append(result.log_path)
+        if (
+            result.antigravity_log_path is not None
+            and result.antigravity_log_path not in agy_log_paths
+        ):
+            agy_log_paths.append(result.antigravity_log_path)
         text = _neutralize_untrusted_markers(result.text, config=config, agent_name=agent_name)
         usage = _resolve_usage_metadata(config=config, prompt=attempt_prompt, result=result)
         usage_record = None
@@ -1586,6 +1601,8 @@ def _run_validated_agent_in_scope(
                 observation_provenance=result.observation_provenance,
                 containment=(result.containment.to_dict() if result.containment is not None else None),
             )
+            if result.antigravity_log_path is not None:
+                usage_record.agy_log_path = str(result.antigravity_log_path)
 
         # A backend always loads the uniquely assigned public response file.
         # On a timeout/nonzero exit, that artifact can still be a complete
@@ -1861,6 +1878,34 @@ def _run_validated_agent_in_scope(
             last_classification_text = ""
             last_failure_category = "timeout"
             break
+        elif (
+            backend_agent == "antigravity"
+            and antigravity_attempts is not None
+            and result.antigravity_log_quota_evidence is not None
+            and artifact_unavailable is None
+            and not target_exec_retryable
+            and not replacement_stability_failed
+            and not (result.command_result and result.command_result.capture_diagnostics)
+        ):
+            # agy printed nothing, but its own CLI log for this attempt shows
+            # the executor's RESOURCE_EXHAUSTED 429 (#1604). Route it into the
+            # quota path below: no format validation and no repair pass.
+            evidence = result.antigravity_log_quota_evidence
+            capacity = antigravity_log_quota_capacity(evidence.log_path, evidence.line)
+            provider_capacity = True
+            should_retry = True
+            last_failure_category = "transient"
+            last_error = (
+                f"Antigravity printed no output; agy log {evidence.log_path.name} shows "
+                "RESOURCE_EXHAUSTED (code 429)"
+            )
+            classification_text = evidence.line
+            last_classification_text = evidence.line
+            log(
+                config,
+                f"Antigravity printed no output; agy log {evidence.log_path.name} shows "
+                "RESOURCE_EXHAUSTED (code 429); treating as quota exhaustion",
+            )
         elif result.returncode != 0 and artifact_unavailable is None:
             last_error = f"agent command exited with {result.returncode}"
             classification_text, provider_verdict = _agent_failure_classification(
@@ -3200,6 +3245,7 @@ def _run_validated_agent_in_scope(
                 "unprotected fresh-authorization path is unavailable here; do not rerun "
                 "implementation to recreate the PR."
             )
+    message += _agy_log_suffix()
     message += diagnostics.format_for_error()
     if (
         last_failure_category not in {"deterministic", "fresh-contract-integrity"}

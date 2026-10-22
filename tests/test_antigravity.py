@@ -2138,3 +2138,246 @@ def test_semantic_dedupe_waiter_keeps_role_independent_unknown_holder_allowance(
     assert caught.value.holder_turn_bound_seconds is None
     assert "allowing 780s" in capsys.readouterr().err
     assert _agy_commands(runner) == []
+
+
+# --- silent quota failure: agy CLI log lookup (#1604) -------------------------
+
+import os as _os
+import time as _time
+
+import importlib as _importlib
+
+from coding_review_agent_loop.runner import CommandResult as _CommandResult
+
+
+class _ActiveAgy:
+    """The live adapter module: another test re-imports it after collection."""
+
+    def __getattr__(self, name):
+        return getattr(_importlib.import_module("coding_review_agent_loop.agents.antigravity"), name)
+
+
+_agy = _ActiveAgy()
+
+
+def _active_agy_module():
+    return _importlib.import_module("coding_review_agent_loop.agents.antigravity")
+
+_AGY_429_LOG = AGY_LOG_STARTUP_LINES + AGY_LOG_429_LINE + "\n"
+
+
+def _cmd_result(stdout, returncode=0):
+    return _CommandResult(["agy"], Path("."), stdout, "", returncode)
+
+
+@pytest.mark.parametrize(
+    "stdout,returncode,response_file,expected",
+    [
+        ("", 0, None, True),
+        (AGY_SILENT_WARNING + "\n", 0, None, True),
+        ("\x1b[33mWarning: Run ended with no output and no recorded error\x1b[0m\r\n", 1, None, True),
+        (AGY_SILENT_WARNING + "\nerror: Your AI credits balance is too low\n", 0, None, False),
+        ("some review text\n", 0, None, False),
+        ("", None, None, False),
+        ("", 0, "response file text", False),
+    ],
+    ids=["empty", "warning", "ansi-warning", "warning-plus-text", "other-text", "timeout", "response-file"],
+)
+def test_silent_antigravity_attempt_detector(stdout, returncode, response_file, expected):
+    assert _agy.is_silent_antigravity_attempt(_cmd_result(stdout, returncode), response_file) is expected
+
+
+def test_agy_log_inventory_missing_and_unreadable(tmp_path):
+    assert _agy.snapshot_antigravity_logs(tmp_path / "missing") == frozenset()
+    blocker = tmp_path / "file"
+    blocker.write_text("x", encoding="utf-8")
+    assert _agy.snapshot_antigravity_logs(blocker / "log") is None
+    (tmp_path / "log").mkdir()
+    (tmp_path / "log" / "cli-20261022_020350.log").write_text("", encoding="utf-8")
+    (tmp_path / "log" / "other.txt").write_text("", encoding="utf-8")
+    assert _agy.snapshot_antigravity_logs(tmp_path / "log") == frozenset({"cli-20261022_020350.log"})
+
+
+def _write_log(log_dir, wall_time, mtime, text=_AGY_429_LOG):
+    path = log_dir / agy_log_name(wall_time)
+    path.write_text(text, encoding="utf-8")
+    _os.utime(path, (mtime, mtime))
+    return path
+
+
+def test_agy_log_locator_matches_single_new_in_window_log(tmp_path):
+    spawn = _time.time()
+    path = _write_log(tmp_path, spawn, spawn + 0.5)
+    lookup = _agy.find_antigravity_attempt_log(tmp_path, frozenset(), spawn, spawn + 1)
+    assert lookup.log_path == path
+
+
+def test_agy_log_locator_rejects_pre_existing_log_inside_both_windows(tmp_path):
+    spawn = _time.time()
+    prior = _write_log(tmp_path, spawn - 1, spawn - 0.5)
+    inventory = _agy.snapshot_antigravity_logs(tmp_path)
+    assert prior.name in inventory
+    lookup = _agy.find_antigravity_attempt_log(tmp_path, inventory, spawn, spawn + 1)
+    assert lookup.log_path is None
+    assert "no new agy log" in lookup.reason
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["name-outside-window", "stale-mtime", "symlink", "ambiguous", "no-directory", "no-inventory"],
+)
+def test_agy_log_locator_refuses_unusable_candidates(tmp_path, case):
+    spawn = _time.time()
+    log_dir = tmp_path / "log"
+    log_dir.mkdir()
+    inventory = frozenset()
+    if case == "name-outside-window":
+        _write_log(log_dir, spawn + 60, spawn + 0.5)
+    elif case == "stale-mtime":
+        _write_log(log_dir, spawn, spawn - 30)
+    elif case == "symlink":
+        target = tmp_path / "elsewhere.log"
+        target.write_text(_AGY_429_LOG, encoding="utf-8")
+        (log_dir / agy_log_name(spawn)).symlink_to(target)
+    elif case == "ambiguous":
+        _write_log(log_dir, spawn, spawn + 0.5)
+        _write_log(log_dir, spawn + 1, spawn + 0.5)
+    elif case == "no-directory":
+        log_dir.rmdir()
+    else:
+        _write_log(log_dir, spawn, spawn + 0.5)
+        inventory = None
+    lookup = _agy.find_antigravity_attempt_log(log_dir, inventory, spawn, spawn + 1)
+    assert lookup.log_path is None
+    assert lookup.reason
+    if case == "ambiguous":
+        assert "ambiguous" in lookup.reason
+    if case == "no-inventory":
+        assert lookup.reason == "no pre-spawn inventory"
+
+
+def test_agy_log_reader_finds_only_executor_429_lines(tmp_path):
+    path = tmp_path / "cli.log"
+    path.write_text(_AGY_429_LOG, encoding="utf-8")
+    assert _agy.antigravity_log_quota_line(path) == AGY_LOG_429_LINE
+    path.write_text(
+        AGY_LOG_STARTUP_LINES
+        + "E1022 02:03:52.215232 1 x.go:1] agent executor error: generating and executing: "
+        "INTERNAL (code 500)\n"
+        + "I1022 02:03:52.215232 1 x.go:1] agent executor error: RESOURCE_EXHAUSTED (code 429)\n"
+        + "E1022 02:03:52.215232 1 x.go:1] fetch failed: RESOURCE_EXHAUSTED (code 429)\n",
+        encoding="utf-8",
+    )
+    assert _agy.antigravity_log_quota_line(path) is None
+    path.write_text(AGY_LOG_STARTUP_LINES, encoding="utf-8")
+    assert _agy.antigravity_log_quota_line(path) is None
+    link = tmp_path / "link.log"
+    path.write_text(_AGY_429_LOG, encoding="utf-8")
+    link.symlink_to(path)
+    assert _agy.antigravity_log_quota_line(link) is None
+    assert _agy.antigravity_log_quota_line(tmp_path / "missing.log") is None
+
+
+def test_agy_log_reader_is_bounded_to_the_tail(tmp_path, monkeypatch):
+    monkeypatch.setattr(_active_agy_module(), "AGY_LOG_READ_LIMIT_BYTES", 4096)
+    path = tmp_path / "cli.log"
+    path.write_text(AGY_LOG_429_LINE + "\n" + ("I1022 filler line\n" * 2000), encoding="utf-8")
+    assert _agy.antigravity_log_quota_line(path) is None
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(AGY_LOG_429_LINE + "\n")
+    assert _agy.antigravity_log_quota_line(path) == AGY_LOG_429_LINE
+
+
+def _backend_config(tmp_path):
+    agy_dir = tmp_path / "antigravity"
+    agy_dir.mkdir(parents=True, exist_ok=True)
+    return make_config(tmp_path, antigravity_dir=agy_dir)
+
+
+def test_backend_attaches_evidence_for_silent_attempt_with_new_429_log(tmp_path, _isolated_agy_log_dir):
+    AntigravityBackend = _agy.AntigravityBackend
+
+    runner = AgyLogRunner(
+        antigravity_outputs=[(AGY_SILENT_WARNING, 0)],
+        log_dir=_isolated_agy_log_dir, agy_logs=[_AGY_429_LOG],
+    )
+    result = AntigravityBackend().run(runner, _backend_config(tmp_path), "Review.", run_id="r1")
+    written = runner.written_agy_logs[0]
+    assert result.antigravity_log_path == written
+    assert result.antigravity_log_quota_evidence.log_path == written
+    assert result.antigravity_log_quota_evidence.line == AGY_LOG_429_LINE
+
+
+def test_backend_records_log_path_without_evidence_when_no_429(tmp_path, _isolated_agy_log_dir):
+    AntigravityBackend = _agy.AntigravityBackend
+
+    runner = AgyLogRunner(
+        antigravity_outputs=[("", 0)],
+        log_dir=_isolated_agy_log_dir, agy_logs=[AGY_LOG_STARTUP_LINES],
+    )
+    result = AntigravityBackend().run(runner, _backend_config(tmp_path), "Review.", run_id="r1")
+    assert result.antigravity_log_path == runner.written_agy_logs[0]
+    assert result.antigravity_log_quota_evidence is None
+
+
+@pytest.mark.parametrize(
+    "output,response_file",
+    [(("plain review text", 0), None), ((AGY_SILENT_WARNING, None), None), (("", 0), "response file text")],
+    ids=["other-text", "timeout", "response-file"],
+)
+def test_backend_skips_lookup_for_non_silent_attempts(
+    tmp_path, _isolated_agy_log_dir, monkeypatch, output, response_file
+):
+    AntigravityBackend = _agy.AntigravityBackend
+
+    calls = []
+    monkeypatch.setattr(
+        _agy, "find_antigravity_attempt_log", lambda *a, **k: calls.append(a) or None
+    )
+    runner = AgyLogRunner(
+        antigravity_outputs=[output],
+        public_response_outputs=[response_file] if response_file else [],
+        log_dir=_isolated_agy_log_dir, agy_logs=[_AGY_429_LOG],
+    )
+    result = AntigravityBackend().run(runner, _backend_config(tmp_path), "Review.", run_id="r1")
+    assert calls == []
+    assert result.antigravity_log_path is None
+    assert result.antigravity_log_quota_evidence is None
+
+
+def test_backend_takes_log_inventory_under_settings_lock_before_spawn(tmp_path, _isolated_agy_log_dir, monkeypatch):
+    import fcntl
+    AntigravityBackend = _agy.AntigravityBackend
+
+    settings_file = tmp_path / "agy-settings" / "settings.json"
+    monkeypatch.setattr(_active_agy_module(), "_antigravity_settings_path", lambda: settings_file)
+    lock_path = settings_file.with_suffix(".json.lock")
+    events = []
+    real_snapshot = _agy.snapshot_antigravity_logs
+
+    def snapshot(log_dir):
+        with lock_path.open("a+") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                events.append("snapshot-locked")
+            else:
+                fcntl.flock(probe, fcntl.LOCK_UN)
+                events.append("snapshot-unlocked")
+        return real_snapshot(log_dir)
+
+    monkeypatch.setattr(_active_agy_module(), "snapshot_antigravity_logs", snapshot)
+
+    class OrderRunner(AgyLogRunner):
+        def run_with_log(self, args, **kwargs):
+            if list(args[:1]) == ["agy"]:
+                events.append("spawn")
+            return super().run_with_log(args, **kwargs)
+
+    runner = OrderRunner(
+        antigravity_outputs=[(AGY_SILENT_WARNING, 0)],
+        log_dir=_isolated_agy_log_dir, agy_logs=[_AGY_429_LOG],
+    )
+    result = AntigravityBackend().run(runner, _backend_config(tmp_path), "Review.", run_id="r1")
+    assert events == ["snapshot-locked", "spawn"]
+    assert result.antigravity_log_quota_evidence is not None

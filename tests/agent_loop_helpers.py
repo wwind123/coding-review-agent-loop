@@ -2181,6 +2181,71 @@ def patch_object_in(modules, name, *args, **kwargs):
 _CAPACITY = "Selected model is at capacity. Please try a different model."
 
 
+AGY_SILENT_WARNING = "warning: run ended with no output and no recorded error"
+AGY_LOG_429_LINE = (
+    "E1022 02:03:52.215232 12345 executor.go:88] agent executor error: generating and "
+    "executing: RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota)."
+)
+AGY_LOG_STARTUP_LINES = (
+    "E1022 02:03:50.100000 12345 auth.go:12] error getting token source: "
+    "You are not logged into Antigravity.\n"
+    "W1022 02:03:50.200000 12345 credits.go:40] failed to refresh G1 credits\n"
+    "I1022 02:03:50.300000 12345 auth.go:90] applyAuthResult: ok authMethod=consumer\n"
+)
+
+
+def agy_log_name(wall_time: float) -> str:
+    """agy's local-time CLI log name for a wall-clock instant."""
+    return datetime.datetime.fromtimestamp(wall_time).strftime("cli-%Y%m%d_%H%M%S.log")
+
+
+class AgyLogRunner(FakeRunner):
+    """FakeRunner whose agy calls carry a spawn observation and may write an agy log.
+
+    ``agy_logs`` holds one entry per agy invocation: the log text to write, or
+    None for an attempt that writes no log.  ``spawn_wall_time`` pins the
+    reported spawn instant (default: the real call time).
+    """
+
+    def __init__(self, *args, log_dir, agy_logs=(), spawn_wall_time=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.agy_log_dir = Path(log_dir)
+        self.agy_logs = list(agy_logs)
+        self.agy_spawn_wall_time = spawn_wall_time
+        self.written_agy_logs: list[Path] = []
+
+    def run_with_log(self, args, **kwargs):
+        from dataclasses import replace as dc_replace
+        import time as time_module
+        from coding_review_agent_loop.runner import ExecutableIdentity, ExecutionObservation
+
+        spawn = self.agy_spawn_wall_time or time_module.time()
+        result = super().run_with_log(args, **kwargs)
+        if list(args[:1]) != ["agy"] or "models" in args:
+            return result
+        content = self.agy_logs.pop(0) if self.agy_logs else None
+        if content is not None:
+            self.agy_log_dir.mkdir(parents=True, exist_ok=True)
+            # A distinct start-up stamp per attempt, as separate agy runs have.
+            offset = 0
+            while (path := self.agy_log_dir / agy_log_name(spawn + offset)).exists():
+                offset += 1
+            path.write_text(content, encoding="utf-8")
+            os.utime(path, (spawn + 0.5, spawn + 0.5))
+            self.written_agy_logs.append(path)
+        identity = ExecutableIdentity(None, None, None, None)
+        observation = ExecutionObservation(
+            spawn_wall_time=spawn,
+            spawn_monotonic=0.0,
+            exit_monotonic=1.0,
+            elapsed_seconds=1.0,
+            before=identity,
+            after=identity,
+            interrupted=False,
+        )
+        return dc_replace(result, observation=observation)
+
+
 __all__ = [name for name in globals() if not name.startswith("__")]
 
 

@@ -906,3 +906,196 @@ def test_no_wait_unless_every_group_is_parsed_within_duration(tmp_path, advancin
             )
             assert isinstance(error, QuotaResetExceededError)
     assert slept == []
+
+
+# --- silent quota failure read from agy's own CLI log (#1604) -----------------
+
+SILENT = (AGY_SILENT_WARNING + "\n", 0)
+AGY_429_LOG = AGY_LOG_STARTUP_LINES + AGY_LOG_429_LINE + "\n"
+
+
+def _live_agy():
+    """The adapter module the backend runs from (another test re-imports it)."""
+    import importlib
+
+    return importlib.import_module("coding_review_agent_loop.agents.antigravity")
+
+
+def _strict_validate(text):
+    if not text.startswith("ok"):
+        raise AgentLoopError("missing required format")
+    return text
+
+
+def _silent_turn(tmp_path, log_dir, outputs, agy_logs, *, spawn_wall_time=None, **overrides):
+    runner = AgyLogRunner(
+        antigravity_outputs=list(outputs), log_dir=log_dir, agy_logs=agy_logs,
+        spawn_wall_time=spawn_wall_time,
+    )
+    config = make_config(tmp_path, agent_max_retries=overrides.pop("agent_max_retries", 1), **overrides)
+    logs: list[str] = []
+    repairs: list[object] = []
+
+    def record_repair(*_a, **_k):
+        repairs.append(1)
+        return None
+
+    try:
+        with patch("coding_review_agent_loop.validated_agent.log", lambda _c, m: logs.append(m)), \
+                patch.object(_live_agy(), "log", lambda _c, m: logs.append(m)), \
+                patch("coding_review_agent_loop.validated_agent.attempt_repair", record_repair):
+            response = validated_agent._run_validated_agent(
+                runner, agent="antigravity", config=config, prompt="PROMPT",
+                marker_description="none", validate=_strict_validate, use_repair=True,
+            )
+        error = None
+    except (AgentInvocationError, QuotaResetExceededError) as exc:
+        response, error = None, exc
+    cmds = [c for c, _cwd in runner.commands if c[:1] == ["agy"]]
+    models = [c[c.index("--model") + 1] for c in cmds if "--model" in c]
+    return response, error, models, logs, repairs, runner
+
+
+def test_silent_attempt_with_agy_log_429_falls_back_in_the_same_turn(tmp_path, _isolated_agy_log_dir):
+    with workdir_claims.workdir_claim_scope():
+        response, error, models, logs, repairs, runner = _silent_turn(
+            tmp_path, _isolated_agy_log_dir, [SILENT, ("ok review", 0)], [AGY_429_LOG, None],
+            antigravity_models=(GEM1, OPUS),
+        )
+        assert error is None and response.model_used == OPUS
+        assert models == [GEM1, OPUS]
+        entry = agy.quota_memory_for_current_run().entry("gemini")
+        assert entry is not None and entry.source == "cooldown"
+    assert repairs == []
+    name = runner.written_agy_logs[0].name
+    assert (
+        f"Antigravity printed no output; agy log {name} shows RESOURCE_EXHAUSTED (code 429); "
+        "treating as quota exhaustion"
+    ) in logs
+    assert any("skipping quota group gemini" in line for line in logs)
+    assert not any("retrying in" in line for line in logs)
+
+
+def test_silent_agy_log_429_on_every_group_stops_unavailable_on_all_models(tmp_path, _isolated_agy_log_dir):
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, _logs, repairs, _runner = _silent_turn(
+            tmp_path, _isolated_agy_log_dir, [SILENT, SILENT], [AGY_429_LOG, AGY_429_LOG],
+            antigravity_models=(GEM1, OPUS),
+        )
+    assert type(error) is AgentInvocationError
+    assert str(error).startswith("Antigravity unavailable on all models")
+    assert error.failure_category == "transient"
+    assert models == [GEM1, OPUS]
+    assert repairs == []
+
+
+@pytest.mark.parametrize(
+    "agy_log", [None, AGY_LOG_STARTUP_LINES + "I1022 02:03:52.000000 1 run.go:1] done\n"],
+    ids=["no-log", "log-without-429"],
+)
+def test_silent_attempt_without_usable_agy_log_keeps_format_failure_path(
+    tmp_path, _isolated_agy_log_dir, agy_log
+):
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, logs, repairs, runner = _silent_turn(
+            tmp_path, _isolated_agy_log_dir, [SILENT], [agy_log],
+            antigravity_models=(GEM1, OPUS), agent_max_retries=0,
+        )
+        assert agy.quota_memory_for_current_run().entry("gemini") is None
+    assert isinstance(error, AgentInvocationError)
+    assert "Antigravity unavailable" not in str(error)
+    assert error.failure_category != "transient"
+    assert models == [GEM1]
+    assert repairs == [1]
+    assert not any("treating as quota exhaustion" in line for line in logs)
+    if agy_log is None:
+        assert any("no new matching agy log" in line for line in logs)
+        assert "agy log:" not in str(error)
+    else:
+        path = runner.written_agy_logs[0]
+        assert any(f"agy log {path.name} has no RESOURCE_EXHAUSTED 429 line" in line for line in logs)
+        assert f"agy log: {path}" in str(error)
+
+
+def test_silent_attempt_with_unreadable_agy_log_dir_keeps_today_behavior(tmp_path, monkeypatch):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(_live_agy(), "_antigravity_log_dir", lambda: blocker / "log")
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, _logs, repairs, _runner = _silent_turn(
+            tmp_path, tmp_path / "unused", [SILENT], [None],
+            antigravity_models=(GEM1, OPUS), agent_max_retries=0,
+        )
+        assert agy.quota_memory_for_current_run().entry("gemini") is None
+    assert isinstance(error, AgentInvocationError)
+    assert models == [GEM1] and repairs == [1]
+
+
+def test_agy_log_lookup_exception_never_fails_the_turn(tmp_path, _isolated_agy_log_dir, monkeypatch):
+    def boom(*_a, **_k):
+        raise RuntimeError("lookup exploded")
+
+    monkeypatch.setattr(_live_agy(), "find_antigravity_attempt_log", boom)
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, logs, repairs, _runner = _silent_turn(
+            tmp_path, _isolated_agy_log_dir, [SILENT], [AGY_429_LOG],
+            antigravity_models=(GEM1, OPUS), agent_max_retries=0,
+        )
+        assert agy.quota_memory_for_current_run().entry("gemini") is None
+    assert "lookup exploded" not in str(error)
+    assert any("agy log lookup failed: lookup exploded" in line for line in logs)
+    assert models == [GEM1] and repairs == [1]
+
+
+def test_prior_attempt_429_log_near_spawn_leaves_quota_unchanged(tmp_path, _isolated_agy_log_dir):
+    import os
+    import time
+
+    spawn = time.time()
+    prior = _isolated_agy_log_dir / agy_log_name(spawn - 1)
+    prior.write_text(AGY_429_LOG, encoding="utf-8")
+    os.utime(prior, (spawn - 0.5, spawn - 0.5))
+    # Inside both tolerance windows: only the pre-spawn inventory rejects it.
+    assert agy.find_antigravity_attempt_log(
+        _isolated_agy_log_dir, frozenset(), spawn, spawn + 1
+    ).log_path == prior
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, logs, repairs, _runner = _silent_turn(
+            tmp_path, _isolated_agy_log_dir, [SILENT], [None],
+            spawn_wall_time=spawn, antigravity_models=(GEM1, OPUS), agent_max_retries=0,
+        )
+        assert agy.quota_memory_for_current_run().entry("gemini") is None
+        assert agy.quota_memory_for_current_run().entry("claude") is None
+    assert models == [GEM1]
+    assert "Antigravity unavailable" not in str(error)
+    assert repairs == [1]
+    assert not any("treating as quota exhaustion" in line for line in logs)
+    assert any("no new matching agy log" in line for line in logs)
+
+
+_AGY_LONG_RESET_LOG = AGY_LOG_STARTUP_LINES + AGY_LOG_429_LINE + " retryDelay: 14400s\n"
+_AGY_NO_429_LOG = AGY_LOG_STARTUP_LINES + "I1022 02:03:52.000000 1 run.go:1] done\n"
+
+
+@pytest.mark.parametrize(
+    "agy_logs,error_type,prefix,max_retries",
+    [
+        ([AGY_429_LOG, AGY_429_LOG], AgentInvocationError, "Antigravity unavailable on all models", 1),
+        ([_AGY_LONG_RESET_LOG, _AGY_LONG_RESET_LOG], QuotaResetExceededError, "", 1),
+        ([_AGY_NO_429_LOG], AgentInvocationError, "", 0),
+    ],
+    ids=["all-models-stop", "parsed-reset-stop", "ordinary-failure"],
+)
+def test_every_terminal_error_names_each_located_agy_log(
+    tmp_path, _isolated_agy_log_dir, agy_logs, error_type, prefix, max_retries
+):
+    with workdir_claims.workdir_claim_scope():
+        _r, error, _models, _logs, _repairs, runner = _silent_turn(
+            tmp_path, _isolated_agy_log_dir, [SILENT] * len(agy_logs), agy_logs,
+            antigravity_models=(GEM1, OPUS), agent_max_retries=max_retries,
+        )
+    assert type(error) is error_type
+    assert str(error).startswith(prefix)
+    assert len(runner.written_agy_logs) == len(agy_logs)
+    for path in runner.written_agy_logs:
+        assert f"agy log: {path}." in str(error)

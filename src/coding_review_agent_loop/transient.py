@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from .reset_parsing import _parse_rate_limit_reset_seconds
@@ -278,8 +279,9 @@ class AntigravityCapacityClassification:
     diagnostic: str = ""
     # The provider-owned error frame(s) that matched (#1236); empty when none.
     frame: str = ""
-    # "credits" when a correlated credits-balance frame qualified (#1598).
-    reason: Literal["capacity", "credits"] = "capacity"
+    # "credits" when a correlated credits-balance frame qualified (#1598);
+    # "agy-log" when a silent attempt's own agy CLI log showed a 429 (#1604).
+    reason: Literal["capacity", "credits", "agy-log"] = "capacity"
     # Typed auth verdict (#1598): callers force non-retryable with no fallback
     # unless a typed runner retry decision applies.
     auth_failure: bool = False
@@ -434,14 +436,28 @@ def classify_antigravity_quota_exhaustion(
     reset = _antigravity_frame_reset_seconds(frame)
     if reset is not None:
         return QuotaExhaustion(reset, "parsed", frame) if reset > threshold else None
-    if capacity.reason == "credits":
-        # The credits exemption already rejected capacity-only wording (#1598).
+    if capacity.reason in ("credits", "agy-log"):
+        # The credits exemption already rejected capacity-only wording (#1598);
+        # an agy-log frame is an executor RESOURCE_EXHAUSTED 429 line (#1604).
         return QuotaExhaustion(None, "cooldown", frame)
     if _ANTIGRAVITY_CAPACITY_ONLY_RE.search(frame):
         return None
     if _ANTIGRAVITY_HARD_QUOTA_RE.search(frame):
         return QuotaExhaustion(None, "cooldown", frame)
     return None
+
+
+def antigravity_log_quota_capacity(
+    log_path: Path, line: str
+) -> AntigravityCapacityClassification:
+    """Capacity verdict built from a silent attempt's agy CLI log line (#1604)."""
+    return AntigravityCapacityClassification(
+        True,
+        f"Antigravity printed no output; agy log {log_path} shows "
+        f"RESOURCE_EXHAUSTED (code 429): {line}",
+        line,
+        reason="agy-log",
+    )
 
 
 def _antigravity_frame_json(frame: str) -> dict | None:

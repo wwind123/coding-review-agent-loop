@@ -34,6 +34,14 @@ def normalize_agent_name(value: str) -> AgentName:
 
 
 @dataclass(frozen=True)
+class AntigravityLogQuotaEvidence:
+    """A silent agy attempt's own CLI log line showing RESOURCE_EXHAUSTED 429 (#1604)."""
+
+    log_path: Path
+    line: str
+
+
+@dataclass(frozen=True)
 class AgentResult:
     text: str
     raw_output: str = ""
@@ -76,6 +84,10 @@ class AgentResult:
     # turn, and uses the snapshot for validation and evidence derivation.
     test_turn_id: str | None = None
     test_turn_observations: tuple[object, ...] = ()
+    # Antigravity only (#1604): the agy CLI log located for a silent attempt,
+    # and its RESOURCE_EXHAUSTED 429 executor line when one was found.
+    antigravity_log_path: Path | None = None
+    antigravity_log_quota_evidence: AntigravityLogQuotaEvidence | None = None
 
     def __post_init__(self) -> None:
         if self.containment is None and self.command_result is not None:
