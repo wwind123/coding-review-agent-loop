@@ -1587,3 +1587,23 @@ def test_local_agent_loop_doc_states_managed_receipt_and_unproducible_evidence_r
     assert "is never blocking" in flat
     assert "A missing or failing receipt the loop can produce keeps the existing rules" in flat
     assert "`agent-loop run-tests -- <command>`" in flat
+
+
+def test_subprocess_log_pruning_is_documented_as_layout_gated():
+    """Issue #1576: pruning is gated on the subprocess-logs/<slug>/ layout, not the default root."""
+    text = LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
+    flat = " ".join(text.split())
+    assert "Pruning is gated on the path layout, not on whether the capture root is the default" in flat
+    assert "an explicit `--subprocess-log-dir` whose grandparent directory is named `subprocess-logs`" in flat
+    assert "Explicit roots outside that layout are never pruned." in flat
+    assert "`subprocess-logs/<slug>/<invocation>/` cache layout" not in flat
+    readme = " ".join(README.read_text(encoding="utf-8").split())
+    assert (
+        "Old subprocess capture directories in the `subprocess-logs/<slug>/` layout "
+        "(including an explicit `--subprocess-log-dir` in that layout) are pruned after 14 days"
+    ) in readme
+    pr_help = " ".join(build_parser()._subparsers._group_actions[0].choices["pr"].format_help().split())
+    assert "agent-loop cache's" not in pr_help
+    assert "subprocess-logs/<slug>/ layout" in pr_help
+    assert "any --subprocess-log-dir whose path follows that layout" in pr_help
+    assert "is subject to the same retention pruning as the default" in pr_help

@@ -9009,9 +9009,13 @@ unlocked directories on a best-effort basis.
 sets how many days old capture directories are kept. The default is 14 days;
 `0` or `never` disables pruning entirely. Negative, fractional, non-numeric or
 empty values are rejected at startup, before any capture directory is touched.
-Pruning runs only for invocation directories in the
-`subprocess-logs/<slug>/<invocation>/` cache layout, and only touches real
-(non-symlink) directories that carry the capture marker, are older than the
+Pruning is gated on the path layout, not on whether the capture root is the
+default: it runs only when the invocation directory's path follows the
+`subprocess-logs/<slug>/<invocation>/` layout. That covers the default cache
+location and also an explicit `--subprocess-log-dir` whose grandparent
+directory is named `subprocess-logs`, whose sibling invocation directories are
+then swept too. Explicit roots outside that layout are never pruned. A sweep
+only touches real (non-symlink) directories that carry the capture marker, are older than the
 retention period, and are not leased by a live invocation. Such a directory is
 removed whole, including subdirectories, without following symlinks; the marker
 and lease file are removed last, so a partially failed removal is retried by a

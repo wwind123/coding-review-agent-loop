@@ -740,7 +740,9 @@ def build_parser() -> argparse.ArgumentParser:
             help=(
                 "External directory for active subprocess captures. The default is a unique "
                 "directory under the agent-loop cache; relative overrides are resolved from the "
-                "primary agent directory, and paths inside managed checkouts are rejected."
+                "primary agent directory, and paths inside managed checkouts are rejected. An "
+                "explicit directory in the subprocess-logs/<slug>/<invocation> layout is subject "
+                "to the same retention pruning as the default."
             ),
         )
         subparser.add_argument(
@@ -748,8 +750,9 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             metavar="N",
             help=(
-                "Days to keep old subprocess capture directories under the agent-loop cache's "
-                "subprocess-logs/<slug>/ layout before best-effort pruning (default: 14; also "
+                "Days to keep old subprocess capture directories in the subprocess-logs/<slug>/ "
+                "layout (the default capture location, or any --subprocess-log-dir whose path "
+                "follows that layout) before best-effort pruning (default: 14; also "
                 "AGENT_LOOP_SUBPROCESS_LOG_RETENTION_DAYS). 0 or never disables pruning."
             ),
         )

@@ -244,3 +244,18 @@ def test_partial_failure_keeps_the_root_retryable(tmp_path, monkeypatch):
     logging_module._prune_capture_roots(parent, parent / "current", retention_days=14)
 
     assert not os.path.lexists(root)
+
+
+def test_explicit_subprocess_log_dir_in_the_layout_is_pruned(tmp_path):
+    # #1576: the gate is the path layout (grandparent named subprocess-logs),
+    # not whether the capture root is the default cache location.
+    parent = tmp_path / "elsewhere" / "subprocess-logs" / "custom"
+    parent.mkdir(parents=True)
+    old = _root(parent, "old", age_days=100)
+    current = parent / "current"
+    config = make_config(tmp_path, subprocess_log_dir=current, subprocess_log_retention_days=14)
+
+    logging_module.agent_log_path(config, "claude")
+
+    assert not old.exists()
+    assert (current / MARKER).is_file()
