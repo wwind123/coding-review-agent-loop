@@ -1071,3 +1071,31 @@ def test_prior_attempt_429_log_near_spawn_leaves_quota_unchanged(tmp_path, _isol
     assert repairs == [1]
     assert not any("treating as quota exhaustion" in line for line in logs)
     assert any("no new matching agy log" in line for line in logs)
+
+
+_AGY_LONG_RESET_LOG = AGY_LOG_STARTUP_LINES + AGY_LOG_429_LINE + " retryDelay: 14400s\n"
+_AGY_NO_429_LOG = AGY_LOG_STARTUP_LINES + "I1022 02:03:52.000000 1 run.go:1] done\n"
+
+
+@pytest.mark.parametrize(
+    "agy_logs,error_type,prefix,max_retries",
+    [
+        ([AGY_429_LOG, AGY_429_LOG], AgentInvocationError, "Antigravity unavailable on all models", 1),
+        ([_AGY_LONG_RESET_LOG, _AGY_LONG_RESET_LOG], QuotaResetExceededError, "", 1),
+        ([_AGY_NO_429_LOG], AgentInvocationError, "", 0),
+    ],
+    ids=["all-models-stop", "parsed-reset-stop", "ordinary-failure"],
+)
+def test_every_terminal_error_names_each_located_agy_log(
+    tmp_path, _isolated_agy_log_dir, agy_logs, error_type, prefix, max_retries
+):
+    with workdir_claims.workdir_claim_scope():
+        _r, error, _models, _logs, _repairs, runner = _silent_turn(
+            tmp_path, _isolated_agy_log_dir, [SILENT] * len(agy_logs), agy_logs,
+            antigravity_models=(GEM1, OPUS), agent_max_retries=max_retries,
+        )
+    assert type(error) is error_type
+    assert str(error).startswith(prefix)
+    assert len(runner.written_agy_logs) == len(agy_logs)
+    for path in runner.written_agy_logs:
+        assert f"agy log: {path}." in str(error)
