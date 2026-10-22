@@ -756,8 +756,8 @@ def test_auth_beats_usage_limit_structured(error) -> None:
         (f"ERROR: {_USAGE}", "transient"),
         (f"ERROR: unauthorized. {_USAGE_PLAIN}", "non-retryable"),
         (f"ERROR: invalid api key. {_USAGE_PLAIN}", "non-retryable"),
-        # Auth evidence keeps the legacy stderr chain, which never matched a bare 401.
-        (f"ERROR: 401 {_USAGE_PLAIN}", "deterministic"),
+        (f"ERROR: 401 {_USAGE_PLAIN}", "non-retryable"),
+        (f"ERROR: 403 {_USAGE_PLAIN}", "non-retryable"),
         (f"refusing: dirty checkout. {_USAGE_PLAIN}", "non-retryable"),
         ("ERROR: credit balance too low", "non-retryable"),
     ],
@@ -947,4 +947,22 @@ def test_unreadable_localtime_returns_none(monkeypatch) -> None:
     assert reset_parsing._host_local_zone() is None
     assert reset_parsing._parse_rate_limit_reset_seconds(
         "try again at 2:01 AM", now_utc=_PDT_FALLBACK_NOW
+    ) is None
+
+
+def test_bare_try_again_at_in_spring_forward_gap_is_none() -> None:
+    now = _dt.datetime(2026, 3, 8, 8, 0, tzinfo=_UTC)  # 00:00 PST, gap day
+    assert _at("try again at 2:30 AM", now) is None
+
+
+def test_bare_try_again_at_rolling_into_gap_is_none() -> None:
+    now = _dt.datetime(2026, 3, 7, 11, 0, tzinfo=_UTC)  # 03:00 PST, day before the gap
+    assert _at("try again at 2:30 AM", now) is None
+
+
+def test_bare_try_again_at_gap_through_shared_parser(monkeypatch) -> None:
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+    now = _dt.datetime(2026, 3, 8, 8, 0, tzinfo=_UTC)
+    assert reset_parsing._parse_rate_limit_reset_seconds(
+        "You've hit your usage limit. Try again at 2:30 AM.", now_utc=now
     ) is None

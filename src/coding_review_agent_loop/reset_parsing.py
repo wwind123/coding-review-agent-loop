@@ -158,9 +158,14 @@ def _parse_try_again_at_seconds(
     today = now_utc.astimezone(tz).date()
     month_name = m.group("month_a") or m.group("month_b")
     if month_name is None:
-        # A bare clock time: the next future occurrence, today or tomorrow.
+        # A bare clock time: the next future occurrence, today or tomorrow. A
+        # wall time that does not exist (a spring-forward gap) is None, never
+        # silently rolled to another day.
         for date in (today, today + datetime.timedelta(days=1)):
-            future = [t for t in _local_occurrences(date, hour, minute, tz) if t > now_utc]
+            occurrences = _local_occurrences(date, hour, minute, tz)
+            if not occurrences:
+                return None
+            future = [t for t in occurrences if t > now_utc]
             if future:
                 return int((future[0] - now_utc).total_seconds())
         return None

@@ -253,11 +253,11 @@ def classify_codex_failure(raw_output: str) -> ProviderFailureVerdict | None:
         # in the middle must survive (the capture itself is already bounded).
         full = "\n".join(channel.stderr_lines)
         text = full
-        if (
-            _USAGE_LIMIT_RE.search(full)
-            and not _STRUCTURED_AUTH_RE.search(full)
-            and not _DIRTY_CHECKOUT_RE.search(full)
-        ):
+        usage_limit = bool(_USAGE_LIMIT_RE.search(full))
+        if usage_limit and _STRUCTURED_AUTH_RE.search(full):
+            # Auth evidence (including a bare 401/403) beats usage-limit wording.
+            category = "non-retryable"
+        elif usage_limit and not _DIRTY_CHECKOUT_RE.search(full):
             # Advisory only (#1281): retries key on structured verdicts.
             category = "transient"
         elif NON_RETRYABLE_AGENT_OUTPUT_RE.search(full):
