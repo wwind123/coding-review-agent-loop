@@ -1,8 +1,8 @@
 # Execution and concurrency
 
-How agent and Git processes run: per-run worktrees over a shared store, the agent-loop-owned Git boundary and private fetch transport with SSH identity selection, pre-turn checkout verification, process-tree containment, test interpreter and worker budgets, pre-collection launch-failure provenance, the Antigravity quota-group fallback, and the other entry paths outside the review loop.
+How agent and Git processes run: per-run worktrees over a shared store, the agent-loop-owned Git boundary and private fetch transport with SSH identity selection, pre-turn checkout verification, process-tree containment, test interpreter and worker budgets, pre-collection launch-failure provenance, the Antigravity quota-group fallback, the opt-in quota reset wait, and the other entry paths outside the review loop.
 
-Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_containment.py`, `tests/test_test_workers.py`.
+Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_containment.py`, `tests/test_test_workers.py`.
 
 ## Execution and Concurrency
 
@@ -302,6 +302,28 @@ cross-group jump per turn; a second verified exhaustion is a shared-limit stop;
 and an all-groups-cooling state stops before invoking. Only when every group
 carries a parsed long reset is `QuotaResetExceededError` raised. Memory is not
 persisted across processes.
+
+**Quota reset wait.** `--wait-for-quota-reset DURATION` (off by default) turns
+a parsed long-reset stop into a bounded wait. `quota_wait.py` owns a
+`QuotaWaitBudget` (at most 2 waits and DURATION in total). Like the quota
+memory, it is keyed by the `workdir_claims` owner's `run_id`, dropped by a run
+finalizer, shared by nested loops and context-propagated reviewer threads, and
+local to the turn with no owner. `validated_agent.py` reserves from the budget
+at the long-reset raise sites and sleeps between invocations, outside
+`run_agent_result`, so no subprocess or settings lock is held. It then
+replays the frozen failed invocation (prompt, session, timeout and settings)
+in a dedicated attempt slot. For Antigravity it waits only when
+`stop_is_verified_long_reset()` holds and the latest group reset is within
+DURATION. A pre-dispatch all-exhausted wait builds the next invocation
+normally, and a post-failure wait replays the failed one. Waits sleep in
+slices of at most 30 s on a process-level cancel event in a waiter registry.
+The CLI installs a SIGTERM handler for the command only when the option is
+set. The handler, and SIGINT's own `KeyboardInterrupt`, reach the main
+thread. There, a waiting main thread converts the interrupt to
+`QuotaResetExceededError`, and the reviewer (`review_rounds.py`) and debater
+(`discuss_loop.py`) executors cancel waiting workers before terminating
+processes and joining. `cli.main` maps an interrupt that cancelled a wait to
+exit code 3. SIGTERM with no active wait keeps its previous behaviour.
 
 ## Other Entry Paths
 

@@ -1,0 +1,429 @@
+"""Opt-in waiting for a parsed usage-limit reset (#1601)."""
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from agent_loop_helpers import FakeRunner, make_config, patch_attr_in, patch_object_in
+from coding_review_agent_loop import (
+    cli,
+    discuss_loop,
+    quota_wait,
+    response_validation,
+    review_rounds,
+    validated_agent,
+    workdir_claims,
+)
+from coding_review_agent_loop.agents.base import AgentResult
+from coding_review_agent_loop.errors import QuotaResetExceededError
+from test_semantic_evidence_repair_routing import (
+    _forbid_repair,
+    _implementation_with_claim,
+    _observation,
+    _sequenced_validator,
+)
+
+import coding_review_agent_loop.plan_first_loop as plan_first_loop
+import coding_review_agent_loop.pr_loop as pr_loop
+
+SIX_HOURS = 6 * 3600
+
+
+def _claude_limit(reset="resets in 2h"):
+    return AgentResult(
+        text=(
+            '{"type":"result","is_error":true,"api_error_status":429,'
+            f'"result":"Claude AI usage limit reached (usage_limit_reached) · {reset}"}}'
+        ),
+        returncode=1,
+    )
+
+
+OK = AgentResult(text="fine", returncode=0, session_id="s-ok")
+
+
+@pytest.fixture
+def slept(monkeypatch):
+    calls: list[float] = []
+    monkeypatch.setattr(quota_wait, "_sleeper", calls.append)
+    return calls
+
+
+@pytest.fixture
+def logs(monkeypatch):
+    lines: list[str] = []
+    monkeypatch.setattr(validated_agent, "log", lambda _c, m: lines.append(m))
+    monkeypatch.setattr(quota_wait, "log", lambda _c, m: lines.append(m))
+    return lines
+
+
+def _turn(tmp_path, results, *, wait=SIX_HOURS, retries=0, runner=None, session_id="s0", **kwargs):
+    runner = runner or FakeRunner()
+    config = make_config(tmp_path, agent_max_retries=retries, wait_for_quota_reset_seconds=wait)
+    with patch.object(validated_agent, "run_agent_result", side_effect=list(results)) as invoke:
+        try:
+            response = validated_agent._run_validated_agent(
+                runner, agent="claude", config=config, prompt="PROMPT",
+                marker_description="none", validate=lambda text: text,
+                session_id=session_id, **kwargs,
+            )
+            error = None
+        except QuotaResetExceededError as exc:
+            response, error = None, exc
+    return response, error, invoke, runner
+
+
+def _runner_sleeps(runner):
+    return [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["sleep"]]
+
+
+# --- off-default / wait-within / wait-beyond / no-parsed-reset ----------------
+
+def test_off_default_raises_immediately_without_budget(tmp_path, slept, monkeypatch):
+    monkeypatch.setattr(
+        quota_wait, "quota_wait_budget_for_current_run",
+        lambda _c: pytest.fail("budget consulted with the option off"),
+    )
+    _r, error, invoke, runner = _turn(tmp_path, [_claude_limit("resets in 5h")], wait=None)
+    assert isinstance(error, QuotaResetExceededError)
+    assert "quota exhausted. Reset in 5h" in str(error)
+    assert "Rerun when quota resets" in str(error)
+    assert invoke.call_count == 1
+    assert slept == [] and _runner_sleeps(runner) == []
+    assert QuotaResetExceededError.EXIT_CODE == 3
+
+
+def test_wait_within_duration_replays_same_invocation(tmp_path, slept, logs):
+    response, error, invoke, runner = _turn(tmp_path, [_claude_limit(), OK])
+    assert error is None and response.text == "fine"
+    assert invoke.call_count == 2
+    first, second = (call.kwargs for call in invoke.call_args_list)
+    assert first["prompt"] == second["prompt"] == "PROMPT"
+    assert first["session_id"] == second["session_id"] == "s0"
+    assert first["timeout_seconds"] == second["timeout_seconds"]
+    assert first["attempt_suffix"] == "attempt1"  # no ordinary retry consumed
+    assert second["attempt_suffix"] == "quota-wait-1"
+    # One wait of reset + margin, delivered in bounded slices.
+    assert sum(slept) == 7200 + quota_wait.QUOTA_WAIT_MARGIN_SECONDS
+    assert max(slept) <= quota_wait.QUOTA_WAIT_SLICE_SECONDS
+    assert _runner_sleeps(runner) == []  # no ordinary retry backoff either
+    waiting = [line for line in logs if "quota exhausted; waiting until" in line]
+    assert len(waiting) == 1
+    assert "(2h 1m) for reset (wait 1 of 2)" in waiting[0]
+    assert any("quota reset wait finished" in line for line in logs)
+
+
+def test_wait_beyond_duration_raises_without_sleeping(tmp_path, slept):
+    _r, error, invoke, runner = _turn(tmp_path, [_claude_limit("resets in 5h")], wait=3600)
+    assert isinstance(error, QuotaResetExceededError)
+    assert "Reset in 5h" in str(error)
+    assert invoke.call_count == 1
+    assert slept == [] and _runner_sleeps(runner) == []
+
+
+def test_unparsed_reset_keeps_ordinary_retry_and_never_waits(tmp_path, slept):
+    unparsed = AgentResult(text="HTTP 429: rate limit exceeded.", returncode=1)
+    response, error, invoke, runner = _turn(tmp_path, [unparsed, OK], retries=1)
+    assert error is None and response.text == "fine"
+    assert slept == []
+    assert len(_runner_sleeps(runner)) == 1
+    assert invoke.call_args_list[1].kwargs["attempt_suffix"] == "attempt2"
+
+
+# --- quota-replay-frozen -------------------------------------------------------
+
+def test_quota_on_evidence_reask_replays_the_reask_prompt_and_session(tmp_path, slept, monkeypatch):
+    patch_attr_in(
+        monkeypatch, (validated_agent, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair
+    )
+    results = [
+        AgentResult(text=_implementation_with_claim(), returncode=0, session_id="s-first"),
+        _claude_limit(),
+        AgentResult(text=_implementation_with_claim(), returncode=0),
+    ]
+    catalogs = [[_observation(suite_start="unknown")], [_observation()], [_observation()]]
+    config = make_config(tmp_path, agent_max_retries=0, wait_for_quota_reset_seconds=SIX_HOURS)
+    with patch_object_in(
+        (validated_agent, response_validation), "run_agent_result", side_effect=results
+    ) as invoke:
+        response = validated_agent._run_validated_agent(
+            FakeRunner(), agent="claude", config=config, prompt="Implement the issue.",
+            marker_description="structured issue_implementation result",
+            validate=_sequenced_validator(catalogs, invoke), role="coder", use_repair=True,
+            repair_expected_kind="issue_implementation", session_id="caller",
+            reask_on_evidence_rejection=True,
+        )
+    assert response.marker_value is not None
+    assert invoke.call_count == 3
+    _original, reask, replay = (call.kwargs for call in invoke.call_args_list)
+    assert "Previous response not accepted: test evidence" in reask["prompt"]
+    assert reask["session_id"] == "s-first"
+    assert replay["prompt"] == reask["prompt"]
+    assert replay["session_id"] == reask["session_id"]
+    assert reask["attempt_suffix"] == "evidence-reask"
+    assert replay["attempt_suffix"] == "quota-wait-1"
+    assert sum(slept) == 7260
+
+
+# --- count-bound / duration-bound / shared-budget ------------------------------
+
+def test_third_limit_after_two_waits_raises_without_sleeping(tmp_path, slept):
+    _r, error, invoke, _runner = _turn(
+        tmp_path, [_claude_limit("resets in 1h")] * 3 + [OK], wait=SIX_HOURS
+    )
+    assert isinstance(error, QuotaResetExceededError)
+    assert invoke.call_count == 3
+    assert sum(slept) == 2 * (3600 + quota_wait.QUOTA_WAIT_MARGIN_SECONDS)
+
+
+def test_run_budget_with_two_waits_used_refuses_another(tmp_path, slept):
+    config = make_config(tmp_path, wait_for_quota_reset_seconds=SIX_HOURS)
+    with workdir_claims.workdir_claim_scope():
+        budget = quota_wait.quota_wait_budget_for_current_run(config)
+        assert budget.try_reserve(60) and budget.try_reserve(60)
+        slept.clear()
+        _r, error, invoke, _runner = _turn(tmp_path, [_claude_limit("resets in 10m"), OK])
+    assert isinstance(error, QuotaResetExceededError)
+    assert invoke.call_count == 1 and slept == []
+
+
+def test_cumulative_duration_bound():
+    budget = quota_wait.QuotaWaitBudget(3 * 3600)
+    budget.waits_used, budget.seconds_waited = 1, 9000
+    assert budget.try_reserve(3600) is None
+    assert (budget.waits_used, budget.seconds_waited) == (1, 9000)
+    reservation = budget.try_reserve(1800 - quota_wait.QUOTA_WAIT_MARGIN_SECONDS)
+    assert reservation.sleep_seconds == 1800 and reservation.wait_number == 2
+
+
+def test_cumulative_duration_bound_through_a_turn(tmp_path, slept):
+    config = make_config(tmp_path, wait_for_quota_reset_seconds=3 * 3600)
+    with workdir_claims.workdir_claim_scope():
+        budget = quota_wait.quota_wait_budget_for_current_run(config)
+        budget.waits_used, budget.seconds_waited = 1, 9000
+        _r, error, invoke, _runner = _turn(
+            tmp_path, [_claude_limit("resets in 1h"), OK], wait=3 * 3600
+        )
+    assert isinstance(error, QuotaResetExceededError)
+    assert invoke.call_count == 1 and slept == []
+
+
+def test_reviewer_threads_share_one_serialized_run_budget(tmp_path):
+    config = make_config(tmp_path, wait_for_quota_reset_seconds=3 * 3600)
+    barrier = threading.Barrier(2)
+    seen = []
+
+    def run_turn(reviewer):
+        budget = quota_wait.quota_wait_budget_for_current_run(config)
+        barrier.wait(timeout=60)
+        seen.append((budget, budget.try_reserve(2 * 3600)))
+        return review_rounds._ReviewerTurnResult(reviewer_name=str(reviewer))
+
+    with workdir_claims.workdir_claim_scope():
+        outer = quota_wait.quota_wait_budget_for_current_run(config)
+        review_rounds._launch_reviewer_turns(
+            FakeRunner(), ["codex", "gemini"], thread_name_prefix="t", run_turn=run_turn
+        )
+        assert seen[0][0] is seen[1][0] is outer
+        assert sum(reservation is not None for _b, reservation in seen) == 1
+        assert outer.waits_used == 1 and outer.seconds_waited <= outer.limit_seconds
+    assert quota_wait._run_budgets == {}
+    with workdir_claims.workdir_claim_scope():
+        assert quota_wait.quota_wait_budget_for_current_run(config).waits_used == 0
+
+
+def test_no_owner_budget_is_local():
+    config = type("C", (), {"wait_for_quota_reset_seconds": 60})()
+    assert quota_wait.quota_wait_budget_for_current_run(config) is not (
+        quota_wait.quota_wait_budget_for_current_run(config)
+    )
+
+
+# --- signals -------------------------------------------------------------------
+
+def _signal_when_waiting(signum, *, count=1):
+    def fire():
+        deadline = time.monotonic() + 20
+        while quota_wait.active_wait_count() < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        os.kill(os.getpid(), signum)
+
+    thread = threading.Thread(target=fire, daemon=True)
+    thread.start()
+    return thread
+
+
+PR_ARGS = ["pr", "77", "--repo", "OWNER/REPO", "--wait-for-quota-reset", "6h"]
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
+def test_signal_during_main_thread_wait_is_a_clean_quota_stop(tmp_path, monkeypatch, capsys, signum):
+    previous = signal.getsignal(signal.SIGTERM)
+    runner = FakeRunner()
+    config = make_config(tmp_path, agent_max_retries=0, wait_for_quota_reset_seconds=SIX_HOURS)
+
+    def fake_pr_loop(*_a, **_k):
+        with patch.object(validated_agent, "run_agent_result", side_effect=[_claude_limit(), OK]):
+            validated_agent._run_validated_agent(
+                runner, agent="claude", config=config, prompt="P",
+                marker_description="none", validate=lambda t: t,
+            )
+        pytest.fail("the wait was not interrupted")
+
+    monkeypatch.setattr(cli, "run_pr_loop", fake_pr_loop)
+    started = time.monotonic()
+    firing = _signal_when_waiting(signum)
+    assert cli.main(PR_ARGS) == QuotaResetExceededError.EXIT_CODE
+    firing.join(5)
+    assert time.monotonic() - started < 20
+    assert "Claude quota reset wait interrupted; rerun to resume" in capsys.readouterr().err
+    assert signal.getsignal(signal.SIGTERM) == previous
+    assert runner.comments == []  # the wait writes nothing to GitHub
+    assert not quota_wait.wait_was_interrupted()  # cleared for the next command
+
+
+def _record_terminations(runner):
+    calls = []
+    original = runner.terminate_active_processes
+
+    def spy():
+        calls.append(True)
+        return original()
+
+    runner.terminate_active_processes = spy
+    return calls
+
+
+def _waiting_worker(config, name):
+    reservation = quota_wait.QuotaWaitReservation(7200, 1, 2)
+    quota_wait.wait_for_reset(config, name, reservation)
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
+def test_signal_cancels_a_waiting_reviewer_worker(tmp_path, monkeypatch, capsys, signum):
+    previous = signal.getsignal(signal.SIGTERM)
+    runner = FakeRunner()
+    terminations = _record_terminations(runner)
+    config = make_config(tmp_path, wait_for_quota_reset_seconds=SIX_HOURS)
+    outcomes = []
+
+    def run_turn(reviewer):
+        try:
+            _waiting_worker(config, "Codex")
+        except QuotaResetExceededError as exc:
+            outcomes.append(exc)
+            return review_rounds._ReviewerTurnResult(reviewer_name="Codex", error=exc)
+        return review_rounds._ReviewerTurnResult(reviewer_name="Codex")
+
+    def fake_pr_loop(*_a, **_k):
+        review_rounds._launch_reviewer_turns(runner, ["codex"], thread_name_prefix="t", run_turn=run_turn)
+        pytest.fail("the interrupt did not reach the main thread")
+
+    monkeypatch.setattr(cli, "run_pr_loop", fake_pr_loop)
+    started = time.monotonic()
+    firing = _signal_when_waiting(signum)
+    assert cli.main(PR_ARGS) == QuotaResetExceededError.EXIT_CODE
+    firing.join(5)
+    assert time.monotonic() - started < quota_wait.QUOTA_WAIT_SLICE_SECONDS
+    assert terminations == [True]
+    assert len(outcomes) == 1 and "wait interrupted" in str(outcomes[0])
+    assert "quota reset wait interrupted" in capsys.readouterr().err
+    assert signal.getsignal(signal.SIGTERM) == previous
+    assert quota_wait.active_wait_count() == 0
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
+def test_signal_cancels_waiting_discuss_debaters(tmp_path, monkeypatch, capsys, signum):
+    runner = FakeRunner()
+    terminations = _record_terminations(runner)
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), discuss_parallel=True,
+        wait_for_quota_reset_seconds=SIX_HOURS,
+    )
+    outcomes = []
+
+    def debater_turn(_runner, *, reviewer_name, **_kwargs):
+        try:
+            _waiting_worker(config, reviewer_name)
+        except QuotaResetExceededError as exc:
+            outcomes.append(exc)
+            raise
+        pytest.fail("the debater wait was not cancelled")
+
+    monkeypatch.setattr(discuss_loop, "_run_discuss_debater_turn", debater_turn)
+
+    def fake_discuss(*_a, **_k):
+        discuss_loop.run_discuss_loop(runner, issue_number=56, config=config)
+        pytest.fail("the interrupt did not reach the main thread")
+
+    monkeypatch.setattr(cli, "run_discuss_loop", fake_discuss)
+    started = time.monotonic()
+    firing = _signal_when_waiting(signum, count=2)
+    assert cli.main(
+        ["discuss", "56", "--repo", "OWNER/REPO", "--wait-for-quota-reset", "6h"]
+    ) == QuotaResetExceededError.EXIT_CODE
+    firing.join(5)
+    assert time.monotonic() - started < quota_wait.QUOTA_WAIT_SLICE_SECONDS
+    assert terminations == [True]
+    assert len(outcomes) == 2
+    assert "quota reset wait interrupted" in capsys.readouterr().err
+
+
+def test_sigterm_without_active_wait_keeps_default_termination(tmp_path):
+    script = (
+        "import os, signal, time\n"
+        "from coding_review_agent_loop import quota_wait\n"
+        "assert quota_wait.install_sigterm_handler() == signal.SIG_DFL\n"
+        "os.kill(os.getpid(), signal.SIGTERM)\n"
+        "time.sleep(10)\n"
+        "raise SystemExit(0)\n"
+    )
+    src = Path(quota_wait.__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(src)}
+    completed = subprocess.run(
+        [sys.executable, "-c", script], env=env, timeout=60, capture_output=True, text=True,
+    )
+    assert completed.returncode == -signal.SIGTERM, completed.stderr
+
+
+def test_sigterm_without_active_wait_chains_to_a_python_handler():
+    received = []
+    original = signal.signal(signal.SIGTERM, lambda signum, _frame: received.append(signum))
+    try:
+        previous = quota_wait.install_sigterm_handler()
+        os.kill(os.getpid(), signal.SIGTERM)
+        deadline = time.monotonic() + 5
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert received == [signal.SIGTERM]
+        assert not quota_wait.wait_was_interrupted()
+        quota_wait.restore_sigterm_handler(previous)
+        assert signal.getsignal(signal.SIGTERM) is previous
+    finally:
+        signal.signal(signal.SIGTERM, original)
+
+
+def test_ordinary_keyboard_interrupt_still_propagates(monkeypatch):
+    previous = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(cli, "run_pr_loop", lambda *_a, **_k: (_ for _ in ()).throw(KeyboardInterrupt))
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(PR_ARGS)
+    assert signal.getsignal(signal.SIGTERM) == previous
+
+
+def test_option_off_installs_no_sigterm_handler(monkeypatch):
+    previous = signal.getsignal(signal.SIGTERM)
+    seen = []
+    monkeypatch.setattr(cli, "run_pr_loop", lambda *_a, **_k: seen.append(signal.getsignal(signal.SIGTERM)) or 0)
+    assert cli.main(["pr", "77", "--repo", "OWNER/REPO"]) == 0
+    assert seen == [previous]
+    monkeypatch.setattr(cli, "run_pr_loop", lambda *_a, **_k: seen.append(signal.getsignal(signal.SIGTERM)) or 0)
+    assert cli.main(PR_ARGS) == 0
+    assert seen[-1] != previous
+    assert signal.getsignal(signal.SIGTERM) == previous

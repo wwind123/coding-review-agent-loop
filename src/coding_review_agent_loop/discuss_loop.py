@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, get_backend
+from . import quota_wait
 from .workdir_claims import claimed_run
 from .config import AgentLoopConfig, ensure_agent_workdirs, resolve_base_branch
 from .child_topology import NeedsHumanDecision
@@ -1906,7 +1907,9 @@ def _run_discuss_loop(
             except KeyboardInterrupt:
                 # Workers never receive the terminal SIGINT; kill their agent
                 # process groups so their wait loops return and the shutdown
-                # below completes promptly, then propagate the interrupt.
+                # below completes promptly, then propagate the interrupt.  A
+                # worker sleeping out a quota reset is woken the same way (#1601).
+                quota_wait.cancel_active_waits()
                 runner.terminate_active_processes()
                 raise
             finally:

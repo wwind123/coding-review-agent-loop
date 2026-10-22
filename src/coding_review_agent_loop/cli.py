@@ -73,7 +73,7 @@ from .github import (
     validate_open_issue,
     validate_open_pr,
 )
-from . import tool_provenance
+from . import quota_wait, tool_provenance
 from .logging import agent_log_path, log
 from .orchestrator import (
     run_discuss_loop,
@@ -764,6 +764,17 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=2,
             help="Maximum transient retries; shared across the Antigravity fallback chain (default: 2).",
+        )
+        subparser.add_argument(
+            "--wait-for-quota-reset",
+            metavar="DURATION",
+            default=None,
+            help=(
+                "When an agent hits a usage limit with a parsed reset, wait for the reset "
+                "(plus a 60s margin) and retry the same turn instead of stopping, if it fits "
+                "within DURATION (for example 6h, 90m, 1h30m or plain seconds; at most 24h). "
+                "At most 2 waits and DURATION in total per run. Default: off."
+            ),
         )
         subparser.add_argument(
             "--agent-retry-backoff-seconds",
@@ -2682,6 +2693,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return PREFLIGHT_INDETERMINATE
     runner = Runner(dry_run=args.dry_run)
     claim_stack = contextlib.ExitStack()
+    # Only with --wait-for-quota-reset: SIGTERM during a quota wait becomes a
+    # clean, resumable quota stop; otherwise SIGTERM keeps its behaviour (#1601).
+    quota_wait_enabled = getattr(args, "wait_for_quota_reset", None) is not None
+    previous_sigterm = None
+    if quota_wait_enabled:
+        quota_wait.reset_wait_state()
+        previous_sigterm = quota_wait.install_sigterm_handler()
     try:
         # Preserve tokens (rather than a rendered command) so timeout guidance can
         # be safely shell-quoted locally. Programmatic callers have no sys.argv.
@@ -2951,8 +2969,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     except AgentLoopError as exc:
         print(f"agent-loop: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # An interrupt that cancelled a quota wait is a resumable quota stop;
+        # every other interrupt propagates unchanged.
+        message = quota_wait.interrupted_message() if quota_wait_enabled else None
+        if message is None:
+            raise
+        print(f"agent-loop: {message}", file=sys.stderr)
+        return QuotaResetExceededError.EXIT_CODE
     finally:
         claim_stack.close()
+        if quota_wait_enabled:
+            quota_wait.restore_sigterm_handler(previous_sigterm)
+            quota_wait.reset_wait_state()
     return 0
 
 

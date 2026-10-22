@@ -4656,6 +4656,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--mergeability-poll-interval-seconds", "--log-dir", "--subprocess-log-dir",
     "--subprocess-log-retention-days",
     "--progress-interval-seconds", "--agent-max-retries", "--agent-retry-backoff-seconds",
+    "--wait-for-quota-reset",
     "--agent-memory-dir", "--salvage-comment-patch-max-bytes", "--planning-context-mode",
     "--pr-review-context-mode", "--pr-review-policy", "--pr-review-broad-rule",
     "--expected-closing-issue",

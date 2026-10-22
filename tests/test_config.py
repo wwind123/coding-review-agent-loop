@@ -312,3 +312,45 @@ def test_retention_flag_is_a_recovery_value_option():
     from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS
 
     assert RETENTION_FLAG in _RECOVERY_VALUE_OPTIONS
+
+
+# --- #1601: --wait-for-quota-reset duration parsing --------------------------
+
+@pytest.mark.parametrize(
+    "value, seconds",
+    [("6h", 21600), ("90m", 5400), ("1h30m", 5400), ("3600", 3600), ("45s", 45), (" 2H ", 7200), ("24h", 86400)],
+)
+def test_quota_wait_duration_parses_to_seconds(value, seconds):
+    from coding_review_agent_loop.config import parse_quota_wait_duration
+
+    assert parse_quota_wait_duration(value) == seconds
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "25h", "garbage", "", "h", "1d", "0h0m", "1.5h"])
+def test_invalid_quota_wait_duration_names_the_option(value):
+    from coding_review_agent_loop.config import parse_quota_wait_duration
+
+    with pytest.raises(AgentLoopError, match="--wait-for-quota-reset"):
+        parse_quota_wait_duration(value)
+
+
+def test_quota_wait_option_reaches_config_and_defaults_off(tmp_path):
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.config import config_from_args
+    from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS
+
+    base_argv = [
+        "pr", "77", "--repo", "OWNER/REPO", "--reviewer", "codex",
+        "--codex-dir", str(tmp_path / "codex"), "--dangerous-agent-permissions",
+    ]
+    parser = build_parser()
+    assert config_from_args(parser.parse_args(base_argv), FakeRunner()).wait_for_quota_reset_seconds is None
+    config = config_from_args(parser.parse_args([*base_argv, "--wait-for-quota-reset", "1h30m"]), FakeRunner())
+    assert config.wait_for_quota_reset_seconds == 5400
+    with pytest.raises(AgentLoopError, match="--wait-for-quota-reset"):
+        config_from_args(parser.parse_args([*base_argv, "--wait-for-quota-reset", "0"]), FakeRunner())
+    assert "--wait-for-quota-reset" in _RECOVERY_VALUE_OPTIONS
+    assert make_config(tmp_path).wait_for_quota_reset_seconds is None
+    for bad in (0, -1, 86401, True, "6h"):
+        with pytest.raises(AgentLoopError, match="--wait-for-quota-reset"):
+            make_config(tmp_path, wait_for_quota_reset_seconds=bad)

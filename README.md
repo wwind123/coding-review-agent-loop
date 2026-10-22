@@ -998,7 +998,10 @@ tells an agent to relay a decision, the relay must be disclosed in the comment.
   installed and authenticated locally.
 - Agent CLIs can exhaust quota, time out, update themselves, or return malformed
   structured output. Retries, repair passes, and salvage reduce lost work but
-  cannot guarantee unattended completion.
+  cannot guarantee unattended completion. A usage limit with a parsed reset
+  stops the run (exit code 3) unless you opt in to waiting for it with
+  `--wait-for-quota-reset DURATION` (for example `6h`; see
+  [Waiting for a quota reset](docs/local_agent_loop.md#waiting-for-a-quota-reset)).
 - Default agent checkouts live under the system temporary directory (`/tmp` on
   Linux) and may disappear after a reboot or system cleanup. Configure explicit
   workdirs for long-lived installations.

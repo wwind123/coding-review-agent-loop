@@ -177,6 +177,16 @@ def _isolate_workdir_claims(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _reset_quota_wait_state():
+    """A cancelled quota wait (#1601) must not cancel a later test's waits."""
+    from coding_review_agent_loop import quota_wait
+
+    quota_wait.reset_wait_state()
+    yield
+    quota_wait.reset_wait_state()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_store_locks(tmp_path_factory):
     """Keep shared-store locks and owner records (#1162) off the real host lock root."""
     from coding_review_agent_loop import run_worktrees
