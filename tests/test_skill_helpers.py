@@ -1987,6 +1987,93 @@ class TestRunExternalRetries:
         assert calls["models"] == [("Gemini 3.8 Flash (High)",)] * 2
         assert sleeps == [1]
 
+    _CREDITS_OUTPUT = (
+        "error: Your AI credits balance is too low to continue.\n"
+        'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Resource has been exhausted '
+        '(e.g. check quota).","status":"RESOURCE_EXHAUSTED","error_code":429,'
+        '"code_kind":"http","retryable":true}'
+    )
+
+    def test_antigravity_credits_output_falls_back_with_credits_log(self, monkeypatch, capsys) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+
+        outcomes = [
+            AgentResult(text="", raw_output=self._CREDITS_OUTPUT, returncode=1),
+            AgentResult(text="final", returncode=0),
+        ]
+        calls, sleeps, _out, exit_code = self._invoke(monkeypatch, "antigravity", outcomes, max_retries=1)
+        assert exit_code == 0
+        assert calls["models"] == [("Gemini 3.8 Flash (High)",), ("Claude Opus 5.5 (Medium)",)]
+        assert sleeps == []
+        assert (
+            'Antigravity model "Gemini 3.8 Flash (High)" out of credits; '
+            'falling back to "Claude Opus 5.5 (Medium)"'
+        ) in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            'AGY_ERROR: {"status":"X","error_code":401,"message":"nope"}',
+            "Error: request timed out (code 429)\n"
+            'AGY_ERROR: {"status":"X","error_code":403,"message":"timeout"}',
+            "error: invalid api key",
+        ],
+    )
+    def test_antigravity_auth_failure_has_no_retry_or_fallback(self, monkeypatch, raw) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+
+        outcomes = [AgentResult(text="", raw_output=raw, returncode=1), AgentResult(text="never", returncode=0)]
+        calls, sleeps, _out, exit_code = self._invoke(monkeypatch, "antigravity", outcomes, max_retries=2)
+        assert exit_code == 1
+        assert calls["n"] == 1
+        assert sleeps == []
+
+    def test_antigravity_dirty_checkout_plus_credits_has_no_fallback(self, monkeypatch, capsys) -> None:
+        from coding_review_agent_loop.agents.base import AgentResult
+
+        outcomes = [
+            AgentResult(text="", raw_output=f"Error: dirty checkout\n{self._CREDITS_OUTPUT}", returncode=1),
+            AgentResult(text="never", returncode=0),
+        ]
+        calls, sleeps, _out, exit_code = self._invoke(monkeypatch, "antigravity", outcomes, max_retries=2)
+        assert exit_code == 1
+        assert calls["n"] == 1
+        assert sleeps == []
+        assert "out of credits" not in capsys.readouterr().err
+
+    def test_antigravity_target_exec_retry_outranks_auth_text(self, monkeypatch) -> None:
+        import helpers.run_external as rex
+        from coding_review_agent_loop.agents.base import AgentResult
+        from coding_review_agent_loop.containment import ContainmentEvidence
+        from coding_review_agent_loop.runner import CommandResult
+
+        monkeypatch.setattr(
+            rex.Runner, "target_exec_retry_decision",
+            lambda self, command, errno_value: (True, "agy being replaced; unauthorized (code 401)"),
+            raising=False,
+        )
+        failed = AgentResult(
+            text="",
+            raw_output="unauthorized",
+            returncode=127,
+            command_result=CommandResult(["agy", "exec"], Path("/tmp"), "", "", 127),
+            containment=ContainmentEvidence(
+                backend="systemd-cgroup-v2",
+                termination_cause="target-exec-error",
+                target_exec_errno=2,
+                cleanup_confirmed=True,
+                diagnostics=("target exec failed (2): missing",),
+            ),
+        )
+        outcomes = [failed, AgentResult(text="final", returncode=0)]
+        calls, sleeps, output_path, exit_code = self._invoke(
+            monkeypatch, "antigravity", outcomes, max_retries=1
+        )
+        assert exit_code == 0
+        assert calls["n"] == 2
+        assert sleeps == [1]
+        assert Path(output_path).read_text(encoding="utf-8") == "final"
+
     def test_writes_minimal_response_evidence_sidecar(self, monkeypatch, tmp_path) -> None:
         import helpers.run_external as rex
         from coding_review_agent_loop.agents.base import AgentResult

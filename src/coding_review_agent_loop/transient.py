@@ -248,6 +248,11 @@ class AntigravityCapacityClassification:
     diagnostic: str = ""
     # The provider-owned error frame(s) that matched (#1236); empty when none.
     frame: str = ""
+    # "credits" when a correlated credits-balance frame qualified (#1598).
+    reason: Literal["capacity", "credits"] = "capacity"
+    # Typed auth verdict (#1598): callers force non-retryable with no fallback
+    # unless a typed runner retry decision applies.
+    auth_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -271,6 +276,19 @@ _ANTIGRAVITY_CAPACITY_ONLY_RE = re.compile(
     r"(?i)high traffic|try again in a minute|overload|no capacity|capacity"
 )
 _ANTIGRAVITY_HARD_QUOTA_RE = re.compile(r"(?i)\bquota\b|resource[ _-]?exhausted")
+# Antigravity-only partition of NON_RETRYABLE_AGENT_OUTPUT_RE (#1598): auth and
+# dirty-checkout keep unconditional precedence; only billing/credit wording can
+# be exempted, and only by a correlated retryable credits frame.
+_ANTIGRAVITY_AUTH_RE = re.compile(
+    r"\bauth(?:entication|orization)?\b|unauthorized|forbidden|invalid api key", re.I
+)
+_ANTIGRAVITY_DIRTY_CHECKOUT_RE = re.compile(r"dirty (?:checkout|workdir|working tree)", re.I)
+_ANTIGRAVITY_BILLING_RE = re.compile(r"credit|billing", re.I)
+_ANTIGRAVITY_CREDITS_EXHAUSTED_RE = re.compile(r"(?i)credits?\s+balance\s+(?:is\s+)?too\s+low")
+_ANTIGRAVITY_NUMERIC_AUTH_TEXT_RE = re.compile(
+    r"(?i)\b(?:code|http|status|error)[ _:=\"']*(?:\(\s*)?(?:401|403)\b"
+)
+_ANTIGRAVITY_429_RE = re.compile(r"\b429\b")
 
 
 _ANTIGRAVITY_ERROR_LINE_RE = re.compile(r"(?i)^\s*(?:error|fatal)\s*[:\[]")
@@ -386,11 +404,100 @@ def classify_antigravity_quota_exhaustion(
     reset = _antigravity_frame_reset_seconds(frame)
     if reset is not None:
         return QuotaExhaustion(reset, "parsed", frame) if reset > threshold else None
+    if capacity.reason == "credits":
+        # The credits exemption already rejected capacity-only wording (#1598).
+        return QuotaExhaustion(None, "cooldown", frame)
     if _ANTIGRAVITY_CAPACITY_ONLY_RE.search(frame):
         return None
     if _ANTIGRAVITY_HARD_QUOTA_RE.search(frame):
         return QuotaExhaustion(None, "cooldown", frame)
     return None
+
+
+def _antigravity_frame_json(frame: str) -> dict | None:
+    """Parsed JSON object of an AGY_ERROR or bare JSON error frame, or None."""
+    body = frame.strip()
+    if _ANTIGRAVITY_AGY_ERROR_RE.match(body):
+        body = body.split(":", 1)[1].strip()
+    if not body.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _antigravity_frame_numeric_auth(frame: str) -> bool:
+    """True when one provider frame carries a numeric 401/403 status."""
+    parsed = _antigravity_frame_json(frame)
+    if parsed is not None:
+        candidates = [parsed]
+        if isinstance(parsed.get("error"), dict):
+            candidates.append(parsed["error"])
+        for candidate in candidates:
+            for key in ("error_code", "code", "status"):
+                if _status_value(candidate.get(key)) in (401, 403):
+                    return True
+    return bool(_ANTIGRAVITY_NUMERIC_AUTH_TEXT_RE.search(frame))
+
+
+def _antigravity_frame_qualifies_for_credits(frame: str) -> bool:
+    """A provider-retryable frame: AGY_ERROR ``retryable: true`` or 429 RESOURCE_EXHAUSTED."""
+    # The retryable-only verdict is agy's own: bare JSON (which a transcript can
+    # print) must show 429 with RESOURCE_EXHAUSTED instead.
+    if _ANTIGRAVITY_AGY_ERROR_RE.match(frame):
+        parsed = _antigravity_frame_json(frame)
+        if parsed is not None and parsed.get("retryable") is True:
+            return True
+    return bool(_ANTIGRAVITY_429_RE.search(frame)) and bool(
+        re.search(r"(?i)resource[ _-]?exhausted", frame)
+    )
+
+
+def _antigravity_credits_exemption(
+    text: str,
+    window_frames: list[tuple[list[str], int]],
+    nonempty_count: int,
+) -> AntigravityCapacityClassification:
+    """Capacity only for credits wording correlated with a terminal retryable frame (#1598).
+
+    The credits-balance wording must sit inside the qualifying frame itself or in
+    the provider error line ending on the non-empty line immediately before it.
+    Credits wording anywhere else in the transcript never qualifies.
+    """
+    for position, (chunk, last) in enumerate(window_frames):
+        if last < nonempty_count - 3:
+            continue
+        frame = "\n".join(chunk)
+        if not _antigravity_frame_qualifies_for_credits(frame):
+            continue
+        correlated: list[str] = []
+        if position > 0:
+            previous_chunk, previous_last = window_frames[position - 1]
+            first_nonempty = last - len([line for line in chunk if line.strip()]) + 1
+            if (
+                previous_last == first_nonempty - 1
+                and _ANTIGRAVITY_ERROR_LINE_RE.match(previous_chunk[0])
+            ):
+                correlated = previous_chunk
+        error_line = "\n".join(correlated)
+        if not (
+            _ANTIGRAVITY_CREDITS_EXHAUSTED_RE.search(frame)
+            or (error_line and _ANTIGRAVITY_CREDITS_EXHAUSTED_RE.search(error_line))
+        ):
+            continue
+        if _ANTIGRAVITY_CAPACITY_ONLY_RE.search(frame) or (
+            error_line and _ANTIGRAVITY_CAPACITY_ONLY_RE.search(error_line)
+        ):
+            continue
+        stripped = text.strip()
+        diagnostic = (
+            stripped if len(stripped) <= 2400 else f"{stripped[:1200]}\n{stripped[-1200:]}"
+        )
+        matched = f"{error_line}\n{frame}" if error_line else frame
+        return AntigravityCapacityClassification(True, diagnostic, matched, reason="credits")
+    return AntigravityCapacityClassification(False)
 
 
 def classify_antigravity_capacity(
@@ -406,12 +513,27 @@ def classify_antigravity_capacity(
     error line (or its adjacent detail line), a compact JSON error line, or an
     unframed standalone provider diagnostic qualifies. Framed provider errors
     must be terminal output so unrelated transcript wording cannot suppress a
-    real capacity failure; authentication/billing retain non-retryable precedence.
+    real capacity failure. Authentication (auth words or a terminal 401/403
+    frame) and dirty checkouts retain non-retryable precedence; billing wording
+    is exempt only for a correlated Antigravity credits-balance frame (#1598).
     """
     if (returncode in (None, 0) and not empty_response) or not text.strip():
         return AntigravityCapacityClassification(False)
-    if NON_RETRYABLE_AGENT_OUTPUT_RE.search(text):
+    raw_window = _antigravity_retained_window(text)
+    window_frames = _antigravity_provider_frames(raw_window)
+    nonempty_count = len([line for line in raw_window if line.strip()])
+    # Ordered precedence (#1598): auth, then dirty checkout, then billing (which
+    # only a correlated credits frame can exempt), then the capacity signatures.
+    if _ANTIGRAVITY_AUTH_RE.search(text) or any(
+        _antigravity_frame_numeric_auth("\n".join(chunk))
+        for chunk, last in window_frames
+        if last >= nonempty_count - 3
+    ):
+        return AntigravityCapacityClassification(False, auth_failure=True)
+    if _ANTIGRAVITY_DIRTY_CHECKOUT_RE.search(text):
         return AntigravityCapacityClassification(False)
+    if _ANTIGRAVITY_BILLING_RE.search(text):
+        return _antigravity_credits_exemption(text, window_frames, nonempty_count)
     # A provider normally prints its failure at either end; retaining a bounded
     # tail avoids accepting a capacity phrase from an unrelated long transcript.
     stripped = text.strip()
@@ -422,8 +544,6 @@ def classify_antigravity_capacity(
     def has_signature(value: str) -> bool:
         return any(signature in value.lower() for signature in lowered_signatures)
 
-    window_frames = _antigravity_provider_frames(_antigravity_retained_window(text))
-    nonempty_count = len([line for line in _antigravity_retained_window(text) if line.strip()])
     terminal_frames = [
         "\n".join(chunk)
         for chunk, last in window_frames
