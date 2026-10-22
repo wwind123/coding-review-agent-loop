@@ -667,3 +667,28 @@ def test_non_antigravity_credit_and_billing_classification_unchanged() -> None:
         _ev(type="turn.failed", error={"message": "billing hard limit reached"})
     )
     assert (billing.category, billing.billing) == ("non-retryable", True)
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        '{"message":"credits balance too low","code":402,"retryable":true}',
+        '{"error":{"message":"x","code":402},"retryable":true}',
+        'AGY_ERROR: {"status":"FAILED_PRECONDITION","error_code":402,"retryable":false}',
+    ],
+)
+def test_antigravity_credits_need_agy_retryable_or_429_resource_exhausted(frame) -> None:
+    # Only agy's own AGY_ERROR retryable verdict, or 429 with RESOURCE_EXHAUSTED,
+    # qualifies; bare JSON retryable=true alone never does.
+    for text in (frame, f"{_CREDITS_LINE}\n{frame}"):
+        capacity = _agy(text)
+        assert not capacity.is_capacity and capacity.reason != "credits", text
+        assert transient.classify_antigravity_quota_exhaustion(capacity) is None
+
+
+def test_antigravity_bare_json_429_resource_exhausted_still_qualifies() -> None:
+    capacity = _agy(
+        f"{_CREDITS_LINE}\n"
+        '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"exhausted"}}'
+    )
+    assert capacity.is_capacity and capacity.reason == "credits"

@@ -763,3 +763,18 @@ def test_typed_target_exec_retry_outranks_antigravity_auth_verdict(tmp_path, aut
     assert len(sleeps) == 1
     assert any("transient failure" in line for line in logs)
     assert not any("non-retryable" in line for line in logs)
+
+
+def test_bare_json_retryable_credits_frame_causes_no_quota_marking_or_fallback(tmp_path):
+    output = (
+        "error: Your AI credits balance is too low to continue.\n"
+        '{"message":"credits balance too low","code":402,"retryable":true}'
+    )
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, sleeps, logs = _turn(
+            tmp_path, [_fail(output), ("never", 0)], antigravity_models=(GEM1, OPUS),
+        )
+        assert not _gemini_marked()
+    assert error is not None and error.failure_category == "non-retryable"
+    assert models == [GEM1] and sleeps == []
+    assert not any("out of credits" in line for line in logs)

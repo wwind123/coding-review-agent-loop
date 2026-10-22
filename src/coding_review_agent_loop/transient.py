@@ -444,9 +444,12 @@ def _antigravity_frame_numeric_auth(frame: str) -> bool:
 
 def _antigravity_frame_qualifies_for_credits(frame: str) -> bool:
     """A provider-retryable frame: AGY_ERROR ``retryable: true`` or 429 RESOURCE_EXHAUSTED."""
-    parsed = _antigravity_frame_json(frame)
-    if parsed is not None and parsed.get("retryable") is True:
-        return True
+    # The retryable-only verdict is agy's own: bare JSON (which a transcript can
+    # print) must show 429 with RESOURCE_EXHAUSTED instead.
+    if _ANTIGRAVITY_AGY_ERROR_RE.match(frame):
+        parsed = _antigravity_frame_json(frame)
+        if parsed is not None and parsed.get("retryable") is True:
+            return True
     return bool(_ANTIGRAVITY_429_RE.search(frame)) and bool(
         re.search(r"(?i)resource[ _-]?exhausted", frame)
     )
