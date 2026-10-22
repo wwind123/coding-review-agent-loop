@@ -1715,8 +1715,9 @@ Other important boundaries:
   CLIs may still consume substantial CPU, memory, network, and provider quota.
 - Raw subprocess logs and salvage artifacts can contain sensitive repository
   context. Protect access to the configured log directories and review their
-  retention settings. Old subprocess capture directories are pruned after 14
-  days by default; `--subprocess-log-retention-days N` (or
+  retention settings. Old subprocess capture directories in the
+  `subprocess-logs/<slug>/` layout (including an explicit
+  `--subprocess-log-dir` in that layout) are pruned after 14 days by default; `--subprocess-log-retention-days N` (or
   `AGENT_LOOP_SUBPROCESS_LOG_RETENTION_DAYS`) changes that, and `0` or `never`
   disables pruning. Archive captures elsewhere for long-term storage; see
   [Logs](docs/local_agent_loop.md#logs).
