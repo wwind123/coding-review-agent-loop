@@ -2031,3 +2031,135 @@ def test_codex_oversized_structured_billing_error_gets_billing_suggestion(tmp_pa
     assert n == 1 and sleeps == []
     text = str(out)
     assert "non-retryable" in text and "billing" in text and "authenticated" not in text
+
+
+# --- Codex plan usage limits (#1281) -----------------------------------------
+
+_USAGE_HEAD = (
+    "You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing), "
+    "visit https://chatgpt.com/codex/settings/usage to purchase more credits"
+)
+
+
+def _short_clock(minutes_ahead=2):
+    import datetime
+    import zoneinfo
+
+    target = datetime.datetime.now(zoneinfo.ZoneInfo("America/Los_Angeles")) + datetime.timedelta(
+        minutes=minutes_ahead
+    )
+    return target.strftime("%I:%M %p").lstrip("0")
+
+
+@pytest.fixture
+def _la_tz(monkeypatch):
+    monkeypatch.setenv("TZ", "America/Los_Angeles")
+
+
+def _spy_reset_parse(monkeypatch):
+    parsed: list[str] = []
+    real = validated_agent._parse_rate_limit_reset_seconds
+
+    def spy(text, **kwargs):
+        parsed.append(text)
+        return real(text, **kwargs)
+
+    monkeypatch.setattr(validated_agent, "_parse_rate_limit_reset_seconds", spy)
+    return parsed
+
+
+@pytest.mark.parametrize("shape", ["message", "turn_failed"])
+def test_codex_usage_limit_long_reset_raises_quota_reset_once(tmp_path, _la_tz, shape):
+    message = f"{_USAGE_HEAD} or try again at Oct 23rd, 2099 3:05 PM."
+    raw = (
+        _codex_stream(message=message)
+        if shape == "message"
+        else _codex_stream(error={"message": message})
+    )
+    calls = {"n": 0}
+
+    def mock_run(_runner, **_kwargs):
+        calls["n"] += 1
+        return AgentResult(text="", raw_output=raw, returncode=1, provider="codex")
+
+    config = make_config(tmp_path, reviewer="codex", agent_max_retries=2)
+    runner = FakeRunner()
+    with patch_object_in((validated_agent, response_validation), "run_agent_result", mock_run):
+        with pytest.raises(QuotaResetExceededError) as excinfo:
+            _run_validated_agent(
+                runner, agent="codex", config=config, prompt="Review.",
+                marker_description="test", validate=lambda text: text, role="reviewer",
+            )
+    assert calls["n"] == 1
+    assert [c for c, _cwd in runner.commands if c and c[0] == "sleep"] == []
+    text = str(excinfo.value)
+    assert "Codex quota exhausted. Reset in" in text
+    assert "deterministic" not in text and "billing / credit balance" not in text
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _codex_stream(message=f"{_USAGE_HEAD}."),
+        _codex_stream(error={"code": "usage_limit_reached", "message": "Usage limit reached"}),
+    ],
+)
+def test_codex_usage_limit_without_reset_is_bounded_transient_with_quota_suggestion(tmp_path, raw):
+    n, sleeps, out = _drive_codex(tmp_path, [raw], retries=2)
+    assert n == 3 and len(sleeps) == 2
+    assert isinstance(out, AgentInvocationError)
+    assert out.failure_category == "transient"
+    text = str(out)
+    assert "deterministic" not in text and "non-retryable" not in text
+    assert "wait for quota reset" in text
+    assert "billing / credit balance" not in text
+
+
+def test_codex_usage_limit_short_reset_follows_ordinary_retry(tmp_path, _la_tz):
+    raw = _codex_stream(message=f"{_USAGE_HEAD} or try again at {_short_clock()}.")
+    n, sleeps, out = _drive_codex(tmp_path, [raw, None], retries=2)
+    assert n == 2 and len(sleeps) == 1 and out.text == "valid"
+
+
+def test_codex_earlier_long_reset_does_not_drive_quota_stop_without_terminal_reset(
+    tmp_path, monkeypatch
+):
+    raw = "\n".join([
+        json.dumps({"type": "error", "message": "rate limit reached; try again in 2 days"}),
+        json.dumps({"type": "turn.failed", "error": {"message": f"{_USAGE_HEAD}."}}),
+    ])
+    parsed = _spy_reset_parse(monkeypatch)
+    n, sleeps, out = _drive_codex(tmp_path, [raw], retries=2)
+    assert n == 3 and len(sleeps) == 2
+    assert isinstance(out, AgentInvocationError)
+    assert out.failure_category == "transient"
+    assert parsed and all("2 days" not in text for text in parsed)
+    # The verdict text still carries the supporting error for diagnostics.
+    from coding_review_agent_loop import transient
+
+    assert "try again in 2 days" in transient.classify_codex_failure(raw).text
+
+
+def test_codex_earlier_long_reset_yields_to_terminal_short_reset(tmp_path, _la_tz, monkeypatch):
+    raw = "\n".join([
+        json.dumps({"type": "error", "message": "rate limit reached; try again in 2 days"}),
+        json.dumps({"type": "turn.failed", "error": {
+            "message": f"{_USAGE_HEAD} or try again at {_short_clock()}."}}),
+    ])
+    parsed = _spy_reset_parse(monkeypatch)
+    n, sleeps, out = _drive_codex(tmp_path, [raw, None], retries=2)
+    assert n == 2 and len(sleeps) == 1 and out.text == "valid"
+    assert parsed and all("2 days" not in text for text in parsed)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"message": f"{_USAGE_HEAD}.", "status": 401},
+        {"message": f"unauthorized: {_USAGE_HEAD}."},
+    ],
+)
+def test_codex_usage_limit_with_auth_is_not_retried(tmp_path, error):
+    n, sleeps, out = _drive_codex(tmp_path, [_codex_stream(error=error)], retries=2)
+    assert n == 1 and sleeps == []
+    assert out.failure_category == "non-retryable"

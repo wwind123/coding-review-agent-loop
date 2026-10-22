@@ -692,3 +692,259 @@ def test_antigravity_bare_json_429_resource_exhausted_still_qualifies() -> None:
         '{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","message":"exhausted"}}'
     )
     assert capacity.is_capacity and capacity.reason == "credits"
+
+
+# --- Codex plan usage limits (#1281) -----------------------------------------
+
+import datetime as _dt  # noqa: E402
+import zoneinfo as _zi  # noqa: E402
+
+_USAGE = (
+    "You've hit your usage limit. Upgrade to Pro (https://openai.com/chatgpt/pricing), "
+    "visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:05 PM."
+)
+_USAGE_PLAIN = "You've hit your usage limit. Try again at 3:05 PM."
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _ev(type="error", message=_USAGE),
+        _ev(type="turn.failed", error={"message": _USAGE}),
+        _stream(_TOOL, _ev(type="error", message=_USAGE), _ev(type="turn.failed", error={"message": _USAGE})),
+        _ev(type="error", message=_USAGE_PLAIN),
+        _ev(type="turn.failed", error={"code": "usage_limit_reached", "message": "Usage limit reached"}),
+    ],
+)
+def test_codex_usage_limit_is_transient_not_billing(raw) -> None:
+    verdict = transient.classify_codex_failure(raw)
+    assert verdict.source == "structured"
+    assert (verdict.category, verdict.billing) == ("transient", False)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"message": f"payment required. {_USAGE}"},
+        {"message": f"insufficient_quota: {_USAGE}"},
+        {"message": _USAGE, "status": 402},
+        {"message": "402 usage limit exceeded"},
+    ],
+)
+def test_hard_billing_beats_usage_limit(error) -> None:
+    verdict = transient.classify_codex_failure(_ev(type="turn.failed", error=error))
+    assert (verdict.category, verdict.billing) == ("non-retryable", True)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        {"message": _USAGE, "status": 401},
+        {"message": _USAGE, "status": 403},
+        {"message": f"unauthorized: {_USAGE_PLAIN}"},
+        {"message": f"invalid api key; {_USAGE_PLAIN}"},
+    ],
+)
+def test_auth_beats_usage_limit_structured(error) -> None:
+    verdict = transient.classify_codex_failure(_ev(type="turn.failed", error=error))
+    assert (verdict.category, verdict.billing) == ("non-retryable", False)
+
+
+@pytest.mark.parametrize(
+    "stderr,expected",
+    [
+        (f"ERROR: {_USAGE}", "transient"),
+        (f"ERROR: unauthorized. {_USAGE_PLAIN}", "non-retryable"),
+        (f"ERROR: invalid api key. {_USAGE_PLAIN}", "non-retryable"),
+        # Auth evidence keeps the legacy stderr chain, which never matched a bare 401.
+        (f"ERROR: 401 {_USAGE_PLAIN}", "deterministic"),
+        (f"refusing: dirty checkout. {_USAGE_PLAIN}", "non-retryable"),
+        ("ERROR: credit balance too low", "non-retryable"),
+    ],
+)
+def test_usage_limit_stderr_path(stderr, expected) -> None:
+    verdict = transient.classify_codex_failure(_stream(_ev(type="turn.started"), stderr))
+    assert verdict.source == "stderr"
+    assert (verdict.category, verdict.billing) == (expected, False)
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["Your credit balance is too low to access the API.", "billing hard limit has been reached"],
+)
+def test_plain_billing_without_usage_limit_stays_billing(message) -> None:
+    verdict = transient.classify_codex_failure(_ev(type="turn.failed", error={"message": message}))
+    assert (verdict.category, verdict.billing) == ("non-retryable", True)
+
+
+def test_usage_limit_warning_then_deterministic_terminal_stays_deterministic() -> None:
+    raw = _stream(
+        _ev(type="error", message=_USAGE),
+        _ev(type="turn.failed", error={"message": "model produced an invalid patch"}),
+    )
+    verdict = transient.classify_codex_failure(raw)
+    assert verdict.category == "deterministic"
+    assert _USAGE in verdict.text
+
+
+def test_authoritative_text_is_only_the_authoritative_error() -> None:
+    raw = _stream(
+        _ev(type="error", message="rate limit; try again in 2 days"),
+        _ev(type="turn.failed", error={"message": _USAGE_PLAIN}),
+    )
+    verdict = transient.classify_codex_failure(raw)
+    assert verdict.authoritative_text == f"message: {_USAGE_PLAIN}"
+    assert "try again in 2 days" in verdict.text
+    stderr_only = transient.classify_codex_failure(_stream(_ev(type="turn.started"), "boom"))
+    assert stderr_only.authoritative_text == ""
+    none = transient.classify_codex_failure(_ev(type="turn.started"))
+    assert none.source == "none" and none.authoritative_text == ""
+
+
+def test_usage_limit_signal_is_narrow() -> None:
+    for text in ("usage: agent-loop [options]", "line limit exceeded", "memory usage limit"):
+        assert not transient._USAGE_LIMIT_RE.search(text)
+
+
+def test_quota_regex_matches_usage_limit_wording() -> None:
+    assert agent_failure._QUOTA_RATE_LIMIT_RE.search(_USAGE)
+    assert agent_failure._QUOTA_RATE_LIMIT_RE.search("usage_limit_reached")
+    suggestion = agent_failure._failure_suggestion("transient", "agent command exited with 1", "codex",
+                                                  classification_text=_USAGE)
+    assert "wait for quota reset" in suggestion
+
+
+# --- try-again-at / day-unit reset parsing (#1281) ----------------------------
+
+_LA = _zi.ZoneInfo("America/Los_Angeles")
+_UTC = _dt.timezone.utc
+
+
+def _at(text: str, now: _dt.datetime, tz=_LA):
+    return reset_parsing._parse_try_again_at_seconds(text, now_utc=now, local_tz=tz)
+
+
+def test_try_again_at_bare_time_later_today() -> None:
+    now = _dt.datetime(2026, 10, 22, 21, 0, tzinfo=_UTC)  # 14:00 PDT
+    assert _at(_USAGE, now) == 65 * 60
+    assert _at("try again at 3:05 p.m.", now) == 65 * 60
+
+
+def test_try_again_at_bare_time_rolls_to_next_day() -> None:
+    now = _dt.datetime(2026, 10, 22, 23, 0, tzinfo=_UTC)  # 16:00 PDT
+    assert _at("try again at 3:05 PM", now) == 23 * 3600 + 5 * 60
+
+
+def test_try_again_at_with_day_and_month() -> None:
+    now = _dt.datetime(2026, 10, 22, 21, 0, tzinfo=_UTC)
+    assert _at("try again at 3:05 PM on 23 Oct.", now) == 24 * 3600 + 65 * 60
+
+
+def test_try_again_at_month_ordinal_year() -> None:
+    now = _dt.datetime(2026, 10, 22, 21, 0, tzinfo=_UTC)
+    assert _at("try again at Oct 23rd, 2026 3:05 PM.", now) == 24 * 3600 + 65 * 60
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "try again at Oct 21st, 2026 3:05 PM",  # past
+        "try again at 3:05 PM on 21 Oct",  # past, no year
+        "try again at 13:05 PM",  # invalid hour
+        "try again at 3:75 PM",  # invalid minute
+        "try again at Foo 23rd, 2026 3:05 PM",  # unknown month
+        "try again at 3:05 PM on 31 Feb",  # invalid day
+        "try again later",
+    ],
+)
+def test_try_again_at_fail_safe(text) -> None:
+    now = _dt.datetime(2026, 10, 22, 21, 0, tzinfo=_UTC)
+    assert _at(text, now) is None
+    assert reset_parsing._parse_rate_limit_reset_seconds(text, now_utc=now) is None
+
+
+def test_try_again_at_spring_forward_gap_is_none() -> None:
+    now = _dt.datetime(2026, 3, 8, 8, 0, tzinfo=_UTC)  # 00:00 PST
+    assert _at("try again at Mar 8th, 2026 2:30 AM", now) is None
+    assert _at("try again at 2:30 AM on 8 Mar", now) is None
+
+
+def test_try_again_at_ambiguous_fall_back_takes_earliest_future() -> None:
+    before = _dt.datetime(2026, 11, 1, 8, 0, tzinfo=_UTC)  # 01:00 PDT
+    assert _at("try again at 1:30 AM", before) == 30 * 60  # 1:30 PDT
+    between = _dt.datetime(2026, 11, 1, 8, 45, tzinfo=_UTC)  # 01:45 PDT
+    assert _at("try again at 1:30 AM", between) == 45 * 60  # 1:30 PST = 09:30Z
+
+
+def test_try_again_in_days() -> None:
+    parse = reset_parsing._parse_rate_limit_reset_seconds
+    assert parse("try again in 2 days 3 hours") == 183600
+    assert parse("try again in 2 days 3 hours 5 minutes") == 183600 + 300
+    assert parse("try again in 1 day") == 86400
+    assert parse("resets in 2d 1h") == 2 * 86400 + 3600
+
+
+def test_legacy_reset_forms_unchanged() -> None:
+    parse = reset_parsing._parse_rate_limit_reset_seconds
+    now = _dt.datetime(2026, 10, 22, 21, 0, tzinfo=_UTC)
+    assert parse("Retry-After: 30") == 30
+    assert parse("retryDelay: '12s'") == 12
+    assert parse("try again in 1h 2m 3s") == 3723
+    assert parse("resets in 4 hours") == 14400
+    assert parse("reset at 2026-10-22T22:00:00Z", now_utc=now) == 3600
+    assert parse("resets 3pm (America/Los_Angeles)", now_utc=now) == 3600
+    # Earlier forms keep precedence over the new try-again-at form.
+    assert parse("retry after 7; try again at 3:05 PM", now_utc=now) == 7
+
+
+_PDT_FALLBACK_NOW = _dt.datetime(2026, 11, 1, 8, 59, tzinfo=_UTC)
+
+
+@pytest.mark.parametrize(
+    "tz_value",
+    ["America/Los_Angeles", ":America/Los_Angeles", "TZFILE", ":TZFILE"],
+)
+def test_production_default_uses_explicit_tz_rules(monkeypatch, tz_value) -> None:
+    tzfile = Path("/usr/share/zoneinfo/America/Los_Angeles")
+    if "TZFILE" in tz_value:
+        if not tzfile.exists():
+            pytest.skip("system tzdata not installed")
+        tz_value = tz_value.replace("TZFILE", str(tzfile))
+    monkeypatch.setenv("TZ", tz_value)
+    consulted = []
+    monkeypatch.setattr(reset_parsing, "_load_localtime_zone", lambda: consulted.append(1) or _zi.ZoneInfo("Europe/Berlin"))
+    text = "try again at 2:01 AM"
+    assert reset_parsing._parse_rate_limit_reset_seconds(text, now_utc=_PDT_FALLBACK_NOW) == 3720
+    assert consulted == []
+
+
+def test_production_default_reads_localtime_when_tz_unset(monkeypatch) -> None:
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setattr(reset_parsing, "_load_localtime_zone", lambda: _LA)
+    assert reset_parsing._parse_rate_limit_reset_seconds(
+        "try again at 2:01 AM", now_utc=_PDT_FALLBACK_NOW
+    ) == 3720
+
+
+@pytest.mark.parametrize("tz_value", ["PST8PDT,M3.2.0,M11.1.0", "", ":", "Not/AZone", "/nonexistent/tzfile"])
+def test_unsupported_explicit_tz_returns_none_without_localtime(monkeypatch, tz_value) -> None:
+    monkeypatch.setenv("TZ", tz_value)
+    consulted = []
+    monkeypatch.setattr(
+        reset_parsing, "_load_localtime_zone",
+        lambda: consulted.append(1) or _zi.ZoneInfo("Europe/Berlin"),
+    )
+    assert reset_parsing._host_local_zone() is None
+    assert reset_parsing._parse_rate_limit_reset_seconds(
+        "try again at 2:01 AM", now_utc=_PDT_FALLBACK_NOW
+    ) is None
+    assert consulted == []
+
+
+def test_unreadable_localtime_returns_none(monkeypatch) -> None:
+    monkeypatch.delenv("TZ", raising=False)
+    monkeypatch.setattr(reset_parsing, "_LOCALTIME_PATH", "/nonexistent/localtime")
+    assert reset_parsing._host_local_zone() is None
+    assert reset_parsing._parse_rate_limit_reset_seconds(
+        "try again at 2:01 AM", now_utc=_PDT_FALLBACK_NOW
+    ) is None

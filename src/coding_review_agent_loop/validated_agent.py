@@ -1740,6 +1740,9 @@ def _run_validated_agent_in_scope(
                 )
                 continue
         should_retry = False
+        # Codex structured verdicts read the reset from the authoritative error
+        # only (#1281); None falls back to the whole classification text.
+        reset_evidence_text: str | None = None
         provider_capacity = False
         capacity = None
         if artifact_contract_refusal is not None:
@@ -1806,6 +1809,8 @@ def _run_validated_agent_in_scope(
                 if provider_verdict is not None and provider_verdict.source == "structured"
                 else None
             )
+            if structured_verdict is not None:
+                reset_evidence_text = structured_verdict.authoritative_text
             should_retry = (
                 target_exec_retryable
                 or replacement_stability_failed
@@ -1855,6 +1860,8 @@ def _run_validated_agent_in_scope(
                 if provider_verdict is not None and provider_verdict.source == "structured"
                 else None
             )
+            if structured_verdict is not None:
+                reset_evidence_text = structured_verdict.authoritative_text
             should_retry = replacement_stability_failed or (
                 structured_verdict.category == "transient"
                 if structured_verdict is not None
@@ -2953,8 +2960,12 @@ def _run_validated_agent_in_scope(
                         raise _antigravity_stop_error(
                             classification_text, shared_limit=quota_transition == "shared-limit"
                         )
-            elif _QUOTA_RATE_LIMIT_RE.search(classification_text):
-                reset_secs = _parse_rate_limit_reset_seconds(classification_text)
+            elif _QUOTA_RATE_LIMIT_RE.search(
+                reset_text := (
+                    reset_evidence_text if reset_evidence_text is not None else classification_text
+                )
+            ):
+                reset_secs = _parse_rate_limit_reset_seconds(reset_text)
                 if reset_secs is not None and reset_secs > LONG_RESET_THRESHOLD_SECONDS:
                     raise _quota_reset_error(reset_secs, classification_text)
             transition = (
