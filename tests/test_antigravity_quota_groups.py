@@ -1099,3 +1099,107 @@ def test_every_terminal_error_names_each_located_agy_log(
     assert len(runner.written_agy_logs) == len(agy_logs)
     for path in runner.written_agy_logs:
         assert f"agy log: {path}." in str(error)
+
+
+# --- the post-exit agy log lookup is taken under the settings lock (#1614) ----
+
+def _spy_attempt_log_lookup(monkeypatch, on_call):
+    live = _live_agy()
+    real = live.find_antigravity_attempt_log
+    calls: list[tuple] = []
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        on_call()
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(live, "find_antigravity_attempt_log", spy)
+    return calls
+
+
+def test_silent_attempt_lists_agy_logs_while_the_settings_lock_is_held(
+    tmp_path, _isolated_agy_log_dir, monkeypatch
+):
+    import fcntl
+
+    live = _live_agy()
+    settings_path = tmp_path / "agy-settings" / "settings.json"
+    monkeypatch.setattr(live, "_antigravity_settings_path", lambda: settings_path)
+    probes: list[str] = []
+
+    def probe_lock():
+        with settings_path.with_suffix(".json.lock").open("a+") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                probes.append("held")
+            else:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                probes.append("free")
+
+    calls = _spy_attempt_log_lookup(monkeypatch, probe_lock)
+    with workdir_claims.workdir_claim_scope():
+        response, error, models, logs, _repairs, runner = _silent_turn(
+            tmp_path, _isolated_agy_log_dir, [SILENT, ("ok review", 0)], [AGY_429_LOG, None],
+            antigravity_models=(GEM1, OPUS),
+        )
+        assert agy.quota_memory_for_current_run().entry("gemini") is not None
+    assert error is None and response.model_used == OPUS
+    assert len(calls) == 1 and probes == ["held"]
+    assert any(
+        f"agy log {runner.written_agy_logs[0].name} shows RESOURCE_EXHAUSTED" in line
+        for line in logs
+    )
+
+
+def test_agy_log_created_after_the_locked_lookup_is_never_a_candidate(
+    tmp_path, _isolated_agy_log_dir, monkeypatch
+):
+    import os
+    import time
+
+    live = _live_agy()
+    monkeypatch.setattr(
+        live, "_antigravity_settings_path", lambda: tmp_path / "agy-settings" / "settings.json"
+    )
+    spawn = time.time()
+    intruder = _isolated_agy_log_dir / agy_log_name(spawn + 1)
+    real_remove = live._remove_own_settings_lock_holder
+
+    def plant_then_release(*args, **kwargs):
+        # Another agent-loop turn's 429 log, inside this attempt's windows,
+        # appears after the lookup but before the settings lock is released.
+        intruder.write_text(AGY_429_LOG, encoding="utf-8")
+        os.utime(intruder, (spawn + 0.5, spawn + 0.5))
+        return real_remove(*args, **kwargs)
+
+    monkeypatch.setattr(live, "_remove_own_settings_lock_holder", plant_then_release)
+    with workdir_claims.workdir_claim_scope():
+        _r, error, models, logs, repairs, _runner = _silent_turn(
+            tmp_path, _isolated_agy_log_dir, [SILENT], [None],
+            spawn_wall_time=spawn, antigravity_models=(GEM1, OPUS), agent_max_retries=0,
+        )
+        assert agy.quota_memory_for_current_run().entry("gemini") is None
+    assert intruder.exists()
+    # The same file would have been the single candidate for a later listing.
+    assert live.find_antigravity_attempt_log(
+        _isolated_agy_log_dir, frozenset(), spawn, spawn + 1
+    ).log_path == intruder
+    assert isinstance(error, AgentInvocationError)
+    assert "Antigravity unavailable" not in str(error)
+    assert intruder.name not in str(error)
+    assert models == [GEM1] and repairs == [1]
+    assert not any("treating as quota exhaustion" in line for line in logs)
+    assert any("no new matching agy log" in line for line in logs)
+
+
+def test_non_silent_turn_does_not_list_agy_logs(tmp_path, _isolated_agy_log_dir, monkeypatch):
+    calls = _spy_attempt_log_lookup(monkeypatch, lambda: None)
+    with workdir_claims.workdir_claim_scope():
+        response, error, models, _logs, repairs, _runner = _silent_turn(
+            tmp_path, _isolated_agy_log_dir, [("ok review", 0)], [None],
+            antigravity_models=(GEM1, OPUS),
+        )
+    assert error is None and response.model_used == GEM1
+    assert models == [GEM1] and repairs == []
+    assert calls == []
