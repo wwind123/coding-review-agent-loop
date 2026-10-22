@@ -44,6 +44,7 @@ from .round_state import (
 )
 from .partial_round_recovery import PartialRoundRecovery, RecoveryTarget
 from .publication_resume import PublicationResumeStop
+from . import quota_wait
 from .scratch import make_private_dirs
 from .review_spool import (
     PRIVATE_DIR_NAME,
@@ -1305,6 +1306,8 @@ def _launch_reviewer_turns(
             for future in as_completed(futures):
                 results[futures[future]] = future.result()
         except KeyboardInterrupt:
+            # Wake workers sleeping out a quota reset before the shutdown join (#1601).
+            quota_wait.cancel_active_waits()
             runner.terminate_active_processes()
             raise
         finally:

@@ -1043,7 +1043,7 @@ The default Antigravity chain is `Gemini 3.8 Flash (High)` → `Gemini 3.7 Flash
 - **Credits exception.** agy's `credits balance is too low` error is billing wording, but the balance belongs to a model family, not the account. It counts as quota exhaustion (the group cools down and the chain falls back, logging `Antigravity model "<failed>" out of credits; falling back to "<next>"`) only when the credits wording sits in a terminal provider frame that shows `429` with `RESOURCE_EXHAUSTED` or an `AGY_ERROR` JSON `"retryable": true`, or in the provider error line immediately before that frame. Credits wording elsewhere in the transcript never qualifies. Auth words (`unauthorized`, `forbidden`, `invalid api key`, `authentication`), a numeric 401/403 in a terminal provider frame, and dirty-checkout failures take precedence: they are non-retryable with no retry or fallback, even when the same output also has timeout or `429` wording, unless a typed runner retry decision (a target executable mid self-update, capture diagnostics or replacement stability) applies. Codex and Claude billing classification is unchanged. When every group is exhausted, the stop is the transient `Antigravity unavailable on all models` error, not a billing failure.
 - **On exhaustion** the whole group is skipped: there are no same-model retries, no sleeps and no sibling walk. The turn jumps once to the first entry of another group. A second verified exhaustion in the same turn is treated as a shared limit and stops the turn; further groups are not tried.
 - **Run-scoped memory.** An exhausted group is remembered for the logical run (shared by nested loops and reviewer threads, dropped when the run ends) until its parsed reset, or, with no parsed reset, for `--antigravity-quota-cooldown-seconds` (default 600, max 3600). Later turns skip a cooling group and re-probe it afterwards; each transition is logged once. Nothing is latched for the rest of the run. Memory is not persisted across processes, so a rerun rediscovers exhaustion once.
-- **Early stop.** When every group in the chain is cooling down, the turn stops without invoking agy: `Antigravity unavailable on all models`, naming the last frame, the models tried and when groups become eligible again. `QuotaResetExceededError` is raised only when every group has a parsed long reset; unverified text never stops an Antigravity turn. Transient capacity failures (`high traffic`) still retry the same model, then fall back. Each capacity failure logs its attempt duration.
+- **Early stop.** When every group in the chain is cooling down, the turn stops without invoking agy: `Antigravity unavailable on all models`, naming the last frame, the models tried and when groups become eligible again. `QuotaResetExceededError` is raised only when every group has a parsed long reset; unverified text never stops an Antigravity turn. With `--wait-for-quota-reset`, that verified stop (including the shared-limit stop) waits for the earliest group reset instead when every reset is within DURATION (see [Waiting for a quota reset](#waiting-for-a-quota-reset)). Transient capacity failures (`high traffic`) still retry the same model, then fall back. Each capacity failure logs its attempt duration.
 - **Repair chain.** The format-repair chain is the union of the repair models and the antigravity chain, so it now ends with `Claude Opus 5.5 (Medium)`. Repair neither reads nor marks quota memory.
 - **Skill helper.** `helpers/run_external.py` applies the same classification and group skip within one invocation, with memory local to that invocation.
 - **Independence trade-off.** With the default board (Codex, Claude Code on `claude-opus-5-5`, Antigravity), an Opus fallback means two reviewers run the same model in different harnesses and may share blind spots. The round reconciliation summary and log then state, for example, `note: Claude and Antigravity both reviewed with Claude Opus 5.5` (only for reviews made in that round). To keep models distinct, pass your own chain, for example `--antigravity-models "Gemini 3.8 Flash (High)" "Gemini 3.1 Pro (High)" "Claude Sonnet 5.5 (Medium)"`. Refusing same-model panels is an operator policy choice and is not enforced.
@@ -9119,6 +9119,53 @@ normal missing-marker responses are treated as non-retryable configuration or
 protocol failures. One exception: an Antigravity credits-balance failure
 correlated with a retryable `429 RESOURCE_EXHAUSTED` provider frame is quota
 exhaustion and falls back (see [Quota groups and fallback](#quota-groups-and-fallback)).
+
+#### Waiting for a quota reset
+
+By default a usage limit whose parsed reset is more than 300 s away stops the
+run with `QuotaResetExceededError` and exit code 3 ("Rerun when quota
+resets..."). `--wait-for-quota-reset DURATION` (off by default) waits instead
+when the reset fits. DURATION accepts plain seconds or `h`/`m`/`s` units, for
+example `3600`, `90m`, `6h` or `1h30m`. It must be positive and no longer than
+`24h`.
+
+- **When it waits.** A Codex, Claude or Gemini turn waits when the failure has a
+  parsed reset (for example Claude's `429 usage_limit_reached ... resets
+  1:30am (America/Los_Angeles)` or Codex's `try again at <time>`). The wait
+  lasts until the reset plus a 60 s margin. The turn then replays the exact
+  invocation that hit the limit: the same effective prompt, session ID, timeout
+  and settings. That includes a corrective re-ask's prompt and session. A wait
+  is neither a new round nor an ordinary retry: it never consumes
+  `--agent-max-retries`, and it has its own attempt slots.
+- **When it stops as today.** The run stops when the reset is beyond the
+  remaining budget, when there is no parsed reset (quota wording without a time
+  keeps the ordinary bounded retry path), and for short resets (300 s or less,
+  which already retry).
+- **Bounds.** A logical run waits at most 2 times and at most DURATION in total.
+  Nested loops and parallel reviewer or debater threads share this budget. A
+  limit that keeps returning therefore stops the run.
+- **Status.** Before sleeping the run logs `<agent> quota exhausted; waiting
+  until <local time> (<duration>) for reset (wait N of 2)`, and after it logs
+  `<agent> quota reset wait finished; retrying the same turn`. The wait happens
+  between agent invocations, so it holds no agent subprocess and no Antigravity
+  settings lock, and it posts nothing to GitHub.
+- **Antigravity.** A turn waits only when every quota group in the chain
+  carries a parsed, unexpired reset and the latest of them is within DURATION.
+  It sleeps until the earliest group reset. A stop before any dispatch (every
+  group already exhausted) waits and then builds the intended invocation
+  normally, keeping any pending re-ask. A stop after a failed invocation (no
+  fallback group left, or the shared-limit stop after a fallback) replays that
+  invocation on the group that becomes eligible. A chain with an untried
+  group or a cooldown-only group (no parsed reset) stops as today.
+- **Interrupts.** SIGINT or SIGTERM during a wait stops the run cleanly as a
+  quota stop: `<agent> quota reset wait interrupted; rerun to resume ...` with
+  exit code 3, so the run can be resumed. This also applies to waits in parallel
+  reviewer or debater threads. The main thread wakes them within 30 s, still
+  terminates active agent processes, and then exits. With the option set, the
+  CLI installs its SIGTERM handler for the duration of the command and restores
+  the previous handler afterwards. A SIGTERM that arrives when no wait is active
+  keeps its previous behaviour, as does every other interrupt.
+- The skill helper `helpers/run_external.py` and format-repair turns never wait.
 
 Each top-level run also writes `<run-id>-usage-summary.json` in the same
 directory. That sidecar aggregates usage by call, by agent, and for the full

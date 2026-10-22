@@ -61,6 +61,7 @@
   "publication_resume",
   "pytest_plugin._agent_loop_lifecycle_probe",
   "pytest_plugin._agent_loop_worker_cap",
+  "quota_wait",
   "repair",
   "repair_preservation",
   "reset_parsing",

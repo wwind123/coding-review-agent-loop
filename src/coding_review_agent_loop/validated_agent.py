@@ -75,6 +75,7 @@ from .usage import RunUsageContext, UsageMetadata, estimate_usage
 from .worker_telemetry import append_record, run_record, telemetry_log_path
 from .workdirs import active_workdir
 from .comment_rendering import render_agent_unavailable_comment
+from . import quota_wait
 from .round_state import ApprovedPlanContext
 from .agent_failure import (
     STRUCTURED_PUBLIC_RESPONSE_KINDS,
@@ -1054,6 +1055,16 @@ def _history_strip_allowed(
     )
 
 
+@dataclass(frozen=True)
+class _QuotaReplay:
+    """The exact invocation a quota wait replays (#1601)."""
+
+    prompt: str
+    session_id: str | None
+    timeout_seconds: int | None
+    invocation_kwargs: dict[str, object]
+
+
 def _run_validated_agent(*args, **kwargs):
     """Run one validated agent turn, then remove its per-turn response directories.
 
@@ -1246,6 +1257,17 @@ def _run_validated_agent_in_scope(
         # One dedicated planner replay for a fresh matrix integrity refusal;
         # never consumes agent_max_retries or Antigravity fallback state.
         max_attempts += 1
+    # Run-scoped wait budget, fetched lazily so an unset option never creates one.
+    quota_wait_budget: quota_wait.QuotaWaitBudget | None = None
+    # Only ever created from an invocation dispatched in this turn that then
+    # failed quota; None at turn entry (#1601).
+    pending_quota_replay: _QuotaReplay | None = None
+    last_dispatch: _QuotaReplay | None = None
+    quota_replays_used = 0
+    # Quota-exhausted dispatches since the last wait.  Each wait renews them
+    # by extending the attempt ceiling, so a replay and any renewed Antigravity
+    # fallback never consume the ordinary allowance (#1601).
+    quota_dispatches_since_wait = 0
     last_error =f"{agent_name} produced no output."
     last_result: AgentResult | None = None
     last_classification_text = ""
@@ -1355,6 +1377,33 @@ def _run_validated_agent_in_scope(
         message += diagnostics.format_for_error()
         return QuotaResetExceededError(message)
 
+    def _reserve_quota_wait(reset_secs: int) -> quota_wait.QuotaWaitReservation | None:
+        nonlocal quota_wait_budget
+        if config.wait_for_quota_reset_seconds is None:
+            return None
+        if quota_wait_budget is None:
+            quota_wait_budget = quota_wait.quota_wait_budget_for_current_run(config)
+        return quota_wait_budget.try_reserve(reset_secs)
+
+    def _wait_for_quota_reset(reservation: quota_wait.QuotaWaitReservation) -> None:
+        """Wait, then renew the attempts the wait reopens (bounded by the 2-wait budget)."""
+        nonlocal max_attempts, quota_dispatches_since_wait
+        quota_wait.wait_for_reset(config, agent_name, reservation)
+        max_attempts += quota_dispatches_since_wait
+        quota_dispatches_since_wait = 0
+
+    def _antigravity_quota_wait() -> quota_wait.QuotaWaitReservation | None:
+        """Reserve a wait only for a verified all-groups parsed long reset within DURATION."""
+        state = antigravity_attempts
+        limit = config.wait_for_quota_reset_seconds
+        if limit is None or not state.stop_is_verified_long_reset():
+            return None
+        latest = state.latest_reset_seconds()
+        earliest = state.earliest_reset_seconds()
+        if latest is None or earliest is None or latest > limit:
+            return None
+        return _reserve_quota_wait(earliest)
+
     def _antigravity_stop_error(
         classification_text: str, *, shared_limit: bool
     ) -> AgentInvocationError:
@@ -1368,14 +1417,25 @@ def _run_validated_agent_in_scope(
             state.unavailable_message(shared_limit), failure_category="transient"
         )
 
-    for attempt in range(1, max_attempts + 1):
+    attempt = 0
+    # A while loop: a quota wait may extend max_attempts mid-turn.
+    while attempt < max_attempts:
+        attempt += 1
         replacement_stability_failed = False
         if (
             antigravity_attempts is not None
             and antigravity_attempts.ensure_eligible_before_attempt() == "all-exhausted"
         ):
             log(config, f"{agent_name}: every Antigravity quota group is cooling down; not invoking")
-            raise _antigravity_stop_error(last_classification_text, shared_limit=False)
+            reservation = _antigravity_quota_wait()
+            if reservation is None:
+                raise _antigravity_stop_error(last_classification_text, shared_limit=False)
+            # Pre-dispatch: nothing failed in this attempt, so wait, re-check
+            # and build the intended invocation normally -- never a replay,
+            # and pending corrective context is left untouched (#1601).
+            _wait_for_quota_reset(reservation)
+            if antigravity_attempts.ensure_eligible_before_attempt() == "all-exhausted":
+                raise _antigravity_stop_error(last_classification_text, shared_limit=False)
         attempt_started_at = time.monotonic()
         attempt_config = (
             antigravity_attempts.singleton_config(config)
@@ -1384,61 +1444,79 @@ def _run_validated_agent_in_scope(
         )
         invocation_kwargs: dict[str, object] = {}
         is_executable_replacement_replay = executable_replacement_replay_pending
-        if backend_agent == "claude":
-            invocation_kwargs["attempt_suffix"] = (
-                "self-update-attempt2"
-                if is_executable_replacement_replay
-                else f"attempt{ordinary_retries_used + 1}"
-            )
-        elif is_executable_replacement_replay:
-            invocation_kwargs["attempt_suffix"] = executable_replacement_policies[backend_agent][2]
-        if pending_matrix_integrity_reprompt is not None:
-            attempt_prompt = _fresh_matrix_contract_retry_prompt(
-                prompt, pending_matrix_integrity_reprompt
-            )
+        is_quota_replay = pending_quota_replay is not None
+        if pending_quota_replay is not None:
+            # A quota-wait replay takes precedence over every other builder:
+            # the exact effective prompt, session, timeout and settings of the
+            # invocation that failed quota (#1601).
+            quota_replays_used += 1
+            attempt_prompt = pending_quota_replay.prompt
+            attempt_session_id = pending_quota_replay.session_id
+            next_timeout_seconds = pending_quota_replay.timeout_seconds
+            invocation_kwargs = dict(pending_quota_replay.invocation_kwargs)
             if backend_agent == "claude":
-                invocation_kwargs["attempt_suffix"] = "matrix-integrity-replay"
-            pending_matrix_integrity_reprompt = None
-        elif pending_judgement_reask is not None:
-            # Same frozen prompt and session as the original turn (#1185).
-            attempt_prompt = _missing_judgement_field_reask_prompt(
-                prompt, *pending_judgement_reask
-            )
-            if backend_agent == "claude":
-                invocation_kwargs["attempt_suffix"] = "judgement-reask"
-            pending_judgement_reask = None
-        elif pending_omission_reask_ids is not None:
-            # Reuse the frozen prompt and session: publishing or rebuilding the
-            # prompt between the two turns would reopen #1156.
-            attempt_prompt = _prior_disposition_omission_reask_prompt(
-                prompt, pending_omission_reask_ids
-            )
-            if backend_agent == "claude":
-                invocation_kwargs["attempt_suffix"] = "omission-reask"
-            pending_omission_reask_ids = None
-        elif pending_contract_reprompt is not None and document_path_rejection is not None:
-            attempt_prompt = _architecture_document_path_retry_prompt(
-                prompt, *document_path_rejection
-            )
+                invocation_kwargs["attempt_suffix"] = f"quota-wait-{quota_replays_used}"
+            pending_quota_replay = None
+            pending_contract_reprompt = None
         else:
-            attempt_prompt = (
-                _architecture_contract_retry_prompt(prompt, pending_contract_reprompt)
-                if pending_contract_reprompt is not None
-                else prompt
-            )
-        pending_contract_reprompt = None
-        attempt_session_id = session_id
-        if pending_evidence_reask_detail is not None:
-            # Same frozen prompt plus the sanitized rejection; resume the
-            # rejected acquisition's own session when one exists (#1240).
-            attempt_prompt = _evidence_rejection_reask_prompt(
-                prompt, pending_evidence_reask_detail
-            )
-            attempt_session_id = pending_evidence_reask_session
             if backend_agent == "claude":
-                invocation_kwargs["attempt_suffix"] = "evidence-reask"
-            pending_evidence_reask_detail = None
-            pending_evidence_reask_session = None
+                invocation_kwargs["attempt_suffix"] = (
+                    "self-update-attempt2"
+                    if is_executable_replacement_replay
+                    else f"attempt{ordinary_retries_used + 1}"
+                )
+            elif is_executable_replacement_replay:
+                invocation_kwargs["attempt_suffix"] = executable_replacement_policies[backend_agent][2]
+            if pending_matrix_integrity_reprompt is not None:
+                attempt_prompt = _fresh_matrix_contract_retry_prompt(
+                    prompt, pending_matrix_integrity_reprompt
+                )
+                if backend_agent == "claude":
+                    invocation_kwargs["attempt_suffix"] = "matrix-integrity-replay"
+                pending_matrix_integrity_reprompt = None
+            elif pending_judgement_reask is not None:
+                # Same frozen prompt and session as the original turn (#1185).
+                attempt_prompt = _missing_judgement_field_reask_prompt(
+                    prompt, *pending_judgement_reask
+                )
+                if backend_agent == "claude":
+                    invocation_kwargs["attempt_suffix"] = "judgement-reask"
+                pending_judgement_reask = None
+            elif pending_omission_reask_ids is not None:
+                # Reuse the frozen prompt and session: publishing or rebuilding the
+                # prompt between the two turns would reopen #1156.
+                attempt_prompt = _prior_disposition_omission_reask_prompt(
+                    prompt, pending_omission_reask_ids
+                )
+                if backend_agent == "claude":
+                    invocation_kwargs["attempt_suffix"] = "omission-reask"
+                pending_omission_reask_ids = None
+            elif pending_contract_reprompt is not None and document_path_rejection is not None:
+                attempt_prompt = _architecture_document_path_retry_prompt(
+                    prompt, *document_path_rejection
+                )
+            else:
+                attempt_prompt = (
+                    _architecture_contract_retry_prompt(prompt, pending_contract_reprompt)
+                    if pending_contract_reprompt is not None
+                    else prompt
+                )
+            pending_contract_reprompt = None
+            attempt_session_id = session_id
+            if pending_evidence_reask_detail is not None:
+                # Same frozen prompt plus the sanitized rejection; resume the
+                # rejected acquisition's own session when one exists (#1240).
+                attempt_prompt = _evidence_rejection_reask_prompt(
+                    prompt, pending_evidence_reask_detail
+                )
+                attempt_session_id = pending_evidence_reask_session
+                if backend_agent == "claude":
+                    invocation_kwargs["attempt_suffix"] = "evidence-reask"
+                pending_evidence_reask_detail = None
+                pending_evidence_reask_session = None
+        last_dispatch = _QuotaReplay(
+            attempt_prompt, attempt_session_id, next_timeout_seconds, dict(invocation_kwargs)
+        )
         if usage_context is not None:
             usage_context.note_agent_dispatch()
         while True:
@@ -1475,7 +1553,7 @@ def _run_validated_agent_in_scope(
         validation_acquisition = result
         # The bounded deadline belongs only to the interrupted invocation and
         # its dedicated replay. A later ordinary retry has its normal budget.
-        if is_executable_replacement_replay:
+        if is_executable_replacement_replay or is_quota_replay:
             executable_replacement_replay_pending = False
             next_timeout_seconds = timeout_seconds
         last_result = result
@@ -2936,6 +3014,7 @@ def _run_validated_agent_in_scope(
                         capacity, threshold=LONG_RESET_THRESHOLD_SECONDS
                     )
                     if quota is not None:
+                        quota_dispatches_since_wait += 1
                         previous_model = antigravity_attempts.models[antigravity_attempts.model_index]
                         previous_group = antigravity_attempts.groups[antigravity_attempts.model_index]
                         quota_transition = antigravity_attempts.next_after_quota_exhaustion(
@@ -2957,9 +3036,17 @@ def _run_validated_agent_in_scope(
                                 "without delay",
                             )
                             continue
-                        raise _antigravity_stop_error(
-                            classification_text, shared_limit=quota_transition == "shared-limit"
-                        )
+                        reservation = _antigravity_quota_wait()
+                        if reservation is None:
+                            raise _antigravity_stop_error(
+                                classification_text, shared_limit=quota_transition == "shared-limit"
+                            )
+                        # Post-failure: replay the invocation that failed quota on
+                        # the group that becomes eligible first (#1601).
+                        _wait_for_quota_reset(reservation)
+                        pending_quota_replay = last_dispatch
+                        antigravity_attempts.exhaustion_jumps = 0
+                        continue
             elif _QUOTA_RATE_LIMIT_RE.search(
                 reset_text := (
                     reset_evidence_text if reset_evidence_text is not None else classification_text
@@ -2967,7 +3054,15 @@ def _run_validated_agent_in_scope(
             ):
                 reset_secs = _parse_rate_limit_reset_seconds(reset_text)
                 if reset_secs is not None and reset_secs > LONG_RESET_THRESHOLD_SECONDS:
-                    raise _quota_reset_error(reset_secs, classification_text)
+                    reservation = _reserve_quota_wait(reset_secs)
+                    if reservation is None:
+                        raise _quota_reset_error(reset_secs, classification_text)
+                    # Wait outside run_agent_result (no subprocess or settings
+                    # lock held), then replay the same invocation (#1601).
+                    quota_dispatches_since_wait += 1
+                    _wait_for_quota_reset(reservation)
+                    pending_quota_replay = last_dispatch
+                    continue
             transition = (
                 antigravity_attempts.next_after_failure(
                     retryable=should_retry, provider_capacity=provider_capacity

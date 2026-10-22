@@ -153,6 +153,32 @@ DISCUSS_RESULT_MODES: frozenset[str] = frozenset({"triage", "answer"})
 BASE_PROVENANCE_VALUES = frozenset({"explicit", "repository-default", "pr-metadata"})
 
 
+# Upper bound for --wait-for-quota-reset (#1601).
+MAX_QUOTA_WAIT_SECONDS = 24 * 3600
+_QUOTA_WAIT_DURATION_RE = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?")
+
+
+def parse_quota_wait_duration(value: object) -> int | None:
+    """Parse ``--wait-for-quota-reset`` (``3600``, ``90m``, ``6h``, ``1h30m``) to seconds."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    seconds: int | None = None
+    if text.isdigit():
+        seconds = int(text)
+    elif text:
+        match = _QUOTA_WAIT_DURATION_RE.fullmatch(text)
+        if match is not None and any(match.groups()):
+            hours, minutes, secs = (int(part or 0) for part in match.groups())
+            seconds = hours * 3600 + minutes * 60 + secs
+    if seconds is None or not 0 < seconds <= MAX_QUOTA_WAIT_SECONDS:
+        raise AgentLoopError(
+            f"--wait-for-quota-reset must be a positive duration such as 6h, 90m, 1h30m "
+            f"or plain seconds, no longer than 24h (got {value!r})."
+        )
+    return seconds
+
+
 @dataclass(frozen=True)
 class ResolvedInvocation:
     """Provider configuration resolved for one substantive invocation."""
@@ -343,6 +369,9 @@ class AgentLoopConfig:
     antigravity_quota_cooldown_seconds: int = DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS
     # Explicit (model, group) overrides of the derived quota group (#1236).
     antigravity_quota_groups: tuple[tuple[str, str], ...] = ()
+    # Opt-in bound (seconds) for waiting out a parsed quota reset (#1601);
+    # None keeps the immediate QuotaResetExceededError stop.
+    wait_for_quota_reset_seconds: int | None = None
     # Declared model / reasoning effort for the dynamic signature (#332). Empty
     # means "not declared" (the agent runs its own default and the signature
     # falls back to the generic provider name). antigravity always has a model.
@@ -633,6 +662,15 @@ class AgentLoopConfig:
             raise AgentLoopError(
                 "--antigravity-quota-cooldown-seconds must be a positive integer "
                 f"no larger than {MAX_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS}."
+            )
+        wait_limit = self.wait_for_quota_reset_seconds
+        if wait_limit is not None and (
+            isinstance(wait_limit, bool)
+            or not isinstance(wait_limit, int)
+            or not 0 < wait_limit <= MAX_QUOTA_WAIT_SECONDS
+        ):
+            raise AgentLoopError(
+                "--wait-for-quota-reset must be a positive duration no longer than 24h."
             )
         seen_group_models: set[str] = set()
         for override in self.antigravity_quota_groups:
@@ -2422,6 +2460,9 @@ def config_from_args(
             DEFAULT_ANTIGRAVITY_QUOTA_COOLDOWN_SECONDS,
         ),
         antigravity_quota_groups=quota_group_overrides,
+        wait_for_quota_reset_seconds=parse_quota_wait_duration(
+            getattr(args, "wait_for_quota_reset", None)
+        ),
         codex_model=getattr(args, "codex_model", ""),
         codex_reasoning_effort=getattr(args, "codex_reasoning_effort", ""),
         reviewer_codex_model=getattr(args, "reviewer_codex_model", ""),

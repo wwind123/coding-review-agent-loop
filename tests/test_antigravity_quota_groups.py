@@ -778,3 +778,131 @@ def test_bare_json_retryable_credits_frame_causes_no_quota_marking_or_fallback(t
     assert error is not None and error.failure_category == "non-retryable"
     assert models == [GEM1] and sleeps == []
     assert not any("out of credits" in line for line in logs)
+
+
+# --- #1601: opt-in wait for a verified all-groups parsed reset --------------
+
+SIX_HOURS = 6 * 3600
+
+
+@pytest.fixture
+def advancing_sleeper(monkeypatch):
+    """Injected quota-wait sleeper that advances the quota-memory clock."""
+    from coding_review_agent_loop import quota_wait
+
+    clock = FakeClock()
+    slept: list[float] = []
+
+    def sleep(seconds):
+        slept.append(seconds)
+        clock.now += seconds
+
+    wait_logs: list[str] = []
+    monkeypatch.setattr(quota_wait, "_sleeper", sleep)
+    monkeypatch.setattr(quota_wait, "log", lambda _c, m: wait_logs.append(m))
+    return clock, slept, wait_logs
+
+
+def test_wait_pre_dispatch_all_parsed_builds_the_normal_first_invocation(tmp_path, advancing_sleeper):
+    clock, slept, wait_logs = advancing_sleeper
+    with patch.object(agy, "_now", clock), workdir_claims.workdir_claim_scope(), \
+            patch.object(validated_agent, "run_agent_result", wraps=validated_agent.run_agent_result) as invoke:
+        memory = agy.quota_memory_for_current_run()
+        memory.mark_exhausted("gemini", 3600, "parsed", QUOTA_4H, 0.0, cooldown_seconds=600)
+        memory.mark_exhausted("claude", 7200, "parsed", QUOTA_4H, 0.0, cooldown_seconds=600)
+        response, error, models, sleeps, logs = _turn(
+            tmp_path, [("first", 0)], agent_max_retries=0, wait_for_quota_reset_seconds=SIX_HOURS,
+        )
+    assert error is None and response.text == "first"
+    assert models == [GEM1]  # zero dispatches before the wait, one after
+    assert invoke.call_count == 1
+    assert invoke.call_args.kwargs["prompt"] == "PROMPT"
+    assert invoke.call_args.kwargs["session_id"] is None
+    assert "attempt_suffix" not in invoke.call_args.kwargs  # not a quota replay
+    assert sum(slept) == 3600 + 60 and sleeps == []
+    assert any(
+        "quota exhausted; waiting until" in line and "(wait 1 of 2)" in line
+        for line in wait_logs
+    )
+
+
+def test_wait_pre_dispatch_keeps_a_pending_judgement_reask(tmp_path, advancing_sleeper):
+    from coding_review_agent_loop.errors import MissingJudgementFieldError
+
+    clock, slept, wait_logs = advancing_sleeper
+    config = make_config(tmp_path, agent_max_retries=0, wait_for_quota_reset_seconds=SIX_HOURS)
+    runner = FakeRunner(antigravity_outputs=[("no verdict", 0), ("with verdict", 0)])
+    calls = []
+
+    def validate(text):
+        calls.append(text)
+        if text == "no verdict":
+            # A peer reviewer thread exhausts the remaining group meanwhile.
+            agy.quota_memory_for_current_run().mark_exhausted(
+                "claude", 3600, "parsed", QUOTA_4H, 0.0, cooldown_seconds=600
+            )
+            raise MissingJudgementFieldError(
+                "missing verdict", field_path="verdict", allowed_values=("approved", "blocking")
+            )
+        return text
+
+    with patch.object(agy, "_now", clock), workdir_claims.workdir_claim_scope(), \
+            patch.object(validated_agent, "run_agent_result", wraps=validated_agent.run_agent_result) as invoke:
+        agy.quota_memory_for_current_run().mark_exhausted(
+            "gemini", 1800, "parsed", QUOTA_4H, 0.0, cooldown_seconds=600
+        )
+        response = validated_agent._run_validated_agent(
+            runner, agent="antigravity", config=config, prompt="PROMPT", marker_description="none",
+            validate=validate, session_id="S1", reask_on_missing_judgement_field=True,
+        )
+    assert response.text == "with verdict"
+    assert invoke.call_count == 2
+    first, second = (call.kwargs for call in invoke.call_args_list)
+    assert first["prompt"] == "PROMPT"
+    assert second["prompt"] != first["prompt"]  # the pending re-ask, not a stale replay
+    assert second["prompt"].startswith("PROMPT") and "verdict" in second["prompt"][len("PROMPT"):]
+    assert second["session_id"] == first["session_id"] == "S1"
+    assert sum(slept) == 1800 + 60
+
+
+def test_wait_after_fresh_two_group_shared_limit_replays_failed_invocation(tmp_path, advancing_sleeper):
+    clock, slept, wait_logs = advancing_sleeper
+    with patch.object(agy, "_now", clock), workdir_claims.workdir_claim_scope(), \
+            patch.object(validated_agent, "run_agent_result", wraps=validated_agent.run_agent_result) as invoke:
+        response, error, models, sleeps, _logs = _turn(
+            tmp_path, [_fail(QUOTA_4H), _fail(QUOTA_4H.replace("4h", "5h")), ("after reset", 0)],
+            agent_max_retries=0, wait_for_quota_reset_seconds=SIX_HOURS,
+        )
+    assert error is None and response.text == "after reset"
+    # Waits for the earliest (Gemini) reset, then replays on that group.
+    assert models == [GEM1, OPUS, GEM1]
+    assert sum(slept) == 14400 + 60 and sleeps == []
+    prompts = [call.kwargs["prompt"] for call in invoke.call_args_list]
+    assert prompts[2] == prompts[1]
+
+
+@pytest.mark.parametrize("case", ["untried-group", "cooldown-only", "beyond-duration"])
+def test_no_wait_unless_every_group_is_parsed_within_duration(tmp_path, advancing_sleeper, case):
+    clock, slept, wait_logs = advancing_sleeper
+    with patch.object(agy, "_now", clock), workdir_claims.workdir_claim_scope():
+        if case == "untried-group":
+            _r, error, models, _s, _l = _turn(
+                tmp_path, [_fail(QUOTA_4H), _fail(QUOTA_4H), ("never", 0)],
+                antigravity_models=(GEM1, OPUS, "Model X"), wait_for_quota_reset_seconds=SIX_HOURS,
+            )
+            assert type(error) is AgentInvocationError and "failed the same way" in str(error)
+        elif case == "cooldown-only":
+            agy.quota_memory_for_current_run().mark_exhausted(
+                "gemini", None, "cooldown", LIVE_SAMPLE, 0.0, cooldown_seconds=600
+            )
+            _r, error, models, _s, _l = _turn(
+                tmp_path, [_fail(QUOTA_4H)], wait_for_quota_reset_seconds=SIX_HOURS,
+            )
+            assert type(error) is AgentInvocationError
+            assert str(error).startswith("Antigravity unavailable on all models")
+        else:
+            _r, error, models, _s, _l = _turn(
+                tmp_path, [_fail(QUOTA_4H), _fail(QUOTA_4H)], wait_for_quota_reset_seconds=3600,
+            )
+            assert isinstance(error, QuotaResetExceededError)
+    assert slept == []

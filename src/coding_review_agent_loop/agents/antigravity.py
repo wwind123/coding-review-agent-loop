@@ -329,6 +329,11 @@ class AntigravityQuotaGroupMemory:
         known = [value for value in remaining if value is not None]
         return min(known) if known else None
 
+    def latest_expiry(self, groups) -> int | None:
+        remaining = [self.remaining_seconds(g) for g in dict.fromkeys(groups)]
+        known = [value for value in remaining if value is not None]
+        return max(known) if known else None
+
     def all_parsed(self, groups) -> bool:
         distinct = tuple(dict.fromkeys(groups))
         if not distinct:
@@ -485,6 +490,9 @@ class AntigravityAttemptState:
 
     def earliest_reset_seconds(self) -> int | None:
         return self.memory.earliest_expiry(self.groups)
+
+    def latest_reset_seconds(self) -> int | None:
+        return self.memory.latest_expiry(self.groups)
 
     def unavailable_message(self, shared_limit: bool = False) -> str:
         frame = (self.last_frame or self.memory.last_frame(self.groups)).strip().splitlines()
