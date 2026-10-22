@@ -1283,21 +1283,24 @@ def _silent_attempt_log_evidence(
     config: AgentLoopConfig,
     result: CommandResult,
     response_file_text: str | None,
-    log_dir: Path,
-    pre_existing: frozenset[str] | None,
+    lookup: AntigravityLogLookup | Exception | None,
 ) -> tuple[Path | None, AntigravityLogQuotaEvidence | None]:
-    """Locate and read this silent attempt's agy log; never raises."""
+    """Read this silent attempt's agy log from a lookup taken under the lock.
+
+    ``lookup`` is None when no lookup was taken (no pre-spawn inventory), or
+    the exception the lookup raised. Never raises.
+    """
     try:
         if not is_silent_antigravity_attempt(result, response_file_text):
             return None, None
-        observation = result.observation
-        if observation is None:
+        if result.observation is None:
             log(config, "Antigravity printed no output; no agy log lookup (no spawn observation)")
             return None, None
-        spawn = observation.spawn_wall_time
-        lookup = find_antigravity_attempt_log(
-            log_dir, pre_existing, spawn, spawn + observation.elapsed_seconds
-        )
+        if isinstance(lookup, Exception):
+            log(config, f"Antigravity agy log lookup failed: {lookup}")
+            return None, None
+        if lookup is None:
+            lookup = AntigravityLogLookup(None, "no pre-spawn inventory")
         if lookup.log_path is None:
             log(config, f"Antigravity printed no output; no new matching agy log ({lookup.reason})")
             return None, None
@@ -1494,6 +1497,7 @@ class AntigravityBackend:
         result: CommandResult | None = None
         agy_log_dir = _antigravity_log_dir()
         agy_log_inventory: frozenset[str] | None = None
+        agy_log_lookup: AntigravityLogLookup | Exception | None = None
 
         def strip_injected_prefix() -> None:
             # Only a verified header+body is removed; anything swapped or
@@ -1608,6 +1612,9 @@ class AntigravityBackend:
                         # Taken under the settings lock, which serializes
                         # agent-loop agy turns host-wide, so a later silent
                         # attempt can prove which agy log is its own (#1604).
+                        # The post-exit listing below is also taken under
+                        # it, so another turn's log never becomes a
+                        # candidate (#1614).
                         try:
                             agy_log_inventory = snapshot_antigravity_logs(agy_log_dir)
                         except Exception:  # noqa: BLE001
@@ -1636,6 +1643,25 @@ class AntigravityBackend:
                             else timeout_seconds
                         ),
                     )
+                    # The stdout-only silence check is necessary for the
+                    # final one, so normal turns pay no directory listing.
+                    # The log content is read after release (#1614).
+                    if (
+                        role != _SEMANTIC_DEDUPE_ROLE
+                        and agy_log_inventory is not None
+                        and result.observation is not None
+                        and is_silent_antigravity_attempt(result, None)
+                    ):
+                        try:
+                            spawn = result.observation.spawn_wall_time
+                            agy_log_lookup = find_antigravity_attempt_log(
+                                agy_log_dir,
+                                agy_log_inventory,
+                                spawn,
+                                spawn + result.observation.elapsed_seconds,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - never fail the turn
+                            agy_log_lookup = exc
                 finally:
                     # This also handles a partial GEMINI.md write that raises
                     # before the subprocess is spawned.
@@ -1709,7 +1735,7 @@ class AntigravityBackend:
         agy_log_evidence: AntigravityLogQuotaEvidence | None = None
         if role != _SEMANTIC_DEDUPE_ROLE:
             agy_log_path, agy_log_evidence = _silent_attempt_log_evidence(
-                config, result, response_file_text, agy_log_dir, agy_log_inventory
+                config, result, response_file_text, agy_log_lookup
             )
         return AgentResult(
             text=message_text,
