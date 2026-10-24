@@ -16608,3 +16608,147 @@ def test_fresh_process_resume_with_drifted_review_identity_forces_review_with_re
     assert len(activations) == 1 and activations[0].attached_run_id is None
     assert events == ["review"]
     assert _attempt_checkpoint_lines(runner) == ["PR #7 qualification checkpoint: attached attempt 555/1."]
+
+
+# --- PR step-back approach alternative on a managed PR (#1628) ---------------
+
+
+def _approach_alternative_coder_comment(comment_id, *, subject, round_number):
+    """A durable step-back coder record whose summary proposes an approach change."""
+    raw = json.dumps({
+        "schema_version": 1,
+        "kind": "coder_followup",
+        "state": "blocking",
+        "summary": "Approach alternative: drop the predecessor-head disqualifier.",
+    })
+    return {
+        "id": comment_id,
+        "user": {"login": "agent-loop", "id": 1},
+        "body": _attach_round_metadata(
+            "coder round",
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="Claude",
+                round_number=round_number, subject=subject,
+                raw_structured_coder_response=raw,
+                step_back_entries=({
+                    "phase": "pr",
+                    "reviewer": "Codex",
+                    "trigger_round": 1,
+                    "trigger_head": "abc123",
+                    "anchor": {"path": "src/spool.py", "start": 124, "end": 140},
+                },),
+            ),
+        ),
+    }
+
+
+@pytest.mark.parametrize("step_back_rounds", [3, 0], ids=["step-back-on", "step-back-off"])
+def test_managed_resume_after_approach_alternative_uses_real_continuity_authorization(
+    tmp_path, monkeypatch, step_back_rounds,
+):
+    """`approach-alt-managed-continuity`: real publication and real activation.
+
+    The step-back coder record at the new head is the round record the real
+    continuity grant correlates; a resume authenticates that grant through the
+    real ``activate_managed_ci``.  With step-back on it stops before any review
+    or dispatch; with ``--pr-step-back-rounds 0`` it continues to the review of
+    that head.  Neither path publishes a competing grant or label.
+    """
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+
+    runner = _workflow_runner_for_issue_authorization(None, labeled=True)
+    runner.codex_outputs = [
+        structured_pr_review(
+            state="approved", summary="Reviewed the approach-alternative head.",
+            reviewer="OpenAI Codex",
+        )
+    ]
+    publish_config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+    )
+    root = publish_issue_created_authorization(
+        runner, config=publish_config,
+        handoff=replace(
+            _authorization_handoff(),
+            override_nonce="opening-nonce",
+            opening_override_nonce="opening-nonce",
+        ),
+        metadata=replace(metadata(), body=runner.rest_pr["body"]),
+    )
+    runner.intent_comments.extend([
+        {
+            "id": 88,
+            "user": {"login": "agent-loop", "id": 1},
+            "body": _attach_round_metadata(
+                "reviewer round",
+                PostedRoundMetadata(
+                    flow="pr", role="reviewer", agent="Codex",
+                    round_number=1, subject="abc123", state="blocking",
+                ),
+            ),
+        },
+        _approach_alternative_coder_comment(89, subject="next-head", round_number=2),
+    ])
+    # The same round records as the PR conversation view shows them.
+    runner.pr_payload["comments"] = [
+        {
+            "author": {"login": "agent-loop"},
+            "createdAt": f"2026-10-24T00:00:{index:02d}Z",
+            "body": comment["body"],
+        }
+        for index, comment in enumerate(runner.intent_comments[-2:])
+    ]
+    runner.rest_pr["head"]["sha"] = "next-head"
+    runner.pr_payload["headRefOid"] = "next-head"
+    publish_issue_created_continuity_authorization(
+        runner, config=publish_config, handoff=root,
+        predecessor_head="abc123", new_head="next-head", round_comment_ids=(88, 89),
+    )
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_pr_mode=True,
+        managed_ci_fresh_authorization=True, managed_ci_issue_number=643,
+        managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
+        pr_step_back_rounds=step_back_rounds,
+        invocation_argv=(
+            "agent-loop", "pr", "7", "--managed-ci", "--managed-ci-fresh",
+            "--managed-ci-issue", "643", "--managed-ci-trusted-actor", "agent-loop",
+            "--allow-unprotected-managed-ci",
+            "--pr-step-back-rounds", str(step_back_rounds),
+        ),
+    )
+    captured = {}
+    _stop_after_real_reviewer(monkeypatch, captured)
+
+    expected = HumanDecisionRequiredError if step_back_rounds else _ReviewReached
+    with pytest.raises(expected) as excinfo:
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+
+    # Real activation accepted the live head through the continuity grant.
+    assert captured["activation"] is not None
+    resumed = captured["managed_resume"]
+    assert resumed is not None and resumed.issue_created_handoff is not None
+    assert resumed.issue_created_handoff.authorization_kind == "continuity"
+    assert resumed.issue_created_handoff.head_sha == "next-head"
+    # No competing grant, label write or CI dispatch: not ordinary recovery.
+    kinds = [
+        record.kind
+        for comment in runner.intent_comments
+        if (record := parse_issue_created_authorization_comment(comment["body"]))
+        is not None
+    ]
+    assert kinds == ["creation", "continuity"]
+    assert runner.labels_posted is False
+    assert runner.dispatch_count == 0
+    reviewer_commands = [
+        command for command, _cwd in runner.commands if command[:2] == ["codex", "exec"]
+    ]
+    if step_back_rounds:
+        message = str(excinfo.value)
+        assert "the coder proposes replacing the approved approach" in message
+        assert "drop the predecessor-head disqualifier." in message
+        assert reviewer_commands == []
+        assert not any("Review verdict" in comment for comment in runner.comments)
+    else:
+        assert len(reviewer_commands) == 1
+        assert "next-head" in " ".join(reviewer_commands[0])
