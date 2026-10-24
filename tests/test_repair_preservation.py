@@ -2784,3 +2784,140 @@ def test_full_repair_validation_accepts_a_tagged_plan_review():
         json.dumps(source),
         json.dumps(source) + "\n<!-- AGENT_PLAN_STATE: blocking -->\n-- OpenAI Codex",
     )
+
+
+# ---------------------------------------------------------------------------
+# #1626: scoped test_observations preservation for a shape-defect repair,
+# exercised through the real execute_repair path with a stubbed repair model.
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace as _SimpleNamespace_1626  # noqa: E402
+
+import coding_review_agent_loop.repair as _repair_module_1626  # noqa: E402
+from coding_review_agent_loop.protocol import validate_structured_coder_followup as _validate_followup_1626  # noqa: E402
+from agent_loop_helpers import FakeRunner as _FakeRunner_1626, make_config as _make_config_1626  # noqa: E402
+
+_VALID_1626 = {"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass", "claim": "current-result"}
+_MALFORMED_1626 = [
+    {"command": "node --test scripts/locales.test.mjs", "receipt_id": f"r-{index}", "claim": "reran"}
+    for index in range(9)
+]
+_PROSE_1626 = "The node command ran with no environment override; the gitignored venv supplied PyICU."
+
+
+def _followup_1626(observations, *, summary="Re-ran the locale tests.", notes=None):
+    payload = {
+        "schema_version": 1, "kind": "coder_followup", "state": "blocking", "summary": summary,
+        "addressed_items": ["item-10"], "remaining_items": [],
+        "addressed_item_notes": notes or {"item-10": "Re-ran the command."},
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+        "test_observations": observations,
+    }
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _execute_repair_1626(tmp_path, monkeypatch, source, target):
+    prompts = []
+
+    def fake_cli_repair(runner, config, prompt, *, model, log_path):
+        prompts.append(prompt)
+        return _SimpleNamespace_1626(
+            text=target, returncode=0, raw_output=target, usage=None, raw_usage=None,
+            observed_model=None, text_source="stdout",
+        )
+
+    monkeypatch.setattr(_repair_module_1626, "run_cli_repair", fake_cli_repair)
+    config = _make_config_1626(tmp_path, repair_backend="claude", repair_models=("repair-model",))
+    repaired, parsed, attempts = _repair_module_1626.execute_repair(
+        source, runner=_FakeRunner_1626(), config=config, run_id="repair-1626",
+        usage_context=None,
+        validate=lambda text: _validate_followup_1626(text, test_observations_mode="repair-first"),
+        expected_kind="coder_followup",
+        test_observations_shape_defect=True,
+        test_turn_receipts=({"command": _VALID_1626["command"], "receipt_id": "receipt-pass", "outcome": "passed"},),
+    )
+    assert len(prompts) == 1 and "## test_observations repair:" in prompts[0]
+    return repaired, parsed, attempts
+
+
+_NATIVE_1626 = [*_MALFORMED_1626, _VALID_1626]
+
+
+@pytest.mark.parametrize(
+    "source_observations",
+    [_NATIVE_1626, json.dumps(_NATIVE_1626)],
+    ids=["native-array", "json-array-string"],
+)
+@pytest.mark.parametrize(
+    "target_observations",
+    [
+        [_VALID_1626],
+        [_VALID_1626, {**_MALFORMED_1626[0], "claim": "current-result"}],
+    ],
+    ids=["malformed-removed", "malformed-corrected"],
+)
+def test_shape_repair_keeping_the_valid_citation_is_accepted_1626(
+    tmp_path, monkeypatch, source_observations, target_observations
+):
+    """Matrix row `malformed-array-repair-preservation` (accepting half).
+
+    A JSON-array string source is a citation source, never prose: the target
+    keeps the decoded valid citation without moving the string anywhere.
+    """
+    target = _followup_1626(target_observations)
+    repaired, parsed, attempts = _execute_repair_1626(
+        tmp_path, monkeypatch, _followup_1626(source_observations), target
+    )
+    assert repaired == target
+    assert "receipt-pass" in [item.receipt_id for item in parsed.test_observations]
+    assert [attempt.outcome for attempt in attempts] == ["succeeded"]
+
+
+@pytest.mark.parametrize(
+    "source_observations",
+    [_NATIVE_1626, json.dumps(_NATIVE_1626)],
+    ids=["native-array", "json-array-string"],
+)
+def test_shape_repair_removing_the_valid_citation_is_rejected_1626(
+    tmp_path, monkeypatch, source_observations
+):
+    target = _followup_1626([])
+    repaired, parsed, attempts = _execute_repair_1626(
+        tmp_path, monkeypatch, _followup_1626(source_observations), target
+    )
+    assert repaired is None and parsed is None
+    assert [attempt.outcome for attempt in attempts] == ["invalid_output"]
+    assert "test_observations" in attempts[0].diagnostic
+
+
+def test_shape_repair_must_move_prose_not_delete_it_1626(tmp_path, monkeypatch):
+    source = _followup_1626(_PROSE_1626)
+    moved = _followup_1626([_VALID_1626], summary=f"Re-ran the locale tests. {_PROSE_1626}")
+    repaired, parsed, _attempts = _execute_repair_1626(tmp_path, monkeypatch, source, moved)
+    assert repaired == moved
+    assert parsed.test_observation_degradations == ()
+    into_note = _followup_1626([], notes={"item-10": f"Re-ran the command. {_PROSE_1626}"})
+    repaired, _parsed, _attempts = _execute_repair_1626(tmp_path, monkeypatch, source, into_note)
+    assert repaired == into_note
+    deleted = _followup_1626([_VALID_1626])
+    repaired, parsed, attempts = _execute_repair_1626(tmp_path, monkeypatch, source, deleted)
+    assert repaired is None and parsed is None
+    assert [attempt.outcome for attempt in attempts] == ["invalid_output"]
+
+
+def test_shape_repair_candidate_that_keeps_prose_is_not_accepted_1626(tmp_path, monkeypatch):
+    source = _followup_1626(_PROSE_1626)
+    repaired, parsed, attempts = _execute_repair_1626(tmp_path, monkeypatch, source, source)
+    assert repaired is None and parsed is None
+    assert [attempt.outcome for attempt in attempts] == ["invalid_output"]
+
+
+def test_unflagged_preservation_still_pins_every_source_citation_object_1626():
+    source = _followup_1626([*_MALFORMED_1626[:2], _VALID_1626])
+    removed = _followup_1626([_VALID_1626])
+    with pytest.raises(AgentLoopError, match="test_observations"):
+        validate_repair_preservation(source, removed)
+    validate_repair_preservation(source, removed, test_observations_shape_defect=True)
+    # A prose source carries no unflagged constraint at all.
+    validate_repair_preservation(_followup_1626(_PROSE_1626), _followup_1626([]))

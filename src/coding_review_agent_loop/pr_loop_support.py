@@ -84,6 +84,9 @@ from .managed_ci import (
     wait_for_ordinary_recovery,
 )
 from .protocol import (
+    CITATION_DROPPED_OUTCOME,
+    TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
+    TEST_OBSERVATIONS_NOT_ARRAY_RULES,
     ApprovedFollowup,
     ParsedReview,
     StructuredCoderFollowup,
@@ -303,20 +306,90 @@ class _UnchangedHeadTracker:
     The count belongs to a single head: a follow-up on any other head,
     including one advanced externally between rounds, starts a fresh count,
     and a follow-up that moves the head clears it.
+
+    Each tracked head also has one evidence-progress grant (#1626): one extra
+    review round when the follow-up at the limit made cited, authoritative
+    evidence progress.  The grant resets whenever the tracked head changes,
+    so the extra rounds are bounded at one per head.  Like the count, it is
+    in-memory only.
     """
 
     def __init__(self) -> None:
         self.head_sha: str | None = None
         self.count = 0
+        self.evidence_progress_granted = False
 
     def observe(self, reviewed_head: str | None, head_after_followup: str | None) -> int:
+        previous_head = self.head_sha
         if not reviewed_head or head_after_followup != reviewed_head:
             self.head_sha, self.count = None, 0
         elif reviewed_head == self.head_sha:
             self.count += 1
         else:
             self.head_sha, self.count = reviewed_head, 1
+        if self.head_sha != previous_head:
+            self.evidence_progress_granted = False
         return self.count
+
+    def grant_evidence_progress(self) -> bool:
+        """Spend this head's one evidence-progress grant; False once it is used."""
+        if self.head_sha is None or self.evidence_progress_granted:
+            return False
+        self.evidence_progress_granted = True
+        return True
+
+
+@dataclass(frozen=True)
+class FollowupCitationDiagnosis:
+    """What happened to one accepted follow-up's test_observations (#1626).
+
+    ``uncited_receipts`` counts the distinct receipts in the coder
+    acquisition's frozen catalog that no surviving citation cites; it never
+    reads the bounded round evidence or the runner's mutable latest turn.
+    """
+
+    non_array_drop: bool
+    repair_attempted: bool
+    uncited_receipts: int
+
+
+def followup_citation_diagnosis(
+    parsed: object, coder_turn_receipt_ids: Iterable[str]
+) -> FollowupCitationDiagnosis | None:
+    """Diagnose an accepted follow-up's citations against its frozen catalog."""
+    if not isinstance(parsed, StructuredCoderFollowup):
+        return None
+    non_array = [
+        record
+        for record in parsed.test_observation_degradations
+        if record.outcome == CITATION_DROPPED_OUTCOME
+        and record.rule in TEST_OBSERVATIONS_NOT_ARRAY_RULES
+        and record.element_path == "coder_followup.test_observations"
+    ]
+    cited = {citation.receipt_id for citation in parsed.test_observations}
+    return FollowupCitationDiagnosis(
+        non_array_drop=bool(non_array),
+        repair_attempted=any(
+            record.rule == TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE for record in non_array
+        ),
+        uncited_receipts=len(frozenset(coder_turn_receipt_ids) - cited),
+    )
+
+
+def cited_evidence_progress(
+    parsed: object,
+    superseding_receipts: Iterable[str],
+) -> frozenset[str]:
+    """Superseding current-turn receipts that a surviving citation also cites (#1626).
+
+    Live reconciliation supersedes a failure from any compatible pass, cited
+    or not; the grant also requires that the pass was presented to
+    reviewers, so a failed repair (citations dropped) never earns it.
+    """
+    if not isinstance(parsed, StructuredCoderFollowup):
+        return frozenset()
+    cited = {citation.receipt_id for citation in parsed.test_observations}
+    return frozenset(superseding_receipts) & cited
 
 
 def _coder_followup_head_log(

@@ -133,6 +133,27 @@ the follow-up comment and the round summary, and are restored onto the coder
 carrier on resume. Canonical `risk_test_matrix_evidence` citations stay
 strict: a verified row must never stand on fewer citations than it declared.
 
+The `test_observations` field as a whole is decoded first and repaired before
+it degrades (#1626). In every parse mode, a string that decodes to a JSON
+array is used as that array, with one `citations-decoded-from-string` record
+that renders on its own line ahead of the drop list. The parser takes a
+`test_observations_mode`. The default, `degrade`, keeps today's single field
+drop and is used by every historical, resume and legacy re-parse. Fresh coder
+follow-up and issue-implementation turns build their validators with
+`_architecture_and_test_observation_mode_validators`. Their primary pair is
+`repair-first`: a value that is still not an array, or more than eight
+malformed items, raises the repairable `TestObservationsShapeError`. The
+validated turn then runs the structured repair with a targeted instruction
+and the acquisition's tool-owned run-tests receipts. Both receipt
+prohibitions are narrowed to canonical matrix-evidence envelopes. A scoped
+preservation rule classifies the source as the parser does. A native or
+decoded array pins its valid citations and lets malformed ones be corrected
+or removed. Prose must be moved into `summary` or an item note, never
+deleted. If repair yields no accepted candidate, a non-array value falls back
+to the `degrade-after-repair` pair. That pair accepts the original through
+the same acceptance boundary, with a drop record whose rule says repair was
+attempted, and never spends an agent retry. The over-bound case stays fatal.
+
 Every function, method and nested def in `protocol.py` that can still reach
 an `AgentLoopError`-family raise is classified in `shape_check_audit.py` as
 `fatal`, `mixed` or `delegated`. Each raise site and raise-reaching call site

@@ -433,6 +433,29 @@ def _architecture_mode_validators(
     }
 
 
+def _architecture_and_test_observation_mode_validators(
+    factory: Callable[[str, str], Callable[[str], object]],
+) -> dict[str, object]:
+    """The architecture pair plus the test_observations fallback pair (#1626).
+
+    For a fresh coder follow-up or issue implementation.  All four callables
+    come from one two-argument factory ``(architecture_mode,
+    test_observations_mode)``, so they differ only in those modes: the
+    primary pair is ``repair-first`` and the fallback pair, used only after a
+    failed repair of a non-array ``test_observations``, is
+    ``degrade-after-repair``.
+    """
+    return {
+        "validate": factory("degradable", "repair-first"),
+        "strict_revalidate": factory("strict", "repair-first"),
+        "degrade_architecture_impact": True,
+        "test_observations_fallback_validate": factory("degradable", "degrade-after-repair"),
+        "test_observations_fallback_strict_revalidate": factory(
+            "strict", "degrade-after-repair"
+        ),
+    }
+
+
 def _canonical_comparison_projection(result: object) -> object:
     """Project a result for the degradable-versus-strict equality check.
 

@@ -31,6 +31,7 @@ from .errors import (
     SemanticPatchPayloadRejection,
     MissingJudgementFieldError,
     MissingPriorItemDispositionError,
+    TestObservationsShapeError,
     UnknownPriorItemDispositionError,
 )
 from .github import (
@@ -378,10 +379,14 @@ def _run_structured_repair(
                     "reject_unsolicited_risk_test_matrix_contract",
                     "evidence_row_id_universe",
                     "optional_item_ids",
+                    "test_observations_shape_defect",
+                    "test_turn_receipts",
                 )
             ):
                 raise
             legacy_kwargs = dict(repair_kwargs)
+            legacy_kwargs.pop("test_observations_shape_defect", None)
+            legacy_kwargs.pop("test_turn_receipts", None)
             legacy_kwargs.pop("optional_item_ids", None)
             legacy_kwargs.pop("reviewer_requirement_ids", None)
             legacy_kwargs.pop("require_execution_strategy_contract", None)
@@ -402,6 +407,15 @@ def _run_structured_repair(
                     allowed_prior_item_ids=repair_kwargs.get("allowed_prior_item_ids"),
                     evidence_row_id_universe=repair_kwargs.get("evidence_row_id_universe"),
                     forbid_architecture_impact=forbid,
+                )
+            elif repair_kwargs.get("test_observations_shape_defect"):
+                # The scoped test_observations rule applies on every repair
+                # entry point, so a legacy hook cannot bypass it (#1626).
+                validate_repair_preservation(
+                    raw,
+                    repaired,
+                    forbid_architecture_impact=forbid,
+                    test_observations_shape_defect=True,
                 )
             elif forbid:
                 require_repair_architecture_impact_absent(repaired)
@@ -1067,6 +1081,38 @@ class _QuotaReplay:
     invocation_kwargs: dict[str, object]
 
 
+# Bound on the tool-owned receipt list handed to a test_observations repair.
+_TEST_TURN_RECEIPTS_LIMIT = 16
+
+
+def _test_turn_receipts(acquisition: AgentResult | None) -> tuple[dict[str, str], ...]:
+    """This turn's run-tests receipts for a test_observations repair (#1626).
+
+    Built only from the acquisition's closed, tool-owned catalog, never from
+    model text, and bounded.  The repair model may cite only these; the
+    downstream receipt binding remains the authoritative check.
+    """
+    from .local_test_evidence import redact_test_command
+
+    receipts: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for observation in getattr(acquisition, "test_turn_observations", ()) or ():
+        receipt_id = getattr(observation, "receipt_id", None)
+        if not isinstance(receipt_id, str) or not receipt_id.strip() or receipt_id in seen:
+            continue
+        seen.add(receipt_id)
+        command = getattr(observation, "command", ())
+        safe_command = redact_test_command(command)[0] if command else ""
+        receipts.append({
+            "command": safe_command,
+            "receipt_id": receipt_id,
+            "outcome": str(getattr(observation, "outcome", "unknown")),
+        })
+        if len(receipts) >= _TEST_TURN_RECEIPTS_LIMIT:
+            break
+    return tuple(receipts)
+
+
 def _run_validated_agent(*args, **kwargs):
     """Run one validated agent turn, then remove its per-turn response directories.
 
@@ -1123,6 +1169,8 @@ def _run_validated_agent_in_scope(
     semantic_patch_payload_validator: Callable[[dict], object] | None = None,
     degrade_architecture_impact: bool = False,
     strict_revalidate: Callable[[str], object] | None = None,
+    test_observations_fallback_validate: Callable[[str], object] | None = None,
+    test_observations_fallback_strict_revalidate: Callable[[str], object] | None = None,
     reask_on_prior_disposition_omission: bool = False,
     reask_on_missing_judgement_field: bool = False,
     reask_on_evidence_rejection: bool = False,
@@ -1136,6 +1184,13 @@ def _run_validated_agent_in_scope(
         raise AgentLoopError(
             "Internal error: an invocation that enables architecture-impact degradation "
             "must supply its strict re-parse."
+        )
+    if (test_observations_fallback_validate is None) != (
+        test_observations_fallback_strict_revalidate is None
+    ):
+        raise AgentLoopError(
+            "Internal error: a test_observations fallback validator must be supplied "
+            "together with its strict re-parse."
         )
     validation_acquisition: AgentResult | None = None
     # The last response refused for an unsatisfied architecture-impact
@@ -1217,6 +1272,40 @@ def _run_validated_agent_in_scope(
             runner=runner,
             acquisition=acquisition if acquisition is not None else validation_acquisition,
         )
+
+    def accept_test_observations_fallback(text: str) -> _AcceptedCandidate | None:
+        """Accept the original response with today's #927 drop (#1626).
+
+        Only after a repair of a non-array test_observations produced no
+        accepted candidate.  The fallback validator differs from the primary
+        one only in its ``degrade-after-repair`` mode, so every other defect
+        still rejects; it runs the same contract refusal and is accepted
+        through the same boundary with the matching strict re-parse.
+        """
+        if test_observations_fallback_validate is None:
+            return None
+        try:
+            fallback_result = _with_validation_context(
+                test_observations_fallback_validate,
+                runner=runner,
+                acquisition=validation_acquisition,
+            )(text)
+            if contract_refusal(fallback_result, text) is not None:
+                return None
+            return _accept_candidate(
+                text,
+                fallback_result,
+                strict_revalidate=test_observations_fallback_strict_revalidate,
+                runner=runner,
+                acquisition=validation_acquisition,
+            )
+        except AgentLoopError as fallback_exc:
+            log(
+                config,
+                f"{agent_display_name(agent)}: test_observations fallback not accepted "
+                f"({fallback_exc})",
+            )
+            return None
 
     agent_name = agent_display_name(agent)
     operation_description = operation_description or _operation_description_from_context(
@@ -2767,6 +2856,15 @@ def _run_validated_agent_in_scope(
                             repair_kwargs["allowed_prior_item_ids"] = tuple(repair_allowed_prior_item_ids)
                         if repair_expected_kind == "pr_review" and repair_evidence_row_ids is not None:
                             repair_kwargs["evidence_row_id_universe"] = tuple(repair_evidence_row_ids)
+                        test_observations_shape_defect = (
+                            isinstance(exc, TestObservationsShapeError)
+                            and repair_expected_kind in {"coder_followup", "issue_implementation"}
+                        )
+                        if test_observations_shape_defect:
+                            repair_kwargs["test_observations_shape_defect"] = True
+                            repair_kwargs["test_turn_receipts"] = _test_turn_receipts(
+                                validation_acquisition
+                            )
                         original_validation_error = str(exc)
                         if marker_safety_failure:
                             marker_safety_repair_attempted = True
@@ -3023,6 +3121,31 @@ def _run_validated_agent_in_scope(
                                 for attempt in repair_attempts
                             )
                             last_error = f"{original_validation_error}; repair invocation failure: {details}"
+                        if (
+                            test_observations_shape_defect
+                            and exc.fallback_degradable
+                            and terminal_evidence_rejection is None
+                        ):
+                            # Repair produced no accepted candidate: fall back
+                            # to today's drop, recorded as after a repair
+                            # attempt.  Never spends an agent retry (#1626).
+                            fallback = accept_test_observations_fallback(
+                                normalized if normalized is not None else text
+                            )
+                            if fallback is not None:
+                                log(
+                                    config,
+                                    f"{agent_name}: repair failed; degraded test_observations",
+                                )
+                                if usage_record is not None:
+                                    usage_record.validation_status = "validated"
+                                return _accepted_validated_response(
+                                    fallback,
+                                    session_id=result.session_id,
+                                    usage=usage,
+                                    model_used=result.model_used,
+                                    **_response_identity_fields(result),
+                                )
             else:
                 if usage_record is not None:
                     usage_record.validation_status = "validated"

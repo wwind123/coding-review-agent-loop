@@ -5896,3 +5896,113 @@ def test_comparison_partner_selection_skips_restored_rows_only():
     passing = _by_receipt(evidence)["run-b-pass"]
     assert passing.environment_state == "unknown"
     assert ENVIRONMENT_NOT_COMPARED_CAVEAT in passing.caveats
+
+
+# ---------------------------------------------------------------------------
+# #1626: evidence progress from the live reconciliation, and unknown receipts.
+# ---------------------------------------------------------------------------
+
+
+def test_superseded_by_current_turn_names_only_this_turns_superseding_receipts_1626():
+    from coding_review_agent_loop.local_test_evidence import (
+        TREE_CHANGE_SUPERSESSION,
+        superseded_by_current_turn,
+    )
+
+    registry = EnvironmentIdentityRegistry()
+    failure = _observation(
+        outcome="failed", timestamp="2026-10-23T10:00:00+00:00", receipt_id="fail-1", registry=registry,
+    )
+    passing = _observation(
+        outcome="passed", timestamp="2026-10-23T10:05:00+00:00", receipt_id="pass-now", registry=registry,
+    )
+    evidence = reconcile_test_observations([failure, passing], registry=registry)
+    assert evidence.observations[0].superseded_by == "pass-now"
+    assert superseded_by_current_turn(evidence, {"pass-now"}) == frozenset({"pass-now"})
+    # A superseding receipt from another turn is not this turn's progress.
+    assert superseded_by_current_turn(evidence, {"pass-other"}) == frozenset()
+    assert superseded_by_current_turn(None, {"pass-now"}) == frozenset()
+    # The tree-change label is never progress, even if a catalog named it.
+    labelled = evidence_module.LocalTestEvidence(observations=(
+        evidence_module.replace(failure, superseded_by=TREE_CHANGE_SUPERSESSION),
+    ))
+    assert superseded_by_current_turn(labelled, {TREE_CHANGE_SUPERSESSION}) == frozenset()
+    # A self-reported failure is never an authoritative failure to supersede.
+    self_reported = evidence_module.LocalTestEvidence(observations=(
+        evidence_module.replace(failure, provenance="self-reported", superseded_by="pass-now"),
+    ))
+    assert superseded_by_current_turn(self_reported, {"pass-now"}) == frozenset()
+
+
+def test_incompatible_pass_supersedes_nothing_1626():
+    from coding_review_agent_loop.local_test_evidence import superseded_by_current_turn
+
+    registry = EnvironmentIdentityRegistry()
+    failure = _observation(
+        outcome="failed", timestamp="2026-10-23T10:00:00+00:00", receipt_id="fail-1", registry=registry,
+    )
+    other_env = _observation(
+        outcome="passed", timestamp="2026-10-23T10:05:00+00:00", receipt_id="pass-now",
+        registry=registry, environment={"PATH": "/opt/other/bin"},
+    )
+    evidence = reconcile_test_observations([failure, other_env], registry=registry)
+    assert evidence.observations[0].superseded_by is None
+    assert superseded_by_current_turn(evidence, {"pass-now"}) == frozenset()
+
+
+def test_repair_citing_an_unknown_receipt_cannot_supersede_or_verify_1626():
+    """Matrix row `unknown-receipt-cited`."""
+    from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+    from coding_review_agent_loop.local_test_evidence import superseded_by_current_turn
+    from coding_review_agent_loop.pr_loop_support import cited_evidence_progress
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+
+    registry = EnvironmentIdentityRegistry()
+    failure = _observation(
+        outcome="failed", timestamp="2026-10-23T10:00:00+00:00", receipt_id="fail-1", registry=registry,
+    )
+    failure = evidence_module.replace(failure, turn_id="coder-turn")
+    runner = Runner()
+    runner._environment_registry = registry
+    runner._local_test_observations.append(failure)
+    rendered = runner.render_local_test_evidence()
+    live = runner.last_reconciled_local_test_evidence
+    assert live is not None and live.observations[0].superseded_by is None
+    payload = {
+        "schema_version": 1, "kind": "coder_followup", "state": "blocking", "summary": "Re-ran.",
+        "addressed_items": [], "remaining_items": [],
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [],
+        "test_observations": [{
+            "command": "python -m pytest tests/test_protocol.py -q",
+            "receipt_id": "invented-receipt", "claim": "current-result",
+        }],
+    }
+    parsed = validate_structured_coder_followup(
+        json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
+        test_observations_mode="repair-first",
+    )
+    # The coder acquisition's frozen catalog never contains the invented ID.
+    catalog = frozenset({"fail-1"})
+    assert superseded_by_current_turn(live, catalog) == frozenset()
+    assert cited_evidence_progress(parsed, superseded_by_current_turn(live, catalog)) == frozenset()
+    public = _render_test_observation_citations(
+        parsed.test_observations, local_test_evidence=rendered, current_test_turn_id="coder-turn",
+    )
+    assert "unverified: unknown or cross-turn receipt" in public
+
+
+def test_runner_retains_and_clears_the_unbounded_reconciliation_1626(tmp_path):
+    runner = Runner()
+    assert runner.last_reconciled_local_test_evidence is None
+    registry = EnvironmentIdentityRegistry()
+    runner._environment_registry = registry
+    runner._local_test_observations.append(_observation(
+        outcome="failed", timestamp="2026-10-23T10:00:00+00:00", receipt_id="fail-1", registry=registry,
+    ))
+    bounded = runner.render_local_test_evidence()
+    assert bounded is not None
+    assert [row.receipt_id for row in runner.last_reconciled_local_test_evidence.observations] == ["fail-1"]
+    runner._local_test_observations.clear()
+    assert runner.render_local_test_evidence() is None
+    assert runner.last_reconciled_local_test_evidence is None

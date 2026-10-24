@@ -2920,3 +2920,89 @@ def test_resumed_round_restores_citation_records_equal_to_a_reparse_927(kind):
     assert carrier.kind == kind
     assert carrier.test_observation_degradations == records
     assert _parse_927(kind, resumed.coder_output).test_observation_degradations == records
+
+
+# ---------------------------------------------------------------------------
+# #1626: decoded-from-string and after-repair citation records.
+# ---------------------------------------------------------------------------
+
+
+def _citation_response_1626(kind, observations):
+    payload = json.loads(_citation_response_927(kind).split("\n<!--", 1)[0])
+    payload["test_observations"] = observations
+    return json.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+
+
+def _parse_1626(kind, text, *, mode="degrade"):
+    from coding_review_agent_loop.protocol import (
+        validate_structured_coder_followup,
+        validate_structured_issue_implementation,
+    )
+
+    if kind == "issue_implementation":
+        return validate_structured_issue_implementation(text, test_observations_mode=mode)
+    return validate_structured_coder_followup(text, test_observations_mode=mode)
+
+
+def test_normalization_record_renders_beside_all_eight_drop_records_1626():
+    """Matrix row `render-boundary-normalization`."""
+    source = json.loads(_citation_response_927("coder_followup").split("\n<!--", 1)[0])
+    text = _citation_response_1626("coder_followup", json.dumps(source["test_observations"]))
+    records = _parse_1626("coder_followup", text).test_observation_degradations
+    assert len(records) == 9
+    assert records[0].outcome == "citations-decoded-from-string"
+    drops = records[1:]
+    assert all(record.outcome == "citation-dropped" for record in drops)
+    metadata = PostedRoundMetadata(
+        flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+        raw_structured_coder_response=text,
+        test_observation_degradations=records,
+    )
+    decoded = _decode_round_metadata(_encode_round_metadata(metadata))
+    assert decoded.test_observation_degradations == records
+    body = _attach_round_metadata(
+        "Coder follow-up.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude", metadata
+    )
+    assert body.count("### Test observation parse degradations") == 1
+    for record in drops:
+        assert f"`{record.element_path}`" in body
+    assert "omitted" not in body
+    assert "- Normalized `coder_followup.test_observations`" in body
+    assert "citations-decoded-from-string" in body
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+def test_resume_reparse_of_a_posted_prose_payload_keeps_todays_records_1626(kind):
+    """Matrix row `resume-legacy-reparse`: default degrade mode, never newly fatal."""
+    from coding_review_agent_loop.protocol import (
+        TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
+        TEST_OBSERVATIONS_NOT_ARRAY_RULE,
+    )
+    from coding_review_agent_loop.round_state import _resume_pr_round, rebuild_resumed_coder_carrier
+
+    text = _citation_response_1626(kind, "The node command ran with no environment override.")
+    records = _parse_1626(kind, text).test_observation_degradations
+    [legacy] = records
+    assert legacy.rule == TEST_OBSERVATIONS_NOT_ARRAY_RULE
+    after_repair = _parse_1626(kind, text, mode="degrade-after-repair").test_observation_degradations
+    assert after_repair[0].rule == TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE
+    for posted in (records, after_repair):
+        metadata = PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=1, subject="head",
+            raw_structured_coder_response=text,
+            test_observation_degradations=posted,
+        )
+        assert _decode_round_metadata(_encode_round_metadata(metadata)).test_observation_degradations == posted
+        comment = IssueComment(
+            author="bot", created_at="2026-09-23T00:00:00Z",
+            body=_attach_round_metadata(
+                "Coder follow-up.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude", metadata
+            ),
+        )
+        resumed = _resume_pr_round([comment], head_sha="head", configured_reviewers=("codex",))
+        assert resumed is not None
+        assert resumed.coder_metadata.test_observation_degradations == posted
+        carrier = rebuild_resumed_coder_carrier(resumed.coder_output, resumed.coder_metadata)
+        assert carrier.kind == kind
+        # The reconstruction re-parse uses the default degrade mode.
+        assert _parse_1626(kind, resumed.coder_output).test_observation_degradations == records

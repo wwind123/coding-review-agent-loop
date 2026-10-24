@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal
@@ -35,7 +35,7 @@ from .repair_preservation import (
     recover_payload,
     validate_repair_preservation,
 )
-from .protocol_markers import scan_reserved_markers
+from .protocol_markers import sanitize_historical_text, scan_reserved_markers
 from .usage import RunUsageContext, estimate_usage
 from .protocol import (
     normalize_risk_test_matrix_string_lists,
@@ -1467,9 +1467,18 @@ def _build_repair_prompt(
     require_risk_test_matrix_contract: bool = False,
     reject_unsolicited_risk_test_matrix_contract: bool = False,
     evidence_row_id_universe: Sequence[str] | None = None,
+    test_observations_shape_defect: bool = False,
+    test_turn_receipts: Sequence[Mapping[str, object]] | None = None,
 ) -> str:
     if expected_kind is not None and expected_kind not in _SUPPORTED_EXPECTED_KINDS:
         raise ValueError(f"Unsupported expected repair kind: {expected_kind}")
+    if (test_observations_shape_defect or test_turn_receipts is not None) and (
+        expected_kind not in {"coder_followup", "issue_implementation"}
+    ):
+        raise ValueError(
+            "test_observations_shape_defect and test_turn_receipts may only be used for "
+            "coder_followup or issue_implementation repair"
+        )
     if (
         (surfaced_requirement_ids is not None or requires_direct_discussion_ack)
         and expected_kind not in {"coder_followup", "issue_implementation", "plan_state", "plan_revision"}
@@ -1481,6 +1490,7 @@ def _build_repair_prompt(
         expected_kind,
         surfaced_requirement_ids,
         requires_direct_discussion_ack,
+        test_observations_shape_defect=test_observations_shape_defect,
     )
     coder_followup_required_items_instruction = _coder_followup_required_items_instruction(
         expected_kind, unresolved_item_ids, optional_item_ids
@@ -1513,17 +1523,32 @@ def _build_repair_prompt(
         if expected_kind is not None
         else "## Expected response kind:\nNo expected response kind was provided; choose from the format-selection rules.\n"
     )
+    receipt_prohibition = (
+        "Do not generate or preserve canonical matrix-evidence envelopes: matrix identities, "
+        "canonical rows, receipt IDs/citations inside `risk_test_matrix_evidence`, mappings, "
+        "statuses, ordering, or a final risk-test evidence envelope. This prohibition does not "
+        "apply to `test_observations`: the authorized test_observations repair below is "
+        "exempt, and its receipt citations are required. "
+        if test_observations_shape_defect
+        else "Do not generate or preserve matrix identities, "
+        "canonical rows, receipt IDs/citations, mappings, statuses, ordering, or a final "
+        "risk-test evidence envelope. "
+    )
     semantic_evidence_instruction = (
         "## Semantic implementation evidence boundary:\n"
         "For `issue_implementation` and `coder_followup`, repair only bounded semantic "
         "coverage claims. Claims may select approved row IDs and current-turn execution_ref "
-        "handles plus test facts and caveats. Do not generate or preserve matrix identities, "
-        "canonical rows, receipt IDs/citations, mappings, statuses, ordering, or a final "
-        "risk-test evidence envelope. Fresh legacy evidence fields are removed. "
+        "handles plus test facts and caveats. "
+        + receipt_prohibition
+        + "Fresh legacy evidence fields are removed. "
         "Preserve `risk_test_matrix_coverage_gaps` verbatim when the source has it, and emit none when it does not. "
         + semantic_risk_claim_schema_text(preserve_optional_keys=True)
         + " Never invent `execution_refs`, test identifiers, or assertions; leave an unknown "
         "fact empty or remove the claim row rather than fabricate facts.\n"
+        + (
+            _test_observations_shape_repair_instruction(test_turn_receipts)
+            if test_observations_shape_defect else ""
+        )
         if expected_kind in {"issue_implementation", "coder_followup"} else ""
     )
     fresh_contract_instruction = (
@@ -1591,10 +1616,55 @@ def _build_repair_prompt(
     return prompt
 
 
+_TEST_TURN_RECEIPT_FIELD_CHARS = 240
+
+
+def _test_observations_shape_repair_instruction(
+    receipts: Sequence[Mapping[str, object]] | None,
+) -> str:
+    """The targeted test_observations repair section (#1626).
+
+    ``receipts`` are this turn's tool-owned run-tests receipts; each value is
+    sanitized and bounded before it enters the prompt.
+    """
+    rendered: list[dict[str, str]] = []
+    for receipt in receipts or ():
+        rendered.append({
+            key: " ".join(
+                sanitize_historical_text(str(receipt.get(key, ""))).split()
+            )[:_TEST_TURN_RECEIPT_FIELD_CHARS]
+            for key in ("command", "receipt_id", "outcome")
+        })
+    receipt_text = (
+        json.dumps(rendered, indent=2)
+        if rendered
+        else "[] (no run-tests receipts were captured in this turn)"
+    )
+    return (
+        "## test_observations repair:\n"
+        "The source `test_observations` is not a JSON array of citations, so every citation "
+        "would be dropped. Repair it as follows:\n"
+        "- `test_observations` must be a JSON array of objects with exactly the keys "
+        '`"command"`, `"receipt_id"` and `"claim"`; `claim` is `current-result` or '
+        "`base-reproduction`. Cite only the current-turn receipts listed below.\n"
+        "- Cite a listed receipt only when the original response says it ran that command "
+        "(in `tests_run`, the test_observations prose, or the summary).\n"
+        "- Correct or remove malformed citation entries, and keep valid ones verbatim.\n"
+        "- Move any prose from `test_observations` into `summary` or the relevant "
+        "`addressed_item_notes`/`remaining_item_notes` entry. Never delete it.\n"
+        "- Never invent receipt IDs. With no listed receipts, emit `[]` and move the prose.\n"
+        "Current-turn run-tests receipts (tool-owned):\n"
+        + receipt_text
+        + "\n"
+    )
+
+
 def _issue_implementation_instruction(
     expected_kind: str | None,
     surfaced_requirement_ids: Sequence[str] | None,
     requires_direct_discussion_ack: bool,
+    *,
+    test_observations_shape_defect: bool = False,
 ) -> str:
     if expected_kind != "issue_implementation":
         return ""
@@ -1622,7 +1692,12 @@ def _issue_implementation_instruction(
         + semantic_risk_claim_schema_text(preserve_optional_keys=True)
         + " Never invent `execution_refs`, test identifiers, or assertions; leave an unknown fact "
         "empty or remove the claim row rather than fabricate facts. "
-        "Remove fresh `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, and other legacy evidence-envelope fields instead of recreating them. "
+        + (
+            "Remove fresh `risk_test_matrix_evidence` and its matrix identities, canonical rows, receipt IDs, mappings, statuses, and other legacy evidence-envelope fields instead of recreating them; "
+            "the authorized `test_observations` receipt citations are exempt and required. "
+            if test_observations_shape_defect
+            else "Remove fresh `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, and other legacy evidence-envelope fields instead of recreating them. "
+        )
         + requirement_rule
         + " A positive PR with a blocked disposition remains a terminal conflict after repair; "
         "do not relabel or silently remove that blocker.\n"
@@ -1991,6 +2066,9 @@ def execute_repair(
                         ),
                         evidence_row_id_universe=prompt_kwargs.get("evidence_row_id_universe"),
                         forbid_architecture_impact=forbid_architecture_impact,
+                        test_observations_shape_defect=bool(
+                            prompt_kwargs.get("test_observations_shape_defect")
+                        ),
                     )
                 except NonRepairableEvidenceRejection as exc:
                     # Repair preserves the coder's own claims, so every later
@@ -2329,6 +2407,8 @@ def attempt_repair(
     require_risk_test_matrix_contract: bool = False,
     reject_unsolicited_risk_test_matrix_contract: bool = False,
     evidence_row_id_universe: Sequence[str] | None = None,
+    test_observations_shape_defect: bool = False,
+    test_turn_receipts: Sequence[Mapping[str, object]] | None = None,
 ) -> str | None:
     """Call gemini-3.1-flash-lite via the Gemini CLI to reformat a malformed review response.
 
@@ -2351,6 +2431,8 @@ def attempt_repair(
         require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
         evidence_row_id_universe=evidence_row_id_universe,
+        test_observations_shape_defect=test_observations_shape_defect,
+        test_turn_receipts=test_turn_receipts,
     )
     try:
         oversized_prompt = len(prompt.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES
@@ -2387,6 +2469,7 @@ def attempt_repair(
                 allowed_prior_item_ids=allowed_prior_item_ids,
                 allow_legacy_matrix_removal=reject_unsolicited_risk_test_matrix_contract,
                 evidence_row_id_universe=evidence_row_id_universe,
+                test_observations_shape_defect=test_observations_shape_defect,
             )
         except Exception as exc:
             _logger.debug("repair pass content preservation failed: %s", exc)

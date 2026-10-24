@@ -1329,3 +1329,221 @@ def test_semantic_dedupe_transport_removes_its_whole_isolated_workdir(
     assert hidden_while_running
     assert isolated_dirs and all(not os.path.lexists(path) for path in isolated_dirs)
     assert turn_dirs and all(not path.exists() for path in turn_dirs)
+
+
+# ---------------------------------------------------------------------------
+# #1626: a non-array test_observations goes to format repair before any drop.
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.architecture_contract import (  # noqa: E402
+    _architecture_and_test_observation_mode_validators as _observation_validators_1626,
+)
+from coding_review_agent_loop.local_test_evidence import LocalTestObservation as _Observation_1626  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE as _AFTER_REPAIR_RULE_1626,
+)
+from coding_review_agent_loop.unresolved_items import (  # noqa: E402
+    _validate_coder_followup_response as _validate_followup_1626,
+)
+from agent_loop_helpers import structured_coder_followup as _structured_followup_1626  # noqa: E402
+import coding_review_agent_loop.repair as _repair_module_1626  # noqa: E402
+
+_PROSE_1626 = (
+    "The node command ran with no environment override; the checkout's gitignored venv "
+    "symlink supplies PyICU to build_locales.mjs."
+)
+_PASS_COMMAND_1626 = ("node", "--test", "scripts/locales.test.mjs")
+
+
+def _followup_text_1626(observations, *, summary="Re-ran the locale tests.", **changes):
+    raw = _structured_followup_1626(summary=summary, tests_run=["node --test scripts/locales.test.mjs"])
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["test_observations"] = observations
+    for key, value in changes.items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    return json.dumps(payload) + raw[end:]
+
+
+_REPAIRED_1626 = _followup_text_1626(
+    [{"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass", "claim": "current-result"}],
+    summary=f"Re-ran the locale tests. {_PROSE_1626}",
+)
+
+
+class _ReceiptRunner1626(FakeRunner):
+    """A coder turn that captures one passing run-tests receipt."""
+
+    def run_with_log(self, args, **kwargs):
+        if str(args[0]) == "claude":
+            self._latest_test_turn_id = "coder-turn"
+            self._local_test_observations.append(_Observation_1626(
+                command=_PASS_COMMAND_1626, outcome="passed", provenance="parent-observed",
+                receipt_id="receipt-pass", turn_id="coder-turn",
+            ))
+        return super().run_with_log(args, **kwargs)
+
+
+def _followup_turn_1626(tmp_path, outputs, *, repair=None, run_cli_repair=None, monkeypatch=None, **config_changes):
+    runner = _ReceiptRunner1626(claude_outputs=list(outputs))
+    config = make_config(
+        tmp_path, coder="claude", agent_max_retries=0, agent_retry_backoff_seconds=0,
+        **config_changes,
+    )
+    calls = []
+
+    def fake_repair(raw, cmd, **kwargs):
+        calls.append(kwargs)
+        return repair(raw) if callable(repair) else repair
+
+    validators = _observation_validators_1626(
+        lambda mode, observations_mode: lambda text: _validate_followup_1626(
+            text, unresolved_items=(), human_requirements=(),
+            required_architecture_impact_contract=1, architecture_status_mode=mode,
+            test_observations_mode=observations_mode,
+        )
+    )
+    kwargs = dict(
+        agent="claude", config=config, prompt="Address the review.",
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        require_architecture_impact_contract=True, role="coder",
+        use_repair=True, repair_expected_kind="coder_followup", **validators,
+    )
+    if run_cli_repair is not None:
+        # The suite-wide conftest stubs the legacy hook; restore the real
+        # execute_repair route for this turn.
+        monkeypatch.setattr(validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
+        monkeypatch.setattr(_repair_module_1626, "run_cli_repair", run_cli_repair)
+        call = lambda: validated_agent._run_validated_agent(runner, **kwargs)  # noqa: E731
+    else:
+        def call():
+            with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
+                return validated_agent._run_validated_agent(runner, **kwargs)
+    try:
+        outcome = call()
+    except AgentLoopError as exc:
+        outcome = exc
+    coder_turns = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    return outcome, calls, coder_turns
+
+
+def test_prose_test_observations_are_repaired_to_a_cited_array_1626(tmp_path):
+    """Matrix row `prose-repair-succeeds`."""
+    response, calls, coder_turns = _followup_turn_1626(
+        tmp_path, [_followup_text_1626(_PROSE_1626)], repair=_REPAIRED_1626,
+    )
+    assert isinstance(response, ValidatedAgentResponse), response
+    assert response.text == _REPAIRED_1626
+    assert [item.receipt_id for item in response.marker_value.test_observations] == ["receipt-pass"]
+    assert response.marker_value.test_observation_degradations == ()
+    # The targeted repair received the tool-owned receipts of this turn.
+    [kwargs] = calls
+    assert kwargs["test_observations_shape_defect"] is True
+    assert kwargs["test_turn_receipts"] == (
+        {"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass", "outcome": "passed"},
+    )
+    assert len(coder_turns) == 1, "no agent retry is consumed"
+    assert response.acquisition_test_observations[0].receipt_id == "receipt-pass"
+
+
+@pytest.mark.parametrize(
+    "repair",
+    [None, "prose"],
+    ids=["repair-unavailable", "repair-still-prose"],
+)
+def test_failed_repair_falls_back_to_the_after_repair_drop_1626(tmp_path, repair):
+    """Matrix row `prose-repair-fails-fallback` (legacy hook variants)."""
+    source = _followup_text_1626(_PROSE_1626)
+    response, calls, coder_turns = _followup_turn_1626(
+        tmp_path, [source], repair=(source if repair == "prose" else None),
+    )
+    assert isinstance(response, ValidatedAgentResponse), response
+    assert response.text == source
+    assert response.marker_value.test_observations == ()
+    [record] = response.marker_value.test_observation_degradations
+    assert record.outcome == "citation-dropped"
+    assert record.rule == _AFTER_REPAIR_RULE_1626
+    assert "PyICU" not in record.observed_preview
+    assert len(calls) == 1
+    assert len(coder_turns) == 1, "no agent retry is consumed"
+
+
+def test_exhausted_repair_chain_falls_back_to_the_after_repair_drop_1626(tmp_path, monkeypatch):
+    """Matrix row `prose-repair-fails-fallback` (real execute_repair, exhausted chain)."""
+    attempts = []
+
+    def failing_cli_repair(runner, config, prompt, *, model, log_path):
+        attempts.append((model, "## test_observations repair:" in prompt))
+        return SimpleNamespace(
+            text="", returncode=1, raw_output="model unavailable", usage=None,
+            raw_usage=None, observed_model=None, text_source="stdout",
+        )
+
+    source = _followup_text_1626(_PROSE_1626)
+    response, _calls, coder_turns = _followup_turn_1626(
+        tmp_path, [source], run_cli_repair=failing_cli_repair, monkeypatch=monkeypatch,
+        repair_backend="claude", repair_models=("repair-a", "repair-b"),
+    )
+    assert isinstance(response, ValidatedAgentResponse), response
+    assert attempts == [("repair-a", True), ("repair-b", True)]
+    [record] = response.marker_value.test_observation_degradations
+    assert record.rule == _AFTER_REPAIR_RULE_1626
+    assert len(coder_turns) == 1
+
+
+def test_fallback_keeps_an_architecture_near_miss_record_1626(tmp_path):
+    """Matrix row `fallback-architecture-near-miss`."""
+    near_miss = {
+        "status": "modified", "rationale": "The loader changed shape.",
+        "affected_components": ["loader"], "dependencies": ["json"],
+        "execution_data_flows": ["parse"], "persistence": ["none"],
+        "public_contracts": ["loader api"], "security_boundaries": ["none"],
+        "canonical_document_action": "update",
+        "canonical_document_path": "docs/architecture/components.md",
+        "canonical_document_rationale": "The loader section changed.",
+    }
+    source = _followup_text_1626(_PROSE_1626, architecture_impact=near_miss)
+    response, _calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=None)
+    assert isinstance(response, ValidatedAgentResponse), response
+    parsed = response.marker_value
+    assert parsed.architecture_impact.status == "changed"
+    assert [record.outcome for record in parsed.architecture_impact_degradations] == [
+        "normalized-to-changed"
+    ]
+    [record] = parsed.test_observation_degradations
+    assert record.rule == _AFTER_REPAIR_RULE_1626
+    # The accepted text is the canonicalized, strictly re-parsed form.
+    assert '"modified"' not in response.text
+    assert len(coder_turns) == 1
+
+
+def test_fallback_does_not_mask_another_fatal_defect_1626(tmp_path):
+    """Matrix row `fallback-other-defect`."""
+    source = _followup_text_1626(_PROSE_1626, summary="   ")
+    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=None)
+    assert isinstance(outcome, AgentLoopError)
+    assert not isinstance(outcome, ValidatedAgentResponse)
+    assert len(calls) == 1
+
+
+def test_valid_array_followup_runs_no_repair_1626(tmp_path):
+    """Matrix row `valid-array-unchanged` at the validated-turn seam."""
+    valid = _followup_text_1626([
+        {"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass", "claim": "current-result"}
+    ])
+    response, calls, _coder_turns = _followup_turn_1626(tmp_path, [valid], repair=_REPAIRED_1626)
+    assert isinstance(response, ValidatedAgentResponse), response
+    assert response.text == valid
+    assert calls == []
+    assert response.marker_value.test_observation_degradations == ()
+
+
+def test_fallback_validators_must_be_supplied_as_a_pair_1626(tmp_path):
+    with pytest.raises(AgentLoopError, match="supplied together"):
+        validated_agent._run_validated_agent(
+            FakeRunner(), agent="claude", config=make_config(tmp_path), prompt="x",
+            marker_description="x", validate=lambda text: text,
+            test_observations_fallback_validate=lambda text: text,
+        )

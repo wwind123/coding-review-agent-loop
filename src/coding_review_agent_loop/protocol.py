@@ -18,6 +18,7 @@ from .errors import (
     IssueImplementationConflictError,
     MissingJudgementFieldError,
     NonRepairableEvidenceRejection,
+    TestObservationsShapeError,
 )
 from .protocol_markers import sanitize_historical_text
 from .review_scheduling import normalize_fix_scope
@@ -540,7 +541,13 @@ ARCHITECTURE_IMPACT_STATUS_ALIASES = {"modified": "changed"}
 PARSE_DEGRADATION_FIELD_CHARS = 200
 PARSE_DEGRADATION_PREVIEW_CHARS = 120
 PARSE_DEGRADATION_OUTCOMES = frozenset(
-    {"normalized-to-changed", "degraded-to-undetermined", "claim-dropped", "citation-dropped"}
+    {
+        "normalized-to-changed",
+        "degraded-to-undetermined",
+        "claim-dropped",
+        "citation-dropped",
+        "citations-decoded-from-string",
+    }
 )
 # Records beyond this count are summarized rather than rendered; the
 # rendering module re-exports it under the same name.
@@ -549,6 +556,9 @@ PARSE_DEGRADATION_RENDER_LIMIT = 8
 # bounded (fatal beyond it) to keep every record stored and rendered (#927).
 CITATION_DEGRADATION_MAX_DROPS = PARSE_DEGRADATION_RENDER_LIMIT
 CITATION_DROPPED_OUTCOME = "citation-dropped"
+# A test_observations string that decoded to a JSON array (#1626).  At most
+# one per response; it renders outside the drop-record limit.
+CITATIONS_DECODED_FROM_STRING_OUTCOME = "citations-decoded-from-string"
 ARCHITECTURE_IMPACT_NEAR_MISS_RULE = "architecture_impact.status-closed-enum-near-miss"
 
 
@@ -4847,6 +4857,22 @@ CITATION_KEYS_RULE = "citation keys are not exactly command, receipt_id and clai
 CITATION_BLANK_FIELD_RULE = "citation command or receipt_id is not a non-blank string"
 CITATION_CLAIM_RULE = "citation claim is not current-result or base-reproduction"
 TEST_OBSERVATIONS_NOT_ARRAY_RULE = "test_observations is not a JSON array; no citation is kept"
+TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE = (
+    "test_observations is not a JSON array; format repair was attempted and did not "
+    "produce one; no citation is kept"
+)
+TEST_OBSERVATIONS_NOT_ARRAY_RULES = frozenset(
+    {TEST_OBSERVATIONS_NOT_ARRAY_RULE, TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE}
+)
+TEST_OBSERVATIONS_DECODED_FROM_STRING_RULE = (
+    "test_observations was a string holding a JSON array; the decoded array was used"
+)
+# How a fresh or historical parse treats a non-array test_observations (#1626).
+# ``degrade`` is today's #927 drop and the default for every historical,
+# resume and legacy re-parse; ``repair-first`` raises a repairable
+# TestObservationsShapeError; ``degrade-after-repair`` is the fallback drop
+# once repair failed, recorded with a rule saying so.
+TEST_OBSERVATIONS_MODES = frozenset({"repair-first", "degrade", "degrade-after-repair"})
 
 
 def _test_observation_item_defect(item: object) -> tuple[TestObservationCitation | None, str | None]:
@@ -4884,8 +4910,26 @@ def _citation_defect_observed(item: object, rule: str) -> str:
     return _json_type_label(item)
 
 
+def _decode_test_observations_string(value: object, *, context: str) -> list | None:
+    """Decode a test_observations string that holds a JSON array (#1626).
+
+    The string is bounded like any dropped value before it is decoded.
+    Returns the decoded list, or None when ``value`` is not a string or does
+    not decode to a list.  Every parse mode and repair preservation share it,
+    so strict, fallback and resume re-parses keep the same citations.
+    """
+    if not isinstance(value, str):
+        return None
+    _check_dropped_value_bound(value, context=context)  # shape-check: delegated
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return None
+    return decoded if isinstance(decoded, list) else None
+
+
 def _degradable_test_observations(
-    value: object, *, context: str
+    value: object, *, context: str, mode: str = "degrade"
 ) -> tuple[tuple[TestObservationCitation, ...], tuple[ParseDegradation, ...]]:
     """Parse model-authored follow-up citations, dropping malformed items (#927).
 
@@ -4896,23 +4940,65 @@ def _degradable_test_observations(
     drops reject the whole response, so every retained record is stored and
     rendered in full.  Every dropped raw value is bounded before its record
     is built.
+
+    A string holding a JSON array is decoded first in every mode, with one
+    ``citations-decoded-from-string`` record (#1626).  ``mode`` decides only
+    what happens to a value that is still not an array: see
+    ``TEST_OBSERVATIONS_MODES``.
     """
+    if mode not in TEST_OBSERVATIONS_MODES:
+        raise ValueError(f"Unknown test_observations mode: {mode}")
+    leading: tuple[ParseDegradation, ...] = ()
+    if isinstance(value, str):
+        _check_dropped_value_bound(value, context=context)  # shape-check: fatal:payload-bound
+        decoded = _decode_test_observations_string(value, context=context)  # shape-check: fatal:payload-bound
+        if decoded is not None:
+            value = decoded
+            leading = (ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
+                element_path=context,
+                rule=TEST_OBSERVATIONS_DECODED_FROM_STRING_RULE,
+                observed=_json_type_label(""),
+                outcome=CITATIONS_DECODED_FROM_STRING_OUTCOME,
+            ),)
     if not isinstance(value, list):
         # A non-list value counts as one drop at the field path.
         _check_dropped_value_bound(value, context=context)  # shape-check: fatal:payload-bound
+        if mode == "repair-first":
+            # Dropping the field would silently discard the turn's evidence
+            # citations, so the structured repair pass gets it first.
+            raise TestObservationsShapeError(  # shape-check: fatal:no-conservative-reading
+                f"{context} must be a JSON array of citation objects, not "
+                f"{_json_type_label(value)}.",
+                field_path=context,
+                type_label=_json_type_label(value),
+                fallback_degradable=True,
+            )
         return (), (ParseDegradation.build(  # shape-check: fatal:authentication-or-forgery
             element_path=context,
-            rule=TEST_OBSERVATIONS_NOT_ARRAY_RULE,
+            rule=(
+                TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE
+                if mode == "degrade-after-repair"
+                else TEST_OBSERVATIONS_NOT_ARRAY_RULE
+            ),
             observed=_json_type_label(value),
             outcome=CITATION_DROPPED_OUTCOME,
         ),)
     classified = [_test_observation_item_defect(item) for item in value]
     drop_count = sum(1 for _citation, rule in classified if rule is not None)
     if drop_count > CITATION_DEGRADATION_MAX_DROPS:
-        raise AgentLoopError(  # shape-check: fatal:payload-bound
+        message = (
             f"{context} has {drop_count} malformed citations, beyond the "
             f"{CITATION_DEGRADATION_MAX_DROPS}-citation drop bound."
         )
+        if mode == "repair-first":
+            # Repairable, but the terminal outcome stays fatal: no fallback.
+            raise TestObservationsShapeError(  # shape-check: fatal:payload-bound
+                message,
+                field_path=context,
+                type_label=_json_type_label(value),
+                fallback_degradable=False,
+            )
+        raise AgentLoopError(message)  # shape-check: fatal:payload-bound
     citations: list[TestObservationCitation] = []
     records: list[ParseDegradation] = []
     for index, (citation, rule) in enumerate(classified):
@@ -4928,7 +5014,7 @@ def _degradable_test_observations(
             observed=_citation_defect_observed(value[index], rule),  # shape-check: fatal:authentication-or-forgery
             outcome=CITATION_DROPPED_OUTCOME,
         ))
-    return tuple(citations), tuple(records)
+    return tuple(citations), leading + tuple(records)
 
 
 def _semantic_execution_ref(observation: object) -> str | None:
@@ -7669,6 +7755,7 @@ def validate_structured_coder_followup(
     allow_historical_canonical_evidence: bool = False,
     architecture_status_mode: str = "strict",
     expected_sub_item_ids: Mapping[str, Sequence[str]] | None = None,
+    test_observations_mode: str = "degrade",
 ) -> StructuredCoderFollowup | None:
     payload = _extract_structured_coder_followup_payload(text)  # shape-check: fatal:unparseable-envelope
     if payload is None:
@@ -7732,6 +7819,7 @@ def validate_structured_coder_followup(
     test_observations, test_observation_degradations = _degradable_test_observations(  # shape-check: fatal:payload-bound
         payload.get("test_observations", []),
         context="coder_followup.test_observations",
+        mode=test_observations_mode,
     )
     risk_claims = None
     if "risk_test_matrix_claims" in payload:
@@ -7926,6 +8014,7 @@ def validate_structured_issue_implementation(
     execution_catalog: Sequence[object] | None = None,
     allow_historical_canonical_evidence: bool = False,
     architecture_status_mode: str = "strict",
+    test_observations_mode: str = "degrade",
 ) -> StructuredIssueImplementation | None:
     """Parse and validate the strict issue-implementation result envelope.
 
@@ -8002,6 +8091,7 @@ def validate_structured_issue_implementation(
     test_observations, test_observation_degradations = _degradable_test_observations(  # shape-check: fatal:payload-bound
         payload.get("test_observations", []),
         context="issue_implementation.test_observations",
+        mode=test_observations_mode,
     )
     risk_claims = None
     if "risk_test_matrix_claims" in payload:

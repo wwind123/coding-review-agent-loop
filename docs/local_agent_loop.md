@@ -2286,6 +2286,27 @@ A malformed `test_observations` citation in a follow-up or implementation
 result is dropped with its own record, and the round summary lists every
 dropped citation. More than eight malformed citations reject the response.
 
+A wrongly shaped `test_observations` field is fixed before anything is dropped
+(#1626):
+
+- A string that holds a JSON array is decoded and used as that array. The
+  round summary shows one `citations-decoded-from-string` line ahead of any
+  drop records.
+- In a fresh follow-up or implementation, a value that is still not an array
+  (prose, an object, a number), or more than eight malformed citations, goes
+  to the structured format repair first. The repair prompt lists this turn's
+  run-tests receipts and asks for an array of `{command, receipt_id, claim}`
+  citations, with the prose moved into `summary` or an item note. A repair
+  that deletes the prose or a valid citation, or still returns a non-array,
+  is not accepted.
+- If repair fails or is unavailable, a non-array value falls back to the
+  single field drop, recorded with the rule `test_observations is not a JSON
+  array; format repair was attempted and did not produce one; no citation is
+  kept`. No agent retry is spent. More than eight malformed citations still
+  reject the response.
+- Resumed runs and other re-parses of responses that were already posted keep
+  the earlier drop record and never become fatal.
+
 Catalog collisions and non-passing or non-authoritative in-catalog selectors
 are not repairable by reformatting, so they skip the structured repair pass
 and its model fallback chain entirely. The run reports `Failure category:
@@ -4570,6 +4591,23 @@ and the receipt is attributed to the current head, which rejects a receipt from 
 head as `head-mismatch`. Whether test evidence alone answers a code finding is the
 reviewer's decision in the next round, and the unchanged-head coder-turn limit still
 applies unchanged.
+
+The unchanged-head limit has one bounded exception (#1626). The follow-up that
+reaches the limit gets one more review round for that head when a run-tests
+receipt from its own turn meets both conditions:
+
+- It superseded a parent-observed failure receipt in the live evidence
+  reconciliation.
+- A surviving `test_observations` citation in the accepted follow-up cites it.
+
+The run logs `unchanged head but authoritative cited evidence progress;
+granting one review round` with the receipt IDs. A later unchanged follow-up at
+the same head stops as before, and the grant is not persisted across a resume.
+When the stop fires and the last follow-up's `test_observations` were dropped
+as a non-array, the stop message adds: `The coder's test_observations were not
+a JSON array (format repair attempted: yes|no); N run-tests receipt(s) from
+that turn went uncited, so the blocker may be a tool format problem rather than
+a code defect.`
 
 #### Qualified panel evidence
 
