@@ -132,6 +132,15 @@ class CompactPrReviewTailContext:
     action: str | None = None
 
 
+# One-line array example for the coder's citation field (#1626): a prose
+# value drops every citation, so the shape is shown explicitly.
+TEST_OBSERVATIONS_ARRAY_GUIDANCE = (
+    "`test_observations` is a JSON array of citation objects, for example "
+    + '`"test_observations": [{"command": "<exact run-tests command>", "receipt_id": "<receipt from agent-loop run-tests>", "claim": "current-result"}]`'
+    + ". It is never prose: put explanations in `summary` or the item notes."
+)
+
+
 def _architecture_context_block(
     config: AgentLoopConfig,
     context: ArchitectureSnapshot | ArchitecturePair | None = None,
@@ -1810,6 +1819,7 @@ def _structured_coder_followup_guidance(
         "}",
         "",
         "Required structured fields: `schema_version`, `kind`, `state`, `summary`, `addressed_items`, `remaining_items`, `human_requirements`, `human_requirement_dispositions`, and `architecture_impact` for this fresh coder turn. `addressed_item_notes`, `remaining_item_notes`, `disputed_items`, `dispute_evidence`, `tests_run`, and `test_observations` are optional.",
+        TEST_OBSERVATIONS_ARRAY_GUIDANCE,
         "Your response and public response file must start directly with `{`, contain exactly one top-level JSON object, and must not include stdout filtering markers, prose, headings, or code fences before or between the JSON and footer.",
         "After the JSON object, add exactly one footer `<!-- AGENT_STATE: approved|blocking -->`, then only your standalone signature. The JSON `state` must match the `AGENT_STATE` footer exactly.",
         *(
@@ -1934,7 +1944,7 @@ Rules:
 - A created-PR result may not contain a `blocked` signed-requirement disposition. If a signed requirement is discovered to be blocked after a PR was opened, set `pr_number` to `null`, keep the real PR number or URL in the summary or disposition evidence so the operator can locate it, and describe the conflict.
 - A null-PR blocker unrelated to signed requirements is valid with the empty ledger required by the rules above.
 - `tests_run` is optional and may be absent, `null`, or an empty array when no tests ran. When supplied, it contains only exact command strings; report why tests could not run in `summary`.
-- `test_observations` is optional display evidence; when supplied, report only exact managed-wrapper commands and outcomes. A legacy or direct-shell report remains capture-limited.
+- `test_observations` is optional display evidence; when supplied, report only exact managed-wrapper commands and outcomes. A legacy or direct-shell report remains capture-limited. {TEST_OBSERVATIONS_ARRAY_GUIDANCE}
 - A standalone Node test script is citable only when run as `node --test <file>` (one runner test that passes only on exit 0); a package.json script is citable via `npm run <name>` only when it is a single recognized test command with no pre/post scripts.
 - When the approved-plan context contains an applicable risk matrix, report semantic `risk_test_matrix_claims` only: each claim names an approved `row_id`, current-turn `execution_refs`, actual test identifiers/locations, workflow/outcome/forbidden-effect assertions, and optional caveats. {semantic_risk_claim_schema_text(include_coverage_map=include_coverage_map)}{coverage_map_rules} Do not emit `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs, mappings, statuses, or envelope bookkeeping. The orchestrator derives those fields from the approved matrix, authoritative journal, and authenticated PR head. Never emit `evidence_source` or `signed_evidence_reference`: only the orchestrator labels a row operator-signed, from signed human evidence the owning reviewers cleared. Planned tests and unverified commands are not evidence.
 - Start directly with exactly one top-level JSON object. Put the `<!-- AGENT_STATE: blocking -->` footer immediately after it and only your standalone signature after the footer.

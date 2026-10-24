@@ -1963,3 +1963,348 @@ def test_unchanged_head_stop_names_unsuperseded_evidence_receipts(tmp_path):
         str(without.value),
     )
     assert found is not None, str(without.value)
+
+
+# --- #1626: dropped test_observations, repair-first, and evidence progress ---
+
+import coding_review_agent_loop.local_test_evidence as _evidence_module_1626  # noqa: E402
+import coding_review_agent_loop.repair as _repair_module_1626  # noqa: E402
+
+_CMD_1626 = ("python3", "-m", "pytest", "tests/test_x.py", "-q", "-n", "0")
+_CMD_TEXT_1626 = "python3 -m pytest tests/test_x.py -q -n 0"
+_PROSE_1626 = (
+    "The node command ran with no environment override; the checkout's gitignored venv "
+    "symlink supplies PyICU to build_locales.mjs."
+)
+
+
+class _EvidenceRunner1626(FakeRunner):
+    """A PR whose open item is evidence: one parent-observed failure at abc123.
+
+    ``turn_receipts`` lists, per coder turn, the run-tests receipts that turn
+    captures as ``(receipt_id, outcome, environment)``.
+    """
+
+    def __init__(self, *, turn_receipts, tmp_path, **kwargs):
+        super().__init__(advance_pr_head_on_coder_followup=False, **kwargs)
+        from coding_review_agent_loop.local_test_evidence import EnvironmentIdentityRegistry
+
+        self.registry = EnvironmentIdentityRegistry()
+        self._environment_registry = self.registry
+        self.turn_receipts = list(turn_receipts)
+        self.coder_turns = 0
+        self._local_test_observations.append(self._receipt(
+            "fail-1", "failed", {"PATH": "/usr/bin"}, turn="earlier-turn", minute=0,
+        ))
+
+    def _receipt(self, receipt_id, outcome, environment, *, turn, minute):
+        from coding_review_agent_loop.local_test_evidence import (
+            EvidenceScope,
+            LocalTestObservation,
+            TreeAttribution,
+        )
+
+        return LocalTestObservation(
+            command=_CMD_1626, outcome=outcome, provenance="parent-observed",
+            scope=EvidenceScope("unknown", ()), receipt_id=receipt_id, turn_id=turn,
+            timestamp=f"2026-10-23T20:{minute:02d}:00+00:00",
+            normalized_command=_CMD_TEXT_1626, returncode=0 if outcome == "passed" else 4,
+            attribution=TreeAttribution(
+                state="current-head", head="abc123", tracked_digest="tree-a", stable=True,
+            ),
+            environment_identity=self.registry.capture(environment),
+        )
+
+    def run_with_log(self, args, **kwargs):
+        if str(args[0]) == "claude":
+            self.coder_turns += 1
+            turn = f"coder-turn-{self.coder_turns}"
+            self._latest_test_turn_id = turn
+            receipts = self.turn_receipts.pop(0) if self.turn_receipts else ()
+            for index, (receipt_id, outcome, environment) in enumerate(receipts):
+                self._local_test_observations.append(self._receipt(
+                    receipt_id, outcome, environment, turn=turn,
+                    minute=10 * self.coder_turns + index,
+                ))
+        return super().run_with_log(args, **kwargs)
+
+
+def _followup_1626(observations=None, *, summary="Re-ran the evidence command."):
+    raw = structured_coder_followup(
+        remaining_items=["item-1"], addressed_items=[], summary=summary,
+        tests_run=[_CMD_TEXT_1626],
+    )
+    if observations is None:
+        return raw
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["test_observations"] = observations
+    return json.dumps(payload) + raw[end:]
+
+
+def _citation_1626(receipt_id):
+    return {"command": _CMD_TEXT_1626, "receipt_id": receipt_id, "claim": "current-result"}
+
+
+def _evidence_reviews_1626(carried_rounds, *, final="approved"):
+    blocking = structured_pr_review(
+        state="blocking", summary="Needs an admissible passing observation.",
+        blocking_items=["Provide an admissible passing observation of the evidence command."],
+    )
+    carried = structured_pr_review(
+        state="blocking", summary="Still no admissible passing observation.",
+        prior_item_dispositions=[
+            {"item_id": "item-1", "disposition": "blocking", "note": "Failed receipt stands."}
+        ],
+    )
+    reviews = [blocking] + [carried] * carried_rounds
+    if final == "approved":
+        reviews.append(structured_pr_review(
+            state="approved", summary="The cited pass supersedes the failure.",
+            prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
+        ))
+    return reviews
+
+
+def _run_evidence_loop_1626(
+    tmp_path, monkeypatch, *, coder_outputs, turn_receipts, reviews, repair_output=None,
+):
+    """Drive run_pr_loop through the real validated turn and execute_repair.
+
+    The stubbed repair model stands in for a real repair launch: it replaces
+    the runner's latest test turn and captures no receipts.
+    """
+    runner = _EvidenceRunner1626(
+        turn_receipts=turn_receipts, tmp_path=tmp_path,
+        codex_outputs=reviews, claude_outputs=coder_outputs,
+    )
+    repair_launches = []
+
+    def repair_launch(launch_runner, config, prompt, *, model, log_path):
+        launch_runner._latest_test_turn_id = f"repair-turn-{len(repair_launches) + 1}"
+        repair_launches.append(prompt)
+        text = repair_output or ""
+        return SimpleNamespace(
+            text=text, returncode=0 if text else 1, raw_output=text or "repair unavailable",
+            usage=None, raw_usage=None, observed_model=None, text_source="stdout",
+        )
+
+    monkeypatch.setattr(validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
+    monkeypatch.setattr(_repair_module_1626, "run_cli_repair", repair_launch)
+    config = make_config(
+        tmp_path, coder="claude", reviewer="codex", max_rounds=8,
+        repair_backend="claude", repair_models=("repair-model",), quiet=False,
+    )
+    try:
+        outcome = run_pr_loop(runner, pr_number=77, config=config)
+    except AgentLoopError as exc:
+        outcome = exc
+    return outcome, runner, repair_launches
+
+
+def _reviews_run_1626(runner):
+    return len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]])
+
+
+def test_evidence_only_followup_repaired_and_cited_gets_one_review_round_1626(tmp_path, monkeypatch, capsys):
+    """Matrix row `evidence-only-1738` (repair succeeds).
+
+    The prior follow-up already left abc123 unchanged; the next one reruns the
+    command, gets a compatible pass, and writes prose.  Repair (which repoints
+    the runner's latest test turn) returns a cited array, live reconciliation
+    supersedes the failure with the coder turn's pass, and the grant lets the
+    reviewer see it instead of stopping.
+    """
+    prose = _followup_1626(_PROSE_1626)
+    repaired = _followup_1626(
+        [_citation_1626("pass-2")], summary=f"Re-ran the evidence command. {_PROSE_1626}"
+    )
+    outcome, runner, launches = _run_evidence_loop_1626(
+        tmp_path, monkeypatch,
+        coder_outputs=[_followup_1626(), prose],
+        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})]],
+        reviews=_evidence_reviews_1626(1),
+        repair_output=repaired,
+    )
+    assert outcome == 0, outcome
+    assert len(launches) == 1 and "## test_observations repair:" in launches[0]
+    assert '"receipt_id": "pass-2"' in launches[0]
+    assert runner.latest_test_turn_id == "repair-turn-1"
+    # Review three ran on the unchanged head because of the grant.
+    assert _reviews_run_1626(runner) == 3
+    live = runner.last_reconciled_local_test_evidence
+    failure = next(row for row in live.observations if row.receipt_id == "fail-1")
+    assert failure.superseded_by == "pass-2"
+    assert "authoritative cited evidence progress; granting one review round" in capsys.readouterr().err
+
+
+def test_evidence_only_followup_with_failed_repair_stops_and_names_the_drop_1626(tmp_path, monkeypatch):
+    """Matrix rows `evidence-only-1738` (repair fails) and `degrade-after-failed-repair`.
+
+    The same compatible pass supersedes the failure in live reconciliation,
+    but the citations were dropped, so no grant: the stop fires and names
+    the non-array test_observations and the true uncited count, taken from
+    the coder acquisition's catalog rather than the repointed runner.
+    """
+    outcome, runner, launches = _run_evidence_loop_1626(
+        tmp_path, monkeypatch,
+        coder_outputs=[_followup_1626(), _followup_1626(_PROSE_1626)],
+        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})]],
+        reviews=_evidence_reviews_1626(1, final=None),
+        repair_output=None,
+    )
+    assert isinstance(outcome, AgentLoopError), outcome
+    message = str(outcome)
+    assert "unchanged in 2 consecutive follow-up rounds" in message
+    assert (
+        "The coder's test_observations were not a JSON array (format repair attempted: yes); "
+        "1 run-tests receipt(s) from that turn went uncited, so the blocker may be a tool "
+        "format problem rather than a code defect."
+    ) in message
+    assert message.index("not a JSON array") < message.index("human review required.") + 200
+    assert len(launches) == 1
+    assert runner.latest_test_turn_id == "repair-turn-1"
+    live = runner.last_reconciled_local_test_evidence
+    assert next(row for row in live.observations if row.receipt_id == "fail-1").superseded_by == "pass-2"
+    assert _reviews_run_1626(runner) == 2
+
+
+def test_uncited_supersession_or_no_supersession_still_stops_1626(tmp_path, monkeypatch):
+    """Matrix rows `unchanged-head-no-progress` and `stop-message-unchanged`."""
+    # (a) Supersession by this turn's pass, but no surviving citation cites it.
+    outcome, runner, _launches = _run_evidence_loop_1626(
+        tmp_path / "uncited", monkeypatch,
+        coder_outputs=[_followup_1626(), _followup_1626([])],
+        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})]],
+        reviews=_evidence_reviews_1626(1, final=None),
+    )
+    assert isinstance(outcome, AgentLoopError), outcome
+    assert re.fullmatch(
+        r"PR #77: Claude left head abc123 unchanged in 2 consecutive follow-up rounds, so another "
+        r"review of the same diff cannot change the verdict\. Stopping before round \d+; "
+        r"human review required\.",
+        str(outcome),
+    ), str(outcome)
+    live = runner.last_reconciled_local_test_evidence
+    assert next(row for row in live.observations if row.receipt_id == "fail-1").superseded_by == "pass-2"
+    # (b) Nothing superseded by a coder-turn receipt; a cited model claim
+    # naming a receipt that superseded nothing earns nothing either.
+    outcome, runner, _launches = _run_evidence_loop_1626(
+        tmp_path / "none", monkeypatch,
+        coder_outputs=[_followup_1626(), _followup_1626([_citation_1626("fail-1")])],
+        turn_receipts=[(), ()],
+        reviews=_evidence_reviews_1626(1, final=None),
+    )
+    assert isinstance(outcome, AgentLoopError), outcome
+    message = str(outcome)
+    assert "unchanged in 2 consecutive follow-up rounds" in message
+    assert "unsuperseded failure receipts" in message
+    assert "not a JSON array" not in message
+    assert _reviews_run_1626(runner) == 2
+
+
+def test_grant_is_bounded_to_one_round_per_head_1626(tmp_path, monkeypatch):
+    """Matrix row `unchanged-head-second-grant` (loop level)."""
+    repaired = _followup_1626(
+        [_citation_1626("pass-2")], summary=f"Re-ran the evidence command. {_PROSE_1626}"
+    )
+    outcome, runner, _launches = _run_evidence_loop_1626(
+        tmp_path, monkeypatch,
+        coder_outputs=[_followup_1626(), _followup_1626(_PROSE_1626), _followup_1626([_citation_1626("pass-3")])],
+        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin"})], [("pass-3", "passed", {"PATH": "/usr/bin"})]],
+        reviews=_evidence_reviews_1626(2, final=None),
+        repair_output=repaired,
+    )
+    assert isinstance(outcome, AgentLoopError), outcome
+    assert "unchanged in 3 consecutive follow-up rounds" in str(outcome)
+    assert _reviews_run_1626(runner) == 3
+
+
+def test_unchanged_head_tracker_grants_once_per_head_1626():
+    """Matrix row `unchanged-head-second-grant` (tracker unit)."""
+    tracker = pr_loop_support._UnchangedHeadTracker()
+    assert tracker.grant_evidence_progress() is False  # no tracked head yet
+    tracker.observe("H", "H")
+    tracker.observe("H", "H")
+    assert tracker.grant_evidence_progress() is True
+    tracker.observe("H", "H")
+    assert tracker.count == 3
+    assert tracker.grant_evidence_progress() is False
+    # A different head resets the grant.
+    tracker.observe("J", "J")
+    assert tracker.grant_evidence_progress() is True
+    # A follow-up that moves the head clears the count and the grant.
+    tracker.observe("J", "K")
+    tracker.observe("K", "K")
+    assert tracker.evidence_progress_granted is False
+
+
+def test_bounded_metadata_eviction_never_grants_a_round_1626(tmp_path, monkeypatch):
+    """Matrix row `grant-not-from-bounded-eviction`."""
+    # The byte cap drops every detail row from the bounded projection.
+    monkeypatch.setattr(_evidence_module_1626, "MAX_ROUND_BYTES", 300)
+    outcome, runner, _launches = _run_evidence_loop_1626(
+        tmp_path, monkeypatch,
+        coder_outputs=[_followup_1626(), _followup_1626([_citation_1626("pass-2")])],
+        # An incompatible pass: reconciliation adds a caveat, supersedes nothing.
+        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/opt/other/bin"})]],
+        reviews=_evidence_reviews_1626(1, final=None),
+    )
+    assert isinstance(outcome, AgentLoopError), outcome
+    assert "unchanged in 2 consecutive follow-up rounds" in str(outcome)
+    live = runner.last_reconciled_local_test_evidence
+    assert next(row for row in live.observations if row.receipt_id == "fail-1").superseded_by is None
+    bounded = _evidence_module_1626.decode_bounded_evidence(
+        runner.render_local_test_evidence(current_head="abc123")
+    )
+    assert bounded is None or not any(row.receipt_id == "fail-1" for row in bounded.observations)
+    assert _reviews_run_1626(runner) == 2
+
+
+def test_uncited_count_survives_bounding_and_runner_repointing_1626(tmp_path, monkeypatch):
+    """Matrix row `stop-count-unbounded`."""
+    # Retained failures crowd this turn's passes out of the bounded evidence.
+    monkeypatch.setattr(_evidence_module_1626, "MAX_ROUND_OBSERVATIONS", 1)
+    outcome, runner, launches = _run_evidence_loop_1626(
+        tmp_path, monkeypatch,
+        coder_outputs=[_followup_1626(), _followup_1626(_PROSE_1626)],
+        turn_receipts=[(), [
+            ("pass-a", "passed", {"PATH": "/opt/a"}),
+            ("pass-b", "passed", {"PATH": "/opt/b"}),
+            ("pass-c", "passed", {"PATH": "/opt/c"}),
+        ]],
+        reviews=_evidence_reviews_1626(1, final=None),
+        repair_output=None,
+    )
+    assert isinstance(outcome, AgentLoopError), outcome
+    assert "3 run-tests receipt(s) from that turn went uncited" in str(outcome)
+    assert len(launches) == 1 and runner.latest_test_turn_id == "repair-turn-1"
+    assert runner.current_test_turn_observations() == ()
+    bounded = _evidence_module_1626.decode_bounded_evidence(
+        runner.render_local_test_evidence(current_head="abc123")
+    )
+    assert [row.receipt_id for row in bounded.observations] == ["fail-1"]
+
+
+def test_stop_message_is_byte_identical_without_a_non_array_drop_1626():
+    """Matrix row `stop-message-unchanged` (message unit)."""
+    from coding_review_agent_loop.pr_loop import unchanged_head_stop_message
+    from coding_review_agent_loop.pr_loop_support import FollowupCitationDiagnosis
+
+    base = dict(
+        pr=77, coder_name="Claude", previous_head="abc123", turns=2, round_number=3,
+        evidence=None, route=" ROUTE",
+    )
+    expected = (
+        "PR #77: Claude left head abc123 unchanged in 2 consecutive follow-up rounds, so another "
+        "review of the same diff cannot change the verdict. Stopping before round 4; "
+        "human review required. ROUTE"
+    )
+    assert unchanged_head_stop_message(**base) == expected
+    assert unchanged_head_stop_message(
+        **base, citation_diagnosis=FollowupCitationDiagnosis(False, False, 4)
+    ) == expected
+    with_drop = unchanged_head_stop_message(
+        **base, citation_diagnosis=FollowupCitationDiagnosis(True, False, 2)
+    )
+    assert "(format repair attempted: no); 2 run-tests receipt(s)" in with_drop
+    assert with_drop.endswith(" ROUTE")

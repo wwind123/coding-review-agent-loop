@@ -402,16 +402,30 @@ SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {
             "violation is corruption rather than an agent defect."
         ),
     ),
+    "_decode_test_observations_string": ShapeCheckClassification(
+        "delegated",
+        frozenset(),
+        (
+            "Generic shape helper; the consequence is classified at each caller's annotated "
+            "site."
+        ),
+    ),
     "_degradable_test_observations": ShapeCheckClassification(
         "mixed",
-        frozenset({"authentication-or-forgery", "payload-bound"}),
+        frozenset({"authentication-or-forgery", "no-conservative-reading", "payload-bound"}),
         (
             "Drops a malformed follow-up citation with its own citation-dropped record; "
             "more than CITATION_DEGRADATION_MAX_DROPS drops or an over-bound dropped value "
             "rejects under payload-bound, and record construction propagates "
-            "marker-neutralization failures. Fatal sites: authentication-or-forgery: marker "
+            "marker-neutralization failures. In repair-first mode a non-array value raises "
+            "the repairable TestObservationsShapeError under no-conservative-reading, "
+            "because dropping it would discard the turn's evidence citations (#1626). "
+            "Fatal sites: authentication-or-forgery: marker "
             "neutralization through sanitize_historical_text, identity digests, "
-            "orchestrator-owned authority fields or canonical evidence rows; payload-bound: "
+            "orchestrator-owned authority fields or canonical evidence rows; "
+            "no-conservative-reading: removing the element would weaken an obligation, "
+            "finding, disposition, approved topology or discussion answer rather than a "
+            "claim; payload-bound: "
             "a hard cap or count bound that keeps an accepted payload bounded."
         ),
     ),

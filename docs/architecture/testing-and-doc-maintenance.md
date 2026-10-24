@@ -133,6 +133,41 @@ the follow-up comment and the round summary, and are restored onto the coder
 carrier on resume. Canonical `risk_test_matrix_evidence` citations stay
 strict: a verified row must never stand on fewer citations than it declared.
 
+The `test_observations` field as a whole is decoded first and repaired before
+it degrades (#1626). In every parse mode, a string that decodes to a JSON
+array is used as that array, with one `citations-decoded-from-string` record
+that renders on its own line ahead of the drop list. The parser takes a
+`test_observations_mode`. The default, `degrade`, keeps today's single field
+drop and is used by every historical, resume and legacy re-parse. Fresh coder
+follow-up and issue-implementation turns build their validators with
+`_architecture_and_test_observation_mode_validators`. Their primary pair is
+`repair-first`: a value that is still not an array, or more than eight
+malformed items, raises the repairable `TestObservationsShapeError`. The
+validated turn then runs the structured repair with a targeted instruction
+and the acquisition's tool-owned run-tests receipts. Both receipt
+prohibitions are narrowed to canonical matrix-evidence envelopes. A scoped
+preservation rule classifies the source as the parser does. A native or
+decoded array pins its valid citations and lets malformed ones be corrected
+or removed. Prose must be moved into `summary` or an item note, never
+deleted. If repair yields no accepted candidate, a non-array value falls back
+to the `degrade-after-repair` pair. That pair accepts the original through
+the same acceptance boundary, with a drop record whose rule says repair was
+attempted, and never spends an agent retry. The over-bound case stays fatal.
+The validated turn classifies the shape defect from the source payload
+(`source_has_test_observations_shape_defect`), not from the first validation
+error, so a response whose other repairable defect is reported first still
+gets the targeted repair. When the original still carries that other defect,
+the fallback also tries a rejected repair candidate, but only when the
+source's own `test_observations` is the degradable non-array value and the
+candidate keeps that exact value (`candidate_retains_source_test_observations`).
+A native or encoded array source, including the over-bound case, is never
+degraded this way, and a candidate that changed the field (to an array, or to
+other or empty prose) was judged by the scoped preservation rule and is never
+rescued. The
+candidate must also pass the unflagged preservation rules against the source,
+it inherits the source's architecture near-miss record, and it is accepted
+only with the after-repair drop record.
+
 Every function, method and nested def in `protocol.py` that can still reach
 an `AgentLoopError`-family raise is classified in `shape_check_audit.py` as
 `fatal`, `mixed` or `delegated`. Each raise site and raise-reaching call site

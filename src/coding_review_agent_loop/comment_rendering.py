@@ -22,6 +22,7 @@ from .errors import AgentLoopError
 from .expected_closure import normalize_issue_ids
 from .agents.registry import agent_display_name, agent_signature
 from .protocol import (
+    CITATIONS_DECODED_FROM_STRING_OUTCOME,
     DEGRADED_ROW_CLAIM_DIAGNOSTIC,
     PARSE_DEGRADATION_RENDER_LIMIT,
     UNAPPROVED_ROW_CLAIM_DIAGNOSTIC,
@@ -983,10 +984,35 @@ TEST_OBSERVATION_DEGRADATIONS_HEADING = "### Test observation parse degradations
 
 
 def render_test_observation_degradations_section(records: Sequence[object]) -> str | None:
-    """Render dropped follow-up citation records in full (#927)."""
-    return render_parse_degradations_section(
-        records, heading=TEST_OBSERVATION_DEGRADATIONS_HEADING
-    )
+    """Render dropped follow-up citation records in full (#927).
+
+    A ``citations-decoded-from-string`` normalization (#1626) renders on its
+    own line ahead of the drop list, so it never displaces one of the up to
+    ``CITATION_DEGRADATION_MAX_DROPS`` drop records.
+    """
+    decoded = [
+        record for record in records
+        if getattr(record, "outcome", None) == CITATIONS_DECODED_FROM_STRING_OUTCOME
+    ]
+    drops = [
+        record for record in records
+        if getattr(record, "outcome", None) != CITATIONS_DECODED_FROM_STRING_OUTCOME
+    ]
+    if not decoded:
+        return render_parse_degradations_section(
+            drops, heading=TEST_OBSERVATION_DEGRADATIONS_HEADING
+        )
+    lines = [TEST_OBSERVATION_DEGRADATIONS_HEADING]
+    for record in decoded:
+        lines.append(
+            f"- Normalized `{_degradation_cell(getattr(record, 'element_path', ''))}`: "
+            f"`{_degradation_cell(getattr(record, 'rule', ''))}`; outcome "
+            f"`{_degradation_cell(getattr(record, 'outcome', ''))}`"
+        )
+    drop_section = render_parse_degradations_section(drops, heading="")
+    if drop_section:
+        lines.append(drop_section.lstrip("\n"))
+    return "\n".join(lines)
 
 
 def _degradation_cell(text: object) -> str:

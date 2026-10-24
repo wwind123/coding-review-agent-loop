@@ -4094,3 +4094,34 @@ def unsuperseded_receipts_sentence(value: object) -> str:
         + ". This stop may be evidence bookkeeping rather than a missing code change; an operator "
         "can verify the command and decide whether the receipts are still meaningful."
     )
+
+
+def superseded_by_current_turn(
+    evidence: LocalTestEvidence | None, current_turn_receipt_ids: Iterable[str]
+) -> frozenset[str]:
+    """Receipts from this coder turn that superseded an authoritative failure (#1626).
+
+    Reads the live, unbounded reconciliation, never the bounded round
+    projection: a failure that merely fell out of the byte-capped projection
+    never counts.  Only failure rows that ``unsuperseded_receipts_sentence``
+    would otherwise name (parent-observed, not out-of-checkout, not a
+    non-evidence launch failure) contribute, and only a ``superseded_by``
+    value in ``current_turn_receipt_ids`` is returned, so the tree-change
+    label or an earlier turn's receipt never does.
+    """
+    if evidence is None:
+        return frozenset()
+    current = frozenset(
+        receipt for receipt in current_turn_receipt_ids if isinstance(receipt, str) and receipt
+    )
+    return frozenset(
+        row.superseded_by
+        for row in evidence.observations
+        if row.is_failure
+        and row.provenance == "parent-observed"
+        and not row.is_out_of_checkout_context
+        and not row.is_non_evidence_launch_failure
+        and row.superseded_by
+        and row.superseded_by != TREE_CHANGE_SUPERSESSION
+        and row.superseded_by in current
+    )

@@ -200,6 +200,27 @@ base (each `unavailable` when Git fails), flags items asking for evidence, and
 offers the override options. Nothing is persisted, so a resumed run stops with the
 same text.
 
+**Unchanged-head stop and evidence progress.** `_UnchangedHeadTracker` counts
+consecutive PR follow-ups that leave one head unchanged and stops at
+`MAX_UNCHANGED_HEAD_CODER_TURNS` (#985). It has one bounded exception
+(#1626). Each tracked head gets a single extra review round when the follow-up
+at the limit made cited, authoritative evidence progress, meaning a receipt
+that passes three checks:
+- it is in the coder acquisition's frozen catalog
+  (`acquisition_test_observations`, captured before any repair launch can
+  repoint the runner's latest test turn);
+- the live, unbounded reconciliation retained by
+  `Runner.render_local_test_evidence` names it as `superseded_by` on a
+  parent-observed failure (`superseded_by_current_turn`);
+- a surviving `test_observations` citation of the accepted follow-up cites it.
+
+A failed citation repair therefore never earns the grant. A different head
+resets it, and like the count it is in memory only. The bounded round evidence
+projection stays display-only; no gate or count reads it. When the stop fires
+after the last follow-up's `test_observations` were dropped as a non-array,
+the message names that, says whether repair was attempted, and gives the
+number of uncited receipts from the frozen catalog.
+
 **PR evidence-only stall stop** (`--pr-evidence-stall-rounds` K, default 2,
 `0` disables). A `pr_review` blocking item may carry `evidence_row_ids`, parsed in
 `protocol.py` (blocking items only, bounded unique strings), validated against the
