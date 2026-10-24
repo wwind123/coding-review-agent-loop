@@ -86,6 +86,22 @@ TREE_CHANGE_SUPERSESSION = "superseded-by-tree-change"
 TREE_CHANGE_CAVEAT = (
     "failure recorded at an obsolete tracked tree; historical, not an outstanding obligation"
 )
+# Issue #1633: attached only to a parent-observed failure restored from an
+# earlier run and superseded by a later qualifying pass at the same head and
+# tracked tree.  Environments cannot be compared across a restart (their bytes
+# are never persisted), so the relaxation is made visible on the failure.  It
+# is derived by each reconcile only and never added to the passing row, whose
+# receipt-pass authority rejects "environment" and "supersed" caveats.
+CROSS_RESTART_SUPERSESSION_CAVEAT = "superseded across a restart; environment not compared"
+# The in-process comparison verdicts.  The "differs" caveat is the only form of
+# a "different" verdict that survives a restart, so it is ranked ahead of
+# generic caveats and disqualifies a restored pass from cross-restart
+# supersession.
+ENVIRONMENT_DIFFERS_CAVEAT = "effective target environment differs"
+ENVIRONMENT_NOT_COMPARED_CAVEAT = "effective target environment could not be compared"
+_RESTART_COMMAND_DIGEST_RE = re.compile(r"^[0-9a-f]{32}$")
+_RESTART_COMMAND_DOMAIN = b"restart-command-v2\x00"
+_RESTART_ROOT_MARKER = "\x00ROOT"
 MAX_PRIVATE_DIAGNOSTIC_BYTES = 8 * 1024
 MAX_PRIVATE_TOTAL_BYTES = 128 * 1024
 MAX_ROUND_OBSERVATIONS = 32
@@ -565,6 +581,14 @@ class LocalTestObservation:
     # Issue #1326: the ``run-tests --fixture`` lifecycle; ``None`` for every
     # fixture-less row, which keeps the legacy projection unchanged.
     fixture: FixtureRecord | None = None
+    # Issue #1633: the broker-computed command identity that survives a
+    # restart (see ``_restart_command_digest``).  ``None`` for every row the
+    # broker did not create, which never takes part in cross-restart
+    # supersession.
+    restart_command_digest: str | None = field(default=None, repr=False, compare=False)
+    # Issue #1633: set only by ``decode_bounded_evidence``.  Never projected,
+    # so a persisted payload cannot claim it.
+    restored: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.outcome not in OUTCOMES:
@@ -654,6 +678,10 @@ class LocalTestObservation:
             )
         if self.fixture is not None:
             projection["fixture"] = self.fixture.to_dict()
+        if self.restart_command_digest is not None and _RESTART_COMMAND_DIGEST_RE.match(
+            self.restart_command_digest
+        ):
+            projection["restart_command_digest"] = self.restart_command_digest
         return projection
 
     def to_dict(self) -> dict[str, object]:
@@ -807,7 +835,10 @@ def _prioritized_caveats(caveats: Iterable[str]) -> list[str]:
             return 3
         if item in {_TRUNCATED_CAVEAT, _ARGV_OMITTED_CAVEAT}:
             return 4
-        return 5
+        if item in {ENVIRONMENT_DIFFERS_CAVEAT, CROSS_RESTART_SUPERSESSION_CAVEAT}:
+            # Issue #1633: verdicts that must survive repeated transport.
+            return 5
+        return 6
 
     kept = [c for c in unique if not (has_omitted and c == _TRUNCATED_CAVEAT)]
     return sorted(kept, key=rank)
@@ -871,6 +902,9 @@ def observation_from_mapping(
         environment_state = "unknown"
     fixture: FixtureRecord | None = None
     fixture_caveats: tuple[str, ...] = ()
+    restart_digest = value.get("restart_command_digest")
+    if not isinstance(restart_digest, str) or not _RESTART_COMMAND_DIGEST_RE.match(restart_digest):
+        restart_digest = None
     if "fixture" in value:
         raw_fixture = value.get("fixture")
         if isinstance(raw_fixture, FixtureRecord):
@@ -913,6 +947,7 @@ def observation_from_mapping(
         # A restored row cannot prove its tokens were never altered.
         command_verbatim=value.get("command_verbatim") is True,
         fixture=fixture,
+        restart_command_digest=restart_digest,
     )
 
 
@@ -939,16 +974,176 @@ def _same_receipt(left: LocalTestObservation, right: LocalTestObservation) -> bo
     return left.receipt_id is not None and left.receipt_id == right.receipt_id
 
 
+def _restart_command_digest(argv: Sequence[str], cwd: Path, root: Path) -> str | None:
+    """Return the restart-stable command identity, or ``None`` (issue #1633).
+
+    The digest is an injective function of what ran: the checkout-relative
+    cwd and the raw argv, modulo only the location of the checkout root.  The
+    single rewrite substitutes the exact root string by a NUL marker, which is
+    invertible because argv and paths cannot contain NUL; length prefixes fix
+    the field boundaries.  Nothing is resolved or normalized, and nothing is
+    derived from the deliberately lossy redaction output.  Any input that
+    cannot be encoded that way, or whose redacted argv would exceed the argv
+    cap (and so be downgraded on transport), gets no digest and fails closed.
+    """
+    if not isinstance(root, Path):
+        raise TypeError("restart command digest root must be a Path")
+    root_text = str(root)
+    cwd_text = str(cwd)
+    if cwd_text == root_text:
+        relative = "."
+    elif cwd_text.startswith(root_text + os.sep):
+        relative = cwd_text[len(root_text) + 1 :]
+    else:
+        return None
+    tokens = tuple(argv)
+    if any(not isinstance(token, str) or "\x00" in token for token in tokens) or "\x00" in relative:
+        return None
+    redacted, _command, _ids, _caveats = _redact_command_tokens(tokens, cwd=cwd)
+    if sum(len(token.encode()) for token in redacted) > MAX_SAFE_ARGV_BYTES:
+        return None
+    digest = hashlib.sha256(_RESTART_COMMAND_DOMAIN)
+    try:
+        for text in (relative, *(token.replace(root_text, _RESTART_ROOT_MARKER) for token in tokens)):
+            encoded = text.encode("utf-8", errors="surrogateescape")
+            digest.update(struct.pack(">I", len(encoded)))
+            digest.update(encoded)
+    except UnicodeEncodeError:
+        return None
+    return digest.hexdigest()[:32]
+
+
+def _snapshot_positively_known(
+    current_snapshot: "TrackedTreeSnapshot | None", current_head: str | None
+) -> bool:
+    return bool(
+        current_head
+        and current_snapshot is not None
+        and current_snapshot.complete
+        and current_snapshot.stable is True
+        and current_snapshot.status_clean is True
+        and current_snapshot.tracked_digest
+        and current_snapshot.head == current_head
+    )
+
+
+def _restart_fixture_key(
+    observation: LocalTestObservation,
+) -> tuple[bool, tuple[str, str] | None]:
+    """Transport-normalized fixture identity; ``(False, None)`` fails closed."""
+    fixture = observation.fixture
+    if fixture is None:
+        return True, None
+    path_bytes = len(fixture.path.encode("utf-8", errors="replace"))
+    if (
+        path_bytes > MAX_FIXTURE_PATH_BYTES
+        # A transported path at the bound may be a truncation of a longer
+        # one, so it can never prove identity either.
+        or (path_bytes >= MAX_FIXTURE_PATH_BYTES - 6 and fixture.path.endswith("..."))
+        or not _FIXTURE_DIGEST_RE.match(fixture.digest)
+    ):
+        return False, None
+    return True, (fixture.path, fixture.digest)
+
+
+def _restart_scope_key(observation: LocalTestObservation) -> tuple[str, tuple[str, ...]]:
+    return EvidenceScope.from_value(observation.scope.to_dict()).normalized()
+
+
+@dataclass(frozen=True)
+class _CrossRestartContext:
+    """The reconcile's validated current state for cross-restart supersession."""
+
+    current_head: str | None
+    current_snapshot: "TrackedTreeSnapshot | None"
+    snapshot_head_matches: bool
+    refreshed_restored: frozenset[int]
+
+
+def _can_supersede_across_restart(
+    failure: LocalTestObservation,
+    passing: LocalTestObservation,
+    *,
+    context: _CrossRestartContext | None,
+    failure_index: int,
+    passing_index: int,
+) -> tuple[bool, str | None]:
+    """The gated branch for a failure restored from an earlier run (#1633).
+
+    It never compares redaction-rewritten fields (``normalized_command``,
+    ``command``, ``identifiers``); command identity is the broker digest.  A
+    persisted state or caveat never satisfies a check alone: restored rows
+    qualify only through the attribution refresh of this reconcile.
+    """
+    if failure.provenance != "parent-observed":
+        return False, None
+    if (
+        context is None
+        or not context.snapshot_head_matches
+        or not _snapshot_positively_known(context.current_snapshot, context.current_head)
+    ):
+        return False, "current head or tracked tree is not positively known"
+    assert context.current_snapshot is not None
+    if passing.environment_identity is None and not passing.restored:
+        return False, "later pass has no live or restored identity"
+    for row, index in ((failure, failure_index), (passing, passing_index)):
+        if row.restored and index not in context.refreshed_restored:
+            return False, "restored attribution was not confirmed against the current head"
+        attribution = row.attribution
+        if (
+            attribution.state != "current-head"
+            or attribution.head != context.current_head
+            or attribution.stable is not True
+            or attribution.tracked_digest != context.current_snapshot.tracked_digest
+            or attribution.untracked_input
+        ):
+            return False, "attribution is not stable current-head at the current tracked digest"
+    if (
+        failure.restart_command_digest is None
+        or passing.restart_command_digest is None
+        or failure.restart_command_digest != passing.restart_command_digest
+    ):
+        return False, "command differs; subset/superset or command disagreement remains visible"
+    failure_fixture_ok, failure_fixture = _restart_fixture_key(failure)
+    passing_fixture_ok, passing_fixture = _restart_fixture_key(passing)
+    if not failure_fixture_ok or not passing_fixture_ok or failure_fixture != passing_fixture:
+        return False, "fixture identity differs; a run with another fixture or none cannot supersede it"
+    if _restart_scope_key(failure) != _restart_scope_key(passing):
+        return False, "scope differs; subset/superset result cannot supersede the failure"
+    if (
+        passing.environment_state == "different"
+        or ENVIRONMENT_DIFFERS_CAVEAT in passing.caveats
+    ):
+        return False, "environment identity is different"
+    if (
+        failure.is_out_of_checkout_context
+        or passing.is_out_of_checkout_context
+        or failure.is_non_evidence_launch_failure
+    ):
+        return False, None
+    return True, None
+
+
 def _can_supersede(
     failure: LocalTestObservation,
     passing: LocalTestObservation,
     *,
     registry: EnvironmentIdentityRegistry | None,
+    context: _CrossRestartContext | None = None,
+    failure_index: int = -1,
+    passing_index: int = -1,
 ) -> tuple[bool, str | None]:
     if not failure.is_failure or passing.outcome != "passed":
         return False, None
     if passing.provenance != "parent-observed":
         return False, "later pass was not parent-observed"
+    if failure.restored:
+        return _can_supersede_across_restart(
+            failure, passing, context=context,
+            failure_index=failure_index, passing_index=passing_index,
+        )
+    # A live failure keeps the strict in-process rule: a restored pass has no
+    # identity, so the comparison below can never be "equivalent".
     if failure.normalized_command != passing.normalized_command:
         return False, "command differs; subset/superset or command disagreement remains visible"
     if _fixture_identity(failure) != _fixture_identity(passing):
@@ -1008,7 +1203,13 @@ def _clear_tree_change_label(observation: LocalTestObservation) -> LocalTestObse
         None if observation.superseded_by == TREE_CHANGE_SUPERSESSION
         else observation.superseded_by
     )
-    caveats = tuple(item for item in observation.caveats if item != TREE_CHANGE_CAVEAT)
+    # Issue #1633: the cross-restart caveat is likewise derived per reconcile;
+    # a persisted or forged copy is never input.
+    caveats = tuple(
+        item
+        for item in observation.caveats
+        if item not in {TREE_CHANGE_CAVEAT, CROSS_RESTART_SUPERSESSION_CAVEAT}
+    )
     if label == observation.superseded_by and caveats == observation.caveats:
         return observation
     return replace(observation, superseded_by=label, caveats=caveats)
@@ -1144,14 +1345,18 @@ def reconcile_test_observations(
     # Make live comparisons visible without persisting the environment bytes.
     # A first observation has no comparison partner; later observations with
     # the same command and scope expose divergence or unavailable identity.
+    # Restored rows have no identity, so they are neither compared nor used
+    # as partners (issue #1633): a live row whose only same-key predecessors
+    # are restored keeps "not-compared".
     for index, row in enumerate(rows):
-        if row.environment_state == "identity-unknown":
+        if row.environment_state == "identity-unknown" or row.restored:
             continue
         comparable = next(
             (
                 previous
                 for previous in reversed(rows[:index])
-                if previous.normalized_command == row.normalized_command
+                if not previous.restored
+                and previous.normalized_command == row.normalized_command
                 and previous.scope.normalized() == row.scope.normalized()
                 and _fixture_identity(previous) == _fixture_identity(row)
             ),
@@ -1170,13 +1375,13 @@ def reconcile_test_observations(
             rows[index] = replace(
                 row,
                 environment_state="different",
-                caveats=(*row.caveats, "effective target environment differs"),
+                caveats=(*row.caveats, ENVIRONMENT_DIFFERS_CAVEAT),
             )
         else:
             rows[index] = replace(
                 row,
                 environment_state="unknown",
-                caveats=(*row.caveats, "effective target environment could not be compared"),
+                caveats=(*row.caveats, ENVIRONMENT_NOT_COMPARED_CAVEAT),
             )
 
     # Compare live observations with the clean eventual tree at handoff. This
@@ -1185,6 +1390,7 @@ def reconcile_test_observations(
         current_head is None
         or current_snapshot is not None and current_snapshot.head == current_head
     )
+    refreshed_restored: set[int] = set()
     if (
         current_snapshot is not None
         and current_snapshot.complete
@@ -1194,6 +1400,29 @@ def reconcile_test_observations(
     ):
         for index, row in enumerate(rows):
             if row.environment_identity is None:
+                # Issue #1633: a parent-observed row restored from an earlier
+                # run is refreshed from its own persisted head and digest.
+                # Anything else that lacks a live identity is left untouched,
+                # and the later stale and tree-change passes still own every
+                # restored row this does not confirm.
+                attribution = row.attribution
+                if (
+                    row.restored
+                    and row.provenance == "parent-observed"
+                    and snapshot_head_matches
+                    and attribution.stable is True
+                    and attribution.tracked_digest == current_snapshot.tracked_digest
+                    and attribution.head
+                    and attribution.head == current_head
+                ):
+                    state = (
+                        "untracked-input-unverified"
+                        if attribution.untracked_input
+                        or attribution.state == "untracked-input-unverified"
+                        else "current-head"
+                    )
+                    rows[index] = replace(row, attribution=replace(attribution, state=state))
+                    refreshed_restored.add(index)
                 continue
             attribution = row.attribution
             if attribution.stable is not True or not attribution.tracked_digest:
@@ -1226,6 +1455,12 @@ def reconcile_test_observations(
                     caveats=(*row.caveats, "tested tracked tree differs from the eventual PR tree"),
                 )
 
+    restart_context = _CrossRestartContext(
+        current_head=current_head,
+        current_snapshot=current_snapshot,
+        snapshot_head_matches=snapshot_head_matches,
+        refreshed_restored=frozenset(refreshed_restored),
+    )
     for failure_index, failure in enumerate(rows):
         if (
             not failure.is_failure
@@ -1234,13 +1469,25 @@ def reconcile_test_observations(
             or failure.is_non_evidence_launch_failure
         ):
             continue
-        for later in rows[failure_index + 1 :]:
+        for later_index in range(failure_index + 1, len(rows)):
+            later = rows[later_index]
             if later.outcome != "passed" or later.is_out_of_checkout_context:
                 continue
-            allowed, reason = _can_supersede(failure, later, registry=registry)
+            allowed, reason = _can_supersede(
+                failure, later, registry=registry, context=restart_context,
+                failure_index=failure_index, passing_index=later_index,
+            )
             if allowed:
                 receipt = later.receipt_id or f"observation-{rows.index(later)}"
-                rows[failure_index] = replace(failure, superseded_by=receipt)
+                rows[failure_index] = replace(
+                    failure,
+                    superseded_by=receipt,
+                    # Issue #1633: only the failure carries the caveat.
+                    caveats=(
+                        (*failure.caveats, CROSS_RESTART_SUPERSESSION_CAVEAT)
+                        if failure.restored else failure.caveats
+                    ),
+                )
                 break
             if reason and (
                 "environment" in reason
@@ -1695,6 +1942,8 @@ def decode_bounded_evidence(
             # Execution selectors are invocation-local and must never become
             # durable receipt authority after a restart.
             execution_ref=None,
+            # Issue #1633: the only place a row is marked restored.
+            restored=True,
             superseded_by=(
                 _safe_text(row["superseded_by"], MAX_SAFE_IDENTIFIER_BYTES)
                 if restore_classification
@@ -3297,7 +3546,7 @@ class TestBrokerServer:
                     fixture_run.finish(self)
             return self._complete_request(
                 argv=argv, cwd=cwd, environment=environment, before=before,
-                result=result, fixture_run=fixture_run,
+                result=result, fixture_run=fixture_run, root=pinned_root.path,
             )
 
     def _run_foreground(
@@ -3461,6 +3710,7 @@ class TestBrokerServer:
     def _complete_request(
         self, *, argv: tuple[str, ...], cwd: Path, environment: Mapping[str, str],
         before: "TrackedTreeSnapshot", result: Any, fixture_run: "_FixtureRun | None",
+        root: Path | None = None,
     ) -> dict[str, object]:
         """Snapshot, attribute, fold, journal and build the result frame."""
         launched_fixture = fixture_run is not None and fixture_run.supervisor is not None
@@ -3575,6 +3825,11 @@ class TestBrokerServer:
                     str(item) for item in (getattr(result, "args", ()) or ())
                 ),
                 fixture=fixture_record,
+                # Issue #1633: computed over the raw argv and the confined cwd
+                # relative to the pinned root, never from redacted output.
+                restart_command_digest=(
+                    _restart_command_digest(argv, cwd, root) if root is not None else None
+                ),
             )
             with self._journal_lock:
                 if self._stop_event.is_set() and "unattributed: broker shutdown" not in observation.attribution.caveats:

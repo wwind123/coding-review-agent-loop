@@ -163,6 +163,11 @@ cleaned on rerun; inspect and preserve salvage before reusing them.
 Salvage is partial implementation evidence, not approval or a guaranteed full
 backup. Usage can be exact, partial, or estimated. Test receipts must retain
 failure and scope caveats; a passing subset does not erase a broader failure.
+A failure restored from an earlier run can be superseded at an unchanged head
+and tracked tree only by a gated cross-restart rule. That rule matches commands
+by a broker-computed digest over the checkout-relative cwd and raw argv, never
+compares environments or persists environment material, and leaves the visible
+caveat `superseded across a restart; environment not compared` on the failure.
 
 ## Context and Trust
 
