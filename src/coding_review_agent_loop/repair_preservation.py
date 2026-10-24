@@ -1048,6 +1048,26 @@ def candidate_keeps_degradable_test_observations(text: str) -> bool:
         return False
 
 
+def candidate_retains_source_test_observations(source: str, candidate: str) -> bool:
+    """Whether a rejected repair candidate may fall back to the non-array drop (#1626).
+
+    Both conditions must hold:
+    - the source itself is the fallback-degradable non-array shape (never a
+      native or encoded array, whose valid citations stay pinned and whose
+      over-bound case stays fatal);
+    - the candidate keeps that exact value, so the fallback drops only what
+      the pre-#1626 degrade parse of the source would have dropped, and no
+      prose is lost or replaced.
+    """
+    if not (
+        candidate_keeps_degradable_test_observations(source)
+        and candidate_keeps_degradable_test_observations(candidate)
+    ):
+        return False
+    source_payload, candidate_payload = _payload(source), _payload(candidate)
+    return source_payload["test_observations"] == candidate_payload["test_observations"]
+
+
 def _validate_test_observations_shape_repair(
     source: dict, target: dict, require: Callable[[bool, str], None]
 ) -> None:

@@ -2967,3 +2967,22 @@ def test_candidate_fallback_shape_is_only_the_non_array_field_1626(observations,
     from coding_review_agent_loop.repair_preservation import candidate_keeps_degradable_test_observations
 
     assert candidate_keeps_degradable_test_observations(_followup_1626(observations)) is expected
+
+
+@pytest.mark.parametrize(
+    ("source", "candidate", "expected"),
+    [
+        (_PROSE_1626, _PROSE_1626, True),
+        (_PROSE_1626, "", False),
+        (_PROSE_1626, [], False),
+        (json.dumps(_NATIVE_1626), "", False),
+        (_NATIVE_1626, "", False),
+        ({"note": "x"}, {"note": "x"}, True),
+    ],
+)
+def test_candidate_must_retain_a_degradable_source_value_1626(source, candidate, expected):
+    from coding_review_agent_loop.repair_preservation import candidate_retains_source_test_observations
+
+    assert candidate_retains_source_test_observations(
+        _followup_1626(source), _followup_1626(candidate)
+    ) is expected

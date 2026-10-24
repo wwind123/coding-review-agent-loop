@@ -1674,3 +1674,45 @@ def test_candidate_fallback_keeps_the_source_architecture_record_1626(tmp_path):
     ]
     [record] = parsed.test_observation_degradations
     assert record.rule == _AFTER_REPAIR_RULE_1626
+
+
+_OVER_BOUND_ENCODED_1626 = json.dumps([
+    *[
+        {"command": "node --test scripts/locales.test.mjs", "receipt_id": f"r-{index}", "claim": "reran"}
+        for index in range(9)
+    ],
+    _CITATION_1626,
+])
+
+
+@pytest.mark.parametrize(
+    ("source_observations", "candidate_observations", "accepted"),
+    [
+        pytest.param(_OVER_BOUND_ENCODED_1626, "", False, id="over-bound-encoded-to-empty-string"),
+        pytest.param(_OVER_BOUND_ENCODED_1626, _PROSE_1626, False, id="over-bound-encoded-to-prose"),
+        pytest.param(_PROSE_1626, "", False, id="prose-to-empty-string"),
+        pytest.param(_PROSE_1626, "Tests passed.", False, id="prose-replaced"),
+        pytest.param(_PROSE_1626, {"note": _PROSE_1626}, False, id="prose-to-object"),
+        pytest.param(_PROSE_1626, _PROSE_1626, True, id="prose-kept-verbatim"),
+    ],
+)
+def test_candidate_fallback_requires_a_degradable_source_and_the_same_value_1626(
+    tmp_path, source_observations, candidate_observations, accepted
+):
+    """Review items 7 and 8, as one class with items 3 and 6.
+
+    The candidate fallback may only drop exactly what the pre-#1626 degrade
+    parse of the source would have dropped.  The source must itself be the
+    degradable non-array shape (an over-bound encoded array stays fatal), and
+    the candidate must keep that value verbatim (no lost or replaced prose).
+    """
+    source = _with_earlier_defect_1626(_followup_text_1626(source_observations), "tests-run-string")
+    candidate = _followup_text_1626(candidate_observations)
+    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=candidate)
+    assert len(calls) == 1 and len(coder_turns) == 1
+    if accepted:
+        assert isinstance(outcome, ValidatedAgentResponse), outcome
+        [record] = outcome.marker_value.test_observation_degradations
+        assert record.rule == _AFTER_REPAIR_RULE_1626
+    else:
+        assert isinstance(outcome, AgentLoopError), outcome

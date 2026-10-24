@@ -157,10 +157,13 @@ The validated turn classifies the shape defect from the source payload
 (`source_has_test_observations_shape_defect`), not from the first validation
 error, so a response whose other repairable defect is reported first still
 gets the targeted repair. When the original still carries that other defect,
-the fallback also tries a rejected repair candidate. The candidate's own
-`test_observations` must still be the non-array field
-(`candidate_keeps_degradable_test_observations`); a candidate that made it an
-array was judged by the scoped preservation rule and is never rescued. The
+the fallback also tries a rejected repair candidate, but only when the
+source's own `test_observations` is the degradable non-array value and the
+candidate keeps that exact value (`candidate_retains_source_test_observations`).
+A native or encoded array source, including the over-bound case, is never
+degraded this way, and a candidate that changed the field (to an array, or to
+other or empty prose) was judged by the scoped preservation rule and is never
+rescued. The
 candidate must also pass the unflagged preservation rules against the source,
 it inherits the source's architecture near-miss record, and it is accepted
 only with the after-repair drop record.

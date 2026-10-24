@@ -66,7 +66,7 @@ from .repair import (
 )
 from .repair_preservation import (
     normalize_architecture_impact_near_miss,
-    candidate_keeps_degradable_test_observations,
+    candidate_retains_source_test_observations,
     recover_payload,
     require_recoverable_semantic_patch,
     source_has_test_observations_shape_defect,
@@ -1339,10 +1339,11 @@ def _run_validated_agent_in_scope(
     ) -> _AcceptedCandidate | None:
         """Fall back on a rejected repair candidate (#1626).
 
-        Only a candidate whose own test_observations is still the
-        fallback-degradable non-array shape qualifies; one that turned the
-        field into an array was judged by the scoped preservation rule and is
-        never rescued.  The candidate must also pass today's unflagged
+        Only when the source's test_observations is the fallback-degradable
+        non-array shape, and the candidate keeps that exact value; a
+        candidate that changed the field (to an array, or to other or empty
+        prose) was judged by the scoped preservation rule and is never
+        rescued.  The candidate must also pass today's unflagged
         preservation against the source, and it inherits the source's
         architecture near-miss record.
         """
@@ -1365,7 +1366,7 @@ def _run_validated_agent_in_scope(
             forbid = near_miss.forbid_architecture_impact
             source_records = (near_miss.record,) if near_miss.record is not None else ()
         for candidate in dict.fromkeys(candidates):
-            if not candidate_keeps_degradable_test_observations(candidate):
+            if not candidate_retains_source_test_observations(source, candidate):
                 continue
             try:
                 validate_repair_preservation(
