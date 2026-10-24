@@ -1058,6 +1058,10 @@ class _CrossRestartContext:
     current_snapshot: "TrackedTreeSnapshot | None"
     snapshot_head_matches: bool
     refreshed_restored: frozenset[int]
+    # Each row's own head as it entered this reconcile, before the handoff
+    # refresh rewrites a live row's head to the current one.  Eligibility is
+    # judged on these, never on a rewritten attribution.
+    entry_heads: tuple[str | None, ...] = ()
 
 
 def _can_supersede_across_restart(
@@ -1089,6 +1093,10 @@ def _can_supersede_across_restart(
     for row, index in ((failure, failure_index), (passing, passing_index)):
         if row.restored and index not in context.refreshed_restored:
             return False, "restored attribution was not confirmed against the current head"
+        if not 0 <= index < len(context.entry_heads) or (
+            context.entry_heads[index] != context.current_head
+        ):
+            return False, "row was not recorded at the current head"
         attribution = row.attribution
         if (
             attribution.state != "current-head"
@@ -1341,6 +1349,7 @@ def reconcile_test_observations(
     # assigns ``rows[index]`` in place, so ``entry_facts[index]`` stays bound
     # to its observation.
     entry_facts = [_TreeChangeEntryFacts.of(row) for row in rows]
+    entry_heads = tuple(row.attribution.head for row in rows)
 
     # Make live comparisons visible without persisting the environment bytes.
     # A first observation has no comparison partner; later observations with
@@ -1460,6 +1469,7 @@ def reconcile_test_observations(
         current_snapshot=current_snapshot,
         snapshot_head_matches=snapshot_head_matches,
         refreshed_restored=frozenset(refreshed_restored),
+        entry_heads=entry_heads,
     )
     for failure_index, failure in enumerate(rows):
         if (

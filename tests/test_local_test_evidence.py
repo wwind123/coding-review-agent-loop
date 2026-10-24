@@ -5415,6 +5415,10 @@ def _mismatch_cases():
         "fixture": (dict(), dict(fixture=other_fixture), dict(), True),
         "pass-tracked-digest": (dict(), dict(digest="c" * 64), dict(), True),
         "failure-head-with-identical-digest": (dict(head="9" * 40), dict(), dict(), True),
+        # item-1: the live refresh rewrites a matching-digest pass's head to
+        # the current head; eligibility must use the head it was recorded at.
+        "pass-head-with-identical-digest": (dict(), dict(head="9" * 40), dict(), True),
+        "pass-without-head": (dict(), dict(head=None), dict(), True),
         "failure-tracked-digest": (dict(digest="c" * 64), dict(), dict(), False),
         "pass-unstable": (dict(), dict(stable=False), dict(), True),
         "pass-not-parent-observed": (dict(), dict(provenance="telemetry-unverified"), dict(), True),
