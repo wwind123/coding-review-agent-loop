@@ -90,7 +90,6 @@ from .protocol import (
     StructuredIssueImplementation,
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
-    EVIDENCE_OBLIGATION_KIND,
     EVIDENCE_SOURCE_OPERATOR_SIGNED,
     SignedEvidenceReference,
     apply_signed_evidence_references,
@@ -98,7 +97,6 @@ from .protocol import (
     MACHINE_OBLIGATION_KINDS,
     parse_historical_structured_coder_followup,
     parse_historical_structured_issue_implementation,
-    sub_item_parent_id,
 )
 from .runner import Runner
 from . import review_step_back as _step_back
@@ -4044,65 +4042,6 @@ def render_evidence_stall_decision(
         "3. Override with a signed human decision through the existing signed-requirement "
         "path, then rerun the same command."
     )
-
-
-def _followup_reports_code_changes(
-    parsed: StructuredCoderFollowup,
-    prior_items: Sequence[UnresolvedReviewItem],
-    citation_row_ids: Iterable[str],
-) -> bool:
-    """Whether a follow-up was expected to move the PR head (#1338).
-
-    Classified only from orchestrator-owned pre-follow-up state: the ledger
-    and the canonical unsatisfied-row set bound to the predecessor head.  An
-    addressed item (or a sub-item's parent) is citation-only when it is a
-    machine evidence obligation or a reviewer finding whose non-empty
-    ``evidence_row_ids`` all name unsatisfied rows, the same subset test
-    ``evidence_stall.classify_round`` applies.  Returns ``False`` only when at
-    least one item is addressed and every addressed item is citation-only;
-    any other item, an unknown id, or an unavailable row set expects a change.
-    """
-    citation_rows = frozenset(citation_row_ids)
-    if not citation_rows:
-        return True
-    addressed = {
-        *parsed.addressed_items,
-        *(sub_item_parent_id(sub_item) for sub_item in parsed.addressed_sub_items),
-    }
-    if not addressed:
-        return True
-    by_id = {item.item_id: item for item in prior_items}
-    for item_id in addressed:
-        item = by_id.get(item_id)
-        if item is None:
-            return True
-        if item.is_machine_obligation:
-            if item.obligation_kind != EVIDENCE_OBLIGATION_KIND:
-                return True
-            continue
-        # The residual tag (#1325): rows already converted no longer count.
-        residual = item.residual_evidence_row_ids
-        if not residual or not set(residual) <= citation_rows:
-            return True
-    return False
-
-
-def _evidence_stall_citation_rows(
-    snapshot: Mapping[str, object] | None,
-) -> frozenset[str]:
-    """Unsatisfied rows retained from this round's stall snapshot payload.
-
-    The rows are set whenever the predecessor-bound evidence parsed with
-    unsatisfied rows, even when the round does not qualify as a stall.  A
-    skipped or unavailable snapshot yields an empty set, so the head-change
-    expectation stays conservative.
-    """
-    if not isinstance(snapshot, Mapping):
-        return frozenset()
-    rows = snapshot.get("unsatisfied_row_ids")
-    if not isinstance(rows, (list, tuple)):
-        return frozenset()
-    return frozenset(row for row in rows if isinstance(row, str) and row)
 
 
 def _head_bound_coder_record(

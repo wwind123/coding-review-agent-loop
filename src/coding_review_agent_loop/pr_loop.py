@@ -471,8 +471,6 @@ from .pr_loop_support import (
     freeze_signed_baseline,
     latest_conversion_index,
     mint_signed_evidence_references,
-    _followup_reports_code_changes,
-    _evidence_stall_citation_rows,
     _publish_evidence_release,
     _evidence_freeze_gate,
     _refuse_dispatch_while_evidence_frozen,
@@ -9249,17 +9247,6 @@ def run_pr_loop(
                     runner, config
                 )
                 if isinstance(coder_response.marker_value, StructuredCoderFollowup):
-                    # A citation-only follow-up may leave the head unchanged;
-                    # any other addressed item expects a pushed change (#1338).
-                    # Classified against the ledger and unsatisfied rows fixed
-                    # before the coder turn, never against agent prose.
-                    head_change_expected = _followup_reports_code_changes(
-                        coder_response.marker_value,
-                        prior_items=pre_turn_ledger,
-                        citation_row_ids=_evidence_stall_citation_rows(
-                            evidence_stall_snapshot
-                        ),
-                    )
                     derived_followup, _followup_derived_risk_evidence = (
                         _derive_authenticated_risk_evidence_for_coder(
                             coder_response.marker_value,
@@ -9267,8 +9254,6 @@ def run_pr_loop(
                             runner=runner,
                             assigned_workdir=active_workdir(config),
                             head_sha=updated_pr_context.metadata.head_sha,
-                            predecessor_head=pr_metadata.head_sha,
-                            head_change_expected=head_change_expected,
                             # A semantic correction resumes this coder turn,
                             # so it carries the same guard (#1366).
                             config=dataclasses_replace(

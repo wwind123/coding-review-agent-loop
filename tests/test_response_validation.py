@@ -1033,7 +1033,7 @@ def test_followup_overlong_refs_through_validated_agent_never_repairs_1300(tmp_p
     assert parsed.risk_test_matrix_claims.degradations == ()
 
 
-# --- #1338: the head-change expectation survives the bounded correction -----
+# --- #1627: the bounded correction authenticates against the current head ---
 
 import json as _json  # noqa: E402
 from types import SimpleNamespace as _NS  # noqa: E402
@@ -1045,7 +1045,6 @@ from coding_review_agent_loop.local_test_evidence import (  # noqa: E402
 )
 from coding_review_agent_loop.execution_policy import make_approved_plan_context as _plan_context  # noqa: E402
 from coding_review_agent_loop.protocol import (  # noqa: E402
-    PREDECESSOR_HEAD_UNMOVED_MESSAGE as _UNMOVED,
     SemanticRiskCoverageClaim as _Claim,
     SemanticRiskCoverageClaims as _Claims,
     StructuredHumanRequirementsPayload as _HumanPayload,
@@ -1152,65 +1151,58 @@ def _correction_fixture(monkeypatch, tmp_path, *, reauthenticated_head):
             text=_json.dumps(corrected_payload) + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
         ),
     )
-    flags = []
+    heads = []
     real_derive = _response_validation.derive_risk_test_matrix_evidence
 
     def spy(**kwargs):
-        flags.append((kwargs["current_head"], kwargs["head_change_expected"]))
+        heads.append(kwargs["current_head"])
         return real_derive(**kwargs)
 
     monkeypatch.setattr(_response_validation, "derive_risk_test_matrix_evidence", spy)
 
-    def run(head_change_expected):
+    def run():
         return _response_validation._derive_authenticated_risk_evidence_for_coder(
             parsed,
             approved_plan_context=context,
             runner=Runner(),
             assigned_workdir=tmp_path,
             head_sha="head-same",
-            predecessor_head="head-same",
-            head_change_expected=head_change_expected,
             config=_NS(coder="codex", coder_test_command_timeout_seconds=1),
             session_id="coder-session",
             reauthenticate_head=lambda: reauthenticated_head,
         )
 
-    return run, flags
+    return run, heads
 
 
-def test_correction_at_unchanged_head_verifies_without_a_head_change_expectation(monkeypatch, tmp_path):
-    """Issue #1338 `correction-continuation-forwards-flag` (False direction)."""
-    run, flags = _correction_fixture(monkeypatch, tmp_path, reauthenticated_head="head-same")
+def test_same_head_correction_at_unchanged_head_verifies(monkeypatch, tmp_path):
+    """Issue #1627 `same-head-correction-verified`.
 
-    _parsed, result = run(False)
+    The reauthenticated head equals ``head_sha``, which is also the
+    predecessor head: the corrected receipt is verified with citations.
+    """
+    run, heads = _correction_fixture(monkeypatch, tmp_path, reauthenticated_head="head-same")
 
-    assert flags == [("head-same", False), ("head-same", False)]
-    assert result.evidence.rows[0].status == "verified"
+    _parsed, result = run()
+
+    assert heads == ["head-same", "head-same"]
+    row = result.evidence.rows[0]
+    assert row.status == "verified"
+    assert row.evidence_citations
     assert not any(d.code == "checkout-head-mismatch" for d in result.diagnostics)
 
 
-def test_correction_at_unchanged_head_keeps_the_head_change_expectation(monkeypatch, tmp_path):
-    """Issue #1338 `correction-continuation-forwards-flag` (True, same-head continuation)."""
-    run, flags = _correction_fixture(monkeypatch, tmp_path, reauthenticated_head="head-same")
+def test_remote_head_race_correction_stays_unverified(monkeypatch, tmp_path):
+    """Issue #1627 `remote-head-race-correction-unverified`: race demotion is unchanged."""
+    run, heads = _correction_fixture(monkeypatch, tmp_path, reauthenticated_head="head-raced")
 
-    _parsed, result = run(True)
+    _parsed, result = run()
 
-    assert flags == [("head-same", True), ("head-same", True)]
+    assert heads == ["head-same", "head-raced"]
     row = result.evidence.rows[0]
-    assert row.status != "verified" and row.evidence_citations == ()
-    assert any(
-        d.code == "checkout-head-mismatch" and d.message == _UNMOVED for d in result.diagnostics
-    )
-
-
-def test_remote_head_race_continuation_receives_the_head_change_expectation(monkeypatch, tmp_path):
-    """Issue #1338 `correction-continuation-forwards-flag` (True, race continuation)."""
-    run, flags = _correction_fixture(monkeypatch, tmp_path, reauthenticated_head="head-raced")
-
-    _parsed, result = run(True)
-
-    assert flags == [("head-same", True), ("head-raced", True)]
-    assert result.evidence.rows[0].status != "verified"
+    assert row.status != "verified"
+    assert row.evidence_citations == ()
+    assert "head changed during bounded semantic correction" in row.caveats
     assert any(d.code == "head-changed-during-correction" for d in result.diagnostics)
 
 

@@ -16,7 +16,6 @@ from coding_review_agent_loop.comment_rendering import (
 from coding_review_agent_loop.errors import AgentLoopError
 from coding_review_agent_loop.local_test_evidence import LocalTestObservation, TreeAttribution
 from coding_review_agent_loop.protocol import (
-    PREDECESSOR_HEAD_UNMOVED_MESSAGE,
     RiskTestMatrixChange,
     SemanticRiskCoverageClaim,
     SemanticRiskCoverageClaims,
@@ -809,7 +808,7 @@ def _ordinary_row_claim(*execution_refs: str) -> SemanticRiskCoverageClaims:
 
 
 def _derive_at_head(
-    observation, *, current_head, predecessor_head, head_change_expected, tree="tree-current"
+    observation, *, current_head, checkout_head=None, tree_clean=True, tree="tree-current"
 ):
     matrix = parse_risk_test_matrix(_matrix())
     return derive_risk_test_matrix_evidence(
@@ -819,26 +818,24 @@ def _derive_at_head(
         invocation_id="turn-current",
         current_head=current_head,
         current_tree_digest=tree,
-        authenticated_checkout_head=current_head,
-        authenticated_tree_clean=True,
-        predecessor_head=predecessor_head,
-        head_change_expected=head_change_expected,
+        authenticated_checkout_head=current_head if checkout_head is None else checkout_head,
+        authenticated_tree_clean=tree_clean,
         expected_identity=risk_test_matrix_identity(matrix),
     )
 
 
-def test_evidence_only_followup_at_unchanged_head_verifies() -> None:
-    """Issue #1338 `evidence-only-unchanged-head-verified`."""
+def test_unchanged_head_receipt_with_clean_checkout_is_verified() -> None:
+    """Issue #1627 `unchanged-head-untagged-verified` at the builder.
+
+    The builder takes no predecessor head: a receipt from a clean checkout
+    authenticated at the exact current head is verified whether or not the
+    follow-up moved the head.
+    """
     observation = _derived_observation(
         execution_ref="invocation:observation-1", receipt_id="receipt-1"
     )
 
-    result = _derive_at_head(
-        observation,
-        current_head="head-current",
-        predecessor_head="head-current",
-        head_change_expected=False,
-    )
+    result = _derive_at_head(observation, current_head="head-current")
 
     row = result.evidence.rows[0]
     assert row.status == "verified"
@@ -846,50 +843,30 @@ def test_evidence_only_followup_at_unchanged_head_verifies() -> None:
     assert not any(d.code == "checkout-head-mismatch" for d in result.diagnostics)
 
 
-def test_evidence_only_followup_keeps_the_clean_tree_and_digest_proofs() -> None:
-    """Issue #1338: the unchanged-head path never relaxes the tree proofs."""
+def test_unchanged_head_keeps_the_clean_tree_and_digest_proofs() -> None:
+    """Issue #1627 `unchanged-head-dirty-rejected`: tree proofs still disqualify."""
     observation = _derived_observation(
         execution_ref="invocation:observation-1", receipt_id="receipt-1"
     )
-    matrix = parse_risk_test_matrix(_matrix())
-    dirty = derive_risk_test_matrix_evidence(
-        matrix=matrix,
-        claims=_ordinary_row_claim("invocation:observation-1"),
-        observations=(observation,),
-        invocation_id="turn-current",
-        current_head="head-current",
-        current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
-        authenticated_tree_clean=False,
-        predecessor_head="head-current",
-        head_change_expected=False,
-        expected_identity=risk_test_matrix_identity(matrix),
-    )
+
+    dirty = _derive_at_head(observation, current_head="head-current", tree_clean=False)
     assert dirty.evidence.rows[0].status == "stale/unverified"
+    assert dirty.evidence.rows[0].evidence_citations == ()
     assert any(d.code == "checkout-tree-unavailable" for d in dirty.diagnostics)
 
-    other_tree = _derive_at_head(
-        observation,
-        current_head="head-current",
-        predecessor_head="head-current",
-        head_change_expected=False,
-        tree="tree-edited",
-    )
+    other_tree = _derive_at_head(observation, current_head="head-current", tree="tree-edited")
     assert other_tree.evidence.rows[0].status != "verified"
     assert any(d.code == "tree-mismatch" for d in other_tree.diagnostics)
 
 
-def test_claimed_change_followup_at_unchanged_head_is_rejected() -> None:
-    """Issue #1338 `claimed-change-unchanged-head-rejected`."""
+def test_unpushed_local_commit_is_rejected_as_checkout_head_mismatch() -> None:
+    """Issue #1627 `unpushed-commit-rejected`."""
     observation = _derived_observation(
         execution_ref="invocation:observation-1", receipt_id="receipt-1"
     )
 
     result = _derive_at_head(
-        observation,
-        current_head="head-current",
-        predecessor_head="head-current",
-        head_change_expected=True,
+        observation, current_head="head-current", checkout_head="head-local-unpushed"
     )
 
     row = result.evidence.rows[0]
@@ -897,15 +874,14 @@ def test_claimed_change_followup_at_unchanged_head_is_rejected() -> None:
     assert row.evidence_citations == ()
     mismatches = [d for d in result.diagnostics if d.code == "checkout-head-mismatch"]
     assert mismatches
-    assert all(d.message == PREDECESSOR_HEAD_UNMOVED_MESSAGE for d in mismatches)
-    assert "predecessor head" in PREDECESSOR_HEAD_UNMOVED_MESSAGE
+    assert all(
+        d.message == "The assigned checkout was not authenticated at the exact current PR head."
+        for d in mismatches
+    )
 
 
-@pytest.mark.parametrize("head_change_expected", [False, True])
-def test_moved_head_verifies_new_head_evidence_and_rejects_old_head_evidence(
-    head_change_expected,
-) -> None:
-    """Issue #1338 `moved-head-evidence-attribution`."""
+def test_moved_head_verifies_new_head_evidence_and_rejects_old_head_evidence() -> None:
+    """Issue #1627 `moved-head-attribution`."""
     new_receipt = _derived_observation(
         execution_ref="invocation:observation-1", receipt_id="receipt-new"
     )
@@ -915,42 +891,40 @@ def test_moved_head_verifies_new_head_evidence_and_rejects_old_head_evidence(
     )
     old_receipt.attribution = {**old_receipt.attribution, "head": "head-old"}
 
-    verified = _derive_at_head(
-        new_receipt,
-        current_head="head-new",
-        predecessor_head="head-old",
-        head_change_expected=head_change_expected,
-    )
+    verified = _derive_at_head(new_receipt, current_head="head-new")
     assert verified.evidence.rows[0].status == "verified"
     assert not any(d.code == "checkout-head-mismatch" for d in verified.diagnostics)
 
-    rejected = _derive_at_head(
-        old_receipt,
-        current_head="head-new",
-        predecessor_head="head-old",
-        head_change_expected=head_change_expected,
-    )
+    rejected = _derive_at_head(old_receipt, current_head="head-new")
     assert rejected.evidence.rows[0].status != "verified"
     assert rejected.evidence.rows[0].evidence_citations == ()
     assert any(d.code == "head-mismatch" for d in rejected.diagnostics)
     assert not any(d.code == "checkout-head-mismatch" for d in rejected.diagnostics)
 
 
-def test_omitted_predecessor_head_never_triggers_the_unmoved_clause() -> None:
-    """Issue #1338: ``predecessor_head=None`` ignores the head-change flag."""
+def test_moved_head_with_checkout_left_at_old_head_is_checkout_head_mismatch() -> None:
+    """Issue #1627 edge case: the checkout did not follow the moved PR head."""
+    old_receipt = _derived_observation(
+        execution_ref="invocation:observation-1", receipt_id="receipt-old"
+    )
+    old_receipt.attribution = {**old_receipt.attribution, "head": "head-old"}
+
+    result = _derive_at_head(old_receipt, current_head="head-new", checkout_head="head-old")
+
+    assert result.evidence.rows[0].status != "verified"
+    assert any(d.code == "checkout-head-mismatch" for d in result.diagnostics)
+
+
+def test_missing_current_head_is_still_rejected() -> None:
+    """Issue #1627 edge case: an omitted current head never verifies."""
     observation = _derived_observation(
         execution_ref="invocation:observation-1", receipt_id="receipt-1"
     )
 
-    result = _derive_at_head(
-        observation,
-        current_head="head-current",
-        predecessor_head=None,
-        head_change_expected=True,
-    )
+    result = _derive_at_head(observation, current_head=None, checkout_head="head-current")
 
-    assert result.evidence.rows[0].status == "verified"
-    assert not any(d.code == "checkout-head-mismatch" for d in result.diagnostics)
+    assert result.evidence.rows[0].status != "verified"
+    assert any(d.code == "checkout-head-mismatch" for d in result.diagnostics)
 
 
 def test_current_turn_catalog_filters_a_misbehaving_cumulative_provider() -> None:
