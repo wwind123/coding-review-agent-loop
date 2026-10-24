@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from collections.abc import Iterable, Sequence
 
 BINDING_BOUND = "bound"
 BINDING_NEEDS_REPAIR = "needs-repair"
