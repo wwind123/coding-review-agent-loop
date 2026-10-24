@@ -873,107 +873,18 @@ def test_reraised_duplicate_is_a_new_item_with_its_own_tag_and_the_original_keep
     } == {"item-1": ("row-a",), "item-2": ()}
 
 
-# --- #1338: unchanged-head follow-ups and the head-change expectation -------
+# --- #1627: unchanged-head follow-ups authenticate against the current head --
 
 from types import SimpleNamespace  # noqa: E402
 
 import coding_review_agent_loop.response_validation as response_validation_module  # noqa: E402
 from coding_review_agent_loop.agent_failure import ValidatedAgentResponse  # noqa: E402
+from coding_review_agent_loop.pr_loop_support import MAX_UNCHANGED_HEAD_CODER_TURNS  # noqa: E402
 from coding_review_agent_loop.local_test_evidence import (  # noqa: E402
     LocalTestObservation,
     TreeAttribution,
 )
-from coding_review_agent_loop.pr_loop_support import (  # noqa: E402
-    _evidence_stall_citation_rows,
-    _followup_reports_code_changes,
-)
-from coding_review_agent_loop.protocol import (  # noqa: E402
-    EVIDENCE_OBLIGATION_KIND,
-    PREDECESSOR_HEAD_UNMOVED_MESSAGE,
-    ReviewSubItem,
-    UnresolvedReviewItem,
-    validate_structured_coder_followup,
-)
-
-
-def _finding(item_id, rows=(), sub_items=()):
-    return UnresolvedReviewItem(
-        item_id=item_id, reviewer="codex", source_round=1, text=f"finding {item_id}",
-        status="blocking", evidence_row_ids=tuple(rows), sub_items=tuple(sub_items),
-    )
-
-
-def _obligation(item_id, kind):
-    evidence = kind == EVIDENCE_OBLIGATION_KIND
-    return UnresolvedReviewItem(
-        item_id=item_id, reviewer="orchestrator", source_round=1, text=f"obligation {kind}",
-        status="blocking", authority="machine", obligation_kind=kind,
-        lifecycle="evidence_deferred" if evidence else "repair_required",
-        failed_head_sha=None if evidence else "abc123",
-        obligation_identity=f"{kind}:identity" if evidence else None,
-    )
-
-
-_LEDGER = (
-    _finding("item-1", rows=("row-a",)),
-    _finding("item-2"),
-    _finding("item-3", rows=("row-a", "row-b")),
-    _finding("item-4", rows=("row-a",), sub_items=(ReviewSubItem("item-4.s1", "sub a"),)),
-    _finding("item-5", sub_items=(ReviewSubItem("item-5.s1", "sub b"),)),
-    _obligation("item-6", EVIDENCE_OBLIGATION_KIND),
-    _obligation("item-7", "github-pr-checks"),
-)
-
-
-def _followup(addressed=(), sub_items=()):
-    return dataclasses.replace(
-        validate_structured_coder_followup(structured_coder_followup(addressed_items=list(addressed))),
-        addressed_sub_items=tuple(sub_items),
-    )
-
-
-@pytest.mark.parametrize(
-    ("addressed", "sub_items", "rows", "expected"),
-    [
-        pytest.param(["item-1"], [], {"row-a"}, False, id="tagged-citation-finding"),
-        pytest.param(["item-6"], [], {"row-a"}, False, id="machine-evidence-obligation"),
-        pytest.param(["item-1", "item-6"], [], {"row-a"}, False, id="all-citation-only"),
-        pytest.param(["item-2"], [], {"row-a"}, True, id="untagged-finding"),
-        pytest.param(["item-3"], [], {"row-a"}, True, id="tag-names-satisfied-row"),
-        pytest.param(["item-1", "item-2"], [], {"row-a"}, True, id="mixed-turn"),
-        pytest.param(["item-99"], [], {"row-a"}, True, id="id-missing-from-ledger"),
-        pytest.param([], ["item-4.s1"], {"row-a"}, False, id="sub-item-of-citation-finding"),
-        pytest.param([], ["item-5.s1"], {"row-a"}, True, id="sub-item-of-code-finding"),
-        pytest.param(["item-7"], [], {"row-a"}, True, id="non-evidence-obligation"),
-        pytest.param(["item-1"], [], set(), True, id="row-set-unavailable"),
-        pytest.param([], [], {"row-a"}, True, id="nothing-addressed"),
-    ],
-)
-def test_head_change_expectation_classifier(addressed, sub_items, rows, expected):
-    """Issue #1338 `head-change-expectation-classifier`."""
-    parsed = _followup(addressed, sub_items)
-    assert _followup_reports_code_changes(
-        parsed, prior_items=_LEDGER, citation_row_ids=rows
-    ) is expected
-
-
-def test_classifier_ignores_agent_prose_and_uses_only_ledger_state():
-    """Claimed prose cannot turn an untagged finding into a citation-only turn."""
-    parsed = dataclasses.replace(
-        _followup(["item-2"]),
-        summary="Evidence-only: re-ran the tests, no code changes.",
-        addressed_item_notes={"item-2": "Evidence only; nothing pushed."},
-    )
-    assert _followup_reports_code_changes(parsed, prior_items=_LEDGER, citation_row_ids={"row-a"})
-
-
-def test_citation_rows_come_from_the_stall_snapshot_even_when_it_does_not_qualify():
-    assert _evidence_stall_citation_rows(None) == frozenset()
-    assert _evidence_stall_citation_rows({"qualifies": False, "unsatisfied_row_ids": []}) == frozenset()
-    assert _evidence_stall_citation_rows(
-        {"qualifies": False, "reasons": ["checks-failing"], "unsatisfied_row_ids": ["row-a"]}
-    ) == frozenset({"row-a"})
-    assert _evidence_stall_citation_rows({"unsatisfied_row_ids": "row-a"}) == frozenset()
+from coding_review_agent_loop.protocol import validate_structured_coder_followup  # noqa: E402
 
 
 def _receipt(turn_id, head="abc123"):
@@ -1027,21 +938,21 @@ def _citing_followup(turn_id, plan_context, *, addressed, remaining, receipt_hea
     )
 
 
-def _run_followups(tmp_path, monkeypatch, *, reviews, turns):
+def _run_followups(tmp_path, monkeypatch, *, reviews, turns, expected_error=None):
     """Drive run_pr_loop with scripted coder turns.
 
     Each turn is ``(addressed, remaining, pushed_head, receipt_head)``:
     ``pushed_head=None`` leaves the PR head unchanged (nothing pushed), and
     the turn cites one passing receipt attributed to ``receipt_head``.  The
     assigned checkout is clean at whatever the PR head is after the turn.
+    With ``expected_error`` the loop must raise it; the raised exception is
+    returned in place of the exit code.
     """
     plan_context = _plan_context("row-a")
     runner = FakeRunner(codex_outputs=list(reviews))
     config = _config(tmp_path)
     remaining_turns = list(enumerate(turns, start=1))
-    expectations = []
     real_validated_agent = pr_loop_module._run_validated_agent
-    real_classifier = pr_loop_module._followup_reports_code_changes
 
     def current_head():
         return runner.pr_payload.get("headRefOid") or "abc123"
@@ -1058,13 +969,7 @@ def _run_followups(tmp_path, monkeypatch, *, reviews, turns):
             addressed=addressed, remaining=remaining, receipt_head=receipt_head,
         )
 
-    def classify(*args, **kwargs):
-        expected = real_classifier(*args, **kwargs)
-        expectations.append(expected)
-        return expected
-
     monkeypatch.setattr(pr_loop_module, "_run_validated_agent", fake_validated_agent)
-    monkeypatch.setattr(pr_loop_module, "_followup_reports_code_changes", classify)
     monkeypatch.setattr(
         response_validation_module,
         "stable_tracked_tree_snapshot",
@@ -1081,12 +986,17 @@ def _run_followups(tmp_path, monkeypatch, *, reviews, turns):
         "reconcile_test_observations",
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
-    result = run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context)
+    if expected_error is None:
+        result = run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context)
+    else:
+        with pytest.raises(expected_error) as raised:
+            run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context)
+        result = raised.value
     coder_records = {
         record.metadata.round_number: record.metadata
         for record in _posted_records(runner, config) if record.metadata.role == "coder"
     }
-    return result, runner, config, coder_records, expectations
+    return result, runner, config, coder_records
 
 
 def _row_evidence(metadata, row_id="row-a"):
@@ -1098,15 +1008,21 @@ def _codes(metadata, code):
     return [d for d in metadata.risk_test_matrix_diagnostics if d.get("code") == code]
 
 
+def _assert_verified(metadata):
+    row = _row_evidence(metadata)
+    assert row["status"] == "verified"
+    assert row["evidence_citations"]
+    assert not _codes(metadata, "checkout-head-mismatch")
+
+
 def test_citation_only_followup_at_unchanged_head_verifies_and_never_stalls(tmp_path, monkeypatch):
-    """Issue #1338 `pr-loop-evidence-only-no-stall`.
+    """Issue #1338 `pr-loop-evidence-only-no-stall`, kept under #1627.
 
     Turn 1 pushes a fix but cites a receipt from the old head, leaving row-a
     unsatisfied; turn 2 pushes nothing and re-runs the row at the head it
-    already has.  Without #1338 turn 2 failed with checkout-head-mismatch and
-    the third review stopped on an evidence stall.
+    already has, so the third review sees a verified row and never stalls.
     """
-    result, runner, config, coder_records, expectations = _run_followups(
+    result, runner, config, coder_records = _run_followups(
         tmp_path, monkeypatch,
         reviews=[
             _review([_tagged()]),
@@ -1122,23 +1038,43 @@ def test_citation_only_followup_at_unchanged_head_verifies_and_never_stalls(tmp_
     )
 
     assert result == 0
-    # Round 1 has no evidence bound to the head yet, so it stays conservative;
-    # the moved head rejects the old-head receipt without a predecessor clause.
-    assert expectations[0] is True
+    # The moved head rejects the old-head receipt by its own attribution.
     assert _row_evidence(coder_records[2])["status"] != "verified"
     assert _codes(coder_records[2], "head-mismatch")
     assert not _codes(coder_records[2], "checkout-head-mismatch")
-    # Round 2 addresses only the tagged citation finding while row-a is unsatisfied.
-    assert expectations[1] is False
-    row = _row_evidence(coder_records[3])
-    assert row["status"] == "verified"
-    assert row["evidence_citations"]
-    assert not _codes(coder_records[3], "checkout-head-mismatch")
+    _assert_verified(coder_records[3])
     snapshots = _stall_snapshots(runner, config)
     assert snapshots[2]["qualifies"] is True
     # The next review sees the verified row, so the stall window does not fill.
     assert snapshots[3]["qualifies"] is False
     assert "no-unsatisfied-rows" in snapshots[3]["reasons"]
+
+
+def test_untagged_finding_evidence_only_followup_at_unchanged_head_verifies(tmp_path, monkeypatch):
+    """Issue #1627 `unchanged-head-untagged-verified` (the #1747 shape).
+
+    An ordinary reviewer finding with no ``evidence_row_ids`` asks for
+    admissible observations.  The coder re-runs the row at the head it
+    already has and pushes nothing; the receipt from the clean checkout at
+    that exact head is verified, whatever the finding's wording or tags.
+    """
+    result, _runner, _config_, coder_records = _run_followups(
+        tmp_path, monkeypatch,
+        reviews=[
+            _review([
+                "Provide admissible passing test observations for the risk-matrix rows; "
+                "do not change code just to move the SHA."
+            ]),
+            _review(resolved=["item-1"]),
+        ],
+        turns=[(["item-1"], [], None, "abc123")],
+    )
+
+    assert result == 0
+    assert len(coder_records) == 1
+    (metadata,) = coder_records.values()
+    _assert_verified(metadata)
+    assert not _codes(metadata, "head-mismatch")
 
 
 @pytest.mark.parametrize(
@@ -1148,31 +1084,65 @@ def test_citation_only_followup_at_unchanged_head_verifies_and_never_stalls(tmp_
         pytest.param((["item-1"], ["item-2"], None, "head-2"), id="code-only"),
     ],
 )
-def test_code_claim_followup_at_unchanged_head_is_rejected(tmp_path, monkeypatch, turn_two):
-    """Issue #1338 `pr-loop-code-claim-unpushed`."""
-    result, runner, config, coder_records, expectations = _run_followups(
+def test_code_claim_followup_at_unchanged_head_receipts_verify_and_reviewer_keeps_finding(
+    tmp_path, monkeypatch, turn_two
+):
+    """Issue #1627 `code-finding-tests-only-stop`: admissibility ignores the head move.
+
+    Turn 2 answers a real code finding without pushing.  Its receipt is a
+    true test of the current head and is verified; the reviewer still keeps
+    the code finding open, so verified evidence never resolves it.
+    """
+    result, runner, config, coder_records = _run_followups(
         tmp_path, monkeypatch,
         reviews=[
             _review(["A real code defect in the loader", _tagged()]),
             _review(carried=["item-1", "item-2"]),
-            _review(resolved=["item-1", "item-2"]),
+            _review(carried=["item-2"], resolved=["item-1"]),
+            _review(resolved=["item-2"]),
         ],
-        turns=[(["item-1", "item-2"], [], "head-2", "abc123"), turn_two],
+        turns=[
+            (["item-1", "item-2"], [], "head-2", "abc123"),
+            turn_two,
+            (["item-2"], [], "head-3", "head-3"),
+        ],
     )
 
     assert result == 0
-    # The row set was available in round 2, so only the classification expects a push.
-    assert _stall_snapshots(runner, config)[2]["unsatisfied_row_ids"] == ["row-a"]
-    assert expectations == [True, True]
-    row = _row_evidence(coder_records[3])
-    assert row["status"] != "verified"
-    assert not row["evidence_citations"]
-    mismatches = _codes(coder_records[3], "checkout-head-mismatch")
-    assert mismatches
-    # The receipt itself was admissible: only the unmoved head rejected it.
+    _assert_verified(coder_records[3])
     assert not _codes(coder_records[3], "inadmissible-execution")
     assert not _codes(coder_records[3], "head-mismatch")
-    assert all(d["message"] == PREDECESSOR_HEAD_UNMOVED_MESSAGE for d in mismatches)
+    # The reviewer carried the code finding past the verified evidence.
+    carried = {item.item_id for item in coder_records[4].prior_items}
+    assert "item-2" in carried
+
+
+def test_unchanged_head_stop_still_fires_with_verified_evidence(tmp_path, monkeypatch):
+    """Issue #1627 `code-finding-tests-only-stop`: the stop is independent of evidence.
+
+    The coder answers a code finding only with tests and pushes nothing in
+    MAX_UNCHANGED_HEAD_CODER_TURNS consecutive follow-ups.  Every receipt is
+    verified, yet the reviewer keeps the finding and the unchanged-head stop
+    fires with its existing message.
+    """
+    turns = [(["item-1"], [], None, "abc123")] * MAX_UNCHANGED_HEAD_CODER_TURNS
+    reviews = [_review(["A real code defect in the loader"])] + [
+        _review(carried=["item-1"]) for _ in range(MAX_UNCHANGED_HEAD_CODER_TURNS)
+    ]
+    error, runner, _config_, coder_records = _run_followups(
+        tmp_path, monkeypatch, reviews=reviews, turns=turns, expected_error=AgentLoopError,
+    )
+
+    assert (
+        f"left head abc123 unchanged in {MAX_UNCHANGED_HEAD_CODER_TURNS} consecutive "
+        "follow-up rounds" in str(error)
+    )
+    assert len(coder_records) == MAX_UNCHANGED_HEAD_CODER_TURNS
+    for metadata in coder_records.values():
+        _assert_verified(metadata)
+    # The identical head is not reviewed again after the stop.
+    reviews_run = [cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
+    assert len(reviews_run) == MAX_UNCHANGED_HEAD_CODER_TURNS
 
 
 # --- #1329: historical obsolete-tree failures through display transport ----------
