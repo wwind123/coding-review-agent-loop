@@ -153,6 +153,13 @@ deleted. If repair yields no accepted candidate, a non-array value falls back
 to the `degrade-after-repair` pair. That pair accepts the original through
 the same acceptance boundary, with a drop record whose rule says repair was
 attempted, and never spends an agent retry. The over-bound case stays fatal.
+The validated turn classifies the shape defect from the source payload
+(`source_has_test_observations_shape_defect`), not from the first validation
+error, so a response whose other repairable defect is reported first still
+gets the targeted repair. When the original still carries that other defect,
+the fallback also tries a rejected repair candidate. The candidate must have
+fixed everything except the non-array field and must pass the unflagged
+preservation rules against the source.
 
 Every function, method and nested def in `protocol.py` that can still reach
 an `AgentLoopError`-family raise is classified in `shape_check_audit.py` as

@@ -2921,3 +2921,31 @@ def test_unflagged_preservation_still_pins_every_source_citation_object_1626():
     validate_repair_preservation(source, removed, test_observations_shape_defect=True)
     # A prose source carries no unflagged constraint at all.
     validate_repair_preservation(_followup_1626(_PROSE_1626), _followup_1626([]))
+
+
+@pytest.mark.parametrize(
+    ("observations", "expected"),
+    [
+        (_PROSE_1626, True),
+        ({"command": "x"}, True),
+        (7, True),
+        (_NATIVE_1626, True),  # nine malformed items: over the drop bound
+        (json.dumps(_NATIVE_1626), True),
+        ([_VALID_1626], False),
+        (json.dumps([_VALID_1626]), False),
+        ([_VALID_1626, *_MALFORMED_1626[:8]], False),
+    ],
+)
+def test_source_shape_defect_is_classified_like_the_repair_first_parser_1626(observations, expected):
+    from coding_review_agent_loop.repair_preservation import source_has_test_observations_shape_defect
+
+    assert source_has_test_observations_shape_defect(_followup_1626(observations)) is expected
+
+
+def test_source_without_test_observations_or_payload_has_no_shape_defect_1626():
+    from coding_review_agent_loop.repair_preservation import source_has_test_observations_shape_defect
+
+    payload = json.loads(_followup_1626([]).split("\n<!--", 1)[0])
+    payload.pop("test_observations")
+    assert source_has_test_observations_shape_defect(json.dumps(payload)) is False
+    assert source_has_test_observations_shape_defect("not json") is False

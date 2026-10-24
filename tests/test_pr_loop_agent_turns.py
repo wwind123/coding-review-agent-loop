@@ -1547,3 +1547,57 @@ def test_fallback_validators_must_be_supplied_as_a_pair_1626(tmp_path):
             marker_description="x", validate=lambda text: text,
             test_observations_fallback_validate=lambda text: text,
         )
+
+
+def _with_earlier_defect_1626(text, defect):
+    payload, end = json.JSONDecoder().raw_decode(text)
+    if defect == "tests-run-string":
+        payload["tests_run"] = "node --test scripts/locales.test.mjs"
+    else:
+        payload["unexpected_note"] = "an extra top-level key"
+    return json.dumps(payload) + text[end:]
+
+
+@pytest.mark.parametrize("defect", ["tests-run-string", "extra-top-level-key"])
+@pytest.mark.parametrize("repair_outcome", ["fixes-both", "fixes-other-keeps-prose", "unavailable"])
+def test_prose_with_an_earlier_checked_defect_still_gets_the_targeted_repair_1626(
+    tmp_path, defect, repair_outcome
+):
+    """Regression for review item-1: the shape defect is classified from the source.
+
+    The earlier defect raises first, yet the repair is still flagged with the
+    receipts; a candidate that fixed the other defect but kept the prose is
+    accepted by the after-repair fallback instead of failing the turn.
+    """
+    source = _with_earlier_defect_1626(_followup_text_1626(_PROSE_1626), defect)
+    repair = {
+        "fixes-both": _REPAIRED_1626,
+        "fixes-other-keeps-prose": _followup_text_1626(_PROSE_1626),
+        "unavailable": None,
+    }[repair_outcome]
+    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=repair)
+    [kwargs] = calls
+    assert kwargs["test_observations_shape_defect"] is True
+    assert kwargs["test_turn_receipts"][0]["receipt_id"] == "receipt-pass"
+    assert len(coder_turns) == 1, "no agent retry is consumed"
+    if repair_outcome == "fixes-both":
+        assert isinstance(outcome, ValidatedAgentResponse), outcome
+        assert [item.receipt_id for item in outcome.marker_value.test_observations] == ["receipt-pass"]
+        assert outcome.marker_value.test_observation_degradations == ()
+    elif repair_outcome == "fixes-other-keeps-prose":
+        assert isinstance(outcome, ValidatedAgentResponse), outcome
+        assert outcome.text == repair
+        [record] = outcome.marker_value.test_observation_degradations
+        assert record.rule == _AFTER_REPAIR_RULE_1626
+    else:
+        # The original still carries the other defect: nothing is accepted.
+        assert isinstance(outcome, AgentLoopError)
+
+
+def test_repaired_candidate_fallback_keeps_unflagged_preservation_1626(tmp_path):
+    """A candidate that also lost content is never accepted by the fallback."""
+    source = _with_earlier_defect_1626(_followup_text_1626(_PROSE_1626), "tests-run-string")
+    lossy = _followup_text_1626(_PROSE_1626, summary="Done.")
+    outcome, calls, _coder_turns = _followup_turn_1626(tmp_path, [source], repair=lossy)
+    assert len(calls) == 1
+    assert isinstance(outcome, AgentLoopError)

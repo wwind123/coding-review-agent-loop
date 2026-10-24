@@ -9,7 +9,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 
@@ -63,6 +63,7 @@ from .repair_preservation import (
     normalize_architecture_impact_near_miss,
     recover_payload,
     require_recoverable_semantic_patch,
+    source_has_test_observations_shape_defect,
     require_repair_architecture_impact_absent,
     validate_repair_preservation,
 )
@@ -1306,6 +1307,54 @@ def _run_validated_agent_in_scope(
                 f"({fallback_exc})",
             )
             return None
+
+    def accept_repaired_test_observations_fallback(
+        source: str,
+        *,
+        repaired: str | None,
+        attempts: Sequence[RepairAttemptResult],
+        repair_kwargs: Mapping[str, object],
+    ) -> _AcceptedCandidate | None:
+        """Fall back on a rejected repair candidate (#1626).
+
+        The candidate must still pass today's unflagged preservation against
+        the source, so the fallback can only drop the non-array field that
+        the pre-#1626 degrade parse would also have dropped.
+        """
+        if test_observations_fallback_validate is None:
+            return None
+        candidates = [
+            attempt.output for attempt in reversed(attempts)
+            if attempt.outcome == "invalid_output" and attempt.output
+        ]
+        if repaired and repaired not in candidates:
+            candidates.insert(0, repaired)
+        forbid = False
+        if degrade_architecture_impact:
+            forbid = normalize_architecture_impact_near_miss(
+                source,
+                required_contract=require_architecture_impact_contract,
+                expected_kind=repair_expected_kind,
+            ).forbid_architecture_impact
+        for candidate in dict.fromkeys(candidates):
+            try:
+                validate_repair_preservation(
+                    source,
+                    candidate,
+                    unresolved_item_ids=repair_kwargs.get("unresolved_item_ids"),
+                    optional_item_ids=repair_kwargs.get("optional_item_ids") or (),
+                    surfaced_requirement_ids=repair_kwargs.get("surfaced_requirement_ids"),
+                    reviewer_requirement_ids=repair_kwargs.get("reviewer_requirement_ids"),
+                    allowed_prior_item_ids=repair_kwargs.get("allowed_prior_item_ids"),
+                    evidence_row_id_universe=repair_kwargs.get("evidence_row_id_universe"),
+                    forbid_architecture_impact=forbid,
+                )
+            except AgentLoopError:
+                continue
+            accepted = accept_test_observations_fallback(candidate)
+            if accepted is not None:
+                return accepted
+        return None
 
     agent_name = agent_display_name(agent)
     operation_description = operation_description or _operation_description_from_context(
@@ -2856,9 +2905,17 @@ def _run_validated_agent_in_scope(
                             repair_kwargs["allowed_prior_item_ids"] = tuple(repair_allowed_prior_item_ids)
                         if repair_expected_kind == "pr_review" and repair_evidence_row_ids is not None:
                             repair_kwargs["evidence_row_id_universe"] = tuple(repair_evidence_row_ids)
+                        # Classified from the source, not from the first error:
+                        # an earlier-checked defect in the same response must
+                        # not hide the test_observations shape defect (#1626).
                         test_observations_shape_defect = (
-                            isinstance(exc, TestObservationsShapeError)
-                            and repair_expected_kind in {"coder_followup", "issue_implementation"}
+                            repair_expected_kind in {"coder_followup", "issue_implementation"}
+                            and (
+                                isinstance(exc, TestObservationsShapeError)
+                                or source_has_test_observations_shape_defect(
+                                    normalized if normalized is not None else text
+                                )
+                            )
                         )
                         if test_observations_shape_defect:
                             repair_kwargs["test_observations_shape_defect"] = True
@@ -3123,15 +3180,30 @@ def _run_validated_agent_in_scope(
                             last_error = f"{original_validation_error}; repair invocation failure: {details}"
                         if (
                             test_observations_shape_defect
-                            and exc.fallback_degradable
                             and terminal_evidence_rejection is None
                         ):
                             # Repair produced no accepted candidate: fall back
                             # to today's drop, recorded as after a repair
                             # attempt.  Never spends an agent retry (#1626).
-                            fallback = accept_test_observations_fallback(
-                                normalized if normalized is not None else text
+                            # The original is tried first; then a repair
+                            # candidate that fixed every other defect but
+                            # kept the non-array field, held to today's
+                            # unflagged preservation rules.
+                            fallback = (
+                                accept_test_observations_fallback(
+                                    normalized if normalized is not None else text
+                                )
+                                if isinstance(exc, TestObservationsShapeError)
+                                and exc.fallback_degradable
+                                else None
                             )
+                            if fallback is None:
+                                fallback = accept_repaired_test_observations_fallback(
+                                    normalized if normalized is not None else text,
+                                    repaired=repaired,
+                                    attempts=repair_attempts,
+                                    repair_kwargs=repair_kwargs,
+                                )
                             if fallback is not None:
                                 log(
                                     config,

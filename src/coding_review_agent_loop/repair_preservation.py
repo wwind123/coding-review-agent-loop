@@ -9,6 +9,7 @@ import re
 from .errors import AgentLoopError
 from .protocol import (
     _normalized_review_item_text,
+    CITATION_DEGRADATION_MAX_DROPS,
     _decode_test_observations_string,
     _test_observation_item_defect,
     ParseDegradation,
@@ -1001,6 +1002,30 @@ def _validate_evidence_row_tag_preservation(
                 "Repair content preservation failed for blocking_items.evidence_row_ids: "
                 "repair must not add or change an evidence_row_ids tag."
             )
+
+
+def source_has_test_observations_shape_defect(raw: str) -> bool:
+    """Whether a coder source carries the repair-first test_observations defect (#1626).
+
+    Classified from the source payload itself, as the repair-first parser
+    would: a present value that is neither a list nor a string decoding to
+    one, or more than ``CITATION_DEGRADATION_MAX_DROPS`` malformed items.  The
+    validated turn uses it so the targeted repair runs even when another
+    defect in the same response is reported first.
+    """
+    payload = _payload(raw)
+    if not isinstance(payload, dict) or "test_observations" not in payload:
+        return False
+    value = payload["test_observations"]
+    if not isinstance(value, list):
+        try:
+            value = _decode_test_observations_string(value, context="test_observations")
+        except AgentLoopError:
+            return True
+        if value is None:
+            return True
+    malformed = sum(1 for item in value if _test_observation_item_defect(item)[1] is not None)
+    return malformed > CITATION_DEGRADATION_MAX_DROPS
 
 
 def _validate_test_observations_shape_repair(
