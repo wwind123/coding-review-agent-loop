@@ -2949,3 +2949,21 @@ def test_source_without_test_observations_or_payload_has_no_shape_defect_1626():
     payload.pop("test_observations")
     assert source_has_test_observations_shape_defect(json.dumps(payload)) is False
     assert source_has_test_observations_shape_defect("not json") is False
+
+
+@pytest.mark.parametrize(
+    ("observations", "expected"),
+    [
+        (_PROSE_1626, True),
+        ({"command": "x"}, True),
+        (None, True),
+        ([], False),
+        ([_VALID_1626], False),
+        (json.dumps([_VALID_1626]), False),
+        (_NATIVE_1626, False),
+    ],
+)
+def test_candidate_fallback_shape_is_only_the_non_array_field_1626(observations, expected):
+    from coding_review_agent_loop.repair_preservation import candidate_keeps_degradable_test_observations
+
+    assert candidate_keeps_degradable_test_observations(_followup_1626(observations)) is expected

@@ -44,7 +44,12 @@ from . import tool_provenance
 from .logging import log, new_run_id, run_usage_summary_path
 from .managed_ci import waivable_protection_states, waiver_flags_for_protection
 from .prompts import build_completion_recovery_prompt
-from .protocol import AgentUnavailable, parse_agent_unavailable, ParseDegradation
+from .protocol import (
+    TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
+    AgentUnavailable,
+    ParseDegradation,
+    parse_agent_unavailable,
+)
 from .repair import (
     CandidateDecision,
     RepairAttemptResult,
@@ -61,6 +66,7 @@ from .repair import (
 )
 from .repair_preservation import (
     normalize_architecture_impact_near_miss,
+    candidate_keeps_degradable_test_observations,
     recover_payload,
     require_recoverable_semantic_patch,
     source_has_test_observations_shape_defect,
@@ -1274,7 +1280,9 @@ def _run_validated_agent_in_scope(
             acquisition=acquisition if acquisition is not None else validation_acquisition,
         )
 
-    def accept_test_observations_fallback(text: str) -> _AcceptedCandidate | None:
+    def accept_test_observations_fallback(
+        text: str, *, source_records: tuple[ParseDegradation, ...] = ()
+    ) -> _AcceptedCandidate | None:
         """Accept the original response with today's #927 drop (#1626).
 
         Only after a repair of a non-array test_observations produced no
@@ -1291,7 +1299,21 @@ def _run_validated_agent_in_scope(
                 runner=runner,
                 acquisition=validation_acquisition,
             )(text)
+            # A repaired candidate carries the source's near-miss record,
+            # as the successful repair path does (merge, never replace).
+            fallback_result = _attach_architecture_degradations(fallback_result, source_records)
             if contract_refusal(fallback_result, text) is not None:
+                return None
+            if not any(
+                record.rule == TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE
+                for record in getattr(
+                    _unwrap_architecture_result(fallback_result),
+                    "test_observation_degradations",
+                    (),
+                )
+            ):
+                # The fallback exists only to drop a non-array field; any
+                # other acceptance belongs to the repair-first path.
                 return None
             return _accept_candidate(
                 text,
@@ -1317,9 +1339,12 @@ def _run_validated_agent_in_scope(
     ) -> _AcceptedCandidate | None:
         """Fall back on a rejected repair candidate (#1626).
 
-        The candidate must still pass today's unflagged preservation against
-        the source, so the fallback can only drop the non-array field that
-        the pre-#1626 degrade parse would also have dropped.
+        Only a candidate whose own test_observations is still the
+        fallback-degradable non-array shape qualifies; one that turned the
+        field into an array was judged by the scoped preservation rule and is
+        never rescued.  The candidate must also pass today's unflagged
+        preservation against the source, and it inherits the source's
+        architecture near-miss record.
         """
         if test_observations_fallback_validate is None:
             return None
@@ -1330,13 +1355,18 @@ def _run_validated_agent_in_scope(
         if repaired and repaired not in candidates:
             candidates.insert(0, repaired)
         forbid = False
+        source_records: tuple[ParseDegradation, ...] = ()
         if degrade_architecture_impact:
-            forbid = normalize_architecture_impact_near_miss(
+            near_miss = normalize_architecture_impact_near_miss(
                 source,
                 required_contract=require_architecture_impact_contract,
                 expected_kind=repair_expected_kind,
-            ).forbid_architecture_impact
+            )
+            forbid = near_miss.forbid_architecture_impact
+            source_records = (near_miss.record,) if near_miss.record is not None else ()
         for candidate in dict.fromkeys(candidates):
+            if not candidate_keeps_degradable_test_observations(candidate):
+                continue
             try:
                 validate_repair_preservation(
                     source,
@@ -1351,7 +1381,9 @@ def _run_validated_agent_in_scope(
                 )
             except AgentLoopError:
                 continue
-            accepted = accept_test_observations_fallback(candidate)
+            accepted = accept_test_observations_fallback(
+                candidate, source_records=source_records
+            )
             if accepted is not None:
                 return accepted
         return None

@@ -1601,3 +1601,76 @@ def test_repaired_candidate_fallback_keeps_unflagged_preservation_1626(tmp_path)
     outcome, calls, _coder_turns = _followup_turn_1626(tmp_path, [source], repair=lossy)
     assert len(calls) == 1
     assert isinstance(outcome, AgentLoopError)
+
+
+_NEAR_MISS_1626 = {
+    "status": "modified", "rationale": "The loader changed shape.",
+    "affected_components": ["loader"], "dependencies": ["json"],
+    "execution_data_flows": ["parse"], "persistence": ["none"],
+    "public_contracts": ["loader api"], "security_boundaries": ["none"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "docs/architecture/components.md",
+    "canonical_document_rationale": "The loader section changed.",
+}
+_CITATION_1626 = {
+    "command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass",
+    "claim": "current-result",
+}
+
+
+@pytest.mark.parametrize(
+    "repaired_observations",
+    [[], [_CITATION_1626]],
+    ids=["empty-array", "cited-array"],
+)
+def test_candidate_fallback_never_rescues_an_array_that_deleted_the_prose_1626(
+    tmp_path, repaired_observations
+):
+    """Review items 3 and 6: a candidate rejected by scoped preservation stays rejected.
+
+    The earlier tests_run defect is fixed and test_observations became an
+    array, but the prose was deleted from summary and notes.  The scoped rule
+    refuses it, and the candidate fallback must not accept it either.
+    """
+    source = _with_earlier_defect_1626(_followup_text_1626(_PROSE_1626), "tests-run-string")
+    deleted = _followup_text_1626(repaired_observations)
+    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=deleted)
+    assert len(calls) == 1 and len(coder_turns) == 1
+    assert isinstance(outcome, AgentLoopError), outcome
+
+
+def test_candidate_fallback_never_rescues_an_emptied_decoded_array_1626(tmp_path):
+    """Review item 3: a JSON-array string with nine malformed items and one valid citation.
+
+    Repair to [] removes the valid decoded citation.  Scoped preservation
+    refuses it; the over-bound source is not fallback-degradable, and the
+    candidate is an array, so nothing is accepted.
+    """
+    malformed = [
+        {"command": "node --test scripts/locales.test.mjs", "receipt_id": f"r-{index}", "claim": "reran"}
+        for index in range(9)
+    ]
+    source = _followup_text_1626(json.dumps([*malformed, _CITATION_1626]))
+    outcome, calls, _coder_turns = _followup_turn_1626(tmp_path, [source], repair=_followup_text_1626([]))
+    assert calls and calls[0]["test_observations_shape_defect"] is True
+    assert isinstance(outcome, AgentLoopError), outcome
+
+
+def test_candidate_fallback_keeps_the_source_architecture_record_1626(tmp_path):
+    """Review item 4: both the normalized-to-changed and after-repair records survive."""
+    source = _with_earlier_defect_1626(
+        _followup_text_1626(_PROSE_1626, architecture_impact=_NEAR_MISS_1626), "tests-run-string"
+    )
+    candidate = _followup_text_1626(
+        _PROSE_1626, architecture_impact={**_NEAR_MISS_1626, "status": "changed"}
+    )
+    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=candidate)
+    assert isinstance(outcome, ValidatedAgentResponse), outcome
+    assert len(calls) == 1 and len(coder_turns) == 1
+    parsed = outcome.marker_value
+    assert parsed.architecture_impact.status == "changed"
+    assert [record.outcome for record in parsed.architecture_impact_degradations] == [
+        "normalized-to-changed"
+    ]
+    [record] = parsed.test_observation_degradations
+    assert record.rule == _AFTER_REPAIR_RULE_1626

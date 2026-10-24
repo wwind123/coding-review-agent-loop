@@ -157,9 +157,13 @@ The validated turn classifies the shape defect from the source payload
 (`source_has_test_observations_shape_defect`), not from the first validation
 error, so a response whose other repairable defect is reported first still
 gets the targeted repair. When the original still carries that other defect,
-the fallback also tries a rejected repair candidate. The candidate must have
-fixed everything except the non-array field and must pass the unflagged
-preservation rules against the source.
+the fallback also tries a rejected repair candidate. The candidate's own
+`test_observations` must still be the non-array field
+(`candidate_keeps_degradable_test_observations`); a candidate that made it an
+array was judged by the scoped preservation rule and is never rescued. The
+candidate must also pass the unflagged preservation rules against the source,
+it inherits the source's architecture near-miss record, and it is accepted
+only with the after-repair drop record.
 
 Every function, method and nested def in `protocol.py` that can still reach
 an `AgentLoopError`-family raise is classified in `shape_check_audit.py` as

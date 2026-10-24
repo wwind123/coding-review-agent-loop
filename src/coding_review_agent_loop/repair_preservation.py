@@ -1028,6 +1028,26 @@ def source_has_test_observations_shape_defect(raw: str) -> bool:
     return malformed > CITATION_DEGRADATION_MAX_DROPS
 
 
+def candidate_keeps_degradable_test_observations(text: str) -> bool:
+    """Whether a repair candidate still has the fallback-degradable shape (#1626).
+
+    True only for a present value that is neither a list nor a string that
+    decodes to one: the non-array field the after-repair fallback drops.  A
+    candidate that turned the field into an array (native or encoded) must
+    instead pass the scoped preservation rule, so it is never rescued here.
+    """
+    payload = _payload(text)
+    if not isinstance(payload, dict) or "test_observations" not in payload:
+        return False
+    value = payload["test_observations"]
+    if isinstance(value, list):
+        return False
+    try:
+        return _decode_test_observations_string(value, context="test_observations") is None
+    except AgentLoopError:
+        return False
+
+
 def _validate_test_observations_shape_repair(
     source: dict, target: dict, require: Callable[[bool, str], None]
 ) -> None:
