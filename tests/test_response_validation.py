@@ -1694,3 +1694,21 @@ def test_identifier_containing_a_command_word_requests_binding_repair(token):
     )
     with _pytest.raises(_AgentLoopError, match="unknown-row-reference"):
         _validate_binding(_binding_review([text]))
+
+
+@_pytest.mark.parametrize(
+    "text",
+    [
+        "Add a null guard in loader.py and provide passing test observations for share-page-locale.",
+        "Remove the null guard in loader.py and provide passing test observations for share-page-locale.",
+    ],
+)
+def test_code_addition_or_removal_raises_no_binding_repair(text):
+    """Review item-6: a mixed finding is validated untouched and never offered a tag."""
+    parsed = _validate_binding(_binding_review([text]))
+    assert parsed.blocking_items[0].evidence_row_ids == ()
+    with _pytest.raises(_AgentLoopError, match="evidence_row_ids"):
+        _validate_repair_preservation(
+            _binding_review([text]), _binding_review([_tag(text)]),
+            evidence_row_id_universe=_BIND_ROWS, evidence_binding_context=_BIND_CONTEXT,
+        )

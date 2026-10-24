@@ -236,9 +236,14 @@ observations were rejected as `checkout-head-mismatch`. `evidence_binding.py` is
 pure: `derive_evidence_row_binding(text, EvidenceBindingContext)` returns `bound`,
 `needs-repair` (closed reasons `unknown-row-reference`, `ambiguous-collective`,
 `missing-row-reference`), `code-demand` or `not-evidence`. It requires evidence
-vocabulary and a matrix reference, treats any code-demand wording outside a closed
-negated-phrase list as `code-demand` (never bound or repaired, still head-changing),
-binds cited enforceable row IDs, and binds a collective "risk-matrix rows" reference
+vocabulary and a matrix reference, and binding is never the default: the text must be
+fully accounted for by a closed evidence-request vocabulary once row references,
+backticked spans, command spans and a closed list of negated phrases are removed, and
+must hold no code-demand wording. Any unaccounted word gives `code-demand` (not
+provably evidence-only; never bound or repaired, still head-changing). Patterns that
+excuse a token match whole tokens only, while keyword matching is case-insensitive and
+row IDs compare exactly. A row list binds only when fully interpreted. It then binds
+cited enforceable row IDs, and binds a collective "risk-matrix rows" reference
 to every enforceable row only when the known unsatisfied set equals the whole
 enforceable set. `pr_loop_support.evidence_binding_context_for_head` builds one
 immutable context per reviewed head (enforceable rows, plus the head-bound

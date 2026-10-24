@@ -16,8 +16,11 @@ The rules run in a fixed order:
 2. Matrix reference: evidence vocabulary with no reference to the matrix (an
    approved row ID, a row-ID-shaped token after "row"/"rows", a collective
    phrase, or any matrix phrase) is ``not-evidence``.
-3. Sole demand: any code-demand wording outside a closed list of negated
-   phrases gives ``code-demand``; such a finding is never bound or repaired.
+3. Sole demand: the text must be fully accounted for by a closed
+   evidence-request vocabulary (plus row references, backticked spans,
+   command spans and the closed negated phrases), and contain no code-demand
+   wording.  Otherwise it is ``code-demand`` (not provably evidence-only):
+   never bound or repaired.
 4. Cited rows: every row-ID-shaped reference must be enforceable, and a row
    list is used only when fully interpreted; then the
    finding binds to exactly the cited enforceable rows.  An unknown reference
@@ -106,6 +109,7 @@ _TAIL_TOKEN_RE = re.compile(r"`[^`\n]+`|(?<![\w-])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]
 # identifier, so `node-startup` or `run-smoke` is never read as the command
 # word `node` or `run`.  Patterns that make the result more conservative (the
 # code-demand scan) keep ordinary word boundaries.
+_BACKTICKED_SPAN_RE = re.compile(r"`[^`\n]+`")
 _TOKEN_START = r"(?<![\w-])"
 _TOKEN_END = r"(?![\w-])"
 # Words that introduce a command; the command span runs to the next list
@@ -136,6 +140,9 @@ _NEGATED_CODE_CHANGE_RE = re.compile(
     r"|no\s+code\s+changes?"
     r"|without\s+(?:changing|modifying)\s+(?:the\s+)?code"
     r"|not\s+to\s+change\s+(?:the\s+)?code)"
+    # An optional closed purpose clause, e.g. "just to move the SHA".
+    r"(?:\s+(?:just|only|merely|simply)\s+(?:to|for)\s+(?:move|bump|advance|change|update)"
+    r"\s+the\s+(?:sha|head|commit|pr\s+head))?"
     + _TOKEN_END,
     _I,
 )
@@ -147,6 +154,51 @@ _CODE_DEMAND_RE = re.compile(
     r"|\b(?:add|remove)\s+(?:a\s+|the\s+)?code\s+paths?\b",
     _I,
 )
+
+
+# The sole-demand proof (#1622 review step-back): a finding is evidence-only
+# only when EVERY word of its text is accounted for.  Row references (bare
+# kebab/snake or backticked tokens), backticked spans, command spans and the
+# closed negated phrases are removed first; each remaining word must belong to
+# this closed evidence-request vocabulary.  Any other word means the finding
+# is not provably evidence-only, so it is never bound or repaired and stays an
+# ordinary head-changing finding.  This inverts the default: binding is never
+# reached by failing to find a reason not to bind.
+_SOLE_DEMAND_VOCABULARY = frozenset(
+    """
+    provide provides providing supply capture captured cite citing attach include
+    show record post report submit share produce collect give rerun rerunning
+    re-run re-running run running runs
+    admissible passing passed captured tool-captured fresh current new same
+    unchanged existing test tests observation observations evidence citation
+    citations receipt receipts result results run-tests agent-loop
+    risk risk-matrix matrix row rows each every all both any
+    the a an for of at on to in from with via using through by within under
+    and or also too plus as well then again please
+    it them these those this that its their they you we are is still remain
+    remains not yet unsatisfied unverified stale verified head pr
+    one two three four five six seven eight nine ten eleven twelve thirteen
+    """.split()
+)
+_WORD_RE = re.compile(r"[A-Za-z0-9]+(?:['’\-][A-Za-z0-9]+)*")
+_BARE_ROW_SHAPED_RE = re.compile(r"(?<![\w-])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+(?![\w-])")
+
+
+def _unaccounted_words(text: str) -> list[str]:
+    """Words of ``text`` outside the closed evidence-request vocabulary."""
+    remaining = _NEGATED_CODE_CHANGE_RE.sub(" ", text)
+    remaining = _BACKTICKED_SPAN_RE.sub(" ", remaining)
+    for start, end in reversed(_command_spans(remaining)):
+        remaining = remaining[:start] + " " + remaining[end:]
+    remaining = _BARE_ROW_SHAPED_RE.sub(
+        lambda match: match.group(0) if match.group(0).lower() in _SOLE_DEMAND_VOCABULARY else " ",
+        remaining,
+    )
+    return [
+        word
+        for word in _WORD_RE.findall(remaining)
+        if not word.isdigit() and word.lower() not in _SOLE_DEMAND_VOCABULARY
+    ]
 
 
 def _whole_token_re(row_id: str) -> re.Pattern[str]:
@@ -224,7 +276,7 @@ def derive_evidence_row_binding(
     collective = bool(_COLLECTIVE_RE.search(text))
     if not (cited or unknown or collective or _MATRIX_PHRASE_RE.search(text)):
         return EvidenceRowBinding(BINDING_NOT_EVIDENCE)
-    if _CODE_DEMAND_RE.search(_NEGATED_CODE_CHANGE_RE.sub(" ", text)):
+    if _CODE_DEMAND_RE.search(_NEGATED_CODE_CHANGE_RE.sub(" ", text)) or _unaccounted_words(text):
         return EvidenceRowBinding(BINDING_CODE_DEMAND)
     if unknown:
         return EvidenceRowBinding(BINDING_NEEDS_REPAIR, reason=REASON_UNKNOWN_ROW_REFERENCE)

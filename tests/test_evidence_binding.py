@@ -545,3 +545,63 @@ def test_negation_inside_an_identifier_does_not_excuse_a_code_demand():
     assert _derive("Provide passing test observations for row-a after the bug-fix.").kind == (
         BINDING_CODE_DEMAND
     )
+
+
+# --- sole-demand proof: every word accounted for (#1622 review step-back) ------
+
+_ADD_GUARD = "Add a null guard in loader.py and provide passing test observations for row-a."
+_REMOVE_GUARD = "Remove the null guard in loader.py and provide passing test observations for row-a."
+
+
+@pytest.mark.parametrize(
+    ("text", "kind", "rows"),
+    [
+        # Accounted for: evidence vocabulary, row references, matrix phrases.
+        pytest.param(ITEM_9_TEXT, BINDING_BOUND, ROWS, id="item-9-collective-with-purpose-negation"),
+        pytest.param("Capture admissible passing test observations for rows row-a and row-b.",
+                     BINDING_BOUND, ("row-a", "row-b"), id="vocabulary-and-rows"),
+        # Accounted for: command spans and backticked spans.
+        pytest.param("Provide passing test observations for row-a using `agent-loop run-tests -- python -m pytest`.",
+                     BINDING_BOUND, ("row-a",), id="backticked-command"),
+        pytest.param("Provide passing test observations for row-a through agent-loop run-tests -- python -m pytest.",
+                     BINDING_BOUND, ("row-a",), id="bare-command-span"),
+        # Accounted for: the closed negations, with or without the closed purpose clause.
+        pytest.param("Provide passing test observations for row-a; do not change code.",
+                     BINDING_BOUND, ("row-a",), id="negation"),
+        pytest.param("Provide passing test observations for row-a; never change the code just to bump the head.",
+                     BINDING_BOUND, ("row-a",), id="negation-with-purpose"),
+        # Unaccounted words: explicit code additions and removals (item-6).
+        pytest.param(_ADD_GUARD, BINDING_CODE_DEMAND, (), id="add-guard"),
+        pytest.param(_REMOVE_GUARD, BINDING_CODE_DEMAND, (), id="remove-guard"),
+        pytest.param("Provide passing test observations for row-a after adding a null guard.",
+                     BINDING_CODE_DEMAND, (), id="trailing-code-work"),
+        pytest.param("Provide passing test observations for row-a; also handle the empty list.",
+                     BINDING_CODE_DEMAND, (), id="second-clause-code-work"),
+        pytest.param("Provide passing test observations for row-a; do not change code other than the parser.",
+                     BINDING_CODE_DEMAND, (), id="negation-with-unclosed-remainder"),
+        pytest.param("Cover the empty-input path and provide passing test observations for row-a.",
+                     BINDING_CODE_DEMAND, (), id="unlisted-verb"),
+        # Unaccounted words also stop an otherwise needs-repair finding: never repaired into a tag.
+        pytest.param("Add a guard and provide passing test observations for risk-matrix row `ghost-row`.",
+                     BINDING_CODE_DEMAND, (), id="no-repair-for-mixed-unknown"),
+    ],
+)
+def test_binding_requires_every_word_to_be_accounted_for(text, kind, rows):
+    binding = derive_evidence_row_binding(text, ALL_UNSATISFIED)
+    assert (binding.kind, binding.rows) == (kind, rows)
+
+
+@pytest.mark.parametrize("text", [_ADD_GUARD, _REMOVE_GUARD])
+def test_code_addition_or_removal_is_never_bound_when_minted_or_carried(text):
+    assert derived_evidence_row_ids(
+        text, reviewer_tag=(), has_sub_items=False, context=ALL_UNSATISFIED
+    ) == ()
+    item = _finding("item-1", text)
+    result, bound = bind_carried_evidence_findings(
+        [item], ALL_UNSATISFIED, carried_item_ids=("item-1",)
+    )
+    assert bound == () and result == [item]
+    # The classifier keeps it head-changing as a code finding.
+    assert _classify_followup_head_change(
+        _followup(["item-1"]), [item], {"row-a"}, ROWS
+    ) == FollowupHeadChange(True, HEAD_CHANGE_CODE_FINDING)

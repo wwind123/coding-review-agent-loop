@@ -1369,6 +1369,14 @@ def _three_turn_unchanged_head(tmp_path, monkeypatch, text):
     [
         pytest.param(_MIXED_ROW_A, id="mixed-evidence-and-code"),
         pytest.param(_PLAIN_CODE, id="plain-code-finding"),
+        pytest.param(
+            "Add a null guard in loader.py and provide passing test observations for row-a.",
+            id="add-guard-and-evidence",
+        ),
+        pytest.param(
+            "Remove the null guard in loader.py and provide passing test observations for row-a.",
+            id="remove-guard-and-evidence",
+        ),
     ],
 )
 def test_code_demand_finding_at_unchanged_head_stays_head_changing_with_generic_stop(

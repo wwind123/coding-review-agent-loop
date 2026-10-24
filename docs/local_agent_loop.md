@@ -4395,9 +4395,11 @@ item in round metadata, and a malformed stored tag degrades to an ordinary findi
 **Deterministic binding.** When a reviewer omits the tag on a blocking finding that
 asks only for evidence, the orchestrator binds it in code: to the approved row IDs
 the finding cites, or to every enforceable row when it names the risk-matrix rows as
-a whole and every row is unsatisfied at the reviewed head. A finding that also
-demands a code change (any code-change wording other than a closed list of negations
-such as "do not change code") is never bound and stays an ordinary finding. An
+a whole and every row is unsatisfied at the reviewed head. Binding needs the whole
+finding to read as an evidence request: every word must come from a closed
+evidence-request vocabulary, row IDs, backticked spans, commands, or a closed list of
+negations such as "do not change code". A finding with any other wording, such as
+"add a null guard", is never bound and stays an ordinary finding. An
 evidence-only finding that names unknown rows, no row ID, or the rows collectively
 while some are satisfied is returned to the reviewer as a bounded binding repair; that
 repair may add a tag only to the flagged finding. Carried untagged findings are bound
