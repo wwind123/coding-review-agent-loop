@@ -1653,6 +1653,11 @@ satisfied row makes the item an ordinary finding. A tagged prior item keeps its
 tag while it stays unresolved; if the concern becomes a code defect, resolve or
 replace the item and raise a new untagged blocking item. Never put the tag on
 `same_pr_followups` or `future_followups`.
+An untagged finding that cites approved matrix rows and asks only for evidence
+is bound to those rows by the orchestrator. An evidence-only finding that names
+unknown rows or no row ID is returned for a binding repair, while a finding that
+also demands a code change is treated as an ordinary code finding, so raise each
+evidence request as its own item.
 A row whose evidence the coder repeatedly could not capture may be converted by
 the orchestrator (or by the operator) to a human-only exact-head evidence
 obligation; it then appears among the human-only evidence obligations, owned by

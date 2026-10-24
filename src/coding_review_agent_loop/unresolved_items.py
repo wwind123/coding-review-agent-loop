@@ -15,6 +15,11 @@ from .errors import (
     MissingPriorItemDispositionError,
     UnknownPriorItemDispositionError,
 )
+from .evidence_binding import (
+    BINDING_NEEDS_REPAIR,
+    EvidenceBindingContext,
+    derive_evidence_row_binding,
+)
 from .github import PullRequestMergeability
 from .prompts import render_coder_human_requirements_prompt_context
 from .protocol import (
@@ -790,7 +795,9 @@ def _raise_unknown_prior_item_disposition(
 
 
 def _validate_evidence_row_tags(
-    parsed: ParsedReview, approved_matrix_row_ids: Sequence[str] | None
+    parsed: ParsedReview,
+    approved_matrix_row_ids: Sequence[str] | None,
+    evidence_binding_context: EvidenceBindingContext | None = None,
 ) -> None:
     """Reject an ``evidence_row_ids`` tag the approved matrix cannot back (#1324).
 
@@ -798,10 +805,27 @@ def _validate_evidence_row_tags(
     approved matrix, or ``None`` when there is no applicable matrix.  Shape
     errors come from the parser; this check supplies the matrix context and
     runs inside the same bounded repair loop.
+
+    With the per-head ``evidence_binding_context`` (#1622), an untagged,
+    sub-item-free blocking finding that asks only for risk-matrix evidence
+    but cannot be bound deterministically is returned for a binding repair
+    instead of being guessed.
     """
     allowed = set(approved_matrix_row_ids or ())
     for index, item in enumerate(parsed.blocking_items):
         if not item.evidence_row_ids:
+            if evidence_binding_context is None or item.sub_items:
+                continue
+            binding = derive_evidence_row_binding(item.text, evidence_binding_context)
+            if binding.kind == BINDING_NEEDS_REPAIR:
+                raise AgentLoopError(
+                    f"pr_review.blocking_items at index {index} asks only for risk-matrix "
+                    f"evidence but has no derivable row binding ({binding.reason}): bind this "
+                    "evidence-only finding to approved risk-matrix row IDs with "
+                    "evidence_row_ids. Allowed rows: "
+                    + ", ".join(sorted(evidence_binding_context.enforceable_row_ids))
+                    + "."
+                )
             continue
         if not approved_matrix_row_ids:
             raise AgentLoopError(
@@ -828,6 +852,7 @@ def _validate_review_response(
     architecture_status_mode: str,
     approved_matrix_row_ids: Sequence[str] | None = None,
     optional_item_ids: Sequence[str] = (),
+    evidence_binding_context: EvidenceBindingContext | None = None,
 ) -> ParsedReview:
     """Validate a PR review against the carried ledger.
 
@@ -838,7 +863,7 @@ def _validate_review_response(
     parsed = parse_pr_review(
         text, reviewer=reviewer, architecture_status_mode=architecture_status_mode
     )
-    _validate_evidence_row_tags(parsed, approved_matrix_row_ids)
+    _validate_evidence_row_tags(parsed, approved_matrix_row_ids, evidence_binding_context)
 
     unresolved_by_id = {item.item_id: item for item in unresolved_items}
     dispositions = _maybe_fill_resolved_dispositions_from_prose(

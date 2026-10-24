@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Callable, Literal
 from .agents.antigravity import AntigravityBackend
 from .agents.format_repair import run_cli_repair
 from .coder_ci_guard import coder_ci_guard_environment
+from .evidence_binding import EvidenceBindingContext, flagged_finding_texts
 from .agents.base import STDIN_PROMPT_THRESHOLD_BYTES
 from .agents.gemini import _parse_gemini_payload
 from .config import (
@@ -1467,6 +1468,7 @@ def _build_repair_prompt(
     require_risk_test_matrix_contract: bool = False,
     reject_unsolicited_risk_test_matrix_contract: bool = False,
     evidence_row_id_universe: Sequence[str] | None = None,
+    evidence_binding_context: EvidenceBindingContext | None = None,
 ) -> str:
     if expected_kind is not None and expected_kind not in _SUPPORTED_EXPECTED_KINDS:
         raise ValueError(f"Unsupported expected repair kind: {expected_kind}")
@@ -1506,7 +1508,9 @@ def _build_repair_prompt(
     )
     prior_item_dispositions_instruction = _repair_prior_item_ids_instruction(
         allowed_prior_item_ids, unknown_prior_item_ids, same_round_context
-    ) + _repair_evidence_row_ids_instruction(expected_kind, evidence_row_id_universe)
+    ) + _repair_evidence_row_ids_instruction(
+        expected_kind, evidence_row_id_universe, evidence_binding_context, raw
+    )
     expected_kind_instruction = (
         "## Expected response kind:\n"
         f"You MUST repair this response as `{expected_kind}`. Output no other `kind` value.\n"
@@ -1990,6 +1994,7 @@ def execute_repair(
                             prompt_kwargs.get("reject_unsolicited_risk_test_matrix_contract")
                         ),
                         evidence_row_id_universe=prompt_kwargs.get("evidence_row_id_universe"),
+                        evidence_binding_context=prompt_kwargs.get("evidence_binding_context"),
                         forbid_architecture_impact=forbid_architecture_impact,
                     )
                 except NonRepairableEvidenceRejection as exc:
@@ -2272,18 +2277,46 @@ def _reviewer_human_requirements_instruction(
 
 
 def _repair_evidence_row_ids_instruction(
-    expected_kind: str | None, universe: Sequence[str] | None
+    expected_kind: str | None,
+    universe: Sequence[str] | None,
+    binding_context: EvidenceBindingContext | None = None,
+    raw: str | None = None,
 ) -> str:
     if expected_kind != "pr_review" or universe is None:
         return ""
     allowed = ", ".join(sorted(universe)) or "(none: the approved plan has no applicable matrix)"
-    return (
+    instruction = (
         "## Evidence row tags:\n"
         "A blocking item may carry `evidence_row_ids` (approved risk-matrix row IDs for a finding "
         "whose sole demand is admissible citation evidence). Keep every valid tag verbatim on "
         "the same item and never add or change one. Remove a tag only when it names a row "
         f"outside the allowed rows or when no matrix applies; allowed rows: {allowed}\n"
     )
+    flagged = _flagged_repair_findings(raw, binding_context)
+    if not flagged:
+        return instruction
+    return instruction + (
+        "Exception (binding repair): each evidence-only finding below asks only for "
+        "risk-matrix evidence but names no derivable row. Add `evidence_row_ids` naming the "
+        "allowed rows it asks about to that finding only, keep its text unchanged, and add no "
+        "tag to any other finding:\n"
+        + "".join(f"- {text}\n" for text in flagged)
+    )
+
+
+def _flagged_repair_findings(
+    raw: str | None, binding_context: EvidenceBindingContext | None
+) -> tuple[str, ...]:
+    """Flagged findings of the original response, for the binding-repair instruction."""
+    if raw is None or binding_context is None:
+        return ()
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(raw.lstrip())
+    except ValueError:
+        return ()
+    if not isinstance(payload, dict) or payload.get("kind") != "pr_review":
+        return ()
+    return flagged_finding_texts(payload.get("blocking_items"), binding_context)
 
 
 def _repair_prior_item_ids_instruction(
@@ -2329,6 +2362,7 @@ def attempt_repair(
     require_risk_test_matrix_contract: bool = False,
     reject_unsolicited_risk_test_matrix_contract: bool = False,
     evidence_row_id_universe: Sequence[str] | None = None,
+    evidence_binding_context: EvidenceBindingContext | None = None,
 ) -> str | None:
     """Call gemini-3.1-flash-lite via the Gemini CLI to reformat a malformed review response.
 
@@ -2351,6 +2385,7 @@ def attempt_repair(
         require_risk_test_matrix_contract=require_risk_test_matrix_contract,
         reject_unsolicited_risk_test_matrix_contract=reject_unsolicited_risk_test_matrix_contract,
         evidence_row_id_universe=evidence_row_id_universe,
+        evidence_binding_context=evidence_binding_context,
     )
     try:
         oversized_prompt = len(prompt.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES
@@ -2387,6 +2422,7 @@ def attempt_repair(
                 allowed_prior_item_ids=allowed_prior_item_ids,
                 allow_legacy_matrix_removal=reject_unsolicited_risk_test_matrix_contract,
                 evidence_row_id_universe=evidence_row_id_universe,
+                evidence_binding_context=evidence_binding_context,
             )
         except Exception as exc:
             _logger.debug("repair pass content preservation failed: %s", exc)

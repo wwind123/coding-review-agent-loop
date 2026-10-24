@@ -64,6 +64,12 @@ from .github import (
 )
 from .issue_pr_handoff import find_latest_issue_pr_handoff
 from .logging import log
+from .evidence_binding import (
+    BINDING_BOUND,
+    BINDING_NEEDS_REPAIR,
+    EvidenceBindingContext,
+    derive_evidence_row_binding,
+)
 from . import evidence_stall as _evidence_stall
 from . import evidence_conversion as _evidence_conversion
 from .evidence_conversion import (
@@ -91,6 +97,7 @@ from .protocol import (
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
     EVIDENCE_OBLIGATION_KIND,
+    PREDECESSOR_HEAD_UNMOVED_MESSAGE,
     EVIDENCE_SOURCE_OPERATOR_SIGNED,
     SignedEvidenceReference,
     apply_signed_evidence_references,
@@ -4046,6 +4053,107 @@ def render_evidence_stall_decision(
     )
 
 
+HEAD_CHANGE_CITATION_ONLY = "citation-only"
+HEAD_CHANGE_NO_CITATION_ROWS = "no-citation-rows"
+HEAD_CHANGE_EMPTY_ADDRESSED = "empty-addressed"
+HEAD_CHANGE_UNKNOWN_ITEM = "unknown-item"
+HEAD_CHANGE_MACHINE_OBLIGATION = "machine-obligation"
+HEAD_CHANGE_UNTAGGED_EVIDENCE_REQUEST = "untagged-evidence-request"
+HEAD_CHANGE_CODE_FINDING = "code-finding"
+
+
+@dataclass(frozen=True)
+class FollowupHeadChange:
+    """Whether a follow-up was expected to move the head, and why (#1338, #1622).
+
+    ``untagged_evidence_item_ids`` names the head-forcing untagged findings
+    that read as pure evidence requests; it is non-empty only for the
+    ``untagged-evidence-request`` reason.
+    """
+
+    expected: bool
+    reason: str
+    untagged_evidence_item_ids: tuple[str, ...] = ()
+
+
+def _classify_followup_head_change(
+    parsed: StructuredCoderFollowup,
+    prior_items: Sequence[UnresolvedReviewItem],
+    citation_row_ids: Iterable[str],
+    enforceable_row_ids: Sequence[str] = (),
+) -> FollowupHeadChange:
+    """Classify whether a follow-up was expected to move the PR head (#1338).
+
+    Classified only from orchestrator-owned pre-follow-up state: the ledger
+    and the canonical unsatisfied-row set bound to the predecessor head.  An
+    addressed item (or a sub-item's parent) is citation-only when it is a
+    machine evidence obligation or a reviewer finding whose non-empty
+    ``evidence_row_ids`` all name unsatisfied rows, the same subset test
+    ``evidence_stall.classify_round`` applies.  ``expected`` is ``False``
+    only when at least one item is addressed and every addressed item is
+    citation-only; any other item, an unknown id, or an unavailable row set
+    expects a change.
+
+    The reason is diagnostic only (#1622): it never changes ``expected``.
+    ``untagged-evidence-request`` means every head-forcing item is an untagged,
+    sub-item-free reviewer finding whose text derives ``bound`` or
+    ``needs-repair`` under the enforceable rows and these citation rows.
+    """
+    citation_rows = frozenset(citation_row_ids)
+    if not citation_rows:
+        return FollowupHeadChange(True, HEAD_CHANGE_NO_CITATION_ROWS)
+    addressed = {
+        *parsed.addressed_items,
+        *(sub_item_parent_id(sub_item) for sub_item in parsed.addressed_sub_items),
+    }
+    if not addressed:
+        return FollowupHeadChange(True, HEAD_CHANGE_EMPTY_ADDRESSED)
+    by_id = {item.item_id: item for item in prior_items}
+    context = (
+        EvidenceBindingContext(tuple(enforceable_row_ids), citation_rows)
+        if enforceable_row_ids
+        else None
+    )
+    forcing: list[str] = []
+    untagged_evidence: list[str] = []
+    for item_id in sorted(addressed):
+        item = by_id.get(item_id)
+        if item is None:
+            forcing.append(HEAD_CHANGE_UNKNOWN_ITEM)
+            continue
+        if item.is_machine_obligation:
+            if item.obligation_kind != EVIDENCE_OBLIGATION_KIND:
+                forcing.append(HEAD_CHANGE_MACHINE_OBLIGATION)
+            continue
+        # The residual tag (#1325): rows already converted no longer count.
+        residual = item.residual_evidence_row_ids
+        if residual and set(residual) <= citation_rows:
+            continue
+        if (
+            not item.evidence_row_ids
+            and not item.sub_items
+            and context is not None
+            and derive_evidence_row_binding(item.text, context).kind
+            in {BINDING_BOUND, BINDING_NEEDS_REPAIR}
+        ):
+            forcing.append(HEAD_CHANGE_UNTAGGED_EVIDENCE_REQUEST)
+            untagged_evidence.append(item_id)
+            continue
+        forcing.append(HEAD_CHANGE_CODE_FINDING)
+    if not forcing:
+        return FollowupHeadChange(False, HEAD_CHANGE_CITATION_ONLY)
+    for reason in (
+        HEAD_CHANGE_UNKNOWN_ITEM,
+        HEAD_CHANGE_MACHINE_OBLIGATION,
+        HEAD_CHANGE_CODE_FINDING,
+    ):
+        if reason in forcing:
+            return FollowupHeadChange(True, reason)
+    return FollowupHeadChange(
+        True, HEAD_CHANGE_UNTAGGED_EVIDENCE_REQUEST, tuple(untagged_evidence)
+    )
+
+
 def _followup_reports_code_changes(
     parsed: StructuredCoderFollowup,
     prior_items: Sequence[UnresolvedReviewItem],
@@ -4053,38 +4161,128 @@ def _followup_reports_code_changes(
 ) -> bool:
     """Whether a follow-up was expected to move the PR head (#1338).
 
-    Classified only from orchestrator-owned pre-follow-up state: the ledger
-    and the canonical unsatisfied-row set bound to the predecessor head.  An
-    addressed item (or a sub-item's parent) is citation-only when it is a
-    machine evidence obligation or a reviewer finding whose non-empty
-    ``evidence_row_ids`` all name unsatisfied rows, the same subset test
-    ``evidence_stall.classify_round`` applies.  Returns ``False`` only when at
-    least one item is addressed and every addressed item is citation-only;
-    any other item, an unknown id, or an unavailable row set expects a change.
+    The boolean view of :func:`_classify_followup_head_change`.
     """
-    citation_rows = frozenset(citation_row_ids)
-    if not citation_rows:
-        return True
-    addressed = {
-        *parsed.addressed_items,
-        *(sub_item_parent_id(sub_item) for sub_item in parsed.addressed_sub_items),
-    }
-    if not addressed:
-        return True
-    by_id = {item.item_id: item for item in prior_items}
-    for item_id in addressed:
-        item = by_id.get(item_id)
-        if item is None:
-            return True
-        if item.is_machine_obligation:
-            if item.obligation_kind != EVIDENCE_OBLIGATION_KIND:
-                return True
-            continue
-        # The residual tag (#1325): rows already converted no longer count.
-        residual = item.residual_evidence_row_ids
-        if not residual or not set(residual) <= citation_rows:
-            return True
-    return False
+    return _classify_followup_head_change(parsed, prior_items, citation_row_ids).expected
+
+
+def untagged_evidence_stop_cause(
+    classification: FollowupHeadChange | None,
+    diagnostics: Iterable[object],
+    *,
+    head_moved: bool,
+) -> str:
+    """The unchanged-head stop cause for the untagged evidence deadlock (#1622).
+
+    Empty unless the head did not move, an untagged pure-evidence request
+    forced the head-change expectation, and the follow-up's evidence was
+    rejected as ``checkout-head-mismatch`` because the predecessor head did
+    not move; every other shape keeps today's stop text.
+    """
+    if (
+        head_moved
+        or classification is None
+        or classification.reason != HEAD_CHANGE_UNTAGGED_EVIDENCE_REQUEST
+        or not classification.untagged_evidence_item_ids
+    ):
+        return ""
+    if not any(
+        getattr(diagnostic, "code", None) == "checkout-head-mismatch"
+        and getattr(diagnostic, "message", None) == PREDECESSOR_HEAD_UNMOVED_MESSAGE
+        for diagnostic in diagnostics
+    ):
+        return ""
+    items = ", ".join(classification.untagged_evidence_item_ids)
+    return (
+        f" Cause: evidence-only finding(s) {items} had no risk-matrix row binding, so their "
+        "run-tests observations at the unchanged head were rejected as "
+        "checkout-head-mismatch. Route: the reviewer should tag the finding with "
+        "evidence_row_ids, or rerun after it re-raises a tagged finding."
+    )
+
+
+def evidence_binding_context_for_head(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    head_sha: str | None,
+    approved_plan_context: ApprovedPlanContext | None,
+    open_items: Sequence[UnresolvedReviewItem],
+    comments: Sequence[object] | None = None,
+    signed_evidence_references: Sequence[SignedEvidenceReference] = (),
+) -> EvidenceBindingContext | None:
+    """The one binding context for a reviewed head (#1622).
+
+    ``None`` when no applicable matrix exists.  The unsatisfied set is read as
+    the evidence stall reads it (converted rows excluded, admitted signed
+    references overlaid); unreadable history or no head-bound coder record
+    leaves it ``None``, which only blocks a collective binding.
+    """
+    if not _matrix_applies(approved_plan_context):
+        return None
+    assert approved_plan_context is not None
+    enforceable = _evidence_stall.approved_matrix_row_ids(approved_plan_context)
+    if not enforceable:
+        return None
+    unsatisfied_rows: frozenset[str] | None = None
+    if head_sha:
+        try:
+            records = admitted_pr_records(runner, config, pr_number=pr_number, comments=comments)
+            history_references, _audits = evidence_authority_from_records(records)
+            unsatisfied = _head_bound_unsatisfied_rows(
+                records,
+                head_sha,
+                approved_plan_context,
+                excluded_row_ids=_evidence_conversion.converted_rows(
+                    open_items, matrix_identity=approved_plan_context.risk_test_matrix_identity
+                ),
+                signed_references=_cumulative_references(
+                    (*history_references, *signed_evidence_references)
+                ),
+            )
+        except AgentLoopError as exc:
+            log(config, f"Evidence row binding: head-bound rows unavailable ({exc})")
+            unsatisfied = None
+        if unsatisfied is not None and unsatisfied.reason is None:
+            unsatisfied_rows = frozenset(unsatisfied.rows)
+    return EvidenceBindingContext(tuple(enforceable), unsatisfied_rows)
+
+
+def bind_carried_evidence_findings(
+    items: Sequence[UnresolvedReviewItem],
+    context: EvidenceBindingContext | None,
+    *,
+    carried_item_ids: Iterable[str],
+) -> tuple[list[UnresolvedReviewItem], tuple[tuple[str, tuple[str, ...]], ...]]:
+    """Bind carried untagged evidence-only findings in place (#1622).
+
+    Only open ``blocking`` reviewer findings carried from earlier rounds, with
+    no tag, sub-items or converted rows, are considered, and only a ``bound``
+    derivation is written.  Carried items are never repaired: every other
+    result leaves the item an ordinary finding.  Returns the ledger and the
+    ``(item id, rows)`` bindings applied.
+    """
+    if context is None:
+        return list(items), ()
+    carried = set(carried_item_ids)
+    bound: list[tuple[str, tuple[str, ...]]] = []
+    result: list[UnresolvedReviewItem] = []
+    for item in items:
+        if (
+            item.item_id in carried
+            and item.status == "blocking"
+            and not item.is_machine_obligation
+            and not item.evidence_row_ids
+            and not item.converted_row_ids
+            and not item.sub_items
+        ):
+            binding = derive_evidence_row_binding(item.text, context)
+            if binding.kind == BINDING_BOUND and binding.rows:
+                item = dataclasses_replace(item, evidence_row_ids=binding.rows)
+                bound.append((item.item_id, binding.rows))
+        result.append(item)
+    return result, tuple(bound)
 
 
 def _evidence_stall_citation_rows(

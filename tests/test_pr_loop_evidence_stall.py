@@ -1027,7 +1027,7 @@ def _citing_followup(turn_id, plan_context, *, addressed, remaining, receipt_hea
     )
 
 
-def _run_followups(tmp_path, monkeypatch, *, reviews, turns):
+def _run_followups(tmp_path, monkeypatch, *, reviews, turns, catch_stop=False):
     """Drive run_pr_loop with scripted coder turns.
 
     Each turn is ``(addressed, remaining, pushed_head, receipt_head)``:
@@ -1081,7 +1081,12 @@ def _run_followups(tmp_path, monkeypatch, *, reviews, turns):
         "reconcile_test_observations",
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
-    result = run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context)
+    try:
+        result = run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan_context)
+    except AgentLoopError as exc:
+        if not catch_stop:
+            raise
+        result = exc
     coder_records = {
         record.metadata.round_number: record.metadata
         for record in _posted_records(runner, config) if record.metadata.role == "coder"
@@ -1173,6 +1178,288 @@ def test_code_claim_followup_at_unchanged_head_is_rejected(tmp_path, monkeypatch
     assert not _codes(coder_records[3], "inadmissible-execution")
     assert not _codes(coder_records[3], "head-mismatch")
     assert all(d["message"] == PREDECESSOR_HEAD_UNMOVED_MESSAGE for d in mismatches)
+
+
+# --- #1622: deterministic row binding for untagged evidence-only findings ------
+
+from unittest.mock import patch as _patch  # noqa: E402
+
+import coding_review_agent_loop.validated_agent as validated_agent_module  # noqa: E402
+
+_CITED_ROW_A = (
+    "Provide passing run-tests test observations for risk-matrix row `row-a`; "
+    "do not change code just to move the SHA."
+)
+_COLLECTIVE = (
+    "Provide admissible passing test observations for the risk-matrix rows; "
+    "do not change code just to move the SHA."
+)
+_MISSING_ROW = "Provide passing test observations for the risk-matrix row."
+_MIXED_ROW_A = (
+    "Fix the locale fallback defect for row-a and provide passing test observations "
+    "through run-tests"
+)
+_PLAIN_CODE = "A real code defect in the loader"
+
+
+def _ledger_tags(metadata):
+    return {
+        item.item_id: item.evidence_row_ids
+        for item in metadata.prior_items if not item.is_machine_obligation
+    }
+
+
+def _reviewer_new_item_tags(runner, config, round_number):
+    return {
+        item.item_id: item.evidence_row_ids
+        for record in _posted_records(runner, config)
+        if record.metadata.role == "reviewer" and record.metadata.round_number == round_number
+        for item in record.metadata.new_items
+    }
+
+
+def _spy_binding_contexts(monkeypatch, *, prefix_none_rounds=0):
+    """Record each per-head context; ``prefix_none_rounds`` simulates pre-fix rounds."""
+    real = pr_loop_module.evidence_binding_context_for_head
+    contexts = []
+
+    def spy(*args, **kwargs):
+        context = None if len(contexts) < prefix_none_rounds else real(*args, **kwargs)
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(pr_loop_module, "evidence_binding_context_for_head", spy)
+    return contexts
+
+
+def test_untagged_finding_citing_unsatisfied_rows_is_bound_and_verified_at_unchanged_head(
+    tmp_path, monkeypatch,
+):
+    """Matrix row `bind-cited-rows-verify` (#1622).
+
+    The reviewer cites `row-a` and asks only for evidence but omits the tag.
+    Before #1622 the unchanged-head turn was head-changing and rejected.
+    """
+    contexts = _spy_binding_contexts(monkeypatch)
+    result, runner, config, coder_records, expectations = _run_followups(
+        tmp_path, monkeypatch,
+        reviews=[
+            _review([{"text": _CITED_ROW_A}]),
+            _review(carried=["item-1"]),
+            _review(carried=["item-1"]),
+            _review(resolved=["item-1"]),
+        ],
+        turns=[
+            (["item-1"], [], "head-2", "abc123"),
+            (["item-1"], [], None, "head-2"),
+            (["item-1"], [], "head-3", "head-3"),
+        ],
+    )
+
+    assert result == 0
+    assert contexts[0] is not None and contexts[0].enforceable_row_ids == ("row-a",)
+    # Minted with exactly the cited row, and only that row.
+    assert _reviewer_new_item_tags(runner, config, 1) == {"item-1": ("row-a",)}
+    assert _ledger_tags(coder_records[2]) == {"item-1": ("row-a",)}
+    # The second turn pushes nothing and is citation-only.
+    assert expectations[1] is False
+    row = _row_evidence(coder_records[3])
+    assert row["status"] == "verified"
+    assert not _codes(coder_records[3], "checkout-head-mismatch")
+    # The turn-one receipt from the old head never verified the row.
+    assert _row_evidence(coder_records[2])["status"] != "verified"
+
+
+def test_collective_reference_with_every_row_unsatisfied_mints_bound_and_verifies(
+    tmp_path, monkeypatch,
+):
+    """Matrix row `bind-collective-all-unsatisfied` through the PR loop."""
+    result, runner, config, coder_records, expectations = _run_followups(
+        tmp_path, monkeypatch,
+        reviews=[
+            _review([_PLAIN_CODE]),
+            _review([{"text": _COLLECTIVE}], resolved=["item-1"]),
+            _review(resolved=["item-2"]),
+        ],
+        turns=[
+            (["item-1"], [], "head-2", "abc123"),
+            (["item-2"], [], None, "head-2"),
+        ],
+    )
+
+    assert result == 0
+    # Round 2 is the first head with known unsatisfied rows (all of them).
+    assert _reviewer_new_item_tags(runner, config, 2) == {"item-2": ("row-a",)}
+    assert expectations == [True, False]
+    assert _row_evidence(coder_records[3])["status"] == "verified"
+    assert not _codes(coder_records[3], "checkout-head-mismatch")
+
+
+def test_binding_repair_tags_only_the_flagged_finding_with_the_shared_context(
+    tmp_path, monkeypatch,
+):
+    """Matrix rows `repair-flagged-scope` and `repair-non-derivable` through the PR loop."""
+    contexts = _spy_binding_contexts(monkeypatch)
+    hook_contexts = []
+
+    def repair_hook(raw, cmd, **kwargs):
+        hook_contexts.append(kwargs.get("evidence_binding_context"))
+        payload, end = json.JSONDecoder().raw_decode(raw)
+        payload["blocking_items"] = [
+            {"text": _MISSING_ROW, "evidence_row_ids": ["row-a"]}, _PLAIN_CODE,
+        ]
+        return json.dumps(payload) + raw[end:]
+
+    with _patch.object(validated_agent_module, "attempt_repair", repair_hook):
+        result, runner, config, _coder_records, _expectations = _run_followups(
+            tmp_path, monkeypatch,
+            reviews=[
+                _review([_MISSING_ROW, _PLAIN_CODE]),
+                _review(resolved=["item-1", "item-2"]),
+            ],
+            turns=[(["item-1", "item-2"], [], "head-2", "head-2")],
+        )
+
+    assert result == 0
+    # The repair saw the very context object the round validated with.
+    assert hook_contexts and hook_contexts[0] is contexts[0]
+    # Minting keeps the reviewer's repaired tag and leaves the code finding untagged.
+    assert _reviewer_new_item_tags(runner, config, 1) == {"item-1": ("row-a",), "item-2": ()}
+
+
+def test_binding_repair_that_tags_the_unflagged_finding_is_rejected(tmp_path, monkeypatch):
+    """Matrix row `repair-flagged-scope`: attempt A (both tagged) never reaches the ledger."""
+
+    def repair_hook(raw, cmd, **kwargs):
+        payload, end = json.JSONDecoder().raw_decode(raw)
+        payload["blocking_items"] = [
+            {"text": _MISSING_ROW, "evidence_row_ids": ["row-a"]},
+            {"text": _PLAIN_CODE, "evidence_row_ids": ["row-a"]},
+        ]
+        return json.dumps(payload) + raw[end:]
+
+    with _patch.object(validated_agent_module, "attempt_repair", repair_hook):
+        with pytest.raises(AgentLoopError):
+            _run_followups(
+                tmp_path, monkeypatch,
+                reviews=[_review([_MISSING_ROW, _PLAIN_CODE])],
+                turns=[],
+            )
+
+
+def _three_turn_unchanged_head(tmp_path, monkeypatch, text):
+    return _run_followups(
+        tmp_path, monkeypatch,
+        reviews=[
+            _review([{"text": text}]),
+            _review(carried=["item-1"]),
+            _review(carried=["item-1"]),
+        ],
+        turns=[
+            (["item-1"], [], "head-2", "abc123"),
+            (["item-1"], [], None, "head-2"),
+            (["item-1"], [], None, "head-2"),
+        ],
+        catch_stop=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param(_MIXED_ROW_A, id="mixed-evidence-and-code"),
+        pytest.param(_PLAIN_CODE, id="plain-code-finding"),
+    ],
+)
+def test_code_demand_finding_at_unchanged_head_stays_head_changing_with_generic_stop(
+    tmp_path, monkeypatch, text,
+):
+    """Matrix rows `mixed-finding-not-bound` and `code-finding-unchanged-head`."""
+    stop, runner, config, coder_records, expectations = _three_turn_unchanged_head(
+        tmp_path, monkeypatch, text,
+    )
+
+    assert isinstance(stop, AgentLoopError)
+    # Never bound and never repaired, so the item stays an ordinary finding.
+    assert _reviewer_new_item_tags(runner, config, 1) == {"item-1": ()}
+    assert _ledger_tags(coder_records[3]) == {"item-1": ()}
+    assert expectations == [True, True, True]
+    mismatches = _codes(coder_records[3], "checkout-head-mismatch")
+    assert mismatches
+    assert all(d["message"] == PREDECESSOR_HEAD_UNMOVED_MESSAGE for d in mismatches)
+    assert _row_evidence(coder_records[3])["status"] != "verified"
+    message = str(stop)
+    assert message.startswith("PR #77: ") and "left head head-2 unchanged in 2" in message
+    assert "Cause:" not in message
+    assert "row binding" not in message
+
+
+def test_unbound_evidence_request_names_the_deadlock_cause_in_the_unchanged_head_stop(
+    tmp_path, monkeypatch,
+):
+    """Matrix row `stop-cause-diagnosis`.
+
+    A pre-fix record minted an untagged evidence request naming no row ID; it
+    is carried (never repaired) and cannot bind, so the deadlock persists and
+    the stop names the cause instead of the generic text alone.
+    """
+    _spy_binding_contexts(monkeypatch, prefix_none_rounds=1)
+    stop, runner, config, coder_records, expectations = _three_turn_unchanged_head(
+        tmp_path, monkeypatch, _MISSING_ROW,
+    )
+
+    assert isinstance(stop, AgentLoopError)
+    assert _ledger_tags(coder_records[3]) == {"item-1": ()}
+    assert expectations == [True, True, True]
+    assert _codes(coder_records[3], "checkout-head-mismatch")
+    message = str(stop)
+    assert "left head head-2 unchanged in 2" in message
+    assert "Cause: evidence-only finding(s) item-1 had no risk-matrix row binding" in message
+    assert "rejected as checkout-head-mismatch" in message
+    assert "tag the finding with evidence_row_ids" in message
+
+
+def test_carried_legacy_untagged_finding_is_bound_at_reconciliation_and_persisted(
+    tmp_path, monkeypatch,
+):
+    """Matrix row `carried-legacy-bind-resume`.
+
+    Round 1 simulates a pre-fix record (no binding context, so it is minted
+    untagged).  The reviewer keeps it open in round 2; reconciliation binds
+    it, the unchanged-head turn verifies the row, and the posted ledger that a
+    resume reconstructs carries the tag.
+    """
+    _spy_binding_contexts(monkeypatch, prefix_none_rounds=1)
+    result, runner, config, coder_records, expectations = _run_followups(
+        tmp_path, monkeypatch,
+        reviews=[
+            _review([{"text": _CITED_ROW_A}]),
+            _review(carried=["item-1"]),
+            _review(resolved=["item-1"]),
+        ],
+        turns=[
+            (["item-1"], [], "head-2", "abc123"),
+            (["item-1"], [], None, "head-2"),
+        ],
+    )
+
+    assert result == 0
+    assert _reviewer_new_item_tags(runner, config, 1) == {"item-1": ()}
+    assert _ledger_tags(coder_records[2]) == {"item-1": ()}
+    # Bound by round-2 reconciliation, so the unchanged-head turn is citation-only.
+    assert _ledger_tags(coder_records[3]) == {"item-1": ("row-a",)}
+    assert expectations == [True, False]
+    assert _row_evidence(coder_records[3])["status"] == "verified"
+    assert not _codes(coder_records[3], "checkout-head-mismatch")
+    # The round-3 reviewer record, decoded exactly as a resume decodes it, carries
+    # the stored tag; nothing re-derives it on reload.
+    round_three = [
+        record.metadata for record in _posted_records(runner, config)
+        if record.metadata.role == "reviewer" and record.metadata.round_number == 3
+    ]
+    assert round_three and all(
+        _ledger_tags(metadata) == {"item-1": ("row-a",)} for metadata in round_three
+    )
 
 
 # --- #1329: historical obsolete-tree failures through display transport ----------

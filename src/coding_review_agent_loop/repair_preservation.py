@@ -7,6 +7,12 @@ import json
 import re
 
 from .errors import AgentLoopError
+from .evidence_binding import (
+    BINDING_CODE_DEMAND,
+    EvidenceBindingContext,
+    derive_evidence_row_binding,
+    flagged_finding_texts,
+)
 from .protocol import (
     _normalized_review_item_text,
     ParseDegradation,
@@ -380,6 +386,18 @@ def _normalized_disposition(value: object) -> object:
     return value
 
 
+def _without_evidence_row_tag(entry: object) -> object:
+    """A finding without its ``evidence_row_ids`` tag, for grounding (#1622).
+
+    The tag is closed-vocabulary metadata bounded by the approved row universe
+    and checked by :func:`_validate_evidence_row_tag_preservation`, so its row
+    IDs are not reviewer prose a repaired finding must be grounded in.
+    """
+    if isinstance(entry, dict) and "evidence_row_ids" in entry:
+        return {key: value for key, value in entry.items() if key != "evidence_row_ids"}
+    return entry
+
+
 def _validate_review_grounding(
     raw: str,
     source: dict | None,
@@ -427,7 +445,7 @@ def _validate_review_grounding(
         for name in names:
             value = payload.get(name)
             if isinstance(value, list):
-                entries.extend(value)
+                entries.extend(_without_evidence_row_tag(entry) for entry in value)
         return entries
 
     source_findings = bucket_entries(source, buckets)
@@ -467,6 +485,7 @@ def _validate_review_grounding(
         if not isinstance(value, list):
             continue
         for entry in value:
+            entry = _without_evidence_row_tag(entry)
             target_findings.append((
                 name, _joined_text(entry), _authorized_neutralization_labels(entry),
             ))
@@ -927,7 +946,10 @@ def _pr_finding_view(entry: object) -> object:
 
 
 def _validate_evidence_row_tag_preservation(
-    source: dict, target: dict, universe: Sequence[str] | None = None
+    source: dict,
+    target: dict,
+    universe: Sequence[str] | None = None,
+    binding_context: EvidenceBindingContext | None = None,
 ) -> None:
     """A repair keeps each valid ``evidence_row_ids`` tag verbatim and invents none (#1324).
 
@@ -937,7 +959,19 @@ def _validate_evidence_row_tag_preservation(
     be copied onto a duplicate finding, onto a finding whose sub-items differ,
     or onto a merged finding that absorbed an untagged code defect; such an
     ambiguous transfer is rejected rather than resolved by guessing.
+
+    The one exception is the binding repair (#1622): with the per-head
+    ``binding_context``, a valid tag may be added to a finding that matches
+    an untagged source finding the same context flags as ``needs-repair``
+    (computed from the original response, never from error text), each
+    flagged finding at most once, and only while the repaired text still
+    derives as something other than ``code-demand``.
     """
+    flagged_sources = list(
+        flagged_finding_texts(source.get("blocking_items"), binding_context)
+    )
+    consumed_flagged: set[int] = set()
+    enforceable = set(binding_context.enforceable_row_ids) if binding_context else set()
 
     def entries(payload: dict) -> list[tuple[str, tuple[str, ...] | None]]:
         raw_entries = payload.get("blocking_items")
@@ -994,11 +1028,37 @@ def _validate_evidence_row_tag_preservation(
                 "Repair content preservation failed for blocking_items.evidence_row_ids: "
                 "keep each valid evidence_row_ids tag verbatim on its finding."
             )
-        if len(owner) < len(targets):
-            raise AgentLoopError(
-                "Repair content preservation failed for blocking_items.evidence_row_ids: "
-                "repair must not add or change an evidence_row_ids tag."
+        for j, target_text in enumerate(targets):
+            if j in owner:
+                continue
+            if binding_context is None or not set(tags) <= enforceable:
+                raise AgentLoopError(
+                    "Repair content preservation failed for blocking_items.evidence_row_ids: "
+                    "repair must not add or change an evidence_row_ids tag."
+                )
+            if (
+                derive_evidence_row_binding(target_text, binding_context).kind
+                == BINDING_CODE_DEMAND
+            ):
+                raise AgentLoopError(
+                    "Repair content preservation failed for blocking_items.evidence_row_ids: "
+                    "repair must not tag a finding that still demands a code change."
+                )
+            match = next(
+                (
+                    index
+                    for index, flagged_text in enumerate(flagged_sources)
+                    if index not in consumed_flagged and same_finding(flagged_text, target_text)
+                ),
+                None,
             )
+            if match is None:
+                raise AgentLoopError(
+                    "Repair content preservation failed for blocking_items.evidence_row_ids: "
+                    "repair must not add or change an evidence_row_ids tag except on a "
+                    "finding flagged for a binding repair."
+                )
+            consumed_flagged.add(match)
 
 
 def validate_repair_preservation(
@@ -1013,6 +1073,7 @@ def validate_repair_preservation(
     allow_legacy_matrix_removal: bool = False,
     forbid_architecture_impact: bool = False,
     evidence_row_id_universe: Sequence[str] | None = None,
+    evidence_binding_context: EvidenceBindingContext | None = None,
 ) -> None:
     """Reject observable losses, not certify semantic equivalence.
 
@@ -1564,7 +1625,9 @@ def validate_repair_preservation(
             )
             moved_to_evidence.add(_normalized_review_item_text(entry))
     if source["kind"] == "pr_review":
-        _validate_evidence_row_tag_preservation(source, target, evidence_row_id_universe)
+        _validate_evidence_row_tag_preservation(
+            source, target, evidence_row_id_universe, evidence_binding_context
+        )
     for field in finding_fields:
         entries = source.get(field)
         if not isinstance(entries, list):

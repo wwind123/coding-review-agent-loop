@@ -4392,6 +4392,19 @@ through ordinary `unresolved` dispositions (no re-declaration, no duplicate item
 reviewer who raises a new blocking item gives it its own tag. It is persisted on the
 item in round metadata, and a malformed stored tag degrades to an ordinary finding.
 
+**Deterministic binding.** When a reviewer omits the tag on a blocking finding that
+asks only for evidence, the orchestrator binds it in code: to the approved row IDs
+the finding cites, or to every enforceable row when it names the risk-matrix rows as
+a whole and every row is unsatisfied at the reviewed head. A finding that also
+demands a code change (any code-change wording other than a closed list of negations
+such as "do not change code") is never bound and stays an ordinary finding. An
+evidence-only finding that names unknown rows, no row ID, or the rows collectively
+while some are satisfied is returned to the reviewer as a bounded binding repair; that
+repair may add a tag only to the flagged finding. Carried untagged findings are bound
+the same way when the ledger is reconciled and are never repaired. If a follow-up is
+still rejected at an unchanged head only because such an unbound request forced a
+head-change expectation, the unchanged-head stop names that cause.
+
 **Classification.** The unsatisfied-row set is derived only from orchestrator-written
 state: the canonical `risk_test_matrix_evidence` and diagnostics on the coder record
 whose resulting head equals the current PR head, bound to the currently approved matrix

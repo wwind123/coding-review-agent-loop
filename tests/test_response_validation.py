@@ -1369,3 +1369,280 @@ def test_degrade_out_of_checkout_tests_keeps_baseline_out_of_evidence(tmp_path):
     assert degraded.tests_run == ("python3 -m pytest tests/test_api.py -q",)
     assert degraded.out_of_checkout_tests_run == (baseline,)
     assert response_validation._degrade_out_of_checkout_tests(degraded, config=config) is degraded
+
+
+# --- #1622: deterministic evidence row binding and the binding repair ----------
+
+from types import SimpleNamespace  # noqa: E402
+
+import pytest as _pytest  # noqa: E402
+
+import coding_review_agent_loop.repair as _repair_module  # noqa: E402
+from coding_review_agent_loop.errors import AgentLoopError as _AgentLoopError  # noqa: E402
+from coding_review_agent_loop.evidence_binding import EvidenceBindingContext  # noqa: E402
+from coding_review_agent_loop.repair import _build_repair_prompt, execute_repair  # noqa: E402
+from coding_review_agent_loop.repair_preservation import (  # noqa: E402
+    validate_repair_preservation as _validate_repair_preservation,
+)
+from coding_review_agent_loop.runner import CommandResult as _CommandResult  # noqa: E402
+from coding_review_agent_loop.unresolved_items import _validate_review_response  # noqa: E402
+
+_BIND_ROWS = ("share-page-locale", "row-b")
+_BIND_CONTEXT = EvidenceBindingContext(_BIND_ROWS, frozenset({"share-page-locale"}))
+_FLAGGED = "Provide passing test observations for the risk-matrix row."
+_CODE = "A real code defect in the loader"
+_MIXED = (
+    "Fix the locale fallback defect for share-page-locale and provide passing test observations "
+    "through run-tests"
+)
+_BINDING_REPAIR = "bind this evidence-only finding"
+
+
+def _binding_review(blocking, *, same_pr=(), future=()):
+    return (
+        json.dumps({
+            "schema_version": 1, "kind": "pr_review", "state": "blocking", "summary": "s",
+            "blocking_items": list(blocking), "same_pr_followups": list(same_pr),
+            "future_followups": list(future), "prior_item_dispositions": [],
+        })
+        + "\n<!-- AGENT_STATE: blocking -->\n-- OpenAI Codex"
+    )
+
+
+def _validate_binding(text, context=_BIND_CONTEXT, rows=_BIND_ROWS):
+    return _validate_review_response(
+        text, reviewer="OpenAI Codex", unresolved_items=(), architecture_status_mode="legacy",
+        approved_matrix_row_ids=rows, evidence_binding_context=context,
+    )
+
+
+@_pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("Provide passing test observations for risk-matrix row `unknown-row`", "unknown-row-reference"),
+        ("Provide passing test observations for share-page-locale and risk-matrix row `ghost-row`", "unknown-row-reference"),
+        (_FLAGGED, "missing-row-reference"),
+        ("Provide passing test observations for the risk-matrix rows.", "ambiguous-collective"),
+    ],
+)
+def test_non_derivable_evidence_finding_requests_a_binding_repair(text, reason):
+    """Matrix rows `repair-non-derivable` and `unknown-row-reference-repair` (validation)."""
+    with _pytest.raises(_AgentLoopError, match=_BINDING_REPAIR) as raised:
+        _validate_binding(_binding_review([text]))
+    assert reason in str(raised.value)
+    assert "row-b, share-page-locale" in str(raised.value)
+
+
+def test_collective_reference_with_unknown_unsatisfied_rows_requests_repair():
+    with _pytest.raises(_AgentLoopError, match="ambiguous-collective"):
+        _validate_binding(
+            _binding_review(["Provide passing test observations for the risk-matrix rows."]),
+            context=EvidenceBindingContext(_BIND_ROWS, None),
+        )
+
+
+@_pytest.mark.parametrize(
+    "text",
+    [
+        _MIXED,
+        _CODE,
+        "Provide passing test observations for share-page-locale; do not change code.",
+        "Provide passing test observations for the risk-matrix rows.",
+    ],
+)
+def test_bound_code_demand_and_plain_findings_raise_no_binding_repair(text):
+    """Matrix row `mixed-finding-not-bound` (validation): no repair for a code demand."""
+    all_unsatisfied = EvidenceBindingContext(_BIND_ROWS, frozenset(_BIND_ROWS))
+    parsed = _validate_binding(_binding_review([text]), context=all_unsatisfied)
+    assert [item.evidence_row_ids for item in parsed.blocking_items] == [()]
+
+
+def test_excluded_shapes_never_request_a_binding_repair():
+    """Matrix row `explicit-tag-and-exclusions` (validation)."""
+    review = _binding_review(
+        [
+            {"text": _FLAGGED, "evidence_row_ids": ["row-b"]},
+            {"text": _FLAGGED + " Two parts.", "sub_items": ["first", "second"]},
+        ],
+        same_pr=[_FLAGGED],
+        future=[_FLAGGED],
+    )
+    parsed = _validate_binding(review)
+    # The reviewer tag is kept verbatim, never overridden or extended.
+    assert parsed.blocking_items[0].evidence_row_ids == ("row-b",)
+    assert parsed.blocking_items[1].evidence_row_ids == ()
+    # Without a binding context (no applicable matrix) nothing is derived.
+    plain = _validate_review_response(
+        _binding_review([_FLAGGED]), reviewer="OpenAI Codex", unresolved_items=(),
+        architecture_status_mode="legacy", approved_matrix_row_ids=None,
+    )
+    assert plain.blocking_items[0].evidence_row_ids == ()
+
+
+def _tag(text, rows=("share-page-locale",)):
+    return {"text": text, "evidence_row_ids": list(rows)}
+
+
+def test_binding_repair_may_tag_only_the_flagged_finding():
+    """Matrix row `repair-flagged-scope` (preservation)."""
+    source = _binding_review([_FLAGGED, _CODE])
+    only_flagged = _binding_review([_tag(_FLAGGED), _CODE])
+    both = _binding_review([_tag(_FLAGGED), _tag(_CODE)])
+    _validate_repair_preservation(
+        source, only_flagged, evidence_row_id_universe=_BIND_ROWS,
+        evidence_binding_context=_BIND_CONTEXT,
+    )
+    with _pytest.raises(_AgentLoopError, match="flagged for a binding repair"):
+        _validate_repair_preservation(
+            source, both, evidence_row_id_universe=_BIND_ROWS,
+            evidence_binding_context=_BIND_CONTEXT,
+        )
+    # Without the context in the kwargs, any added tag is still rejected.
+    with _pytest.raises(_AgentLoopError, match="must not add or change"):
+        _validate_repair_preservation(source, only_flagged, evidence_row_id_universe=_BIND_ROWS)
+    # The repaired response then revalidates.
+    assert _validate_binding(only_flagged).blocking_items[0].evidence_row_ids == ("share-page-locale",)
+
+
+def test_binding_repair_rejects_unknown_rows_and_a_second_copy():
+    source = _binding_review([_FLAGGED])
+    # An out-of-universe tag is never accepted: revalidation rejects it.
+    with _pytest.raises(_AgentLoopError, match="unknown"):
+        _validate_binding(_binding_review([_tag(_FLAGGED, ("ghost",))]))
+    with _pytest.raises(_AgentLoopError, match="Repair content preservation failed"):
+        _validate_repair_preservation(
+            source, _binding_review([_tag(_FLAGGED), _tag(_FLAGGED)]),
+            evidence_row_id_universe=_BIND_ROWS, evidence_binding_context=_BIND_CONTEXT,
+        )
+
+
+def test_repair_cannot_tag_the_unchanged_mixed_finding():
+    """Matrix row `mixed-finding-not-bound` (repair preservation)."""
+    source = _binding_review([_MIXED, _FLAGGED])
+    with _pytest.raises(_AgentLoopError, match="evidence_row_ids"):
+        _validate_repair_preservation(
+            source, _binding_review([_tag(_MIXED), _FLAGGED]),
+            evidence_row_id_universe=_BIND_ROWS, evidence_binding_context=_BIND_CONTEXT,
+        )
+
+
+def test_repair_prompt_states_the_binding_exception_only_with_flagged_findings():
+    prompt = _build_repair_prompt(
+        _binding_review([_FLAGGED, _CODE]), expected_kind="pr_review",
+        evidence_row_id_universe=_BIND_ROWS, evidence_binding_context=_BIND_CONTEXT,
+    )
+    assert "Exception (binding repair)" in prompt
+    assert f"- {_FLAGGED}" in prompt and f"- {_CODE}" not in prompt
+    assert "Exception (binding repair)" not in _build_repair_prompt(
+        _binding_review([_CODE]), expected_kind="pr_review",
+        evidence_row_id_universe=_BIND_ROWS, evidence_binding_context=_BIND_CONTEXT,
+    )
+    assert "Exception (binding repair)" not in _build_repair_prompt(
+        _binding_review([_FLAGGED]), expected_kind="pr_review", evidence_row_id_universe=_BIND_ROWS,
+    )
+
+
+def _run_review_with_repair_hook(tmp_path, hook):
+    runner = FakeRunner(codex_outputs=[_binding_review([_FLAGGED, _CODE])])
+    config = make_config(tmp_path, reviewer=("codex",), agent_max_retries=0)
+    with patch_object_in((validated_agent,), "attempt_repair", hook):
+        return validated_agent._run_validated_agent(
+            runner, agent="codex", config=config, prompt="REVIEW PROMPT", session_id=None,
+            marker_description="<!-- AGENT_STATE: approved|blocking -->",
+            validate=lambda text: _validate_binding(text),
+            use_repair=True, repair_expected_kind="pr_review",
+            repair_evidence_row_ids=_BIND_ROWS,
+            repair_evidence_binding_context=_BIND_CONTEXT,
+            role="reviewer", operation_description="PR review",
+        )
+
+
+def test_validated_agent_carries_the_same_context_into_repair_preservation(tmp_path):
+    """Matrix row `repair-flagged-scope` (repair kwargs, validated-agent entry point)."""
+    seen = []
+
+    def hook(raw, cmd, **kwargs):
+        seen.append(kwargs.get("evidence_binding_context"))
+        return _binding_review([_tag(_FLAGGED), _CODE])
+
+    response = _run_review_with_repair_hook(tmp_path, hook)
+    assert seen == [_BIND_CONTEXT] and seen[0] is _BIND_CONTEXT
+    assert [item.evidence_row_ids for item in response.marker_value.blocking_items] == [
+        ("share-page-locale",), (),
+    ]
+
+
+def test_validated_agent_rejects_a_repair_that_tags_the_unflagged_finding(tmp_path):
+    def hook(raw, cmd, **kwargs):
+        return _binding_review([_tag(_FLAGGED), _tag(_CODE)])
+
+    with _pytest.raises(_AgentLoopError):
+        _run_review_with_repair_hook(tmp_path, hook)
+
+
+def test_legacy_kwarg_fallback_still_scopes_preservation_with_the_context(tmp_path):
+    """The legacy hook without the keyword is retried; preservation keeps the context."""
+    calls = []
+
+    def legacy_hook(raw, cmd, *, expected_kind=None, allowed_prior_item_ids=None):
+        calls.append(expected_kind)
+        return _binding_review([_tag(_FLAGGED), _CODE])
+
+    response = _run_review_with_repair_hook(tmp_path, legacy_hook)
+    assert calls == ["pr_review"]
+    assert response.marker_value.blocking_items[0].evidence_row_ids == ("share-page-locale",)
+
+    def legacy_both(raw, cmd, *, expected_kind=None, allowed_prior_item_ids=None):
+        return _binding_review([_tag(_FLAGGED), _tag(_CODE)])
+
+    with _pytest.raises(_AgentLoopError):
+        _run_review_with_repair_hook(tmp_path / "both", legacy_both)
+
+
+class _BindingRepairRunner:
+    def __init__(self, outputs):
+        self.outputs = iter(outputs)
+
+    def run_with_log(self, args, **kwargs):
+        text = next(self.outputs)
+        Path(args[args.index("--output-last-message") + 1]).write_text(text)
+        stdout = json.dumps({"type": "turn.completed", "usage": {
+            "input_tokens": 1, "output_tokens": 1, "cached_input_tokens": 0,
+        }})
+        kwargs["log_path"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["log_path"].write_text(stdout)
+        return _CommandResult(args, kwargs["cwd"], stdout, "", 0)
+
+
+def test_execute_repair_scopes_tag_permission_with_the_context(tmp_path):
+    """Matrix row `repair-flagged-scope` (execute_repair entry point)."""
+    both = _binding_review([_tag(_FLAGGED), _tag(_CODE)])
+    only_flagged = _binding_review([_tag(_FLAGGED), _CODE])
+    config = make_config(tmp_path, repair_backend="codex", repair_models=("first", "second"))
+    repaired, _, attempts = execute_repair(
+        _binding_review([_FLAGGED, _CODE]), runner=_BindingRepairRunner([both, only_flagged]),
+        config=config, run_id="repair", usage_context=None,
+        validate=lambda text: _validate_binding(text), expected_kind="pr_review",
+        evidence_row_id_universe=_BIND_ROWS, evidence_binding_context=_BIND_CONTEXT,
+    )
+    assert repaired == only_flagged
+    assert attempts[0].outcome != "succeeded"
+    assert "flagged for a binding repair" in (attempts[0].diagnostic or "")
+
+
+def test_attempt_repair_forwards_the_context_to_preservation(monkeypatch):
+    only_flagged = _binding_review([_tag(_FLAGGED), _CODE])
+    both = _binding_review([_tag(_FLAGGED), _tag(_CODE)])
+    for output, expected in ((only_flagged, only_flagged), (both, None)):
+        monkeypatch.setattr(
+            _repair_module.subprocess, "run",
+            lambda *a, **k: SimpleNamespace(returncode=0, stdout="x", stderr=""),
+        )
+        monkeypatch.setattr(
+            _repair_module, "_parse_gemini_payload",
+            lambda _stdout, output=output: (output, None, None, None, None),
+        )
+        assert _repair_module.attempt_repair(
+            _binding_review([_FLAGGED, _CODE]), "gemini", expected_kind="pr_review",
+            evidence_row_id_universe=_BIND_ROWS, evidence_binding_context=_BIND_CONTEXT,
+        ) == expected

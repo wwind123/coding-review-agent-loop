@@ -95,6 +95,7 @@ from .protocol import (
     EXECUTION_DISPOSITION_PLANNING,
 )
 from .evidence_stall import approved_matrix_row_ids
+from .evidence_binding import EvidenceBindingContext, derived_evidence_row_ids
 from .evidence_conversion import capture_classification_payload
 from .errors import (
     AgentInvocationError,
@@ -208,6 +209,7 @@ from .prompts import (
     render_coder_human_requirements_prompt_context,
 )
 from .protocol import (
+    ApprovedFollowup,
     ParsedPlanReview,
     ParsedReview,
     ReviewItemDisposition,
@@ -472,7 +474,11 @@ from .pr_loop_support import (
     latest_conversion_index,
     mint_signed_evidence_references,
     _followup_reports_code_changes,
+    _classify_followup_head_change,
     _evidence_stall_citation_rows,
+    bind_carried_evidence_findings,
+    evidence_binding_context_for_head,
+    untagged_evidence_stop_cause,
     _publish_evidence_release,
     _evidence_freeze_gate,
     _refuse_dispatch_while_evidence_frozen,
@@ -621,6 +627,30 @@ def _managed_v1_dispatch_records(managed_ci) -> tuple:
     if managed_ci is None or managed_ci.protocol_version != 1:
         return ()
     return tuple(managed_ci.v1_dispatch_records)
+
+
+def _minted_evidence_row_ids(
+    item: ApprovedFollowup,
+    context: EvidenceBindingContext | None,
+    *,
+    config: AgentLoopConfig,
+    item_id: str,
+) -> tuple[str, ...]:
+    """The tag a new blocking ledger item is minted with (#1324, #1622).
+
+    The reviewer's tag wins verbatim; otherwise the deterministic binding
+    under the same per-head context validation used.  Each derived binding
+    is logged for auditability.
+    """
+    rows = derived_evidence_row_ids(
+        item.text,
+        reviewer_tag=item.evidence_row_ids,
+        has_sub_items=bool(item.sub_items),
+        context=context,
+    )
+    if rows and not item.evidence_row_ids:
+        log(config, f"Bound evidence-only {item_id} to risk-matrix row(s) {', '.join(rows)}")
+    return rows
 
 
 def unchanged_head_stop_message(
@@ -3758,6 +3788,20 @@ def run_pr_loop(
             # (reviewer, requests) pairs from this round's reviews (#1068).
             round_evidence_requests: list[tuple[str, tuple[str, ...]]] = []
             current_pr_subject = str(pr_metadata.head_sha or "unknown")
+            # One immutable binding context per reviewed head (#1622), shared
+            # unchanged by review validation, repair and ledger minting.
+            unchanged_head_stop_cause = ""
+            round_evidence_binding_context = evidence_binding_context_for_head(
+                runner,
+                config,
+                pr_number=pr_number,
+                head_sha=pr_metadata.head_sha,
+                approved_plan_context=approved_plan_context,
+                open_items=prior_unresolved_items,
+                # A fresh read: the round's prefetched comments can predate the
+                # coder record that produced this head.
+                signed_evidence_references=current_signed_references(),
+            )
             round_ledger_incomplete = _round_ledger_may_be_incomplete(
                 current_resume=current_resume,
                 prior_unresolved_items=prior_unresolved_items,
@@ -4165,6 +4209,7 @@ def run_pr_loop(
                     # message, so an empty tuple changes no outcome.
                     current_round_items=(), architecture_status_mode=mode,
                     approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
+                    evidence_binding_context=round_evidence_binding_context,
                 ))
 
             def _pr_publication(reviewer_name: str):
@@ -5268,6 +5313,7 @@ def run_pr_loop(
                                         item.item_id for item in prior_unresolved_items
                                     ),
                                     repair_evidence_row_ids=approved_matrix_row_ids(approved_plan_context) or (),
+                                    repair_evidence_binding_context=round_evidence_binding_context,
                                     ledger_incomplete=round_ledger_incomplete,
                                     repair_resolved_history_item_ids=round_resolved_history_item_ids,
                                     role="reviewer",
@@ -5559,6 +5605,7 @@ def run_pr_loop(
                         optional_item_ids=compact_hidden_future_ids,
                         current_round_items=round_new_unresolved_items, architecture_status_mode=mode,
                         approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
+                        evidence_binding_context=round_evidence_binding_context,
                     ))
                     review_response, review_failure = _capture_agent_invocation(
                         lambda: _same_round_replay_or_invoke(
@@ -5622,6 +5669,7 @@ def run_pr_loop(
                                 item.item_id for item in prior_unresolved_items
                             ),
                             repair_evidence_row_ids=approved_matrix_row_ids(approved_plan_context) or (),
+                            repair_evidence_binding_context=round_evidence_binding_context,
                             ledger_incomplete=round_ledger_incomplete,
                             repair_resolved_history_item_ids=round_resolved_history_item_ids,
                             role="reviewer",
@@ -5816,7 +5864,11 @@ def run_pr_loop(
                                     status="blocking",
                                     fix_scope=blocking_item.fix_scope,
                                     sub_items=blocking_item.sub_items,
-                                    evidence_row_ids=blocking_item.evidence_row_ids,
+                                    evidence_row_ids=_minted_evidence_row_ids(
+                                        blocking_item, round_evidence_binding_context,
+                                        config=config,
+                                        item_id=f"item-{next_unresolved_item_number}",
+                                    ),
                                 )
                                 round_new_unresolved_items.append(tracked_item)
                                 reviewer_new_unresolved_items.append(tracked_item)
@@ -6025,6 +6077,19 @@ def run_pr_loop(
                 ledger_view=pr_ledger_view,
                 **evidence_reconciliation_kwargs,
             )
+            # Carried untagged evidence-only findings (#1622) gain the same
+            # deterministic binding, with the same context; never repaired.
+            unresolved_items, carried_bindings = bind_carried_evidence_findings(
+                unresolved_items,
+                round_evidence_binding_context,
+                carried_item_ids=(item.item_id for item in prior_unresolved_items),
+            )
+            for bound_item_id, bound_rows in carried_bindings:
+                log(
+                    config,
+                    f"Round {round_number}: bound carried evidence-only {bound_item_id} to "
+                    f"risk-matrix row(s) {', '.join(bound_rows)}",
+                )
             if use_compact_pr_context:
                 pr_compact_prior_summaries = list(
                     bound_compact_prior_summaries(
@@ -6475,6 +6540,7 @@ def run_pr_loop(
                                     optional_item_ids=compact_hidden_future_ids,
                                     current_round_items=round_new_unresolved_items, architecture_status_mode="strict",
                                     approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
+                                    evidence_binding_context=round_evidence_binding_context,
                                 ),
                                 repair_kwargs={
                                     "expected_kind": "pr_review",
@@ -6483,6 +6549,11 @@ def run_pr_loop(
                                         item.item_id for item in prior_unresolved_items
                                     ),
                                     "evidence_row_id_universe": approved_matrix_row_ids(approved_plan_context) or (),
+                                    **(
+                                        {"evidence_binding_context": round_evidence_binding_context}
+                                        if round_evidence_binding_context is not None
+                                        else {}
+                                    ),
                                 },
                                 forbid_architecture_impact=_acknowledgement_repair_forbids_assessment(
                                     review_output
@@ -6530,7 +6601,11 @@ def run_pr_loop(
                                             text=item.text,
                                             status="blocking",
                                             sub_items=item.sub_items,
-                                            evidence_row_ids=item.evidence_row_ids,
+                                            evidence_row_ids=_minted_evidence_row_ids(
+                                                item, round_evidence_binding_context,
+                                                config=config,
+                                                item_id=f"item-{next_unresolved_item_number}",
+                                            ),
                                         )
                                         round_new_unresolved_items.append(new_item)
                                         unresolved_items.append(new_item)
@@ -9260,6 +9335,14 @@ def run_pr_loop(
                             evidence_stall_snapshot
                         ),
                     )
+                    # The reason only names a stop cause (#1622); it never
+                    # changes the expectation above.
+                    followup_head_change = _classify_followup_head_change(
+                        coder_response.marker_value,
+                        pre_turn_ledger,
+                        _evidence_stall_citation_rows(evidence_stall_snapshot),
+                        approved_matrix_row_ids(approved_plan_context) or (),
+                    )
                     derived_followup, _followup_derived_risk_evidence = (
                         _derive_authenticated_risk_evidence_for_coder(
                             coder_response.marker_value,
@@ -9287,6 +9370,13 @@ def run_pr_loop(
                     coder_response = dataclasses_replace(
                         coder_response,
                         marker_value=derived_followup,
+                    )
+                    unchanged_head_stop_cause = untagged_evidence_stop_cause(
+                        followup_head_change,
+                        getattr(derived_followup, "risk_test_matrix_diagnostics", ()),
+                        head_moved=(
+                            updated_pr_context.metadata.head_sha != pr_metadata.head_sha
+                        ),
                     )
                 local_test_evidence = runner.render_local_test_evidence(
                     current_head=updated_pr_context.metadata.head_sha,
@@ -9635,7 +9725,7 @@ def run_pr_loop(
                             if latest_coder_metadata is not None
                             else None
                         ),
-                        route=route,
+                        route=unchanged_head_stop_cause + route,
                     )
                 )
             log(

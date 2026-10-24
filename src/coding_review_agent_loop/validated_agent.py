@@ -43,6 +43,7 @@ from . import tool_provenance
 from .logging import log, new_run_id, run_usage_summary_path
 from .managed_ci import waivable_protection_states, waiver_flags_for_protection
 from .prompts import build_completion_recovery_prompt
+from .evidence_binding import EvidenceBindingContext
 from .protocol import AgentUnavailable, parse_agent_unavailable, ParseDegradation
 from .repair import (
     CandidateDecision,
@@ -377,6 +378,7 @@ def _run_structured_repair(
                     "require_risk_test_matrix_contract",
                     "reject_unsolicited_risk_test_matrix_contract",
                     "evidence_row_id_universe",
+                    "evidence_binding_context",
                     "optional_item_ids",
                 )
             ):
@@ -388,6 +390,7 @@ def _run_structured_repair(
             legacy_kwargs.pop("require_risk_test_matrix_contract", None)
             legacy_kwargs.pop("reject_unsolicited_risk_test_matrix_contract", None)
             legacy_kwargs.pop("evidence_row_id_universe", None)
+            legacy_kwargs.pop("evidence_binding_context", None)
             repaired = attempt_repair(raw, config.gemini_cmd, **legacy_kwargs)
         if repaired is None:
             return None, None, []
@@ -401,6 +404,7 @@ def _run_structured_repair(
                     repaired,
                     allowed_prior_item_ids=repair_kwargs.get("allowed_prior_item_ids"),
                     evidence_row_id_universe=repair_kwargs.get("evidence_row_id_universe"),
+                    evidence_binding_context=repair_kwargs.get("evidence_binding_context"),
                     forbid_architecture_impact=forbid,
                 )
             elif forbid:
@@ -1107,6 +1111,7 @@ def _run_validated_agent_in_scope(
     reject_unsolicited_risk_test_matrix_contract: bool = False,
     repair_allowed_prior_item_ids: Sequence[str] | None = None,
     repair_evidence_row_ids: Sequence[str] | None = None,
+    repair_evidence_binding_context: EvidenceBindingContext | None = None,
     ledger_incomplete: bool = False,
     repair_resolved_history_item_ids: Sequence[str] | None = None,
     role: str | None = None,
@@ -2767,6 +2772,11 @@ def _run_validated_agent_in_scope(
                             repair_kwargs["allowed_prior_item_ids"] = tuple(repair_allowed_prior_item_ids)
                         if repair_expected_kind == "pr_review" and repair_evidence_row_ids is not None:
                             repair_kwargs["evidence_row_id_universe"] = tuple(repair_evidence_row_ids)
+                            if repair_evidence_binding_context is not None:
+                                # The same per-head context validation used (#1622).
+                                repair_kwargs["evidence_binding_context"] = (
+                                    repair_evidence_binding_context
+                                )
                         original_validation_error = str(exc)
                         if marker_safety_failure:
                             marker_safety_repair_attempted = True

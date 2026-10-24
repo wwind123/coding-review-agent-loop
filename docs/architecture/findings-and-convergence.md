@@ -2,7 +2,7 @@
 
 How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline and future follow-ups, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the PR step-back, sweep and sibling escalation, the non-convergence stop, the evidence-only stall stop and evidence conversion.
 
-Source paths: `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
+Source paths: `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/evidence_binding.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_evidence_binding.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
 
 ## Findings, evidence and convergence
 
@@ -228,6 +228,39 @@ invalid unless it equals the record number minus one and its content is consiste
 and a qualifying snapshot names its head, identity, and rows). An invalid or missing
 snapshot ends the window walk. History that cannot be decoded suppresses the stop with a log
 line. State is orchestrator-owned, so a resumed run recomputes the same decision.
+
+**Deterministic row binding** (#1622). A reviewer who asks only for evidence but
+omits `evidence_row_ids` would otherwise leave an ordinary finding, so a follow-up
+that only re-ran tests at the unchanged head was classified head-changing and its
+observations were rejected as `checkout-head-mismatch`. `evidence_binding.py` is
+pure: `derive_evidence_row_binding(text, EvidenceBindingContext)` returns `bound`,
+`needs-repair` (closed reasons `unknown-row-reference`, `ambiguous-collective`,
+`missing-row-reference`), `code-demand` or `not-evidence`. It requires evidence
+vocabulary and a matrix reference, treats any code-demand wording outside a closed
+negated-phrase list as `code-demand` (never bound or repaired, still head-changing),
+binds cited enforceable row IDs, and binds a collective "risk-matrix rows" reference
+to every enforceable row only when the known unsatisfied set equals the whole
+enforceable set. `pr_loop_support.evidence_binding_context_for_head` builds one
+immutable context per reviewed head (enforceable rows, plus the head-bound
+unsatisfied rows read as the stall reads them, or `None` when unknown), and
+`pr_loop.py` passes that same object to review validation, repair and minting, so
+they cannot diverge. Validation raises a bounded binding repair for an untagged,
+sub-item-free `needs-repair` finding. The repair kwargs carry the context as
+`evidence_binding_context` into `validate_repair_preservation` on every repair entry
+point; the tag-preservation check re-derives the flagged findings from the original
+response and allows an added valid tag only on a matching flagged finding whose
+repaired text is not `code-demand`. Without a context any added tag is still
+rejected. A reviewer tag is never overridden, and follow-ups, sub-item findings and
+machine obligations are never bound. New blocking items are minted with the reviewer
+tag or the `bound` derivation. After round-end settlement,
+`bind_carried_evidence_findings` binds carried untagged blocking reviewer findings
+the same way, never repairing them; the tag then persists through ordinary item
+serialization, so a resume replays it. `_classify_followup_head_change` returns the
+head-change expectation with a closed reason, and `_followup_reports_code_changes`
+stays its boolean view. When the head did not move, the reason is
+`untagged-evidence-request`, and the derived evidence carries the predecessor-unmoved
+`checkout-head-mismatch` diagnostic, the unchanged-head stop names the cause and the
+route; every other stop text is unchanged.
 
 **Evidence conversion** (`--pr-evidence-capture-attempts` N, default 2, `0`
 disables; `--pr-convert-evidence-rows`). `protocol.derive_risk_test_matrix_evidence`
