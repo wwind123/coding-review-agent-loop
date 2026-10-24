@@ -101,18 +101,28 @@ _ROW_TOKEN_RE = re.compile(_ROW_TOKEN)
 # A token in the clause after a parsed row list: backticked, or a bare
 # kebab/snake identifier shaped like a row ID.
 _TAIL_TOKEN_RE = re.compile(r"`[^`\n]+`|(?<![\w-])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+(?![\w-])")
+# Patterns that EXCUSE a token from being a row reference match whole tokens
+# only (#1622 review item-5): a hyphen or underscore continues a kebab/snake
+# identifier, so `node-startup` or `run-smoke` is never read as the command
+# word `node` or `run`.  Patterns that make the result more conservative (the
+# code-demand scan) keep ordinary word boundaries.
+_TOKEN_START = r"(?<![\w-])"
+_TOKEN_END = r"(?![\w-])"
 # Words that introduce a command; the command span runs to the next list
 # continuation (comma, semicolon, "and", "or") or the end of the clause.
 _COMMAND_INTRO_RE = re.compile(
-    r"\b(?:using|via|through|run|running|re-?run|re-?running|execute|executing"
-    r"|invoke|invoking|command)\b",
+    _TOKEN_START
+    + r"(?:using|via|through|run|running|re-?run|re-?running|execute|executing"
+    r"|invoke|invoking|command)"
+    + _TOKEN_END,
     _I,
 )
-_COMMAND_SPAN_END_RE = re.compile(r",|;|\band\b|\bor\b", _I)
+_COMMAND_SPAN_END_RE = re.compile(r",|;|" + _TOKEN_START + r"(?:and|or)" + _TOKEN_END, _I)
 # A backticked span is a command, not a row ID, when it holds whitespace or
-# path/assignment characters, or starts with a common tool name.
+# path/assignment characters, or is or starts with a whole tool-name token.
 _COMMAND_CONTENT_RE = re.compile(
-    r"\s|[/.=$]|^(?:agent-loop|python\d*|pytest|pip|npm|npx|pnpm|yarn|node|git|gh|uv|make|bash|sh)\b",
+    r"\s|[/.=$]|^(?:agent-loop|python\d*|pytest|pip|npm|npx|pnpm|yarn|node|git|gh|uv|make|bash|sh)"
+    r"(?=\s|$)",
     _I,
 )
 # The end of the clause a row list belongs to: sentence punctuation followed
@@ -121,10 +131,12 @@ _CLAUSE_END_RE = re.compile(r"[.!?](?=\s|$)|\n")
 # The closed list of negated code-change phrases stripped before the
 # code-demand scan.  Any other code-demand wording keeps the finding ordinary.
 _NEGATED_CODE_CHANGE_RE = re.compile(
-    r"\b(?:do\s+not|don['’]t|never)\s+change\s+(?:the\s+)?code\b"
-    r"|\bno\s+code\s+changes?\b"
-    r"|\bwithout\s+(?:changing|modifying)\s+(?:the\s+)?code\b"
-    r"|\bnot\s+to\s+change\s+(?:the\s+)?code\b",
+    _TOKEN_START
+    + r"(?:(?:do\s+not|don['’]t|never)\s+change\s+(?:the\s+)?code"
+    r"|no\s+code\s+changes?"
+    r"|without\s+(?:changing|modifying)\s+(?:the\s+)?code"
+    r"|not\s+to\s+change\s+(?:the\s+)?code)"
+    + _TOKEN_END,
     _I,
 )
 _CODE_DEMAND_RE = re.compile(

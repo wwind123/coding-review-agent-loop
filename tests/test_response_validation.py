@@ -1683,3 +1683,14 @@ def test_command_span_after_a_row_raises_no_repair_and_mints_the_row(tail):
     assert derived_evidence_row_ids(
         item.text, reviewer_tag=item.evidence_row_ids, has_sub_items=False, context=_BIND_CONTEXT
     ) == ("share-page-locale",)
+
+
+@_pytest.mark.parametrize("token", ["`node-startup`", "run-smoke"])
+def test_identifier_containing_a_command_word_requests_binding_repair(token):
+    """Review item-5: a kebab ID such as node-startup is never excused as a command."""
+    text = (
+        "Provide passing test observations for risk-matrix rows share-page-locale, row-b, "
+        f"and also {token}."
+    )
+    with _pytest.raises(_AgentLoopError, match="unknown-row-reference"):
+        _validate_binding(_binding_review([text]))

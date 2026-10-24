@@ -502,3 +502,46 @@ def test_carried_finding_with_a_command_span_is_bound(tail):
     )
     assert bound == (("item-1", ("row-a",)),)
     assert result[0].evidence_row_ids == ("row-a",)
+
+
+# --- excuse patterns match whole tokens only (#1622 review item-5) -----------
+
+_IDENTIFIER_CONTAINS_KEYWORD = [
+    "`node-startup`", "node-startup", "`run-smoke`", "run-smoke", "`using-cache`",
+    "via-proxy", "`git-hooks`", "`pytest-xdist-row`", "rerun-guard", "`command_palette`",
+    "`agent-loop-row`", "and-or-row",
+]
+
+
+@pytest.mark.parametrize("token", _IDENTIFIER_CONTAINS_KEYWORD)
+def test_identifier_containing_a_command_word_is_an_unknown_row(token):
+    text = f"Provide passing test observations for risk-matrix rows row-a, row-b, and also {token}."
+    binding = _derive(text)
+    assert (binding.kind, binding.reason, binding.rows) == (
+        BINDING_NEEDS_REPAIR, REASON_UNKNOWN_ROW_REFERENCE, ()
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        " using `node scripts/check.js`",
+        " via `node`",
+        " with `git`",
+        " then run `pytest -q`",
+        " using `agent-loop`",
+    ],
+)
+def test_whole_tool_tokens_still_count_as_commands(tail):
+    binding = _derive(f"Provide passing test observations for risk-matrix row `row-a`{tail}.")
+    assert (binding.kind, binding.rows) == (BINDING_BOUND, ("row-a",))
+
+
+def test_negation_inside_an_identifier_does_not_excuse_a_code_demand():
+    # Only the closed negated phrases are stripped, never a fragment of an ID.
+    text = "Fix the guard and provide passing test observations for row-a."
+    assert _derive(text).kind == BINDING_CODE_DEMAND
+    # A hyphenated code-demand word stays a code demand (conservative side).
+    assert _derive("Provide passing test observations for row-a after the bug-fix.").kind == (
+        BINDING_CODE_DEMAND
+    )
