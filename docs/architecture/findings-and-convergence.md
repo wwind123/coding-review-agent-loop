@@ -179,7 +179,8 @@ before stopping; the same check runs at every round start before any review, so
 a resumed run stops before reviewing the proposal head. The loop raises
 `HumanDecisionRequiredError` (exit code 4) quoting the alternative and offering a
 scope change, a stated limitation, or continued generalization with
-`--pr-step-back-rounds 0`, which also disables this stop. A pushed head, a
+`--pr-step-back-rounds 0`, which also disables this stop; history export classifies the
+message as a human-decision stop. A pushed head, a
 `Generalization:` answer, or an unreadable record never stops. The sibling
 escalation message also names the scope-change route (approve the scope change,
 push the replacement and rerun).
