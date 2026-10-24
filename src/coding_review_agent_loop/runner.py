@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TypeVar
 
+from .agent_executable import agent_executable_environment
 from .containment import (
     ContainmentEvidence,
     ContainmentPolicy,
@@ -2425,6 +2426,9 @@ class Runner:
                     input_file.seek(0)
 
                 launch_env = {**os.environ, **env} if env is not None else dict(os.environ)
+                # Issue #1632: pin the agent's agent-loop after the backend env
+                # merge, so it composes with the coder CI-dispatch guard.
+                launch_env.update(agent_executable_environment(launch_env))
                 if turn_id is not None:
                     launch_env["AGENT_LOOP_INVOCATION_ID"] = turn_id
                 if broker is not None:
@@ -2644,6 +2648,7 @@ class Runner:
             log_file.flush()
             allocated_fds: tuple[int, int] | None = None
             launch_env = {**os.environ, **env} if env is not None else dict(os.environ)
+            launch_env.update(agent_executable_environment(launch_env))
             if turn_id is not None:
                 launch_env["AGENT_LOOP_INVOCATION_ID"] = turn_id
             if broker is not None:

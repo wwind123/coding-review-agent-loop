@@ -1765,6 +1765,15 @@ citable. `--fixture` needs at least 30 seconds and the broker; it never runs
 locally. See
 [Multi-process fixtures](docs/local_agent_loop.md#multi-process-fixtures-run-tests---fixture).
 
+Every agent subprocess resolves this install's `agent-loop`: the orchestrator
+puts a private, import-pinned launcher first on each agent's `PATH` and exports
+its absolute path as `AGENT_LOOP_EXECUTABLE`, whatever other `agent-loop` the
+inherited `PATH` holds. Each brokered receipt records the client's tool commit;
+a receipt from a different or unidentified `agent-loop` is flagged with a
+`run-tests-tool-mismatch` or `run-tests-tool-unidentified` diagnostic, never
+rejected. See
+[Agent-loop executable pin and receipt tool identity](docs/local_agent_loop.md#agent-loop-executable-pin-and-receipt-tool-identity).
+
 When agent memory is enabled, the wrapper records measured outcomes, elapsed
 time, the attempted cap, a privacy-preserving environment fingerprint, and
 cheap lockfile/configuration hashes in `test-runtime.json`. Recent successful
@@ -1814,9 +1823,8 @@ must leave headroom for analysis, edits, and reporting; split or shard healthy
 browser/integration matrices when that improves diagnosis and retry cost.
 
 Before a managed wrapper is recommended, agent-loop runs a non-mutating
-`run-tests --preflight` probe. It checks at most the absolute `agent-loop`
-console entry and the current-interpreter module fallback, once per invocation,
-with a five-second watchdog (and no more than six distinct recognized inner
+`run-tests --preflight` probe. It checks only the running install's pinned
+`agent-loop` launcher, once per invocation, with a five-second watchdog (and no more than six distinct recognized inner
 launcher candidates per invocation). The inner probe uses the effective target
 environment, including ambient values merged with a partial overlay. The probe
 never runs remembered test arguments,

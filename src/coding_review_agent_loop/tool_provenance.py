@@ -13,6 +13,7 @@ import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Callable
 
 from . import inspect_tool
@@ -86,10 +87,25 @@ def capture_tool_provenance(
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
 ) -> dict:
     """Capture the loaded package's checkout HEAD and cleanliness; never raises."""
+    return _capture_with_refusal(
+        lambda git: executable_location_refusal(git, config),
+        executor=executor,
+        which=which,
+        deadline_seconds=deadline_seconds,
+    )
+
+
+def _capture_with_refusal(
+    refusal: Callable[[str], str | None],
+    *,
+    executor: inspect_tool.Executor | None,
+    which: Callable[[str], str | None],
+    deadline_seconds: float,
+) -> dict:
     package_path = str(Path(__file__).resolve().parent)
     result = _empty(package_path)
     try:
-        _capture(config, result, executor, which, deadline_seconds)
+        _capture(refusal, result, executor, which, deadline_seconds)
     except _Stop as stop:
         result["error"] = stop.error
     except subprocess.TimeoutExpired:
@@ -106,14 +122,14 @@ def capture_tool_provenance(
     return result
 
 
-def _capture(config, result, executor, which, deadline_seconds) -> None:
+def _capture(refusal_for, result, executor, which, deadline_seconds) -> None:
     found = which("git")
     if not found:
         raise _Stop("git-unavailable")
     # Pin one absolute path: a relative PATH entry would otherwise be validated
     # against this process's cwd but executed against the probe's cwd.
     git = os.path.abspath(found)
-    refusal = executable_location_refusal(git, config)
+    refusal = refusal_for(git)
     if refusal:
         result["untrusted_git"] = git
         raise _Stop("git-untrusted-location")
@@ -204,3 +220,63 @@ def capture_process_provenance(config: AgentLoopConfig) -> dict:
 def process_provenance(config: AgentLoopConfig) -> dict:
     """The cached capture, capturing (and logging) when the CLI did not."""
     return capture_process_provenance(config)
+
+
+CLIENT_DEADLINE_SECONDS = 3.0
+
+
+def _client_git_refusal(environment: Mapping[str, str], cwd: Path | None) -> Callable[[str], str | None]:
+    """Refuse a git executable inside the assigned workdir or the cwd checkout."""
+    roots = [
+        value for value in (environment.get("AGENT_LOOP_WORKDIR"), str(cwd) if cwd else None) if value
+    ]
+
+    def refusal(git: str) -> str | None:
+        forms = {os.path.abspath(git), os.path.realpath(git)}
+        for root in roots:
+            for base in {os.path.abspath(root), os.path.realpath(root)}:
+                for form in forms:
+                    if form == base or form.startswith(base.rstrip(os.sep) + os.sep):
+                        return f"{git} lies inside {root}"
+        return None
+
+    return refusal
+
+
+def capture_client_tool_provenance(
+    *,
+    environment: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+    executor: inspect_tool.Executor | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+    deadline_seconds: float = CLIENT_DEADLINE_SECONDS,
+) -> dict:
+    """Config-free capture for the ``run-tests`` client (#1632); never raises."""
+    try:
+        values = os.environ if environment is None else environment
+        refusal = _client_git_refusal(values, cwd)
+    except Exception:  # noqa: BLE001 - capture must never abort a run
+        refusal = lambda git: None  # noqa: E731
+    try:
+        return _capture_with_refusal(
+            refusal, executor=executor, which=which, deadline_seconds=deadline_seconds
+        )
+    except Exception as exc:  # noqa: BLE001 - capture must never abort a run
+        result = _empty(str(Path(__file__).resolve().parent))
+        result["error"] = f"capture-failed: {type(exc).__name__}"
+        return result
+
+
+_ORCHESTRATOR_FALLBACK: dict | None = None
+
+
+def orchestrator_tool_provenance() -> dict:
+    """The orchestrator's cached capture, or a lazy config-free capture once."""
+    global _ORCHESTRATOR_FALLBACK
+    if _PROCESS_PROVENANCE is not None:
+        return _PROCESS_PROVENANCE
+    if _ORCHESTRATOR_FALLBACK is None:
+        _ORCHESTRATOR_FALLBACK = capture_client_tool_provenance(
+            deadline_seconds=DEFAULT_DEADLINE_SECONDS
+        )
+    return _ORCHESTRATOR_FALLBACK

@@ -1,8 +1,8 @@
 # Execution and concurrency
 
-How agent and Git processes run: per-run worktrees over a shared store, the agent-loop-owned Git boundary and private fetch transport with SSH identity selection, pre-turn checkout verification, process-tree containment, test interpreter and worker budgets, pre-collection launch-failure provenance, the Antigravity quota-group fallback, the opt-in quota reset wait, and the other entry paths outside the review loop.
+How agent and Git processes run: per-run worktrees over a shared store, the agent-loop-owned Git boundary and private fetch transport with SSH identity selection, pre-turn checkout verification, process-tree containment, test interpreter and worker budgets, pre-collection launch-failure provenance, the Antigravity quota-group fallback, the opt-in quota reset wait, the agent-loop executable pin with its receipt tool identity, and the other entry paths outside the review loop.
 
-Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_containment.py`, `tests/test_test_workers.py`.
+Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/agent_executable.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_containment.py`, `tests/test_test_workers.py`, `tests/test_agent_executable.py`.
 
 ## Execution and Concurrency
 
@@ -350,6 +350,62 @@ registers its stale-latch reset there. A run-lifecycle lock, separate from the
 claim registry lock, covers the increment, the hooks and the decrement, so no
 other run is admitted before the reset finishes. Waits outside any scope have
 no run boundary, so their callers call `reset_wait_state()` themselves.
+
+### Agent-loop executable pin
+
+Agents are told to run `agent-loop run-tests -- <command>`, so every agent
+subprocess must resolve the orchestrator's own install, not the first
+`agent-loop` on its inherited `PATH` (#1632). `agent_executable.py` writes a
+private, content-addressed POSIX `sh` launcher named `agent-loop` under
+`<scratch>/agent-loop-exe/<digest>/`, using the same atomic-replace pattern as
+the coder `gh` guard. It execs the lexical `sys.executable` with `-I` and
+prepends the orchestrator's effective import path, frozen at install time
+without empty or relative entries, so a coder's `PYTHONPATH`, its cwd and
+user-site installs cannot select other code. Both launch-environment sites in
+`runner.py` (pipe and PTY) apply `agent_executable_environment` after the
+backend env merge and before the broker environment and containment
+preparation. It puts only the launcher directory first on `PATH` (never the
+whole venv `bin`), strips an earlier copy so launches never stack it, and
+exports the launcher path as `AGENT_LOOP_EXECUTABLE`. Because the pin is
+applied last it composes with the coder CI-dispatch guard: the final `PATH`
+is `<launcher dir>:<guard dir>:<pre-guard PATH>`, and the guard still strips
+only its own directory. The read-only inspector builds its own closed `PATH`
+and is unchanged. Installation is fail-soft: an `OSError` logs one warning
+and the agent keeps its inherited `PATH`. Windows is out of scope.
+
+The launcher is the only run-tests wrapper candidate. `_wrapper_candidates` and
+`resolve_wrapper_prefix` in `test_runtime.py` return neither an ambient-`PATH`
+`agent-loop` nor the unpinned `sys.executable -m coding_review_agent_loop.cli`
+spelling. When the launcher is unavailable or fails its `run-tests --preflight`
+probe, the sandboxed coder grant is omitted with the existing warning and no
+wrapper is rendered. Report-side parsing still recognizes coder-typed `-m` and
+bare spellings. At startup, issue, task, pr, discuss and managed-pr log a
+warning naming both paths when the agent-visible `agent-loop` is not the
+launcher, and an informational line when the inherited `PATH` holds another
+`agent-loop`. Neither line blocks the run.
+
+**Receipt tool identity.** The `run-tests` client captures its own tool
+commit, dirty flag and package path (bounded at 3 s, never raising) and sends
+them to the broker as the reserved `AGENT_LOOP_RUN_TESTS_TOOL_COMMIT`,
+`AGENT_LOOP_RUN_TESTS_TOOL_DIRTY` and `AGENT_LOOP_RUN_TESTS_TOOL_PACKAGE`
+environment entries, so the broker request schema is unchanged and old and
+new clients and brokers interoperate. The broker pops them before the target
+launches; they are also environment-identity exclusions. Each journaled
+observation gets a `ToolIdentity` comparing the client with the orchestrator's
+process capture: `match` (equal commits), `mismatch` (different commits, or
+different package digests when a commit is unknown), `unidentified` (an older
+client sent nothing) or `unknown`. Only commits and 12-hex package digests are
+stored; raw package paths go only to the orchestrator's stderr log. The record
+is projected as its own `tool_identity` field outside the four-caveat cap and
+decoded defensively, so legacy rows are unchanged and a malformed value
+decodes as absent. It is unauthenticated diagnostic data. It never changes
+provenance, supersession or the evidence gate: the broker, not the client,
+executes the target, so a flagged receipt stays parent-observed. The coder
+follow-up receipts section, the unchanged-head stop and the evidence-stall
+decision render the derived `run-tests-tool-mismatch` or
+`run-tests-tool-unidentified` diagnostic. Standalone (broker-less) telemetry
+rows record `tool_commit`, `tool_dirty` and `tool_package_digest` and stay
+telemetry-unverified.
 
 ## Other Entry Paths
 

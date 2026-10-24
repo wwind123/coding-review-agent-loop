@@ -4113,11 +4113,14 @@ def render_evidence_stall_decision(
     matrix_identity: str,
     rows: Mapping[str, str],
     k: int,
+    evidence: object = None,
 ) -> str:
     """Human-decision text for an evidence-only stall (#1324).
 
     Names the PR, the exact head, the approved matrix identity prefix, K, and
     each unsatisfied row with its orchestrator-derived explanation.
+    ``evidence`` (the bound coder record's bounded local test evidence) adds
+    the run-tests tool identity clause when a receipt was flagged (#1632).
     """
     def clean(text: str) -> str:
         text = " ".join(str(text).split()).replace("`", "'")
@@ -4133,6 +4136,7 @@ def render_evidence_stall_decision(
         "check or other machine obligation was open, and the unsatisfied risk-matrix rows did "
         "not change. Unsatisfied rows and why their capture failed:\n"
         f"{row_lines}\n"
+        f"{_tool_identity_line(evidence)}"
         "Decide how to proceed:\n"
         "1. Continue so the coder retries capture: rerun with `--pr-evidence-stall-rounds 0` "
         "(or a larger K).\n"
@@ -4143,6 +4147,13 @@ def render_evidence_stall_decision(
         "3. Override with a signed human decision through the existing signed-requirement "
         "path, then rerun the same command."
     )
+
+
+def _tool_identity_line(evidence: object) -> str:
+    from .local_test_evidence import tool_identity_clause
+
+    clause = tool_identity_clause(evidence).strip() if evidence else ""
+    return f"{clause}\n" if clause else ""
 
 
 def _head_bound_coder_record(
@@ -4751,7 +4762,8 @@ def _pr_evidence_stall_decision(
         )
         raise HumanDecisionRequiredError(
             render_evidence_stall_decision(
-                pr_number, head_sha, identity, unsatisfied.rows, config.pr_evidence_stall_rounds
+                pr_number, head_sha, identity, unsatisfied.rows, config.pr_evidence_stall_rounds,
+                evidence=(bound.metadata.local_test_evidence if bound is not None else None),
             )
         )
     return EvidenceStallOutcome(snapshot.to_payload())

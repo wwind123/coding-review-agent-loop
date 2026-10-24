@@ -248,7 +248,11 @@ from .ci_health import (
     classify_watch_failure,
     is_wholly_infrastructure_blocked,
 )
-from .local_test_evidence import superseded_by_current_turn, unsuperseded_receipts_sentence
+from .local_test_evidence import (
+    superseded_by_current_turn,
+    tool_identity_clause,
+    unsuperseded_receipts_sentence,
+)
 from .comment_rendering import (
     add_coder_followup_head_unchanged_notice,
     normalize_freeform_signature,
@@ -651,6 +655,7 @@ def unchanged_head_stop_message(
         "review of the same diff cannot change the verdict. Stopping before round "
         f"{round_number + 1}; human review required."
         f"{unsuperseded_receipts_sentence(evidence)}"
+        f"{tool_identity_clause(evidence)}"
         f"{citation_sentence}"
         f"{route}"
     )

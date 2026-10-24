@@ -73,7 +73,7 @@ from .github import (
     validate_open_issue,
     validate_open_pr,
 )
-from . import quota_wait, tool_provenance
+from . import agent_executable, quota_wait, tool_provenance
 from .logging import agent_log_path, log
 from .orchestrator import (
     run_discuss_loop,
@@ -2147,6 +2147,7 @@ def _record_run_tests_result(
     caveats: Sequence[str],
     launch_integrity: str,
     launch_state: Mapping[str, str],
+    tool_identity: Mapping[str, object] | None = None,
 ) -> None:
     record_test_observation(
         args.memory_dir,
@@ -2165,7 +2166,42 @@ def _record_run_tests_result(
         caveats=caveats,
         launch_integrity=launch_integrity,
         launch_state=launch_state,
+        tool_identity=tool_identity,
     )
+
+
+def _client_tool_identity() -> dict[str, str]:
+    """The run-tests client's own agent-loop identity as reserved variables (#1632).
+
+    Carried to the broker through ``environment_overrides`` so the request
+    schema is unchanged; capture is bounded and never raises.
+    """
+    from .local_test_evidence import TOOL_COMMIT_ENV, TOOL_DIRTY_ENV, TOOL_PACKAGE_ENV
+
+    try:
+        captured = tool_provenance.capture_client_tool_provenance(cwd=Path.cwd())
+    except Exception:  # noqa: BLE001 - identity is diagnostic only
+        captured = {}
+    dirty = captured.get("dirty")
+    return {
+        TOOL_COMMIT_ENV: str(captured.get("commit") or ""),
+        TOOL_DIRTY_ENV: "true" if dirty is True else "false" if dirty is False else "unknown",
+        TOOL_PACKAGE_ENV: str(captured.get("package_path") or ""),
+    }
+
+
+def _standalone_tool_fields(identity: Mapping[str, str]) -> dict[str, object]:
+    """Standalone telemetry stamp: commit, dirty flag and package digest (#1632)."""
+    from .agent_executable import package_digest
+    from .local_test_evidence import TOOL_COMMIT_ENV, TOOL_DIRTY_ENV, TOOL_PACKAGE_ENV
+
+    package = identity.get(TOOL_PACKAGE_ENV) or ""
+    dirty = identity.get(TOOL_DIRTY_ENV)
+    return {
+        "tool_commit": identity.get(TOOL_COMMIT_ENV) or None,
+        "tool_dirty": True if dirty == "true" else False if dirty == "false" else None,
+        "tool_package_digest": package_digest(package) if package else None,
+    }
 
 
 def _broker_frame_is_pre_collection(result: object) -> bool:
@@ -2224,7 +2260,7 @@ def _run_fixture_tests(
             raw_inner,
             timeout_seconds=chosen,
             cwd=Path.cwd(),
-            environment_overrides=worker_budget.environment(),
+            environment_overrides={**worker_budget.environment(), **_client_tool_identity()},
             fixture=fixture,
         )
     except BrokerNotDispatched as exc:
@@ -2368,7 +2404,10 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                     raw_inner,
                     timeout_seconds=chosen,
                     cwd=Path.cwd(),
-                    environment_overrides=worker_budget.environment(),
+                    environment_overrides={
+                        **worker_budget.environment(),
+                        **_client_tool_identity(),
+                    },
                 )
             except (AgentLoopError, OSError, ValueError) as exc:
                 print(
@@ -2540,6 +2579,7 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                 caveats=result.worker_caveats,
                 launch_integrity=launch_integrity_state(result),
                 launch_state=launch_state_fields(result),
+                tool_identity=_standalone_tool_fields(_client_tool_identity()),
             )
         return int(result.returncode if result.returncode is not None else 1)
     except (AgentLoopError, OSError, ValueError) as exc:
@@ -2749,6 +2789,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command in {"issue", "task", "pr", "discuss", "managed-pr"}:
             # Before claims, sandbox setup and base-branch resolution (#1111).
             tool_provenance.capture_process_provenance(config)
+            # Issue #1632: warn when agents would resolve another agent-loop.
+            agent_executable.log_preflight(config)
         # Claim every required checkout before base-branch resolution, sandbox
         # setup or dispatch; released on every exit path below (#1127).
         claim_stack.enter_context(

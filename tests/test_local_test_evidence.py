@@ -6006,3 +6006,276 @@ def test_runner_retains_and_clears_the_unbounded_reconciliation_1626(tmp_path):
     runner._local_test_observations.clear()
     assert runner.render_local_test_evidence() is None
     assert runner.last_reconciled_local_test_evidence is None
+
+
+# --------------------------------------------- run-tests tool identity (#1632)
+
+from dataclasses import replace
+
+from coding_review_agent_loop.agent_executable import package_digest as _package_digest
+from coding_review_agent_loop.local_test_evidence import (
+    BROKER_REQUEST_FIELDS,
+    OUT_OF_CHECKOUT_CONTEXT_CAVEAT,
+    PRE_COLLECTION_LAUNCH_FAILURE_PREFIX,
+    TOOL_COMMIT_ENV,
+    TOOL_DIRTY_ENV,
+    TOOL_IDENTITY_ENVS,
+    TOOL_PACKAGE_ENV,
+    ToolIdentity,
+    build_tool_identity,
+    tool_identity_clause,
+    tool_identity_diagnostic,
+    unsuperseded_receipts_sentence,
+)
+
+_ORCHESTRATOR = {
+    "commit": "bc60cc2" + "0" * 33,
+    "dirty": False,
+    "package_path": "/opt/release/site-packages/coding_review_agent_loop",
+}
+
+
+def _client(commit=None, dirty="false", package="/opt/release/site-packages/coding_review_agent_loop"):
+    return {TOOL_COMMIT_ENV: commit or "", TOOL_DIRTY_ENV: dirty, TOOL_PACKAGE_ENV: package}
+
+
+def _tool_broker_rows(tmp_path, monkeypatch, *overrides, orchestrator=_ORCHESTRATOR):
+    """Run one brokered request per override set; return rows and target envs."""
+    monkeypatch.setattr(evidence_module, "_orchestrator_tool_provenance", lambda: dict(orchestrator))
+    root = tmp_path / "repo"
+    root.mkdir()
+    _init_snapshot_repo(root)
+    targets = []
+
+    def execute(argv, cwd, timeout, environment, stream):
+        targets.append(dict(environment))
+        return SimpleNamespace(
+            outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="",
+            wrapper_bootstrap="verified", inner_exec="started", suite_start="verified",
+        )
+
+    registry = EnvironmentIdentityRegistry()
+    server = BrokerServer(
+        root=root, turn_id="turn-tool", execute=execute, environment_registry=registry
+    ).start()
+    try:
+        environment = {
+            **server.environment,
+            "AGENT_LOOP_INVOCATION_ID": "turn-tool",
+            "PATH": os.environ.get("PATH", ""),
+        }
+        for override in overrides:
+            result = BrokerClient(environment).run(
+                [sys.executable, "-c", "pass"], timeout_seconds=5, cwd=root,
+                environment_overrides=override or None,
+            )
+            assert result.outcome == "passed"
+        rows = list(server.journal)
+    finally:
+        server.stop()
+    return rows, targets, registry
+
+
+def test_matching_receipt_is_stamped_and_survives_bounded_transport(tmp_path, monkeypatch):
+    fields_before = frozenset(BROKER_REQUEST_FIELDS)
+    rows, targets, registry = _tool_broker_rows(
+        tmp_path, monkeypatch, _client(commit=_ORCHESTRATOR["commit"], dirty="true"), {}
+    )
+    stamped, unstamped = rows
+    assert stamped.provenance == "parent-observed"
+    identity = stamped.tool_identity
+    assert identity.status == "match"
+    assert identity.client_commit == _ORCHESTRATOR["commit"]
+    assert identity.client_dirty is True
+    assert identity.client_package_digest == _package_digest(_ORCHESTRATOR["package_path"])
+    assert tool_identity_diagnostic(stamped) is None
+    # Neither forwarded to the target nor part of the environment identity.
+    assert all(name not in target for target in targets for name in TOOL_IDENTITY_ENVS)
+    assert stamped.environment_identity.compare(unstamped.environment_identity) == "equivalent"
+    assert set(TOOL_IDENTITY_ENVS) <= ENVIRONMENT_EXCLUSIONS
+    assert frozenset(BROKER_REQUEST_FIELDS) == fields_before
+    for name in TOOL_IDENTITY_ENVS:
+        assert name not in BROKER_REQUEST_FIELDS
+    # The identity survives encode/decode as its own field, without raw paths.
+    encoded = bounded_evidence_for_round(
+        reconcile_test_observations([stamped], registry=registry)
+    )
+    assert _ORCHESTRATOR["package_path"] not in encoded
+    decoded = decode_bounded_evidence(encoded)
+    (restored,) = decoded.observations
+    assert restored.tool_identity == identity
+    assert restored.provenance == "parent-observed"
+    assert tool_identity_diagnostic(restored) is None
+    assert tool_identity_clause(encoded) == ""
+
+
+def test_mismatched_commit_is_flagged_not_rejected(tmp_path, monkeypatch, capsys):
+    rows, _targets, registry = _tool_broker_rows(
+        tmp_path, monkeypatch,
+        _client(commit="42340e7b" + "1" * 32, package="/tmp/clone/src/coding_review_agent_loop"),
+    )
+    (row,) = rows
+    assert row.tool_identity.status == "mismatch"
+    assert row.provenance == "parent-observed"
+    assert row.outcome == "passed"
+    diagnostic = tool_identity_diagnostic(row)
+    assert diagnostic == (
+        "run-tests-tool-mismatch: receipt produced by agent-loop 42340e7, orchestrator is bc60cc2"
+    )
+    # The orchestrator log (stderr) names both full package paths once.
+    err = capsys.readouterr().err
+    assert err.count("run-tests receipt produced by agent-loop") == 1
+    assert "/tmp/clone/src/coding_review_agent_loop" in err and _ORCHESTRATOR["package_path"] in err
+    evidence = reconcile_test_observations([row], registry=registry)
+    encoded = bounded_evidence_for_round(evidence)
+    assert "/tmp/clone" not in encoded
+    (restored,) = decode_bounded_evidence(encoded).observations
+    assert tool_identity_diagnostic(restored) == diagnostic
+    assert diagnostic in tool_identity_clause(encoded)
+
+
+def test_unknown_commits_compare_package_digests():
+    unknown = {**_ORCHESTRATOR, "commit": None}
+    differs = build_tool_identity(_client(package="/tmp/clone/src/coding_review_agent_loop"), unknown)
+    assert differs.status == "mismatch"
+    text = tool_identity_diagnostic(SimpleNamespace(tool_identity=differs))
+    assert text == (
+        "run-tests-tool-mismatch: receipt produced by agent-loop package "
+        f"{_package_digest('/tmp/clone/src/coding_review_agent_loop')}, orchestrator is package "
+        f"{_package_digest(_ORCHESTRATOR['package_path'])}"
+    )
+    same = build_tool_identity(_client(), unknown)
+    assert same.status == "unknown"
+    assert tool_identity_diagnostic(SimpleNamespace(tool_identity=same)) is None
+    dirty_match = build_tool_identity(
+        _client(commit=_ORCHESTRATOR["commit"], dirty="true"), {**_ORCHESTRATOR, "dirty": True}
+    )
+    assert dirty_match.status == "match"
+
+
+def test_legacy_client_without_identity_is_unidentified_and_accepted(tmp_path, monkeypatch):
+    rows, _targets, _registry = _tool_broker_rows(tmp_path, monkeypatch, {})
+    (row,) = rows
+    assert row.outcome == "passed" and row.provenance == "parent-observed"
+    assert row.tool_identity.status == "unidentified"
+    assert tool_identity_diagnostic(row) == (
+        "run-tests-tool-unidentified: run-tests client did not report its agent-loop "
+        "identity (likely an older install)"
+    )
+
+
+def test_tool_identity_never_changes_provenance_or_supersession():
+    registry = EnvironmentIdentityRegistry()
+    failure = _observation(
+        outcome="failed", timestamp="2026-10-09T10:00:00+00:00", receipt_id="fail-a",
+        registry=registry,
+    )
+    passing = _observation(
+        outcome="passed", timestamp="2026-10-09T10:05:00+00:00", receipt_id="pass-b",
+        registry=registry,
+    )
+    mismatch = build_tool_identity(_client(commit="42340e7"), _ORCHESTRATOR)
+    plain = reconcile_test_observations([failure, passing], registry=registry)
+    flagged = reconcile_test_observations(
+        [failure, replace(passing, tool_identity=mismatch)], registry=registry
+    )
+    assert [(row.receipt_id, row.provenance, row.superseded_by) for row in plain.observations] == [
+        (row.receipt_id, row.provenance, row.superseded_by) for row in flagged.observations
+    ]
+    assert plain.authoritative_failures == flagged.authoritative_failures
+    assert _by_receipt(flagged)["fail-a"].superseded_by == "pass-b"
+    assert _by_receipt(flagged)["pass-b"].tool_identity == mismatch
+
+
+def test_legacy_rows_decode_and_project_byte_identically():
+    registry = EnvironmentIdentityRegistry()
+    row = _observation(
+        outcome="failed", timestamp="2026-10-09T10:00:00+00:00", receipt_id="legacy",
+        registry=registry,
+    )
+    assert "tool_identity" not in row.public_projection()
+    encoded = bounded_evidence_for_round(reconcile_test_observations([row], registry=registry))
+    assert "tool_identity" not in encoded
+    (restored,) = decode_bounded_evidence(encoded).observations
+    assert restored.tool_identity is None
+    assert tool_identity_diagnostic(restored) is None
+    assert "tool_identity" not in restored.public_projection()
+    canonical = canonicalize_bounded_evidence(encoded)
+    assert canonicalize_bounded_evidence(canonical) == canonical
+    assert "tool_identity" not in canonical
+    assert tool_identity_clause(encoded) == ""
+    assert unsuperseded_receipts_sentence(encoded) != ""
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "match",
+        [],
+        {"status": "bogus"},
+        {"status": "mismatch", "client_commit": {"x": 1}, "client_dirty": "maybe"},
+        {"status": "match", "client_package_digest": "not-hex", "orchestrator_commit": 7},
+    ],
+)
+def test_malformed_tool_identity_decodes_without_raising(malformed):
+    registry = EnvironmentIdentityRegistry()
+    row = _observation(
+        outcome="passed", timestamp="2026-10-09T10:00:00+00:00", receipt_id="r", registry=registry
+    )
+    payload = json.loads(bounded_evidence_for_round(reconcile_test_observations([row], registry=registry)))
+    payload["observations"][0]["tool_identity"] = malformed
+    decoded = decode_bounded_evidence(json.dumps(payload))
+    (restored,) = decoded.observations
+    identity = restored.tool_identity
+    if isinstance(malformed, dict) and malformed.get("status") in {"match", "mismatch"}:
+        assert identity is not None
+        assert identity.client_commit is None and identity.orchestrator_commit is None
+        assert identity.client_package_digest is None and identity.client_dirty is None
+    else:
+        assert identity is None
+
+
+def test_tool_diagnostic_survives_saturated_caveat_slots():
+    registry = EnvironmentIdentityRegistry()
+    caveats = (
+        f"{PRE_COLLECTION_LAUNCH_FAILURE_PREFIX}: interpreter missing",
+        OUT_OF_CHECKOUT_CONTEXT_CAVEAT,
+        "capture-limited",
+        "safe command truncated; argv omitted",
+    )
+    row = replace(
+        _observation(
+            outcome="launch-failed", timestamp="2026-10-09T10:00:00+00:00", receipt_id="sat",
+            registry=registry,
+        ),
+        caveats=caveats,
+        tool_identity=build_tool_identity(_client(commit="42340e7"), _ORCHESTRATOR),
+    )
+    projection = row.public_projection()
+    assert projection["caveats"] == list(caveats)
+    encoded = bounded_evidence_for_round(reconcile_test_observations([row], registry=registry))
+    (restored,) = decode_bounded_evidence(encoded, restore_classification=True).observations
+    for caveat in caveats:
+        assert caveat in restored.caveats
+    assert tool_identity_diagnostic(restored).startswith("run-tests-tool-mismatch: ")
+    assert "run-tests-tool-mismatch" in tool_identity_clause(encoded)
+
+
+def test_dropped_flagged_rows_stay_countable_after_truncation():
+    registry = EnvironmentIdentityRegistry()
+    mismatch = build_tool_identity(_client(commit="42340e7"), _ORCHESTRATOR)
+    rows = [
+        replace(
+            _observation(
+                outcome="passed", timestamp=f"2026-10-09T10:{index:02d}:00+00:00",
+                receipt_id=f"r{index}", registry=registry,
+            ),
+            tool_identity=mismatch,
+        )
+        for index in range(40)
+    ]
+    encoded = bounded_evidence_for_round(reconcile_test_observations(rows, registry=registry))
+    payload = json.loads(encoded)
+    assert len(payload["observations"]) < 40
+    dropped = 40 - len(payload["observations"])
+    assert f"{dropped} dropped row(s) carried a run-tests tool identity diagnostic" in payload["caveats"]

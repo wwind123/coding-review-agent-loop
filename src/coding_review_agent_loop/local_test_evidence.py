@@ -23,6 +23,7 @@ import shlex
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -159,6 +160,10 @@ ENVIRONMENT_EXCLUSIONS = frozenset(
         # Broker-owned per-request fixture state directory (#1326); the
         # fixture identity itself keys fixture rows apart.
         "AGENT_LOOP_FIXTURE_STATE_DIR",
+        # Client tool identity (#1632): diagnostic only, popped by the broker.
+        "AGENT_LOOP_RUN_TESTS_TOOL_COMMIT",
+        "AGENT_LOOP_RUN_TESTS_TOOL_DIRTY",
+        "AGENT_LOOP_RUN_TESTS_TOOL_PACKAGE",
         "PWD",
         "OLDPWD",
         "SHLVL",
@@ -543,6 +548,163 @@ def decode_fixture_record(value: object) -> tuple[FixtureRecord, tuple[str, ...]
         return unreadable_fixture_record(value), (FIXTURE_UNREADABLE_CAVEAT,)
 
 
+TOOL_COMMIT_ENV = "AGENT_LOOP_RUN_TESTS_TOOL_COMMIT"
+TOOL_DIRTY_ENV = "AGENT_LOOP_RUN_TESTS_TOOL_DIRTY"
+TOOL_PACKAGE_ENV = "AGENT_LOOP_RUN_TESTS_TOOL_PACKAGE"
+TOOL_IDENTITY_ENVS = (TOOL_COMMIT_ENV, TOOL_DIRTY_ENV, TOOL_PACKAGE_ENV)
+TOOL_IDENTITY_STATUSES = frozenset({"match", "mismatch", "unidentified", "unknown"})
+TOOL_MISMATCH_DIAGNOSTIC = "run-tests-tool-mismatch"
+TOOL_UNIDENTIFIED_DIAGNOSTIC = "run-tests-tool-unidentified"
+_TOOL_COMMIT_RE = re.compile(r"^[0-9a-f]{7,64}$")
+_TOOL_DIGEST_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _tool_commit(value: object) -> str | None:
+    if isinstance(value, str) and _TOOL_COMMIT_RE.match(value.strip().lower()):
+        return value.strip().lower()
+    return None
+
+
+def _tool_digest(value: object) -> str | None:
+    return value if isinstance(value, str) and _TOOL_DIGEST_RE.match(value) else None
+
+
+def _tool_dirty(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return {"true": True, "false": False}.get(value.strip().lower())
+    return None
+
+
+@dataclass(frozen=True)
+class ToolIdentity:
+    """The ``run-tests`` client's agent-loop identity against the orchestrator's (#1632).
+
+    Unauthenticated diagnostic data: it never changes provenance,
+    supersession or the evidence gate.  Raw package paths are never stored;
+    only short digests are.
+    """
+
+    status: str
+    client_commit: str | None = None
+    client_dirty: bool | None = None
+    client_package_digest: str | None = None
+    orchestrator_commit: str | None = None
+    orchestrator_dirty: bool | None = None
+    orchestrator_package_digest: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "client_commit": self.client_commit,
+            "client_dirty": self.client_dirty,
+            "client_package_digest": self.client_package_digest,
+            "orchestrator_commit": self.orchestrator_commit,
+            "orchestrator_dirty": self.orchestrator_dirty,
+            "orchestrator_package_digest": self.orchestrator_package_digest,
+        }
+
+    @classmethod
+    def from_value(cls, value: object) -> "ToolIdentity | None":
+        """Decode defensively; any malformed value yields ``None``."""
+        if isinstance(value, ToolIdentity):
+            return value
+        if not isinstance(value, Mapping):
+            return None
+        status = value.get("status")
+        if status not in TOOL_IDENTITY_STATUSES:
+            return None
+        try:
+            return cls(
+                status=str(status),
+                client_commit=_tool_commit(value.get("client_commit")),
+                client_dirty=_tool_dirty(value.get("client_dirty")),
+                client_package_digest=_tool_digest(value.get("client_package_digest")),
+                orchestrator_commit=_tool_commit(value.get("orchestrator_commit")),
+                orchestrator_dirty=_tool_dirty(value.get("orchestrator_dirty")),
+                orchestrator_package_digest=_tool_digest(value.get("orchestrator_package_digest")),
+            )
+        except Exception:  # noqa: BLE001 - malformed input never raises
+            return None
+
+
+def _package_path_digest(path: object) -> str | None:
+    if not isinstance(path, str) or not path.strip():
+        return None
+    from .agent_executable import package_digest
+
+    return package_digest(path.strip())
+
+
+def build_tool_identity(
+    client: Mapping[str, str], orchestrator: Mapping[str, object]
+) -> ToolIdentity:
+    """Compare the client's reported identity with the orchestrator's capture."""
+    reported = any(name in client for name in TOOL_IDENTITY_ENVS)
+    client_commit = _tool_commit(client.get(TOOL_COMMIT_ENV))
+    client_digest = _package_path_digest(client.get(TOOL_PACKAGE_ENV))
+    orchestrator_commit = _tool_commit(orchestrator.get("commit"))
+    orchestrator_digest = _package_path_digest(orchestrator.get("package_path"))
+    if not reported:
+        status = "unidentified"
+    elif client_commit and orchestrator_commit:
+        status = "match" if client_commit == orchestrator_commit else "mismatch"
+    elif client_digest and orchestrator_digest and client_digest != orchestrator_digest:
+        status = "mismatch"
+    else:
+        status = "unknown"
+    return ToolIdentity(
+        status=status,
+        client_commit=client_commit,
+        client_dirty=_tool_dirty(client.get(TOOL_DIRTY_ENV)),
+        client_package_digest=client_digest,
+        orchestrator_commit=orchestrator_commit,
+        orchestrator_dirty=_tool_dirty(orchestrator.get("dirty")),
+        orchestrator_package_digest=orchestrator_digest,
+    )
+
+
+def _orchestrator_tool_provenance() -> Mapping[str, object]:
+    from .tool_provenance import orchestrator_tool_provenance
+
+    return orchestrator_tool_provenance()
+
+
+def _tool_label(commit: str | None, dirty: bool | None, digest: str | None) -> str:
+    if commit:
+        return commit[:7] + (" dirty" if dirty else "")
+    if digest:
+        return f"package {digest}"
+    return "unknown"
+
+
+def tool_identity_diagnostic(row: object) -> str | None:
+    """The ``run-tests-tool-*`` diagnostic for a row's tool identity, or None."""
+    identity = getattr(row, "tool_identity", None)
+    if identity is None and isinstance(row, Mapping):
+        identity = ToolIdentity.from_value(row.get("tool_identity"))
+    if not isinstance(identity, ToolIdentity):
+        return None
+    if identity.status == "mismatch":
+        if identity.client_commit and identity.orchestrator_commit:
+            client = _tool_label(identity.client_commit, identity.client_dirty, None)
+            orchestrator = _tool_label(identity.orchestrator_commit, identity.orchestrator_dirty, None)
+        else:
+            client = _tool_label(None, None, identity.client_package_digest)
+            orchestrator = _tool_label(None, None, identity.orchestrator_package_digest)
+        return (
+            f"{TOOL_MISMATCH_DIAGNOSTIC}: receipt produced by agent-loop {client}, "
+            f"orchestrator is {orchestrator}"
+        )
+    if identity.status == "unidentified":
+        return (
+            f"{TOOL_UNIDENTIFIED_DIAGNOSTIC}: run-tests client did not report its agent-loop "
+            "identity (likely an older install)"
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class LocalTestObservation:
     command: tuple[str, ...]
@@ -586,6 +748,10 @@ class LocalTestObservation:
     # broker did not create, which never takes part in cross-restart
     # supersession.
     restart_command_digest: str | None = field(default=None, repr=False, compare=False)
+    # Issue #1632: the run-tests client's tool identity, set by the broker on
+    # every journaled row.  Diagnostic only; ``None`` keeps legacy rows and
+    # projections unchanged.
+    tool_identity: ToolIdentity | None = field(default=None, compare=False)
     # Issue #1633: set only by ``decode_bounded_evidence``.  Never projected,
     # so a persisted payload cannot claim it.
     restored: bool = field(default=False, repr=False, compare=False)
@@ -682,6 +848,9 @@ class LocalTestObservation:
             self.restart_command_digest
         ):
             projection["restart_command_digest"] = self.restart_command_digest
+        if isinstance(self.tool_identity, ToolIdentity):
+            # Its own field, outside the four-caveat cap (#1632).
+            projection["tool_identity"] = self.tool_identity.to_dict()
         return projection
 
     def to_dict(self) -> dict[str, object]:
@@ -948,6 +1117,7 @@ def observation_from_mapping(
         command_verbatim=value.get("command_verbatim") is True,
         fixture=fixture,
         restart_command_digest=restart_digest,
+        tool_identity=ToolIdentity.from_value(value.get("tool_identity")),
     )
 
 
@@ -1873,11 +2043,25 @@ def bounded_evidence_for_round(evidence: LocalTestEvidence | Mapping[str, object
         value = dict(payload)
         value["observations"] = candidate
         if truncated:
+            kept_ids = {id(row) for row in candidate}
+            # Issue #1632: a dropped row's tool diagnostic stays countable.
+            dropped_tool = sum(
+                1 for row in all_details
+                if id(row) not in kept_ids and tool_identity_diagnostic(row) is not None
+            )
             value["caveats"] = list(
                 dict.fromkeys(
                     [
                         *value.get("caveats", []),
                         "local evidence details truncated before transport",
+                        *(
+                            [
+                                f"{dropped_tool} dropped row(s) carried a run-tests tool "
+                                "identity diagnostic"
+                            ]
+                            if dropped_tool
+                            else []
+                        ),
                     ]
                 )
             )
@@ -3061,6 +3245,7 @@ class TestBrokerServer:
         self._worker_lock_root: Path | None = None
         # Runner-supplied at turn start; never read from a coder request (#1107).
         self._telemetry_attribution = dict(telemetry_attribution) if telemetry_attribution else None
+        self._tool_mismatch_logged: set[tuple[str | None, str | None]] = set()
 
     def set_execution_context(
         self,
@@ -3454,6 +3639,12 @@ class TestBrokerServer:
             BROKER_ENDPOINT_ENV, BROKER_CAPABILITY_ENV, BROKER_PROTOCOL_ENV, FIXTURE_STATE_DIR_ENV,
         ):
             environment.pop(name, None)
+        # Issue #1632: the client's tool identity is diagnostic only; it never
+        # reaches the target or its environment identity.
+        client_tool = {
+            name: str(environment.pop(name)) for name in TOOL_IDENTITY_ENVS if name in environment
+        }
+        tool_identity = self._tool_identity(client_tool)
         environment["AGENT_LOOP_INVOCATION_ID"] = self.turn_id
         pinned_root = self._pinned_root
         if pinned_root is None:
@@ -3564,7 +3755,29 @@ class TestBrokerServer:
             return self._complete_request(
                 argv=argv, cwd=cwd, environment=environment, before=before,
                 result=result, fixture_run=fixture_run, root=pinned_root.path,
+                tool_identity=tool_identity,
             )
+
+    def _tool_identity(self, client: Mapping[str, str]) -> ToolIdentity | None:
+        """Compare a request's client identity with this orchestrator; never raises."""
+        try:
+            orchestrator = _orchestrator_tool_provenance()
+            identity = build_tool_identity(client, orchestrator)
+        except Exception:  # noqa: BLE001 - a diagnostic must never refuse a run
+            return None
+        if identity.status == "mismatch":
+            # Raw package paths go only to the orchestrator's own log.
+            key = (client.get(TOOL_COMMIT_ENV), client.get(TOOL_PACKAGE_ENV))
+            if key not in self._tool_mismatch_logged:
+                self._tool_mismatch_logged.add(key)
+                sys.stderr.write(
+                    "agent-loop: Warning: run-tests receipt produced by agent-loop "
+                    f"{client.get(TOOL_COMMIT_ENV) or 'unknown'} from "
+                    f"{client.get(TOOL_PACKAGE_ENV) or '<unknown package>'}; orchestrator is "
+                    f"{orchestrator.get('commit') or 'unknown'} from "
+                    f"{orchestrator.get('package_path') or '<unknown package>'}\n"
+                )
+        return identity
 
     def _run_foreground(
         self, argv: tuple[str, ...], *, cwd: Path, cwd_fd: int, timeout_seconds: float,
@@ -3727,7 +3940,7 @@ class TestBrokerServer:
     def _complete_request(
         self, *, argv: tuple[str, ...], cwd: Path, environment: Mapping[str, str],
         before: "TrackedTreeSnapshot", result: Any, fixture_run: "_FixtureRun | None",
-        root: Path | None = None,
+        root: Path | None = None, tool_identity: ToolIdentity | None = None,
     ) -> dict[str, object]:
         """Snapshot, attribute, fold, journal and build the result frame."""
         launched_fixture = fixture_run is not None and fixture_run.supervisor is not None
@@ -3847,6 +4060,7 @@ class TestBrokerServer:
                 restart_command_digest=(
                     _restart_command_digest(argv, cwd, root) if root is not None else None
                 ),
+                tool_identity=tool_identity,
             )
             with self._journal_lock:
                 if self._stop_event.is_set() and "unattributed: broker shutdown" not in observation.attribution.caveats:
@@ -4093,6 +4307,30 @@ def unsuperseded_receipts_sentence(value: object) -> str:
         + ", ".join(named) + more
         + ". This stop may be evidence bookkeeping rather than a missing code change; an operator "
         "can verify the command and decide whether the receipts are still meaningful."
+    )
+
+
+def tool_identity_clause(value: object) -> str:
+    """One bounded clause naming the first run-tests tool diagnostic (#1632), or ``""``.
+
+    Accepts decoded evidence or a bounded evidence string.
+    """
+    evidence = value
+    if not isinstance(value, LocalTestEvidence):
+        evidence = decode_bounded_evidence(value, restore_classification=True) if value else None
+    if evidence is None:
+        return ""
+    diagnostics = [
+        diagnostic
+        for row in evidence.observations
+        if (diagnostic := tool_identity_diagnostic(row)) is not None
+    ]
+    if not diagnostics:
+        return ""
+    more = f" ({len(diagnostics) - 1} more row(s) flagged)" if len(diagnostics) > 1 else ""
+    return (
+        f" Run-tests tool identity: {_bounded(diagnostics[0], 240)}{more}; receipts are kept and "
+        "judged as before."
     )
 
 
