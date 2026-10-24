@@ -453,3 +453,52 @@ def test_backticked_tokens_in_a_later_clause_do_not_affect_the_list():
         "Run them with `agent-loop run-tests`."
     )
     assert (binding.kind, binding.rows) == (BINDING_BOUND, ("row-a", "row-b"))
+
+
+# --- the clause after a row list: row candidates vs command spans (items 3, 4) --
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Bare unknown rows the list grammar did not reach (item-3).
+        "Provide passing test observations for risk-matrix rows row-a, row-b, and also ghost-row.",
+        "Provide passing test observations for rows row-a and row-b, then ghost-row.",
+        "Provide passing test observations for rows row-a, row-b plus also ghost_row.",
+        # Backticked unknown rows the grammar did not reach (item-2).
+        "Provide passing test observations for rows `row-a`, `row-b` then `ghost-row`.",
+        "Provide passing test observations for rows `row-a`, `row-b` with `ghost-row` too.",
+        # An unknown row after a command span still counts.
+        "Provide passing test observations for rows row-a via `agent-loop run-tests`, and also ghost-row.",
+    ],
+)
+def test_unparsed_row_candidate_after_a_list_forces_repair(text):
+    binding = _derive(text)
+    assert (binding.kind, binding.reason, binding.rows) == (
+        BINDING_NEEDS_REPAIR, REASON_UNKNOWN_ROW_REFERENCE, ()
+    )
+
+
+_COMMAND_TAILS = [
+    " using `agent-loop run-tests`",
+    " via `run-tests`",
+    " through agent-loop run-tests",
+    " by running `pytest tests/test_row_a.py -q`",
+    " with `agent-loop run-tests -- python -m pytest`",
+    " (rerun with run-tests)",
+]
+
+
+@pytest.mark.parametrize("tail", _COMMAND_TAILS)
+def test_command_span_after_a_row_list_is_not_a_row_reference(tail):
+    binding = _derive(f"Provide passing test observations for risk-matrix row `row-a`{tail}.")
+    assert (binding.kind, binding.rows) == (BINDING_BOUND, ("row-a",))
+
+
+@pytest.mark.parametrize("tail", _COMMAND_TAILS)
+def test_carried_finding_with_a_command_span_is_bound(tail):
+    item = _finding("item-1", f"Provide passing test observations for risk-matrix row `row-a`{tail}.")
+    result, bound = bind_carried_evidence_findings(
+        [item], ALL_UNSATISFIED, carried_item_ids=("item-1",)
+    )
+    assert bound == (("item-1", ("row-a",)),)
+    assert result[0].evidence_row_ids == ("row-a",)

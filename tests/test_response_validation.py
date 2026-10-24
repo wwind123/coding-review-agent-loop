@@ -1657,3 +1657,29 @@ def test_unknown_final_row_after_a_compound_separator_requests_binding_repair(se
     )
     with _pytest.raises(_AgentLoopError, match="unknown-row-reference"):
         _validate_binding(_binding_review([text]))
+
+
+def test_unparsed_bare_unknown_row_after_a_list_requests_binding_repair():
+    """Review item-3: a bare unknown row the list grammar did not reach is never dropped."""
+    text = (
+        "Provide passing test observations for risk-matrix rows share-page-locale, row-b, "
+        "and also ghost-row."
+    )
+    with _pytest.raises(_AgentLoopError, match="unknown-row-reference"):
+        _validate_binding(_binding_review([text]))
+
+
+@_pytest.mark.parametrize(
+    "tail", [" using `agent-loop run-tests`", " via `run-tests`", " through agent-loop run-tests"]
+)
+def test_command_span_after_a_row_raises_no_repair_and_mints_the_row(tail):
+    """Review item-4: a same-sentence command does not block a derivable binding."""
+    from coding_review_agent_loop.evidence_binding import derived_evidence_row_ids
+
+    text = f"Provide passing test observations for risk-matrix row `share-page-locale`{tail}."
+    parsed = _validate_binding(_binding_review([text]))
+    item = parsed.blocking_items[0]
+    assert item.evidence_row_ids == ()
+    assert derived_evidence_row_ids(
+        item.text, reviewer_tag=item.evidence_row_ids, has_sub_items=False, context=_BIND_CONTEXT
+    ) == ("share-page-locale",)

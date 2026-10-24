@@ -98,7 +98,23 @@ _ROW_LIST_RE = re.compile(
     _I,
 )
 _ROW_TOKEN_RE = re.compile(_ROW_TOKEN)
-_BACKTICKED_RE = re.compile(r"`[^`\n]+`")
+# A token in the clause after a parsed row list: backticked, or a bare
+# kebab/snake identifier shaped like a row ID.
+_TAIL_TOKEN_RE = re.compile(r"`[^`\n]+`|(?<![\w-])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+(?![\w-])")
+# Words that introduce a command; the command span runs to the next list
+# continuation (comma, semicolon, "and", "or") or the end of the clause.
+_COMMAND_INTRO_RE = re.compile(
+    r"\b(?:using|via|through|run|running|re-?run|re-?running|execute|executing"
+    r"|invoke|invoking|command)\b",
+    _I,
+)
+_COMMAND_SPAN_END_RE = re.compile(r",|;|\band\b|\bor\b", _I)
+# A backticked span is a command, not a row ID, when it holds whitespace or
+# path/assignment characters, or starts with a common tool name.
+_COMMAND_CONTENT_RE = re.compile(
+    r"\s|[/.=$]|^(?:agent-loop|python\d*|pytest|pip|npm|npx|pnpm|yarn|node|git|gh|uv|make|bash|sh)\b",
+    _I,
+)
 # The end of the clause a row list belongs to: sentence punctuation followed
 # by whitespace or the end of the text, or a line break.
 _CLAUSE_END_RE = re.compile(r"[.!?](?=\s|$)|\n")
@@ -147,17 +163,42 @@ def _row_references(text: str, enforceable: Sequence[str]) -> tuple[list[tuple[i
                     cited.append((position, token))
             elif token and token not in unknown:
                 unknown.append(token)
-        # A list is bound only when it is fully interpreted.  A backticked
-        # token left in the same clause after the parsed list may be a row the
-        # grammar did not reach, so an unknown one forces a binding repair
-        # instead of a partial binding of the rows parsed so far.
+        # A list is bound only when it is fully interpreted.  A row-shaped
+        # token left in the same clause after the parsed list, bare or
+        # backticked, may be a row the grammar did not reach, so an unknown one
+        # forces a binding repair instead of a partial binding.  Command spans
+        # are not row references and never count.
         clause_end = _CLAUSE_END_RE.search(text, list_match.end())
         tail = text[list_match.end(): clause_end.start() if clause_end else len(text)]
-        for token_match in _BACKTICKED_RE.finditer(tail):
-            token = _strip_token(token_match.group(0))
-            if token and token not in allowed and token not in unknown:
+        for token in _unparsed_row_candidates(tail):
+            if token not in allowed and token not in unknown:
                 unknown.append(token)
     return cited, unknown
+
+
+def _command_spans(tail: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    for intro in _COMMAND_INTRO_RE.finditer(tail):
+        end = _COMMAND_SPAN_END_RE.search(tail, intro.end())
+        spans.append((intro.start(), end.start() if end else len(tail)))
+    return spans
+
+
+def _unparsed_row_candidates(tail: str) -> list[str]:
+    """Potential row references in the clause after a parsed row list."""
+    spans = _command_spans(tail)
+    candidates: list[str] = []
+    for match in _TAIL_TOKEN_RE.finditer(tail):
+        if any(start <= match.start() < end for start, end in spans):
+            continue
+        raw = match.group(0)
+        token = _strip_token(raw)
+        if not token or _COMMAND_INTRO_RE.fullmatch(token):
+            continue
+        if raw.startswith("`") and _COMMAND_CONTENT_RE.search(token):
+            continue
+        candidates.append(token)
+    return candidates
 
 
 def derive_evidence_row_binding(
