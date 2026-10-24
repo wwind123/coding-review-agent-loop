@@ -46,6 +46,7 @@ from coding_review_agent_loop.review_step_back import render_step_back_human_dec
 from coding_review_agent_loop.issue_pr_handoff import format_issue_pr_handoff_comment
 from coding_review_agent_loop.round_state import (
     PostedRoundMetadata,
+    PostedRoundRecord,
     _approved_plan_hash,
     _attach_round_metadata,
 )
@@ -1300,3 +1301,44 @@ def test_history_export_baseline_forms_follow_the_plan_evidence_rule():
     )
     for column in _BASELINE_COLUMNS:
         assert legacy[column] == {"value": 0, "evidence": "verified"}
+
+
+def _approach_alternative_stop_message() -> str:
+    from coding_review_agent_loop import review_step_back as sb
+
+    records = (
+        PostedRoundRecord(
+            index=1,
+            metadata=PostedRoundMetadata(
+                flow="pr", role="coder", agent="Claude", round_number=4, subject="b" * 40,
+                step_back_entries=({
+                    "phase": "pr", "reviewer": CODEX, "trigger_round": 3,
+                    "trigger_head": "a" * 40,
+                    "anchor": {"path": "src/spool.py", "start": 124, "end": 140},
+                },),
+                raw_structured_coder_response=json.dumps(
+                    {"summary": "Approach alternative: drop the predecessor check."}
+                ),
+            ),
+            body="",
+        ),
+    )
+    alternative = sb.pr_step_back_approach_alternative(records, head_sha="b" * 40)
+    return sb.render_pr_step_back_approach_alternative_decision(PR, alternative)
+
+
+def test_pr_approach_alternative_stop_is_a_human_decision_stop():
+    """#1628: the rendered message, including its ``PR #N: `` prefix, is recognized."""
+    message = _approach_alternative_stop_message()
+    assert message.startswith(f"PR #{PR}: ")
+    stop = recognize_diagnostic(render_pr_scheduling_diagnostic("round 5", message))
+    assert (stop.kind, stop.reason, stop.round_number) == (
+        KIND_HUMAN_DECISION_STOP, "pr-step-back-approach-alternative", 5,
+    )
+    # Without the PR prefix it is recognized too; other PR stops stay generic.
+    bare = message.split(": ", 1)[1]
+    assert recognize_diagnostic(
+        render_pr_scheduling_diagnostic("round 5", bare)
+    ).reason == "pr-step-back-approach-alternative"
+    other = recognize_diagnostic(render_pr_scheduling_diagnostic("round 5", "PR #9: panel unsafe"))
+    assert (other.kind, other.reason) == (KIND_PR_STOP, "scheduling-stop")

@@ -2432,20 +2432,17 @@ def step_back_generalization(
         metadata = record.metadata
         if record.index != entry.record_index or metadata.role != "coder":
             continue
-        raw = metadata.raw_structured_coder_response
-        if not raw:
-            return None
-        try:
-            payload, _end = json.JSONDecoder().raw_decode(raw.lstrip())
-        except ValueError:
-            return None
-        summary = payload.get("summary") if isinstance(payload, dict) else None
-        return summary if isinstance(summary, str) else None
+        return _decode_coder_summary(metadata.raw_structured_coder_response)
     return None
 
 
+# Leading bytes of the two step-back coder choices' ``summary`` (#1628).
+PR_STEP_BACK_GENERALIZATION_PREFIX = "Generalization:"
+PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX = "Approach alternative:"
+
+
 def render_pr_step_back_coder_guidance(triggers: Sequence[PrClusterTrigger]) -> str:
-    """The generalize-the-class coder instruction for one or more clusters."""
+    """The two-choice step-back coder instruction for one or more clusters."""
     blocks = []
     for trigger in triggers:
         cluster = trigger.cluster
@@ -2457,12 +2454,144 @@ def render_pr_step_back_coder_guidance(triggers: Sequence[PrClusterTrigger]) -> 
     return (
         "STEP-BACK TURN (orchestrator, not a reviewer finding): a reviewer has blocked "
         "several consecutive rounds, each with a new finding in the same part of the code. "
-        "Do not patch only the newest finding. Name the common root of these findings, fix "
+        "Do not patch only the newest finding. Choose exactly one:\n"
+        "(a) Generalize: name the common root of these findings, fix "
         "the whole class with one rule, and add a parametrized test that covers every branch "
         "of that rule. This replaces any instruction to keep the change small and "
-        "localized. Begin the `summary` of your structured response with `Generalization:` "
-        "followed by the rule you applied.\n"
+        "localized. Begin the `summary` of your structured response with "
+        f"`{PR_STEP_BACK_GENERALIZATION_PREFIX}` followed by the rule you applied.\n"
+        "(b) Approach alternative: if the approved approach itself generates this class of "
+        "findings, do not redesign beyond the approved plan and do not patch the newest "
+        "finding. Begin the `summary` with "
+        f"`{PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX}`, then name the materially smaller "
+        "alternative (which may be removing or relaxing an existing check or guard) and say "
+        "which of these findings it dissolves. The run then stops for a human decision on "
+        "that alternative; no review runs on it first.\n"
         "Clusters:\n" + "\n".join(blocks) + "\n"
+    )
+
+
+@dataclass(frozen=True)
+class PrApproachAlternative:
+    """A step-back coder turn that proposed replacing the approved approach."""
+
+    coder_round: int
+    head: str
+    entries: tuple[PrStepBackEntry, ...]
+    excerpt: str
+
+    @property
+    def reviewers(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(entry.reviewer for entry in self.entries))
+
+
+def _decode_coder_summary(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    try:
+        payload, _end = json.JSONDecoder().raw_decode(raw.lstrip())
+    except ValueError:
+        return None
+    summary = payload.get("summary") if isinstance(payload, dict) else None
+    return summary if isinstance(summary, str) else None
+
+
+def approach_alternative_excerpt(summary: str | None) -> str | None:
+    """The proposed alternative when ``summary`` opens with the prefix, else ``None``."""
+    if not isinstance(summary, str):
+        return None
+    text = summary.lstrip()
+    if not text.startswith(PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX):
+        return None
+    return text[len(PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX):].strip()
+
+
+def pr_step_back_approach_alternative(
+    records: Sequence["PostedRoundRecord"], *, head_sha: str | None
+) -> PrApproachAlternative | None:
+    """The newest valid step-back coder record's alternative, bound to ``head_sha``.
+
+    Returns ``None`` (today's behavior, never an approval) unless the newest PR
+    coder record carrying a valid step-back entry has a summary opening with
+    :data:`PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX`, its resulting head is
+    exactly ``head_sha``, and no PR review of that head was recorded after it.
+    A moved head means a human pushed past the proposal.
+    """
+    if not head_sha:
+        return None
+    ordered = sorted(records, key=lambda item: item.index)
+    latest: "PostedRoundRecord | None" = None
+    for record in ordered:
+        metadata = record.metadata
+        if (
+            metadata.flow == "pr"
+            and metadata.role == "coder"
+            and metadata.step_back_status == "valid"
+            and any(entry.get("phase") == PHASE_PR for entry in metadata.step_back_entries)
+        ):
+            latest = record
+    if latest is None or latest.metadata.subject != head_sha:
+        return None
+    if any(
+        record.index > latest.index
+        and record.metadata.flow == "pr"
+        and record.metadata.role == "reviewer"
+        and record.metadata.subject == head_sha
+        for record in ordered
+    ):
+        return None
+    excerpt = approach_alternative_excerpt(
+        _decode_coder_summary(latest.metadata.raw_structured_coder_response)
+    )
+    if excerpt is None:
+        return None
+    metadata = latest.metadata
+    entries = tuple(
+        PrStepBackEntry(
+            reviewer=str(entry["reviewer"]),
+            trigger_round=int(entry["trigger_round"]),
+            trigger_head=str(entry["trigger_head"]),
+            path=str(entry["anchor"]["path"]),
+            start=int(entry["anchor"]["start"]),
+            end=int(entry["anchor"]["end"]),
+            coder_round=metadata.round_number,
+            resulting_head=str(metadata.subject),
+            record_index=latest.index,
+        )
+        for entry in metadata.step_back_entries
+        if entry.get("phase") == PHASE_PR
+    )
+    return PrApproachAlternative(metadata.round_number, head_sha, entries, excerpt)
+
+
+# Leading bytes of the PR approach-alternative human-decision stop (#1628).
+PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT = (
+    "human decision required: the coder proposes replacing the approved approach"
+)
+
+
+def render_pr_step_back_approach_alternative_decision(
+    pr_number: int, alternative: PrApproachAlternative
+) -> str:
+    """Human-decision diagnostic after a step-back turn proposed an approach change."""
+    excerpt = alternative.excerpt.strip()
+    if len(excerpt) > ALTERNATIVE_EXCERPT_LIMIT:
+        excerpt = excerpt[: ALTERNATIVE_EXCERPT_LIMIT - 1].rstrip() + "…"
+    clusters = "; ".join(
+        f"{entry.reviewer} on `{entry.path}` lines {entry.start}-{entry.end}"
+        for entry in alternative.entries
+    ) or "(no cluster recorded)"
+    return (
+        f"PR #{pr_number}: "
+        + PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT
+        + f" (step-back turn at round {alternative.coder_round}, resulting head "
+        f"`{alternative.head}`, after consecutive blocks from {clusters}). No review or "
+        f"coder turn was run on it. Proposed alternative (excerpt): {excerpt or '(empty)'} "
+        "Decide one of: rerun with the scope change approved (re-plan or amend the issue, "
+        "push the replacement and rerun); accept a stated limitation (document it, resolve "
+        "or defer the findings, push the commit and rerun); or continue generalizing (rerun "
+        "with --pr-step-back-rounds 0). A pushed head no longer equals the recorded head, so "
+        "a rerun after a push does not stop again on this proposal."
     )
 
 
@@ -2524,7 +2653,9 @@ def render_pr_step_back_human_decision(
         f"{excerpt or '(not recorded)'} Decide one of: continue (rerun with "
         "--pr-step-back-rounds 0, which also disables step-back detection), accept a stated "
         "limitation (document it, resolve or defer the sibling, push the commit and rerun), or "
-        "redesign the affected code (push the redesign and rerun). After a push, a rerun does "
+        "redesign the affected code (push the redesign and rerun). If the approved approach "
+        "itself generates this class of findings, approve a scope change (re-plan or amend "
+        "the issue), push the replacement and rerun. After a push, a rerun does "
         "not stop again on this round's sibling; only a new sibling in a later review does."
     )
 

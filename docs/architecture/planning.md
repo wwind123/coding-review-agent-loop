@@ -43,6 +43,16 @@ resolved model/effort settings. An implementation override must not implicitly
 change the reviewer or repair backend. Issue creation and PR resume converge
 on the shared PR loop after provenance validation.
 
+Every plan and plan-revision prompt form (full, compact and semantic patch)
+requires one `plan_steps` entry beginning `Smallest alternative:` that names the
+smallest change that could resolve the issue, including removing or relaxing the
+existing check that produces the bad outcome, and says `adopted` or why it was
+rejected; an issue's prescribed design is a suggestion unless marked as a hard
+requirement. Full and compact plan-review prompts tell reviewers to block on a
+missing note, a weak rejection reason or a clearly sufficient rejected
+alternative. This is prompt-only: no plan schema or validator change, so
+historical and approved plans stay valid (#1628).
+
 Stateful or multi-mode planning can add a generation-1 risk-based mode and
 transition matrix. The matrix is a bounded structured contract with explicit
 applicability, meaningful combinations, exclusions, stable matrix-local row IDs,

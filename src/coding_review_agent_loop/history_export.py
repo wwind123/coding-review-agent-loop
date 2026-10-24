@@ -60,6 +60,7 @@ from .review_step_back import (
     BASELINE_FORM_FULL,
     BASELINE_FORM_UNAVAILABLE,
     PLAN_STEP_BACK_HUMAN_DECISION_PREFIX,
+    PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT,
     effective_new_items,
     eligible_new_mandatory_items,
     first_plan_review_round,
@@ -171,6 +172,7 @@ _PLAN_SCHEDULING_RE = _template_regex(
 _PR_SCHEDULING_RE = _template_regex(
     PR_SCHEDULING_DIAGNOSTIC_TEMPLATE, {"label": _LABEL_GROUP, "message": r".*"}
 )
+_PR_NUMBER_PREFIX_RE = re.compile(r"^PR #[1-9][0-9]*: ")
 _CI_COMMENT_RE = _template_regex(CI_INFRASTRUCTURE_COMMENT_HEADLINE, {"pr_number": r"[1-9][0-9]*"})
 _CI_STOP_RE = _template_regex(CI_INFRASTRUCTURE_STOP_HEADLINE, {"pr_number": r"[1-9][0-9]*"})
 _INCOMPLETE_ROUND_RE = _template_regex(
@@ -284,6 +286,15 @@ def recognize_diagnostic(body: str) -> RecognizedDiagnostic | None:
         if message.startswith(PLAN_PRIMARY_STALL_PREFIX):
             return RecognizedDiagnostic(
                 KIND_HUMAN_DECISION_STOP, "plan-primary-stall", round_number, terminal=True
+            )
+        # The PR approach-alternative stop (#1628) is rendered after a
+        # ``PR #N: `` prefix.
+        if _PR_NUMBER_PREFIX_RE.sub("", message, count=1).startswith(
+            PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT
+        ):
+            return RecognizedDiagnostic(
+                KIND_HUMAN_DECISION_STOP, "pr-step-back-approach-alternative", round_number,
+                terminal=True,
             )
         return RecognizedDiagnostic(kind, "scheduling-stop", round_number, terminal=True)
     first_line = body.split("\n", 1)[0]

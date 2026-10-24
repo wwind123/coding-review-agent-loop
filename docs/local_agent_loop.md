@@ -4351,9 +4351,18 @@ earlier.
   (each configured reviewer, or only the primary under `primary-then-panel`) has
   blocked K consecutive rounds with **new** mandatory findings, and those findings'
   `path:line-range` references cluster on one file span, the next coder turn is a
-  step-back: do not patch only the newest finding, name the common root, fix the
-  whole class with one rule, add a parametrized test covering every branch, and
-  begin the `summary` with `Generalization:` and the rule. Repeats of an unresolved
+  step-back: do not patch only the newest finding, and choose one of two answers.
+  Either name the common root, fix the whole class with one rule, add a
+  parametrized test covering every branch, and begin the `summary` with
+  `Generalization:` and the rule; or, when the approved approach itself generates
+  this class, begin the `summary` with `Approach alternative:` and name a
+  materially smaller alternative (for example removing or relaxing an existing
+  check) without redesigning beyond the plan. An `Approach alternative:` answer
+  stops the run at the human-decision boundary (exit code 4) before any review of
+  that head, quoting the alternative: rerun with the scope change approved
+  (re-plan or amend the issue, push the replacement), accept a stated limitation,
+  or continue generalizing with `--pr-step-back-rounds 0`. A resumed run stops
+  again only while the PR head still equals the proposal head. Repeats of an unresolved
   finding, future follow-ups, findings without a line reference, and blocks on
   unrelated files do not count. Reviewers that omit line references never trigger
   it. Several reviewers triggering at once share one coder turn.
@@ -4380,7 +4389,7 @@ general reviewer contract is unchanged in every other round.
 If the sweep review, or any later review while the episode is active, introduces a
 new mandatory finding in the cluster, the run stops at the human-decision boundary
 (exit code 4) before any further coder turn: continue (rerun with `--pr-step-back-rounds 0`),
-accept a stated limitation, or redesign (for the last two, push the commit and rerun: only a sibling introduced by the review of the round being dispatched stops the run, so a sibling that already stopped it does not stop it again). The message names the cluster, the mapping
+accept a stated limitation, or redesign (if the approved approach itself generates the class, approve a scope change first by re-planning or amending the issue; for the last two, push the commit and rerun: only a sibling introduced by the review of the round being dispatched stops the run, so a sibling that already stopped it does not stop it again). The message names the cluster, the mapping
 outcome, the sibling findings, and the coder's `Generalization:` excerpt. A carried
 item is not a sibling and keeps the episode open while it is in the cluster; the
 episode closes when the reviewer approves or no unresolved mandatory item of theirs

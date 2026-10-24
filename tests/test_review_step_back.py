@@ -3290,3 +3290,139 @@ def test_unified_diff_form_escapes_removed_two_hyphen_fence_line():
     assert rendered.chars == len(payload)
     assert _ESCAPE_NOTICE_FRAGMENT in rendered.block
     assert not any(_FENCE_LIKE_LINE_START.match(line) for line in payload_lines[2:])
+
+
+# --- PR step-back approach alternative (#1628) -------------------------------
+
+
+def _alt_raw(summary):
+    return json.dumps({"kind": "coder_followup", "summary": summary})
+
+
+def _pr_trigger():
+    return sb.PrClusterTrigger(
+        PR_REVIEWER, 3, HEAD_A, sb.Cluster("src/spool.py", 124, 140, ("item-1",)),
+        ("[item-1] (round 3) gap one",),
+    )
+
+
+def test_pr_step_back_guidance_offers_both_choices_and_keeps_the_cluster_block():
+    """`pr-step-back-two-choices`."""
+    guidance = sb.render_pr_step_back_coder_guidance([_pr_trigger()])
+    assert "Choose exactly one" in guidance
+    assert f"`{sb.PR_STEP_BACK_GENERALIZATION_PREFIX}`" in guidance
+    assert f"`{sb.PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX}`" in guidance
+    assert "fix the whole class with one rule" in guidance
+    assert "parametrized test" in guidance
+    assert "do not redesign beyond the approved plan" in guidance
+    assert "removing or relaxing an existing check" in guidance
+    assert "Clusters:" in guidance and "`src/spool.py` lines 124-140" in guidance
+    assert "[item-1] (round 3) gap one" in guidance
+
+
+def test_approach_alternative_matches_a_valid_step_back_record_at_the_same_head():
+    records = [
+        _pr_coder(
+            50, 4, HEAD_B, entries=[_pr_entry()],
+            raw=_alt_raw("  Approach alternative: drop the predecessor check."),
+        )
+    ]
+    alt = sb.pr_step_back_approach_alternative(records, head_sha=HEAD_B)
+    assert alt is not None
+    assert alt.excerpt == "drop the predecessor check."
+    assert alt.coder_round == 4 and alt.head == HEAD_B
+    assert alt.reviewers == (PR_REVIEWER,)
+    assert alt.entries[0].path == "src/spool.py"
+
+
+@pytest.mark.parametrize(
+    "records, head",
+    [
+        # Generalization keeps today's behavior.
+        ([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Generalization: one rule"))], HEAD_B),
+        # A non-step-back coder record never stops, even with the prefix.
+        ([_pr_coder(50, 4, HEAD_B, raw=_alt_raw("Approach alternative: x"))], HEAD_B),
+        # Unreadable or missing raw response.
+        ([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw="not json")], HEAD_B),
+        ([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=None)], HEAD_B),
+        ([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=json.dumps(["x"]))], HEAD_B),
+        # No head.
+        ([_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Approach alternative: x"))], None),
+    ],
+)
+def test_approach_alternative_fails_open_to_todays_behavior(records, head):
+    """`approach-alt-malformed`."""
+    assert sb.pr_step_back_approach_alternative(records, head_sha=head) is None
+
+
+def test_approach_alternative_ignores_an_invalid_step_back_record():
+    """`approach-alt-malformed`: an invalid step-back status carries no entries."""
+    invalid = PostedRoundRecord(
+        index=50,
+        metadata=PostedRoundMetadata(
+            flow="pr", role="coder", agent="Claude", round_number=4, subject=HEAD_B,
+            step_back_status="invalid",
+            raw_structured_coder_response=_alt_raw("Approach alternative: x"),
+        ),
+        body="",
+    )
+    assert sb.pr_step_back_approach_alternative([invalid], head_sha=HEAD_B) is None
+
+
+def test_approach_alternative_does_not_stop_on_a_moved_head():
+    """`approach-alt-head-moved`."""
+    records = [
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Approach alternative: x"))
+    ]
+    assert sb.pr_step_back_approach_alternative(records, head_sha=HEAD_C) is None
+
+
+def test_approach_alternative_does_not_stop_after_that_head_was_reviewed():
+    records = [
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Approach alternative: x")),
+        _pr_review(60, 4, HEAD_B, state="approved"),
+    ]
+    assert sb.pr_step_back_approach_alternative(records, head_sha=HEAD_B) is None
+
+
+def test_only_the_newest_step_back_record_counts():
+    records = [
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Approach alternative: x")),
+        _pr_coder(70, 6, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Generalization: y")),
+    ]
+    assert sb.pr_step_back_approach_alternative(records, head_sha=HEAD_B) is None
+
+
+def test_approach_alternative_decision_quotes_truncates_and_lists_three_choices():
+    long_text = "drop the check " * 400
+    records = [
+        _pr_coder(50, 4, HEAD_B, entries=[_pr_entry()], raw=_alt_raw("Approach alternative: " + long_text))
+    ]
+    alt = sb.pr_step_back_approach_alternative(records, head_sha=HEAD_B)
+    message = sb.render_pr_step_back_approach_alternative_decision(77, alt)
+    assert message.startswith("PR #77: " + sb.PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT)
+    assert "drop the check" in message and "…" in message
+    assert len(message) < sb.ALTERNATIVE_EXCERPT_LIMIT + 1200
+    assert "rerun with the scope change approved" in message
+    assert "accept a stated limitation" in message
+    assert "--pr-step-back-rounds 0" in message
+    assert "No review or coder turn was run on it" in message
+    assert "src/spool.py` lines 100-105" in message
+
+
+def test_sibling_escalation_offers_the_reachable_scope_change_route():
+    """`generalization-unchanged`: prefix and existing choices kept."""
+    entry = sb.pr_step_back_history(
+        [_pr_coder(50, 4, HEAD_B, entries=[_pr_entry()])], PR_REVIEWER
+    )[0][0]
+    message = sb.render_pr_step_back_human_decision(
+        reviewer=PR_REVIEWER, entry=entry, mapping=None, siblings=(), window=40,
+        generalization="Generalization: x", sibling_round=5,
+    )
+    assert message.startswith(
+        "human decision required: the coder generalized a class of findings at round "
+    )
+    assert "--pr-step-back-rounds 0" in message and "accept a stated limitation" in message
+    assert "redesign the affected code" in message
+    assert "approve a scope change (re-plan or amend the issue), push the replacement and rerun" in message
+    assert "re-offer" not in message and "step-back offers" not in message

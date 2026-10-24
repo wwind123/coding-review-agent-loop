@@ -1831,3 +1831,88 @@ def test_enabling_the_gate_on_longer_history_measures_growth_from_the_first_atte
     growth = [c for c in runner.measurement_calls if c[:3] == ["git", "diff", "--shortstat"]][0]
     assert growth[3] == SB_HEAD and growth[4] == runner.pr_payload["headRefOid"]
     assert len(_sb_coder_prompts(runner)) == 5
+
+
+# --- PR step-back approach alternative (#1628) -------------------------------
+
+
+def _approach_alternative_coders():
+    return [
+        structured_coder_followup(addressed_items=[f"item-{n}"]) for n in (1, 2)
+    ] + [
+        structured_coder_followup(
+            addressed_items=["item-3"],
+            summary="Approach alternative: drop the predecessor-head disqualifier.",
+        )
+    ]
+
+
+def test_an_approach_alternative_step_back_stops_live_for_a_human_decision(tmp_path):
+    """`approach-alt-live-stop`."""
+    runner = _StepBackRunner(
+        claude_outputs=_approach_alternative_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
+    message = str(excinfo.value)
+    assert "the coder proposes replacing the approved approach" in message
+    assert "drop the predecessor-head disqualifier." in message
+    assert "rerun with the scope change approved" in message
+    assert "accept a stated limitation" in message and "--pr-step-back-rounds 0" in message
+    assert len(_sb_coder_prompts(runner)) == 3  # no further coder turn
+    assert len(_sb_codex_prompts(runner)) == 3  # no sweep review of the proposal head
+    assert not any("gh workflow run" in " ".join(cmd) for cmd, _cwd in runner.commands)
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+
+def test_a_resumed_run_stops_before_reviewing_the_approach_alternative_head(tmp_path):
+    """`approach-alt-resume-stop`: the record was posted, the live stop never ran."""
+    runner = _StepBackRunner(
+        claude_outputs=_approach_alternative_coders(),
+        codex_outputs=_three_clustered_blocks(),
+    )
+    with patch.object(pr_loop, "_pr_step_back_approach_alternative_stop"):
+        with pytest.raises(AgentLoopError, match="scripted agent output exhausted"):
+            run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
+    assert len(_sb_coder_prompts(runner)) == 3
+    reviews_before = len(_sb_codex_prompts(runner))  # includes the failed sweep attempt
+    runner.codex_outputs.append(_sb_review(resolved=["item-3"]))
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
+    assert "drop the predecessor-head disqualifier." in str(excinfo.value)
+    assert len(_sb_coder_prompts(runner)) == 3
+    assert len(_sb_codex_prompts(runner)) == reviews_before  # no review of that head
+    # Continuing to generalize disables the stop and reviews the head.
+    assert run_pr_loop(
+        runner, pr_number=77, config=_sb_config(tmp_path, pr_step_back_rounds=0)
+    ) == 0
+    assert len(_sb_codex_prompts(runner)) == reviews_before + 1
+
+
+def test_a_generalization_step_back_still_runs_the_sweep_review(tmp_path):
+    """`generalization-unchanged`."""
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+    assert run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path)) == 0
+    assert "Enumerate ALL remaining instances" in _sb_codex_prompts(runner)[3]
+
+
+def test_a_sibling_escalation_lists_the_scope_change_route(tmp_path):
+    """`generalization-unchanged`: the sibling stop keeps its prefix and adds the route."""
+    _runner, message = _run_to_sibling(tmp_path, "another branch at src/spool.py:134")
+    assert "human decision required: the coder generalized a class of findings" in message
+    assert "approve a scope change (re-plan or amend the issue)" in message
+    assert "re-offer" not in message
+
+
+def test_disabled_step_back_never_stops_on_an_approach_alternative_summary(tmp_path):
+    """`approach-alt-malformed`: step-back rounds 0 never stops."""
+    runner = _StepBackRunner(
+        claude_outputs=_approach_alternative_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+    config = _sb_config(tmp_path, pr_step_back_rounds=0)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
