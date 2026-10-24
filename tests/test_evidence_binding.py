@@ -360,3 +360,46 @@ def test_bound_tag_round_trips_through_round_state_serialization():
         evidence_row_ids=("row-a",),
     )
     assert _deserialize_unresolved_item(_serialize_unresolved_item(item)) == item
+
+
+# --- keyword case never hides a row reference (#1622 review item-1) -----------
+
+@pytest.mark.parametrize(
+    ("text", "kind", "reason", "rows"),
+    [
+        # Mixed known and unknown rows behind capitalized list keywords.
+        ("Provide passing test observations for risk-matrix Rows `row-a` and `ghost-row`.",
+         BINDING_NEEDS_REPAIR, REASON_UNKNOWN_ROW_REFERENCE, ()),
+        ("Provide passing test observations for ROWS row-a AND ghost-row.",
+         BINDING_NEEDS_REPAIR, REASON_UNKNOWN_ROW_REFERENCE, ()),
+        ("Provide passing test observations for Row: row-a Or `ghost-row`.",
+         BINDING_NEEDS_REPAIR, REASON_UNKNOWN_ROW_REFERENCE, ()),
+        # Unknown-only behind a capitalized keyword must not fall through to a
+        # collective binding of every row.
+        ("Provide passing test observations for the Risk-Matrix Rows `ghost-row`.",
+         BINDING_NEEDS_REPAIR, REASON_UNKNOWN_ROW_REFERENCE, ()),
+        ("Provide passing test observations for Row `ghost-row`.",
+         BINDING_NEEDS_REPAIR, REASON_UNKNOWN_ROW_REFERENCE, ()),
+        # Capitalized vocabulary, collective and matrix phrases still classify.
+        ("Provide PASSING TEST OBSERVATIONS for the RISK-MATRIX ROWS.", BINDING_BOUND, None, ROWS),
+        ("Provide Passing Test Observations for the Risk-Matrix Row.",
+         BINDING_NEEDS_REPAIR, REASON_MISSING_ROW_REFERENCE, ()),
+        ("FIX the defect and provide passing test observations for row-a.",
+         BINDING_CODE_DEMAND, None, ()),
+        ("Provide passing test observations for row-a; Do Not Change Code.",
+         BINDING_BOUND, None, ("row-a",)),
+    ],
+)
+def test_keyword_case_never_hides_a_row_reference(text, kind, reason, rows):
+    binding = _derive(text, ALL_UNSATISFIED)
+    assert (binding.kind, binding.reason, binding.rows) == (kind, reason, rows)
+
+
+def test_row_id_identity_stays_case_sensitive():
+    # `ROW-A` is not the approved `row-a`: after a row keyword it is unknown.
+    assert _derive("Provide passing test observations for Rows `ROW-A`.").reason == (
+        REASON_UNKNOWN_ROW_REFERENCE
+    )
+    # A bare differently-cased token is not the approved ID and is never bound.
+    bare = _derive("Provide passing test observations for ROW-A.")
+    assert (bare.kind, bare.rows) == (BINDING_NOT_EVIDENCE, ())

@@ -64,23 +64,32 @@ class EvidenceRowBinding:
     reason: str | None = None
 
 
+# Keyword recognition is case-insensitive everywhere (#1622 review): "Rows",
+# "AND" or "Risk-Matrix" must never hide a row reference.  Row-ID identity is
+# not: IDs are compared exactly, with their original case.
+_I = re.IGNORECASE
 _EVIDENCE_VOCABULARY_RE = re.compile(
     r"test[- ]observations?"
     r"|\brun-tests\b"
     r"|\b(?:admissible|passing|captured)\s+(?:[\w-]+\s+){0,2}?(?:evidence|observations?|citations?)\b"
     r"|risk[- ](?:test[- ])?matrix\s+evidence"
-    r"|\bcitation\s+evidence\b"
+    r"|\bcitation\s+evidence\b",
+    _I,
 )
-_MATRIX_PHRASE_RE = re.compile(r"risk[- ](?:test[- ])?matrix(?:\s+rows?)?|\bmatrix\s+rows?\b")
+_MATRIX_PHRASE_RE = re.compile(
+    r"risk[- ](?:test[- ])?matrix(?:\s+rows?)?|\bmatrix\s+rows?\b", _I
+)
 _COLLECTIVE_RE = re.compile(
     r"risk[- ](?:test[- ])?matrix\s+rows\b"
     r"|\b(?:all|every|each)\s+(?:of\s+the\s+)?(?:(?:risk[- ](?:test[- ])?)?matrix\s+)?rows?\b"
     r"|\bthe\s+(?:\d+|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen)"
-    r"\s+(?:(?:risk[- ](?:test[- ])?)?matrix\s+)?rows\b"
+    r"\s+(?:(?:risk[- ](?:test[- ])?)?matrix\s+)?rows\b",
+    _I,
 )
 _ROW_TOKEN = r"(?:`[^`\n]+`|[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+)(?![\w-])"
 _ROW_LIST_RE = re.compile(
-    r"\brows?(?:\s*:\s*|\s+)(" + _ROW_TOKEN + r"(?:\s*(?:,|/|\band\b|\bor\b)\s*" + _ROW_TOKEN + r")*)"
+    r"\brows?(?:\s*:\s*|\s+)(" + _ROW_TOKEN + r"(?:\s*(?:,|/|\band\b|\bor\b)\s*" + _ROW_TOKEN + r")*)",
+    _I,
 )
 _ROW_TOKEN_RE = re.compile(_ROW_TOKEN)
 # The closed list of negated code-change phrases stripped before the
@@ -89,14 +98,16 @@ _NEGATED_CODE_CHANGE_RE = re.compile(
     r"\b(?:do\s+not|don['’]t|never)\s+change\s+(?:the\s+)?code\b"
     r"|\bno\s+code\s+changes?\b"
     r"|\bwithout\s+(?:changing|modifying)\s+(?:the\s+)?code\b"
-    r"|\bnot\s+to\s+change\s+(?:the\s+)?code\b"
+    r"|\bnot\s+to\s+change\s+(?:the\s+)?code\b",
+    _I,
 )
 _CODE_DEMAND_RE = re.compile(
     r"\b(?:fix(?:es|ed|ing)?|change[sd]?|changing|modif(?:y|ies|ied|ying)"
     r"|update[sd]?|updating|implement(?:s|ed|ing)?|refactor\w*|rewrit\w*"
     r"|defects?|bugs?|regressions?|broken|incorrect(?:ly)?|wrong)\b"
     r"|\bmissing\s+(?:handling|guard)s?\b"
-    r"|\b(?:add|remove)\s+(?:a\s+|the\s+)?code\s+paths?\b"
+    r"|\b(?:add|remove)\s+(?:a\s+|the\s+)?code\s+paths?\b",
+    _I,
 )
 
 
@@ -133,15 +144,14 @@ def derive_evidence_row_binding(
     text: str, context: EvidenceBindingContext
 ) -> EvidenceRowBinding:
     """Classify one finding text; see the module docstring for the rule order."""
-    lowered = text.lower()
-    if not _EVIDENCE_VOCABULARY_RE.search(lowered):
+    if not _EVIDENCE_VOCABULARY_RE.search(text):
         return EvidenceRowBinding(BINDING_NOT_EVIDENCE)
     enforceable = tuple(dict.fromkeys(context.enforceable_row_ids))
     cited, unknown = _row_references(text, enforceable)
-    collective = bool(_COLLECTIVE_RE.search(lowered))
-    if not (cited or unknown or collective or _MATRIX_PHRASE_RE.search(lowered)):
+    collective = bool(_COLLECTIVE_RE.search(text))
+    if not (cited or unknown or collective or _MATRIX_PHRASE_RE.search(text)):
         return EvidenceRowBinding(BINDING_NOT_EVIDENCE)
-    if _CODE_DEMAND_RE.search(_NEGATED_CODE_CHANGE_RE.sub(" ", lowered)):
+    if _CODE_DEMAND_RE.search(_NEGATED_CODE_CHANGE_RE.sub(" ", text)):
         return EvidenceRowBinding(BINDING_CODE_DEMAND)
     if unknown:
         return EvidenceRowBinding(BINDING_NEEDS_REPAIR, reason=REASON_UNKNOWN_ROW_REFERENCE)
