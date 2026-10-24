@@ -472,12 +472,16 @@ def test_antigravity_backend_gemini_md_lock_serializes_concurrent_access(tmp_pat
 
 def test_antigravity_module_imports_without_fcntl():
     """Antigravity module must import cleanly even when fcntl is unavailable (Windows)."""
-    import importlib
     import sys
 
-    # Remove any cached import of the module under test
-    mods_to_remove = [k for k in sys.modules if "antigravity" in k]
-    for m in mods_to_remove:
+    import coding_review_agent_loop.agents as agents_pkg
+
+    # Keep the original module objects: other modules hold references to
+    # their functions, and a later test that monkeypatches the module (for
+    # example its ``_now`` clock) must patch the object production code uses.
+    saved = {k: v for k, v in sys.modules.items() if "antigravity" in k}
+    saved_attr = agents_pkg.__dict__.get("antigravity")
+    for m in saved:
         del sys.modules[m]
 
     # Simulate a platform without fcntl by hiding it
@@ -491,16 +495,12 @@ def test_antigravity_module_imports_without_fcntl():
             sys.modules["fcntl"] = original
         else:
             sys.modules.pop("fcntl", None)
-        # Re-remove so later tests get a clean import
-        for k in list(sys.modules):
-            if "antigravity" in k:
-                del sys.modules[k]
-        real_mod = importlib.import_module("coding_review_agent_loop.agents.antigravity")
-        import coding_review_agent_loop.agents.registry as registry_mod
-        import coding_review_agent_loop.repair as repair_mod
-
-        registry_mod.BACKENDS["antigravity"] = real_mod.BACKEND
-        repair_mod.AntigravityBackend = real_mod.AntigravityBackend
+        # Restore the original modules so later tests see the same objects.
+        for k in [k for k in sys.modules if "antigravity" in k]:
+            del sys.modules[k]
+        sys.modules.update(saved)
+        if saved_attr is not None:
+            agents_pkg.antigravity = saved_attr
 
 def test_antigravity_backend_git_lock_path_follows_linked_worktree(tmp_path):
     """_git_lock_path resolves a file-form .git marker (linked worktree) to the real

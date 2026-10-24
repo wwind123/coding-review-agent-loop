@@ -275,7 +275,7 @@ def test_lookalike_session_variable_names_remain_in_environment_identity(lookali
     assert registry.compare(registry.capture(base), registry.capture(changed)) == "different"
 
 
-def test_restart_evidence_is_identity_unknown_and_never_supersedes():
+def test_restart_evidence_without_a_command_digest_is_identity_unknown_and_never_supersedes():
     registry = EnvironmentIdentityRegistry()
     failure = _observation(
         outcome="failed",
@@ -5125,3 +5125,774 @@ def test_fixture_restart_decode_legacy_rows_have_no_fixture():
     assert "fixture" not in projection
     assert observation_from_mapping(projection).fixture is None
     assert _authoritative_receipt_passes(projection, claim="current-result")
+
+
+# Issue #1633: a failure restored from an earlier run can be superseded by a
+# later qualifying pass at the same head and tracked tree. --------------------
+
+from coding_review_agent_loop import protocol as _protocol  # noqa: E402
+from coding_review_agent_loop.local_test_evidence import (  # noqa: E402
+    CROSS_RESTART_SUPERSESSION_CAVEAT,
+    ENVIRONMENT_DIFFERS_CAVEAT,
+    ENVIRONMENT_NOT_COMPARED_CAVEAT,
+    FixtureRecord as _FixtureRecord,
+    TrackedTreeSnapshot as _RestartSnapshot,
+    _restart_command_digest,
+    observation_from_mapping as _from_mapping,
+    unsuperseded_receipts_sentence as _unsuperseded_sentence,
+)
+from coding_review_agent_loop.test_runtime import (  # noqa: E402
+    normalize_test_command as _normalize_command,
+)
+
+_ROOT_A = Path("/work/run-a/checkout")
+_ROOT_B = Path("/work/run-b/checkout")
+_HEAD = "a" * 40
+_TREE = "b" * 64
+_SCOPE = EvidenceScope("suite", ("tests/test_protocol.py",))
+_PLAIN_ARGV = ("python", "-m", "pytest", "tests/test_protocol.py", "-q")
+_T_FAIL = "2026-10-23T21:27:00+00:00"
+_T_PASS = "2026-10-23T22:24:00+00:00"
+
+
+def _broker_row(
+    argv=_PLAIN_ARGV, *, outcome, receipt, timestamp, registry, root=_ROOT_A, cwd=None,
+    head=_HEAD, digest=_TREE, scope=_SCOPE, fixture=None, environment=None,
+    state="current-head", untracked_input=False, stable=True,
+    provenance="parent-observed", caveats=(),
+):
+    """A row shaped exactly as ``TestBrokerServer._complete_request`` builds it."""
+    cwd = cwd or root
+    return LocalTestObservation(
+        command=tuple(argv),
+        outcome=outcome,
+        provenance=provenance,
+        scope=scope,
+        receipt_id=receipt,
+        turn_id=f"turn-{receipt}",
+        timestamp=timestamp,
+        cwd=str(cwd),
+        normalized_command=_normalize_command(argv, cwd=cwd),
+        returncode=0 if outcome == "passed" else 1,
+        attribution=TreeAttribution(
+            state=state, head=head, pre_digest="all", post_digest="all",
+            tracked_digest=digest, stable=stable, untracked_input=untracked_input,
+        ),
+        environment_state="not-compared",
+        environment_identity=registry.capture(environment or {"PATH": "/usr/bin"}),
+        caveats=("output stream was broker-forwarded", *caveats),
+        wrapper_bootstrap="verified",
+        inner_exec="started",
+        suite_start="verified",
+        fixture=fixture,
+        restart_command_digest=_restart_command_digest(argv, Path(cwd), root),
+    )
+
+
+def _restart_snapshot(head=_HEAD, digest=_TREE, **overrides):
+    values = dict(
+        root=str(_ROOT_B), head=head, digest="all", tracked_digest=digest,
+        status_clean=True, complete=True, stable=True,
+    )
+    values.update(overrides)
+    return _RestartSnapshot(**values)
+
+
+def _persist(rows, *, registry, current_head=None, snapshot=None):
+    """Reconcile, encode and canonicalize as a round record does."""
+    evidence = reconcile_test_observations(
+        rows, current_head=current_head, current_snapshot=snapshot, registry=registry
+    )
+    encoded = bounded_evidence_for_round(evidence)
+    return canonicalize_bounded_evidence(encoded)
+
+
+def _restore(encoded):
+    decoded = decode_bounded_evidence(encoded)
+    assert decoded is not None
+    assert all(row.restored for row in decoded.observations)
+    return list(decoded.observations)
+
+
+def _run_a_failure(argv=_PLAIN_ARGV, **overrides):
+    registry = EnvironmentIdentityRegistry()
+    failure = _broker_row(
+        argv, outcome="failed", receipt="run-a-failure", timestamp=_T_FAIL,
+        registry=registry, **overrides,
+    )
+    return _restore(_persist([failure], registry=registry))
+
+
+def _run_b_pass(argv=_PLAIN_ARGV, *, registry, **overrides):
+    values = dict(root=_ROOT_B)
+    values.update(overrides)
+    return _broker_row(
+        argv, outcome="passed", receipt="run-b-pass", timestamp=_T_PASS,
+        registry=registry, **values,
+    )
+
+
+_DEFAULT = object()
+
+
+def _reconcile_b(rows, *, registry, current_head=_HEAD, snapshot=_DEFAULT):
+    return reconcile_test_observations(
+        rows,
+        current_head=current_head,
+        current_snapshot=_restart_snapshot() if snapshot is _DEFAULT else snapshot,
+        registry=registry,
+    )
+
+
+def _assert_cross_restart_superseded(evidence, *, failure="run-a-failure", passing="run-b-pass"):
+    rows = _by_receipt(evidence)
+    assert rows[failure].superseded_by == passing
+    assert CROSS_RESTART_SUPERSESSION_CAVEAT in rows[failure].caveats
+    assert CROSS_RESTART_SUPERSESSION_CAVEAT not in rows[passing].caveats
+    assert evidence.authoritative_failures == ()
+
+
+def _assert_not_cross_restart_superseded(evidence, *, failure="run-a-failure"):
+    row = _by_receipt(evidence)[failure]
+    assert row.superseded_by != "run-b-pass"
+    assert CROSS_RESTART_SUPERSESSION_CAVEAT not in row.caveats
+
+
+def test_restart_command_digest_rejects_a_non_path_root():
+    with pytest.raises(TypeError):
+        _restart_command_digest(_PLAIN_ARGV, _ROOT_A, str(_ROOT_A))
+    with pytest.raises(TypeError):
+        _restart_command_digest(_PLAIN_ARGV, _ROOT_A, SimpleNamespace(path=_ROOT_A))
+
+
+def test_restart_command_digest_is_root_relative_and_fails_closed_outside_the_root():
+    in_a = _restart_command_digest(
+        ("python", "-m", "pytest", f"{_ROOT_A}/tests/test_a.py"), _ROOT_A / "pkg", _ROOT_A
+    )
+    in_b = _restart_command_digest(
+        ("python", "-m", "pytest", f"{_ROOT_B}/tests/test_a.py"), _ROOT_B / "pkg", _ROOT_B
+    )
+    assert in_a is not None and len(in_a) == 32 and int(in_a, 16) >= 0
+    assert in_a == in_b
+    assert _restart_command_digest(_PLAIN_ARGV, Path("/elsewhere"), _ROOT_A) is None
+    # A sibling sharing the root as a string prefix is not under the root.
+    assert _restart_command_digest(_PLAIN_ARGV, Path(f"{_ROOT_A}-other"), _ROOT_A) is None
+
+
+def _worktree_pair(tmp_path):
+    main = tmp_path / "main"
+    _init_snapshot_repo(main)
+    for package in ("package_a", "package_b"):
+        (main / package).mkdir()
+        (main / package / "keep.txt").write_text("x\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(main), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-qm", "packages"], check=True)
+    other = tmp_path / "other"
+    subprocess.run(
+        ["git", "-C", str(main), "worktree", "add", "-q", "--detach", str(other)], check=True
+    )
+    head = subprocess.run(
+        ["git", "-C", str(main), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    return main.resolve(), other.resolve(), head
+
+
+def _real_broker_row(root, cwd, argv, outcome, turn):
+    def execute(argv, cwd, timeout, environment, stream):
+        return SimpleNamespace(
+            outcome=outcome, returncode=0 if outcome == "passed" else 1,
+            elapsed_seconds=0.01, output_tail="", wrapper_bootstrap="verified",
+            inner_exec="started", suite_start="verified",
+        )
+
+    registry = EnvironmentIdentityRegistry()
+    server = BrokerServer(
+        root=root, turn_id=turn, execute=execute, environment_registry=registry
+    ).start()
+    try:
+        environment = {
+            **server.environment,
+            "AGENT_LOOP_INVOCATION_ID": turn,
+            "PATH": os.environ.get("PATH", ""),
+        }
+        result = BrokerClient(environment).run(list(argv), timeout_seconds=5, cwd=cwd)
+        assert result.outcome == outcome
+        (row,) = server.journal
+    finally:
+        server.stop()
+    return row, registry
+
+
+@pytest.mark.parametrize("subdirectory", [None, "package_a"])
+def test_real_brokers_at_two_worktree_roots_digest_and_supersede_across_restart(
+    tmp_path, subdirectory
+):
+    root_a, root_b, head = _worktree_pair(tmp_path)
+    cwd_a = root_a / subdirectory if subdirectory else root_a
+    cwd_b = root_b / subdirectory if subdirectory else root_b
+    argv_a = (sys.executable, "-m", "pytest", str(cwd_a / "keep.txt"), "-q")
+    argv_b = (sys.executable, "-m", "pytest", str(cwd_b / "keep.txt"), "-q")
+
+    failure, registry_a = _real_broker_row(root_a, cwd_a, argv_a, "failed", "turn-run-a")
+    passing, registry_b = _real_broker_row(root_b, cwd_b, argv_b, "passed", "turn-run-b")
+
+    assert failure.restart_command_digest is not None
+    assert len(failure.restart_command_digest) == 32
+    assert failure.restart_command_digest == passing.restart_command_digest
+    assert failure.attribution.state == passing.attribution.state == "current-head"
+    other_cwd = (root_b / "package_b") if subdirectory else (root_b / "package_a")
+    assert _restart_command_digest(argv_b, other_cwd, root_b) != passing.restart_command_digest
+
+    # Run A persists the failure; run B restores it through the runner.
+    prior = _persist([failure], registry=registry_a)
+    runner = Runner()
+    runner._environment_registry = registry_b
+    runner._local_test_observations.append(passing)
+    merged = runner.render_local_test_evidence(
+        current_head=head, cwd=root_b, prior_local_test_evidence=prior
+    )
+    decoded = decode_bounded_evidence(merged, restore_classification=True)
+    assert decoded is not None
+    rows = _by_receipt(decoded)
+    assert rows[failure.receipt_id].superseded_by == passing.receipt_id
+    assert CROSS_RESTART_SUPERSESSION_CAVEAT in rows[failure.receipt_id].caveats
+    assert decoded.authoritative_failures == ()
+    assert _unsuperseded_sentence(merged) == ""
+    assert str(root_a) not in merged and str(root_b) not in merged
+
+
+def test_restored_failure_superseded_by_live_identical_pass_through_the_runner(
+    monkeypatch, tmp_path
+):
+    argv_a = ("/usr/bin/python3", "-m", "pytest", "tests/test_protocol.py", "-q")
+    prior = _persist(
+        [_broker_row(argv_a, outcome="failed", receipt="run-a-failure", timestamp=_T_FAIL,
+                     registry=EnvironmentIdentityRegistry())],
+        registry=None,
+    )
+    registry_b = EnvironmentIdentityRegistry()
+    live = _run_b_pass(argv_a, registry=registry_b, root=tmp_path)
+    _patch_snapshot(monkeypatch, _restart_snapshot(root=str(tmp_path)))
+    runner = Runner()
+    runner._environment_registry = registry_b
+    runner._local_test_observations.append(live)
+
+    merged = runner.render_local_test_evidence(
+        current_head=_HEAD, cwd=tmp_path, prior_local_test_evidence=prior
+    )
+
+    decoded = decode_bounded_evidence(merged, restore_classification=True)
+    assert decoded is not None
+    _assert_cross_restart_superseded(decoded)
+    rows = _by_receipt(decoded)
+    # The failure stays journaled; the pass is untouched.
+    assert rows["run-a-failure"].outcome == "failed"
+    assert rows["run-b-pass"].superseded_by is None
+    assert rows["run-a-failure"].normalized_command != live.normalized_command
+    assert _unsuperseded_sentence(merged) == ""
+    # Nothing environment-derived and no raw token is persisted.
+    assert "/usr/bin" not in merged
+    assert "restored" not in merged
+    rendered = _render_test_observation_citations((), local_test_evidence=merged)
+    assert "receipt `run-a-failure`" in rendered
+    assert (
+        "failure superseded across a restart by receipt `run-b-pass`; environment not compared"
+        in rendered
+    )
+    cited = _render_test_observation_citations(
+        (SimpleNamespace(command="python -m pytest", receipt_id="run-a-failure",
+                         claim="current-result"),),
+        local_test_evidence=merged,
+    )
+    assert "superseded across a restart by receipt `run-b-pass`" in cited
+
+
+def _mismatch_cases():
+    other_fixture = _FixtureRecord(path="fixtures/service.sh", digest="100755:" + "c" * 40)
+    return {
+        "command": (dict(), dict(argv=("python", "-m", "pytest", "tests/test_other.py", "-q")), dict(), True),
+        "scope": (dict(), dict(scope=EvidenceScope("subset", ("tests/test_protocol.py",))), dict(), True),
+        "fixture": (dict(), dict(fixture=other_fixture), dict(), True),
+        "pass-tracked-digest": (dict(), dict(digest="c" * 64), dict(), True),
+        "failure-head-with-identical-digest": (dict(head="9" * 40), dict(), dict(), True),
+        # item-1: the live refresh rewrites a matching-digest pass's head to
+        # the current head; eligibility must use the head it was recorded at.
+        "pass-head-with-identical-digest": (dict(), dict(head="9" * 40), dict(), True),
+        "pass-without-head": (dict(), dict(head=None), dict(), True),
+        "failure-tracked-digest": (dict(digest="c" * 64), dict(), dict(), False),
+        "pass-unstable": (dict(), dict(stable=False), dict(), True),
+        "pass-not-parent-observed": (dict(), dict(provenance="telemetry-unverified"), dict(), True),
+        "pass-untracked-input": (dict(), dict(untracked_input=True), dict(), True),
+        "failure-self-reported": (dict(provenance="self-reported"), dict(), dict(), False),
+        "snapshot-missing": (dict(), dict(), dict(snapshot=None), True),
+        "snapshot-dirty": (dict(), dict(), dict(snapshot=_restart_snapshot(status_clean=False)), True),
+        "snapshot-unstable": (dict(), dict(), dict(snapshot=_restart_snapshot(stable=False)), True),
+        "snapshot-incomplete": (dict(), dict(), dict(snapshot=_restart_snapshot(complete=False)), True),
+        "snapshot-head-mismatch": (dict(), dict(), dict(snapshot=_restart_snapshot(head="8" * 40)), True),
+        "current-head-none": (dict(), dict(), dict(current_head=None), True),
+    }
+
+
+# Cases whose run-B gate was only the reconcile context: the pass itself was
+# recorded at H/T, so a later restart with a valid snapshot may legitimately
+# supersede.  Every other case is ineligible on the rows' own facts and must
+# stay unsuperseded after transport too.
+_CONTEXT_ONLY_MISMATCHES = frozenset({
+    "snapshot-missing", "snapshot-dirty", "snapshot-unstable", "snapshot-incomplete",
+    "snapshot-head-mismatch", "current-head-none",
+})
+
+
+@pytest.mark.parametrize("case", sorted(_mismatch_cases()))
+def test_mismatched_or_ungated_restored_supersession_is_refused(case):
+    failure_overrides, pass_overrides, reconcile_overrides, authoritative = _mismatch_cases()[case]
+    restored = _run_a_failure(**failure_overrides)
+    assert restored[0].attribution.state == "current-head"  # persisted state alone
+    registry = EnvironmentIdentityRegistry()
+    argv = pass_overrides.pop("argv", _PLAIN_ARGV)
+    live = _run_b_pass(argv, registry=registry, **pass_overrides)
+
+    evidence = _reconcile_b([*restored, live], registry=registry, **reconcile_overrides)
+
+    _assert_not_cross_restart_superseded(evidence)
+    assert ("run-a-failure" in evidence.authoritative_failures) is authoritative
+
+    # Run C restores both rows with no new pass, after canonicalization and
+    # a second transport cycle (item-1: nothing ineligible may become
+    # eligible through persistence, such as a refresh-rewritten head).
+    encoded = bounded_evidence_for_round(evidence)
+    for _cycle in range(2):
+        run_c = _reconcile_b(
+            _restore(canonicalize_bounded_evidence(encoded)),
+            registry=EnvironmentIdentityRegistry(),
+        )
+        if case in _CONTEXT_ONLY_MISMATCHES:
+            _assert_cross_restart_superseded(run_c)
+        else:
+            _assert_not_cross_restart_superseded(run_c)
+            assert ("run-a-failure" in run_c.authoritative_failures) is authoritative
+        encoded = bounded_evidence_for_round(run_c)
+
+
+def test_untracked_input_unverified_rows_never_take_part_across_a_restart():
+    before = _restart_snapshot(untracked_paths=("notes.tmp",))
+    attribution = attribute_current_head(before, before, current_head=_HEAD)
+    assert attribution.state == "untracked-input-unverified"
+    assert attribution.untracked_input is False
+
+    registry = EnvironmentIdentityRegistry()
+    live = _dc_replace(_run_b_pass(registry=registry), attribution=attribution)
+    evidence = _reconcile_b([*_run_a_failure(), live], registry=registry)
+    _assert_not_cross_restart_superseded(evidence)
+    assert "run-a-failure" in evidence.authoritative_failures
+
+    restored = _run_a_failure(state="untracked-input-unverified")
+    evidence = _reconcile_b([*restored, _run_b_pass(registry=registry)], registry=registry)
+    _assert_not_cross_restart_superseded(evidence)
+    assert _by_receipt(evidence)["run-a-failure"].attribution.state == "untracked-input-unverified"
+    assert "run-a-failure" in evidence.authoritative_failures
+
+
+def _external_interpreter(root):
+    return ("/usr/bin/python3", "-m", "pytest", "tests/test_protocol.py", "-q"), root
+
+
+def _long_in_cap_selector(root):
+    return ("python", "-m", "pytest", *(f"tests/test_module_{i:03}.py" for i in range(40))), root
+
+
+def _secret_option(root):
+    return ("python", "-m", "pytest", "--token=abc123", "tests/test_protocol.py"), root
+
+
+def _long_non_repo_argument(root):
+    return ("python", "-m", "pytest", "--junitxml", "reports/" + "x" * 40), root
+
+
+def _in_checkout_paths(root):
+    # The external interpreter keeps the display commands apart; the
+    # in-checkout operand differs only in its worktree root.
+    return ("/usr/bin/python3", "-m", "pytest", f"{root}/tests/test_protocol.py"), root
+
+
+def _relative_subdirectory(root):
+    return (
+        ("/usr/bin/python3", "-m", "pytest", f"{root}/package_a/tests/test_a.py"),
+        root / "package_a",
+    )
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        _external_interpreter, _long_in_cap_selector, _secret_option,
+        _long_non_repo_argument, _in_checkout_paths, _relative_subdirectory,
+    ],
+)
+def test_command_digest_supersedes_where_display_commands_differ(shape):
+    argv_a, cwd_a = shape(_ROOT_A)
+    argv_b, cwd_b = shape(_ROOT_B)
+    restored = _run_a_failure(argv_a, cwd=cwd_a)
+    registry = EnvironmentIdentityRegistry()
+    live = _run_b_pass(argv_b, registry=registry, cwd=cwd_b)
+    assert restored[0].restart_command_digest == live.restart_command_digest is not None
+    assert restored[0].normalized_command != live.normalized_command
+
+    evidence = _reconcile_b([*restored, live], registry=registry)
+
+    _assert_cross_restart_superseded(evidence)
+
+
+def test_live_live_supersession_still_requires_normalized_command_equality():
+    registry = EnvironmentIdentityRegistry()
+    failure = _broker_row(outcome="failed", receipt="live-failure", timestamp=_T_FAIL,
+                          registry=registry)
+    passing = _dc_replace(
+        _broker_row(outcome="passed", receipt="live-pass", timestamp=_T_PASS, registry=registry),
+        normalized_command="python -m pytest tests/test_protocol.py",
+    )
+    assert failure.restart_command_digest == passing.restart_command_digest
+    evidence = _reconcile_b([failure, passing], registry=registry)
+    assert _by_receipt(evidence)["live-failure"].superseded_by is None
+
+
+def test_over_bound_fixture_path_fails_closed_across_a_restart():
+    fixture = _FixtureRecord(path="f" * 600, digest="100755:" + "c" * 40)
+    restored = _run_a_failure(fixture=fixture)
+    registry = EnvironmentIdentityRegistry()
+    live = _run_b_pass(registry=registry, fixture=fixture)
+    evidence = _reconcile_b([*restored, live], registry=registry)
+    _assert_not_cross_restart_superseded(evidence)
+
+    # Two restored rows whose transported path sits at the bound stay apart too.
+    second = _restore(_persist([*restored, live], registry=registry))
+    evidence = _reconcile_b(second, registry=EnvironmentIdentityRegistry())
+    _assert_not_cross_restart_superseded(evidence)
+    assert "run-a-failure" in evidence.authoritative_failures
+
+
+def _placeholder(value):
+    return f"<sha256:{hashlib.sha256(value.encode()).hexdigest()[:16]}>"
+
+
+def _distinct_pairs():
+    selectors = tuple(f"tests/test_module_{i:03}.py" for i in range(40))
+    shared = "a" * 2100
+    return {
+        "shared-display-prefix": (
+            ("python", "-m", "pytest", *selectors, "tests/test_last_a.py"), ".",
+            ("python", "-m", "pytest", *selectors, "tests/test_last_b.py"), ".",
+        ),
+        "long-k-expressions": (
+            ("python", "-m", "pytest", "-k", shared + "x"), ".",
+            ("python", "-m", "pytest", "-k", shared + "y"), ".",
+        ),
+        "control-only": (
+            ("python", "-m", "pytest", "tests/test_a.py"), ".",
+            ("python", "-m", "pytest", "tests/test_a.py\x1b[0m"), ".",
+        ),
+        "generated-vs-literal-placeholder": (
+            ("FLAG=value", "python", "-m", "pytest"), ".",
+            (f"FLAG={_placeholder('value')}", "python", "-m", "pytest"), ".",
+        ),
+        "secret-option-tail": (
+            ("python", "-m", "pytest", "--token=abc first"), ".",
+            ("python", "-m", "pytest", "--token=abc second"), ".",
+        ),
+        "dot-components": (
+            ("python", "-m", "pytest", "{ROOT}/tests/../tests/test_a.py"), ".",
+            ("python", "-m", "pytest", "{ROOT}/tests/test_a.py"), ".",
+        ),
+        "symlinked-root-spelling": (
+            ("python", "-m", "pytest", "/work/link-to-checkout/tests/test_a.py"), ".",
+            ("python", "-m", "pytest", "{ROOT}/tests/test_a.py"), ".",
+        ),
+        "absolute-vs-relative": (
+            ("python", "-m", "pytest", "{ROOT}/tests/test_a.py"), ".",
+            ("python", "-m", "pytest", "tests/test_a.py"), ".",
+        ),
+        "different-subdirectory": (
+            ("python", "-m", "pytest", "tests/test_a.py"), "package_a",
+            ("python", "-m", "pytest", "tests/test_a.py"), "package_b",
+        ),
+        "cwd-outside-root": (
+            ("python", "-m", "pytest", "tests/test_a.py"), "/elsewhere",
+            ("python", "-m", "pytest", "tests/test_a.py"), "/elsewhere",
+        ),
+    }
+
+
+def _bind(argv, cwd, root):
+    bound = tuple(token.replace("{ROOT}", str(root)) for token in argv)
+    if cwd.startswith("/"):
+        return bound, Path(cwd)
+    return bound, root if cwd == "." else root / cwd
+
+
+@pytest.mark.parametrize("case", sorted(_distinct_pairs()))
+def test_distinct_commands_never_supersede_across_two_restarts(case):
+    fail_argv, fail_cwd, pass_argv, pass_cwd = _distinct_pairs()[case]
+    argv_a, cwd_a = _bind(fail_argv, fail_cwd, _ROOT_A)
+    argv_b, cwd_b = _bind(pass_argv, pass_cwd, _ROOT_B)
+    restored = _run_a_failure(argv_a, cwd=cwd_a)
+    registry = EnvironmentIdentityRegistry()
+    live = _run_b_pass(argv_b, registry=registry, cwd=cwd_b)
+    assert (
+        live.restart_command_digest is None
+        or restored[0].restart_command_digest != live.restart_command_digest
+    )
+
+    run_b = _reconcile_b([*restored, live], registry=registry)
+    _assert_not_cross_restart_superseded(run_b)
+    assert "run-a-failure" in run_b.authoritative_failures
+
+    # Run C restores both rows: the restored pass cannot supersede either.
+    encoded = bounded_evidence_for_round(run_b)
+    for raw in ("--token=abc", "abc first", "abc second", "/work/link-to-checkout"):
+        assert raw not in encoded
+    run_c = _reconcile_b(_restore(canonicalize_bounded_evidence(encoded)),
+                         registry=EnvironmentIdentityRegistry())
+    _assert_not_cross_restart_superseded(run_c)
+    assert "run-a-failure" in run_c.authoritative_failures
+
+
+def test_over_cap_argv_gets_no_digest_and_never_supersedes_across_restarts():
+    argv = ("python", "-m", "pytest", *(f"tests/test_module_{i:04}.py" for i in range(300)))
+    restored = _run_a_failure(argv)
+    registry = EnvironmentIdentityRegistry()
+    live = _run_b_pass(argv, registry=registry)
+    assert live.restart_command_digest is None
+    assert restored[0].restart_command_digest is None
+    assert live.public_projection()["outcome"] == "incomplete"
+
+    run_b = _reconcile_b([*restored, live], registry=registry)
+    _assert_not_cross_restart_superseded(run_b)
+    run_c = _reconcile_b(_restore(_persist(list(run_b.observations), registry=registry)),
+                         registry=EnvironmentIdentityRegistry())
+    _assert_not_cross_restart_superseded(run_c)
+    assert "run-a-failure" in run_c.authoritative_failures
+
+
+def test_rows_without_a_valid_digest_never_take_part_across_a_restart():
+    registry = EnvironmentIdentityRegistry()
+    payload = json.loads(_persist(
+        [_broker_row(outcome="failed", receipt="run-a-failure", timestamp=_T_FAIL,
+                     registry=registry)],
+        registry=registry,
+    ))
+    assert payload["observations"][0]["restart_command_digest"]
+    for forged in (None, "F" * 32, "abc", "0" * 64):
+        row = dict(payload["observations"][0])
+        if forged is None:
+            row.pop("restart_command_digest")  # persisted before this change
+        else:
+            row["restart_command_digest"] = forged
+        restored = _restore(json.dumps({**payload, "observations": [row]}))
+        assert restored[0].restart_command_digest is None
+        live = _run_b_pass(registry=registry)
+        evidence = _reconcile_b([*restored, live], registry=registry)
+        _assert_not_cross_restart_superseded(evidence)
+        assert "run-a-failure" in evidence.authoritative_failures
+
+    # A restored digest-less pass cannot supersede a restored failure either.
+    restored_failure = _run_a_failure()
+    old_pass = json.loads(_persist([_run_b_pass(registry=registry)], registry=registry))
+    old_pass["observations"][0].pop("restart_command_digest")
+    evidence = _reconcile_b([*restored_failure, *_restore(json.dumps(old_pass))],
+                            registry=EnvironmentIdentityRegistry())
+    _assert_not_cross_restart_superseded(evidence)
+
+
+def test_restart_command_digest_survives_every_projection_and_transport_cycle():
+    registry = EnvironmentIdentityRegistry()
+    row = _broker_row(outcome="failed", receipt="run-a-failure", timestamp=_T_FAIL,
+                      registry=registry)
+    digest = row.restart_command_digest
+    assert row.to_dict()["restart_command_digest"] == digest
+    assert row.live_projection()["restart_command_digest"] == digest
+    encoded = _persist([row], registry=registry)
+    for _cycle in range(2):
+        encoded = canonicalize_bounded_evidence(encoded)
+        assert _restore(encoded)[0].restart_command_digest == digest
+        encoded = bounded_evidence_for_round(
+            _reconcile_b(_restore(encoded), registry=EnvironmentIdentityRegistry())
+        )
+    bare = _from_mapping({"command": list(_PLAIN_ARGV), "outcome": "failed",
+                          "provenance": "parent-observed"})
+    assert bare.restart_command_digest is None
+    assert "restart_command_digest" not in bare.to_dict()
+    assert "restart_command_digest" not in json.loads(
+        canonicalize_bounded_evidence(bounded_evidence_for_round({"observations": [bare.to_dict()]}))
+    )["observations"][0]
+
+
+def test_supersession_is_rederived_after_a_second_restart_with_no_new_pass():
+    registry = EnvironmentIdentityRegistry()
+    run_b = _reconcile_b([*_run_a_failure(), _run_b_pass(registry=registry)], registry=registry)
+    _assert_cross_restart_superseded(run_b)
+    encoded = bounded_evidence_for_round(run_b)
+    for _cycle in range(2):
+        run_c = _reconcile_b(_restore(canonicalize_bounded_evidence(encoded)),
+                             registry=EnvironmentIdentityRegistry())
+        _assert_cross_restart_superseded(run_c)
+        assert [item.count(CROSS_RESTART_SUPERSESSION_CAVEAT) for item in
+                (run_c.observations[0].caveats,)] == [1]
+        encoded = bounded_evidence_for_round(run_c)
+
+
+def test_persisted_different_verdict_survives_transport_and_blocks_a_restored_pass():
+    registry = EnvironmentIdentityRegistry()
+    generic = tuple(f"generic caveat {index}" for index in range(6))
+    failure = _broker_row(outcome="failed", receipt="run-a-failure", timestamp=_T_FAIL,
+                          registry=registry, root=_ROOT_B, environment={"PATH": "/usr/bin"},
+                          caveats=generic)
+    passing = _run_b_pass(registry=registry, environment={"PATH": "/opt/bin"}, caveats=generic)
+    run_b = _reconcile_b([failure, passing], registry=registry)
+    assert _by_receipt(run_b)["run-b-pass"].environment_state == "different"
+    assert _by_receipt(run_b)["run-a-failure"].superseded_by is None
+
+    encoded = bounded_evidence_for_round(run_b)
+    for _cycle in range(2):
+        encoded = canonicalize_bounded_evidence(encoded)
+        restored = _restore(encoded)
+        assert ENVIRONMENT_DIFFERS_CAVEAT in _by_receipt(
+            SimpleNamespace(observations=restored)
+        )["run-b-pass"].caveats
+        run_c = _reconcile_b(restored, registry=EnvironmentIdentityRegistry())
+        _assert_not_cross_restart_superseded(run_c)
+        assert "run-a-failure" in run_c.authoritative_failures
+        encoded = bounded_evidence_for_round(run_c)
+
+
+def test_same_process_strictness_is_unchanged():
+    registry = EnvironmentIdentityRegistry()
+    failure = _broker_row(outcome="failed", receipt="live-failure", timestamp=_T_FAIL,
+                          registry=registry, root=_ROOT_B, environment={"PATH": "/usr/bin"})
+    different = _run_b_pass(registry=registry, environment={"PATH": "/opt/bin"})
+    evidence = _reconcile_b([failure, different], registry=registry)
+    assert _by_receipt(evidence)["live-failure"].superseded_by is None
+    assert "live-failure" in evidence.authoritative_failures
+
+    # A restored pass never supersedes a live failure.
+    restored_pass = _restore(_persist([_dc_replace(
+        _run_b_pass(registry=registry), timestamp="2026-10-24T00:06:00+00:00"
+    )], registry=registry))
+    evidence = _reconcile_b([failure, *restored_pass], registry=registry)
+    row = _by_receipt(evidence)["live-failure"]
+    assert row.superseded_by is None
+    assert CROSS_RESTART_SUPERSESSION_CAVEAT not in row.caveats
+
+
+def test_attribution_refresh_applies_only_to_matching_restored_rows(tmp_path):
+    registry = EnvironmentIdentityRegistry()
+
+    def restored(receipt, **overrides):
+        values = dict(state="stale")
+        values.update(overrides)
+        row = _broker_row(outcome="failed", receipt=receipt, timestamp=_T_FAIL,
+                          registry=registry, **values)
+        return _restore(_persist([row], registry=registry))[0]
+
+    rows = [
+        restored("matching"),
+        restored("other-head", head="9" * 40),
+        restored("other-tree", digest="c" * 64),
+        restored("unstable", stable=False),
+    ]
+    not_restored = _from_mapping({
+        "command": list(_PLAIN_ARGV), "outcome": "failed", "provenance": "parent-observed",
+        "receipt_id": "unmarked", "timestamp": _T_FAIL,
+        "attribution": {"state": "stale", "head": _HEAD, "stable": True, "tracked_digest": _TREE},
+    })
+    broker_failure = _from_mapping({
+        "command": list(_PLAIN_ARGV), "outcome": "incomplete",
+        "provenance": "telemetry-unverified", "receipt_id": "broker-failure",
+        "timestamp": _T_FAIL, "environment": "identity-unknown",
+        "attribution": {"state": "unknown", "head": _HEAD, "stable": True, "tracked_digest": _TREE},
+    })
+    evidence = reconcile_test_observations(
+        [*rows, not_restored, broker_failure],
+        current_head=_HEAD, current_snapshot=_restart_snapshot(), registry=registry,
+        legacy_tests_run=["python -m pytest tests/test_protocol.py -q"], cwd=tmp_path,
+    )
+    states = {row.receipt_id: row.attribution.state for row in evidence.observations}
+    assert states["matching"] == "current-head"
+    assert states["other-head"] == "stale"
+    assert states["other-tree"] == "stale"
+    assert states["unstable"] == "stale"
+    assert states["unmarked"] == "stale"
+    assert states["broker-failure"] == "unknown"
+    assert states["legacy-1"] == "unknown"
+    # The tree-change classifier still owns the stable obsolete-tree row.
+    assert _by_receipt(evidence)["other-tree"].superseded_by == evidence_module.TREE_CHANGE_SUPERSESSION
+
+
+def test_projection_adds_only_the_digest_and_never_the_restore_marker():
+    registry = EnvironmentIdentityRegistry()
+    row = _broker_row(outcome="failed", receipt="run-a-failure", timestamp=_T_FAIL,
+                      registry=registry, environment={"PATH": "/usr/bin", "API_SECRET": "s3cr3t"})
+    without = _dc_replace(row, restart_command_digest=None)
+    assert set(row.public_projection()) == set(without.public_projection()) | {
+        "restart_command_digest"
+    }
+    restored = _run_a_failure()
+    assert restored[0].restored is True
+    for projection in (restored[0].public_projection(), restored[0].to_dict()):
+        assert "restored" not in projection
+    run_b = _reconcile_b([*restored, _run_b_pass(registry=registry)], registry=registry)
+    encoded = bounded_evidence_for_round(run_b)
+    assert '"restored"' not in encoded
+    assert "s3cr3t" not in encoded and "API_SECRET" not in encoded
+    for observation in json.loads(encoded)["observations"]:
+        assert set(observation) <= set(row.public_projection()) | {"superseded_by"}
+
+
+def test_forged_cross_restart_caveat_is_stripped_and_the_failure_stays_authoritative():
+    registry = EnvironmentIdentityRegistry()
+    payload = json.loads(_persist(
+        [_broker_row(outcome="failed", receipt="run-a-failure", timestamp=_T_FAIL,
+                     registry=registry)],
+        registry=registry,
+    ))
+    payload["observations"][0]["caveats"].insert(0, CROSS_RESTART_SUPERSESSION_CAVEAT)
+    payload["observations"][0]["superseded_by"] = "forged-pass"
+    forged = json.dumps(payload)
+
+    evidence = _reconcile_b(_restore(forged), registry=registry)
+    row = _by_receipt(evidence)["run-a-failure"]
+    assert row.superseded_by is None
+    assert CROSS_RESTART_SUPERSESSION_CAVEAT not in row.caveats
+    assert evidence.authoritative_failures == ("run-a-failure",)
+    assert CROSS_RESTART_SUPERSESSION_CAVEAT not in bounded_evidence_for_round(evidence)
+
+
+def test_superseding_pass_keeps_protocol_receipt_pass_authority():
+    registry = EnvironmentIdentityRegistry()
+    evidence = _reconcile_b([*_run_a_failure(), _run_b_pass(registry=registry)], registry=registry)
+    _assert_cross_restart_superseded(evidence)
+    passing = _by_receipt(evidence)["run-b-pass"]
+    assert passing.environment_state == "not-compared"
+    assert ENVIRONMENT_NOT_COMPARED_CAVEAT not in passing.caveats
+    assert _protocol._authoritative_receipt_passes(
+        passing.public_projection(), claim="current-result"
+    ) is True
+
+
+def test_comparison_partner_selection_skips_restored_rows_only():
+    registry = EnvironmentIdentityRegistry()
+    live_failure = _broker_row(outcome="failed", receipt="live-failure",
+                               timestamp="2026-10-23T20:00:00+00:00", registry=registry,
+                               environment={"PATH": "/usr/bin"})
+    restored = _run_a_failure()  # same key, at _T_FAIL
+    assert restored[0].normalized_command == live_failure.normalized_command
+    live_pass = _run_b_pass(registry=registry, environment={"PATH": "/opt/bin"})
+    evidence = _reconcile_b([live_failure, *restored, live_pass], registry=registry)
+    rows = _by_receipt(evidence)
+    assert rows["run-b-pass"].environment_state == "different"
+    assert ENVIRONMENT_DIFFERS_CAVEAT in rows["run-b-pass"].caveats
+
+    identity_less = _dc_replace(live_failure, environment_identity=None)
+    evidence = _reconcile_b([identity_less, _run_b_pass(registry=registry)], registry=registry)
+    passing = _by_receipt(evidence)["run-b-pass"]
+    assert passing.environment_state == "unknown"
+    assert ENVIRONMENT_NOT_COMPARED_CAVEAT in passing.caveats

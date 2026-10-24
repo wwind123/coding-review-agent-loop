@@ -90,6 +90,7 @@ from .test_runtime import (
     resolve_timeout_seconds,
 )
 from .local_test_evidence import (
+    CROSS_RESTART_SUPERSESSION_CAVEAT,
     TREE_CHANGE_SUPERSESSION,
     decode_bounded_evidence,
     redact_test_command,
@@ -185,6 +186,21 @@ def _render_out_of_checkout_tests(
     ])
 
 
+def _cross_restart_superseding_receipt(item: object) -> str | None:
+    """The superseding receipt of a failure superseded across a restart (#1633)."""
+    superseded_by = getattr(item, "superseded_by", None)
+    if (
+        getattr(item, "is_failure", False)
+        and getattr(item, "provenance", None) == "parent-observed"
+        and isinstance(superseded_by, str)
+        and superseded_by
+        and superseded_by != TREE_CHANGE_SUPERSESSION
+        and CROSS_RESTART_SUPERSESSION_CAVEAT in getattr(item, "caveats", ())
+    ):
+        return superseded_by
+    return None
+
+
 def _render_test_observation_citations(
     citations: Sequence[object],
     *,
@@ -249,6 +265,13 @@ def _render_test_observation_citations(
                 "historical failure at an obsolete tree (not an outstanding "
                 f"obligation) `{observed.outcome}`"
             )
+        elif observed is not None and (
+            superseding := _cross_restart_superseding_receipt(observed)
+        ):
+            reason = (
+                "failure superseded across a restart by receipt "
+                f"`{superseding[:256]}`; environment not compared `{observed.outcome}`"
+            )
         if supported:
             cited.add(receipt_id)
         lines.append(
@@ -269,6 +292,17 @@ def _render_test_observation_citations(
                     f"- `{safe_command}` — receipt `{item.receipt_id[:256]}` — "
                     "historical failure at an obsolete tree (not an outstanding "
                     f"obligation) `{item.outcome}`"
+                )
+                continue
+            superseding = _cross_restart_superseding_receipt(item)
+            if item.receipt_id and item.receipt_id not in cited and superseding:
+                # Issue #1633: the relaxation stays visible; the failure is
+                # journaled and shown, never hidden.
+                safe_command, _identifiers, _caveats = redact_test_command(item.command)
+                lines.append(
+                    f"- `{safe_command}` — receipt `{item.receipt_id[:256]}` — "
+                    f"failure superseded across a restart by receipt `{superseding[:256]}`; "
+                    f"environment not compared `{item.outcome}`"
                 )
                 continue
             if (

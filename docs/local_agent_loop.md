@@ -1751,6 +1751,10 @@ remain comparison-bearing. Environment identity bytes are retained only in
 trusted memory within one orchestrator process. A restart therefore renders
 old observations `identity-unknown`; protected cross-process environment
 comparison is intentionally not supported by this same-user implementation.
+A restored failure can still be superseded at an unchanged head and tree
+under the gated rule in
+[Failures restored across a restart](#failures-restored-across-a-restart),
+which never compares environments.
 
 The broker pins the assigned checkout, opens a validated directory handle, and
 uses handle-based `fchdir` confinement. Traversal, outside paths, final
@@ -1771,8 +1775,10 @@ bounded runtime-timing sidecar when `--memory-dir` is supplied.
 Each observation records a typed outcome (`passed`, `failed`, `timed_out`,
 `interrupted`, `incomplete`, or overlap rejection), provenance, scope, opaque
 receipt/turn identities, and tracked-tree attribution. A later pass supersedes
-a failure only when it is parent-observed and has the same normalized command,
-scope, stable tracked tree, and live in-process environment. A passing subset,
+a live failure only when it is parent-observed and has the same normalized
+command, scope, stable tracked tree, and live in-process environment. A failure
+restored from an earlier run follows the separate gated rule in
+[Failures restored across a restart](#failures-restored-across-a-restart). A passing subset,
 superset mismatch, changed head, environment difference, unknown identity,
 partial output, and unsupported or unverified baseline remain visible. Legacy
 `tests_run` entries are parsed with shell-aware tokenization and labeled
@@ -1852,8 +1858,9 @@ without a stable tracked digest, or equal digests leave the failure blocking.
 Base-reproduction rows, recognised at entry by attribution state or claim, are
 never labelled, and the existing attribution loops are unchanged. Live and
 restored rows are treated alike, so a restored failure without environment
-identity at an obsolete digest is historical too; a restart at an unchanged
-digest is deliberately not loosened.
+identity at an obsolete digest is historical too. A restart at an unchanged
+digest is handled only by the gated rule in
+[Failures restored across a restart](#failures-restored-across-a-restart).
 
 The label is re-derived on every reconcile and never trusted as input: each
 reconcile clears an earlier tree-change label (genuine receipt supersession is
@@ -1862,6 +1869,55 @@ round evidence carries `superseded_by` so that retention evicts superseded and
 historical rows before unresolved failures, and only display consumers (PR
 comment rendering, the unchanged-head stop sentence and canonicalization)
 restore it.
+
+#### Failures restored across a restart
+
+Environment identity is process-scoped and is never persisted, so a failure
+restored from an earlier run could never meet the live supersession rule
+(issue #1633). A later parent-observed pass may supersede such a failure only
+through a separate cross-restart rule. Every check below must hold, and a
+persisted state or caveat never satisfies one on its own:
+
+- The current tracked tree is positively known: the authenticated current head
+  is set, and a complete, stable, clean snapshot with a tracked digest has
+  that head.
+- Both rows have `current-head` attribution in this reconcile, at the current
+  head, stable, at the snapshot's tracked digest, and without untracked input.
+  A restored row reaches `current-head` only when its own persisted head and
+  stable tracked digest match; an `untracked-input-unverified` row never takes
+  part. Restored rows that do not match keep the existing stale and
+  tree-change handling, and legacy or broker-failure rows are never refreshed.
+- Both rows carry the same `restart_command_digest`, scope and fixture
+  identity. Command identity across a restart is this digest, not the display
+  command, which redaction rewrites. The broker computes it when it records
+  the row, as a length-prefixed SHA-256 over the checkout-relative cwd and the
+  raw argv. Its only rewrite substitutes the exact checkout-root string, so the
+  same relative command under another worktree root matches, while commands
+  that redact identically, differ in dot components or root spelling, or run
+  from another subdirectory do not. Rows without a digest fail closed: every row
+  persisted before this rule, any argv whose redacted form exceeds the argv
+  cap, and any cwd that is not under the exact root string. A fixture path at
+  or over the transport bound fails closed too. Head eligibility uses the head
+  each row was recorded at, never the head the handoff promotion rewrites; a
+  live row whose recorded head is rewritten also loses its digest, so the
+  rewritten head cannot make it eligible after a restart.
+- The pass does not carry the persisted `effective target environment differs`
+  verdict. That caveat is ranked so that the caveat cap and repeated transport
+  keep it.
+
+The superseded failure, never the pass, carries the visible caveat
+`superseded across a restart; environment not compared`. It stays journaled and
+renders in PR comments as `failure superseded across a restart by receipt
+<id>; environment not compared`. The caveat is derived by each reconcile: a
+persisted copy is stripped on input. A live row is never environment-compared
+against a restored row, so a live pass whose only same-key predecessors are
+restored keeps `not-compared` and its receipt-pass authority. A restored pass
+from an earlier run can re-derive the supersession on a later restart. Live
+failures keep the strict rule above: a pass in a different environment, or a
+restored pass, never supersedes them. Nothing environment-derived and no raw
+command token is persisted; the only new persisted field is the 32-hex
+`restart_command_digest`, an unkeyed hash in the same exposure class as the
+existing per-secret redaction digests.
 
 Durable metadata contains only bounded, sanitized projections: at most 32
 detailed observations and 16 KiB, with unresolved failures retained longest.
