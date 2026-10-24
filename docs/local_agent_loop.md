@@ -1897,7 +1897,10 @@ persisted state or caveat never satisfies one on its own:
   from another subdirectory do not. Rows without a digest fail closed: every row
   persisted before this rule, any argv whose redacted form exceeds the argv
   cap, and any cwd that is not under the exact root string. A fixture path at
-  or over the transport bound fails closed too.
+  or over the transport bound fails closed too. Head eligibility uses the head
+  each row was recorded at, never the head the handoff promotion rewrites; a
+  live row whose recorded head is rewritten also loses its digest, so the
+  rewritten head cannot make it eligible after a restart.
 - The pass does not carry the persisted `effective target environment differs`
   verdict. That caveat is ranked so that the caveat cap and repeated transport
   keep it.

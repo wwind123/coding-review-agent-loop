@@ -1449,12 +1449,19 @@ def reconcile_test_observations(
                     or attribution.state == "untracked-input-unverified"
                     else "current-head"
                 )
+                promoted_head = current_head or current_snapshot.head
                 rows[index] = replace(
                     row,
-                    attribution=replace(
-                        attribution,
-                        state=state,
-                        head=current_head or current_snapshot.head,
+                    attribution=replace(attribution, state=state, head=promoted_head),
+                    # Issue #1633: a row whose recorded head is rewritten
+                    # here was not run at the promoted head.  It keeps the
+                    # in-process handoff promotion but loses the restart
+                    # command digest, so the rewritten head can never make it
+                    # cross-restart eligible after transport.
+                    restart_command_digest=(
+                        row.restart_command_digest
+                        if attribution.head and attribution.head == promoted_head
+                        else None
                     ),
                 )
             else:

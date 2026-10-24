@@ -5433,6 +5433,16 @@ def _mismatch_cases():
     }
 
 
+# Cases whose run-B gate was only the reconcile context: the pass itself was
+# recorded at H/T, so a later restart with a valid snapshot may legitimately
+# supersede.  Every other case is ineligible on the rows' own facts and must
+# stay unsuperseded after transport too.
+_CONTEXT_ONLY_MISMATCHES = frozenset({
+    "snapshot-missing", "snapshot-dirty", "snapshot-unstable", "snapshot-incomplete",
+    "snapshot-head-mismatch", "current-head-none",
+})
+
+
 @pytest.mark.parametrize("case", sorted(_mismatch_cases()))
 def test_mismatched_or_ungated_restored_supersession_is_refused(case):
     failure_overrides, pass_overrides, reconcile_overrides, authoritative = _mismatch_cases()[case]
@@ -5446,6 +5456,22 @@ def test_mismatched_or_ungated_restored_supersession_is_refused(case):
 
     _assert_not_cross_restart_superseded(evidence)
     assert ("run-a-failure" in evidence.authoritative_failures) is authoritative
+
+    # Run C restores both rows with no new pass, after canonicalization and
+    # a second transport cycle (item-1: nothing ineligible may become
+    # eligible through persistence, such as a refresh-rewritten head).
+    encoded = bounded_evidence_for_round(evidence)
+    for _cycle in range(2):
+        run_c = _reconcile_b(
+            _restore(canonicalize_bounded_evidence(encoded)),
+            registry=EnvironmentIdentityRegistry(),
+        )
+        if case in _CONTEXT_ONLY_MISMATCHES:
+            _assert_cross_restart_superseded(run_c)
+        else:
+            _assert_not_cross_restart_superseded(run_c)
+            assert ("run-a-failure" in run_c.authoritative_failures) is authoritative
+        encoded = bounded_evidence_for_round(run_c)
 
 
 def test_untracked_input_unverified_rows_never_take_part_across_a_restart():
