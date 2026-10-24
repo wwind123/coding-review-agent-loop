@@ -4035,6 +4035,34 @@ def _pr_step_back_sweep_contexts(
     }
 
 
+def _pr_step_back_approach_alternative_stop(
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    records: Sequence[PostedRoundRecord],
+    head_sha: str | None,
+) -> None:
+    """Stop for a human decision when a step-back turn proposed an approach change.
+
+    Shared by the live call (the just-posted coder record) and the round-start
+    resume call (durable history), so both agree (#1628).  Disabled with
+    ``--pr-step-back-rounds 0``; anything unreadable keeps today's behavior.
+    """
+    if config.pr_step_back_rounds <= 0:
+        return
+    alternative = _step_back.pr_step_back_approach_alternative(records, head_sha=head_sha)
+    if alternative is None:
+        return
+    log(
+        config,
+        f"PR step-back: the coder proposed an approach alternative at round "
+        f"{alternative.coder_round} (head {alternative.head}); stopping for a human decision",
+    )
+    raise HumanDecisionRequiredError(
+        _step_back.render_pr_step_back_approach_alternative_decision(pr_number, alternative)
+    )
+
+
 def _pr_step_back_carried_entries(
     entries: Sequence[Mapping[str, object]], *, coder_round: int, head_sha: str | None
 ) -> dict[str, "_step_back.PrStepBackEntry"]:

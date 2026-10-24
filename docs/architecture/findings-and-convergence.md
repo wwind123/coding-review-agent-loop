@@ -142,9 +142,12 @@ mapped finding in every one of those K reviews and the mapped ranges connect wit
 gaps no larger than the window; unrelated paths, repeat-only reviews, findings
 without a line reference, and `UNMAPPABLE` locations never contribute. All
 reviewers that trigger at the same dispatch share one step-back coder turn
-(`step_back_context` replaces the same-PR small-cleanup framing and asks for a
-single rule, a parametrized test, and a summary beginning `Generalization:`;
-the existing `coder_followup` JSON carries it, no new section), and the
+(`step_back_context` replaces the same-PR small-cleanup framing and offers two
+choices: a single rule, a parametrized test, and a summary beginning
+`Generalization:`; or, when the approved approach itself generates the class, a
+summary beginning `Approach alternative:` that names a materially smaller
+alternative without redesigning beyond the plan; the existing `coder_followup`
+JSON carries it, no new section), and the
 orchestrator records one reviewer-owned `step_back_entries` entry per reviewer
 (`phase: "pr"`, `trigger_round`, `trigger_head`, `anchor`) on the coder record. The
 sweep binds to that record's entry reviewers and its resulting head only: the
@@ -165,6 +168,21 @@ from the stored structured response. A carried item is not a sibling; it keeps t
 episode open while it is a member. The episode closes on the reviewer's approval
 or when no unresolved mandatory item of theirs is a member. A malformed entry
 suppresses the trigger and the stop with a log line.
+
+An `Approach alternative:` answer (#1628) stops instead of continuing:
+`pr_step_back_approach_alternative` reads the newest valid step-back coder record
+and matches only when its decoded summary opens with that prefix, its resulting
+head equals the live head, and no review of that head was recorded after it. The
+live check runs after the coder record is posted and after the issue-created
+managed-CI continuity grant for the new head, so a resume activates managed CI
+before stopping; the same check runs at every round start before any review, so
+a resumed run stops before reviewing the proposal head. The loop raises
+`HumanDecisionRequiredError` (exit code 4) quoting the alternative and offering a
+scope change, a stated limitation, or continued generalization with
+`--pr-step-back-rounds 0`, which also disables this stop. A pushed head, a
+`Generalization:` answer, or an unreadable record never stops. The sibling
+escalation message also names the scope-change route (approve the scope change,
+push the replacement and rerun).
 
 **PR non-convergence stop** (`--pr-non-convergence-rounds` K, default 3,
 `0` disables, independent of `--pr-step-back-rounds`). The clustered trigger counts

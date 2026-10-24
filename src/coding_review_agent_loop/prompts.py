@@ -3541,6 +3541,31 @@ def _step_back_anchor_review_block(anchor: PlanStepBackAnchor | None) -> str:
     return render_plan_step_back_anchor_review_notice(anchor) if anchor is not None else ""
 
 
+SMALLEST_ALTERNATIVE_STEP_PREFIX = "Smallest alternative:"
+
+
+def render_smallest_alternative_guidance() -> str:
+    """Planner rule: name the smallest alternative as a reviewable plan step (#1628)."""
+    return (
+        f"Smallest alternative: include one `plan_steps` entry that begins "
+        f"`{SMALLEST_ALTERNATIVE_STEP_PREFIX}`. In a few sentences, name the smallest change "
+        "that could resolve the issue, explicitly considering removing or relaxing the "
+        "existing check or guard that produces the bad outcome, then end with either "
+        "`adopted` or a one-to-two-sentence rejection reason. Do this even when the issue "
+        "body prescribes a design: that design is a suggestion unless the issue marks it as "
+        "a hard requirement. On a revision, keep or update that step; do not drop it.\n"
+    )
+
+
+def render_smallest_alternative_review_guidance() -> str:
+    """Plan-reviewer rule shared by the full and compact review prompts (#1628)."""
+    return (
+        f"Smallest alternative: if the plan has no `{SMALLEST_ALTERNATIVE_STEP_PREFIX}` step, "
+        "its rejection reason is weak, or the rejected alternative is clearly sufficient, "
+        "raise that as a blocking finding.\n"
+    )
+
+
 def _plan_growth_review_guidance(
     config: AgentLoopConfig,
     growth_notice: str | None = None,
@@ -3594,7 +3619,7 @@ For a plan (rather than a clarification), respond with exactly one structured JS
 
 {_execution_strategy_contract_guidance()}
 
-{_plan_growth_planner_guidance(config)}
+{_plan_growth_planner_guidance(config)}{render_smallest_alternative_guidance()}
 {{
   "schema_version": 1,
   "kind": "plan_state",
@@ -3764,7 +3789,7 @@ Plan from {coder_name}:
 
 {plan}
 {render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
-{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_plan_step_back_review_notice() if step_back_review_notice else ''}{_step_back_anchor_review_block(step_back_anchor)}{_plan_review_volatile_blocks(plan, config, plan_sweep_classes=plan_sweep_classes, provenance_baseline=provenance_baseline)}
+{_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_smallest_alternative_review_guidance()}{render_plan_step_back_review_notice() if step_back_review_notice else ''}{_step_back_anchor_review_block(step_back_anchor)}{_plan_review_volatile_blocks(plan, config, plan_sweep_classes=plan_sweep_classes, provenance_baseline=provenance_baseline)}
 Review the plan for correctness, architecture fit, missing edge cases within
 the issue's scope, test strategy, and ambiguity. Use this mandatory structured JSON response format:
 
@@ -3906,6 +3931,7 @@ def _build_compact_plan_review_prompt(
             _plan_review_schema_and_rules() + "\n" + unresolved_items_guidance
             + _plan_review_provenance_guidance(config)
             + _phased_plan_guard(config) + _plan_growth_review_guidance(config)
+            + render_smallest_alternative_review_guidance()
         ),
     )
     subject_line = f"Current plan subject: {compact_tail.subject}" if compact_tail and compact_tail.subject else "Current plan subject: (unknown)"
@@ -4136,7 +4162,7 @@ every `row`/`target_row`/`target_rows` entry is a complete matrix row):
   `merge`, and `value` may add `not_applicable_rationale`.
 No other operation names exist.
 
-{_plan_growth_planner_guidance(config, plan_growth_notice, semantic_patch=True)}
+{_plan_growth_planner_guidance(config, plan_growth_notice, semantic_patch=True)}{render_smallest_alternative_guidance()}
 Operations are applied atomically and simultaneously. The patch must contain
 at least one real change, and its binding must match the authenticated values
 above exactly. Repair may fix only response-envelope presentation; it cannot
@@ -4273,7 +4299,7 @@ Use this mandatory structured JSON response format:
     include_risk_test_matrix_contract=require_risk_test_matrix_contract
 )}
 
-{_plan_growth_planner_guidance(config, plan_growth_notice)}
+{_plan_growth_planner_guidance(config, plan_growth_notice)}{render_smallest_alternative_guidance()}
 {{
   "schema_version": 1,
   "kind": "plan_revision",
@@ -4382,6 +4408,7 @@ def _build_compact_plan_revision_prompt(
         response_protocol=_plan_revision_schema_and_rules(
             include_risk_test_matrix_contract=require_risk_test_matrix_contract
         ) + "\n" + _plan_growth_planner_guidance(config)
+        + render_smallest_alternative_guidance()
         + (
             "\n" + render_generalization_guidance(_HISTORY_PHASE_PLAN)
             if generalization_guidance

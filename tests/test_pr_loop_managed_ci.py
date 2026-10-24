@@ -1601,3 +1601,108 @@ def test_pr_loop_writes_run_end_when_managed_label_cleanup_raises(tmp_path, monk
     assert calls
     assert [r["record"] for r in load_records(telemetry_log_path())] == ["run-start", "run-end"]
     assert runner.telemetry_attribution is None
+
+
+# --- PR step-back approach alternative on a managed PR (#1628) ---------------
+
+
+def test_approach_alternative_stop_publishes_continuity_first_and_resume_stops(
+    tmp_path, monkeypatch,
+):
+    """`approach-alt-managed-continuity`."""
+    from coding_review_agent_loop.errors import HumanDecisionRequiredError
+    from pr_loop_test_helpers import SB_HEAD, _StepBackRunner
+
+    def review(items=(), resolved=()):
+        return structured_pr_review(
+            state="blocking" if items else "approved",
+            summary="review",
+            blocking_items=list(items),
+            prior_item_dispositions=[
+                {"item_id": item, "disposition": "resolved"} for item in resolved
+            ],
+        )
+
+    runner = _StepBackRunner(
+        claude_outputs=[
+            structured_coder_followup(addressed_items=["item-1"]),
+            structured_coder_followup(addressed_items=["item-2"]),
+            structured_coder_followup(
+                addressed_items=["item-3"],
+                summary="Approach alternative: drop the predecessor-head disqualifier.",
+            ),
+        ],
+        codex_outputs=[
+            review(["gap one at src/spool.py:124-131"]),
+            review(["gap two at src/spool.py:131-136"], resolved=["item-1"]),
+            review(["gap three at src/spool.py:140"], resolved=["item-2"]),
+        ],
+        pr_payload={
+            "headRefName": "agent-loop/managed-56", "headRefOid": SB_HEAD,
+            "baseRefName": "main", "body": "Fixes #56",
+        },
+    )
+    handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
+        pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
+        head_sha=SB_HEAD, branch="agent-loop/managed-56",
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="voluntary", override_nonce="root",
+        authorization_kind="creation", authorization_comment_id=17,
+    )
+    events = []
+    activated_heads = []
+    monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", lambda *_a, **_k: handoff)
+
+    def activate(*_args, **_kwargs):
+        activated_heads.append(runner.pr_payload["headRefOid"])
+        return ManagedCiContract(protocol_version=2, issue_created_pr=True)
+
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", activate)
+    monkeypatch.setattr(pr_loop, "revalidate_adopted_managed_ci", lambda *_a, **_k: True)
+    monkeypatch.setattr(pr_loop, "managed_label_present", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        pr_loop, "find_actor_round_metadata_comment_ids", lambda *_a, **_k: (88, 89),
+    )
+
+    def publish(*_args, **kwargs):
+        events.append(("publish", kwargs["new_head"]))
+        return handoff
+
+    monkeypatch.setattr(pr_loop, "publish_issue_created_continuity_authorization", publish)
+    original_stop = pr_loop._pr_step_back_approach_alternative_stop
+
+    def stop(*args, **kwargs):
+        events.append(("stop-check", kwargs["head_sha"]))
+        return original_stop(*args, **kwargs)
+
+    monkeypatch.setattr(pr_loop, "_pr_step_back_approach_alternative_stop", stop)
+    config = make_config(
+        tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
+        allow_unprotected_managed_ci=True, reviewer=("codex",), max_rounds=8,
+    )
+
+    with pytest.raises(HumanDecisionRequiredError, match="replacing the approved approach"):
+        run_pr_loop(
+            runner, pr_number=77, config=config, managed_ci_handoff=handoff,
+            managed_ci_issue_number=56,
+        )
+    new_head = f"{3:040x}"
+    # The continuity grant for the proposal head precedes the live stop.
+    assert events.index(("publish", new_head)) < events.index(("stop-check", new_head))
+    assert events[-1] == ("stop-check", new_head)
+    codex_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]
+    assert len(codex_calls) == 3
+    assert not any(cmd[:3] == ["gh", "workflow", "run"] for cmd, _cwd in runner.commands)
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+    # Resume: managed CI activates for the live head, then the round-start stop fires.
+    events.clear()
+    with pytest.raises(HumanDecisionRequiredError, match="replacing the approved approach"):
+        run_pr_loop(
+            runner, pr_number=77, config=config, managed_ci_handoff=handoff,
+            managed_ci_issue_number=56,
+        )
+    assert activated_heads[-1] == new_head
+    assert events == [("stop-check", new_head)]
+    assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]) == 3
+    assert not any(cmd[:3] == ["gh", "workflow", "run"] for cmd, _cwd in runner.commands)

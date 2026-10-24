@@ -426,6 +426,7 @@ from .child_plan_binding import (
 )
 from .pr_loop_support import (
     ExactHeadCiProof,
+    _pr_step_back_approach_alternative_stop,
     _pr_step_back_carried_entries,
     _pr_step_back_decision,
     _pr_step_back_sweep_contexts,
@@ -3361,6 +3362,20 @@ def run_pr_loop(
             if parent_issue_context is not None:
                 parent_issue_context_refreshed = True
             pr_comments = pr_context.comments
+            # A durable step-back record proposing an approach change at this
+            # exact head stops before any review of it, so a resumed run agrees
+            # with the live stop below (#1628).
+            if config.pr_step_back_rounds > 0:
+                try:
+                    approach_records = _extract_round_metadata_records(pr_comments, flow="pr")
+                except AgentLoopError:
+                    approach_records = ()
+                _pr_step_back_approach_alternative_stop(
+                    config,
+                    pr_number=pr_number,
+                    records=approach_records,
+                    head_sha=pr_metadata.head_sha,
+                )
             pr_posted_checkpoint: PostedRoundMetadata | None = None
             # A review round is a fresh acquisition boundary. Rebind the
             # candidate/base pair before constructing any reviewer prompt so
@@ -9634,6 +9649,18 @@ def run_pr_loop(
                         issue_created_handoff=managed_ci_handoff,
                         override_nonce=managed_ci_handoff.override_nonce,
                     )
+            if step_back_entries:
+                # After the coder record and the managed-CI continuity grant, so
+                # a resume activates managed CI for this head before its
+                # round-start stop (#1628).
+                _pr_step_back_approach_alternative_stop(
+                    config,
+                    pr_number=pr_number,
+                    records=(
+                        PostedRoundRecord(index=0, metadata=latest_coder_metadata, body=""),
+                    ),
+                    head_sha=updated_pr_context.metadata.head_sha,
+                )
             pending_step_back_sweeps = _pr_step_back_carried_entries(
                 step_back_entries,
                 coder_round=coder_record_round,

@@ -7063,3 +7063,69 @@ def test_reviewer_prompts_forbid_searching_for_examples_or_peer_responses(tmp_pa
         assert REVIEW_INDEPENDENCE_RULE in prompts[label], label
     assert "other reviewers' responses" in REVIEW_INDEPENDENCE_RULE
     assert "review spool" in REVIEW_INDEPENDENCE_RULE
+
+
+# --- smallest-alternative plan step (#1628) ----------------------------------
+
+_SMALLEST_ALT_PLANNER_LINE = "explicitly considering removing or relaxing the existing check or guard"
+_SMALLEST_ALT_REVIEWER_LINE = "the rejected alternative is clearly sufficient"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "The planner drops evidence after a push.",
+        "Design: derive the row bindings from the wording of each finding, "
+        "with a deny-list of command words.",
+    ],
+)
+def test_initial_plan_prompt_requires_the_smallest_alternative_step(tmp_path, body):
+    """`plan-prompt-smallest-alt`: with and without a prescribed design."""
+    issue_context = IssueContext(
+        number=1628, repo="OWNER/REPO", title="Plan the fix", body=body,
+        url="https://github.com/OWNER/REPO/issues/1628", comments=(),
+    )
+    prompt = build_issue_plan_prompt(1628, make_config(tmp_path), issue_context=issue_context)
+    assert "begins `Smallest alternative:`" in prompt
+    assert _SMALLEST_ALT_PLANNER_LINE in prompt
+    assert "`adopted` or a one-to-two-sentence rejection reason" in prompt
+    assert "a suggestion unless the issue marks it as a hard requirement" in prompt
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"compact_context": True},
+        {
+            "response_form": "semantic-patch-v1",
+            "base_round_number": 1,
+            "base_state_identity": "a" * 64,
+        },
+    ],
+    ids=["full", "compact", "semantic-patch"],
+)
+def test_every_plan_revision_prompt_form_requires_the_smallest_alternative_step(
+    tmp_path, kwargs
+):
+    """`plan-prompt-smallest-alt`: full, compact and semantic-patch revisions."""
+    prompt = build_plan_revision_prompt(
+        1628, 2, "Previous plan.", "Blocking review.", make_config(tmp_path), **kwargs
+    )
+    assert "begins `Smallest alternative:`" in prompt
+    assert _SMALLEST_ALT_PLANNER_LINE in prompt
+    assert "keep or update that step; do not drop it" in prompt
+
+
+@pytest.mark.parametrize("compact_context", [False, True])
+def test_plan_review_prompt_flags_a_missing_or_weak_smallest_alternative(
+    tmp_path, compact_context
+):
+    """`plan-review-flag-both-forms`."""
+    prompt = build_plan_review_prompt(
+        1628, 2, "Plan.", make_config(tmp_path), reviewer="codex",
+        compact_context=compact_context,
+    )
+    assert prompts_module.render_smallest_alternative_review_guidance() in prompt
+    assert _SMALLEST_ALT_REVIEWER_LINE in prompt
+    assert "raise that as a blocking finding" in prompt
