@@ -1646,3 +1646,14 @@ def test_attempt_repair_forwards_the_context_to_preservation(monkeypatch):
             _binding_review([_FLAGGED, _CODE]), "gemini", expected_kind="pr_review",
             evidence_row_id_universe=_BIND_ROWS, evidence_binding_context=_BIND_CONTEXT,
         ) == expected
+
+
+@_pytest.mark.parametrize("separator", [", and", ", or", " and/or", "; and"])
+def test_unknown_final_row_after_a_compound_separator_requests_binding_repair(separator):
+    """Review item-2: no partial binding reaches validation, minting or carried reconciliation."""
+    text = (
+        "Provide passing test observations for risk-matrix rows `share-page-locale`, `row-b`"
+        f"{separator} `ghost-row`."
+    )
+    with _pytest.raises(_AgentLoopError, match="unknown-row-reference"):
+        _validate_binding(_binding_review([text]))

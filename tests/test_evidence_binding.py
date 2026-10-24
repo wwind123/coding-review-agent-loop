@@ -403,3 +403,53 @@ def test_row_id_identity_stays_case_sensitive():
     # A bare differently-cased token is not the approved ID and is never bound.
     bare = _derive("Provide passing test observations for ROW-A.")
     assert (bare.kind, bare.rows) == (BINDING_NOT_EVIDENCE, ())
+
+
+# --- a row list is bound only when fully interpreted (#1622 review item-2) -----
+
+_SEPARATORS = [", and", ", or", " and/or", "; and", " &", " plus", " as well as", ",", " and"]
+
+
+@pytest.mark.parametrize("separator", _SEPARATORS)
+def test_unknown_final_row_after_any_separator_prevents_partial_binding(separator):
+    text = (
+        "Provide passing test observations for risk-matrix rows `row-a`, `row-b`"
+        f"{separator} `ghost-row`."
+    )
+    binding = _derive(text)
+    assert (binding.kind, binding.reason, binding.rows) == (
+        BINDING_NEEDS_REPAIR, REASON_UNKNOWN_ROW_REFERENCE, ()
+    )
+
+
+@pytest.mark.parametrize("separator", _SEPARATORS)
+def test_fully_known_list_after_any_separator_binds_every_listed_row(separator):
+    text = (
+        "Provide passing test observations for risk-matrix rows `row-a`, `row-b`"
+        f"{separator} `share-page-locale`."
+    )
+    binding = _derive(text)
+    assert (binding.kind, binding.rows) == (BINDING_BOUND, ("row-a", "row-b", "share-page-locale"))
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        " then `ghost-row`",
+        " (and also `ghost-row`)",
+        " with `ghost-row` too",
+    ],
+)
+def test_unparsed_backticked_token_in_the_list_clause_forces_repair(tail):
+    binding = _derive(f"Provide passing test observations for rows `row-a`, `row-b`{tail}.")
+    assert (binding.kind, binding.reason, binding.rows) == (
+        BINDING_NEEDS_REPAIR, REASON_UNKNOWN_ROW_REFERENCE, ()
+    )
+
+
+def test_backticked_tokens_in_a_later_clause_do_not_affect_the_list():
+    binding = _derive(
+        "Provide passing test observations for rows `row-a` and `row-b`. "
+        "Run them with `agent-loop run-tests`."
+    )
+    assert (binding.kind, binding.rows) == (BINDING_BOUND, ("row-a", "row-b"))

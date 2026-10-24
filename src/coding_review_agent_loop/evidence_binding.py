@@ -18,7 +18,8 @@ The rules run in a fixed order:
    phrase, or any matrix phrase) is ``not-evidence``.
 3. Sole demand: any code-demand wording outside a closed list of negated
    phrases gives ``code-demand``; such a finding is never bound or repaired.
-4. Cited rows: every row-ID-shaped reference must be enforceable; then the
+4. Cited rows: every row-ID-shaped reference must be enforceable, and a row
+   list is used only when fully interpreted; then the
    finding binds to exactly the cited enforceable rows.  An unknown reference
    gives ``needs-repair``/``unknown-row-reference``.
 5. Collective reference without IDs: binds to every enforceable row only when
@@ -87,11 +88,20 @@ _COLLECTIVE_RE = re.compile(
     _I,
 )
 _ROW_TOKEN = r"(?:`[^`\n]+`|[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+)(?![\w-])"
+# One or more separators between list tokens, so ", and", ", or", "and/or",
+# "; and", "&" and "as well as" all continue the list (#1622 review item-2).
+_ROW_SEPARATOR = (
+    r"(?:\s*(?:,|;|/|&|\+|\band\b|\bor\b|\bplus\b|\bas\s+well\s+as\b)\s*)+"
+)
 _ROW_LIST_RE = re.compile(
-    r"\brows?(?:\s*:\s*|\s+)(" + _ROW_TOKEN + r"(?:\s*(?:,|/|\band\b|\bor\b)\s*" + _ROW_TOKEN + r")*)",
+    r"\brows?(?:\s*:\s*|\s+)(" + _ROW_TOKEN + r"(?:" + _ROW_SEPARATOR + _ROW_TOKEN + r")*)",
     _I,
 )
 _ROW_TOKEN_RE = re.compile(_ROW_TOKEN)
+_BACKTICKED_RE = re.compile(r"`[^`\n]+`")
+# The end of the clause a row list belongs to: sentence punctuation followed
+# by whitespace or the end of the text, or a line break.
+_CLAUSE_END_RE = re.compile(r"[.!?](?=\s|$)|\n")
 # The closed list of negated code-change phrases stripped before the
 # code-demand scan.  Any other code-demand wording keeps the finding ordinary.
 _NEGATED_CODE_CHANGE_RE = re.compile(
@@ -136,6 +146,16 @@ def _row_references(text: str, enforceable: Sequence[str]) -> tuple[list[tuple[i
                 if all(row_id != token for _, row_id in cited):
                     cited.append((position, token))
             elif token and token not in unknown:
+                unknown.append(token)
+        # A list is bound only when it is fully interpreted.  A backticked
+        # token left in the same clause after the parsed list may be a row the
+        # grammar did not reach, so an unknown one forces a binding repair
+        # instead of a partial binding of the rows parsed so far.
+        clause_end = _CLAUSE_END_RE.search(text, list_match.end())
+        tail = text[list_match.end(): clause_end.start() if clause_end else len(text)]
+        for token_match in _BACKTICKED_RE.finditer(tail):
+            token = _strip_token(token_match.group(0))
+            if token and token not in allowed and token not in unknown:
                 unknown.append(token)
     return cited, unknown
 
