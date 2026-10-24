@@ -371,6 +371,11 @@ def test_signal_cancels_waiting_discuss_debaters(tmp_path, monkeypatch, capsys, 
     firing.join(5)
     assert time.monotonic() - started < quota_wait.QUOTA_WAIT_SLICE_SECONDS
     assert terminations == [True]
+    # The second debater records its cancellation only once its thread has
+    # unwound, which can land just after main() returns; wait briefly for it.
+    deadline = time.monotonic() + 5
+    while len(outcomes) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert len(outcomes) == 2
     assert "quota reset wait interrupted" in capsys.readouterr().err
 

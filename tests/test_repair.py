@@ -5548,3 +5548,86 @@ def test_refused_repair_candidate_is_decided_per_candidate_before_success(tmp_pa
     (record,) = usage.records
     assert record.outcome == "architecture_contract_unsatisfied"
     assert record.validation_status == "invalid"
+
+
+# ---------------------------------------------------------------------------
+# #1626: targeted test_observations repair prompt for both coder kinds.
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib_1626  # noqa: E402
+import json as _json_1626  # noqa: E402
+
+from coding_review_agent_loop.repair import _build_repair_prompt as _build_repair_prompt_1626  # noqa: E402
+
+
+def _prose_source_1626(kind):
+    payload = {"schema_version": 1, "kind": kind, "state": "blocking", "summary": "s"}
+    if kind == "issue_implementation":
+        payload["pr_number"] = 7
+    else:
+        payload.update({"addressed_items": [], "remaining_items": []})
+    payload.update({
+        "human_requirements": {"addressed_ids": [], "checked_discussion_directly": False},
+        "human_requirement_dispositions": [], "test_observations": "prose",
+    })
+    return _json_1626.dumps(payload) + "\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
+
+
+# SHA-256 of the full prompt rendered by the pre-#1626 source (commit
+# dc2d68ae1f) for the same input: the flag-unset prompt must not change.
+_PRE_1626_PROMPT_DIGESTS = {
+    "coder_followup": "88d02009c436c48384578229b808dc197d3a7d859ed5dd4a2f69f3af815d5190",
+    "issue_implementation": "4944b744c463469310cdbde3df39a908ec19f51b3587c9c619457c5eca9f1bcc",
+}
+_RECEIPTS_1626 = (
+    {"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass-1", "outcome": "passed"},
+)
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+def test_unflagged_repair_prompt_is_byte_identical_to_pre_change_1626(kind):
+    prompt = _build_repair_prompt_1626(_prose_source_1626(kind), expected_kind=kind)
+    assert _hashlib_1626.sha256(prompt.encode()).hexdigest() == _PRE_1626_PROMPT_DIGESTS[kind]
+    assert "## test_observations repair:" not in prompt
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+def test_flagged_repair_prompt_has_the_section_receipts_and_narrowed_prohibitions_1626(kind):
+    """Matrix row `repair-prompt-both-kinds`."""
+    prompt = _build_repair_prompt_1626(
+        _prose_source_1626(kind),
+        expected_kind=kind,
+        test_observations_shape_defect=True,
+        test_turn_receipts=_RECEIPTS_1626,
+    )
+    assert "## test_observations repair:" in prompt
+    assert '"receipt_id": "receipt-pass-1"' in prompt
+    assert "node --test scripts/locales.test.mjs" in prompt
+    assert "Never invent receipt IDs" in prompt
+    assert "Never delete it." in prompt
+    assert "`addressed_item_notes`/`remaining_item_notes`" in prompt
+    # Neither prohibition forbids the authorized receipt citations any more.
+    assert "canonical rows, receipt IDs/citations, mappings" not in prompt
+    assert "Remove fresh `risk_test_matrix_evidence`, matrix identities, canonical rows, receipt IDs" not in prompt
+    assert "authorized test_observations repair below is exempt" in prompt
+    if kind == "issue_implementation":
+        assert "receipt citations are exempt and required" in prompt
+
+
+def test_flagged_repair_prompt_without_receipts_asks_for_an_empty_array_1626():
+    prompt = _build_repair_prompt_1626(
+        _prose_source_1626("coder_followup"),
+        expected_kind="coder_followup",
+        test_observations_shape_defect=True,
+        test_turn_receipts=(),
+    )
+    assert "no run-tests receipts were captured in this turn" in prompt
+    assert "emit `[]` and move the prose" in prompt
+
+
+@pytest.mark.parametrize("kind", ["pr_review", "plan_review", "plan_state", None])
+def test_test_observations_repair_flag_is_rejected_for_other_kinds_1626(kind):
+    with pytest.raises(ValueError, match="test_observations_shape_defect"):
+        _build_repair_prompt_1626("{}", expected_kind=kind, test_observations_shape_defect=True)
+    with pytest.raises(ValueError, match="test_turn_receipts"):
+        _build_repair_prompt_1626("{}", expected_kind=kind, test_turn_receipts=())

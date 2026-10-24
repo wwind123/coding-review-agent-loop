@@ -882,7 +882,11 @@ def test_degradable_test_observations_sites_are_records_and_the_drop_bound(proto
         protocol_inventory.annotation(site.line)
         for site in protocol_inventory.propagating("_degradable_test_observations")
     }
-    assert clauses == {"fatal:authentication-or-forgery", "fatal:payload-bound"}
+    assert clauses == {
+        "fatal:authentication-or-forgery",
+        "fatal:no-conservative-reading",
+        "fatal:payload-bound",
+    }
     assert "_test_observation_item_defect" in protocol_inventory.units["_degradable_test_observations"].edges
 
 

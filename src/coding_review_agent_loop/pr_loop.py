@@ -248,7 +248,7 @@ from .ci_health import (
     classify_watch_failure,
     is_wholly_infrastructure_blocked,
 )
-from .local_test_evidence import unsuperseded_receipts_sentence
+from .local_test_evidence import superseded_by_current_turn, unsuperseded_receipts_sentence
 from .comment_rendering import (
     add_coder_followup_head_unchanged_notice,
     normalize_freeform_signature,
@@ -343,6 +343,7 @@ from .architecture_contract import (
     _architecture_metadata_fields,
     _test_observation_degradation_fields,
     _latest_pr_architecture_observation,
+    _architecture_and_test_observation_mode_validators,
     _architecture_mode_validators,
     _architecture_document_paths_hook,
     _resumed_review_architecture,
@@ -432,7 +433,10 @@ from .pr_loop_support import (
     _merge_with_exact_head_proof,
     _read_assigned_workdir_head,
     MAX_UNCHANGED_HEAD_CODER_TURNS,
+    FollowupCitationDiagnosis,
     _UnchangedHeadTracker,
+    cited_evidence_progress,
+    followup_citation_diagnosis,
     _coder_followup_head_log,
     _coder_followup_review_context,
     _reviewer_summary_context,
@@ -622,15 +626,31 @@ def _managed_v1_dispatch_records(managed_ci) -> tuple:
 
 
 def unchanged_head_stop_message(
-    *, pr, coder_name, previous_head, turns, round_number, evidence, route
+    *, pr, coder_name, previous_head, turns, round_number, evidence, route,
+    citation_diagnosis: FollowupCitationDiagnosis | None = None,
 ) -> str:
-    """The unchanged-head stop text; receipts (issue #1182) go before the route."""
+    """The unchanged-head stop text; receipts (issue #1182) go before the route.
+
+    When the last follow-up's test_observations were dropped as a non-array
+    (#1626), the message names that and the uncited receipt count, so an
+    operator can see the blocker may be a tool format problem.
+    """
+    citation_sentence = ""
+    if citation_diagnosis is not None and citation_diagnosis.non_array_drop:
+        citation_sentence = (
+            " The coder's test_observations were not a JSON array (format repair "
+            f"attempted: {'yes' if citation_diagnosis.repair_attempted else 'no'}); "
+            f"{citation_diagnosis.uncited_receipts} run-tests receipt(s) from that turn "
+            "went uncited, so the blocker may be a tool format problem rather than a "
+            "code defect."
+        )
     return (
         f"PR #{pr}: {coder_name} left head {previous_head} unchanged in "
         f"{turns} consecutive follow-up rounds, so another "
         "review of the same diff cannot change the verdict. Stopping before round "
         f"{round_number + 1}; human review required."
         f"{unsuperseded_receipts_sentence(evidence)}"
+        f"{citation_sentence}"
         f"{route}"
     )
 
@@ -9115,6 +9135,11 @@ def run_pr_loop(
                 carried_reasons=dispatch_carried_reasons,
             )
             coder_turn_started_at = datetime.datetime.now(datetime.timezone.utc)
+            # Tool-owned state for the unchanged-head gate (#1626), frozen at
+            # the coder acquisition; a repair launch cannot repoint it.
+            coder_turn_receipt_ids: frozenset[str] = frozenset()
+            followup_citations: FollowupCitationDiagnosis | None = None
+            evidence_progress_receipts: frozenset[str] = frozenset()
             try:
                 coder_response = _run_validated_agent(
                     runner,
@@ -9125,7 +9150,7 @@ def run_pr_loop(
                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
                     require_architecture_impact_contract=True,
                     architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
-                    **_architecture_mode_validators(lambda mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids: _validate_coder_followup_response(
+                    **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids: _validate_coder_followup_response(
                         text,
                         unresolved_items=items,
                         optional_item_ids=optional_ids,
@@ -9155,6 +9180,7 @@ def run_pr_loop(
                             if approved_plan_context is not None and approved_plan_context.matrix_available
                             else None
                         ), architecture_status_mode=mode,
+                        test_observations_mode=observations_mode,
                     )),
                     usage_context=usage_context,
                     role="coder",
@@ -9175,6 +9201,15 @@ def run_pr_loop(
                 )
                 coder_output = coder_response.text
                 coder_session_id = coder_response.session_id
+                # Frozen before any post-authentication correction, from the
+                # coder acquisition's own closed catalog -- never the
+                # runner's latest test turn, which a repair launch replaces.
+                coder_turn_receipt_ids = frozenset(
+                    observation.receipt_id
+                    for observation in coder_response.acquisition_test_observations
+                    if isinstance(getattr(observation, "receipt_id", None), str)
+                    and observation.receipt_id
+                )
                 latest_coder_output = coder_output
                 public_comment = coder_output
                 raw_structured_coder_response: str | None = None
@@ -9285,6 +9320,19 @@ def run_pr_loop(
                         latest_coder_metadata.local_test_evidence
                         if latest_coder_metadata is not None
                         else None
+                    ),
+                )
+                # Decided from the live, unbounded reconciliation and the
+                # surviving citations of the accepted (derived) follow-up;
+                # the bounded round projection stays display-only (#1626).
+                followup_citations = followup_citation_diagnosis(
+                    coder_response.marker_value, coder_turn_receipt_ids
+                )
+                evidence_progress_receipts = cited_evidence_progress(
+                    coder_response.marker_value,
+                    superseded_by_current_turn(
+                        getattr(runner, "last_reconciled_local_test_evidence", None),
+                        coder_turn_receipt_ids,
                     ),
                 )
                 # The coder metadata record posted below is numbered one past the
@@ -9595,7 +9643,21 @@ def run_pr_loop(
             unchanged_head_coder_turns = unchanged_head_tracker.observe(
                 previous_head, updated_pr_context.metadata.head_sha
             )
-            if unchanged_head_coder_turns >= MAX_UNCHANGED_HEAD_CODER_TURNS:
+            if (
+                unchanged_head_coder_turns >= MAX_UNCHANGED_HEAD_CODER_TURNS
+                and evidence_progress_receipts
+                and unchanged_head_tracker.grant_evidence_progress()
+            ):
+                # The follow-up superseded an authoritative failure at this
+                # head with a cited receipt from its own turn: reviewers get
+                # one round to see it, once per head (#1626).
+                log(
+                    config,
+                    f"Round {round_number}: unchanged head but authoritative cited evidence "
+                    "progress; granting one review round (receipt(s) "
+                    f"{', '.join(sorted(evidence_progress_receipts))})",
+                )
+            elif unchanged_head_coder_turns >= MAX_UNCHANGED_HEAD_CODER_TURNS:
                 # Re-reviewing an identical diff reaches the same verdict every
                 # round; a finding a PR-mode coder turn cannot satisfy (such as
                 # a required re-plan) must stop with a route, not consume the
@@ -9621,6 +9683,7 @@ def run_pr_loop(
                             else None
                         ),
                         route=route,
+                        citation_diagnosis=followup_citations,
                     )
                 )
             log(

@@ -240,6 +240,29 @@ class NonRepairableEvidenceRejection(AgentLoopError):
 CITATION_REASKABLE_REASONS = frozenset({"non-passing-selector", "launch-integrity"})
 
 
+class TestObservationsShapeError(AgentLoopError):
+    """A coder's ``test_observations`` field has a shape repair can fix (#1626).
+
+    Raised only by a fresh coder follow-up or issue implementation parse in
+    ``repair-first`` mode, so the structured repair pass runs before any
+    citation is dropped.  It carries the field path and a JSON type label,
+    never the raw value.  ``fallback_degradable`` says whether today's #927
+    drop may accept the original response once repair fails: true for a
+    non-array value, false for the over-bound malformed-item case, which
+    stays fatal.
+    """
+
+    __test__ = False  # Not a pytest test class despite the name.
+
+    def __init__(
+        self, message: str, *, field_path: str, type_label: str, fallback_degradable: bool
+    ) -> None:
+        super().__init__(message)
+        self.field_path = field_path
+        self.type_label = type_label
+        self.fallback_degradable = fallback_degradable
+
+
 class IssueImplementationConflictError(AgentLoopError):
     """A parsed implementation result cannot be handed off as reported.
 

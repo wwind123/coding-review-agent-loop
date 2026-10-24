@@ -152,6 +152,7 @@ def _validate_issue_implementation_response(
     delivered_risk_test_matrix_row_ids=None,
     execution_catalog=None,
     architecture_status_mode: str,
+    test_observations_mode: str = "degrade",
 ) -> StructuredIssueImplementation | _TerminalNoPrImplementation | _TerminalIssueImplementationConflict:
     """Validate an implementation result and isolate the terminal conflict path."""
     if is_clarification_request(text):
@@ -167,6 +168,7 @@ def _validate_issue_implementation_response(
             delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
             execution_catalog=execution_catalog,
             architecture_status_mode=architecture_status_mode,
+            test_observations_mode=test_observations_mode,
         )
     except IssueImplementationConflictError as exc:
         parsed = exc.payload

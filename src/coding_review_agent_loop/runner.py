@@ -65,6 +65,7 @@ from .local_test_evidence import (
     EvidenceScope,
     ExecutionReferenceRegistry,
     TestBrokerServer,
+    LocalTestEvidence,
     LocalTestObservation,
     EnvironmentIdentityRegistry,
     reconcile_test_observations,
@@ -1719,6 +1720,10 @@ class Runner:
         # an invocation-local handle can never collide with a prior live turn.
         self._execution_reference_registry = ExecutionReferenceRegistry()
         self._latest_test_turn_id: str | None = None
+        # The unbounded reconciliation behind the latest rendered round
+        # evidence (#1626).  Only the unchanged-head gate reads it; the
+        # bounded string stays the display and persistence projection.
+        self.last_reconciled_local_test_evidence: LocalTestEvidence | None = None
         self._environment_registry = EnvironmentIdentityRegistry()
         self._containment_role = "coder"
         # Operator worker-budget options (issue #848); None means derive.
@@ -1973,6 +1978,7 @@ class Runner:
             stable_tracked_tree_snapshot,
         )
 
+        self.last_reconciled_local_test_evidence = None
         observations = list(self.local_test_observations())
         if cwd is not None:
             observations = list(
@@ -1998,6 +2004,7 @@ class Runner:
             legacy_tests_run=legacy_tests_run,
             cwd=cwd,
         )
+        self.last_reconciled_local_test_evidence = evidence
         return bounded_evidence_for_round(evidence)
 
     def remember_agent_command(

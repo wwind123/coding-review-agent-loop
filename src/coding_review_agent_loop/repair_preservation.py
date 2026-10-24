@@ -9,6 +9,9 @@ import re
 from .errors import AgentLoopError
 from .protocol import (
     _normalized_review_item_text,
+    CITATION_DEGRADATION_MAX_DROPS,
+    _decode_test_observations_string,
+    _test_observation_item_defect,
     ParseDegradation,
     _extract_json_object_prefix,
     _flatten_plan_review_finding,
@@ -1001,6 +1004,115 @@ def _validate_evidence_row_tag_preservation(
             )
 
 
+def source_has_test_observations_shape_defect(raw: str) -> bool:
+    """Whether a coder source carries the repair-first test_observations defect (#1626).
+
+    Classified from the source payload itself, as the repair-first parser
+    would: a present value that is neither a list nor a string decoding to
+    one, or more than ``CITATION_DEGRADATION_MAX_DROPS`` malformed items.  The
+    validated turn uses it so the targeted repair runs even when another
+    defect in the same response is reported first.
+    """
+    payload = _payload(raw)
+    if not isinstance(payload, dict) or "test_observations" not in payload:
+        return False
+    value = payload["test_observations"]
+    if not isinstance(value, list):
+        try:
+            value = _decode_test_observations_string(value, context="test_observations")
+        except AgentLoopError:
+            return True
+        if value is None:
+            return True
+    malformed = sum(1 for item in value if _test_observation_item_defect(item)[1] is not None)
+    return malformed > CITATION_DEGRADATION_MAX_DROPS
+
+
+def candidate_keeps_degradable_test_observations(text: str) -> bool:
+    """Whether a repair candidate still has the fallback-degradable shape (#1626).
+
+    True only for a present value that is neither a list nor a string that
+    decodes to one: the non-array field the after-repair fallback drops.  A
+    candidate that turned the field into an array (native or encoded) must
+    instead pass the scoped preservation rule, so it is never rescued here.
+    """
+    payload = _payload(text)
+    if not isinstance(payload, dict) or "test_observations" not in payload:
+        return False
+    value = payload["test_observations"]
+    if isinstance(value, list):
+        return False
+    try:
+        return _decode_test_observations_string(value, context="test_observations") is None
+    except AgentLoopError:
+        return False
+
+
+def candidate_retains_source_test_observations(source: str, candidate: str) -> bool:
+    """Whether a rejected repair candidate may fall back to the non-array drop (#1626).
+
+    Both conditions must hold:
+    - the source itself is the fallback-degradable non-array shape (never a
+      native or encoded array, whose valid citations stay pinned and whose
+      over-bound case stays fatal);
+    - the candidate keeps that exact value, so the fallback drops only what
+      the pre-#1626 degrade parse of the source would have dropped, and no
+      prose is lost or replaced.
+    """
+    if not (
+        candidate_keeps_degradable_test_observations(source)
+        and candidate_keeps_degradable_test_observations(candidate)
+    ):
+        return False
+    source_payload, candidate_payload = _payload(source), _payload(candidate)
+    return source_payload["test_observations"] == candidate_payload["test_observations"]
+
+
+def _validate_test_observations_shape_repair(
+    source: dict, target: dict, require: Callable[[bool, str], None]
+) -> None:
+    """The scoped test_observations rule for a shape-defect repair (#1626).
+
+    The source is classified exactly as the parser classifies it: a native
+    list, or a string that decodes to a list, is a citation source whose
+    valid entries are pinned (malformed entries may be corrected or removed);
+    only a value that is neither is prose, which must be moved into
+    ``summary`` or an item note rather than deleted.  The target must hold a
+    native list.
+    """
+    target_observations = target.get("test_observations")
+    require(isinstance(target_observations, list), "test_observations")
+    source_observations = source.get("test_observations")
+    decoded = (
+        source_observations
+        if isinstance(source_observations, list)
+        else _decode_test_observations_string(
+            source_observations, context="test_observations"
+        )
+    )
+    if decoded is not None:
+        target_citations = [
+            citation
+            for citation, _rule in (_test_observation_item_defect(item) for item in target_observations)
+            if citation is not None
+        ]
+        for entry in decoded:
+            citation, _rule = _test_observation_item_defect(entry)
+            if citation is not None:
+                require(citation in target_citations, "test_observations")
+        return
+    fragments = _fragments(source_observations)
+    if not fragments:
+        return
+    destinations = [target.get("summary")]
+    for notes_field in ("addressed_item_notes", "remaining_item_notes"):
+        notes = target.get(notes_field)
+        if isinstance(notes, dict):
+            destinations.extend(notes.values())
+    combined = " ".join(item for item in destinations if isinstance(item, str))
+    require(_contains_fragments(combined, fragments), "test_observations")
+
+
 def validate_repair_preservation(
     raw: str,
     repaired: str,
@@ -1013,6 +1125,7 @@ def validate_repair_preservation(
     allow_legacy_matrix_removal: bool = False,
     forbid_architecture_impact: bool = False,
     evidence_row_id_universe: Sequence[str] | None = None,
+    test_observations_shape_defect: bool = False,
 ) -> None:
     """Reject observable losses, not certify semantic equivalence.
 
@@ -1303,7 +1416,9 @@ def validate_repair_preservation(
 
     if source["kind"] in {"coder_followup", "issue_implementation"}:
         source_observations = source.get("test_observations")
-        if isinstance(source_observations, list):
+        if test_observations_shape_defect:
+            _validate_test_observations_shape_repair(source, target, require)
+        elif isinstance(source_observations, list):
             target_observations = target.get("test_observations", [])
             require(isinstance(target_observations, list), "test_observations")
             for entry in source_observations:

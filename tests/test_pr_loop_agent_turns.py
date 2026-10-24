@@ -1329,3 +1329,390 @@ def test_semantic_dedupe_transport_removes_its_whole_isolated_workdir(
     assert hidden_while_running
     assert isolated_dirs and all(not os.path.lexists(path) for path in isolated_dirs)
     assert turn_dirs and all(not path.exists() for path in turn_dirs)
+
+
+# ---------------------------------------------------------------------------
+# #1626: a non-array test_observations goes to format repair before any drop.
+# ---------------------------------------------------------------------------
+
+from coding_review_agent_loop.architecture_contract import (  # noqa: E402
+    _architecture_and_test_observation_mode_validators as _observation_validators_1626,
+)
+from coding_review_agent_loop.local_test_evidence import LocalTestObservation as _Observation_1626  # noqa: E402
+from coding_review_agent_loop.protocol import (  # noqa: E402
+    TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE as _AFTER_REPAIR_RULE_1626,
+)
+from coding_review_agent_loop.unresolved_items import (  # noqa: E402
+    _validate_coder_followup_response as _validate_followup_1626,
+)
+from agent_loop_helpers import structured_coder_followup as _structured_followup_1626  # noqa: E402
+import coding_review_agent_loop.repair as _repair_module_1626  # noqa: E402
+
+_PROSE_1626 = (
+    "The node command ran with no environment override; the checkout's gitignored venv "
+    "symlink supplies PyICU to build_locales.mjs."
+)
+_PASS_COMMAND_1626 = ("node", "--test", "scripts/locales.test.mjs")
+
+
+def _followup_text_1626(observations, *, summary="Re-ran the locale tests.", **changes):
+    raw = _structured_followup_1626(summary=summary, tests_run=["node --test scripts/locales.test.mjs"])
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["test_observations"] = observations
+    for key, value in changes.items():
+        if value is None:
+            payload.pop(key, None)
+        else:
+            payload[key] = value
+    return json.dumps(payload) + raw[end:]
+
+
+_REPAIRED_1626 = _followup_text_1626(
+    [{"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass", "claim": "current-result"}],
+    summary=f"Re-ran the locale tests. {_PROSE_1626}",
+)
+
+
+class _ReceiptRunner1626(FakeRunner):
+    """A coder turn that captures one passing run-tests receipt."""
+
+    def run_with_log(self, args, **kwargs):
+        if str(args[0]) == "claude":
+            self._latest_test_turn_id = "coder-turn"
+            self._local_test_observations.append(_Observation_1626(
+                command=_PASS_COMMAND_1626, outcome="passed", provenance="parent-observed",
+                receipt_id="receipt-pass", turn_id="coder-turn",
+            ))
+        return super().run_with_log(args, **kwargs)
+
+
+def _followup_turn_1626(tmp_path, outputs, *, repair=None, run_cli_repair=None, monkeypatch=None, **config_changes):
+    runner = _ReceiptRunner1626(claude_outputs=list(outputs))
+    config = make_config(
+        tmp_path, coder="claude", agent_max_retries=0, agent_retry_backoff_seconds=0,
+        **config_changes,
+    )
+    calls = []
+
+    def fake_repair(raw, cmd, **kwargs):
+        calls.append(kwargs)
+        return repair(raw) if callable(repair) else repair
+
+    validators = _observation_validators_1626(
+        lambda mode, observations_mode: lambda text: _validate_followup_1626(
+            text, unresolved_items=(), human_requirements=(),
+            required_architecture_impact_contract=1, architecture_status_mode=mode,
+            test_observations_mode=observations_mode,
+        )
+    )
+    kwargs = dict(
+        agent="claude", config=config, prompt="Address the review.",
+        marker_description="<!-- AGENT_STATE: approved|blocking -->",
+        require_architecture_impact_contract=True, role="coder",
+        use_repair=True, repair_expected_kind="coder_followup", **validators,
+    )
+    if run_cli_repair is not None:
+        # The suite-wide conftest stubs the legacy hook; restore the real
+        # execute_repair route for this turn.
+        monkeypatch.setattr(validated_agent, "attempt_repair", validated_agent._ORIGINAL_ATTEMPT_REPAIR)
+        monkeypatch.setattr(_repair_module_1626, "run_cli_repair", run_cli_repair)
+        call = lambda: validated_agent._run_validated_agent(runner, **kwargs)  # noqa: E731
+    else:
+        def call():
+            with patch("coding_review_agent_loop.validated_agent.attempt_repair", fake_repair):
+                return validated_agent._run_validated_agent(runner, **kwargs)
+    try:
+        outcome = call()
+    except AgentLoopError as exc:
+        outcome = exc
+    coder_turns = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    return outcome, calls, coder_turns
+
+
+def test_prose_test_observations_are_repaired_to_a_cited_array_1626(tmp_path):
+    """Matrix row `prose-repair-succeeds`."""
+    response, calls, coder_turns = _followup_turn_1626(
+        tmp_path, [_followup_text_1626(_PROSE_1626)], repair=_REPAIRED_1626,
+    )
+    assert isinstance(response, ValidatedAgentResponse), response
+    assert response.text == _REPAIRED_1626
+    assert [item.receipt_id for item in response.marker_value.test_observations] == ["receipt-pass"]
+    assert response.marker_value.test_observation_degradations == ()
+    # The targeted repair received the tool-owned receipts of this turn.
+    [kwargs] = calls
+    assert kwargs["test_observations_shape_defect"] is True
+    assert kwargs["test_turn_receipts"] == (
+        {"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass", "outcome": "passed"},
+    )
+    assert len(coder_turns) == 1, "no agent retry is consumed"
+    assert response.acquisition_test_observations[0].receipt_id == "receipt-pass"
+
+
+@pytest.mark.parametrize(
+    "repair",
+    [None, "prose"],
+    ids=["repair-unavailable", "repair-still-prose"],
+)
+def test_failed_repair_falls_back_to_the_after_repair_drop_1626(tmp_path, repair):
+    """Matrix row `prose-repair-fails-fallback` (legacy hook variants)."""
+    source = _followup_text_1626(_PROSE_1626)
+    response, calls, coder_turns = _followup_turn_1626(
+        tmp_path, [source], repair=(source if repair == "prose" else None),
+    )
+    assert isinstance(response, ValidatedAgentResponse), response
+    assert response.text == source
+    assert response.marker_value.test_observations == ()
+    [record] = response.marker_value.test_observation_degradations
+    assert record.outcome == "citation-dropped"
+    assert record.rule == _AFTER_REPAIR_RULE_1626
+    assert "PyICU" not in record.observed_preview
+    assert len(calls) == 1
+    assert len(coder_turns) == 1, "no agent retry is consumed"
+
+
+def test_exhausted_repair_chain_falls_back_to_the_after_repair_drop_1626(tmp_path, monkeypatch):
+    """Matrix row `prose-repair-fails-fallback` (real execute_repair, exhausted chain)."""
+    attempts = []
+
+    def failing_cli_repair(runner, config, prompt, *, model, log_path):
+        attempts.append((model, "## test_observations repair:" in prompt))
+        return SimpleNamespace(
+            text="", returncode=1, raw_output="model unavailable", usage=None,
+            raw_usage=None, observed_model=None, text_source="stdout",
+        )
+
+    source = _followup_text_1626(_PROSE_1626)
+    response, _calls, coder_turns = _followup_turn_1626(
+        tmp_path, [source], run_cli_repair=failing_cli_repair, monkeypatch=monkeypatch,
+        repair_backend="claude", repair_models=("repair-a", "repair-b"),
+    )
+    assert isinstance(response, ValidatedAgentResponse), response
+    assert attempts == [("repair-a", True), ("repair-b", True)]
+    [record] = response.marker_value.test_observation_degradations
+    assert record.rule == _AFTER_REPAIR_RULE_1626
+    assert len(coder_turns) == 1
+
+
+def test_fallback_keeps_an_architecture_near_miss_record_1626(tmp_path):
+    """Matrix row `fallback-architecture-near-miss`."""
+    near_miss = {
+        "status": "modified", "rationale": "The loader changed shape.",
+        "affected_components": ["loader"], "dependencies": ["json"],
+        "execution_data_flows": ["parse"], "persistence": ["none"],
+        "public_contracts": ["loader api"], "security_boundaries": ["none"],
+        "canonical_document_action": "update",
+        "canonical_document_path": "docs/architecture/components.md",
+        "canonical_document_rationale": "The loader section changed.",
+    }
+    source = _followup_text_1626(_PROSE_1626, architecture_impact=near_miss)
+    response, _calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=None)
+    assert isinstance(response, ValidatedAgentResponse), response
+    parsed = response.marker_value
+    assert parsed.architecture_impact.status == "changed"
+    assert [record.outcome for record in parsed.architecture_impact_degradations] == [
+        "normalized-to-changed"
+    ]
+    [record] = parsed.test_observation_degradations
+    assert record.rule == _AFTER_REPAIR_RULE_1626
+    # The accepted text is the canonicalized, strictly re-parsed form.
+    assert '"modified"' not in response.text
+    assert len(coder_turns) == 1
+
+
+def test_fallback_does_not_mask_another_fatal_defect_1626(tmp_path):
+    """Matrix row `fallback-other-defect`."""
+    source = _followup_text_1626(_PROSE_1626, summary="   ")
+    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=None)
+    assert isinstance(outcome, AgentLoopError)
+    assert not isinstance(outcome, ValidatedAgentResponse)
+    assert len(calls) == 1
+
+
+def test_valid_array_followup_runs_no_repair_1626(tmp_path):
+    """Matrix row `valid-array-unchanged` at the validated-turn seam."""
+    valid = _followup_text_1626([
+        {"command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass", "claim": "current-result"}
+    ])
+    response, calls, _coder_turns = _followup_turn_1626(tmp_path, [valid], repair=_REPAIRED_1626)
+    assert isinstance(response, ValidatedAgentResponse), response
+    assert response.text == valid
+    assert calls == []
+    assert response.marker_value.test_observation_degradations == ()
+
+
+def test_fallback_validators_must_be_supplied_as_a_pair_1626(tmp_path):
+    with pytest.raises(AgentLoopError, match="supplied together"):
+        validated_agent._run_validated_agent(
+            FakeRunner(), agent="claude", config=make_config(tmp_path), prompt="x",
+            marker_description="x", validate=lambda text: text,
+            test_observations_fallback_validate=lambda text: text,
+        )
+
+
+def _with_earlier_defect_1626(text, defect):
+    payload, end = json.JSONDecoder().raw_decode(text)
+    if defect == "tests-run-string":
+        payload["tests_run"] = "node --test scripts/locales.test.mjs"
+    else:
+        payload["unexpected_note"] = "an extra top-level key"
+    return json.dumps(payload) + text[end:]
+
+
+@pytest.mark.parametrize("defect", ["tests-run-string", "extra-top-level-key"])
+@pytest.mark.parametrize("repair_outcome", ["fixes-both", "fixes-other-keeps-prose", "unavailable"])
+def test_prose_with_an_earlier_checked_defect_still_gets_the_targeted_repair_1626(
+    tmp_path, defect, repair_outcome
+):
+    """Regression for review item-1: the shape defect is classified from the source.
+
+    The earlier defect raises first, yet the repair is still flagged with the
+    receipts; a candidate that fixed the other defect but kept the prose is
+    accepted by the after-repair fallback instead of failing the turn.
+    """
+    source = _with_earlier_defect_1626(_followup_text_1626(_PROSE_1626), defect)
+    repair = {
+        "fixes-both": _REPAIRED_1626,
+        "fixes-other-keeps-prose": _followup_text_1626(_PROSE_1626),
+        "unavailable": None,
+    }[repair_outcome]
+    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=repair)
+    [kwargs] = calls
+    assert kwargs["test_observations_shape_defect"] is True
+    assert kwargs["test_turn_receipts"][0]["receipt_id"] == "receipt-pass"
+    assert len(coder_turns) == 1, "no agent retry is consumed"
+    if repair_outcome == "fixes-both":
+        assert isinstance(outcome, ValidatedAgentResponse), outcome
+        assert [item.receipt_id for item in outcome.marker_value.test_observations] == ["receipt-pass"]
+        assert outcome.marker_value.test_observation_degradations == ()
+    elif repair_outcome == "fixes-other-keeps-prose":
+        assert isinstance(outcome, ValidatedAgentResponse), outcome
+        assert outcome.text == repair
+        [record] = outcome.marker_value.test_observation_degradations
+        assert record.rule == _AFTER_REPAIR_RULE_1626
+    else:
+        # The original still carries the other defect: nothing is accepted.
+        assert isinstance(outcome, AgentLoopError)
+
+
+def test_repaired_candidate_fallback_keeps_unflagged_preservation_1626(tmp_path):
+    """A candidate that also lost content is never accepted by the fallback."""
+    source = _with_earlier_defect_1626(_followup_text_1626(_PROSE_1626), "tests-run-string")
+    lossy = _followup_text_1626(_PROSE_1626, summary="Done.")
+    outcome, calls, _coder_turns = _followup_turn_1626(tmp_path, [source], repair=lossy)
+    assert len(calls) == 1
+    assert isinstance(outcome, AgentLoopError)
+
+
+_NEAR_MISS_1626 = {
+    "status": "modified", "rationale": "The loader changed shape.",
+    "affected_components": ["loader"], "dependencies": ["json"],
+    "execution_data_flows": ["parse"], "persistence": ["none"],
+    "public_contracts": ["loader api"], "security_boundaries": ["none"],
+    "canonical_document_action": "update",
+    "canonical_document_path": "docs/architecture/components.md",
+    "canonical_document_rationale": "The loader section changed.",
+}
+_CITATION_1626 = {
+    "command": "node --test scripts/locales.test.mjs", "receipt_id": "receipt-pass",
+    "claim": "current-result",
+}
+
+
+@pytest.mark.parametrize(
+    "repaired_observations",
+    [[], [_CITATION_1626]],
+    ids=["empty-array", "cited-array"],
+)
+def test_candidate_fallback_never_rescues_an_array_that_deleted_the_prose_1626(
+    tmp_path, repaired_observations
+):
+    """Review items 3 and 6: a candidate rejected by scoped preservation stays rejected.
+
+    The earlier tests_run defect is fixed and test_observations became an
+    array, but the prose was deleted from summary and notes.  The scoped rule
+    refuses it, and the candidate fallback must not accept it either.
+    """
+    source = _with_earlier_defect_1626(_followup_text_1626(_PROSE_1626), "tests-run-string")
+    deleted = _followup_text_1626(repaired_observations)
+    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=deleted)
+    assert len(calls) == 1 and len(coder_turns) == 1
+    assert isinstance(outcome, AgentLoopError), outcome
+
+
+def test_candidate_fallback_never_rescues_an_emptied_decoded_array_1626(tmp_path):
+    """Review item 3: a JSON-array string with nine malformed items and one valid citation.
+
+    Repair to [] removes the valid decoded citation.  Scoped preservation
+    refuses it; the over-bound source is not fallback-degradable, and the
+    candidate is an array, so nothing is accepted.
+    """
+    malformed = [
+        {"command": "node --test scripts/locales.test.mjs", "receipt_id": f"r-{index}", "claim": "reran"}
+        for index in range(9)
+    ]
+    source = _followup_text_1626(json.dumps([*malformed, _CITATION_1626]))
+    outcome, calls, _coder_turns = _followup_turn_1626(tmp_path, [source], repair=_followup_text_1626([]))
+    assert calls and calls[0]["test_observations_shape_defect"] is True
+    assert isinstance(outcome, AgentLoopError), outcome
+
+
+def test_candidate_fallback_keeps_the_source_architecture_record_1626(tmp_path):
+    """Review item 4: both the normalized-to-changed and after-repair records survive."""
+    source = _with_earlier_defect_1626(
+        _followup_text_1626(_PROSE_1626, architecture_impact=_NEAR_MISS_1626), "tests-run-string"
+    )
+    candidate = _followup_text_1626(
+        _PROSE_1626, architecture_impact={**_NEAR_MISS_1626, "status": "changed"}
+    )
+    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=candidate)
+    assert isinstance(outcome, ValidatedAgentResponse), outcome
+    assert len(calls) == 1 and len(coder_turns) == 1
+    parsed = outcome.marker_value
+    assert parsed.architecture_impact.status == "changed"
+    assert [record.outcome for record in parsed.architecture_impact_degradations] == [
+        "normalized-to-changed"
+    ]
+    [record] = parsed.test_observation_degradations
+    assert record.rule == _AFTER_REPAIR_RULE_1626
+
+
+_OVER_BOUND_ENCODED_1626 = json.dumps([
+    *[
+        {"command": "node --test scripts/locales.test.mjs", "receipt_id": f"r-{index}", "claim": "reran"}
+        for index in range(9)
+    ],
+    _CITATION_1626,
+])
+
+
+@pytest.mark.parametrize(
+    ("source_observations", "candidate_observations", "accepted"),
+    [
+        pytest.param(_OVER_BOUND_ENCODED_1626, "", False, id="over-bound-encoded-to-empty-string"),
+        pytest.param(_OVER_BOUND_ENCODED_1626, _PROSE_1626, False, id="over-bound-encoded-to-prose"),
+        pytest.param(_PROSE_1626, "", False, id="prose-to-empty-string"),
+        pytest.param(_PROSE_1626, "Tests passed.", False, id="prose-replaced"),
+        pytest.param(_PROSE_1626, {"note": _PROSE_1626}, False, id="prose-to-object"),
+        pytest.param(_PROSE_1626, _PROSE_1626, True, id="prose-kept-verbatim"),
+    ],
+)
+def test_candidate_fallback_requires_a_degradable_source_and_the_same_value_1626(
+    tmp_path, source_observations, candidate_observations, accepted
+):
+    """Review items 7 and 8, as one class with items 3 and 6.
+
+    The candidate fallback may only drop exactly what the pre-#1626 degrade
+    parse of the source would have dropped.  The source must itself be the
+    degradable non-array shape (an over-bound encoded array stays fatal), and
+    the candidate must keep that value verbatim (no lost or replaced prose).
+    """
+    source = _with_earlier_defect_1626(_followup_text_1626(source_observations), "tests-run-string")
+    candidate = _followup_text_1626(candidate_observations)
+    outcome, calls, coder_turns = _followup_turn_1626(tmp_path, [source], repair=candidate)
+    assert len(calls) == 1 and len(coder_turns) == 1
+    if accepted:
+        assert isinstance(outcome, ValidatedAgentResponse), outcome
+        [record] = outcome.marker_value.test_observation_degradations
+        assert record.rule == _AFTER_REPAIR_RULE_1626
+    else:
+        assert isinstance(outcome, AgentLoopError), outcome

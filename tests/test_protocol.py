@@ -5873,6 +5873,7 @@ def test_every_parser_call_site_in_src_chooses_its_mode_explicitly():
     root = Path(__file__).resolve().parents[1] / "src" / "coding_review_agent_loop"
     unclassified = []
     degradable_factories = 0
+    test_observation_factories = 0
     for path in root.glob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -5880,8 +5881,13 @@ def test_every_parser_call_site_in_src_chooses_its_mode_explicitly():
                 continue
             func = node.func
             name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-            if name == "_architecture_mode_validators":
+            if name in {
+                "_architecture_mode_validators",
+                "_architecture_and_test_observation_mode_validators",
+            }:
                 degradable_factories += 1
+            if name == "_architecture_and_test_observation_mode_validators":
+                test_observation_factories += 1
             if name not in parsers | helpers:
                 continue
             if any(k.arg == "architecture_status_mode" for k in node.keywords):
@@ -5894,6 +5900,9 @@ def test_every_parser_call_site_in_src_chooses_its_mode_explicitly():
     assert unclassified == []
     # Seven required-contract invocations plus four live review invocations.
     assert degradable_factories == 11
+    # The fresh coder follow-up and both fresh issue-implementation turns
+    # also carry the test_observations fallback pair (#1626).
+    assert test_observation_factories == 3
 
 
 # ---------------------------------------------------------------------------
@@ -7806,3 +7815,116 @@ def test_pr_review_parsing_is_unchanged_by_plan_provenance():
     finding = parsed.blocking_items[0]
     assert finding.provenance is None
     assert "pre_existing" in finding.text
+
+
+# ---------------------------------------------------------------------------
+# #1626: decode-first, repair-first and degrade-after-repair test_observations.
+# ---------------------------------------------------------------------------
+
+
+def _validate_citations_1626(kind, observations, *, mode):
+    from coding_review_agent_loop.protocol import validate_structured_issue_implementation
+
+    validator = (
+        validate_structured_issue_implementation
+        if kind == "issue_implementation"
+        else validate_structured_coder_followup
+    )
+    return validator(_citation_response_927(kind, observations), test_observations_mode=mode)
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+def test_valid_array_is_unchanged_in_repair_first_mode_1626(kind):
+    """Matrix row `valid-array-unchanged`."""
+    parsed = _validate_citations_1626(kind, [_VALID_CITATION_927], mode="repair-first")
+    assert [item.receipt_id for item in parsed.test_observations] == ["known"]
+    assert parsed.test_observation_degradations == ()
+    assert parsed == _validate_citations_927(kind, [_VALID_CITATION_927])
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+@pytest.mark.parametrize("mode", ["repair-first", "degrade", "degrade-after-repair"])
+def test_json_array_string_is_decoded_in_every_mode_1626(kind, mode):
+    """Matrix row `json-string-decoded`: kept citations, one normalization record."""
+    encoded = json.dumps([_VALID_CITATION_927])
+    parsed = _validate_citations_1626(kind, encoded, mode=mode)
+
+    assert [item.receipt_id for item in parsed.test_observations] == ["known"]
+    [record] = parsed.test_observation_degradations
+    assert record.outcome == "citations-decoded-from-string"
+    assert record.element_path == f"{kind}.test_observations"
+    assert record.observed_preview == "type string"
+    assert not any(
+        item.outcome == "citation-dropped" for item in parsed.test_observation_degradations
+    )
+    # The strict re-parse of the accepted text decodes identically.
+    assert _validate_citations_1626(kind, encoded, mode="repair-first") == parsed
+    assert _validate_citations_927(kind, encoded) == parsed
+
+
+def test_decoded_array_keeps_per_item_drops_and_the_drop_bound_1626():
+    malformed = _MALFORMED_CITATIONS_927[:3]
+    encoded = json.dumps([_VALID_CITATION_927, *malformed])
+    parsed = _validate_citations_1626("coder_followup", encoded, mode="degrade")
+    outcomes = [record.outcome for record in parsed.test_observation_degradations]
+    assert outcomes == ["citations-decoded-from-string"] + ["citation-dropped"] * 3
+    over = json.dumps([
+        {"command": "x", "receipt_id": f"r-{index}", "claim": "bad"} for index in range(9)
+    ])
+    with pytest.raises(AgentLoopError, match="beyond the 8-citation drop bound"):
+        _validate_citations_1626("coder_followup", over, mode="degrade")
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+@pytest.mark.parametrize("value", ["The node command ran with no override; PyICU came from .venv.", {"a": 1}, 3])
+def test_non_array_raises_a_repairable_shape_error_in_repair_first_mode_1626(kind, value):
+    from coding_review_agent_loop.errors import TestObservationsShapeError
+
+    with pytest.raises(TestObservationsShapeError) as raised:
+        _validate_citations_1626(kind, value, mode="repair-first")
+    assert raised.value.fallback_degradable is True
+    assert raised.value.field_path == f"{kind}.test_observations"
+    # Only the field path and a type label: never the raw value.
+    assert "PyICU" not in str(raised.value)
+    assert raised.value.type_label.startswith("type ")
+
+
+@pytest.mark.parametrize("kind", ["coder_followup", "issue_implementation"])
+def test_degrade_after_repair_records_that_repair_was_attempted_1626(kind):
+    from coding_review_agent_loop.protocol import (
+        TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
+        TEST_OBSERVATIONS_NOT_ARRAY_RULE,
+    )
+
+    prose = "The pytest run had SECRET_KEY set; the node run passed."
+    parsed = _validate_citations_1626(kind, prose, mode="degrade-after-repair")
+    assert parsed.test_observations == ()
+    [record] = parsed.test_observation_degradations
+    assert record.outcome == "citation-dropped"
+    assert record.rule == TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE
+    assert "format repair was attempted" in record.rule
+    assert "SECRET_KEY" not in record.observed_preview
+    # The default (historical / resume) mode keeps today's #927 record.
+    [legacy] = _validate_citations_927(kind, prose).test_observation_degradations
+    assert legacy.rule == TEST_OBSERVATIONS_NOT_ARRAY_RULE
+
+
+def test_over_bound_malformed_items_raise_a_non_degradable_shape_error_1626():
+    from coding_review_agent_loop.errors import TestObservationsShapeError
+
+    malformed = [{"command": "x", "receipt_id": f"r-{index}", "claim": "bad"} for index in range(9)]
+    with pytest.raises(TestObservationsShapeError) as raised:
+        _validate_citations_1626(
+            "coder_followup", [_VALID_CITATION_927, *malformed], mode="repair-first"
+        )
+    assert raised.value.fallback_degradable is False
+    # Degrade modes keep today's plain fatal error.
+    for mode in ("degrade", "degrade-after-repair"):
+        with pytest.raises(AgentLoopError) as plain:
+            _validate_citations_1626("coder_followup", [_VALID_CITATION_927, *malformed], mode=mode)
+        assert not isinstance(plain.value, TestObservationsShapeError)
+
+
+def test_unknown_test_observations_mode_is_rejected_1626():
+    with pytest.raises(ValueError):
+        _validate_citations_1626("coder_followup", [], mode="lenient")

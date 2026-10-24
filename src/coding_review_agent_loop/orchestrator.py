@@ -833,6 +833,7 @@ from .architecture_contract import (
     _architecture_contract_diagnostic,
     _attach_architecture_degradations,
     _merge_degradation_records,
+    _architecture_and_test_observation_mode_validators,
     _architecture_mode_validators,
     _canonical_comparison_projection,
     _AcceptedCandidate,

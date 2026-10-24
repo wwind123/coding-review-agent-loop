@@ -1252,6 +1252,7 @@ def _validate_coder_followup_response(
     architecture_status_mode: str,
     optional_item_ids: Sequence[str] = (),
     resolved_item_ids: Sequence[str] = (),
+    test_observations_mode: str = "degrade",
 ) -> StructuredCoderFollowup | str:
     prompt_context = render_coder_human_requirements_prompt_context(human_requirements)
     structured_followup = validate_structured_coder_followup(
@@ -1264,6 +1265,7 @@ def _validate_coder_followup_response(
         delivered_risk_test_matrix_row_ids=delivered_risk_test_matrix_row_ids,
         execution_catalog=execution_catalog,
         architecture_status_mode=architecture_status_mode,
+        test_observations_mode=test_observations_mode,
         # Advisory sub-item claims may name only sub-items still open on the
         # carried items (#958); invalid claims are dropped, never rejected.
         expected_sub_item_ids={

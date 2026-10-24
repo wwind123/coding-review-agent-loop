@@ -115,6 +115,7 @@ from .architecture_contract import (
     _test_observation_degradation_fields,
     _TerminalNoPrImplementation,
     _TerminalIssueImplementationConflict,
+    _architecture_and_test_observation_mode_validators,
     _architecture_mode_validators,
     _architecture_document_paths_hook,
 )
@@ -895,10 +896,11 @@ def run_issue_loop(
             marker_description="structured issue_implementation result, blocking, or clarification",
             require_architecture_impact_contract=True,
             architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
-            **_architecture_mode_validators(lambda mode: lambda text: _validate_issue_implementation_response(
+            **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text: _validate_issue_implementation_response(
                 text,
                 human_requirements=implementation_requirements,
                 require_architecture_impact=True, architecture_status_mode=mode,
+                test_observations_mode=observations_mode,
             )),
             usage_context=usage_context,
             # Without the exact coder role a sandboxed run hands this committing
