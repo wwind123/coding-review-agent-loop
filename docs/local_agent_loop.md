@@ -4467,7 +4467,7 @@ Converted rows leave the stall window's unsatisfied set and never re-mint.
 
 **Residual tags.** A finding keeps its original `evidence_row_ids` as provenance and
 gains the converted subset. The residual (tags minus converted rows) is what the stall
-classification, the head-change expectation and further conversions read, so a finding
+classification and further conversions read, so a finding
 tagged A,B with only A converted still demands B, and B can convert later. Only when no
 residual remains does the finding move to the terminal `converted` status, which is
 never mandatory, never counted as resolved, and hidden from reviewer prompts. A new tag
