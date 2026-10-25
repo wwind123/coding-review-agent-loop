@@ -24,16 +24,48 @@ pytest_plugins = ["pytester"]
 TESTS_DIR = Path(__file__).parent
 ROOT = TESTS_DIR.parent
 CALLEE_DIR = ROOT / "ci" / "managed"
-# The plugin and verifier are owned by the reusable workflow (ci/managed), not
-# by this repository's tests; the verifier is loaded by path.
+# The plugin, runner and verifier are owned by the reusable workflow
+# (ci/managed), not by this repository's tests. Managed CI puts the *base*
+# branch's ci/managed first on PYTHONPATH and loads its ci_shard_plugin into the
+# outer session, so importing them by name would test the base copy instead of
+# the one this checkout changes. Load this checkout's copies by path instead.
 if str(CALLEE_DIR) not in sys.path:
     sys.path.append(str(CALLEE_DIR))
-import ci_shard_plugin as _ci_shard  # noqa: E402
 
+
+def _load_checkout_callee(name):
+    spec = importlib.util.spec_from_file_location(f"checkout_{name}", CALLEE_DIR / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses resolve annotations through sys.modules
+    spec.loader.exec_module(module)
+    return module
+
+
+_ci_shard = _load_checkout_callee("ci_shard_plugin")
+run_shard = _load_checkout_callee("run_shard")
+ci_shard_verify = _load_checkout_callee("ci_shard_verify")
 VERIFIER = CALLEE_DIR / "ci_shard_verify.py"
-_spec = importlib.util.spec_from_file_location("callee_ci_shard_verify", VERIFIER)
-ci_shard_verify = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ci_shard_verify)
+# The copy the outer session injected with ``-p ci_shard_plugin`` (None in an
+# ordinary local run); only its stash key finds the recorded real collection.
+_ACTIVE_CI_SHARD = sys.modules.get("ci_shard_plugin")
+
+
+def _use_checkout_plugin(monkeypatch):
+    # In-process pytester sessions resolve ``-p ci_shard_plugin`` through
+    # sys.modules; point that name at this checkout's copy. Subprocess sessions
+    # get it from shard_env's PYTHONPATH instead.
+    monkeypatch.setitem(sys.modules, "ci_shard_plugin", _ci_shard)
+
+
+@pytest.fixture(autouse=True)
+def _nested_sessions_use_checkout_plugin(monkeypatch):
+    _use_checkout_plugin(monkeypatch)
+
+
+def _recorded_full_collection(request):
+    if _ACTIVE_CI_SHARD is None:
+        return None
+    return request.config.stash.get(_ACTIVE_CI_SHARD._FULL_KEY, None)
 ORDINARY_WORKFLOW = ROOT / ".github" / "workflows" / "managed-ci-ordinary.yml"
 MANAGED_WORKFLOW = ROOT / ".github" / "workflows" / "managed-ci.yml"
 HEAD = "b" * 40
@@ -82,10 +114,39 @@ def test_exactly_once_guard_rejects_overlap_and_gaps():
         _ci_shard.check_exactly_once([["a"], []], ["a", "b"])
 
 
+@pytest.mark.parametrize("module", ["ci_shard_plugin", "run_shard", "ci_shard_verify"])
+def test_callee_modules_under_test_are_this_checkouts_copies(module):
+    # Managed CI runs this file under the base branch's callee copies; the tests
+    # must still exercise the copies this checkout changes.
+    loaded = {"ci_shard_plugin": _ci_shard, "run_shard": run_shard, "ci_shard_verify": ci_shard_verify}[module]
+    assert Path(loaded.__file__).resolve() == (CALLEE_DIR / f"{module}.py").resolve()
+
+
+def test_in_process_sessions_load_this_checkouts_plugin_over_a_preloaded_copy(pytester, monkeypatch, tmp_path):
+    # Simulate CI: another ci_shard_plugin is already imported under the plugin's name.
+    decoy = type(sys)("ci_shard_plugin")
+    decoy.__file__ = "/base-branch/ci/managed/ci_shard_plugin.py"
+    monkeypatch.setitem(sys.modules, "ci_shard_plugin", decoy)
+    _use_checkout_plugin(monkeypatch)
+    record = tmp_path / "plugin-file.txt"
+    monkeypatch.setenv("PLUGIN_FILE_RECORD", str(record))
+    pytester.makeconftest("""
+import os
+from pathlib import Path
+def pytest_configure(config):
+    plugin = config.pluginmanager.get_plugin("ci_shard_plugin")
+    Path(os.environ["PLUGIN_FILE_RECORD"]).write_text(str(Path(plugin.__file__).resolve()))
+""")
+    pytester.makepyfile(test_suite="def test_a(): pass")
+    result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
+    result.assert_outcomes(passed=1)
+    assert record.read_text() == str((CALLEE_DIR / "ci_shard_plugin.py").resolve())
+
+
 def test_real_collection_is_covered_exactly_once(request):
     # The plugin is injected by the reusable workflow (``-p ci_shard_plugin``);
     # an ordinary local run never loads it, so there is no recorded collection.
-    full = request.config.stash.get(_ci_shard._FULL_KEY, None)
+    full = _recorded_full_collection(request)
     if not full:
         pytest.skip("collection not recorded in this process")
     assert full
@@ -340,8 +401,6 @@ def test_parse_env_rejects_unknown_store_modes(raw):
 
 
 def test_store_mode_variable_is_declared_and_stripped_from_shard_legs(monkeypatch):
-    import run_shard  # CALLEE_DIR is on sys.path (see the module header)
-
     assert "CI_SHARD_STORE_DURATIONS_MODE" in _ci_shard.SHARD_ENV_VARS
     assert run_shard.SHARD_ENV_VARS == _ci_shard.SHARD_ENV_VARS
     base = {"PATH": "/bin", "CI_SHARD_STORE_DURATIONS": "x.json", "CI_SHARD_STORE_DURATIONS_MODE": "add-missing"}
@@ -819,7 +878,7 @@ def test_unsharded_workflow_command_is_still_detected_as_parallel():
 
 def test_committed_durations_cover_most_of_the_real_collection(request):
     durations = json.loads((TESTS_DIR / ".test_durations").read_text())
-    full = request.config.stash.get(_ci_shard._FULL_KEY, None) or []
+    full = _recorded_full_collection(request) or []
     if len(full) < 1000:
         pytest.skip("only meaningful when the whole suite is collected")
     known = sum(1 for i in full if i in durations)
