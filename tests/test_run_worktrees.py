@@ -719,10 +719,69 @@ def test_worktree_link_missing_source_fails_before_worktree(tmp_path, monkeypatc
     config = env.config(extra=("--worktree-link", "missing-env"))
     with workdir_claim_scope(command="task"):
         claim_agent_workdirs(config)
-        with pytest.raises(AgentLoopError, match="missing-env"):
+        with pytest.raises(AgentLoopError, match="missing-env") as caught:
             ensure_agent_workdirs(config, Runner())
         runs_root = default_run_worktree_root("OWNER/REPO", "claude")
         assert not runs_root.exists() or not list(runs_root.iterdir())
+    # The message names the shared clone and the remedy (#1650).
+    message = str(caught.value)
+    stores = {
+        os.path.realpath(default_agent_workdir("OWNER/REPO", agent)) for agent in ("claude", "codex")
+    }
+    named = message.split("does not exist in the shared clone ", 1)[1].split(";", 1)[0]
+    assert os.path.realpath(named) in stores
+    assert "pass --worktree-setup CMD to create it" in message
+    assert "or create the path there" in message
+    assert "succeeded but did not create" not in message
+
+
+def _unignored_warnings(monkeypatch):
+    messages: list[str] = []
+    monkeypatch.setattr(run_worktrees, "log", lambda _config, message: messages.append(message))
+    return messages
+
+
+@pytest.mark.parametrize("rule, warned", [("node_modules/\n", True), ("/node_modules\n", False)])
+def test_worktree_link_not_ignored_as_symlink_warns_without_writing_ignore_state(
+    tmp_path, monkeypatch, rule, warned
+):
+    env = Env(tmp_path, monkeypatch)
+    commit_gitignore(env, rule)
+    for agent in ("claude", "codex"):
+        store = env.seed_store(agent, venv=False)
+        (store / "node_modules").mkdir()
+    exclude = default_agent_workdir("OWNER/REPO", "claude") / ".git" / "info" / "exclude"
+    before = exclude.read_bytes() if exclude.exists() else None
+    messages = _unignored_warnings(monkeypatch)
+    config = env.config(extra=("--worktree-link", "node_modules"))
+    with workdir_claim_scope(command="task"):
+        prepare_inline(config)
+        assert (config.claude_dir / "node_modules").is_symlink()
+    warnings = [m for m in messages if "is not matched by any ignore rule" in m]
+    if warned:
+        assert warnings and all("'/node_modules'" in m and "info/exclude" in m for m in warnings)
+        assert "without a trailing slash" in warnings[0]
+    else:
+        assert warnings == []
+    assert (exclude.read_bytes() if exclude.exists() else None) == before
+
+
+def test_worktree_link_ignore_probe_failure_is_only_a_hint(tmp_path, monkeypatch):
+    messages = _unignored_warnings(monkeypatch)
+
+    class Broken:
+        def run(self, args, *, cwd, check=True):
+            raise AgentLoopError("probe failed")
+
+    class Odd:
+        def run(self, args, *, cwd, check=True):
+            return SimpleNamespace(returncode=128, stdout="", stderr="fatal")
+
+    for runner in (Broken(), Odd()):
+        assert run_worktrees.warn_unignored_links(
+            tmp_path, tmp_path, ("node_modules",), config=None, runner=runner
+        ) == []
+    assert messages == []
 
 
 def test_worktree_links_are_per_run_and_removal_keeps_store_target(tmp_path, monkeypatch):

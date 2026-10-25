@@ -345,6 +345,10 @@ class AgentLoopConfig:
     default_checkout_stores: tuple[tuple[AgentName, Path], ...] = ()
     run_token: str | None = None
     worktree_links: tuple[str, ...] = ()
+    # Operator-only dependency setup for each shared store (#1650); never read
+    # from repository-controlled configuration.
+    worktree_setup: str | None = None
+    worktree_setup_keys: tuple[str, ...] = ()
     trusted_local_origin: Path | None = None
     trusted_origin_protocol: str = "https"
     # Explicit operator SSH identity for trusted transport (#1380), and every
@@ -1386,10 +1390,10 @@ def default_run_worktree(repo: str, agent: AgentName, run_token: str) -> Path:
 _WORKTREE_LINK_FORBIDDEN = set("*?[]!#\\:\0\n\r\t")
 
 
-def normalize_worktree_link(value: str) -> str:
+def normalize_worktree_link(value: str, *, option: str = "--worktree-link") -> str:
     """Validate one ``--worktree-link`` value; the accepted string is its only spelling."""
     text = str(value)
-    bad = f"Invalid --worktree-link {text!r}: "
+    bad = f"Invalid {option} {text!r}: "
     if not text or text != text.strip():
         raise AgentLoopError(bad + "must be a non-empty path without surrounding whitespace.")
     if any(ch in _WORKTREE_LINK_FORBIDDEN for ch in text):
@@ -1402,6 +1406,11 @@ def normalize_worktree_link(value: str) -> str:
         if part in (".", "..", ".git"):
             raise AgentLoopError(bad + f"component {part!r} is not allowed.")
     return text
+
+
+def normalize_worktree_setup_key(value: str) -> str:
+    """Validate one repo-relative ``--worktree-setup-key`` with the link rules."""
+    return normalize_worktree_link(value, option="--worktree-setup-key")
 
 
 def new_run_token() -> str:
@@ -1738,11 +1747,16 @@ def _ensure_run_worktree(
             ("git", "worktree", "add", "--detach", str(path), f"origin/{config.base or 'HEAD'}"),
             cwd=store,
         )
+        if config.worktree_setup:
+            log(config, f"[dry-run] Would run worktree setup in {store}")
         for link in config.worktree_links:
             log(config, f"[dry-run] Would link {store / link} -> {path / link}")
         return
     verify_before_sync(config, runner, path=path, label=label)
     sha = run_worktrees.prepare_store(store, config=config, runner=runner)
+    from .worktree_setup import maybe_log_dependency_hint
+
+    maybe_log_dependency_hint(store, sha, config=config, runner=runner)
     run_worktrees.prune_dead_worktrees(store, runs_root, path, config=config, runner=runner)
     with run_worktrees.store_lock(store):
         if config.worktree_links:
@@ -1761,6 +1775,7 @@ def _ensure_run_worktree(
     if config.worktree_links:
         mapping = run_worktrees.create_worktree_links(path, store, config.worktree_links)
         register_worktree_links(path, mapping)
+        run_worktrees.warn_unignored_links(path, store, config.worktree_links, config=config, runner=runner)
     _sync_base_branch(path, label=label, default_owned=True, config=config, runner=runner)
 
 
@@ -2319,6 +2334,17 @@ def config_from_args(
             normalize_worktree_link(value) for value in (getattr(args, "worktree_link", None) or ())
         )
     )
+    worktree_setup = getattr(args, "worktree_setup", None)
+    if worktree_setup is not None and not str(worktree_setup).strip():
+        raise AgentLoopError("--worktree-setup must be a non-empty shell command.")
+    worktree_setup_keys = tuple(
+        dict.fromkeys(
+            normalize_worktree_setup_key(value)
+            for value in (getattr(args, "worktree_setup_key", None) or ())
+        )
+    )
+    if worktree_setup_keys and worktree_setup is None:
+        raise AgentLoopError("--worktree-setup-key requires --worktree-setup.")
 
     def resolve_agent_dir(agent: AgentName, value: Path | None) -> Path:
         if value is not None:
@@ -2345,6 +2371,11 @@ def config_from_args(
         log_message = "--worktree-link is ignored: no active agent uses a default per-run worktree."
         print(log_message, file=sys.stderr)
         worktree_links = ()
+    if worktree_setup is not None and not (active_roles & set(store_by_agent)):
+        log_message = "--worktree-setup is ignored: no active agent uses a default per-run worktree."
+        print(log_message, file=sys.stderr)
+        worktree_setup = None
+        worktree_setup_keys = ()
     store_roots = tuple(
         root
         for agent, store in default_checkout_stores
@@ -2671,6 +2702,8 @@ def config_from_args(
         default_checkout_stores=default_checkout_stores,
         run_token=run_token if default_checkout_stores else None,
         worktree_links=worktree_links,
+        worktree_setup=worktree_setup,
+        worktree_setup_keys=worktree_setup_keys,
         containment_mode=getattr(args, "containment_mode", "auto"),
         containment_memory_high=getattr(args, "containment_memory_high", None),
         containment_memory_max=getattr(args, "containment_memory_max", None),

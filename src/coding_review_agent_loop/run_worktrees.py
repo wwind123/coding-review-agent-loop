@@ -6,8 +6,8 @@ CLI run with an omitted ``--<agent>-dir`` gets its own detached
 ``git worktree`` under ``<scratch>/OWNER-REPO/<agent>/runs/<run-token>``,
 protected by the usual #1127 run claim and removed when the run ends.
 
-Store mutations (initialization, import+pin, local-base fast-forward, pack
-compaction, link creation, prune and remove) are serialized by a short, **non-reentrant** host flock that is
+Store mutations (initialization, import+pin, local-base fast-forward, operator
+``--worktree-setup``, pack compaction, link creation, prune and remove) are serialized by a short, **non-reentrant** host flock that is
 never held across an agent turn.  Every worktree created here has a durable
 owner record under the private host lock root; removal and pruning delete only
 a directory whose record still matches its creation identity.
@@ -303,14 +303,44 @@ def add_run_worktree(
         raise
 
 
+def link_source_usable(store: Path, link: str) -> bool:
+    """The one predicate for link preflight and forced setup (#1650).
+
+    ``os.path.exists`` follows symlinks, so a dangling source symlink counts as missing.
+    """
+    return os.path.exists(store / link)
+
+
 def check_link_sources(store: Path, links: Any) -> None:
     """Fail, naming the path, before any worktree is added when a link source is missing."""
     for link in links:
-        if not os.path.exists(store / link):
+        if not link_source_usable(store, link):
             raise AgentLoopError(
-                f"--worktree-link '{link}': {store / link} does not exist in the shared checkout; "
-                "refusing to create a dangling link."
+                f"--worktree-link '{link}': {store / link} does not exist in the shared clone {store}; "
+                "pass --worktree-setup CMD to create it (for example "
+                "`python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`), or create the "
+                "path there. Refusing to create a dangling link."
             )
+
+
+def warn_unignored_links(path: Path, store: Path, links: Any, *, config: Any, runner: Any) -> list[str]:
+    """Warn (never fail, never write ignore state) for links no ignore rule matches as a symlink."""
+    unignored: list[str] = []
+    for link in links:
+        try:
+            result = runner.run(("git", "check-ignore", "-q", "--no-index", "--", link), cwd=path, check=False)
+        except Exception:
+            continue
+        if result.returncode != 1:
+            continue  # 0: ignored; anything else: the probe failed, which is only a hint.
+        unignored.append(link)
+        log(
+            config,
+            f"--worktree-link '{link}': {path / link} is not matched by any ignore rule as a symlink; "
+            f"add '/{link}' to {store / '.git' / 'info' / 'exclude'} (shared by every worktree) or to "
+            f".gitignore without a trailing slash (a dir-only '{link}/' rule does not match a symlink).",
+        )
+    return unignored
 
 
 def create_worktree_links(path: Path, store: Path, links: Any) -> dict[str, str]:
@@ -453,6 +483,7 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
     from .config import _is_stale_default_workdir, _validate_repo_remote
 
     from .agent_permissions import release_orphaned_admin_response_roots, remove_checkout_tree
+    from .worktree_setup import invalidate_setup_record
 
     has_git = store.is_dir() and (store / ".git").exists()
     if has_git:
@@ -462,6 +493,12 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
         # Without a .git there can be no linked worktrees, so skip the enumeration.
         if has_git and len(_linked_worktrees(store, runner)) > 1:
             pass  # live linked worktrees: never delete the store under them
+        elif has_git and getattr(config, "worktree_setup", None) and _store_tracks_paths(store, runner):
+            # A real repository whose tracked files were deleted, not an
+            # artifact-only directory: keep the checkout and the setup record
+            # so the setup gate refuses the deletions instead of re-cloning
+            # over them (#1650).
+            log(config, f"Shared store {store} has tracked content deleted; keeping it for --worktree-setup.")
         elif not free:
             raise AgentLoopError(_held_store_message(store, "is stale and cannot be recreated"))
         else:
@@ -470,6 +507,8 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
 
             if (store / ".git" / "worktrees").is_dir():
                 release_unlistable_tree(store / ".git" / "worktrees")
+            # Before the re-creation, so a crash in between leaves no record (#1650).
+            invalidate_setup_record(store)
             remove_checkout_tree(store)
             forget_checkout(store)
     if not store.exists():
@@ -483,6 +522,7 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
 
         origin = default_origin(config.repo, protocol=config.trusted_origin_protocol,
                                 local_origin=config.trusted_local_origin)
+        invalidate_setup_record(store)
         store.mkdir(mode=0o700)
         _git(runner, store, "init", "-q", "-b", config.base or "main")
         _git(runner, store, "remote", "add", "origin", origin)
@@ -496,6 +536,26 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
         detach = _git(runner, store, "checkout", "--detach", check=False)
         if detach.returncode != 0:
             log(config, f"Could not detach the shared store HEAD at {store}; leaving it as is.")
+
+
+def _store_tracks_paths(store: Path, runner: Any) -> bool:
+    """True when the store holds tracked content: index entries or a non-empty HEAD tree.
+
+    A store whose every tracked file was deleted, unstaged or staged, still
+    has a HEAD commit with paths, so it is never mistaken for an artifact-only
+    directory. Only an unborn HEAD with an empty index counts as untracked, and
+    any inspection failure counts as tracked (fail closed).
+    """
+    listed = _git(runner, store, "ls-files", "-z", check=False)
+    if listed.returncode != 0 or (listed.stdout or "").strip("\0"):
+        return True
+    head = _git(runner, store, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False)
+    if head.returncode != 0:
+        # Unborn HEAD only when the symbolic ref resolves; anything else is broken.
+        symbolic = _git(runner, store, "symbolic-ref", "-q", "HEAD", check=False)
+        return symbolic.returncode != 0
+    tree = _git(runner, store, "ls-tree", "-z", "--name-only", head.stdout.strip(), check=False)
+    return tree.returncode != 0 or bool((tree.stdout or "").strip("\0"))
 
 
 def _held_store_message(store: Path, what: str) -> str:
@@ -546,15 +606,22 @@ def _fetch_and_pin(store: Path, base: str, *, config: Any, runner: Any, free: bo
 
 
 def prepare_store(store: Path, *, config: Any, runner: Any) -> str:
-    """Clone/validate/fetch the store under the lock and return the pinned base SHA."""
+    """Clone/validate/fetch the store under the lock and return the pinned base SHA.
+
+    With ``--worktree-setup`` the operator setup for that same SHA runs in the
+    same lock hold, so a returned pin never has an out-of-date setup (#1650).
+    """
     if not config.base:
         raise AgentLoopError(
             f"Base branch for {config.repo} was not resolved. Pass --base <branch> explicitly."
         )
+    from .worktree_setup import ensure_store_setup
+
     with store_lock(store):
         with probe_free_claim(store) as free:
             _prepare_store_locked(store, free=free, config=config, runner=runner)
             sha = _fetch_and_pin(store, config.base, config=config, runner=runner, free=free)
+            ensure_store_setup(store, sha, free=free, config=config, runner=runner)
         compact_packs_if_needed(store, config=config, runner=runner)
         return sha
 
