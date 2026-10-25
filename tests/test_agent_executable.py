@@ -264,3 +264,57 @@ def test_cli_startup_runs_the_executable_preflight():
     source = (PACKAGE_DIR / "cli.py").read_text(encoding="utf-8")
     capture = source.index("tool_provenance.capture_process_provenance(config)")
     assert "agent_executable.log_preflight(config)" in source[capture:capture + 300]
+
+
+def _install_guard(root):
+    from coding_review_agent_loop.coder_ci_guard import install_guard_launcher
+
+    return install_guard_launcher(root) / "gh"
+
+
+@pytest.mark.parametrize(
+    "install",
+    [
+        lambda root: ae.agent_loop_launcher(root),
+        lambda root: ae.install_agent_loop_launcher(root),
+        _install_guard,
+    ],
+    ids=["locked-agent-loop-launcher", "raw-agent-loop-install", "raw-gh-guard-install"],
+)
+def test_concurrent_first_installs_all_succeed_without_leftovers(tmp_path, monkeypatch, install):
+    """Parallel reviewer turns (or processes) installing at once never collide on staging."""
+    import threading
+
+    real_replace = os.replace
+
+    def slow_replace(src, dst):
+        # Widen the window in which a shared staging name would collide.
+        import time
+
+        time.sleep(0.01)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", slow_replace)
+    root = tmp_path / "fresh-root"
+    workers = 12
+    barrier = threading.Barrier(workers)
+    results, errors = [], []
+
+    def run():
+        barrier.wait()
+        try:
+            results.append(install(root))
+        except BaseException as exc:  # noqa: BLE001 - collected for the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert errors == []
+    assert len(results) == workers and None not in results
+    assert len(set(results)) == 1
+    target = Path(results[0])
+    assert os.access(target, os.X_OK)
+    assert sorted(os.listdir(target.parent)) == [target.name]

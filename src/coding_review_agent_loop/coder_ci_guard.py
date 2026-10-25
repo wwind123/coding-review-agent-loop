@@ -224,10 +224,11 @@ def install_guard_launcher(root: Path | None = None) -> Path:
     directory = make_private_dirs((root or scratch_root() / "coder-ci-guard") / digest)
     launcher = directory / "gh"
     if not launcher.is_file() or launcher.read_text(encoding="utf-8") != text:
-        staging = directory / f".gh.{os.getpid()}.tmp"
-        staging.write_text(text, encoding="utf-8")
-        staging.chmod(0o700)
-        os.replace(staging, launcher)
+        # Same per-writer staging as the agent-loop launcher (#1632), so
+        # concurrent coder and repair launches never share a temporary file.
+        from .agent_executable import _atomic_write_executable
+
+        _atomic_write_executable(directory, launcher, text)
     return directory
 
 

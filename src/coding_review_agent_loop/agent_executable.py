@@ -17,11 +17,14 @@ logged.  Windows is out of scope; the helpers return nothing there.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import shlex
 import shutil
 import sys
+import tempfile
+import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -110,32 +113,51 @@ def install_agent_loop_launcher(root: Path | None = None) -> Path:
     directory = make_private_dirs(expected_launcher_path(root).parent)
     launcher = directory / LAUNCHER_NAME
     if not launcher.is_file() or launcher.read_text(encoding="utf-8") != text:
-        staging = directory / f".{LAUNCHER_NAME}.{os.getpid()}.tmp"
-        staging.write_text(text, encoding="utf-8")
-        staging.chmod(0o700)
-        os.replace(staging, launcher)
+        _atomic_write_executable(directory, launcher, text)
     return launcher
 
 
+def _atomic_write_executable(directory: Path, target: Path, text: str) -> None:
+    """Atomically replace ``target`` via a unique staging file in ``directory``.
+
+    ``mkstemp`` gives every writer (thread or process) its own staging name, so
+    concurrent first installs never share a temporary file.
+    """
+    fd, staging = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.chmod(staging, 0o700)
+        os.replace(staging, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(staging)
+        raise
+
+
 _LAUNCHER_CACHE: dict[str, Path] = {}
+_LAUNCHER_LOCK = threading.Lock()
 _WARNED: set[str] = set()
 
 
 def agent_loop_launcher(root: Path | None = None) -> Path | None:
     """The installed launcher, or ``None`` when it cannot be installed (warned once)."""
     key = str(root) if root is not None else ""
-    cached = _LAUNCHER_CACHE.get(key)
-    if cached is not None and cached.is_file():
-        return cached
-    try:
-        launcher = install_agent_loop_launcher(root)
-    except OSError as exc:
-        _warn_once(
-            f"agent-loop executable pin not installed ({exc}); agents keep their inherited PATH"
-        )
-        return None
-    _LAUNCHER_CACHE[key] = launcher
-    return launcher
+    # Parallel reviewer turns reach the first install together; one thread
+    # installs and the rest reuse its result.
+    with _LAUNCHER_LOCK:
+        cached = _LAUNCHER_CACHE.get(key)
+        if cached is not None and cached.is_file():
+            return cached
+        try:
+            launcher = install_agent_loop_launcher(root)
+        except OSError as exc:
+            _warn_once(
+                f"agent-loop executable pin not installed ({exc}); agents keep their inherited PATH"
+            )
+            return None
+        _LAUNCHER_CACHE[key] = launcher
+        return launcher
 
 
 def _kept_entries(path_value: str, directory: str) -> list[str]:

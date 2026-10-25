@@ -358,7 +358,8 @@ subprocess must resolve the orchestrator's own install, not the first
 `agent-loop` on its inherited `PATH` (#1632). `agent_executable.py` writes a
 private, content-addressed POSIX `sh` launcher named `agent-loop` under
 `<scratch>/agent-loop-exe/<digest>/`, using the same atomic-replace pattern as
-the coder `gh` guard. It execs the lexical `sys.executable` with `-I` and
+the coder `gh` guard; both write through a unique `mkstemp` staging file, and
+a process-wide lock lets parallel reviewer turns share one first install. It execs the lexical `sys.executable` with `-I` and
 prepends the orchestrator's effective import path, frozen at install time
 without empty or relative entries, so a coder's `PYTHONPATH`, its cwd and
 user-site installs cannot select other code. Both launch-environment sites in
