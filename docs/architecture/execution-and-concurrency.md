@@ -364,8 +364,13 @@ without empty or relative entries, so a coder's `PYTHONPATH`, its cwd and
 user-site installs cannot select other code. Both launch-environment sites in
 `runner.py` (pipe and PTY) apply `agent_executable_environment` after the
 backend env merge and before the broker environment and containment
-preparation. It puts only the launcher directory first on `PATH` (never the
-whole venv `bin`), strips an earlier copy so launches never stack it, and
+preparation. The two direct agent spawns outside the runner, the Gemini
+repair backend and the legacy repair pass in `repair.py`, build their whole
+environment with `pinned_agent_environment`, which merges the guard
+environment and then applies the same pin. It puts only the launcher
+directory first on `PATH` (never the whole venv `bin`), removes only earlier
+copies of that directory so launches never stack it, keeps every other
+inherited entry in order (including empty current-directory entries), and
 exports the launcher path as `AGENT_LOOP_EXECUTABLE`. Because the pin is
 applied last it composes with the coder CI-dispatch guard: the final `PATH`
 is `<launcher dir>:<guard dir>:<pre-guard PATH>`, and the guard still strips
@@ -385,7 +390,9 @@ launcher, and an informational line when the inherited `PATH` holds another
 `agent-loop`. Neither line blocks the run.
 
 **Receipt tool identity.** The `run-tests` client captures its own tool
-commit, dirty flag and package path (bounded at 3 s, never raising) and sends
+commit, dirty flag and package path (bounded at 3 s, never raising, and
+refusing a Git executable inside the assigned workdir or the cwd's enclosing
+checkout, found by a `.git` entry without running Git) and sends
 them to the broker as the reserved `AGENT_LOOP_RUN_TESTS_TOOL_COMMIT`,
 `AGENT_LOOP_RUN_TESTS_TOOL_DIRTY` and `AGENT_LOOP_RUN_TESTS_TOOL_PACKAGE`
 environment entries, so the broker request schema is unchanged and old and

@@ -612,10 +612,11 @@ class ToolIdentity:
             return value
         if not isinstance(value, Mapping):
             return None
-        status = value.get("status")
-        if status not in TOOL_IDENTITY_STATUSES:
-            return None
         try:
+            status = value.get("status")
+            # A non-string (possibly unhashable) status is malformed.
+            if not isinstance(status, str) or status not in TOOL_IDENTITY_STATUSES:
+                return None
             return cls(
                 status=str(status),
                 client_commit=_tool_commit(value.get("client_commit")),

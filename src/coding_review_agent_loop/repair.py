@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Callable, Literal
 
 from .agents.antigravity import AntigravityBackend
 from .agents.format_repair import run_cli_repair
+from .agent_executable import pinned_agent_environment
 from .coder_ci_guard import coder_ci_guard_environment
 from .agents.base import STDIN_PROMPT_THRESHOLD_BYTES
 from .agents.gemini import _parse_gemini_payload
@@ -1942,8 +1943,9 @@ def execute_repair(
                     log_path = agent_log_path(config, "gemini-repair", run_id=run_id)
                     oversized_prompt = len(prompt.encode("utf-8")) > STDIN_PROMPT_THRESHOLD_BYTES
                     # This launch keeps shell tools, so a repair of a guarded
-                    # coder response carries the CI-dispatch guard (#1366);
-                    # unguarded repairs keep the ambient env=None exactly.
+                    # coder response carries the CI-dispatch guard (#1366),
+                    # and like every agent launch it gets the agent-loop
+                    # executable pin applied after the guard merge (#1632).
                     guard_env = coder_ci_guard_environment(config, "gemini", "repair")
                     proc = subprocess.run(
                         [
@@ -1958,7 +1960,7 @@ def execute_repair(
                         text=True,
                         timeout=config.repair_timeout_seconds,
                         input=prompt if oversized_prompt else None,
-                        env={**os.environ, **guard_env} if guard_env else None,
+                        env=pinned_agent_environment(guard_env),
                     )
                     returncode = proc.returncode
                     parsed, _, _, _, _ = _parse_gemini_payload(proc.stdout.strip())
@@ -2449,6 +2451,8 @@ def attempt_repair(
             text=True,
             timeout=120,
             input=prompt if oversized_prompt else None,
+            # Issue #1632: every agent launch resolves this install's agent-loop.
+            env=pinned_agent_environment(),
         )
     except Exception as exc:
         _logger.debug("repair pass CLI invocation failed: %s", exc)

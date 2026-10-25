@@ -6215,6 +6215,12 @@ def test_legacy_rows_decode_and_project_byte_identically():
         {"status": "bogus"},
         {"status": "mismatch", "client_commit": {"x": 1}, "client_dirty": "maybe"},
         {"status": "match", "client_package_digest": "not-hex", "orchestrator_commit": 7},
+        # Unhashable or non-string statuses are malformed, never a TypeError.
+        {"status": []},
+        {"status": {}},
+        {"status": 7},
+        {"status": None},
+        {"status": "mismatch", "client_dirty": [], "client_commit": [], "orchestrator_dirty": {}},
     ],
 )
 def test_malformed_tool_identity_decodes_without_raising(malformed):
@@ -6227,7 +6233,12 @@ def test_malformed_tool_identity_decodes_without_raising(malformed):
     decoded = decode_bounded_evidence(json.dumps(payload))
     (restored,) = decoded.observations
     identity = restored.tool_identity
-    if isinstance(malformed, dict) and malformed.get("status") in {"match", "mismatch"}:
+    # The mapping-row diagnostic path decodes the same value without raising.
+    assert tool_identity_diagnostic(payload["observations"][0]) is None or isinstance(
+        tool_identity_diagnostic(payload["observations"][0]), str
+    )
+    status = malformed.get("status") if isinstance(malformed, dict) else None
+    if isinstance(status, str) and status in {"match", "mismatch"}:
         assert identity is not None
         assert identity.client_commit is None and identity.orchestrator_commit is None
         assert identity.client_package_digest is None and identity.client_dirty is None

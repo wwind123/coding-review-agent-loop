@@ -1545,6 +1545,14 @@ def test_every_backend_agent_launch_goes_through_the_pinned_runner_sites():
         source = (agents_dir / f"{name}.py").read_text(encoding="utf-8")
         assert "runner.run_with_log(" in source, name
         assert not re.search(r"subprocess\.(Popen|run|call|check_output)\(", source), name
+    # The only direct agent spawns outside the runner (Gemini repair and the
+    # legacy repair pass) build their environment with the same pin helper.
+    repair_source = (agents_dir.parent / "repair.py").read_text(encoding="utf-8")
+    spawns = [m.start() for m in re.finditer(r"subprocess\.(?:run|Popen)\(", repair_source)]
+    assert len(spawns) == 2
+    for start in spawns:
+        call = repair_source[start:repair_source.index("\n        )", start)]
+        assert "env=pinned_agent_environment(" in call, call
     runner_source = Path(runner_module.__file__).read_text(encoding="utf-8")
     merges = [
         match.start()

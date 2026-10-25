@@ -225,19 +225,45 @@ def process_provenance(config: AgentLoopConfig) -> dict:
 CLIENT_DEADLINE_SECONDS = 3.0
 
 
+def _enclosing_checkout(path: str) -> str | None:
+    """The nearest ancestor of ``path`` holding a ``.git`` entry, found without running Git."""
+    for candidate in (Path(path), *Path(path).parents):
+        try:
+            if os.path.lexists(candidate / ".git"):
+                return str(candidate)
+        except OSError:
+            return None
+    return None
+
+
+def _client_refusal_roots(environment: Mapping[str, str], cwd: Path | None) -> list[str]:
+    """The assigned workdir and the cwd, each widened to its enclosing checkout.
+
+    A Git executable anywhere in either checkout (lexically or after
+    resolving symlinks) is checkout-controlled code and is refused.
+    """
+    roots: list[str] = []
+    for value in (environment.get("AGENT_LOOP_WORKDIR"), str(cwd) if cwd else None):
+        if not value:
+            continue
+        for form in (os.path.abspath(value), os.path.realpath(value)):
+            for root in (form, _enclosing_checkout(form)):
+                if root and root not in roots:
+                    roots.append(root)
+    return roots
+
+
 def _client_git_refusal(environment: Mapping[str, str], cwd: Path | None) -> Callable[[str], str | None]:
-    """Refuse a git executable inside the assigned workdir or the cwd checkout."""
-    roots = [
-        value for value in (environment.get("AGENT_LOOP_WORKDIR"), str(cwd) if cwd else None) if value
-    ]
+    """Refuse a git executable inside the assigned workdir or the cwd's checkout."""
+    roots = _client_refusal_roots(environment, cwd)
 
     def refusal(git: str) -> str | None:
         forms = {os.path.abspath(git), os.path.realpath(git)}
         for root in roots:
-            for base in {os.path.abspath(root), os.path.realpath(root)}:
-                for form in forms:
-                    if form == base or form.startswith(base.rstrip(os.sep) + os.sep):
-                        return f"{git} lies inside {root}"
+            base = root.rstrip(os.sep) or os.sep
+            for form in forms:
+                if form == base or form.startswith(base.rstrip(os.sep) + os.sep):
+                    return f"{git} lies inside {root}"
         return None
 
     return refusal

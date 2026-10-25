@@ -96,6 +96,35 @@ def test_environment_prepends_only_the_launcher_dir_without_stacking(tmp_path):
     assert again["PATH"].split(os.pathsep).count(str(launcher.parent)) == 1
 
 
+@pytest.mark.parametrize(
+    "inherited",
+    [":/usr/bin", "/usr/bin:", "/usr/bin::/bin", "", ":", "/usr/bin"],
+    ids=["leading-empty", "trailing-empty", "interior-empty", "empty", "only-empty", "plain"],
+)
+def test_environment_preserves_every_inherited_entry_including_empty_ones(inherited):
+    env = ae.agent_executable_environment({"PATH": inherited})
+    directory = str(Path(env[ae.EXECUTABLE_ENV]).parent)
+    assert env["PATH"] == directory + os.pathsep + inherited
+    # Idempotent: a second application removes only the launcher dir copy.
+    assert ae.agent_executable_environment({"PATH": env["PATH"]}) == env
+    stacked = os.pathsep.join([directory, inherited, directory])
+    assert ae.agent_executable_environment({"PATH": stacked})["PATH"] == env["PATH"]
+
+
+def test_environment_without_inherited_path_is_only_the_launcher_dir():
+    env = ae.agent_executable_environment({})
+    assert env["PATH"] == str(Path(env[ae.EXECUTABLE_ENV]).parent)
+
+
+def test_pinned_agent_environment_merges_overrides_then_pins():
+    env = ae.pinned_agent_environment(
+        {"PATH": "/guard:/usr/bin", "MARKER": "x"}, ambient={"PATH": "/ignored", "KEEP": "y"}
+    )
+    directory = str(Path(env[ae.EXECUTABLE_ENV]).parent)
+    assert env["PATH"] == os.pathsep.join([directory, "/guard", "/usr/bin"])
+    assert env["MARKER"] == "x" and env["KEEP"] == "y"
+
+
 def test_install_failure_is_fail_soft_and_warned(tmp_path, monkeypatch, capsys):
     _fail_install(monkeypatch)
     ambient = {"PATH": "/usr/bin"}

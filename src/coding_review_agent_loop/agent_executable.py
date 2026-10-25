@@ -113,15 +113,20 @@ def agent_loop_launcher(root: Path | None = None) -> Path | None:
     return launcher
 
 
-def _strip_dir(path_value: str, directory: str) -> str:
+def _kept_entries(path_value: str, directory: str) -> list[str]:
+    """Every ``PATH`` entry except those naming ``directory``.
+
+    Empty POSIX entries mean the current directory, so leading, trailing and
+    interior empty entries are preserved exactly.
+    """
     try:
         excluded = os.path.realpath(directory)
     except OSError:
         excluded = directory
-    return os.pathsep.join(
+    return [
         entry for entry in path_value.split(os.pathsep)
-        if entry and entry != directory and os.path.realpath(entry) != excluded
-    )
+        if not entry or (entry != directory and os.path.realpath(entry) != excluded)
+    ]
 
 
 def agent_executable_environment(
@@ -138,11 +143,29 @@ def agent_executable_environment(
     if launcher is None:
         return {}
     directory = str(launcher.parent)
-    rest = _strip_dir(values.get("PATH", ""), directory)
-    return {
-        "PATH": os.pathsep.join(item for item in (directory, rest) if item),
-        EXECUTABLE_ENV: str(launcher),
-    }
+    inherited = values.get("PATH")
+    kept = [] if inherited is None else _kept_entries(inherited, directory)
+    # Only entries naming the launcher dir are removed, so an inherited
+    # PATH's other entries (including empty current-directory entries) keep
+    # their meaning and order behind it.
+    path = os.pathsep.join([directory, *kept])
+    return {"PATH": path, EXECUTABLE_ENV: str(launcher)}
+
+
+def pinned_agent_environment(
+    overrides: Mapping[str, str] | None = None,
+    *,
+    ambient: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The complete environment for an agent launch outside ``Runner.run_with_log``.
+
+    Merges ``overrides`` (for example the coder CI-dispatch guard) over the
+    ambient environment, then applies the executable pin last, exactly as the
+    runner's launch sites do.  Every direct agent spawn uses this helper.
+    """
+    launch = {**(os.environ if ambient is None else ambient), **(overrides or {})}
+    launch.update(agent_executable_environment(launch))
+    return launch
 
 
 def _warn_once(message: str) -> None:

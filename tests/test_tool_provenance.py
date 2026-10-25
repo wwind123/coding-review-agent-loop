@@ -584,3 +584,37 @@ def test_orchestrator_provenance_prefers_the_process_capture(monkeypatch):
     assert tp.orchestrator_tool_provenance()["package_path"] == "/y"
     assert tp.orchestrator_tool_provenance()["package_path"] == "/y"
     assert len(calls) == 1
+
+
+def test_client_capture_refuses_git_anywhere_in_the_cwd_checkout(repo, tmp_path):
+    """The refusal root is the cwd's enclosing checkout, not just the cwd subtree."""
+    checkout = tmp_path / "other-checkout"
+    (checkout / "tests").mkdir(parents=True)
+    (checkout / ".git").mkdir()
+    sibling_git = checkout / "bin" / "git"
+    sibling_git.parent.mkdir()
+    sibling_git.write_text("#!/bin/sh\nexit 0\n")
+    sibling_git.chmod(0o755)
+    calls = []
+
+    def executor(*args):
+        calls.append(args)
+        raise AssertionError("checkout-controlled git must not run")
+
+    for cwd in (checkout / "tests", checkout):
+        result = REAL_CAPTURE_CLIENT(
+            environment={}, cwd=cwd, which=lambda _name: str(sibling_git), executor=executor
+        )
+        assert result["error"] == "git-untrusted-location"
+        assert result["commit"] is None
+    # A worktree-style ``.git`` file marks the checkout boundary as well.
+    (checkout / ".git").rmdir()
+    (checkout / ".git").write_text("gitdir: /elsewhere\n")
+    result = REAL_CAPTURE_CLIENT(
+        environment={}, cwd=checkout / "tests", which=lambda _name: str(sibling_git), executor=executor
+    )
+    assert result["error"] == "git-untrusted-location"
+    assert calls == []
+    # Git outside the checkout is still used.
+    outside = REAL_CAPTURE_CLIENT(environment={}, cwd=checkout / "tests")
+    assert outside["commit"] == _git(repo, "rev-parse", "HEAD")
