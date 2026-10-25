@@ -18,13 +18,18 @@ from .agents.registry import default_agent_args
 from .checkout_verification import (
     check_worktree_links,
     forget_checkout,
+    link_intact,
+    link_registration,
+    private_path_intact,
+    private_paths,
     recover_gemini_injection,
     refresh_after_sync,
     register_worktree_links,
     registered_links,
+    set_environment_base,
     verify_before_sync,
 )
-from .errors import AgentLoopError
+from .errors import AgentLoopError, CheckoutVerificationError
 from .expected_closure import normalize_issue_ids
 from .github import (
     PullRequestMetadata,
@@ -349,6 +354,8 @@ class AgentLoopConfig:
     # from repository-controlled configuration.
     worktree_setup: str | None = None
     worktree_setup_keys: tuple[str, ...] = ()
+    # Operator-only PR-local dependency environments (#1652).
+    worktree_setup_pr_local: bool = False
     trusted_local_origin: Path | None = None
     trusted_origin_protocol: str = "https"
     # Explicit operator SSH identity for trusted transport (#1380), and every
@@ -1612,8 +1619,11 @@ def _clean_or_reject_checkout(
     # A killed run's verifiable GEMINI.md injection is tool-owned, not dirt.
     recover_gemini_injection(config, runner, path)
     links = registered_links(path)
-    if links:
-        _clean_or_reject_linked_checkout(path, links, label=label, config=config, runner=runner)
+    private = private_paths(path)
+    if links or private:
+        _clean_or_reject_linked_checkout(
+            path, links, label=label, config=config, runner=runner, private=private
+        )
         return
     status = _run_git(runner, path, ("status", "--porcelain")).stdout.strip()
     if not status:
@@ -1626,13 +1636,28 @@ def _clean_or_reject_checkout(
 
 
 def _clean_or_reject_linked_checkout(
-    path: Path, links: dict[bytes, bytes], *, label: str, config: AgentLoopConfig, runner: Runner
+    path: Path,
+    links: dict[bytes, bytes],
+    *,
+    label: str,
+    config: AgentLoopConfig,
+    runner: Runner,
+    private: dict[bytes, object] | None = None,
 ) -> None:
-    """Clean a worktree that carries registered links; the links are never touched."""
+    """Clean a worktree that carries registered links or private environments; never touch them."""
     check_worktree_links(config, runner, path)
     raw = _run_git(runner, path, ("status", "--porcelain", "-z", "--untracked-files=all")).stdout
-    names = {os.fsdecode(link) for link in links}
-    remaining = [r for r in raw.split("\0") if r and r not in {f"?? {n}" for n in names}]
+    link_names = {os.fsdecode(link) for link in links}
+    private_names = {os.fsdecode(name) for name in (private or {})}
+    names = link_names | private_names
+
+    def exempt(record: str) -> bool:
+        if not record.startswith("?? "):
+            return False
+        entry = record[3:].rstrip("/")
+        return entry in names or any(entry.startswith(f"{name}/") for name in private_names)
+
+    remaining = [r for r in raw.split("\0") if r and not exempt(r)]
     if not remaining:
         return
     log(config, f"Cleaning dirty {label[0].lower()}{label[1:]}: {path}")
@@ -1688,6 +1713,7 @@ def _sync_base_branch(
         from . import run_worktrees
 
         sha = run_worktrees.prepare_store(store, config=config, runner=runner)
+        _record_environment_base(path, store, sha, config=config, runner=runner)
         _run_git(runner, path, ("checkout", "--detach", sha))
         refresh_after_sync(config, runner, path)
         return
@@ -1731,6 +1757,47 @@ def run_worktree_store(config: AgentLoopConfig, path: Path) -> Path | None:
     return None
 
 
+def _environment_digest(
+    store: Path, sha: str, *, config: AgentLoopConfig, runner: Runner
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    from .worktree_pr_env import _entry_pairs
+    from .worktree_setup import setup_digest
+
+    digest, entries = setup_digest(
+        store, sha, command=config.worktree_setup or "", keys=config.worktree_setup_keys, runner=runner,
+    )
+    return digest, _entry_pairs(entries)
+
+
+def _record_environment_base(
+    path: Path, store: Path, sha: str, *, config: AgentLoopConfig, runner: Runner
+) -> None:
+    """Re-key a still-shared environment on the base pin whose setup ran in that lock hold (#1652)."""
+    if not config.worktree_setup_pr_local or not registered_links(path) or private_paths(path):
+        return
+    digest, entries = _environment_digest(store, sha, config=config, runner=runner)
+    set_environment_base(path, digest, key_entries=entries)
+
+
+def _validate_existing_registration(path: Path, *, label: str) -> None:
+    """Re-preparation keeps the registration; every private path and link must be intact (#1652)."""
+    registration = link_registration(path)
+    assert registration is not None
+    for raw, (_digest, identity) in sorted(registration.private.items()):
+        if not private_path_intact(path, raw, identity):
+            raise CheckoutVerificationError(
+                f"{label} at {path}: the private dependency environment {os.fsdecode(raw)} was "
+                "removed or replaced; refusing to re-prepare it (links are never recreated over "
+                "private environments)."
+            )
+    for raw, target in sorted(registration.links.items()):
+        if not link_intact(path, raw, target):
+            raise CheckoutVerificationError(
+                f"{label} at {path}: the worktree link {os.fsdecode(raw)} was removed or "
+                "retargeted; refusing to re-prepare it."
+            )
+
+
 def _ensure_run_worktree(
     path: Path, *, agent: AgentName, store: Path, config: AgentLoopConfig, runner: Runner
 ) -> None:
@@ -1772,9 +1839,22 @@ def _ensure_run_worktree(
         run_worktrees.remove_run_worktree(store, path, config=config, runner=runner)
 
     register_run_finalizer(os.path.abspath(path), finalize)
-    if config.worktree_links:
+    if config.worktree_links and link_registration(path) is not None:
+        # Already prepared in this process: keep the registration (nonce,
+        # generation, private paths) and never recreate links over it.
+        _validate_existing_registration(path, label=label)
+    elif config.worktree_links:
         mapping = run_worktrees.create_worktree_links(path, store, config.worktree_links)
-        register_worktree_links(path, mapping)
+        if config.worktree_setup_pr_local:
+            from .worktree_pr_env import worktree_writable
+
+            digest, entries = _environment_digest(store, sha, config=config, runner=runner)
+            register_worktree_links(
+                path, mapping, pr_local=True, writable=worktree_writable(config, agent),
+                base_digest=digest, key_entries=entries,
+            )
+        else:
+            register_worktree_links(path, mapping)
         run_worktrees.warn_unignored_links(path, store, config.worktree_links, config=config, runner=runner)
     _sync_base_branch(path, label=label, default_owned=True, config=config, runner=runner)
 
@@ -2345,6 +2425,12 @@ def config_from_args(
     )
     if worktree_setup_keys and worktree_setup is None:
         raise AgentLoopError("--worktree-setup-key requires --worktree-setup.")
+    worktree_setup_pr_local = bool(getattr(args, "worktree_setup_pr_local", False))
+    if worktree_setup_pr_local and (worktree_setup is None or not worktree_setup_keys or not worktree_links):
+        raise AgentLoopError(
+            "--worktree-setup-pr-local requires --worktree-setup, at least one --worktree-setup-key "
+            "and at least one --worktree-link."
+        )
 
     def resolve_agent_dir(agent: AgentName, value: Path | None) -> Path:
         if value is not None:
@@ -2376,6 +2462,10 @@ def config_from_args(
         print(log_message, file=sys.stderr)
         worktree_setup = None
         worktree_setup_keys = ()
+    if worktree_setup_pr_local and not (active_roles & set(store_by_agent)):
+        log_message = "--worktree-setup-pr-local is ignored: no active agent uses a default per-run worktree."
+        print(log_message, file=sys.stderr)
+        worktree_setup_pr_local = False
     store_roots = tuple(
         root
         for agent, store in default_checkout_stores
@@ -2704,6 +2794,7 @@ def config_from_args(
         worktree_links=worktree_links,
         worktree_setup=worktree_setup,
         worktree_setup_keys=worktree_setup_keys,
+        worktree_setup_pr_local=worktree_setup_pr_local,
         containment_mode=getattr(args, "containment_mode", "auto"),
         containment_memory_high=getattr(args, "containment_memory_high", None),
         containment_memory_max=getattr(args, "containment_memory_max", None),

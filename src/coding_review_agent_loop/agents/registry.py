@@ -215,6 +215,11 @@ def run_agent_result(
         checkout_verification.verify_checkout(
             config, runner, path=checkout, agent=agent, purpose=f"{role or 'agent'} turn"
         )
+        from ..worktree_pr_env import refuse_linked_turn
+
+        # #1652: no turn that can write may start while links into the shared
+        # clone remain, judged from the registration and the live turn role.
+        refuse_linked_turn(config, checkout, role=role, agent=agent)
     try:
         # A direct invocation outside a validated turn (for example the
         # post-authentication evidence correction or semantic dedupe) removes

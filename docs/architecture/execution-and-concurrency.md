@@ -2,7 +2,7 @@
 
 How agent and Git processes run: per-run worktrees over a shared store, the agent-loop-owned Git boundary and private fetch transport with SSH identity selection, pre-turn checkout verification, process-tree containment, test interpreter and worker budgets, pre-collection launch-failure provenance, the Antigravity quota-group fallback, the opt-in quota reset wait, the agent-loop executable pin with its receipt tool identity, and the other entry paths outside the review loop.
 
-Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/worktree_setup.py`, `src/coding_review_agent_loop/worktree_hints.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/agent_executable.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_worktree_setup.py`, `tests/test_worktree_dependency_hints.py`, `tests/test_containment.py`, `tests/test_test_workers.py`, `tests/test_agent_executable.py`.
+Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/worktree_setup.py`, `src/coding_review_agent_loop/worktree_hints.py`, `src/coding_review_agent_loop/worktree_pr_env.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/agent_executable.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_worktree_setup.py`, `tests/test_worktree_dependency_hints.py`, `tests/test_worktree_pr_env.py`, `tests/test_containment.py`, `tests/test_test_workers.py`, `tests/test_agent_executable.py`.
 
 ## Execution and Concurrency
 
@@ -101,6 +101,42 @@ no-PR result) while the implementing coder's per-run worktree is poisoned and it
 has a remote-tracking ref, the stop's message gains a `managed-pr --head`
 resume and the manual worktree-removal command; the exception type, exit code
 and refusal are unchanged and the worktree is left in place.
+
+**PR-local dependency environments (`worktree_pr_env.py`).** The operator
+flag `--worktree-setup-pr-local` (requires `--worktree-setup`, keys and links;
+never read from repository configuration) extends each run worktree's
+in-process link registration in `checkout_verification` with an environment
+state: still-shared `links`, `private` paths (link name to the setup digest
+they were built for and the (st_dev, st_ino) recorded after the build, kept
+allocated by an open descriptor so a recreated path cannot reuse it), the base
+digest of the shared environment, a `writable` flag, a generation and an
+orchestrator-generated nonce. A worktree is writable unless the run is
+sandboxed and its agent holds only CLI-enforced read-only roles. Re-preparation
+of an already registered path keeps the registration, validates its links and
+private paths, and never recreates links. `reconcile_pr_local_environment`
+runs only at orchestrator-owned points outside turns and before the baseline
+capture: `record_checkout_baseline` (a failure poisons, never raises),
+`establish_initial_baseline` and `refresh_after_sync` (a failure raises
+`CheckoutVerificationError`). It privatizes a writable registration that still
+holds links (so no writable turn ever runs with a link into the shared clone)
+and otherwise rebuilds when the setup digest at HEAD differs from the
+environment's digest. Before any mutation it validates the root against the
+recorded alias and identity, requires the tracked tree to equal HEAD (the
+stage-1 predicate, including index flags and submodules, plus the absent-key
+shadow check; otherwise it defers and records the offending paths for the
+remedy), refuses staged or HEAD-owned paths, removes each path
+descriptor-relative (symlinks and files unlinked, directories by fd-based
+`rmtree`), runs the setup command in the worktree with the stage-1 process-group
+handling, and requires each path to be a real directory or file before
+`mark_private`. A pre-turn backstop in `agents/registry.py` refuses a turn
+while links remain if the registration is writable or the live turn is not a
+sandboxed read-only turn. Fingerprints, protected sync cleaning (selected when
+links or private paths exist) and test-evidence snapshots validate private
+paths with `private_path_intact` before exempting them, and the snapshot adds
+one `worktree-env` record (nonce, generation and digest) to the tracked digest,
+so evidence from another environment at the same HEAD is neither current-head
+nor able to supersede. With the flag off no record is added and tracked
+digests are unchanged.
 
 **Incremental import.** `import_ref` exports only objects not reachable from
 destination ref tips that the private fetch repository also holds as commits:

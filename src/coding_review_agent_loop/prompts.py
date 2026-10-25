@@ -1129,8 +1129,30 @@ def _coder_workdir_guidance(
         "running tests or committing, run `pwd` and `git status --branch --short` "
         "and confirm the path is the assigned checkout."
         f"{dangerous_warning}\n"
+        f"{_pr_local_environment_guidance(config, workdir) if implementation else ''}"
         f"{_sandboxed_permission_guidance(config, implementation=implementation, agent=active_agent)}"
     )
+
+
+def _pr_local_environment_guidance(config: AgentLoopConfig, workdir: Path) -> str:
+    """Coder note for --worktree-setup-pr-local; empty with the flag off (#1652)."""
+    if not getattr(config, "worktree_setup_pr_local", False):
+        return ""
+    from .worktree_pr_env import take_rebuild_note
+
+    links = ", ".join(f"`{link}`" for link in config.worktree_links)
+    text = (
+        f"{links} in this checkout are a private dependency environment that agent-loop builds "
+        "from the committed --worktree-setup-key files. After changing a --worktree-setup-key "
+        "file, commit it and keep tracked files committed; agent-loop rebuilds "
+        f"{links} from the committed keys after the turn. Installs during the turn only affect "
+        "this worktree, and test evidence from before the rebuild does not count for the rebuilt "
+        "environment. Do not delete or replace those paths yourself.\n"
+    )
+    note = take_rebuild_note(workdir)
+    if note:
+        text += f"Note: {note}\n"
+    return text
 
 
 def _sandboxed_permission_guidance(

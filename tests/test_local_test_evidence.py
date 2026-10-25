@@ -7027,3 +7027,109 @@ def test_lane_refusal_names_the_holder_of_that_exact_lane(tmp_path, monkeypatch,
         assert b.final["outcome"] == "passed" and a.final["outcome"] == "passed"
     finally:
         server.stop()
+
+
+# --- #1652: evidence binds to one concrete PR-local dependency environment ---
+
+
+def _environment_states(tmp_path):
+    """tracked_digest of one HEAD in every environment state, from real snapshots."""
+    from coding_review_agent_loop import checkout_verification as cv
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    _init_snapshot_repo(root)
+    (root / ".gitignore").write_text("/node_modules\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "ignore"], check=True)
+    source = tmp_path / "store-node_modules"
+    source.mkdir()
+    digests: dict[str, str] = {}
+
+    def capture(label):
+        snapshot = capture_tracked_tree_snapshot(root)
+        assert snapshot.complete and snapshot.status_clean, snapshot.caveats
+        digests[label] = snapshot.tracked_digest
+        return snapshot
+
+    def privatize(digest):
+        link = root / "node_modules"
+        if link.is_symlink():
+            link.unlink()
+        elif link.exists():
+            shutil.rmtree(link)
+        link.mkdir()
+        (link / "dep").write_text(digest, encoding="utf-8")
+        info = os.lstat(link)
+        cv.mark_private(root, {b"node_modules": (info.st_dev, info.st_ino)}, digest)
+
+    capture("unregistered")
+    (root / "node_modules").symlink_to(source)
+    cv.register_worktree_links(root, {"node_modules": str(source)})
+    capture("flag-off-linked")
+    cv.register_worktree_links(root, {"node_modules": str(source)}, pr_local=True, base_digest="d-a")
+    capture("shared")
+    privatize("d-a")
+    capture("private-1")
+    privatize("d-a")
+    capture("private-2")
+    cv.forget_checkout(root)
+    shutil.rmtree(root / "node_modules")
+    (root / "node_modules").symlink_to(source)
+    cv.register_worktree_links(root, {"node_modules": str(source)}, pr_local=True, base_digest="d-a")
+    privatize("d-a")
+    snapshot = capture("fresh-registration-1")
+    cv.forget_checkout(root)
+    return digests, snapshot
+
+
+def test_tracked_digest_names_one_concrete_environment_and_flag_off_is_unchanged(tmp_path):
+    digests, _snapshot = _environment_states(tmp_path)
+    # Flag off (registered links) and unregistered checkouts are byte-identical.
+    assert digests["flag-off-linked"] == digests["unregistered"]
+    environments = [
+        digests[label]
+        for label in ("unregistered", "shared", "private-1", "private-2", "fresh-registration-1")
+    ]
+    assert len(set(environments)) == len(environments)
+
+
+def test_evidence_from_before_a_rebuild_is_stale_and_cannot_supersede(tmp_path):
+    digests, current = _environment_states(tmp_path)
+    registry = EnvironmentIdentityRegistry()
+    before = [
+        _broker_row(outcome="failed", receipt="gen1-failure", timestamp=_T_FAIL, registry=registry,
+                    head=current.head, digest=digests["private-1"]),
+        _broker_row(outcome="passed", receipt="gen1-pass", timestamp=_T_PASS, registry=registry,
+                    head=current.head, digest=digests["private-1"]),
+    ]
+    rebuilt = _dc_replace(current, tracked_digest=digests["private-2"])
+    evidence = reconcile_test_observations(
+        before, current_head=current.head, current_snapshot=rebuilt, registry=registry
+    )
+    rows = _by_receipt(evidence)
+    # Neither row is promoted to current-head, and the earlier pass cannot supersede.
+    assert {rows[name].attribution.state for name in rows} == {"stale"}
+    assert rows["gen1-failure"].superseded_by != "gen1-pass"
+    # Control: the same rows at the environment they ran in do supersede.
+    unchanged = _dc_replace(current, tracked_digest=digests["private-1"])
+    evidence = reconcile_test_observations(
+        before, current_head=current.head, current_snapshot=unchanged, registry=registry
+    )
+    assert _by_receipt(evidence)["gen1-failure"].superseded_by == "gen1-pass"
+
+
+def test_restored_evidence_from_another_registration_never_matches_a_fresh_build(tmp_path):
+    digests, current = _environment_states(tmp_path)
+    head = current.head
+    restored = _run_a_failure(head=head, digest=digests["private-2"])
+    registry = EnvironmentIdentityRegistry()
+    passing = _run_b_pass(registry=registry, head=head, digest=digests["fresh-registration-1"])
+    fresh = _restart_snapshot(head=head, digest=digests["fresh-registration-1"])
+    evidence = _reconcile_b([*restored, passing], registry=registry, current_head=head, snapshot=fresh)
+    # The restored row is not refreshed for the fresh registration, so the pass cannot supersede it.
+    _assert_not_cross_restart_superseded(evidence)
+    # Control: restored evidence from the same registration is confirmed and superseded.
+    same = _run_a_failure(head=head, digest=digests["fresh-registration-1"])
+    evidence = _reconcile_b([*same, passing], registry=registry, current_head=head, snapshot=fresh)
+    _assert_cross_restart_superseded(evidence)

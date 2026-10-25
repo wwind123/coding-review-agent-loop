@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import stat as stat_module
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterator
 
@@ -123,25 +124,81 @@ def _refuse_untrusted_root(path: Path, *, agent: str, purpose: str) -> None:
 
 @dataclass(frozen=True)
 class _LinkRegistration:
-    """Worktree links of one prepared run worktree (``--worktree-link``)."""
+    """Worktree links of one prepared run worktree (``--worktree-link``).
+
+    With ``--worktree-setup-pr-local`` (#1652) a registration also carries its
+    dependency environment: ``links`` keeps only still-shared links, while
+    ``private`` maps each link name that agent-loop rebuilt inside the worktree
+    to the setup digest it was built for and the (st_dev, st_ino) recorded
+    after the build.  ``env_nonce`` is generated here, never derived from
+    repository or agent input, so two independently built environments never
+    share an environment record.
+    """
 
     lexical: str
     alias: str
     identity: tuple[int, int] | None
     links: dict[bytes, bytes]
+    pr_local: bool = False
+    writable: bool = True
+    base_digest: str | None = None
+    private: dict[bytes, tuple[str, tuple[int, int]]] = field(default_factory=dict)
+    env_generation: int = 0
+    env_nonce: str = ""
+    key_entries: tuple[tuple[str, str], ...] = ()
+    deferred: tuple[str, ...] = ()
 
 
 # Held only in this process, never as git ignore state: lexical path -> registration.
 _LINKS: dict[Path, _LinkRegistration] = {}
+# An open descriptor per private environment path keeps its inode allocated,
+# so a deleted-and-recreated path can never reuse the recorded (st_dev, st_ino).
+_PRIVATE_HOLDS: dict[Path, dict[bytes, int]] = {}
 
 
-def register_worktree_links(path: Path, mapping: dict[str, str]) -> None:
+def _release_holds(key: Path) -> None:
+    for fd in _PRIVATE_HOLDS.pop(key, {}).values():
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _hold_private(root: str, name: bytes, identity: tuple[int, int]) -> int:
+    info = private_entry_stat(root, name)
+    if info is None or (info.st_dev, info.st_ino) != tuple(identity):
+        raise AgentLoopError(f"private environment {_disp(name)} changed before it was recorded")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    if stat_module.S_ISDIR(info.st_mode):
+        flags |= os.O_DIRECTORY
+    fd = os.open(os.path.join(os.fsencode(root), name), flags)
+    held = os.fstat(fd)
+    if (held.st_dev, held.st_ino) != tuple(identity):
+        os.close(fd)
+        raise AgentLoopError(f"private environment {_disp(name)} changed before it was recorded")
+    return fd
+
+
+def register_worktree_links(
+    path: Path,
+    mapping: dict[str, str],
+    *,
+    pr_local: bool = False,
+    writable: bool = True,
+    base_digest: str | None = None,
+    key_entries: tuple[tuple[str, str], ...] = (),
+) -> None:
     """Record the links created in ``path`` plus the root identity they are bound to."""
     registration = _LinkRegistration(
         lexical=os.fspath(_key(path)),
         alias=os.path.realpath(os.fspath(path)),
         identity=_root_identity(path),
         links={os.fsencode(link): os.fsencode(target) for link, target in mapping.items()},
+        pr_local=pr_local,
+        writable=writable,
+        base_digest=base_digest,
+        env_nonce=secrets.token_hex(16),
+        key_entries=key_entries,
     )
     with _LEDGER_LOCK:
         _LINKS[_key(path)] = registration
@@ -151,6 +208,96 @@ def registered_links(path: Path) -> dict[bytes, bytes]:
     with _LEDGER_LOCK:
         registration = _LINKS.get(_key(path))
     return dict(registration.links) if registration else {}
+
+
+def private_paths(path: Path) -> dict[bytes, tuple[str, tuple[int, int]]]:
+    """Link names agent-loop rebuilt privately in ``path`` (#1652)."""
+    with _LEDGER_LOCK:
+        registration = _LINKS.get(_key(path))
+    return dict(registration.private) if registration else {}
+
+
+def link_registration(path: Path) -> _LinkRegistration | None:
+    with _LEDGER_LOCK:
+        return _LINKS.get(_key(path))
+
+
+def _update_registration(path: Path, **changes) -> None:
+    with _LEDGER_LOCK:
+        registration = _LINKS.get(_key(path))
+        if registration is None:
+            raise AgentLoopError(f"no worktree link registration exists for {path}")
+        _LINKS[_key(path)] = replace(registration, **changes)
+
+
+def set_environment_base(
+    path: Path, digest: str, *, key_entries: tuple[tuple[str, str], ...] = ()
+) -> None:
+    """Record the setup digest the shared environment was set up for (no-op once private)."""
+    with _LEDGER_LOCK:
+        registration = _LINKS.get(_key(path))
+        if registration is None or registration.private:
+            return
+        _LINKS[_key(path)] = replace(registration, base_digest=digest, key_entries=key_entries)
+
+
+def set_environment_deferred(path: Path, paths: tuple[str, ...]) -> None:
+    """Remember the uncommitted paths that deferred the last privatization (remedy text only)."""
+    with _LEDGER_LOCK:
+        registration = _LINKS.get(_key(path))
+        if registration is not None and registration.deferred != paths:
+            _LINKS[_key(path)] = replace(registration, deferred=paths)
+
+
+def mark_private(
+    path: Path,
+    identities: dict[bytes, tuple[int, int]],
+    digest: str,
+    *,
+    key_entries: tuple[tuple[str, str], ...] = (),
+) -> int:
+    """Atomically move ``identities`` from shared links to private paths; return the generation."""
+    registration = link_registration(path)
+    if registration is None:
+        raise AgentLoopError(f"no worktree link registration exists for {path}")
+    holds: dict[bytes, int] = {}
+    try:
+        for name, identity in identities.items():
+            holds[name] = _hold_private(registration.alias, name, identity)
+    except BaseException:
+        for fd in holds.values():
+            os.close(fd)
+        raise
+    with _LEDGER_LOCK:
+        registration = _LINKS.get(_key(path))
+        if registration is None:
+            for fd in holds.values():
+                os.close(fd)
+            raise AgentLoopError(f"no worktree link registration exists for {path}")
+        _release_holds(_key(path))
+        _PRIVATE_HOLDS[_key(path)] = holds
+        links = {name: target for name, target in registration.links.items() if name not in identities}
+        private = {name: (digest, identity) for name, identity in identities.items()}
+        generation = registration.env_generation + 1
+        _LINKS[_key(path)] = replace(
+            registration, links=links, private=private, env_generation=generation,
+            key_entries=key_entries, deferred=(),
+        )
+    return generation
+
+
+def registration_environment_record(registration: _LinkRegistration | None) -> str | None:
+    if registration is None or not registration.pr_local:
+        return None
+    if registration.private and not registration.links:
+        digests = sorted({digest for digest, _identity in registration.private.values()})
+        return f"private:{registration.env_nonce}:{registration.env_generation}:{','.join(digests)}"
+    return f"shared:{registration.env_nonce}:{registration.base_digest or ''}"
+
+
+def environment_record(path: Path) -> str | None:
+    """The concrete dependency environment of ``path``, or None (flag off or unregistered)."""
+    return registration_environment_record(link_registration(path))
 
 
 def lookup_worktree_links(requested: Path, canonical: Path) -> _LinkRegistration | None:
@@ -169,6 +316,47 @@ def lookup_worktree_links(requested: Path, canonical: Path) -> _LinkRegistration
     return None
 
 
+def private_entry_stat(root: Path | str, name: bytes | str) -> os.stat_result | None:
+    """lstat of ``root/name`` reached descriptor-relative; None when missing or unsafe.
+
+    A symlinked root, a symlinked or non-directory ancestor and a missing entry
+    all return None.  The entry itself is not followed.
+    """
+    parts = [part for part in os.fsencode(name).split(b"/") if part]
+    if not parts:
+        return None
+    try:
+        root_fd = os.open(os.fspath(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    opened = [root_fd]
+    try:
+        dir_fd = root_fd
+        for component in parts[:-1]:
+            try:
+                dir_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+            except OSError:
+                return None
+            opened.append(dir_fd)
+        try:
+            return os.lstat(parts[-1], dir_fd=dir_fd)
+        except OSError:
+            return None
+    finally:
+        for fd in opened:
+            os.close(fd)
+
+
+def private_path_intact(root: Path | str, name: bytes | str, identity: tuple[int, int]) -> bool:
+    """True iff ``root/name`` is the real directory or file recorded when it was built privately."""
+    info = private_entry_stat(root, name)
+    if info is None or stat_module.S_ISLNK(info.st_mode):
+        return False
+    if not (stat_module.S_ISDIR(info.st_mode) or stat_module.S_ISREG(info.st_mode)):
+        return False
+    return (info.st_dev, info.st_ino) == tuple(identity)
+
+
 def link_intact(root: Path, link: bytes | str, target: bytes | str) -> bool:
     """True iff ``root/link`` is, without following symlinked ancestors, exactly the recorded link."""
     try:
@@ -184,6 +372,18 @@ def link_intact(root: Path, link: bytes | str, target: bytes | str) -> bool:
     return descriptor == ("symlink", os.fsencode(target))
 
 
+def _deferred_paths(path: Path) -> tuple[str, ...]:
+    registration = link_registration(path)
+    return registration.deferred if registration is not None else ()
+
+
+def _check_untracked(config, runner, path: Path, name: str, what: str) -> None:
+    if _probe(config, runner, path, ("ls-files", "-z", "--full-name", "--", f":(literal){name}")):
+        raise _Incomplete(f"{what} {name} is staged in the index")
+    if _probe(config, runner, path, ("ls-tree", "-z", "--full-tree", "--name-only", "HEAD", "--", name)):
+        raise _Incomplete(f"{what} {name} is owned by HEAD")
+
+
 def _check_links(config, runner, path: Path, links: dict[bytes, bytes]) -> None:
     for link, target in sorted(links.items()):
         name = _disp(link)
@@ -192,21 +392,49 @@ def _check_links(config, runner, path: Path, links: dict[bytes, bytes]) -> None:
 
             raise _Incomplete(
                 f"worktree link {name} was removed, retargeted or reached through a symlink. "
-                + replaced_link_remedy(config, path, name)
+                + replaced_link_remedy(config, path, name, deferred=_deferred_paths(path))
             )
-        if _probe(config, runner, path, ("ls-files", "-z", "--full-name", "--", f":(literal){name}")):
-            raise _Incomplete(f"worktree link {name} is staged in the index")
-        if _probe(config, runner, path, ("ls-tree", "-z", "--full-tree", "--name-only", "HEAD", "--", name)):
-            raise _Incomplete(f"worktree link {name} is owned by HEAD")
+        _check_untracked(config, runner, path, name, "worktree link")
+
+
+def _check_private(config, runner, path: Path, private: dict[bytes, tuple[str, tuple[int, int]]]) -> None:
+    """Validate every private environment path before any exemption is granted (#1652)."""
+    for raw, (_digest, identity) in sorted(private.items()):
+        name = _disp(raw)
+        if not private_path_intact(path, raw, identity):
+            from .worktree_hints import replaced_private_remedy
+
+            raise _Incomplete(
+                f"private dependency environment {name} was removed, replaced or reached through "
+                "a symlink. " + replaced_private_remedy(config, path, name, deferred=_deferred_paths(path))
+            )
+        _check_untracked(config, runner, path, name, "private dependency environment")
+
+
+def _exempt_untracked(
+    records: list[tuple[bytes, bytes]], links: dict[bytes, bytes], private: dict[bytes, object]
+) -> list[tuple[bytes, bytes]]:
+    """Drop the untracked status records of links and of anything under a private path."""
+    exact = set(links) | set(private)
+    prefixes = tuple(name + b"/" for name in private)
+    return [
+        (xy, name)
+        for xy, name in records
+        if not (xy == b"??" and (name.rstrip(b"/") in exact or (prefixes and name.startswith(prefixes))))
+    ]
 
 
 def check_worktree_links(config, runner, path: Path) -> None:
-    """Raise CheckoutVerificationError unless every registered link is intact and untracked."""
+    """Raise CheckoutVerificationError unless every registered link and private path is intact."""
     links = registered_links(path)
-    if not links:
+    private = private_paths(path)
+    if not links and not private:
         return
     try:
-        _check_links(config, runner, path, links)
+        if links:
+            _check_links(config, runner, path, links)
+        if private:
+            _check_private(config, runner, path, private)
     except _Incomplete as exc:
         raise CheckoutVerificationError(f"Cannot verify worktree links of {path}: {exc}.") from exc
 
@@ -217,6 +445,8 @@ def reset_checkout_baselines() -> None:
         _LEDGER.clear()
         _ROOT_IDENTITY.clear()
         _LINKS.clear()
+        for key in list(_PRIVATE_HOLDS):
+            _release_holds(key)
 
 
 def forget_checkout(path: Path) -> None:
@@ -225,6 +455,7 @@ def forget_checkout(path: Path) -> None:
         _LEDGER.pop(_key(path), None)
         _ROOT_IDENTITY.pop(_key(path), None)
         _LINKS.pop(_key(path), None)
+        _release_holds(_key(path))
 
 
 def has_entry(path: Path) -> bool:
@@ -401,10 +632,13 @@ def capture_fingerprint(config, runner, path: Path) -> CheckoutFingerprint:
     )
     records = _parse_status(status_raw)
     links = registered_links(path)
+    private = private_paths(path)
     if links:
         _check_links(config, runner, path, links)
-        exact = {b"?? " + link for link in links}
-        records = [(xy, name) for xy, name in records if xy + b" " + name not in exact]
+    if private:
+        _check_private(config, runner, path, private)
+    if links or private:
+        records = _exempt_untracked(records, links, private)
     if len(records) > MAX_DIRTY_PATHS:
         tops: dict[bytes, int] = {}
         for _xy, name in records:
@@ -540,13 +774,14 @@ def establish_initial_baseline(config, runner, path: Path) -> None:
     """Startup: record the freshly prepared checkout.  Raises, creating no entry, on failure."""
     if getattr(runner, "dry_run", False):
         return
+    _reconcile_or_raise(config, runner, path, purpose="startup baseline")
     fingerprint = _capture_or_raise(config, runner, path, agent="agent", purpose="startup baseline")
     with _LEDGER_LOCK:
         _LEDGER[_key(path)] = _Expected(fingerprint)
     _remember_root(path, overwrite=True)
 
 
-def record_checkout_baseline(config, runner, path: Path, *, source: str) -> None:
+def record_checkout_baseline(config, runner, path: Path, *, source: str, reconcile: bool = True) -> None:
     """Refresh the baseline from the live checkout; poison it if that cannot be captured."""
     if getattr(runner, "dry_run", False):
         return
@@ -555,6 +790,17 @@ def record_checkout_baseline(config, runner, path: Path, *, source: str) -> None
         # into a trusted one (only a fresh startup establishment may).
         if isinstance(_LEDGER.get(_key(path)), _Poisoned):
             return
+    # Reconcile before the capture, so the baseline describes the reconciled
+    # checkout (#1652).  Called from the backend's finally block: never raise.
+    from .worktree_pr_env import reconcile_pr_local_environment
+
+    try:
+        if reconcile:
+            reconcile_pr_local_environment(config, runner, path)
+    except (AgentLoopError, OSError) as exc:
+        log(config, f"Poisoning checkout baseline for {path} after {source}: {exc}")
+        poison_checkout(path, f"PR-local dependency environment after {source} failed: {exc}")
+        return
     try:
         fingerprint = capture_fingerprint(config, runner, path)
     except _Incomplete as exc:
@@ -619,11 +865,33 @@ def verify_before_sync(config, runner, *, path: Path, label: str) -> None:
     verify_checkout(config, runner, path=path, agent=label, purpose="checkout sync")
 
 
+def _reconcile_or_raise(config, runner, path: Path, *, purpose: str) -> None:
+    from .worktree_pr_env import reconcile_pr_local_environment
+
+    try:
+        reconcile_pr_local_environment(config, runner, path)
+    except CheckoutVerificationError:
+        raise
+    except (AgentLoopError, OSError) as exc:
+        raise CheckoutVerificationError(
+            f"Cannot prepare the PR-local dependency environment of {path} before the {purpose}: "
+            f"{exc}"
+        ) from exc
+
+
 def refresh_after_sync(config, runner, path: Path) -> None:
     if getattr(runner, "dry_run", False):
         return
     if has_entry(path):
-        record_checkout_baseline(config, runner, path, source="sync")
+        if has_poisoned_entry(path):
+            return  # sticky: never reconcile or re-baseline an untrusted checkout
+        try:
+            _reconcile_or_raise(config, runner, path, purpose="checkout sync baseline")
+        except CheckoutVerificationError as exc:
+            # The sync already moved the checkout, so the old baseline is stale.
+            poison_checkout(path, str(exc))
+            raise
+        record_checkout_baseline(config, runner, path, source="sync", reconcile=False)
     else:
         establish_initial_baseline(config, runner, path)
 
