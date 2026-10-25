@@ -207,12 +207,12 @@ def reconcile_pr_local_environment(config: Any, runner: Any, path: Path) -> Priv
         return None
     offending = _uncommitted_inputs(alias, entries, runner=runner)
     if offending:
-        cv.set_environment_deferred(path, tuple(offending))
-        log(
-            config,
-            f"PR-local dependency environment: deferred the rebuild in {path} because tracked "
-            f"paths are uncommitted or hidden: {', '.join(offending[:8])}; nothing was removed.",
-        )
+        if cv.set_environment_deferred(path, tuple(offending)):
+            log(
+                config,
+                f"PR-local dependency environment: deferred the rebuild in {path} because tracked "
+                f"paths are uncommitted or hidden: {', '.join(offending[:8])}; nothing was removed.",
+            )
         return None
     names = sorted(set(registration.links) | set(registration.private))
     _refuse_tracked(config, runner, alias, names)

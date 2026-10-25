@@ -241,12 +241,14 @@ def set_environment_base(
         _LINKS[_key(path)] = replace(registration, base_digest=digest, key_entries=key_entries)
 
 
-def set_environment_deferred(path: Path, paths: tuple[str, ...]) -> None:
-    """Remember the uncommitted paths that deferred the last privatization (remedy text only)."""
+def set_environment_deferred(path: Path, paths: tuple[str, ...]) -> bool:
+    """Remember the uncommitted paths that deferred the last privatization; True when changed."""
     with _LEDGER_LOCK:
         registration = _LINKS.get(_key(path))
         if registration is not None and registration.deferred != paths:
             _LINKS[_key(path)] = replace(registration, deferred=paths)
+            return True
+    return False
 
 
 def mark_private(
@@ -781,7 +783,7 @@ def establish_initial_baseline(config, runner, path: Path) -> None:
     _remember_root(path, overwrite=True)
 
 
-def record_checkout_baseline(config, runner, path: Path, *, source: str, reconcile: bool = True) -> None:
+def record_checkout_baseline(config, runner, path: Path, *, source: str) -> None:
     """Refresh the baseline from the live checkout; poison it if that cannot be captured."""
     if getattr(runner, "dry_run", False):
         return
@@ -795,8 +797,7 @@ def record_checkout_baseline(config, runner, path: Path, *, source: str, reconci
     from .worktree_pr_env import reconcile_pr_local_environment
 
     try:
-        if reconcile:
-            reconcile_pr_local_environment(config, runner, path)
+        reconcile_pr_local_environment(config, runner, path)
     except (AgentLoopError, OSError) as exc:
         log(config, f"Poisoning checkout baseline for {path} after {source}: {exc}")
         poison_checkout(path, f"PR-local dependency environment after {source} failed: {exc}")
@@ -891,7 +892,8 @@ def refresh_after_sync(config, runner, path: Path) -> None:
             # The sync already moved the checkout, so the old baseline is stale.
             poison_checkout(path, str(exc))
             raise
-        record_checkout_baseline(config, runner, path, source="sync", reconcile=False)
+        # Its own reconcile is now a no-op: the environment matches HEAD.
+        record_checkout_baseline(config, runner, path, source="sync")
     else:
         establish_initial_baseline(config, runner, path)
 
