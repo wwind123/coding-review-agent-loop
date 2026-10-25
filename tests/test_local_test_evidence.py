@@ -867,7 +867,7 @@ def test_runner_broker_preserves_turn_binding_and_collects_receipt(tmp_path, mon
     )
     result = runner.run_with_log(
         [sys.executable, "-c", script], cwd=tmp_path, log_path=tmp_path / "coder.log",
-        label="coder", progress_interval_seconds=1,
+        label="coder", progress_interval_seconds=1, env=_src_env(),
     )
     assert result.returncode == 0
     observations = runner.local_test_observations()
@@ -892,7 +892,7 @@ def test_runner_exceptional_teardown_preserves_broker_journal(tmp_path, monkeypa
     with pytest.raises(Exception, match="Command failed"):
         runner.run_with_log(
             [sys.executable, "-c", script], cwd=tmp_path, log_path=tmp_path / "coder.log",
-            label="coder", progress_interval_seconds=1,
+            label="coder", progress_interval_seconds=1, env=_src_env(),
         )
     assert [item.outcome for item in runner.local_test_observations()] == ["passed"]
 

@@ -3504,6 +3504,11 @@ def test_coder_prompt_includes_documentation_reminder(tmp_path):
         assert "README.md" in prompt
         assert "docs/" in prompt
         assert "user-facing subcommand" in prompt
+        # #1660: feature PRs must not churn shared generated data.
+        flat = " ".join(prompt.split())
+        assert "Do not regenerate repository-wide generated data such as test-duration or shard-balancing stores (for example `tests/.test_durations`) as part of a feature or fix PR" in flat
+        assert "leave full refreshes to a dedicated maintenance PR" in flat
+        assert "limit it to entries for the tests you added" in flat
 
 
 def test_issue_prompt_includes_agent_unavailable_guidance(tmp_path):
