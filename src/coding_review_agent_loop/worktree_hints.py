@@ -75,7 +75,30 @@ def with_remedy(message: str, remedy: str | None) -> str:
     return f"{message.rstrip()} {remedy}"
 
 
-def replaced_link_remedy(config: Any, path: Path, link: str) -> str:
+PR_LOCAL_REMEDY_PATH_LIMIT = 8
+
+
+def _pr_local_reason(deferred: tuple[str, ...]) -> str:
+    if deferred:
+        shown = ", ".join(deferred[:PR_LOCAL_REMEDY_PATH_LIMIT])
+        extra = len(deferred) - PR_LOCAL_REMEDY_PATH_LIMIT
+        more = f" (and {extra} more)" if extra > 0 else ""
+        return (
+            "agent-loop deferred the PR-local rebuild because these tracked paths are "
+            f"uncommitted or hidden from Git: {shown}{more}. Commit or remove those changes; "
+            "agent-loop then rebuilds the environment from the committed --worktree-setup-key "
+            "files after the next turn"
+        )
+    return (
+        "no --worktree-setup-key file changed at HEAD, so agent-loop did not rebuild it. "
+        "Commit the --worktree-setup-key change; agent-loop then rebuilds the environment "
+        "privately after the turn"
+    )
+
+
+def replaced_link_remedy(
+    config: Any, path: Path, link: str, *, deferred: tuple[str, ...] = ()
+) -> str:
     """Remedy for a registered worktree link that was removed or retargeted."""
     from .config import run_worktree_store
 
@@ -84,11 +107,28 @@ def replaced_link_remedy(config: Any, path: Path, link: str) -> str:
     except (OSError, RuntimeError, ValueError):
         store = None
     source = f"{store / link}" if store is not None else f"the shared clone's {link}"
+    if getattr(config, "worktree_setup_pr_local", False):
+        return (
+            f"The link points at {source} in the shared clone and must stay unchanged: "
+            + _pr_local_reason(deferred)
+        )
     return (
         f"The link points at {source} in the shared clone and must stay unchanged; "
         "a coder turn may not replace or reinstall it. Changing dependencies inside "
-        "a PR needs PR-local dependency support (not yet available) or an explicit "
-        "--<agent>-dir checkout that owns its own environment"
+        "a PR needs the operator flag --worktree-setup-pr-local (which rebuilds the "
+        "environment privately in the run worktree after a committed --worktree-setup-key "
+        "change) or an explicit --<agent>-dir checkout that owns its own environment"
+    )
+
+
+def replaced_private_remedy(
+    config: Any, path: Path, link: str, *, deferred: tuple[str, ...] = ()
+) -> str:
+    """Remedy for a PR-local environment path that was removed or replaced (#1652)."""
+    return (
+        f"{Path(path) / link} is the private environment agent-loop built from the committed "
+        "setup keys and must stay in place (installing into it is fine; deleting or "
+        "replacing it is not): " + _pr_local_reason(deferred)
     )
 
 

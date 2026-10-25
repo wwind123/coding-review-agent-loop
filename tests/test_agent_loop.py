@@ -5657,3 +5657,74 @@ def test_run_tests_classifies_package_scripts_statically(tmp_path, monkeypatch, 
     if absent:
         assert absent not in err
         assert "Citable runners" not in err
+
+
+# --- #1652: --worktree-setup-pr-local validation and recovery passthrough ---
+
+_PR_LOCAL_COMPANIONS = (
+    "--worktree-setup", "npm ci", "--worktree-setup-key", "package-lock.json",
+    "--worktree-link", "node_modules",
+)
+
+
+def test_worktree_setup_pr_local_requires_setup_keys_and_links(tmp_path, monkeypatch):
+    from test_run_worktrees import Env
+
+    from coding_review_agent_loop.config import AgentLoopConfig
+    from coding_review_agent_loop.errors import AgentLoopError
+
+    env = Env(tmp_path, monkeypatch)
+    assert env.config(extra=(*_PR_LOCAL_COMPANIONS, "--worktree-setup-pr-local")).worktree_setup_pr_local
+    # Off by default, and only the operator CLI turns it on.
+    assert env.config(extra=_PR_LOCAL_COMPANIONS).worktree_setup_pr_local is False
+    assert AgentLoopConfig.__dataclass_fields__["worktree_setup_pr_local"].default is False
+    for extra in (
+        ("--worktree-link", "node_modules"),
+        ("--worktree-setup", "npm ci", "--worktree-link", "node_modules"),
+        ("--worktree-setup", "npm ci", "--worktree-setup-key", "package-lock.json"),
+    ):
+        with pytest.raises(AgentLoopError, match="--worktree-setup-pr-local requires --worktree-setup"):
+            env.config(extra=(*extra, "--worktree-setup-pr-local"))
+
+
+def test_worktree_setup_pr_local_ignored_without_default_per_run_worktree(tmp_path, monkeypatch, capsys):
+    import subprocess
+
+    from test_run_worktrees import Env
+
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.config import config_from_args
+    from coding_review_agent_loop.runner import Runner
+
+    env = Env(tmp_path, monkeypatch)
+    a, b = tmp_path / "a", tmp_path / "b"
+    for path in (a, b):
+        subprocess.run(["git", "clone", "-q", str(env.bare), str(path)], check=True)
+    args = build_parser().parse_args([
+        "task", "x", "--repo", "OWNER/REPO", "--coder", "claude", "--reviewer", "codex",
+        "--base", "main", "--gh-cmd", str(env.gh), "--trusted-local-origin", str(env.bare),
+        "--claude-cmd", "/bin/true", "--codex-cmd", "/bin/true", "--antigravity-cmd", "/bin/true",
+        "--quiet", "--claude-dir", str(a), "--codex-dir", str(b),
+        *_PR_LOCAL_COMPANIONS, "--worktree-setup-pr-local",
+    ])
+    config = config_from_args(args, Runner())
+    assert config.worktree_setup_pr_local is False
+    assert "--worktree-setup-pr-local is ignored" in capsys.readouterr().err
+
+
+def test_recovery_commands_preserve_worktree_setup_pr_local(tmp_path):
+    import shlex
+
+    from agent_loop_helpers import make_config
+
+    from coding_review_agent_loop.cli import build_parser
+    from coding_review_agent_loop.managed_ci import _render_recovery_command
+
+    config = make_config(tmp_path, invocation_argv=(
+        "agent-loop", "issue", "123", "--repo", "OWNER/REPO", *_PR_LOCAL_COMPANIONS,
+        "--worktree-setup-pr-local",
+    ))
+    command = _render_recovery_command(config, target="pr", identifier=456, managed_ci=False)
+    args = build_parser().parse_args(shlex.split(command)[1:])
+    assert args.worktree_setup_pr_local is True
+    assert args.worktree_setup == "npm ci" and args.worktree_link == ["node_modules"]

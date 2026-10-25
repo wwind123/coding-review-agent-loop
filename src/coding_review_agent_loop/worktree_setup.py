@@ -408,8 +408,18 @@ def _wait_for_exit_unreaped(process: subprocess.Popen, timeout_seconds: float) -
         time.sleep(min(_EXIT_POLL_SECONDS, remaining))
 
 
-def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> None:
+def run_setup_command(
+    store: Path,
+    command: str,
+    *,
+    timeout_seconds: float,
+    where: str | None = None,
+    consequence: str = "no setup record was written",
+) -> None:
     """Run ``command`` via ``/bin/sh -c`` in ``store`` as the operator; raise with the output tail.
+
+    ``store`` is the shared clone, or a run worktree for a PR-local environment
+    (#1652); ``where`` and ``consequence`` only select the message text.
 
     However the command ends, every process left in its group is killed before
     the leader is reaped, so no background child of a failed (or finished)
@@ -417,13 +427,14 @@ def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> N
     released. The leader stays an unreaped zombie until then, which keeps its
     PID, and so the group ID, from being reused by an unrelated process.
     """
+    where = where or f"the shared clone {store}"
     if not hasattr(os, "waitid"):
         # Without an unreaped wait the group cannot be killed safely after the
         # shell exits, so a surviving child could outlive the store lock.
         raise AgentLoopError(
             f"--worktree-setup is not supported on this host: os.waitid is unavailable, so "
             f"agent-loop cannot stop the command's background processes safely. Nothing ran "
-            f"in the shared clone {store} and no setup record was written."
+            f"in {where} and {consequence}."
         )
     with tempfile.TemporaryFile() as output:
         try:
@@ -433,16 +444,16 @@ def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> N
             )
         except OSError as exc:
             raise AgentLoopError(
-                f"--worktree-setup could not start in the shared clone {store}: {exc}. "
-                "No setup record was written."
+                f"--worktree-setup could not start in {where}: {exc}. "
+                f"{consequence[:1].upper()}{consequence[1:]}."
             ) from exc
         try:
             _wait_for_exit_unreaped(process, timeout_seconds)
         except subprocess.TimeoutExpired:
             _kill_group(process)
             raise AgentLoopError(
-                f"--worktree-setup timed out after {timeout_seconds:g}s in the shared clone {store}; "
-                f"no setup record was written. Output tail:\n{output_tail(read_output_tail(output))}"
+                f"--worktree-setup timed out after {timeout_seconds:g}s in {where}; "
+                f"{consequence}. Output tail:\n{output_tail(read_output_tail(output))}"
             ) from None
         except BaseException:
             _kill_group(process)
@@ -453,8 +464,8 @@ def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> N
         returncode = process.wait()
         if returncode != 0:
             raise AgentLoopError(
-                f"--worktree-setup exited {returncode} in the shared clone {store}; "
-                f"no setup record was written. Output tail:\n{output_tail(read_output_tail(output))}"
+                f"--worktree-setup exited {returncode} in {where}; "
+                f"{consequence}. Output tail:\n{output_tail(read_output_tail(output))}"
             )
 
 

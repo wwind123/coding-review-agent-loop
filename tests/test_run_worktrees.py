@@ -996,7 +996,7 @@ def test_replaced_worktree_link_refusal_names_store_source_and_remedy(tmp_path, 
     for message in (str(direct.value), str(poisoned.value)):
         assert "worktree link .venv was removed, retargeted or reached through a symlink" in message
         assert str(store / ".venv") in message
-        assert "PR-local dependency support" in message
+        assert "--worktree-setup-pr-local" in message
         assert "--<agent>-dir checkout" in message
     assert "can no longer be trusted" in str(poisoned.value)
 

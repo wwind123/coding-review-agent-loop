@@ -277,6 +277,21 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--worktree-setup-pr-local",
+            action="store_true",
+            default=False,
+            help=(
+                "Opt-in; requires --worktree-setup, at least one --worktree-setup-key and at least "
+                "one --worktree-link. Gives each writable per-run worktree a private dependency "
+                "environment before its first agent turn: agent-loop removes the links without "
+                "following them and runs the setup command inside the worktree. The environment "
+                "is rebuilt after any turn or sync whose committed HEAD changes a "
+                "--worktree-setup-key entry. Read-only worktrees of a sandboxed run keep the shared "
+                "links until a key changes. Setup then runs on PR-controlled key files as the "
+                "operator. Never read from repository configuration."
+            ),
+        )
+        subparser.add_argument(
             "--coder",
             type=normalize_agent_name,
             choices=("claude", "codex", "gemini", "antigravity"),

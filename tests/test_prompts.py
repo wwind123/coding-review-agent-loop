@@ -7177,3 +7177,36 @@ def test_citable_runner_summary_names_every_recognized_launcher_family_1659(tmp_
     environment = {"PATH": ""}
     assert recognized_inner_probe([sys.executable, "-m", "pytest"], cwd=tmp_path, environment=environment)
     assert recognized_inner_probe([sys.executable, "scripts/x.py"], cwd=tmp_path, environment=environment) is None
+
+
+# --- #1652: coder prompt note for PR-local dependency environments ---
+
+
+def test_pr_local_environment_note_only_with_the_flag_and_after_a_rebuild(tmp_path):
+    from dataclasses import replace as _replace
+
+    from agent_loop_helpers import make_config
+
+    from coding_review_agent_loop import checkout_verification as cv
+    from coding_review_agent_loop import worktree_pr_env
+    from coding_review_agent_loop.prompts import _coder_workdir_guidance
+
+    base = _replace(make_config(tmp_path), worktree_links=("node_modules",))
+    workdir = base.claude_dir.resolve()
+    guidance = "private dependency environment that agent-loop builds"
+    note = f"agent-loop rebuilt node_modules privately in this worktree for HEAD {'a' * 40}"
+    with cv._LEDGER_LOCK:
+        worktree_pr_env._REBUILD_NOTES[cv._key(workdir)] = note + " (environment generation 2)."
+    # Flag off: neither the guidance nor the rebuild note, and the note is kept.
+    off = _coder_workdir_guidance(base)
+    assert guidance not in off and "rebuilt node_modules" not in off
+    on = _replace(base, worktree_setup_pr_local=True, worktree_setup="npm ci",
+                  worktree_setup_keys=("package-lock.json",))
+    first = _coder_workdir_guidance(on)
+    assert guidance in first and "`node_modules`" in first
+    assert "Note: agent-loop rebuilt node_modules privately" in first and "a" * 40 in first
+    # The rebuild note appears only in the next coder prompt; the guidance stays.
+    second = _coder_workdir_guidance(on)
+    assert guidance in second and "rebuilt node_modules privately" not in second
+    # Reviewer (non-implementation) prompts never carry either note.
+    assert guidance not in _coder_workdir_guidance(on, implementation=False)

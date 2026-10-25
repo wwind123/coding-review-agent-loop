@@ -2530,11 +2530,17 @@ def capture_tracked_tree_snapshot(
             Path(os.path.abspath(requested_root)), canonical_root
         )
         link_names: set[str] = set()
+        private_names: set[str] = set()
         if registration is not None:
             for link_b, target_b in sorted(registration.links.items()):
                 if not _cv.link_intact(canonical_root, link_b, target_b):
                     raise AgentLoopError("registered worktree link was removed or retargeted")
                 link_names.add(os.fsdecode(link_b))
+            # Validate every private environment before exempting it (#1652).
+            for name_b, (_env_digest, identity) in sorted(registration.private.items()):
+                if not _cv.private_path_intact(canonical_root, name_b, identity):
+                    raise AgentLoopError("registered private environment was removed or replaced")
+                private_names.add(os.fsdecode(name_b))
         top = _run_git(canonical_root, ("rev-parse", "--show-toplevel"), timeout=timeout_seconds, cancel=cancel)
         git_root = Path(top.decode("utf-8", errors="strict").strip()).resolve(strict=True)
         if git_root != canonical_root:
@@ -2548,8 +2554,19 @@ def capture_tracked_tree_snapshot(
         untracked = _git_nul_paths(
             _run_git(canonical_root, ("ls-files", "--others", "--exclude-standard", "-z"), timeout=timeout_seconds, cancel=cancel)
         )
-        if link_names:
-            untracked = [name for name in untracked if name not in link_names]
+        if private_names:
+            for name in private_names:
+                if any(path == name or path.startswith(f"{name}/") for path in tracked) or _run_git(
+                    canonical_root, ("ls-tree", "-z", "--full-tree", "--name-only", "HEAD", "--", name),
+                    timeout=timeout_seconds, cancel=cancel,
+                ):
+                    raise AgentLoopError("registered private environment is tracked or staged")
+        if link_names or private_names:
+            untracked = [
+                name for name in untracked
+                if name not in link_names
+                and not any(name == p or name.startswith(f"{p}/") for p in private_names)
+            ]
         if len(tracked) + len(untracked) > max_files:
             raise AgentLoopError("git snapshot file limit exceeded")
         remaining = [max_bytes]
@@ -2565,6 +2582,13 @@ def capture_tracked_tree_snapshot(
                     )
                 )
         tracked_records: list[tuple[str, int, bytes]] = []
+        # Bind evidence to one concrete dependency environment (#1652); None
+        # (flag off or unregistered) appends nothing, keeping digests unchanged.
+        environment = _cv.registration_environment_record(registration)
+        if environment is not None:
+            tracked_records.append(
+                _bytes_snapshot_record("\0worktree-env\0", environment.encode(), remaining=remaining)
+            )
         for relative in tracked:
             _snapshot_checkpoint(started, timeout_seconds, cancel)
             path = canonical_root / relative

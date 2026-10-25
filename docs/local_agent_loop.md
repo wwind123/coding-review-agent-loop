@@ -1391,8 +1391,9 @@ agent-loop issue 123 --repo OWNER/REPO \
   `poetry.lock`, `uv.lock`, `package-lock.json`, `yarn.lock` or
   `pnpm-lock.yaml`, agent-loop logs one hint per run. It never installs
   anything on its own.
-- A PR that changes a key file still runs against the base environment;
-  per-PR dependency environments are planned separately (#1630, stage 3).
+- Without `--worktree-setup-pr-local`, a PR that changes a key file still runs
+  against the base environment; see
+  [Dependency changes inside a PR](#dependency-changes-inside-a-pr).
 - Without `--worktree-link`, a run-tests launch failure in a per-run worktree
   (a missing `.venv/bin/python`, or an interpreter without pytest), a coder
   test-gate launch failure and a refused out-of-checkout test executable add
@@ -1401,12 +1402,64 @@ agent-loop issue 123 --repo OWNER/REPO \
   outcome, evidence identity and exit codes are unchanged.
 - A replaced or removed link is still refused; the message names the link
   source in the shared clone and says that dependency changes inside a PR need
-  per-PR dependency support or an explicit `--<agent>-dir` checkout. When an
+  `--worktree-setup-pr-local` or an explicit `--<agent>-dir` checkout. When an
   issue run stops after the coder pushed its branch and its checkout became
   untrusted (a checkout refusal or a terminal result with no PR), the stop also
   prints `agent-loop managed-pr --head <branch> --expected-closing-issue N` as
   the resume and the manual `git -C <store> worktree remove --force <run-worktree>`
   cleanup; agent-loop never removes that worktree itself.
+
+#### Dependency changes inside a PR
+
+`--worktree-setup-pr-local` (operator CLI only, never read from repository
+configuration; requires `--worktree-setup`, at least one `--worktree-setup-key`
+and at least one `--worktree-link`) gives per-run worktrees private dependency
+environments, so a PR may change `package-lock.json` or `requirements.txt`:
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO \
+  --worktree-setup "npm ci" \
+  --worktree-setup-key package-lock.json \
+  --worktree-link node_modules \
+  --worktree-setup-pr-local
+```
+
+- Every writable per-run worktree (the coder's, and every worktree of a run
+  that is not `--agent-permissions sandboxed`) gets a private environment
+  before its first agent turn: agent-loop removes its links without following
+  them (a symlink is unlinked, never its target) and runs the setup command
+  inside the worktree. An install during a turn therefore changes only that
+  worktree, never the shared clone. This costs one full install per writable
+  worktree per run, plus one per committed key change; the private environment
+  is removed with the worktree.
+- After each turn and each sync, agent-loop compares the digest of the
+  `--worktree-setup-key` entries at the worktree's committed HEAD with the
+  digest its environment was built for. A difference removes the private paths
+  (or links) and rebuilds them with the setup command, then logs
+  `PR-local dependency environment: rebuilt ...`; the next coder prompt names
+  the rebuilt paths and HEAD. Returning the keys to the base digest rebuilds
+  privately again; it never re-links.
+- During a key-changing turn, tests use the previous private build until the
+  rebuild at the end of the turn, and test evidence from before a rebuild does
+  not count for the rebuilt environment: the evidence snapshot binds each
+  result to one concrete environment (registration nonce, generation and
+  digest).
+- Setup reads only committed bytes. Any uncommitted, staged or index-hidden
+  (`assume-unchanged`, `skip-worktree`) tracked change, a dirty or drifted
+  initialized submodule, or an untracked or ignored file at a key path absent
+  from HEAD defers the rebuild; nothing is removed and the remedy names the
+  paths.
+- Deleting or replacing a private environment, or a link, without a committed
+  key change is still refused, as is staging or committing it.
+- Read-only worktrees of a sandboxed run (agents that hold only CLI-enforced
+  read-only roles) keep the shared links and move to a private environment
+  only on a sync whose HEAD changes a key; the read-only grant is what keeps
+  their turns from writing through the links.
+- Trust boundary: with the flag on, the setup command runs on PR-controlled
+  key files and their install scripts as the operator, unsandboxed, with the
+  same privilege as the test gate running PR code. That is why it is opt-in.
+  A setup failure or timeout poisons the checkout with the output tail and
+  stops the next turn; the shared clone is never touched.
 
 ### Process-tree containment
 

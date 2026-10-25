@@ -1631,3 +1631,36 @@ def test_client_loss_cancellation_is_documented_for_both_phases():
         "non-evidence row is journaled",
     ):
         assert phrase in architecture, phrase
+
+
+def test_docs_describe_pr_local_dependency_environments():
+    """#1652: the opt-in flag, its cost, rebuild rule, limits and trust boundary are documented."""
+    import pathlib
+
+    from coding_review_agent_loop.cli import build_parser
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text()
+    guide = (root / "docs" / "local_agent_loop.md").read_text()
+    architecture = _architecture_set_text()
+    for document in (readme, guide):
+        assert "#### Dependency changes inside a PR" in document
+        assert "planned separately (#1630, stage 3)" not in document
+        for term in (
+            "--worktree-setup-pr-local", "before its first agent turn",
+            "one full install per writable\n  worktree per run", "without following\n  them",
+            "previous private build", "Read-only worktrees of a sandboxed run",
+            "PR-controlled\n  key files", "same privilege as the test gate",
+            "Setup reads only committed bytes",
+        ):
+            assert term in document, term
+    assert "worktree_pr_env.py" in architecture
+    assert "--worktree-setup-pr-local" in architecture
+    decisions = (root / "docs" / "architecture" / "decisions" / "execution-and-concurrency.md").read_text()
+    assert "(#1652)" in decisions
+    issue_help = next(
+        action.choices["issue"].format_help()
+        for action in build_parser()._actions
+        if getattr(action, "choices", None) and "issue" in action.choices
+    )
+    assert "--worktree-setup-pr-local" in issue_help

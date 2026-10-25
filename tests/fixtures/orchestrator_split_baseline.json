@@ -94,6 +94,7 @@
   "worker_telemetry",
   "workflow_transaction",
   "worktree_hints",
+  "worktree_pr_env",
   "worktree_setup"
  ],
  "surface": [
