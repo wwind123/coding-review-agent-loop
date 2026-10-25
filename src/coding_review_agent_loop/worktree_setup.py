@@ -240,12 +240,61 @@ def store_tracked_tree_dirty_paths(store: Path) -> list[str]:
             Path(os.path.realpath(store)), entries,
             timeout_seconds=_PROBE_TIMEOUT_SECONDS, cancel=None, started=time.monotonic(),
         ))
+        # Status and diff trust index flags; a flagged path can hide edited bytes.
+        dirty.update(
+            f"{path} (assume-unchanged or skip-worktree)"
+            for path in _flag_suppressed_paths(Path(os.path.realpath(store)))
+        )
     except AgentLoopError as exc:
         raise AgentLoopError(
             f"Could not verify the tracked tree of the shared clone {store} before --worktree-setup: "
             f"{exc}. Refusing to run setup."
         ) from exc
     return sorted(dirty)
+
+
+def _flag_suppressed_paths(
+    root: Path, *, prefix: str = "", depth: int = 0, budget: list[int] | None = None
+) -> list[str]:
+    """Tracked paths whose index entry hides working-tree changes from status and diff.
+
+    ``git ls-files -v`` tags assume-unchanged entries with a lowercase letter
+    and skip-worktree entries with ``S``. Initialized submodules are inspected
+    by separate confined probes rooted at each submodule, recursively.
+    """
+    from .local_test_evidence import _git_index_entries, _run_git
+
+    if budget is None:
+        budget = [128]
+    raw = _run_git(root, ("ls-files", "-v", "-z"), timeout=_PROBE_TIMEOUT_SECONDS)
+    flagged: list[str] = []
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        if len(record) < 3 or record[1:2] != b" ":
+            raise AgentLoopError("git ls-files -v returned malformed output")
+        tag = record[:1]
+        if tag.islower() or tag == b"S":
+            flagged.append(prefix + record[2:].decode("utf-8", errors="surrogateescape"))
+    entries = _git_index_entries(_run_git(root, ("ls-files", "-s", "-z"), timeout=_PROBE_TIMEOUT_SECONDS))
+    for relative, (mode, _object_id) in entries.items():
+        if mode != "160000":
+            continue
+        path = root / relative
+        if not os.path.lexists(path / ".git"):
+            continue  # uninitialized: no worktree whose bytes could be hidden
+        budget[0] -= 1
+        if budget[0] < 0 or depth >= 8:
+            raise AgentLoopError("gitlink inspection limit exceeded")
+        if path.is_symlink() or not path.is_dir():
+            raise AgentLoopError("gitlink worktree has an unsafe path")
+        sub_root = path.resolve(strict=True)
+        if os.path.commonpath((str(root), str(sub_root))) != str(root):
+            raise AgentLoopError("gitlink worktree escapes the shared clone")
+        flagged += _flag_suppressed_paths(
+            sub_root, prefix=f"{prefix}{relative}/", depth=depth + 1, budget=budget
+        )
+    return flagged
 
 
 def _refuse_dirty(store: Path, paths: list[str], *, reason: str) -> None:
@@ -329,6 +378,17 @@ def _kill_group(process: subprocess.Popen) -> None:
         process.wait(timeout=10)
 
 
+_TAIL_READ_BYTES = 2 * OUTPUT_TAIL_BYTES
+
+
+def read_output_tail(handle: Any) -> bytes:
+    """Read only a bounded suffix of the captured output, however large it grew."""
+    handle.seek(0, os.SEEK_END)
+    size = handle.tell()
+    handle.seek(max(0, size - _TAIL_READ_BYTES))
+    return handle.read(_TAIL_READ_BYTES)
+
+
 def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> None:
     """Run ``command`` via ``/bin/sh -c`` in ``store`` as the operator; raise with the output tail."""
     with tempfile.TemporaryFile() as output:
@@ -346,10 +406,9 @@ def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> N
             returncode = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             _kill_group(process)
-            output.seek(0)
             raise AgentLoopError(
                 f"--worktree-setup timed out after {timeout_seconds:g}s in the shared clone {store}; "
-                f"no setup record was written. Output tail:\n{output_tail(output.read())}"
+                f"no setup record was written. Output tail:\n{output_tail(read_output_tail(output))}"
             ) from None
         except BaseException:
             _kill_group(process)
@@ -358,10 +417,9 @@ def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> N
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(process.pid, signal.SIGKILL)
         if returncode != 0:
-            output.seek(0)
             raise AgentLoopError(
                 f"--worktree-setup exited {returncode} in the shared clone {store}; "
-                f"no setup record was written. Output tail:\n{output_tail(output.read())}"
+                f"no setup record was written. Output tail:\n{output_tail(read_output_tail(output))}"
             )
 
 

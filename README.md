@@ -820,7 +820,8 @@ agent-loop issue 123 --repo OWNER/REPO \
   under the private host lock root, outside the repository.
 - Before a required setup, tracked files in the shared clone (including
   initialized submodules) must match the base commit: any locally modified,
-  staged or deleted tracked file stops the run without overwriting it.
+  staged or deleted tracked file, and any index entry flagged
+  `assume-unchanged` or `skip-worktree`, stops the run without overwriting it.
   Untracked and ignored content there is operator-trusted.
 - Linked environments are shared and mutable across concurrent runs; a rerun
   of setup changes them under other runs' turns.

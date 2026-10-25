@@ -176,16 +176,17 @@ def test_setup_failure_stops_with_output_tail_and_no_record_or_links(tmp_path, m
     counter = tmp_path / "counter"
     failing = setup_command(counter, "for i in $(seq 1 100); do echo line$i; done; exit 3")
     config = setup_config(env, failing)
-    store = claude_store()
     with workdir_claim_scope(command="task"):
         claim_agent_workdirs(config)
         with pytest.raises(AgentLoopError) as caught:
             ensure_agent_workdirs(config, Runner())
     message = str(caught.value)
-    assert "exited 3" in message and str(store) in message
+    clones = [str(default_agent_workdir("OWNER/REPO", agent).resolve()) for agent in ("claude", "codex")]
+    assert "exited 3" in message and any(f"shared clone {clone};" in message for clone in clones)
     assert "line100" in message and "line61" in message and "line60\n" not in message
-    assert worktree_setup.read_setup_record(store) is None
-    assert not worktree_setup.setup_record_path(store).exists()
+    for clone in clones:
+        assert worktree_setup.read_setup_record(Path(clone)) is None
+        assert not worktree_setup.setup_record_path(Path(clone)).exists()
     runs_root = default_run_worktree_root("OWNER/REPO", "claude")
     assert not runs_root.exists() or not list(runs_root.iterdir())
 
@@ -518,10 +519,12 @@ def test_stale_store_recreation_deletes_record_before_reclone(tmp_path, monkeypa
         return real_remove(path)
 
     monkeypatch.setattr(agent_permissions, "remove_checkout_tree", remove)
-    stale = iter([True])
-    real_stale = config_module._is_stale_default_workdir
-    monkeypatch.setattr(config_module, "_is_stale_default_workdir",
-                        lambda path: next(stale, False) or real_stale(path))
+    # Genuinely artifact-only: no working-tree content and no index entries.
+    for entry in store.iterdir():
+        if entry.name != ".git":
+            shutil.rmtree(entry) if entry.is_dir() and not entry.is_symlink() else entry.unlink()
+    (store / ".git" / "index").unlink()
+    assert config_module._is_stale_default_workdir(store)
     run_worktrees.prepare_store(store, config=config, runner=Runner())
     assert record_seen == [False]
     assert runs_in(counter, store) == 2
@@ -686,3 +689,120 @@ def test_dry_run_only_logs_setup(tmp_path, monkeypatch):
         ) is False
     assert messages == [f"Would run worktree setup in {store}"]
     assert not (store / "should-not-exist").exists()
+
+
+# --- review round 1: tracked deletions, index flags, bounded tails ----------------
+
+
+def test_tracked_deletions_are_refused_not_recloned_as_stale_store(tmp_path, monkeypatch):
+    """A real repository whose tracked files were all deleted is not an artifact-only store."""
+    from coding_review_agent_loop import config as config_module
+
+    env = seeded(tmp_path, monkeypatch)
+    counter_a, counter_b = tmp_path / "counter-a", tmp_path / "counter-b"
+    config = setup_config(env, setup_command(counter_a, "true"), links=())
+    store = claude_store()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    record_bytes = worktree_setup.setup_record_path(store).read_bytes()
+    git_marker = store / ".git" / "agent-loop-test-marker"
+    git_marker.write_text("kept\n")
+    for entry in store.iterdir():
+        if entry.name != ".git":
+            shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+    assert config_module._is_stale_default_workdir(store)
+    changed = dataclasses.replace(config, worktree_setup=setup_command(counter_b, "true"))
+    with pytest.raises(AgentLoopError, match="refused") as caught:
+        run_worktrees.prepare_store(store, config=changed, runner=Runner())
+    assert "requirements.txt" in str(caught.value) and str(store) in str(caught.value)
+    assert worktree_setup.setup_record_path(store).read_bytes() == record_bytes
+    assert git_marker.read_text() == "kept\n"  # the clone was not re-created
+    assert not (store / "requirements.txt").exists()  # nothing was restored
+    assert not counter_b.exists()
+
+
+def _assume_unchanged(store: Path) -> str:
+    (store / "package.json").write_text('{"scripts": {"preinstall": "hidden"}}\n')
+    git(store, "update-index", "--assume-unchanged", "package.json")
+    return "package.json"
+
+
+def _skip_worktree(store: Path) -> str:
+    (store / "setup.py").write_text("raise SystemExit('hidden')\n")
+    git(store, "update-index", "--skip-worktree", "setup.py")
+    return "setup.py"
+
+
+def _submodule_skip_worktree(store: Path) -> str:
+    pop = store / "mods" / "pop"
+    (pop / "s.txt").write_text("hidden\n")
+    git(pop, "update-index", "--skip-worktree", "s.txt")
+    return "mods/pop/s.txt"
+
+
+@pytest.mark.parametrize("hide", [_assume_unchanged, _skip_worktree, _submodule_skip_worktree])
+def test_index_flags_hiding_tracked_edits_refuse_setup(tmp_path, monkeypatch, hide):
+    s = SubmoduleEnv(tmp_path, monkeypatch)
+    s.env.commit("setup.py", "print('base')\n")
+    config = s.config()
+    run_worktrees.prepare_store(s.store, config=config, runner=Runner())
+    record_bytes = worktree_setup.setup_record_path(s.store).read_bytes()
+    path = hide(s.store)
+    # Status alone would call this tree clean.
+    assert worktree_setup._porcelain_paths(
+        subprocess.run(["git", "-C", str(s.store), "status", "--porcelain=v1", "-z",
+                        "--untracked-files=no", "--ignore-submodules=all"],
+                       capture_output=True, check=True).stdout
+    ) == []
+    hidden = (s.store / path).read_bytes()
+    counter_b = tmp_path / "counter-b"
+    changed = dataclasses.replace(config, worktree_setup=setup_command(counter_b))
+    with pytest.raises(AgentLoopError, match="assume-unchanged or skip-worktree") as caught:
+        run_worktrees.prepare_store(s.store, config=changed, runner=Runner())
+    assert path in str(caught.value)
+    assert worktree_setup.setup_record_path(s.store).read_bytes() == record_bytes
+    assert (s.store / path).read_bytes() == hidden
+    assert not counter_b.exists()
+
+
+def test_read_output_tail_reads_a_bounded_suffix(tmp_path):
+    big = tmp_path / "big.log"
+    big.write_bytes(b"x" * (10 * 1024 * 1024) + b"\nLAST\n")
+    reads: list[int] = []
+    with open(big, "rb") as handle:
+        real_read = handle.read
+
+        class Spy:
+            def seek(self, *args):
+                return handle.seek(*args)
+
+            def tell(self):
+                return handle.tell()
+
+            def read(self, size=-1):
+                reads.append(size)
+                return real_read(size)
+
+        data = worktree_setup.read_output_tail(Spy())
+    assert data.endswith(b"LAST\n") and len(data) <= 2 * worktree_setup.OUTPUT_TAIL_BYTES
+    assert reads and all(0 < size <= 2 * worktree_setup.OUTPUT_TAIL_BYTES for size in reads)
+
+
+@pytest.mark.parametrize("mode", ["nonzero", "timeout"])
+def test_large_failure_output_is_tail_bounded(tmp_path, monkeypatch, mode):
+    seen: list[int] = []
+    real_tail = worktree_setup.output_tail
+
+    def spy(data):
+        seen.append(len(data))
+        return real_tail(data)
+
+    monkeypatch.setattr(worktree_setup, "output_tail", spy)
+    noise = "head -c 5000000 /dev/zero | tr '\\0' 'x'; echo; echo FINAL-LINE"
+    tail = "exit 4" if mode == "nonzero" else "sleep 30"
+    with pytest.raises(AgentLoopError) as caught:
+        worktree_setup.run_setup_command(tmp_path, f"{noise}; {tail}", timeout_seconds=3)
+    message = str(caught.value)
+    assert "FINAL-LINE" in message
+    assert ("exited 4" in message) if mode == "nonzero" else ("timed out" in message)
+    assert seen and max(seen) <= 2 * worktree_setup.OUTPUT_TAIL_BYTES
+    assert len(message) < 4 * worktree_setup.OUTPUT_TAIL_BYTES

@@ -53,9 +53,12 @@ dev/ino as a secondary check. Setup is required when the record is missing,
 unreadable or different, or when any `--worktree-link` source fails the shared
 `link_source_usable` predicate (`os.path.exists`, so a dangling source symlink
 counts as missing); `_prepare_store_locked` deletes the record before it
-removes a stale store or clones a missing one. A required setup needs a free
+removes a stale store or clones a missing one. With `--worktree-setup`, a store whose
+index still lists tracked paths is never treated as stale, so tracked
+deletions reach the setup gate instead of being re-cloned over. A required setup needs a free
 store claim (otherwise the held-store message), then refuses any locally
-modified, staged or deleted tracked path, any dirty or drifted initialized
+modified, staged or deleted tracked path, any index entry flagged
+assume-unchanged or skip-worktree (which status and diff trust), any dirty or drifted initialized
 submodule (separate confined per-submodule probes, the same inspection as
 test-evidence snapshots; parent probes keep the confined
 `--ignore-submodules=all`) and any untracked file at a key absent at the SHA,

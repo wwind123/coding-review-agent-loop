@@ -493,6 +493,12 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
         # Without a .git there can be no linked worktrees, so skip the enumeration.
         if has_git and len(_linked_worktrees(store, runner)) > 1:
             pass  # live linked worktrees: never delete the store under them
+        elif has_git and getattr(config, "worktree_setup", None) and _store_tracks_paths(store, runner):
+            # A real repository whose tracked files were deleted, not an
+            # artifact-only directory: keep the checkout and the setup record
+            # so the setup gate refuses the deletions instead of re-cloning
+            # over them (#1650).
+            log(config, f"Shared store {store} has tracked files deleted; keeping it for --worktree-setup.")
         elif not free:
             raise AgentLoopError(_held_store_message(store, "is stale and cannot be recreated"))
         else:
@@ -530,6 +536,12 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
         detach = _git(runner, store, "checkout", "--detach", check=False)
         if detach.returncode != 0:
             log(config, f"Could not detach the shared store HEAD at {store}; leaving it as is.")
+
+
+def _store_tracks_paths(store: Path, runner: Any) -> bool:
+    """True when the store's index lists tracked paths (an unreadable index counts as tracked)."""
+    listed = _git(runner, store, "ls-files", "-z", check=False)
+    return listed.returncode != 0 or bool((listed.stdout or "").strip("\0"))
 
 
 def _held_store_message(store: Path, what: str) -> str:
