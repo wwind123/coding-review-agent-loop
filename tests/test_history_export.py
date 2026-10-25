@@ -1342,3 +1342,136 @@ def test_pr_approach_alternative_stop_is_a_human_decision_stop():
     ).reason == "pr-step-back-approach-alternative"
     other = recognize_diagnostic(render_pr_scheduling_diagnostic("round 5", "PR #9: panel unsafe"))
     assert (other.kind, other.reason) == (KIND_PR_STOP, "scheduling-stop")
+
+
+# --- PR sibling and non-convergence human-decision stops (#1640) ------------
+
+
+def _sibling_stop_message() -> str:
+    from coding_review_agent_loop import review_step_back as sb
+
+    entry = sb.PrStepBackEntry(
+        reviewer=CODEX, trigger_round=3, trigger_head="a" * 40, path="src/spool.py",
+        start=124, end=140, coder_round=4, resulting_head="b" * 40, record_index=1,
+    )
+    # pr_loop_support prefixes the rendered sibling text with ``PR #N: ``.
+    return f"PR #{PR}: " + sb.render_pr_step_back_human_decision(
+        reviewer=CODEX, entry=entry, mapping=None,
+        siblings=(sb.FindingLocation("src/spool.py", 134, 134, "item-4"),),
+        window=10, generalization="Every malformed record fails closed.", sibling_round=5,
+    )
+
+
+def _non_convergence_stop_message(items=None) -> str:
+    from coding_review_agent_loop import review_step_back as sb
+
+    result = sb.PrNonConvergence(
+        reviewer=CODEX, k=3, trigger_round=4, first_round=1, first_head="c" * 40,
+        current_head="d" * 40,
+        items=items or (sb.PersistingItem("item-1", "race at src/secure_git.py:10", 3),),
+        coder_rounds=(2, 3, 4),
+    )
+    return sb.render_pr_non_convergence_decision(
+        PR, result, diff_growth="1 file changed", pr_size="2 files changed"
+    )
+
+
+def test_pr_sibling_and_non_convergence_stops_are_human_decision_stops():
+    """`export-classifies`: render-then-recognize through the posted renderer."""
+    from coding_review_agent_loop.pr_loop import render_pr_human_decision_diagnostic
+
+    for message, reason in (
+        (_sibling_stop_message(), "pr-step-back-sibling"),
+        (_non_convergence_stop_message(), "pr-non-convergence"),
+        (_approach_alternative_stop_message(), "pr-step-back-approach-alternative"),
+    ):
+        body = render_pr_human_decision_diagnostic("round 5", message)
+        assert body == render_pr_scheduling_diagnostic("round 5", message)
+        stop = recognize_diagnostic(body)
+        assert (stop.kind, stop.reason, stop.round_number, stop.terminal) == (
+            KIND_HUMAN_DECISION_STOP, reason, 5, True,
+        )
+        # Without the template the bare message is not a diagnostic.
+        assert recognize_diagnostic(message) is None
+        # A body carrying round metadata is a record, never a plain diagnostic.
+        assert recognize_diagnostic(body + "\n<!-- AGENT_LOOP_" + "META: e30= -->") is None
+
+
+def test_pr_stop_renderers_keep_their_bytes():
+    """The shared constants leave the rendered openings unchanged."""
+    assert _sibling_stop_message().startswith(
+        f"PR #{PR}: human decision required: the coder generalized a class of findings at "
+        "round 4 (a step-back turn after Codex blocked consecutive rounds"
+    )
+    assert _non_convergence_stop_message().split("\n", 1)[0] == (
+        f"PR #{PR}: human decision required: Codex kept the same item(s) blocking across 3 "
+        "consecutive coder turns that each changed the head (reviews at rounds 1-4, current "
+        f"head '{'d' * 40}'), so the fix loop is not converging. No further coder turn was "
+        "invoked.".replace("'", "`")
+    )
+
+
+def test_a_bounded_oversized_non_convergence_diagnostic_still_classifies():
+    from coding_review_agent_loop import review_step_back as sb
+    from coding_review_agent_loop.pr_loop import (
+        PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT,
+        render_pr_human_decision_diagnostic,
+    )
+
+    items = tuple(
+        sb.PersistingItem(f"item-{n}", "persisting detail " * 13, 3) for n in range(1, 400)
+    )
+    message = _non_convergence_stop_message(items)
+    body = render_pr_human_decision_diagnostic("round 5", message)
+    assert len(message) > PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT
+    assert len(body) <= PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT
+    assert body.startswith(
+        render_pr_scheduling_diagnostic("round 5", message.split("\n", 1)[0] + "\n")
+    )
+    assert "characters of detail omitted from this diagnostic" in body.rsplit("\n", 1)[1]
+    assert recognize_diagnostic(body).reason == "pr-non-convergence"
+
+
+def test_a_bounded_diagnostic_cuts_an_oversized_first_line():
+    from coding_review_agent_loop.pr_loop import (
+        PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT,
+        render_pr_human_decision_diagnostic,
+    )
+
+    message = "x" * (PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT * 2) + "\nsecond line"
+    body = render_pr_human_decision_diagnostic("round 2", message)
+    assert len(body) <= PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT
+    assert body.startswith(render_pr_scheduling_diagnostic("round 2", "xxx"))
+    assert "second line" not in body
+    omitted = int(body.rsplit("… (", 1)[1].split(" ", 1)[0])
+    assert omitted == len(message) - (len(body.rsplit("\n", 1)[0]) - len(
+        render_pr_scheduling_diagnostic("round 2", "")
+    ))
+
+
+def test_item_text_on_a_later_line_cannot_make_a_stop_look_like_non_convergence():
+    """`export-classifies`: the recognizer only reads the first line."""
+    from coding_review_agent_loop.review_step_back import (
+        PR_NON_CONVERGENCE_DECISION_LEAD,
+        PR_NON_CONVERGENCE_DECISION_MARK,
+    )
+
+    crafted = (
+        f"{PR_NON_CONVERGENCE_DECISION_LEAD}Codex{PR_NON_CONVERGENCE_DECISION_MARK}"
+        "3 consecutive coder turns"
+    )
+    for message in (
+        f"PR #{PR}: panel unsafe\n- [item-1] {crafted}",
+        f"PR #{PR}: {PR_NON_CONVERGENCE_DECISION_LEAD}something else\n{crafted}",
+    ):
+        stop = recognize_diagnostic(render_pr_scheduling_diagnostic("round 5", message))
+        assert (stop.kind, stop.reason) == (KIND_PR_STOP, "scheduling-stop")
+    # A non-convergence message whose item text mimics the sibling prefix keeps its reason.
+    from coding_review_agent_loop import review_step_back as sb
+
+    mimic = _non_convergence_stop_message(
+        (sb.PersistingItem("item-1", sb.PR_STEP_BACK_SIBLING_PREFIX_TEXT + "9", 3),)
+    )
+    assert recognize_diagnostic(
+        render_pr_scheduling_diagnostic("round 5", mimic)
+    ).reason == "pr-non-convergence"

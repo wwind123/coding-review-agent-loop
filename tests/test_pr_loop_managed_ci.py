@@ -1680,6 +1680,15 @@ def test_approach_alternative_stop_publishes_continuity_first_and_resume_stops(
         return original_stop(*args, **kwargs)
 
     monkeypatch.setattr(pr_loop, "_pr_step_back_approach_alternative_stop", stop)
+    real_post = pr_loop.post_pr_comment
+
+    def post(*args, body, **kwargs):
+        # The durable human-decision diagnostic (#1640) is plain text.
+        if isinstance(body, str) and body.startswith("PR review scheduling diagnostic ("):
+            events.append(("diagnostic", runner.pr_payload["headRefOid"]))
+        return real_post(*args, body=body, **kwargs)
+
+    monkeypatch.setattr(pr_loop, "post_pr_comment", post)
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True, reviewer=("codex",), max_rounds=8,
@@ -1693,7 +1702,8 @@ def test_approach_alternative_stop_publishes_continuity_first_and_resume_stops(
     new_head = f"{3:040x}"
     # The continuity grant for the proposal head precedes the live stop.
     assert events.index(("publish", new_head)) < events.index(("stop-check", new_head))
-    assert events[-1] == ("stop-check", new_head)
+    # The durable diagnostic follows the coder record and the continuity grant.
+    assert events[-2:] == [("stop-check", new_head), ("diagnostic", new_head)]
     codex_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]
     assert len(codex_calls) == 3
     assert not any(cmd[:3] == ["gh", "workflow", "run"] for cmd, _cwd in runner.commands)
@@ -1707,6 +1717,6 @@ def test_approach_alternative_stop_publishes_continuity_first_and_resume_stops(
             managed_ci_issue_number=56,
         )
     assert activated_heads[-1] == new_head
-    assert events == [("stop-check", new_head)]
+    assert events == [("stop-check", new_head), ("diagnostic", new_head)]
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]) == 3
     assert not any(cmd[:3] == ["gh", "workflow", "run"] for cmd, _cwd in runner.commands)

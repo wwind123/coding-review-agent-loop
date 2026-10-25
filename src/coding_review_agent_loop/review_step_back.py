@@ -2611,6 +2611,12 @@ def render_pr_sweep_guidance(entry: PrStepBackEntry) -> str:
     )
 
 
+# Leading bytes of the PR step-back sibling human-decision stop (#1640).
+PR_STEP_BACK_SIBLING_PREFIX_TEXT = (
+    "human decision required: the coder generalized a class of findings at round "
+)
+
+
 def render_pr_step_back_human_decision(
     *,
     reviewer: str,
@@ -2645,8 +2651,8 @@ def render_pr_step_back_human_decision(
         )
     )
     return (
-        "human decision required: the coder generalized a class of findings at round "
-        f"{entry.coder_round} (a step-back turn after {reviewer} blocked consecutive rounds "
+        PR_STEP_BACK_SIBLING_PREFIX_TEXT
+        + f"{entry.coder_round} (a step-back turn after {reviewer} blocked consecutive rounds "
         f"on `{entry.path}` lines {entry.start}-{entry.end}), and {reviewer} still raised a "
         f"new sibling finding in round {sibling_round}: {sibling_text}. Cluster mapping: "
         f"{mapped}. No further coder turn was invoked. Coder generalization (excerpt): "
@@ -2916,6 +2922,12 @@ def _clean_decision_text(text: str) -> str:
     return text
 
 
+# First-line fragments of the PR non-convergence human-decision stop (#1640);
+# history export recognizes ``LEAD <reviewer> MARK <k> consecutive coder turns``.
+PR_NON_CONVERGENCE_DECISION_LEAD = "human decision required: "
+PR_NON_CONVERGENCE_DECISION_MARK = " kept the same item(s) blocking across "
+
+
 def render_pr_non_convergence_decision(
     pr_number: int,
     result: PrNonConvergence,
@@ -2939,8 +2951,11 @@ def render_pr_non_convergence_decision(
         else ""
     )
     return (
-        f"PR #{pr_number}: human decision required: {result.reviewer} kept the same "
-        f"item(s) blocking across {result.k} consecutive coder turns that each changed the "
+        f"PR #{pr_number}: "
+        + PR_NON_CONVERGENCE_DECISION_LEAD
+        + result.reviewer
+        + PR_NON_CONVERGENCE_DECISION_MARK
+        + f"{result.k} consecutive coder turns that each changed the "
         f"head (reviews at rounds {result.first_round}-{result.trigger_round}, current head "
         f"`{result.current_head}`), so the fix loop is not converging. No further coder "
         "turn was invoked.\n"

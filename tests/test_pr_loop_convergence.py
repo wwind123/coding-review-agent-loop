@@ -184,14 +184,14 @@ def test_disabling_the_pr_step_back_restores_the_ordinary_prompt(tmp_path):
     assert all("Enumerate ALL remaining" not in p for p in _sb_codex_prompts(runner))
 
 
-def _run_to_sibling(tmp_path, sibling, **runner_kwargs):
+def _run_to_sibling(tmp_path, sibling, *, config=None, **runner_kwargs):
     runner = _StepBackRunner(
         claude_outputs=_step_back_coders(),
         codex_outputs=[*_three_clustered_blocks(), _sb_review([sibling], resolved=["item-3"])],
         **runner_kwargs,
     )
     with pytest.raises(HumanDecisionRequiredError) as excinfo:
-        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
+        run_pr_loop(runner, pr_number=77, config=config or _sb_config(tmp_path))
     return runner, str(excinfo.value)
 
 
@@ -1916,3 +1916,278 @@ def test_disabled_step_back_never_stops_on_an_approach_alternative_summary(tmp_p
     )
     config = _sb_config(tmp_path, pr_step_back_rounds=0)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
+
+
+# --- Durable PR human-decision diagnostics (#1640) ---------------------------
+
+
+_DIAGNOSTIC_LEAD = "PR review scheduling diagnostic ("
+
+
+def _hd_diagnostics(runner):
+    return [
+        comment["body"] for comment in runner.pr_payload.get("comments", [])
+        if comment["body"].startswith(_DIAGNOSTIC_LEAD)
+    ]
+
+
+def _assert_one_hd_diagnostic(runner, message, *, label, reason):
+    from coding_review_agent_loop.history_export import (
+        KIND_HUMAN_DECISION_STOP,
+        recognize_diagnostic,
+    )
+    from coding_review_agent_loop.round_transport import ROUND_RESUME_MARKER_RE
+
+    diagnostics = _hd_diagnostics(runner)
+    assert diagnostics == [pr_loop.render_pr_human_decision_diagnostic(label, message)]
+    assert not ROUND_RESUME_MARKER_RE.search(diagnostics[0])  # audit text, never state
+    recognized = recognize_diagnostic(diagnostics[0])
+    assert recognized is not None
+    assert (recognized.kind, recognized.reason, recognized.terminal) == (
+        KIND_HUMAN_DECISION_STOP, reason, True,
+    )
+    return diagnostics[0]
+
+
+def test_a_sibling_escalation_posts_one_bounded_scheduling_diagnostic(tmp_path):
+    """`sibling-stop-posts`."""
+    runner, message = _run_to_sibling(tmp_path, "another branch at src/spool.py:134")
+    _assert_one_hd_diagnostic(runner, message, label="round 4", reason="pr-step-back-sibling")
+    assert len(_sb_coder_prompts(runner)) == 3  # no coder turn after the stop
+
+
+def test_an_immediate_non_convergence_stop_posts_one_scheduling_diagnostic(tmp_path):
+    """`nonconv-immediate-posts`."""
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    config = _sb_config(tmp_path)
+    message = _nc_stop(runner, config)
+    _assert_one_hd_diagnostic(runner, message, label="round 4", reason="pr-non-convergence")
+    assert len(_sb_coder_prompts(runner)) == 3
+    # The plain diagnostic never breaks round-record decoding on a rerun.
+    assert _nc_stop(runner, config) == message
+    assert len(_hd_diagnostics(runner)) == 2  # one per invocation stop
+
+
+def test_a_live_approach_alternative_stop_posts_one_scheduling_diagnostic(tmp_path):
+    """`approach-live-order` (non-managed path)."""
+    runner = _StepBackRunner(
+        claude_outputs=_approach_alternative_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
+    _assert_one_hd_diagnostic(
+        runner, str(excinfo.value), label="round 3",
+        reason="pr-step-back-approach-alternative",
+    )
+    assert len(_sb_codex_prompts(runner)) == 3
+
+
+def test_a_resumed_approach_alternative_stop_posts_a_new_diagnostic_from_round_records(tmp_path):
+    """`approach-resume-posts`: an earlier diagnostic is on the thread; the rerun
+    re-derives the stop from round records and posts one more."""
+    from coding_review_agent_loop.history_export import recognize_diagnostic
+
+    runner = _StepBackRunner(
+        claude_outputs=_approach_alternative_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+    config = _sb_config(tmp_path)
+    with pytest.raises(HumanDecisionRequiredError) as live:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len(_hd_diagnostics(runner)) == 1
+    reviews_before = len(_sb_codex_prompts(runner))
+    with pytest.raises(HumanDecisionRequiredError) as resumed:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert str(resumed.value) == str(live.value)
+    diagnostics = _hd_diagnostics(runner)
+    assert len(diagnostics) == 2
+    assert recognize_diagnostic(diagnostics[1]).reason == "pr-step-back-approach-alternative"
+    assert len(_sb_codex_prompts(runner)) == reviews_before  # no reviewer invocation
+    assert len(_sb_coder_prompts(runner)) == 3
+    assert _nc_records(runner, config)  # records still decode around the diagnostics
+
+
+class _ProxyTempfile:
+    """``tempfile`` stand-in whose handle fails to write the diagnostic body."""
+
+    def __init__(self, real, *, fail_on):
+        self._real = real
+        self._fail_on = fail_on
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def NamedTemporaryFile(self, *args, **kwargs):  # noqa: N802 - mirrors tempfile
+        inner = self._real.NamedTemporaryFile(*args, **kwargs)
+        fail_on = self._fail_on
+
+        class _Handle:
+            name = inner.name
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return inner.__exit__(*exc)
+
+            def write(self, text):
+                if text.startswith(fail_on):
+                    raise OSError(28, "No space left on device")
+                return inner.write(text)
+
+        return _Handle()
+
+
+def _failing_diagnostic_post(error):
+    """``post_pr_comment`` that fails only for the human-decision diagnostic."""
+    real_post = pr_loop.post_pr_comment
+
+    def post(runner, *, config, pr_number, body, **kwargs):
+        if isinstance(body, str) and body.startswith(_DIAGNOSTIC_LEAD):
+            raise error
+        return real_post(runner, config=config, pr_number=pr_number, body=body, **kwargs)
+
+    return post
+
+
+def _capture_step_back_decision_error(monkeypatch):
+    raised = []
+    original = pr_loop._pr_step_back_decision
+
+    def spy(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except HumanDecisionRequiredError as exc:
+            raised.append(exc)
+            raise
+
+    monkeypatch.setattr(pr_loop, "_pr_step_back_decision", spy)
+    return raised
+
+
+@pytest.mark.parametrize("failure", ["github", "transport-overflow", "temp-file"])
+def test_a_failed_diagnostic_post_keeps_the_original_human_decision_stop(
+    tmp_path, monkeypatch, capsys, failure
+):
+    """`post-failure-exit4`: the original exception object propagates unchanged."""
+    import tempfile
+
+    import coding_review_agent_loop.github as github_module
+    from coding_review_agent_loop.round_transport import RoundCommentOverflowError
+
+    reference_runner, reference = _run_to_sibling(
+        tmp_path / "reference", "another branch at src/spool.py:134"
+    )
+    raised = _capture_step_back_decision_error(monkeypatch)
+    if failure == "temp-file":
+        monkeypatch.setattr(
+            github_module, "tempfile", _ProxyTempfile(tempfile, fail_on=_DIAGNOSTIC_LEAD)
+        )
+    else:
+        error = (
+            AgentLoopError("gh pr comment failed: HTTP 502")
+            if failure == "github"
+            else RoundCommentOverflowError("GitHub comment body exceeds 60000 characters")
+        )
+        monkeypatch.setattr(pr_loop, "post_pr_comment", _failing_diagnostic_post(error))
+    runner, message = _run_to_sibling(
+        tmp_path / "failing", "another branch at src/spool.py:134",
+        config=_sb_config(tmp_path / "failing", quiet=False),
+    )
+    assert message == reference
+    assert raised and isinstance(raised[-1], HumanDecisionRequiredError)
+    assert len(_hd_diagnostics(runner)) == 0
+    assert len(_sb_coder_prompts(runner)) == 3
+    assert "could not post the human-decision diagnostic" in capsys.readouterr().err
+    assert len(_hd_diagnostics(reference_runner)) == 1
+
+
+def test_a_failed_post_reraises_the_same_exception_object(tmp_path, monkeypatch):
+    """`post-failure-exit4`: identity, not only an equal message."""
+    raised = _capture_step_back_decision_error(monkeypatch)
+
+    monkeypatch.setattr(
+        pr_loop, "post_pr_comment", _failing_diagnostic_post(OSError(5, "Input/output error"))
+    )
+    runner = _StepBackRunner(
+        claude_outputs=_step_back_coders(),
+        codex_outputs=[
+            *_three_clustered_blocks(),
+            _sb_review(["another branch at src/spool.py:134"], resolved=["item-3"]),
+        ],
+    )
+    with pytest.raises(HumanDecisionRequiredError) as excinfo:
+        run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
+    assert excinfo.value is raised[-1]
+
+
+def test_the_cli_keeps_exit_four_when_the_diagnostic_post_fails(tmp_path, monkeypatch, capsys):
+    """`post-failure-exit4`: exit code and CLI text are unchanged."""
+    import coding_review_agent_loop.cli as cli_module
+
+    monkeypatch.setattr(
+        pr_loop, "post_pr_comment",
+        _failing_diagnostic_post(AgentLoopError("gh pr comment failed: HTTP 502")),
+    )
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    config = _sb_config(tmp_path)
+
+    def drive_the_fixture(*_args, **_kwargs):
+        return run_pr_loop(runner, pr_number=77, config=config)
+
+    with patch.object(cli_module, "run_pr_loop", side_effect=drive_the_fixture):
+        assert cli_module.main(["pr", "77", "--repo", "OWNER/REPO"]) == 4
+    stderr = capsys.readouterr().err
+    assert "HUMAN DECISION REQUIRED" in stderr
+    assert "not converging" in stderr and "--pr-non-convergence-rounds 0" in stderr
+
+
+def test_an_oversized_non_convergence_stop_posts_a_bounded_diagnostic(tmp_path, monkeypatch):
+    """`oversize-diagnostic-bounded`: through the real post and transport path."""
+    import coding_review_agent_loop.review_step_back as step_back_module
+    from coding_review_agent_loop.history_export import recognize_diagnostic
+    from coding_review_agent_loop.round_transport import MAX_GITHUB_BODY_CHARS
+
+    real_render = step_back_module.render_pr_non_convergence_decision
+    extra = "\n".join(
+        f"- [item-{n}] (attempts: 3) " + "persisting detail " * 12 for n in range(3, 400)
+    )
+
+    def many_items(*args, **kwargs):
+        rendered = real_render(*args, **kwargs)
+        head, sep, tail = rendered.partition("\nDiff growth")
+        return head + "\n" + extra + sep + tail
+
+    monkeypatch.setattr(step_back_module, "render_pr_non_convergence_decision", many_items)
+    runner = _NonConvergenceRunner(claude_outputs=_nc_coders(), codex_outputs=_nc_reviews())
+    message = _nc_stop(runner, _sb_config(tmp_path))
+    assert len(pr_loop.render_pr_scheduling_diagnostic("round 4", message)) > MAX_GITHUB_BODY_CHARS
+    assert message.endswith("blocking finding.")  # the exception text is never bounded
+    (posted,) = _hd_diagnostics(runner)
+    assert posted == pr_loop.render_pr_human_decision_diagnostic("round 4", message)
+    assert len(posted) <= pr_loop.PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT
+    first_line = message.split("\n", 1)[0]
+    assert posted.startswith(pr_loop.render_pr_scheduling_diagnostic("round 4", first_line + "\n"))
+    assert posted.endswith("the full text is in the CLI output of this run)")
+    assert recognize_diagnostic(posted).reason == "pr-non-convergence"
+
+
+def test_disabled_gates_post_no_human_decision_diagnostic(tmp_path):
+    """`gate-disabled-silent`."""
+    runner = _NonConvergenceRunner(
+        claude_outputs=_nc_coders(4),
+        codex_outputs=[*_nc_reviews(), _sb_review(resolved=["item-1", "item-2"])],
+    )
+    assert run_pr_loop(
+        runner, pr_number=77, config=_sb_config(tmp_path, pr_non_convergence_rounds=0)
+    ) == 0
+    assert _hd_diagnostics(runner) == []
+    runner = _StepBackRunner(
+        claude_outputs=_approach_alternative_coders(),
+        codex_outputs=[*_three_clustered_blocks(), _sb_review(resolved=["item-3"])],
+    )
+    assert run_pr_loop(
+        runner, pr_number=77, config=_sb_config(tmp_path / "sb", pr_step_back_rounds=0)
+    ) == 0
+    assert _hd_diagnostics(runner) == []

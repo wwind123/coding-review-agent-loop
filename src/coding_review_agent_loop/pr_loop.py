@@ -13,6 +13,7 @@ import sys
 import time
 from collections.abc import Callable, Collection, Sequence
 from dataclasses import replace as dataclasses_replace
+from typing import NoReturn
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
 from .workdir_claims import claimed_run
@@ -527,6 +528,46 @@ PR_SCHEDULING_DIAGNOSTIC_TEMPLATE = "PR review scheduling diagnostic ({label}): 
 def render_pr_scheduling_diagnostic(label: str, message: str) -> str:
     """The exact body ``stop_pre_panel`` posts."""
     return PR_SCHEDULING_DIAGNOSTIC_TEMPLATE.format(label=label, message=message)
+
+
+# Public size bound for a posted PR human-decision diagnostic (#1640): well
+# under the transport's plain-body limit, so carrier neutralization and host
+# footers cannot push it into RoundCommentOverflowError.
+PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT = 40_000
+
+
+def _pr_human_decision_omission_note(omitted: int) -> str:
+    return (
+        f"… ({omitted} characters of detail omitted from this diagnostic; the full text is "
+        "in the CLI output of this run)"
+    )
+
+
+def render_pr_human_decision_diagnostic(label: str, message: str) -> str:
+    """The PR scheduling diagnostic for a human-decision stop, bounded in size.
+
+    Within :data:`PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT` this is exactly
+    :func:`render_pr_scheduling_diagnostic`.  Otherwise the template, the first
+    line and as many following whole lines as fit are kept verbatim, then an
+    omission note.  The raised exception and the CLI text are never bounded.
+    """
+    full = render_pr_scheduling_diagnostic(label, message)
+    if len(full) <= PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT:
+        return full
+    prefix = render_pr_scheduling_diagnostic(label, "")
+    # The note's digit count can only shrink from this upper bound.
+    reserve = len("\n" + _pr_human_decision_omission_note(len(message)))
+    budget = max(PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT - len(prefix) - reserve, 0)
+    first, *rest = message.split("\n")
+    if len(first) > budget:
+        kept = first[:budget]
+    else:
+        kept = first
+        for line in rest:
+            if len(kept) + 1 + len(line) > budget:
+                break
+            kept += "\n" + line
+    return prefix + kept + "\n" + _pr_human_decision_omission_note(len(message) - len(kept))
 
 
 def _classify_pr_reviewer_prelaunch(
@@ -2538,6 +2579,32 @@ def run_pr_loop(
             )
             raise PrePanelSafetyError(message)
 
+        def stop_for_human_decision(
+            exc: HumanDecisionRequiredError, *, round_number: int
+        ) -> NoReturn:
+            """Post a best-effort PR scheduling diagnostic, then re-raise ``exc`` (#1640).
+
+            Plain audit text only, never state: resume re-derives these stops
+            from round records.  A failed post never changes the stop or exit 4.
+            """
+            message = str(exc)
+            log(config, f"Round {round_number}: {message}")
+            try:
+                post_pr_comment(
+                    runner,
+                    config=config,
+                    pr_number=pr_number,
+                    body=render_pr_human_decision_diagnostic(f"round {round_number}", message),
+                )
+            except (AgentLoopError, OSError) as post_error:
+                log(
+                    config,
+                    "Warning: could not post the human-decision diagnostic to "
+                    f"PR #{pr_number} ({type(post_error).__name__}: {post_error}); "
+                    "the stop stands.",
+                )
+            raise exc
+
         # A scheduler contract written by an earlier run is immutable. Missing
         # legacy scheduler fields intentionally mean "use the full board".
         try:
@@ -3437,12 +3504,15 @@ def run_pr_loop(
                     approach_records = _extract_round_metadata_records(pr_comments, flow="pr")
                 except AgentLoopError:
                     approach_records = ()
-                _pr_step_back_approach_alternative_stop(
-                    config,
-                    pr_number=pr_number,
-                    records=approach_records,
-                    head_sha=pr_metadata.head_sha,
-                )
+                try:
+                    _pr_step_back_approach_alternative_stop(
+                        config,
+                        pr_number=pr_number,
+                        records=approach_records,
+                        head_sha=pr_metadata.head_sha,
+                    )
+                except HumanDecisionRequiredError as exc:
+                    stop_for_human_decision(exc, round_number=round_number)
             pr_posted_checkpoint: PostedRoundMetadata | None = None
             # A review round is a fresh acquisition boundary. Rebind the
             # candidate/base pair before constructing any reviewer prompt so
@@ -8857,17 +8927,20 @@ def run_pr_loop(
             # K code-changing coder turns (#1372), stops for a human decision
             # here, before the round-limit exit and any coder invocation; K clustered blocks otherwise
             # turn this follow-up into one generalize-the-class step-back turn.
-            step_back_decision = _pr_step_back_decision(
-                runner,
-                config,
-                pr_number=pr_number,
-                round_number=round_number,
-                snapshot_comments=pr_comments,
-                tracked=_pr_step_back_tracked_reviewers(config, configured_reviewers),
-                head_sha=pr_metadata.head_sha,
-                base_branch=pr_metadata.base_branch or config.base,
-                approved_plan_context=approved_plan_context,
-            )
+            try:
+                step_back_decision = _pr_step_back_decision(
+                    runner,
+                    config,
+                    pr_number=pr_number,
+                    round_number=round_number,
+                    snapshot_comments=pr_comments,
+                    tracked=_pr_step_back_tracked_reviewers(config, configured_reviewers),
+                    head_sha=pr_metadata.head_sha,
+                    base_branch=pr_metadata.base_branch or config.base,
+                    approved_plan_context=approved_plan_context,
+                )
+            except HumanDecisionRequiredError as exc:
+                stop_for_human_decision(exc, round_number=round_number)
             # A deferred non-convergence stop (#1372) waits for the evidence-stall
             # decision below; on paths where that decision is not evaluated (the
             # final allowed round, a merge-conflict round) it stops here instead.
@@ -8876,7 +8949,10 @@ def run_pr_loop(
                 round_number == allowed_rounds
                 or any(item.item_id == MERGE_CONFLICT_ITEM_ID for item in unresolved_items)
             ):
-                raise HumanDecisionRequiredError(deferred_non_convergence)
+                stop_for_human_decision(
+                    HumanDecisionRequiredError(deferred_non_convergence),
+                    round_number=round_number,
+                )
             if round_number == allowed_rounds:
                 raise AgentLoopError(
                     _round_limit_diagnostic(
@@ -9026,7 +9102,10 @@ def run_pr_loop(
             if deferred_non_convergence:
                 # The evidence stall did not stop at this dispatch, so it cannot own
                 # the window: the non-convergence stop fires before any coder turn.
-                raise HumanDecisionRequiredError(deferred_non_convergence)
+                stop_for_human_decision(
+                    HumanDecisionRequiredError(deferred_non_convergence),
+                    round_number=round_number,
+                )
             stall_context = (
                 _coder_infrastructure_stall_notice(pr_checks.infrastructure_stalls)
                 if pr_checks is not None and is_wholly_infrastructure_blocked(pr_checks)
@@ -9832,14 +9911,17 @@ def run_pr_loop(
                 # After the coder record and the managed-CI continuity grant, so
                 # a resume activates managed CI for this head before its
                 # round-start stop (#1628).
-                _pr_step_back_approach_alternative_stop(
-                    config,
-                    pr_number=pr_number,
-                    records=(
-                        PostedRoundRecord(index=0, metadata=latest_coder_metadata, body=""),
-                    ),
-                    head_sha=updated_pr_context.metadata.head_sha,
-                )
+                try:
+                    _pr_step_back_approach_alternative_stop(
+                        config,
+                        pr_number=pr_number,
+                        records=(
+                            PostedRoundRecord(index=0, metadata=latest_coder_metadata, body=""),
+                        ),
+                        head_sha=updated_pr_context.metadata.head_sha,
+                    )
+                except HumanDecisionRequiredError as exc:
+                    stop_for_human_decision(exc, round_number=round_number)
             pending_step_back_sweeps = _pr_step_back_carried_entries(
                 step_back_entries,
                 coder_round=coder_record_round,
