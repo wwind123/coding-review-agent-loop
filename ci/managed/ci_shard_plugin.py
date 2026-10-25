@@ -4,6 +4,10 @@ Activated only by ``CI_SHARD_INDEX`` / ``CI_SHARD_COUNT`` (1-based index).
 ``CI_SHARD_MANIFEST`` names the manifest written for the aggregate verifier;
 ``CI_SHARD_STORE_DURATIONS`` (independent of sharding) records per-test
 setup+call+teardown seconds for refreshing a durations file.
+``CI_SHARD_STORE_DURATIONS_MODE`` selects how that file is written: ``replace``
+(the default) rewrites it with this session's timings only; ``add-missing``
+keeps every existing entry byte-for-byte and adds only test IDs it lacks, so a
+feature PR's refresh diff is limited to its new tests (#1660).
 ``CI_SHARD_DURATIONS`` names the optional, caller-owned durations file used to
 balance shards; without it the balance is deterministic and equal-weight.
 
@@ -49,8 +53,10 @@ SHARD_ENV_VARS = (
     "CI_SHARD_COUNT",
     "CI_SHARD_MANIFEST",
     "CI_SHARD_STORE_DURATIONS",
+    "CI_SHARD_STORE_DURATIONS_MODE",
     "CI_SHARD_DURATIONS",
 )
+STORE_MODES = ("replace", "add-missing")
 # A repository that loads this plugin through its own conftest (the stage-A
 # transition shim) may set a default durations file; ``CI_SHARD_DURATIONS``
 # always wins.
@@ -64,6 +70,7 @@ class ShardConfig:
     manifest: str | None
     store_durations: str | None
     durations: str | None = None
+    store_mode: str = "replace"
 
     @property
     def sharded(self) -> bool:
@@ -73,6 +80,7 @@ class ShardConfig:
 _CONFIG_KEY = pytest.StashKey[ShardConfig]()
 _FULL_KEY = pytest.StashKey[list]()
 _DURATIONS_KEY = pytest.StashKey[dict]()
+_EXISTING_KEY = pytest.StashKey[dict]()
 
 
 def parse_env(environ) -> ShardConfig:
@@ -90,12 +98,18 @@ def parse_env(environ) -> ShardConfig:
             ) from None
         if count < 1 or not 1 <= index <= count:
             raise pytest.UsageError(f"CI_SHARD_INDEX/CI_SHARD_COUNT: shard {index}/{count} is out of range")
+    store_mode = environ.get("CI_SHARD_STORE_DURATIONS_MODE") or "replace"
+    if store_mode not in STORE_MODES:
+        raise pytest.UsageError(
+            f"CI_SHARD_STORE_DURATIONS_MODE must be one of {', '.join(STORE_MODES)}: {store_mode!r}"
+        )
     return ShardConfig(
         index=index,
         count=count,
         manifest=environ.get("CI_SHARD_MANIFEST") or None,
         store_durations=environ.get("CI_SHARD_STORE_DURATIONS") or None,
         durations=environ.get("CI_SHARD_DURATIONS") or None,
+        store_mode=store_mode,
     )
 
 
@@ -161,6 +175,28 @@ def _load_durations(path=None) -> dict:
     return {k: v for k, v in data.items() if isinstance(v, (int, float))}
 
 
+def _read_existing_store(path: str) -> dict:
+    """Raw contents of an existing durations store for ``add-missing``; a missing file is empty.
+
+    A store that is not a JSON object fails closed before any test runs, so it
+    is never overwritten.
+    """
+    target = Path(path)
+    if not target.exists():
+        return {}
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise pytest.UsageError(
+            f"CI_SHARD_STORE_DURATIONS_MODE=add-missing: cannot read {path} as JSON: {exc}"
+        ) from None
+    if not isinstance(data, dict):
+        raise pytest.UsageError(
+            f"CI_SHARD_STORE_DURATIONS_MODE=add-missing: {path} is not a JSON object"
+        )
+    return data
+
+
 def _atomic_write(path: str, payload) -> None:
     target = Path(path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -190,7 +226,10 @@ def pytest_configure(config):
     config.stash[_CONFIG_KEY] = cfg
     config.stash[_DURATIONS_KEY] = {}
     config.stash[_FULL_KEY] = []
+    config.stash[_EXISTING_KEY] = {}
     if cfg.store_durations and _owns_durations(config):
+        if cfg.store_mode == "add-missing":
+            config.stash[_EXISTING_KEY] = _read_existing_store(cfg.store_durations)
         config.pluginmanager.register(_DurationRecorder(config), "ci-shard-durations")
 
 
@@ -237,5 +276,12 @@ class _DurationRecorder:
     def pytest_sessionfinish(self, session):
         cfg = self.config.stash[_CONFIG_KEY]
         durations = self.config.stash[_DURATIONS_KEY]
-        if durations:
-            _atomic_write(cfg.store_durations, {k: round(v, 4) for k, v in durations.items()})
+        if not durations:
+            return
+        if cfg.store_mode == "add-missing":
+            existing = self.config.stash[_EXISTING_KEY]
+            added = {k: round(v, 4) for k, v in durations.items() if k not in existing}
+            if added:
+                _atomic_write(cfg.store_durations, {**existing, **added})
+            return
+        _atomic_write(cfg.store_durations, {k: round(v, 4) for k, v in durations.items()})

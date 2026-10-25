@@ -219,6 +219,138 @@ def test_d(): pass
     assert data["test_suite.py::test_a"] >= 0.15
 
 
+
+# --------------------------------------------------------------------------
+# Durations store mode (#1660)
+# --------------------------------------------------------------------------
+
+STORE_SUITE = """
+def test_a(): pass
+def test_b(): pass
+def test_c(): pass
+"""
+STORE_IDS = {f"test_suite.py::test_{c}" for c in "abc"}
+
+
+def _seed_store(path):
+    seeded = {
+        "test_suite.py::test_a": 123.456,  # an existing test's sentinel timing
+        "stale::gone": 9.0,  # a test that no longer exists
+        "odd::non_numeric": "not-a-number",
+    }
+    path.write_text(json.dumps(seeded, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    return seeded
+
+
+@pytest.mark.parametrize("workers", [None, "2"])
+def test_add_missing_adds_only_absent_ids_and_keeps_existing_entries(pytester, shard_env, tmp_path, workers):
+    if workers:
+        pytest.importorskip("xdist")
+    pytester.makepyfile(test_suite=STORE_SUITE)
+    store = tmp_path / "store.json"
+    seeded = _seed_store(store)
+    shard_env(CI_SHARD_STORE_DURATIONS=store, CI_SHARD_STORE_DURATIONS_MODE="add-missing")
+    if workers:
+        result = pytester.runpytest_subprocess("-p", "ci_shard_plugin", "-n", workers, "-q")
+    else:
+        result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
+    assert result.ret == 0
+    data = json.loads(store.read_text())
+    assert set(data) == set(seeded) | STORE_IDS
+    for key, value in seeded.items():
+        assert data[key] == value
+    for key in STORE_IDS - set(seeded):
+        assert isinstance(data[key], float)
+    assert not list(tmp_path.glob("*.tmp*"))
+
+
+def test_add_missing_leaves_a_complete_store_byte_identical(pytester, shard_env, tmp_path):
+    pytester.makepyfile(test_suite=STORE_SUITE)
+    store = tmp_path / "store.json"
+    # Deliberately non-canonical formatting: a no-op must not even reformat it.
+    store.write_text('{"test_suite.py::test_c": 3, "test_suite.py::test_a": 1.5,\n"test_suite.py::test_b": 2}')
+    before = store.read_bytes()
+    shard_env(CI_SHARD_STORE_DURATIONS=store, CI_SHARD_STORE_DURATIONS_MODE="add-missing")
+    result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
+    assert result.ret == 0
+    assert store.read_bytes() == before
+
+
+def test_add_missing_creates_a_missing_store(pytester, shard_env, tmp_path):
+    pytester.makepyfile(test_suite=STORE_SUITE)
+    store = tmp_path / "new" / "store.json"
+    shard_env(CI_SHARD_STORE_DURATIONS=store, CI_SHARD_STORE_DURATIONS_MODE="add-missing")
+    result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
+    assert result.ret == 0
+    assert set(json.loads(store.read_text())) == STORE_IDS
+
+
+@pytest.mark.parametrize("content", ["{not json", "[1, 2]", '"text"'])
+def test_add_missing_fails_closed_on_a_malformed_store(pytester, shard_env, tmp_path, content):
+    pytester.makepyfile(test_suite=STORE_SUITE)
+    store = tmp_path / "store.json"
+    store.write_text(content)
+    before = store.read_bytes()
+    shard_env(CI_SHARD_STORE_DURATIONS=store, CI_SHARD_STORE_DURATIONS_MODE="add-missing")
+    result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(["*CI_SHARD_STORE_DURATIONS_MODE=add-missing*"])
+    assert "passed" not in result.stdout.str()
+    assert store.read_bytes() == before
+
+
+def test_invalid_store_mode_is_a_usage_error(pytester, shard_env, tmp_path):
+    pytester.makepyfile(test_suite=STORE_SUITE)
+    store = tmp_path / "store.json"
+    seeded = _seed_store(store)
+    shard_env(CI_SHARD_STORE_DURATIONS=store, CI_SHARD_STORE_DURATIONS_MODE="merge")
+    result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
+    assert result.ret == pytest.ExitCode.USAGE_ERROR
+    result.stderr.fnmatch_lines(["*CI_SHARD_STORE_DURATIONS_MODE*'merge'*"])
+    assert json.loads(store.read_text()) == seeded
+
+
+@pytest.mark.parametrize("mode", [None, "", "replace"])
+def test_replace_mode_still_rewrites_the_store_with_this_session_only(pytester, shard_env, tmp_path, mode):
+    pytester.makepyfile(test_suite=STORE_SUITE)
+    store = tmp_path / "store.json"
+    _seed_store(store)
+    shard_env(CI_SHARD_STORE_DURATIONS=store)
+    if mode is not None:
+        shard_env(CI_SHARD_STORE_DURATIONS_MODE=mode)
+    result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
+    assert result.ret == 0
+    data = json.loads(store.read_text())
+    assert set(data) == STORE_IDS
+    assert data["test_suite.py::test_a"] != 123.456
+
+
+@pytest.mark.parametrize(
+    "raw,expected", [(None, "replace"), ("", "replace"), ("replace", "replace"), ("add-missing", "add-missing")]
+)
+def test_parse_env_store_mode_values(raw, expected):
+    environ = {} if raw is None else {"CI_SHARD_STORE_DURATIONS_MODE": raw}
+    assert _ci_shard.parse_env(environ).store_mode == expected
+
+
+@pytest.mark.parametrize("raw", ["Add-Missing", "append", " replace"])
+def test_parse_env_rejects_unknown_store_modes(raw):
+    with pytest.raises(pytest.UsageError, match="CI_SHARD_STORE_DURATIONS_MODE"):
+        _ci_shard.parse_env({"CI_SHARD_STORE_DURATIONS_MODE": raw})
+
+
+def test_store_mode_variable_is_declared_and_stripped_from_shard_legs(monkeypatch):
+    import run_shard  # CALLEE_DIR is on sys.path (see the module header)
+
+    assert "CI_SHARD_STORE_DURATIONS_MODE" in _ci_shard.SHARD_ENV_VARS
+    assert run_shard.SHARD_ENV_VARS == _ci_shard.SHARD_ENV_VARS
+    base = {"PATH": "/bin", "CI_SHARD_STORE_DURATIONS": "x.json", "CI_SHARD_STORE_DURATIONS_MODE": "add-missing"}
+    for shards in (1, 3):
+        env = run_shard.compose(shards=shards, index=1, manifest="m.json", durations="", base_env=base)
+        assert "CI_SHARD_STORE_DURATIONS_MODE" not in env
+        assert "CI_SHARD_STORE_DURATIONS" not in env
+    # The nested-session test below proves the autouse scrub with the variable set.
+
 OUTER_CONFTEST = """
 pytest_plugins = ["pytester"]
 """
@@ -234,6 +366,7 @@ def test_nested_sessions(pytester, monkeypatch):
     durations = Path(os.environ["OUTER_DURATIONS"])
     before = manifest.read_bytes()
     seeded = durations.read_bytes()
+    assert "CI_SHARD_STORE_DURATIONS_MODE" not in os.environ
     pytester.makepyfile(test_inner=\"\"\"
 def test_1(): pass
 def test_2(): pass
@@ -277,7 +410,7 @@ def test_nested_sessions_cannot_clobber_outer_sharded_outputs(pytester, shard_en
     # Count 1 keeps every outer test (including the nested-launching one) in this shard.
     shard_env(
         CI_SHARD_INDEX=1, CI_SHARD_COUNT=1, CI_SHARD_MANIFEST=outer_manifest,
-        CI_SHARD_STORE_DURATIONS=outer_durations, OUTER_MANIFEST=outer_manifest, OUTER_DURATIONS=outer_durations,
+        CI_SHARD_STORE_DURATIONS=outer_durations, CI_SHARD_STORE_DURATIONS_MODE="replace", OUTER_MANIFEST=outer_manifest, OUTER_DURATIONS=outer_durations,
         PRIVATE_DIR=private,
     )
     args = ["-p", "ci_shard_plugin", "-q"] + (["-n", workers] if workers else [])
@@ -690,7 +823,10 @@ def test_committed_durations_cover_most_of_the_real_collection(request):
     if len(full) < 1000:
         pytest.skip("only meaningful when the whole suite is collected")
     known = sum(1 for i in full if i in durations)
-    assert known / len(full) > 0.9, "refresh tests/.test_durations (see README)"
+    assert known / len(full) > 0.9, (
+        "add the missing tests/.test_durations entries with CI_SHARD_STORE_DURATIONS_MODE=add-missing "
+        "(see README); a full refresh belongs in a dedicated maintenance PR"
+    )
 
 
 def test_callee_files_depend_only_on_the_standard_library_and_pytest():

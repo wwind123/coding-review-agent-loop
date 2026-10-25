@@ -862,6 +862,10 @@ def _coder_documentation_guidance() -> str:
     return (
         "If your implementation adds or changes a user-facing subcommand, flag, "
         "or mode, update README.md and any relevant docs/ files as part of this PR.\n"
+        "Do not regenerate repository-wide generated data such as test-duration or "
+        "shard-balancing stores (for example `tests/.test_durations`) as part of a feature or "
+        "fix PR; leave full refreshes to a dedicated maintenance PR and, if a refresh is "
+        "unavoidable, limit it to entries for the tests you added.\n"
     )
 
 

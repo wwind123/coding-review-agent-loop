@@ -28,6 +28,7 @@ SHARD_ENV_VARS = (
     "CI_SHARD_COUNT",
     "CI_SHARD_MANIFEST",
     "CI_SHARD_STORE_DURATIONS",
+    "CI_SHARD_STORE_DURATIONS_MODE",
     "CI_SHARD_DURATIONS",
 )
 _PYTEST_COMMAND = re.compile(r"(?:^|[\s/;&|])pytest(?:\s|$)|-m\s+pytest(?:\s|$)")
