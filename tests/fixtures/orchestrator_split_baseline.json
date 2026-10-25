@@ -1,5 +1,6 @@
 {
  "modules": [
+  "agent_executable",
   "agent_permissions",
   "agents",
   "agents.antigravity",
