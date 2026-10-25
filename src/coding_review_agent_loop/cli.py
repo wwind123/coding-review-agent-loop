@@ -2229,6 +2229,23 @@ _NO_RECORD_OUTCOMES = frozenset(
 )
 
 
+def _announce_no_test_reason(result) -> None:
+    """Print why a broker refusal ran no test, next to its receipt line (#1653).
+
+    Streamed broker output can be lost or interleaved; this line is the one
+    place every no-record outcome is explained on the client's own stderr.
+    """
+    outcome = str(getattr(result, "outcome", ""))
+    if outcome not in _NO_RECORD_OUTCOMES:
+        return
+    reason = str(getattr(result, "diagnostic", "") or "").strip()
+    if not reason:
+        reason = str(getattr(result, "output_tail", "") or "").strip()
+    if not reason:
+        reason = "the broker gave no reason"
+    print(f"agent-loop: no test ran ({outcome}): {reason}", file=sys.stderr, flush=True)
+
+
 FIXTURE_NOT_DISPATCHED_MESSAGE = (
     "agent-loop: --fixture requires the test broker; nothing was run (not evidence)"
 )
@@ -2283,6 +2300,7 @@ def _run_fixture_tests(
         print(f"agent-loop test execution_ref: {result.execution_ref}", file=sys.stderr, flush=True)
     if result.receipt_id:
         print(f"agent-loop test observation receipt: {result.receipt_id}", file=sys.stderr, flush=True)
+    _announce_no_test_reason(result)
     record = dict(result.fixture or {})
     print(
         "agent-loop fixture: setup={setup} teardown={teardown} cleanup={cleanup}".format(
@@ -2431,6 +2449,7 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                     flush=True,
                 )
+                _announce_no_test_reason(broker_result)
                 if broker_result.outcome == "timed_out":
                     print(timeout_advisory(chosen, policy), file=sys.stderr, flush=True)
                 if _broker_frame_is_pre_collection(broker_result):

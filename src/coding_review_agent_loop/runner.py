@@ -8,6 +8,7 @@ import os
 import re
 import select
 import secrets
+import signal
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,7 @@ from .test_workers import (
     host_wait_seconds,
     ENV_WORKER_RESERVATION,
     host_capacity,
+    process_group_alive,
     terminate_process_group_descendants,
     worker_budget_busy_message,
     worker_lane_identity,
@@ -527,6 +529,7 @@ def _run_foreground_test_body(
     host_wait_heartbeat: Callable[[], None] | None = None,
     host_wait_notify: Callable[[str], None] | None = None,
     host_launch_guard: Callable[[], Any] | None = None,
+    lock_holder_describer: Callable[[], str | None] | None = None,
     package_script: Any = _UNRESOLVED_PACKAGE_SCRIPT,
     classify_pre_collection: bool = False,
     absolute_deadline: float | None = None,
@@ -564,6 +567,12 @@ def _run_foreground_test_body(
     returns a decision whose ``proceed`` is false to skip the target.  With a
     hook the launcher probe bypasses the per-invocation cache and the launcher
     identity is re-read immediately before the guarded spawn.
+
+    ``lock_holder_describer`` (issue #1653) names the live holder of a lock
+    this command was refused for; the broker passes it.  Every refusal goes
+    through ``notify`` so a broker client sees it in its own output.  When
+    ``host_wait_cancel`` is set after launch, the target's whole process group
+    is confirmed gone before the command lane is released.
     """
     requested_cmd = [str(value) for value in args]
     cmd = list(requested_cmd)
@@ -666,11 +675,12 @@ def _run_foreground_test_body(
             handle.close()
         if decision is not None:
             decision.cleanup()
-        print(OVERLAP_REJECTED_MESSAGE, file=sys.stderr, flush=True)
+        message = refusal_with_holder(OVERLAP_REJECTED_MESSAGE, lock_holder_describer)
+        notify(message)
         return ForegroundTestResult(
             cmd, cwd, "overlap-rejected", OVERLAP_REJECTED_EXIT_CODE,
-            0.0, timeout_seconds, OVERLAP_REJECTED_MESSAGE, None, True,
-            wrapper_bootstrap, "not-attempted", "not-started", OVERLAP_REJECTED_MESSAGE,
+            0.0, timeout_seconds, message, None, True,
+            wrapper_bootstrap, "not-attempted", "not-started", message,
             health_provenance,
         )
     if classify_pre_collection and package_script is None:
@@ -697,7 +707,9 @@ def _run_foreground_test_body(
                 handle.close()
             if decision is not None:
                 decision.cleanup()
-            message = worker_budget_busy_message(worker_budget, lock_problem)
+            message = refusal_with_holder(
+                worker_budget_busy_message(worker_budget, lock_problem), lock_holder_describer,
+            )
             notify(message)
             return ForegroundTestResult(
                 cmd, cwd, "worker-budget-busy", WORKER_BUDGET_BUSY_EXIT_CODE,
@@ -705,6 +717,17 @@ def _run_foreground_test_body(
                 wrapper_bootstrap, "not-attempted", "not-started", message,
                 health_provenance,
             )
+        if host_wait_cancel is not None and host_wait_cancel.is_set():
+            # Issue #1653: the client was lost (or the broker stopped) while
+            # this command took its locks; nothing launches.
+            tel.set_outcome("cancelled")
+            worker_lock.close()
+            lane_lock.close()
+            if handle is not None:
+                handle.close()
+            if decision is not None:
+                decision.cleanup()
+            return _cancelled_result(cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance)
         if host_sharing_enabled(invocation_values):
             # Issue #987/#1108: other loops on this host share one worker pool.
             # The run asks for its full budget and waits (bounded) for it; on
@@ -830,6 +853,12 @@ def _run_foreground_test_body(
     probe_setup = None
     launch_source = cmd
     try:
+        if host_wait_cancel is not None and host_wait_cancel.is_set():
+            if handle is not None:
+                handle.close()
+            lane_lock.close()
+            tel.set_outcome("cancelled")
+            return _cancelled_result(cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance)
         if post_admission_setup is not None:
             setup_decision = post_admission_setup(
                 absolute_deadline if absolute_deadline is not None else started + timeout_seconds
@@ -1291,6 +1320,7 @@ def _run_foreground_test_body(
             watchdog_deadline, absolute_deadline - DEADLINE_TERMINATION_ALLOWANCE_SECONDS,
         )
     post_termination_deadline: float | None = None
+    cancelled_while_running = False
     try:
         # A selector keeps output flowing to the terminal while allowing the
         # monotonic watchdog to fire even when the child is quiet.
@@ -1304,7 +1334,21 @@ def _run_foreground_test_body(
                 handle.refresh_report()
                 last_cgroup.update(sample_cgroup(handle.cgroup_path, handle.capabilities))
             now = time.monotonic()
-            if proc.poll() is None and now >= watchdog_deadline:
+            if (
+                not cancelled_while_running
+                and host_wait_cancel is not None
+                and host_wait_cancel.is_set()
+                and proc.poll() is None
+            ):
+                # Issue #1653: the broker lost this request's client (or is
+                # stopping).  Stop the whole group as the watchdog would; the
+                # broker never reports the run as evidence.
+                cancelled_while_running = True
+                if handle is not None:
+                    handle.terminate()
+                terminate_process_group_fully(proc.pid, proc=proc)
+                post_termination_deadline = time.monotonic() + TEST_OUTPUT_DRAIN_GRACE_SECONDS
+            elif proc.poll() is None and now >= watchdog_deadline:
                 timed_out = True
                 # Once the watchdog fires, output draining must not extend the
                 # command beyond this absolute deadline.  This also covers a
@@ -1430,6 +1474,13 @@ def _run_foreground_test_body(
     worker_caveats: tuple[str, ...] = ()
     analysis = None
     try:
+        if host_wait_cancel is not None and host_wait_cancel.is_set():
+            # Issue #1653: a cancelled run's lane is released only once no
+            # member of its group survives (a descendant may ignore SIGTERM
+            # after its leader exited), so a retried identical command can
+            # never overlap the old one.
+            if not terminate_process_group_fully(proc.pid, proc=proc):
+                lane_lock.retain_worker_lock_until_group_exits(proc.pid)
         if worker_budget is not None and worker_budget.enforcing:
             # Descendants count against the worker ceiling until they are gone:
             # terminate the target's process group before releasing the lock.
@@ -1579,6 +1630,69 @@ class _HandshakeExpired(AgentLoopError):
 
 class _LauncherChangedBeforeRelease(AgentLoopError):
     """The authenticated launcher identity changed before the held release."""
+
+
+def refusal_with_holder(message: str, describer: Callable[[], str | None] | None) -> str:
+    """A no-test refusal with its next step and, when known, its holder (#1653)."""
+    holder = None
+    if describer is not None:
+        try:
+            holder = describer()
+        except Exception:  # noqa: BLE001 - a diagnostic never changes the refusal
+            holder = None
+    text = message
+    if holder:
+        text += f" Held by: {holder}."
+    return text + " Retrying immediately will be refused again while the holder runs."
+
+
+def terminate_process_group_fully(
+    pgid: int,
+    *,
+    proc: subprocess.Popen | None = None,
+    grace: float = TERMINATION_GRACE_SECONDS,
+    kill_wait: float = 10.0,
+) -> bool:
+    """SIGTERM the whole group, SIGKILL it after ``grace``; True once it is empty.
+
+    Unlike a leader-based sequence, the group is signalled and escalated even
+    when its leader already exited, since the group persists while any member
+    lives (issue #1653).  ``proc`` is only polled (never waited), so a broker
+    stop and a client-loss cancel may run this concurrently.
+    """
+
+    def gone() -> bool:
+        if proc is not None:
+            try:
+                proc.poll()
+            except Exception:  # noqa: BLE001 - polling only reaps a zombie leader
+                pass
+        return not process_group_alive(pgid)
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass
+    deadline = time.monotonic() + max(0.0, grace)
+    while time.monotonic() < deadline:
+        if gone():
+            return True
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass
+    deadline = time.monotonic() + max(0.05, kill_wait)
+    while True:
+        if gone():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
 
 
 def _terminate_process_group(proc: subprocess.Popen) -> None:

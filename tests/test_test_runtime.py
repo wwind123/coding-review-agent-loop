@@ -4786,7 +4786,8 @@ time.sleep(10)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process-group cleanup")
-def test_broker_owned_target_survives_a_client_kill_and_is_journaled_at_its_watchdog(tmp_path, monkeypatch):
+def test_broker_stops_a_killed_clients_target_and_journals_non_evidence(tmp_path, monkeypatch):
+    """Issue #1653: a killed client no longer leaves its target holding the lane."""
     from coding_review_agent_loop.containment import default_policy
     from coding_review_agent_loop.runner import Runner
 
@@ -4818,11 +4819,12 @@ def test_broker_owned_target_survives_a_client_kill_and_is_journaled_at_its_watc
     assert result.returncode == 0, log
     assert "NOTICE=agent-loop: notice: this command may run for up to" in log
     assert "CLIENT-RC=-9" in log
-    # The parent kept observing the broker-run target to its own watchdog.
+    # The broker saw the lost client and stopped the target's whole group.
     _assert_process_not_active(int(pid_file.read_text(encoding="utf-8")))
     observations = runner.local_test_observations()
-    assert [observation.outcome for observation in observations] == ["timed_out"], observations
-    assert observations[0].provenance == "parent-observed"
+    assert [observation.outcome for observation in observations] == ["incomplete"], observations
+    assert observations[0].provenance == "telemetry-unverified"
+    assert observations[0].caveats[0] == "run-tests client disconnected; target stopped by the broker"
 
 
 def test_client_suppresses_the_notice_for_a_covering_orchestrator_cap(tmp_path, monkeypatch, capsys):
@@ -5941,31 +5943,35 @@ def test_fixture_post_dispatch_response_loss_is_an_unknown_broker_owned_result(t
 
 
 @_FX_HOST
-def test_fixture_post_dispatch_disconnect_still_tears_down_and_journals(tmp_path):
+def test_fixture_post_dispatch_disconnect_is_cancelled_and_leaves_nothing_running(tmp_path):
+    """Issue #1653: a client lost right after dispatch cancels its fixture request.
+
+    Depending on timing the loss lands before the supervisor launch (nothing
+    launched, nothing journaled) or during setup (graceful teardown and a
+    non-evidence row); either way no fixture process survives.
+    """
     import socket as socket_module
 
     root, markers = _fx_repo(tmp_path)
     server = _fx_server(root)
     try:
-        raw = "0123456789abcdef0123456789abcdef"
-        nonce = raw + "." + hmac_new(server.capability, raw)
-        request = {
-            "turn_id": server.turn_id, "nonce": nonce, "argv": list(_FX_PYTEST), "timeout_seconds": 40,
-            "cwd": str(root), "environment": {k: v for k, v in os.environ.items() if not k.startswith("AGENT_LOOP_TEST_BROKER")},
-            "fixture": "fixture.py",
-        }
+        request = _fx_raw_request(server, root, _FX_PYTEST, timeout=40)
         with socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM) as connection:
             connection.connect(server.endpoint)
             fx_evidence._send_frame(connection, request)
         deadline = time.monotonic() + 60
-        while time.monotonic() < deadline and not [row for row in server.journal if row.fixture is not None]:
+        while time.monotonic() < deadline and (server._handler_threads or server._requests):
             time.sleep(0.1)
-        row = _fx_row(server)
+        assert not server._handler_threads
+        rows = [row for row in server.journal if row.fixture is not None]
     finally:
         server.stop()
     _fx_assert_gone(_fx_pids(markers))
-    assert (markers / "teardown-done").exists()
-    assert row.fixture.teardown_status == 0
+    if rows:
+        (row,) = rows
+        assert row.provenance == "telemetry-unverified"
+        assert fx_evidence.BROKER_CLIENT_LOST_CAVEAT in row.caveats
+        assert row.fixture.teardown_status == 0 and (markers / "teardown-done").exists()
 
 
 def hmac_new(capability: str, raw: str) -> str:
@@ -7049,7 +7055,10 @@ def _fx_raw_request(server, root, argv, *, timeout, fixture="fixture.py"):
     return {
         "turn_id": server.turn_id, "nonce": raw + "." + hmac_new(server.capability, raw),
         "argv": list(argv), "timeout_seconds": timeout, "cwd": str(root),
-        "environment": {k: v for k, v in os.environ.items() if not k.startswith("AGENT_LOOP_TEST_BROKER")},
+        "environment": {
+            **{k: v for k, v in os.environ.items() if not k.startswith("AGENT_LOOP_TEST_BROKER")},
+            fx_evidence.BROKER_CLIENT_ACKS_ENV: "1",
+        },
         "fixture": fixture,
     }
 
@@ -7122,11 +7131,14 @@ def test_fixture_non_reading_client_never_holds_the_run_past_its_deadline(tmp_pa
         server.stop()
     _fx_assert_gone(_fx_pids(markers))
     assert (markers / "inner-noisy").exists() and (markers / "teardown-done").exists()
-    assert row.outcome == "timed_out"
+    # Issue #1653: the non-reading client wedges a stream send and is lost,
+    # so its target is stopped and the row is non-evidence.
+    assert row.outcome == "incomplete" and row.provenance == "telemetry-unverified"
+    assert fx_evidence.BROKER_CLIENT_LOST_CAVEAT in row.caveats
     assert row.fixture.teardown_status == 0
     assert forced == []
     # Termination, teardown, the sweep and the after snapshot all finished
-    # by the 30 s request deadline plus snapshot overhead.
+    # well before the 30 s request deadline.
     assert journaled_after < 30 + 3.0, journaled_after
 
 
@@ -7464,3 +7476,237 @@ def test_fixture_worker_descendant_cleanup_keeps_the_teardown_reserve(tmp_path, 
     assert returned_at and returned_at[-1] <= inner_deadlines[0] + 0.05
     assert row.outcome == "timed_out" and result.outcome == "timed_out"
     assert row.fixture.teardown_status == 0
+
+
+
+# --- client-loss cancellation in the runner and fixture path (issue #1653) ----
+
+_RACE_GROUP_TARGET = (
+    "import os, pathlib, signal, sys, time\n"
+    "base = pathlib.Path(sys.argv[1])\n"
+    "if os.fork() == 0:\n"
+    "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "    (base / 'child.pid').write_text(str(os.getpid()))\n"
+    "    time.sleep(120)\n"
+    "    os._exit(0)\n"
+    "(base / 'leader.pid').write_text(str(os.getpid()))\n"
+    "time.sleep(120)\n"
+)
+
+
+def _race_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
+def test_overlap_refusal_is_streamed_through_the_output_callback_with_its_holder(tmp_path, capsys):
+    command = [sys.executable, "-c", "pass"]
+    env = {**os.environ, "AGENT_LOOP_INVOCATION_ID": "overlap-stream-1653"}
+    lock = runtime.acquire_command_lane(command, cwd=tmp_path, env=env)
+    assert lock is not None
+    streamed: list[str] = []
+    try:
+        result = run_foreground_test(
+            command, cwd=tmp_path, timeout_seconds=5, env=env, environment_is_complete=True,
+            output_callback=streamed.append, echo_output=False,
+            lock_holder_describer=lambda: "`pytest -q` (running, 3 s)",
+        )
+    finally:
+        lock.close()
+    assert result.outcome == "overlap-rejected"
+    assert result.returncode == runtime.OVERLAP_REJECTED_EXIT_CODE
+    text = "".join(streamed)
+    assert text.startswith(runtime.OVERLAP_REJECTED_MESSAGE)
+    assert "Held by: `pytest -q` (running, 3 s)." in text
+    assert "Retrying immediately will be refused again" in text
+    assert result.diagnostic == text.strip()
+    # Streamed to the requesting client, not only printed on the parent's stderr.
+    assert runtime.OVERLAP_REJECTED_MESSAGE not in capsys.readouterr().err
+
+
+def test_overlap_refusal_without_a_describer_keeps_the_local_stderr_text(tmp_path, capsys):
+    command = [sys.executable, "-c", "pass"]
+    env = {**os.environ, "AGENT_LOOP_INVOCATION_ID": "overlap-local-1653"}
+    lock = runtime.acquire_command_lane(command, cwd=tmp_path, env=env)
+    try:
+        result = run_foreground_test(
+            command, cwd=tmp_path, timeout_seconds=5, env=env, environment_is_complete=True,
+        )
+    finally:
+        lock.close()
+    err = capsys.readouterr().err
+    assert result.outcome == "overlap-rejected"
+    assert runtime.OVERLAP_REJECTED_MESSAGE in err and "Held by" not in err
+    assert "Retrying immediately will be refused again" in err
+
+
+def test_cancel_landing_at_the_guarded_launch_never_executes_the_target(tmp_path):
+    """Row disconnect-at-launch-race: the guarded check sees the cancel first."""
+    marker = tmp_path / "spawned"
+    cancel = threading.Event()
+
+    class WatcherWinsGuard:
+        def __enter__(self):
+            cancel.set()  # the client-loss watcher set the token under the lock
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    result = run_foreground_test(
+        [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"], cwd=tmp_path,
+        timeout_seconds=30, env=dict(os.environ), environment_is_complete=True, echo_output=False,
+        host_wait_cancel=cancel, host_launch_guard=lambda: WatcherWinsGuard(),
+    )
+    assert result.outcome == "cancelled" and result.inner_exec == "not-attempted"
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="process-group census via /proc")
+def test_cancel_after_the_guarded_launch_terminates_the_whole_registered_group(tmp_path):
+    """Row disconnect-at-launch-race: the launch lands first, so the group is stopped."""
+    base = tmp_path / "group"
+    base.mkdir()
+    cancel = threading.Event()
+    registered: list[object] = []
+
+    def started(proc):
+        registered.append(proc)
+
+        def watcher():
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and not (base / "child.pid").exists():
+                time.sleep(0.05)
+            cancel.set()
+
+        threading.Thread(target=watcher, daemon=True).start()
+
+    began = time.monotonic()
+    result = run_foreground_test(
+        [sys.executable, "-c", _RACE_GROUP_TARGET, str(base)], cwd=tmp_path, timeout_seconds=120,
+        env=dict(os.environ), environment_is_complete=True, echo_output=False,
+        host_wait_cancel=cancel, host_launch_guard=lambda: threading.Lock(), process_started=started,
+    )
+    assert registered and result.outcome != "passed" and result.inner_exec == "started"
+    assert time.monotonic() - began < 30
+    # The lane was released only after the TERM-ignoring child was gone too.
+    assert not _race_alive(int((base / "leader.pid").read_text()))
+    assert not _race_alive(int((base / "child.pid").read_text()))
+    relock = runtime.acquire_command_lane(
+        [sys.executable, "-c", _RACE_GROUP_TARGET, str(base)], cwd=tmp_path, env=dict(os.environ),
+    )
+    assert relock is not None
+    relock.close()
+
+
+def _fx_idle(server, timeout=60):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and (server._handler_threads or server._requests):
+        time.sleep(0.05)
+    return not server._handler_threads and not server._requests
+
+
+def _fx_live_retry(server, root):
+    result = fx_evidence.TestBrokerClient(_fx_env(server)).run(
+        list(_FX_PYTEST), timeout_seconds=40, cwd=root, fixture="fixture.py",
+    )
+    assert result.outcome not in {"overlap-rejected", "worker-budget-busy", "cancelled"}, result
+    return result
+
+
+@_FX_HOST
+def test_fixture_client_lost_before_the_supervisor_launch_launches_nothing(tmp_path, monkeypatch):
+    """Row fixture-loss-before-launch: the hook's guarded check reads the request token."""
+    import socket as socket_module
+
+    root, markers = _fx_repo(tmp_path)
+    launches: list[object] = []
+    real_launch = fx_runtime.FixtureSupervisor.launch.__func__
+
+    def counting_launch(cls, *args, **kwargs):
+        launches.append(args)
+        return real_launch(cls, *args, **kwargs)
+
+    monkeypatch.setattr(fx_runtime.FixtureSupervisor, "launch", classmethod(counting_launch))
+    entered = threading.Event()
+    real_hook = fx_evidence.TestBrokerServer._fixture_setup_hook
+
+    def wrapped(self, fixture_run, **kwargs):
+        hook = real_hook(self, fixture_run, **kwargs)
+        state = kwargs["state"]
+
+        def after_the_runner_check(deadline):
+            entered.set()  # the runner's own pre-hook cancel check has passed
+            assert state.cancel.wait(20)
+            return hook(deadline)
+
+        return after_the_runner_check
+
+    monkeypatch.setattr(fx_evidence.TestBrokerServer, "_fixture_setup_hook", wrapped)
+    server = _fx_server(root)
+    try:
+        client = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+        client.connect(server.endpoint)
+        fx_evidence._send_frame(client, _fx_raw_request(server, root, _FX_PYTEST, timeout=40))
+        assert entered.wait(30)
+        client.close()
+        assert _fx_idle(server)
+        assert launches == [] and server.journal == ()
+        assert not (markers / "setup-started").exists()
+        monkeypatch.setattr(fx_evidence.TestBrokerServer, "_fixture_setup_hook", real_hook)
+        _fx_live_retry(server, root)  # the lane is reusable
+        assert len(launches) == 1
+    finally:
+        server.stop()
+    _fx_assert_gone(_fx_pids(markers))
+
+
+@_FX_HOST
+def test_fixture_client_lost_during_setup_gets_teardown_and_a_non_evidence_row(tmp_path, monkeypatch):
+    """Rows fixture-loss-during-setup and disconnect-receipt-classification (fixture-folded)."""
+    import socket as socket_module
+
+    root, markers = _fx_repo(tmp_path, modes="setup-block")
+    teardowns: list[int] = []
+    real_request_teardown = fx_runtime.FixtureSupervisor.request_teardown
+
+    def spy_teardown(self):
+        teardowns.append(self.process.pid)
+        return real_request_teardown(self)
+
+    monkeypatch.setattr(fx_runtime.FixtureSupervisor, "request_teardown", spy_teardown)
+    server = _fx_server(root)
+    try:
+        client = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+        client.connect(server.endpoint)
+        fx_evidence._send_frame(client, _fx_raw_request(server, root, _FX_PYTEST, timeout=60))
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not (markers / "setup-blocking").exists():
+            time.sleep(0.05)
+        assert (markers / "setup-blocking").exists()
+        started = time.monotonic()
+        client.close()
+        assert _fx_idle(server)
+        assert time.monotonic() - started < 30  # not the remaining setup budget
+        row = _fx_row(server)
+        assert teardowns and (markers / "teardown-done").exists()
+        assert row.provenance == "telemetry-unverified" and row.outcome == "incomplete"
+        assert row.caveats[0] == fx_evidence.BROKER_CLIENT_LOST_CAVEAT
+        assert row.fixture.teardown_status == 0
+        evidence = fx_evidence.reconcile_test_observations(server.journal)
+        assert row.receipt_id not in evidence.authoritative_failures
+        (public,) = evidence.public_projection()["observations"]
+        assert public["receipt_id"] == row.receipt_id
+        assert fx_evidence.BROKER_CLIENT_LOST_CAVEAT in public["caveats"]
+        _fx_set_mode(root, "")
+        _fx_live_retry(server, root)  # the lane is reusable
+    finally:
+        server.stop()
+    _fx_assert_gone(_fx_pids(markers))

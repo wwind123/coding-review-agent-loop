@@ -773,13 +773,21 @@ def configured_interpreter_guidance(config: AgentLoopConfig):
         return None
 
 
+RUN_TESTS_DO_NOT_KILL_GUIDANCE = (
+    "Do not kill a waiting `agent-loop run-tests` client: while it waits for shared test "
+    "capacity it still holds this run's test lane, and a killed client only frees it once the "
+    "broker notices the lost connection."
+)
+
+
 def containment_prompt_guidance(config: AgentLoopConfig | None) -> str:
     """Explain the mechanical resource boundary without exposing protocol markers."""
     if config is None:
         return (
             "The managed test wrapper uses the configured agent-loop containment "
             "lane. Never relaunch an identical test command until its previous "
-            "managed attempt has exited or has been explicitly terminated.\n"
+            "managed attempt has exited or has been explicitly terminated. "
+            + RUN_TESTS_DO_NOT_KILL_GUIDANCE + "\n"
         )
     try:
         policy = config.containment_policy
@@ -797,7 +805,7 @@ def containment_prompt_guidance(config: AgentLoopConfig | None) -> str:
         "uses process-group TERM/KILL with deterministic cleanup but no memory ceiling. "
         "Never relaunch an identical test command until its previous managed attempt "
         "has exited or has been explicitly terminated; free-form agent logs cannot "
-        "deduplicate unwrapped commands.\n"
+        "deduplicate unwrapped commands. " + RUN_TESTS_DO_NOT_KILL_GUIDANCE + "\n"
     )
 
 

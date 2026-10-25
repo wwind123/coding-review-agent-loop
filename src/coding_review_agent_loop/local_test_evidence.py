@@ -2875,15 +2875,177 @@ def _send_frame(connection: socket.socket, payload: Mapping[str, object]) -> Non
 BROKER_STREAM_SEND_GRACE_SECONDS = 10.0
 BROKER_TERMINAL_SEND_GRACE_SECONDS = 2.0
 BROKER_SEND_CANCEL_POLL_SECONDS = 0.05
+# Issue #1653: request-lifetime client liveness.  A client announces that it
+# acknowledges heartbeats through this reserved environment entry (popped by
+# the broker like the tool-identity entries, so the request schema is
+# unchanged).  A client with no acknowledged progress for the timeout is lost.
+BROKER_CLIENT_ACKS_ENV = "AGENT_LOOP_BROKER_CLIENT_ACKS"
+BROKER_CLIENT_ACK_TIMEOUT_SECONDS = 30.0
+BROKER_ACK_FRAME_LIMIT = 256
+BROKER_MONITOR_POLL_SECONDS = 0.1
+BROKER_MONITOR_JOIN_SECONDS = 30.0
+BROKER_CLIENT_LOST_CAVEAT = "run-tests client disconnected; target stopped by the broker"
+BROKER_NO_TEST_OUTCOMES = frozenset(
+    {"overlap-rejected", "worker-budget-busy", "worker-budget-refused", "cancelled"}
+)
+BROKER_REFUSAL_DIAGNOSTIC_BYTES = 2048
 
 
-def _cancelled_frame() -> dict[str, object]:
+BROKER_CLIENT_LOST_DIAGNOSTIC = "test command cancelled before launch (its run-tests client was lost)"
+
+
+def _cancelled_frame(diagnostic: str = "test command cancelled before launch (the broker is stopping)") -> dict[str, object]:
     return {
         "type": "result", "receipt_id": "", "execution_ref": None, "outcome": "cancelled",
         "returncode": None, "elapsed_seconds": 0.0, "output_tail": "",
         "suite_start": "not-started",
-        "diagnostic": "test command cancelled before launch (the broker is stopping)",
+        "diagnostic": diagnostic,
     }
+
+
+def _legacy_client_reason(environment: Mapping[str, object]) -> str:
+    """The visible no-test reason for a client without ack support (#1653)."""
+    pinned = environment.get("AGENT_LOOP_EXECUTABLE")
+    named = (
+        _safe_text(pinned, 512) if isinstance(pinned, str) and pinned.strip()
+        else "$AGENT_LOOP_EXECUTABLE"
+    )
+    return (
+        "agent-loop: this run-tests client predates broker liveness acknowledgements; nothing "
+        f"was run. Re-run with this run's pinned agent-loop executable {named}."
+    )
+
+
+def _legacy_refusal_frame(reason: str) -> dict[str, object]:
+    """A terminal no-test frame an older client already treats as not run."""
+    return {
+        **_cancelled_frame(),
+        "returncode": 125,
+        "inner_exec": "not-attempted",
+        "diagnostic": _safe_text(reason, BROKER_REFUSAL_DIAGNOSTIC_BYTES),
+    }
+
+
+class _AckReader:
+    """Bounded, non-blocking reader of client heartbeat acknowledgements (#1653).
+
+    Only ``{"type": "ack"}`` frames may follow a request.  A partial frame is
+    buffered across polls; EOF, a reset or any other frame means the client
+    is lost.
+    """
+
+    def __init__(self, connection: socket.socket) -> None:
+        self._connection = connection
+        self._buffer = b""
+        self.reason = ""
+
+    def _lost(self, reason: str) -> str:
+        self.reason = reason
+        return "lost"
+
+    def poll(self, timeout: float, *, max_reads: int = 16) -> str | None:
+        """Return ``"ack"``, ``"lost"`` or ``None`` (nothing new)."""
+        acked = False
+        for attempt in range(max_reads):
+            try:
+                ready, _, _ = select.select(
+                    [self._connection], [], [], max(0.0, timeout) if attempt == 0 else 0.0,
+                )
+            except (OSError, ValueError):
+                return self._lost("the client connection closed")
+            if not ready:
+                break
+            try:
+                chunk = self._connection.recv(4096, socket.MSG_DONTWAIT)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                return self._lost("the client connection was reset")
+            if not chunk:
+                return self._lost("the client closed its connection")
+            self._buffer += chunk
+            while len(self._buffer) >= 4:
+                (length,) = struct.unpack(">I", self._buffer[:4])
+                if length < 2 or length > BROKER_ACK_FRAME_LIMIT:
+                    return self._lost("the client sent an unexpected frame")
+                if len(self._buffer) < 4 + length:
+                    break
+                raw, self._buffer = self._buffer[4:4 + length], self._buffer[4 + length:]
+                try:
+                    value = json.loads(raw.decode("utf-8", errors="strict"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return self._lost("the client sent an unexpected frame")
+                if value != {"type": "ack"}:
+                    return self._lost("the client sent an unexpected frame")
+                acked = True
+        return "ack" if acked else None
+
+
+def _drain_acks(connection: socket.socket, seconds: float) -> None:
+    """Discard pending ack bytes before close so the queued result is not reset."""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        remaining = deadline - time.monotonic()
+        try:
+            ready, _, _ = select.select([connection], [], [], max(0.0, remaining))
+            if not ready:
+                return
+            if not connection.recv(4096, socket.MSG_DONTWAIT):
+                return
+        except (BlockingIOError, InterruptedError):
+            pass
+        except (OSError, ValueError):
+            return
+        if remaining <= 0:
+            return
+
+
+class _RequestCancel(Event):
+    """One owned request's cancel token (issue #1653).
+
+    A real ``Event`` (``is_set`` and a bounded ``wait``), also set while the
+    broker's own stop event is set, so every existing stop check holds.
+    """
+
+    def __init__(self, stop: Event) -> None:
+        super().__init__()
+        self._broker_stop = stop
+
+    def is_set(self) -> bool:
+        return super().is_set() or self._broker_stop.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while True:
+            if self.is_set():
+                return True
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return self.is_set()
+            slice_seconds = BROKER_SEND_CANCEL_POLL_SECONDS if remaining is None else min(
+                remaining, BROKER_SEND_CANCEL_POLL_SECONDS
+            )
+            if super().wait(slice_seconds):
+                return True
+
+
+class _BrokerRequest:
+    """Liveness, cancellation and lock-holder state of one owned request (#1653)."""
+
+    def __init__(self, stop: Event, *, command: str, normalized: str) -> None:
+        self.cancel = _RequestCancel(stop)
+        self.done = Event()
+        self.command = command
+        self.normalized = normalized
+        self.phase = "preparing"
+        self.started = time.monotonic()
+        self.last_progress = self.started
+        self.client_lost = False
+        self.loss_reason = ""
+        self.cancel_started = False
+        self.completing = False
+        self.processes: dict[int, Any] = {}
+        self.fixtures: dict[int, tuple[Any, float]] = {}
 
 
 def _host_heartbeat_grace() -> float:
@@ -2908,6 +3070,10 @@ class _ConnectionSender:
         self._lock = Lock()
         self.wedged = False
 
+    def bind_cancel(self, cancel: Event) -> None:
+        """Use an owned request's cancel token (#1653)."""
+        self._cancel = cancel
+
     def _wedge(self) -> None:
         self.wedged = True
         try:
@@ -2922,11 +3088,14 @@ class _ConnectionSender:
         grace: float,
         cancellable: bool = True,
         skip_if_busy: bool = False,
+        lock_wait: float = 0.0,
     ) -> bool:
         """Send one frame; return whether it was delivered or deliberately skipped-safe.
 
         ``skip_if_busy`` (heartbeats) skips the beat, without wedging, when the
-        lock is busy or nothing at all could be written.
+        lock is busy or nothing at all could be written.  ``lock_wait`` lets a
+        skippable beat wait that long for the lock first (#1653), so sustained
+        streaming cannot starve liveness probes.
         """
         raw = json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(raw) > BROKER_FRAME_LIMIT:
@@ -2937,7 +3106,11 @@ class _ConnectionSender:
         # One deadline covers lock acquisition and writing.
         deadline = time.monotonic() + max(0.0, grace)
         if skip_if_busy:
-            if not self._lock.acquire(blocking=False):
+            acquired = (
+                self._lock.acquire(timeout=lock_wait) if lock_wait > 0
+                else self._lock.acquire(blocking=False)
+            )
+            if not acquired:
                 return False
         else:
             while not self._lock.acquire(
@@ -3135,6 +3308,7 @@ class _FixtureRun:
         self.state_dir = Path(tempfile.mkdtemp(prefix="agent-loop-fixture-state-"))
         os.chmod(self.state_dir, 0o700)
         self._finished = False
+        self.request: _BrokerRequest | None = None
 
     def close(self) -> None:
         import shutil
@@ -3151,6 +3325,8 @@ class _FixtureRun:
                 self.supervisor.finish()
                 with server._journal_lock:
                     server._active_fixtures.pop(id(self.supervisor), None)
+                    if self.request is not None:
+                        self.request.fixtures.pop(id(self.supervisor), None)
         finally:
             self.close()
 
@@ -3241,6 +3417,8 @@ class TestBrokerServer:
         # Issue #1326: fixture supervisors are never sent the ordinary
         # SIGTERM/SIGKILL; stop() hands them a graceful teardown first.
         self._active_fixtures: dict[int, tuple[Any, float]] = {}
+        # Issue #1653: owned live requests, each with its own cancel token.
+        self._requests: dict[int, _BrokerRequest] = {}
         self._pinned_root: Any | None = None
         self._worker_budget: Any | None = None
         self._worker_lock_root: Path | None = None
@@ -3354,21 +3532,17 @@ class TestBrokerServer:
                 # Shared with evidence publication: a journal append either
                 # precedes this point or observes the stop and is unattributed.
                 self._stop_event.set()
+                for request in self._requests.values():
+                    request.cancel.set()
                 active = list(self._active_processes.values())
                 fixtures = list(self._active_fixtures.values())
+        from .runner import terminate_process_group_fully
+
         for proc in active:
-            if proc.poll() is None:
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    proc.wait(timeout=2)
-                except ProcessLookupError:
-                    pass
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    proc.wait()
+            # The whole group, including a descendant that ignored SIGTERM
+            # after its leader exited (#1653); idempotent with a client-loss
+            # cancel of the same request.
+            terminate_process_group_fully(proc.pid, proc=proc)
         # Teardown interrupts a running setup; each supervisor then gets its
         # reserve before it (and every inventoried PID) is forcibly killed.
         for supervisor, _reserve in fixtures:
@@ -3448,6 +3622,18 @@ class TestBrokerServer:
                         root=self.root,
                         ceiling=self.timeout_ceiling,
                     )
+                    if dict(validated["environment"]).get(BROKER_CLIENT_ACKS_ENV) != "1":  # type: ignore[call-overload]
+                        # Issue #1653: a client that cannot acknowledge
+                        # heartbeats cannot be proven live, so nothing is
+                        # taken or launched.  The reason is streamed (an older
+                        # client prints output frames) and the terminal frame
+                        # is a no-test result, never an error frame that would
+                        # trigger the client's local fallback.
+                        reason = _legacy_client_reason(validated["environment"])  # type: ignore[arg-type]
+                        sender.send({"type": "output", "data": reason + "\n"}, grace=terminal, cancellable=False)
+                        sender.send(_legacy_refusal_frame(reason), grace=terminal, cancellable=False)
+                        _drain_acks(connection, BROKER_SEND_CANCEL_POLL_SECONDS)
+                        return
                     nonce = str(validated["nonce"])
                     digest = hashlib.sha256(json.dumps(validated, sort_keys=True, default=str).encode()).hexdigest()
                     with self._journal_lock:
@@ -3464,7 +3650,13 @@ class TestBrokerServer:
                         from .test_workers import HOST_WAIT_HEARTBEAT_SECONDS
 
                         last_frame = time.monotonic()
+                        acks = _AckReader(connection)
                         while not reservation.ready.wait(BROKER_SEND_CANCEL_POLL_SECONDS):
+                            # Issue #1653: a follower consumes its own acks so
+                            # they never back up; losing it ends only this
+                            # follower, never the owner's reservation.
+                            if acks.poll(0.0) == "lost":
+                                return
                             if self._stop_event.is_set():
                                 # Cancel this follower alone: the owner's
                                 # reservation is left untouched.
@@ -3479,9 +3671,17 @@ class TestBrokerServer:
                         if reservation.response is None:
                             raise BrokerProtocolError("broker replay did not complete")
                         sender.send(reservation.response, grace=terminal, cancellable=False)
+                        _drain_acks(connection, BROKER_SEND_CANCEL_POLL_SECONDS)
                         return
+                    state = self._register_request(validated)
+                    sender.bind_cancel(state.cancel)
+                    monitor = Thread(
+                        target=self._monitor_client, args=(connection, sender, state),
+                        name="agent-loop-test-broker-client-monitor", daemon=True,
+                    )
+                    monitor.start()
                     try:
-                        response = self._execute_request(validated, connection, sender)
+                        response = self._execute_request(validated, connection, sender, state)
                     except (BrokerProtocolError, AgentLoopError, OSError, ValueError) as exc:
                         if isinstance(exc, AgentLoopError):
                             self._record_capture_failure(validated, exc)
@@ -3493,10 +3693,16 @@ class TestBrokerServer:
                             "error": f"broker execution failed: {type(exc).__name__}",
                         }
                     finally:
+                        # The monitor stops before the terminal send, so a
+                        # heartbeat never follows the result frame.
+                        state.done.set()
+                        monitor.join(BROKER_MONITOR_JOIN_SECONDS)
                         with self._journal_lock:
+                            self._requests.pop(id(state), None)
                             reservation.response = response
                             reservation.ready.set()
                     sender.send(response, grace=terminal, cancellable=False)
+                    _drain_acks(connection, BROKER_SEND_CANCEL_POLL_SECONDS)
                 except (BrokerProtocolError, AgentLoopError, OSError, ValueError) as exc:
                     if (
                         isinstance(exc, AgentLoopError)
@@ -3517,6 +3723,117 @@ class TestBrokerServer:
                 close_now = self._deferred_close and not self._handler_threads
             if close_now:
                 self._close_resources()
+
+    def _register_request(self, validated: Mapping[str, object]) -> _BrokerRequest:
+        """Register an owned request; a stop already in progress cancels it."""
+        argv = tuple(str(item) for item in validated.get("argv", ()))  # type: ignore[union-attr]
+        try:
+            command = redact_test_command(argv)[0]
+        except Exception:  # noqa: BLE001 - a diagnostic label only
+            command = "<unprintable command>"
+        try:
+            from .test_runtime import normalize_test_command
+
+            normalized = normalize_test_command(argv, cwd=Path(str(validated.get("cwd"))))
+        except Exception:  # noqa: BLE001
+            normalized = ""
+        state = _BrokerRequest(self._stop_event, command=command, normalized=normalized)
+        with self._journal_lock:
+            self._requests[id(state)] = state
+            if self._stop_event.is_set():
+                state.cancel.set()
+        return state
+
+    def _monitor_client(
+        self, connection: socket.socket, sender: _ConnectionSender, state: _BrokerRequest,
+    ) -> None:
+        """Watch one owned request's client for its whole lifetime (#1653).
+
+        The sole reader of the connection after the request frame.  EOF, a
+        reset, an unexpected frame, a wedged send, or no acknowledged progress
+        for ``BROKER_CLIENT_ACK_TIMEOUT_SECONDS`` since the request started or
+        the last ack (whether or not a heartbeat could be delivered) is loss.
+        """
+        from .test_workers import HOST_WAIT_HEARTBEAT_SECONDS
+
+        reader = _AckReader(connection)
+        last_probe = time.monotonic()
+        while not state.done.is_set():
+            reason = ""
+            if sender.wedged:
+                reason = "the client stopped reading its output"
+            elif time.monotonic() - state.last_progress > BROKER_CLIENT_ACK_TIMEOUT_SECONDS:
+                reason = (
+                    f"no heartbeat acknowledgement for {BROKER_CLIENT_ACK_TIMEOUT_SECONDS:g} s"
+                )
+            else:
+                status = reader.poll(BROKER_MONITOR_POLL_SECONDS)
+                if status == "lost":
+                    reason = reader.reason
+                elif status == "ack":
+                    state.last_progress = time.monotonic()
+            if reason:
+                if not state.done.is_set():
+                    self._cancel_request(state, reason)
+                return
+            if time.monotonic() - last_probe >= HOST_WAIT_HEARTBEAT_SECONDS:
+                last_probe = time.monotonic()
+                grace = _host_heartbeat_grace()
+                sender.send(
+                    {"type": "output", "data": ""},
+                    grace=grace, cancellable=False, skip_if_busy=True, lock_wait=grace,
+                )
+
+    def _cancel_request(self, state: _BrokerRequest, reason: str) -> None:
+        """Cancel one request whose client was lost; idempotent (#1653).
+
+        Setting the token under the launch lock means a guarded launch either
+        sees it and runs nothing, or is already registered here for
+        termination.  The runner releases the lane only after the group is
+        confirmed empty.
+        """
+        with self._launch_lock:
+            with self._journal_lock:
+                if state.cancel_started or state.completing:
+                    return
+                state.cancel_started = True
+                if not self._stop_event.is_set():
+                    state.client_lost = True
+                    state.loss_reason = reason
+                state.cancel.set()
+                processes = list(state.processes.values())
+                fixtures = list(state.fixtures.values())
+        if state.client_lost:
+            sys.stderr.write(
+                f"agent-loop: run-tests client lost ({reason}); cancelled its request "
+                f"{state.command} ({state.phase})\n"
+            )
+        from .runner import terminate_process_group_fully
+
+        for proc in processes:
+            terminate_process_group_fully(proc.pid, proc=proc)
+        for supervisor, _reserve in fixtures:
+            supervisor.request_teardown()
+        for supervisor, reserve in fixtures:
+            supervisor.finish(budget=reserve)
+
+    def _describe_holder(self, state: _BrokerRequest) -> str | None:
+        """Name another live request of this broker that may hold a lock."""
+        with self._journal_lock:
+            others = [
+                request for request in self._requests.values()
+                if request is not state and not request.done.is_set()
+            ]
+        if not others:
+            return None
+        same = [request for request in others if request.normalized == state.normalized]
+        holder = min(same or others, key=lambda request: request.started)
+        return (
+            f"`{_bounded(holder.command, 200)}` ({holder.phase}, "
+            f"{time.monotonic() - holder.started:.0f} s); it frees when that command finishes "
+            "or is cancelled, not by killing a run-tests client process, and a killed or "
+            f"non-reading client is cancelled within about {BROKER_CLIENT_ACK_TIMEOUT_SECONDS:g} s"
+        )
 
     def _record_capture_failure(
         self,
@@ -3624,11 +3941,14 @@ class TestBrokerServer:
         request: Mapping[str, object],
         connection: socket.socket,
         sender: "_ConnectionSender | None" = None,
+        state: "_BrokerRequest | None" = None,
     ) -> dict[str, object]:
         from .containment import open_confined_cwd
 
         if sender is None:
             sender = _ConnectionSender(connection, self._stop_event)
+        if state is None:
+            state = _BrokerRequest(self._stop_event, command="", normalized="")
 
         argv = tuple(request["argv"])  # type: ignore[arg-type]
         requested_cwd = Path(request["cwd"])  # type: ignore[arg-type]
@@ -3638,6 +3958,7 @@ class TestBrokerServer:
         # owns the authenticated turn identity that remains in its context.
         for name in (
             BROKER_ENDPOINT_ENV, BROKER_CAPABILITY_ENV, BROKER_PROTOCOL_ENV, FIXTURE_STATE_DIR_ENV,
+            BROKER_CLIENT_ACKS_ENV,
         ):
             environment.pop(name, None)
         # Issue #1632: the client's tool identity is diagnostic only; it never
@@ -3670,6 +3991,10 @@ class TestBrokerServer:
                 argv=argv,
                 timeout_seconds=min(MAX_SNAPSHOT_SECONDS, self.timeout_ceiling),
             )
+            if state.cancel.is_set():
+                # Issue #1653: the client was lost (or the broker stopped)
+                # during the bounded before snapshot; nothing launches.
+                return _cancelled_frame(BROKER_CLIENT_LOST_DIAGNOSTIC) if state.client_lost else _cancelled_frame()
             if fixture_request is not None:
                 from .fixture_runtime import require_clean_tree
 
@@ -3679,6 +4004,7 @@ class TestBrokerServer:
                     mount_id=authority.mount_id,
                     timeout_seconds=float(request["timeout_seconds"]),
                 )
+                fixture_run.request = state
                 environment[FIXTURE_STATE_DIR_ENV] = str(fixture_run.state_dir)
 
             def bounded_grace(grace: float) -> float:
@@ -3695,8 +4021,8 @@ class TestBrokerServer:
             def stream(chunk: str) -> None:
                 safe = chunk.encode("utf-8", errors="replace")[:16 * 1024].decode("utf-8", errors="ignore")
                 try:
-                    # A disconnected or non-reading client never stops the
-                    # target; the evidence result is still returned.
+                    # Issue #1653: a send that wedges marks the client lost;
+                    # the monitor then cancels the request and stops its target.
                     sender.send(
                         {"type": "output", "data": safe},
                         grace=bounded_grace(BROKER_STREAM_SEND_GRACE_SECONDS),
@@ -3705,12 +4031,17 @@ class TestBrokerServer:
                     pass
 
             def heartbeat() -> None:
+                # Only the host-capacity wait calls this before launch.
+                if state.phase == "preparing":
+                    state.phase = "waiting for host capacity"
                 sender.send(
                     {"type": "output", "data": ""},
                     grace=bounded_grace(_host_heartbeat_grace()), skip_if_busy=True,
                 )
 
             def wait_notice(text: str) -> None:
+                if state.phase == "preparing" and text.startswith("agent-loop worker budget:"):
+                    state.phase = "waiting for host capacity"
                 sender.send(
                     {"type": "output", "data": text + "\n"},
                     grace=bounded_grace(_host_heartbeat_grace()),
@@ -3729,7 +4060,7 @@ class TestBrokerServer:
             setup_hook = (
                 self._fixture_setup_hook(
                     fixture_run, cwd=cwd, cwd_fd=confined.fd,
-                    environment=environment, parent_cgroup=parent_cgroup,
+                    environment=environment, parent_cgroup=parent_cgroup, state=state,
                 )
                 if fixture_run is not None else None
             )
@@ -3745,7 +4076,7 @@ class TestBrokerServer:
                         timeout_seconds=float(request["timeout_seconds"]),
                         environment=environment, stream=stream, heartbeat=heartbeat,
                         wait_notice=wait_notice, parent_cgroup=parent_cgroup,
-                        fixture_run=fixture_run, setup_hook=setup_hook,
+                        fixture_run=fixture_run, setup_hook=setup_hook, state=state,
                     )
             finally:
                 if fixture_run is not None:
@@ -3753,10 +4084,15 @@ class TestBrokerServer:
                     # failure, exceptions and stop alike, before the after
                     # snapshot (issue #1326).
                     fixture_run.finish(self)
+            with self._journal_lock:
+                # From here a lost client no longer cancels anything: the
+                # target is gone and its locks are released.
+                state.completing = True
+                state.phase = "completing"
             return self._complete_request(
                 argv=argv, cwd=cwd, environment=environment, before=before,
                 result=result, fixture_run=fixture_run, root=pinned_root.path,
-                tool_identity=tool_identity,
+                tool_identity=tool_identity, client_lost=state.client_lost,
             )
 
     def _tool_identity(self, client: Mapping[str, str]) -> ToolIdentity | None:
@@ -3784,18 +4120,26 @@ class TestBrokerServer:
         self, argv: tuple[str, ...], *, cwd: Path, cwd_fd: int, timeout_seconds: float,
         environment: dict[str, str], stream: Any, heartbeat: Any, wait_notice: Any,
         parent_cgroup: Path | None, fixture_run: "_FixtureRun | None", setup_hook: Any | None,
+        state: "_BrokerRequest | None" = None,
     ) -> Any:
         from .runner import run_foreground_test
+
+        if state is None:
+            state = _BrokerRequest(self._stop_event, command="", normalized="")
+        request_state = state
 
         def started(proc: Any) -> None:
             with self._journal_lock:
                 self._active_processes[proc.pid] = proc
+                request_state.processes[proc.pid] = proc
+                request_state.phase = "running"
             if self._process_started is not None:
                 self._process_started(proc)
 
         def finished(proc: Any) -> None:
             with self._journal_lock:
                 self._active_processes.pop(proc.pid, None)
+                request_state.processes.pop(proc.pid, None)
             if self._process_finished is not None:
                 self._process_finished(proc)
 
@@ -3818,10 +4162,11 @@ class TestBrokerServer:
             reservation_telemetry=telemetry,
             worker_budget=self.effective_worker_budget(environment),
             worker_lock_root=self._worker_lock_root,
-            host_wait_cancel=self._stop_event,
+            host_wait_cancel=request_state.cancel,
             host_wait_heartbeat=heartbeat,
             host_wait_notify=wait_notice,
             host_launch_guard=lambda: self._launch_lock,
+            lock_holder_describer=lambda: self._describe_holder(request_state),
             cwd=cwd,
             cwd_fd=cwd_fd,
             timeout_seconds=timeout_seconds,
@@ -3871,8 +4216,14 @@ class TestBrokerServer:
     def _fixture_setup_hook(
         self, fixture_run: "_FixtureRun", *, cwd: Path, cwd_fd: int,
         environment: Mapping[str, str], parent_cgroup: Path | None,
+        state: "_BrokerRequest | None" = None,
     ) -> Any:
-        """The runner's post-admission hook: launch the supervisor, run setup."""
+        """The runner's post-admission hook: launch the supervisor, run setup.
+
+        Issue #1653: every cancel check reads the request's own token, so a
+        lost client cancels this request alone.
+        """
+        cancel: Event = state.cancel if state is not None else self._stop_event
         from .fixture_runtime import (
             MIN_SETUP_AND_INNER_SECONDS,
             SETUP_TERMINATION_MARGIN_SECONDS,
@@ -3890,11 +4241,15 @@ class TestBrokerServer:
             # The host_launch_guard handshake: a stop either sees this
             # registered supervisor or this launch sees the stop.
             with self._launch_lock:
-                if self._stop_event.is_set():
+                if cancel.is_set():
                     fixture_run.decision = SetupDecision(
-                        "cancel", "broker stopping before the fixture launch",
+                        "cancel",
+                        "broker stopping before the fixture launch" if self._stop_event.is_set()
+                        else "run-tests client lost before the fixture launch",
                     )
                     return fixture_run.decision
+                if state is not None:
+                    state.phase = "fixture setup"
                 # Setup stops early enough for its termination grace to end
                 # by the inner deadline; both deadlines are absolute.
                 setup_deadline = deadline - SETUP_TERMINATION_MARGIN_SECONDS
@@ -3908,6 +4263,8 @@ class TestBrokerServer:
                 fixture_run.supervisor = supervisor
                 with self._journal_lock:
                     self._active_fixtures[id(supervisor)] = (supervisor, fixture_run.reserve)
+                    if state is not None:
+                        state.fixtures[id(supervisor)] = (supervisor, fixture_run.reserve)
             try:
                 released = supervisor.start_setup(parent_cgroup, setup_deadline=setup_deadline)
             except (AgentLoopError, OSError) as exc:
@@ -3924,8 +4281,13 @@ class TestBrokerServer:
             # arrive by the inner deadline, never inside the teardown reserve.
             event = supervisor.wait_setup(deadline)
             status = event.get("status") if event is not None else None
-            if self._stop_event.is_set() or status == "cancelled":
-                fixture_run.decision = SetupDecision("cancel", "broker stopping during fixture setup")
+            if cancel.is_set() or status == "cancelled":
+                fixture_run.decision = SetupDecision(
+                    "cancel",
+                    "run-tests client lost during fixture setup"
+                    if state is not None and state.client_lost
+                    else "broker stopping during fixture setup",
+                )
             elif status == 0 and not isinstance(status, bool):
                 fixture_run.decision = SetupDecision("proceed")
             else:
@@ -3942,15 +4304,20 @@ class TestBrokerServer:
         self, *, argv: tuple[str, ...], cwd: Path, environment: Mapping[str, str],
         before: "TrackedTreeSnapshot", result: Any, fixture_run: "_FixtureRun | None",
         root: Path | None = None, tool_identity: ToolIdentity | None = None,
+        client_lost: bool = False,
     ) -> dict[str, object]:
-        """Snapshot, attribute, fold, journal and build the result frame."""
+        """Snapshot, attribute, fold, journal and build the result frame.
+
+        ``client_lost`` (#1653): the broker stopped this target because its
+        client was lost; its row is journaled as non-evidence.
+        """
         launched_fixture = fixture_run is not None and fixture_run.supervisor is not None
         if str(getattr(result, "outcome", "")) == "cancelled" and not launched_fixture:
             # Nothing launched: no post-run snapshot, attribution or evidence.
-            return _cancelled_frame()
+            return _cancelled_frame(BROKER_CLIENT_LOST_DIAGNOSTIC) if client_lost else _cancelled_frame()
         shutdown = self._stop_event.is_set()
         after = None
-        if not shutdown:
+        if not shutdown and not client_lost:
             try:
                 after = stable_tracked_tree_snapshot(
                     self.root,
@@ -4063,6 +4430,18 @@ class TestBrokerServer:
                 ),
                 tool_identity=tool_identity,
             )
+            if client_lost:
+                # Applied after fixture folding, so folding can never restore
+                # an authoritative outcome; the receipt stays visible.
+                observation = replace(
+                    observation,
+                    outcome="incomplete",
+                    provenance="telemetry-unverified",
+                    attribution=TreeAttribution(
+                        state="unknown", stable=False, caveats=(BROKER_CLIENT_LOST_CAVEAT,),
+                    ),
+                    caveats=(BROKER_CLIENT_LOST_CAVEAT, *observation.caveats),
+                )
             with self._journal_lock:
                 if self._stop_event.is_set() and "unattributed: broker shutdown" not in observation.attribution.caveats:
                     observation = replace(
@@ -4081,7 +4460,10 @@ class TestBrokerServer:
                 **_cancelled_frame(),
                 "receipt_id": receipt_id if execution_ref is not None else "",
                 "execution_ref": execution_ref,
-                "diagnostic": "fixture run interrupted (the broker is stopping)",
+                "diagnostic": (
+                    "fixture run interrupted (its run-tests client was lost)" if client_lost
+                    else "fixture run interrupted (the broker is stopping)"
+                ),
                 BROKER_FIXTURE_FIELD: fixture_record.to_dict(),
             }
         response: dict[str, object] = {
@@ -4095,7 +4477,13 @@ class TestBrokerServer:
             "wrapper_bootstrap": str(getattr(result, "wrapper_bootstrap", "unknown")),
             "inner_exec": inner_exec,
             "suite_start": suite_start,
-            "diagnostic": _safe_text(result_diagnostic, MAX_SAFE_CAVEAT_BYTES),
+            # A no-test refusal's reason (and its lock holder, #1653) is the
+            # client's only explanation, so it keeps a larger bound.
+            "diagnostic": _safe_text(
+                result_diagnostic,
+                BROKER_REFUSAL_DIAGNOSTIC_BYTES if result_outcome in BROKER_NO_TEST_OUTCOMES
+                else MAX_SAFE_CAVEAT_BYTES,
+            ),
             "executed_argv": _bounded_argv(getattr(result, "args", argv) or argv),
             "workers_cohort": getattr(result, "workers_cohort", None),
             "worker_enforcement": worker_enforcement,
@@ -4162,6 +4550,8 @@ class TestBrokerClient:
         for name in (BROKER_ENDPOINT_ENV, BROKER_CAPABILITY_ENV, BROKER_PROTOCOL_ENV):
             snapshot_environment.pop(name, None)
         snapshot_environment["AGENT_LOOP_INVOCATION_ID"] = self.turn_id
+        # Issue #1653: this client acknowledges every heartbeat.
+        snapshot_environment[BROKER_CLIENT_ACKS_ENV] = "1"
         if environment_overrides:
             # The client's requested worker values; the broker only honours
             # them when they are stricter than the parent-owned budget.
@@ -4205,6 +4595,7 @@ class TestBrokerClient:
                 raise BrokerNotDispatched(
                     f"broker request was not dispatched: {type(exc).__name__}"
                 ) from exc
+            acks_disabled = False
             while True:
                 try:
                     response = _recv_frame(connection)
@@ -4218,6 +4609,12 @@ class TestBrokerClient:
                     data = response.get("data")
                     if isinstance(data, str):
                         print(data, end="", flush=True)
+                    if data == "" and not acks_disabled:
+                        # Acknowledged only after every earlier frame was
+                        # handled.  Best effort: a failed or slow ack (the
+                        # broker may already have sent its result and closed)
+                        # disables acks and the client keeps reading.
+                        acks_disabled = not _send_ack(connection, socket_bound)
                     continue
                 if response.get("type") == "error":
                     raise BrokerProtocolError(str(response.get("error", "broker request failed")))
@@ -4262,6 +4659,23 @@ class TestBrokerClient:
                         if BROKER_FIXTURE_FIELD in response else None
                     ),
                 )
+
+
+def _send_ack(connection: socket.socket, restore_timeout: float) -> bool:
+    """Send one bounded heartbeat acknowledgement; False when it failed."""
+    from .test_workers import HOST_WAIT_HEARTBEAT_SEND_GRACE_SECONDS
+
+    try:
+        connection.settimeout(HOST_WAIT_HEARTBEAT_SEND_GRACE_SECONDS)
+        _send_frame(connection, {"type": "ack"})
+        return True
+    except (OSError, BrokerProtocolError):
+        return False
+    finally:
+        try:
+            connection.settimeout(restore_timeout)
+        except OSError:
+            pass
 
 
 def broker_client_from_environment(environment: Mapping[str, str] | None = None) -> TestBrokerClient | None:

@@ -1607,3 +1607,27 @@ def test_subprocess_log_pruning_is_documented_as_layout_gated():
     assert "subprocess-logs/<slug>/ layout" in pr_help
     assert "any --subprocess-log-dir whose path follows that layout" in pr_help
     assert "is subject to the same retention pruning as the default" in pr_help
+
+
+def test_client_loss_cancellation_is_documented_for_both_phases():
+    """Issue #1653: the CLI guide and the architecture doc describe client loss."""
+    guide = " ".join(LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8").split())
+    for phrase in (
+        "holds this run's test lane while it waits; let it finish rather than killing it",
+        "is cancelled without launching anything",
+        "is confirmed gone before the lane is released",
+        "run-tests client disconnected; target stopped by the broker",
+        "agent-loop: no test ran (<outcome>): <reason>",
+    ):
+        assert phrase in guide, phrase
+    architecture = " ".join(
+        (REPO_ROOT / "docs" / "architecture" / "execution-and-concurrency.md")
+        .read_text(encoding="utf-8").split()
+    )
+    for phrase in (
+        "no acknowledged progress for 30 s marks the client lost",
+        "while it waits for host capacity",
+        "while its target runs",
+        "non-evidence row is journaled",
+    ):
+        assert phrase in architecture, phrase

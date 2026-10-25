@@ -259,7 +259,18 @@ falls back to the free workers (or one oversubscribed worker) instead of
 refusing; the fallback lowers launched workers after the configured-budget
 judgement, so refuse-mode enforcement is not weakened. A broker request's
 pending admission is cancelled when the broker stops, synchronised with target
-launch so no target starts after the owning turn ends. See
+launch so no target starts after the owning turn ends. Each owned broker
+request also has its own cancel token and a request-lifetime client monitor:
+the client acknowledges every heartbeat, and EOF, a reset, a wedged send or no
+acknowledged progress for 30 s marks the client lost. A lost client's request
+is cancelled while it waits for host capacity, in probing or fixture setup
+(nothing launches, and its lane, worker-budget lock and reservation are
+released) or while its target runs (the whole process group, including
+descendants that ignore SIGTERM, is confirmed gone before the lane is released,
+and a telemetry-unverified, non-evidence row is journaled). A client that does
+not announce acknowledgements gets a visible no-test refusal before any lock is
+taken. No-test refusals reach the client's own output and name a same-broker
+lock holder. See
 [Parallel test-worker budget](../local_agent_loop.md#parallel-test-worker-budget).
 
 The same test-execution boundary distinguishes positive lifecycle provenance
