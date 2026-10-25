@@ -888,3 +888,18 @@ def test_failed_setup_child_cannot_damage_the_environment_after_a_retry(tmp_path
     assert runs_in(counter, store) == 2
     time.sleep(1.5)
     assert not (store / ".venv-state").exists()
+
+
+def test_setup_refuses_before_launch_without_unreaped_wait(tmp_path, monkeypatch):
+    """Without os.waitid the group cannot be killed safely, so setup never launches."""
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    store = claude_store()
+    config = setup_config(env, setup_command(counter, "(sleep 1; echo damaged > .venv-state) & exit 1"))
+    monkeypatch.delattr(os, "waitid")
+    with pytest.raises(AgentLoopError, match="os.waitid is unavailable"):
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert runs_in(counter, store) == 0
+    assert worktree_setup.read_setup_record(store) is None
+    time.sleep(1.5)
+    assert not (store / ".venv-state").exists()

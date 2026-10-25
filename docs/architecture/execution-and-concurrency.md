@@ -71,7 +71,8 @@ re-verifies HEAD and the tracked tree, and runs the command through
 the coder test-command timeout. The leader is observed with `waitid(WNOWAIT)`
 and left unreaped until the whole group has been killed, so however the command
 ends no background child survives the store-lock release and the group ID
-cannot have been reused when it is signalled. A failure or timeout raises
+cannot have been reused when it is signalled; on a host without `os.waitid`
+setup is refused before anything launches. A failure or timeout raises
 with the output tail, leaving no record; a success that still leaves a link
 source missing raises "succeeded but did not create" without a record. Dry-run
 only logs. After linking, a read-only `git check-ignore --no-index` probe in the

@@ -1374,6 +1374,9 @@ agent-loop issue 123 --repo OWNER/REPO \
 - A nonzero exit or timeout stops the run with the output tail and leaves no
   setup record, so the next run retries. A success record is kept per clone
   under the private host lock root, outside the repository.
+- When the command ends, any background process it left in its process group is
+  killed before the store lock is released. Hosts without `os.waitid` refuse
+  `--worktree-setup` before running anything.
 - Before a required setup, tracked files in the shared clone (including
   initialized submodules) must match the base commit: any locally modified,
   staged or deleted tracked file, and any index entry flagged

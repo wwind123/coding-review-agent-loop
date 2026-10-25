@@ -397,9 +397,6 @@ def _wait_for_exit_unreaped(process: subprocess.Popen, timeout_seconds: float) -
 
     Raises ``subprocess.TimeoutExpired`` when the leader is still running at the deadline.
     """
-    if not hasattr(os, "waitid"):
-        process.wait(timeout=timeout_seconds)
-        return
     deadline = time.monotonic() + timeout_seconds
     while True:
         info = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
@@ -420,6 +417,14 @@ def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> N
     released. The leader stays an unreaped zombie until then, which keeps its
     PID, and so the group ID, from being reused by an unrelated process.
     """
+    if not hasattr(os, "waitid"):
+        # Without an unreaped wait the group cannot be killed safely after the
+        # shell exits, so a surviving child could outlive the store lock.
+        raise AgentLoopError(
+            f"--worktree-setup is not supported on this host: os.waitid is unavailable, so "
+            f"agent-loop cannot stop the command's background processes safely. Nothing ran "
+            f"in the shared clone {store} and no setup record was written."
+        )
     with tempfile.TemporaryFile() as output:
         try:
             process = subprocess.Popen(
@@ -444,8 +449,7 @@ def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> N
             raise
         # The leader has exited but is not reaped yet, so the group ID is still
         # ours: stop any surviving descendants, then reap.
-        if hasattr(os, "waitid"):
-            _kill_group(process)
+        _kill_group(process)
         returncode = process.wait()
         if returncode != 0:
             raise AgentLoopError(
