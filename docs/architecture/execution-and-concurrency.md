@@ -2,7 +2,7 @@
 
 How agent and Git processes run: per-run worktrees over a shared store, the agent-loop-owned Git boundary and private fetch transport with SSH identity selection, pre-turn checkout verification, process-tree containment, test interpreter and worker budgets, pre-collection launch-failure provenance, the Antigravity quota-group fallback, the opt-in quota reset wait, the agent-loop executable pin with its receipt tool identity, and the other entry paths outside the review loop.
 
-Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/agent_executable.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_containment.py`, `tests/test_test_workers.py`, `tests/test_agent_executable.py`.
+Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/worktree_setup.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/agent_executable.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_worktree_setup.py`, `tests/test_containment.py`, `tests/test_test_workers.py`, `tests/test_agent_executable.py`.
 
 ## Execution and Concurrency
 
@@ -10,7 +10,7 @@ Concurrent default-dir invocations on one repository are supported.
 Each run with an omitted `--<agent>-dir` gets its own detached `git worktree`
 under `<scratch>/OWNER-REPO/<agent>/runs/<run-token>`, backed by one shared
 clone per repo/agent (the *store*, `<scratch>/OWNER-REPO/<agent>/repo`) that
-owns the object store. Explicit `--<agent>-dir` paths are untouched. Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming it) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep it ignored with `/.venv` (a dir-only `.venv/` rule does not match a symlink). `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it. Parallel
+owns the object store. Explicit `--<agent>-dir` paths are untouched. Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming the shared clone and suggesting `--worktree-setup` or creating the path there) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep every link ignored with a root-anchored pattern without a trailing slash, for example `/.venv` or `/node_modules` in `.gitignore` or the store's `.git/info/exclude` (shared by every worktree); a dir-only `.venv/` or `node_modules/` rule does not match a symlink. agent-loop warns, and never writes ignore state, when a created link is not ignored. `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it. Parallel
 reviewers within one invocation are supported; the orchestrator verifies
 distinct reviewer workdirs. Coder and reviewer turns are separate lifecycle
 stages even when they use the same CLI.
@@ -36,6 +36,40 @@ any worktree. The outermost `workdir_claim_scope` runs registered finalizers
 (identity-verified worktree removal) before releasing claims, on success and
 failure. At startup a run prunes worktrees whose owner record matches and whose
 claim lock is free; unrecognized entries are logged and left untouched.
+
+**Operator worktree setup (`worktree_setup.py`).** `--worktree-setup CMD`
+is an operator CLI flag, never read from repository configuration. Inside
+`prepare_store`'s single store-lock hold, after `_fetch_and_pin` returns the
+base SHA and before pack compaction, `ensure_store_setup` decides whether the
+setup for that same SHA is current, so both `prepare_store` callers (worktree
+creation and every later per-run base sync) never hand out a pin with an
+out-of-date setup; `pin_pr_head` never runs setup. The digest hashes the
+command string's SHA-256 and each `--worktree-setup-key` entry (`git ls-tree`
+mode, type and OID at the SHA, or an `absent` sentinel), never working-tree
+bytes. The success record is `<lock root>/workdir-stores/<store-key>/setup.json`
+(private, outside the clone, written atomically with mode 0600 only after a
+zero exit) and holds the digest, command hash, base SHA and the store root's
+dev/ino as a secondary check. Setup is required when the record is missing,
+unreadable or different, or when any `--worktree-link` source fails the shared
+`link_source_usable` predicate (`os.path.exists`, so a dangling source symlink
+counts as missing); `_prepare_store_locked` deletes the record before it
+removes a stale store or clones a missing one. A required setup needs a free
+store claim (otherwise the held-store message), then refuses any locally
+modified, staged or deleted tracked path, any dirty or drifted initialized
+submodule (separate confined per-submodule probes, the same inspection as
+test-evidence snapshots; parent probes keep the confined
+`--ignore-submodules=all`) and any untracked file at a key absent at the SHA,
+all before the record is touched. It then deletes the record and fsyncs its
+directory (failing closed), runs a non-forced `checkout --detach <sha>`,
+re-verifies HEAD and the tracked tree, and runs the command through
+`/bin/sh -c` in the store as the operator in its own process group, bounded by
+the coder test-command timeout. A failure or timeout kills the group and raises
+with the output tail, leaving no record; a success that still leaves a link
+source missing raises "succeeded but did not create" without a record. Dry-run
+only logs. After linking, a read-only `git check-ignore --no-index` probe in the
+new worktree warns when a link is not ignored as a symlink (never failing,
+never writing ignore state), and with neither setup nor link flags a one-line
+hint per run names dependency manifests found in the pinned tree.
 
 **Incremental import.** `import_ref` exports only objects not reachable from
 destination ref tips that the private fetch repository also holds as commits:

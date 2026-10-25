@@ -252,6 +252,31 @@ def build_parser() -> argparse.ArgumentParser:
             ),
         )
         subparser.add_argument(
+            "--worktree-setup",
+            default=None,
+            metavar="CMD",
+            help=(
+                "Opt-in operator command (run via /bin/sh -c, as the operator, outside any agent "
+                "sandbox) that prepares untracked test dependencies in each active agent's shared "
+                "default clone before per-run worktrees link them, for example "
+                "'python3 -m venv .venv && .venv/bin/pip install -r requirements.txt'. It runs once per "
+                "clone and reruns only when the command or a --worktree-setup-key entry at the pinned "
+                "base commit changes, or a --worktree-link source is missing. A failure stops the run "
+                "with the output tail. Never read from repository configuration."
+            ),
+        )
+        subparser.add_argument(
+            "--worktree-setup-key",
+            action="append",
+            default=None,
+            metavar="PATH",
+            help=(
+                "Repeatable, requires --worktree-setup. A repository-relative path (for example "
+                "package-lock.json or requirements.txt) whose Git entry at the pinned base commit keys "
+                "the setup digest."
+            ),
+        )
+        subparser.add_argument(
             "--coder",
             type=normalize_agent_name,
             choices=("claude", "codex", "gemini", "antigravity"),

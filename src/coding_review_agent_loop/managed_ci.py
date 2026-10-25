@@ -4688,7 +4688,7 @@ _RECOVERY_VALUE_OPTIONS = frozenset({
     "--containment-test-gate-memory-high", "--containment-test-gate-memory-max",
     "--containment-test-gate-memory-swap-max", "--containment-test-gate-tasks-max",
     "--test-workers", "--test-worker-memory", "--test-worker-enforcement",
-    "--worktree-link", "--ci-plumbing-check",
+    "--worktree-link", "--worktree-setup", "--worktree-setup-key", "--ci-plumbing-check",
 })
 _RECOVERY_NARGS_VALUE_OPTIONS = frozenset({
     "--antigravity-models", "--antigravity-quota-signatures", "--agent-retry-backoff-seconds",

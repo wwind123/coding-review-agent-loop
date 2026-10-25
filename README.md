@@ -773,7 +773,66 @@ settings, hooks, environment, and transport options planted in a checkout; a
 live, unrestricted agent running as the same OS user that races agent-loop
 while it runs needs OS-level isolation and is out of scope (#1371).
 
-Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming it) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep it ignored with `/.venv` (a dir-only `.venv/` rule does not match a symlink). `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it.
+Optional `--worktree-link PATH` (repeatable, off by default) symlinks (never copies) an untracked repository-relative path from the shared store, for example `.venv`, into each per-run worktree. The path must exist in the store (otherwise the run fails, naming the shared clone and suggesting `--worktree-setup` or creating the path there) and its parent directories must be tracked. Explicit `--<agent>-dir` checkouts ignore it. The link is exempted from checkout verification, sync cleaning and test-evidence attribution by agent-loop's in-process registry only (no git ignore state is written); a removed, retargeted, staged or committed link is refused. Linked state is shared and mutable across concurrent runs. Keep every link ignored with a root-anchored pattern without a trailing slash, for example `/.venv` or `/node_modules` in `.gitignore` or the store's `.git/info/exclude` (shared by every worktree); a dir-only `.venv/` or `node_modules/` rule does not match a symlink. agent-loop warns, and never writes ignore state, when a created link is not ignored. `.venv/bin/python` works through the link; bare `python` reaches the linked venv only if the agent environment activates it.
+
+### Test dependencies in per-run worktrees
+
+Per-run worktrees start with no untracked environment, so a Python or Node
+project has no in-checkout interpreter or `node_modules` unless the operator
+provides one. `--worktree-setup CMD` (operator CLI only, never read from
+repository configuration) builds it once in each active agent's shared clone
+(`/tmp/coding-review-agent-loop/OWNER-REPO/<agent>/repo`), and `--worktree-link`
+then symlinks it into every per-run worktree. Repeatable
+`--worktree-setup-key PATH` names the repository-relative files whose Git
+entries at the pinned base commit key the setup.
+
+Python:
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO \
+  --worktree-setup "python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" \
+  --worktree-setup-key requirements.txt \
+  --worktree-link .venv
+```
+
+Node:
+
+```bash
+agent-loop issue 123 --repo OWNER/REPO \
+  --worktree-setup "npm ci" \
+  --worktree-setup-key package-lock.json \
+  --worktree-link node_modules
+```
+
+- The command runs via `/bin/sh -c` in the shared clone, as the operator with
+  full privileges and the operator environment, outside any agent sandbox,
+  under the store lock and bounded by `--coder-test-command-timeout-seconds`.
+- It runs again only when the command string or a key entry at the newly
+  pinned base commit changes, when a `--worktree-link` source is missing or
+  is a dangling symlink, or when agent-loop (re-)creates the clone. Without
+  keys it runs once per clone lifetime. Setup is rechecked at every base pin,
+  including the base sync just before implementation; PR-head checkouts keep
+  the base environment.
+- The store lives under `/tmp` and is wiped on reboot; the next run simply
+  sets it up again.
+- A nonzero exit or timeout stops the run with the output tail and leaves no
+  setup record, so the next run retries. A success record is kept per clone
+  under the private host lock root, outside the repository.
+- Before a required setup, tracked files in the shared clone (including
+  initialized submodules) must match the base commit: any locally modified,
+  staged or deleted tracked file stops the run without overwriting it.
+  Untracked and ignored content there is operator-trusted.
+- Linked environments are shared and mutable across concurrent runs; a rerun
+  of setup changes them under other runs' turns.
+- Keep each link ignored as a symlink: `/.venv` or `/node_modules`, without a
+  trailing slash.
+- When neither `--worktree-setup` nor `--worktree-link` is given and the base
+  tree has `requirements*.txt`, `pyproject.toml`, `setup.py`, `Pipfile.lock`,
+  `poetry.lock`, `uv.lock`, `package-lock.json`, `yarn.lock` or
+  `pnpm-lock.yaml`, agent-loop logs one hint per run. It never installs
+  anything on its own.
+- A PR that changes a key file still runs against the base environment;
+  per-PR dependency environments are planned separately (#1630, stage 3).
 
 ### Reviewer blocking scope and declared non-goals
 

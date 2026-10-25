@@ -92,7 +92,8 @@
   "workdir_guard",
   "workdirs",
   "worker_telemetry",
-  "workflow_transaction"
+  "workflow_transaction",
+  "worktree_setup"
  ],
  "surface": [
   "AGENT_ISSUE_PR_HANDOFF_RE",
