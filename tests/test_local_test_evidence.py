@@ -6636,12 +6636,17 @@ def test_live_acking_client_survives_a_host_wait_longer_than_the_ack_timeout(tmp
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="FIONREAD queue sampling")
-def test_draining_client_under_sustained_output_is_never_cancelled(tmp_path, monkeypatch):
-    """Row sustained-output-draining-client: liveness is acked drain progress.
+@pytest.mark.parametrize("acks", [True, False], ids=["acking-drainer", "non-acking-drainer"])
+def test_draining_client_under_sustained_output_is_never_cancelled(tmp_path, monkeypatch, acks):
+    """Row sustained-output-draining-client: liveness is acked progress, never queue depth.
 
-    The client drains slower than the target writes, so its receive queue
-    never empties during the run (sampled with FIONREAD at every frame); it
-    still reaches each heartbeat in FIFO order, acks it, and is never lost.
+    Both variants drain the same sustained output at the same rate, so the
+    receive queue (sampled with FIONREAD at every frame) stays non-empty and
+    keeps falling and refilling: a detector that took queue decreases as
+    progress would see a steady stream of them in both.  The acking drainer
+    reaches each heartbeat in FIFO order, acks it and passes; the identical
+    drainer that never acks is lost at the ack timeout and its target is
+    stopped.  So only acknowledgements keep a request alive.
     """
     import fcntl
     import termios
@@ -6649,20 +6654,25 @@ def test_draining_client_under_sustained_output_is_never_cancelled(tmp_path, mon
     timeout = 3.0
     monkeypatch.setattr(evidence_module, "BROKER_CLIENT_ACK_TIMEOUT_SECONDS", timeout)
     monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 0.2)
+    run_seconds = 8
     argv = (
         sys.executable, "-c",
-        "import time\nend = time.monotonic() + 8\n"
+        f"import time\nend = time.monotonic() + {run_seconds}\n"
         "while time.monotonic() < end:\n    print('y' * 512, flush=True)\n",
     )
-    server = BrokerServer(root=tmp_path, turn_id="turn-1653-drain").start()
+    server = BrokerServer(root=tmp_path, turn_id=f"turn-1653-drain-{acks}").start()
     try:
         client = _open_client(server, _group_request(server, tmp_path, "a9" * 16, argv, timeout=60))
         client.settimeout(15)
         samples = []
         beats = []
         started = time.monotonic()
+        final = None
         while True:
-            frame = evidence_module._recv_frame(client)
+            try:
+                frame = evidence_module._recv_frame(client)
+            except BrokerProtocolError:
+                break  # the lost client's connection was closed by the broker
             pending = fcntl.ioctl(client.fileno(), termios.FIONREAD, struct.pack("i", 0))
             samples.append((time.monotonic() - started, struct.unpack("i", pending)[0]))
             if frame.get("type") != "output":
@@ -6670,32 +6680,34 @@ def test_draining_client_under_sustained_output_is_never_cancelled(tmp_path, mon
                 break
             if frame.get("data") == "":
                 beats.append(time.monotonic() - started)
-                # Best effort, as in the real client: the final beat may be
-                # read after the broker sent its result and closed.
-                evidence_module._send_ack(client, 15)
+                if acks:
+                    # Best effort, as in the real client: the final beat may be
+                    # read after the broker sent its result and closed.
+                    evidence_module._send_ack(client, 15)
             time.sleep(0.002)  # drain slower than the target writes
+        finished = time.monotonic() - started
         client.close()
-        assert final["outcome"] == "passed", final
-        # Pressure interval: the queue is non-empty and non-decreasing across
-        # more than one ack window.  Per 0.5 s bucket the peak depth never
-        # falls (one frame of read/refill jitter allowed), so liveness could
-        # not have come from a shrinking queue; only acknowledgements kept the
-        # request alive.
-        start, end = 1.0, 1.0 + 2 * timeout
-        window = [queued for at, queued in samples if start <= at <= end]
+        # The pressure condition holds in both variants: the queue never
+        # empties and repeatedly decreases while the client drains it.  The
+        # acking window spans a full ack timeout; the non-acking one ends just
+        # before its deadline (the request start plus the timeout).
+        lo, hi = (0.5, 0.5 + timeout) if acks else (0.5, timeout - 0.2)
+        window = [queued for at, queued in samples if lo <= at <= hi]
         assert window and min(window) > 0
-        frame_jitter = 1024
-        peaks = []
-        bucket = start
-        while bucket < end:
-            values = [queued for at, queued in samples if bucket <= at < bucket + 0.5]
-            assert values, bucket
-            peaks.append(max(values))
-            bucket += 0.5
-        assert all(later >= earlier - frame_jitter for earlier, later in zip(peaks, peaks[1:])), peaks
-        assert len([at for at in beats if start <= at <= end]) >= 3
+        decreases = sum(1 for earlier, later in zip(window, window[1:]) if later < earlier)
+        assert decreases >= 20, decreases
+        assert len([at for at in beats if lo <= at <= hi]) >= 3
+        assert _broker_idle(server, 30)
         (row,) = server.journal
-        assert row.provenance == "parent-observed" and row.outcome == "passed"
+        if acks:
+            assert final is not None and final["outcome"] == "passed", final
+            assert row.provenance == "parent-observed" and row.outcome == "passed"
+        else:
+            # Queue decreases are not progress: the drainer is lost at the
+            # ack timeout, long before the target's own 8 s of output ends.
+            assert finished < run_seconds, finished
+            assert row.provenance == "telemetry-unverified" and row.outcome == "incomplete"
+            assert row.caveats[0] == BROKER_CLIENT_LOST_CAVEAT
     finally:
         server.stop()
 
