@@ -224,6 +224,7 @@ from .runner import Runner
 from .salvage import SalvageContext
 from .usage import RunUsageContext
 from .workdirs import active_workdir
+from .worktree_hints import dependency_remedy
 from .workdir_guard import (
     validate_response_tests_within_workdir,
     validate_test_observation_citations_within_workdir,
@@ -9243,6 +9244,7 @@ def run_pr_loop(
                     validate_test_observation_citations_within_workdir(
                         coder_response.marker_value.test_observations,
                         assigned_workdir=active_workdir(config),
+                        dependency_hint=dependency_remedy(config, active_workdir(config)),
                     )
                     raw_structured_coder_response = coder_output
                     if coder_response.marker_value.dropped_resolved_addressed_items:

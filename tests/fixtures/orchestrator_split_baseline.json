@@ -93,6 +93,7 @@
   "workdirs",
   "worker_telemetry",
   "workflow_transaction",
+  "worktree_hints",
   "worktree_setup"
  ],
  "surface": [

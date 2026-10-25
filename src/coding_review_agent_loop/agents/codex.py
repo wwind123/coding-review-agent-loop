@@ -17,6 +17,7 @@ from .base import (
     with_public_response_file_instruction,
     with_sandboxed_last_message_instruction,
 )
+from ..worktree_hints import dependency_hint_environment
 from ..logging import agent_log_path, log
 from ..runner import CommandResult, Runner, executable_identity_changed
 from ..coder_ci_guard import coder_ci_guard_environment
@@ -357,6 +358,8 @@ class CodexBackend:
             last_message_args = []
         agent_env = {
             "AGENT_LOOP_WORKDIR": str(config.codex_dir.resolve()),
+            # Advisory remedy text only (#1651); never evidence or outcome.
+            **dependency_hint_environment(config, config.codex_dir),
             "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
                 config.coder_test_command_timeout_seconds
             ),

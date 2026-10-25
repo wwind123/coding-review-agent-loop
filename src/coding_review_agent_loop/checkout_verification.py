@@ -188,7 +188,12 @@ def _check_links(config, runner, path: Path, links: dict[bytes, bytes]) -> None:
     for link, target in sorted(links.items()):
         name = _disp(link)
         if not link_intact(path, link, target):
-            raise _Incomplete(f"worktree link {name} was removed, retargeted or reached through a symlink")
+            from .worktree_hints import replaced_link_remedy
+
+            raise _Incomplete(
+                f"worktree link {name} was removed, retargeted or reached through a symlink. "
+                + replaced_link_remedy(config, path, name)
+            )
         if _probe(config, runner, path, ("ls-files", "-z", "--full-name", "--", f":(literal){name}")):
             raise _Incomplete(f"worktree link {name} is staged in the index")
         if _probe(config, runner, path, ("ls-tree", "-z", "--full-tree", "--name-only", "HEAD", "--", name)):
@@ -225,6 +230,11 @@ def forget_checkout(path: Path) -> None:
 def has_entry(path: Path) -> bool:
     with _LEDGER_LOCK:
         return _key(path) in _LEDGER
+
+
+def has_poisoned_entry(path: Path) -> bool:
+    with _LEDGER_LOCK:
+        return isinstance(_LEDGER.get(_key(path)), _Poisoned)
 
 
 def poison_checkout(path: Path, reason: str) -> None:

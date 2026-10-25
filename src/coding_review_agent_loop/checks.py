@@ -97,6 +97,14 @@ def _record_gate_observation(config: AgentLoopConfig, result) -> None:
     )
 
 
+def _dependency_remedy_suffix(config: AgentLoopConfig, cwd) -> str:
+    """Advisory remedy for an unlinked per-run worktree (#1651); text only."""
+    from .worktree_hints import dependency_remedy
+
+    remedy = dependency_remedy(config, cwd)
+    return f"\n{remedy}" if remedy else ""
+
+
 def _raise_for_gate_result(result, config: AgentLoopConfig) -> None:
     if getattr(result, "overlap_rejected", False):
         raise AgentLoopError(
@@ -109,6 +117,7 @@ def _raise_for_gate_result(result, config: AgentLoopConfig) -> None:
             "Local test command could not start; this is a launcher/bootstrap failure, "
             f"not a test-suite result: {' '.join(result.args)}\n{detail}\n"
             "Repair the configured executable or interpreter and retry the configured command."
+            + _dependency_remedy_suffix(config, getattr(result, "cwd", None))
         )
     evidence = getattr(result, "containment", None)
     if evidence is not None and evidence.resource_exhausted and result.outcome != "passed":

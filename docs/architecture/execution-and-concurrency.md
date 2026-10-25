@@ -2,7 +2,7 @@
 
 How agent and Git processes run: per-run worktrees over a shared store, the agent-loop-owned Git boundary and private fetch transport with SSH identity selection, pre-turn checkout verification, process-tree containment, test interpreter and worker budgets, pre-collection launch-failure provenance, the Antigravity quota-group fallback, the opt-in quota reset wait, the agent-loop executable pin with its receipt tool identity, and the other entry paths outside the review loop.
 
-Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/worktree_setup.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/agent_executable.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_worktree_setup.py`, `tests/test_containment.py`, `tests/test_test_workers.py`, `tests/test_agent_executable.py`.
+Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/worktree_setup.py`, `src/coding_review_agent_loop/worktree_hints.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/agent_executable.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_worktree_setup.py`, `tests/test_worktree_dependency_hints.py`, `tests/test_containment.py`, `tests/test_test_workers.py`, `tests/test_agent_executable.py`.
 
 ## Execution and Concurrency
 
@@ -79,6 +79,22 @@ only logs. After linking, a read-only `git check-ignore --no-index` probe in the
 new worktree warns when a link is not ignored as a symlink (never failing,
 never writing ignore state), and with neither setup nor link flags a one-line
 hint per run names dependency manifests found in the pinned tree.
+
+**Dependency remedy text (`worktree_hints.py`).** Launch-failure and refusal
+diagnostics add one sentence naming `--worktree-link` and `--worktree-setup`
+only for a default per-run worktree with no configured link, decided from
+parent-owned config (`run_worktree_store` and `config.worktree_links`), never
+from the process-local link registry. Parent-side sites (the coder test gate
+and the workdir guard's out-of-checkout executable refusal) read the config
+directly. A `run-tests` client cannot see that config, so each backend exports
+`AGENT_LOOP_WORKTREE_DEPENDENCY_HINT=unlinked-run-worktree` into the agent
+environment under the same condition; the client reads it only to print one
+extra stderr line after a launch failure or a pre-collection failure, and
+never for classification, outcome, evidence or exit code. A replaced-link
+refusal names the link source in the shared clone. When a poisoned run
+worktree stops an issue run and its branch has a remote-tracking ref, the stop
+appends a `managed-pr --head` resume and the manual worktree-removal command;
+the worktree is left in place.
 
 **Incremental import.** `import_ref` exports only objects not reachable from
 destination ref tips that the private fetch repository also holds as commits:

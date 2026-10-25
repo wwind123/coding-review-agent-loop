@@ -966,3 +966,105 @@ def test_hidden_gemini_response_root_does_not_block_worktree_removal_or_prune(tm
     assert orphan_admin.exists()
     prepare(env.config(), Runner())
     assert not orphan_admin.exists()
+
+
+# --- stage-2 diagnostics (#1651) ---------------------------------------------
+
+
+def test_replaced_worktree_link_refusal_names_store_source_and_remedy(tmp_path, monkeypatch):
+    from coding_review_agent_loop import checkout_verification as cv
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+
+    env = Env(tmp_path, monkeypatch)
+    commit_gitignore(env, "/.venv\n")
+    env.seed_stores()
+    config = env.config(extra=("--worktree-link", ".venv"))
+    with workdir_claim_scope(command="task"):
+        runner = prepare_inline(config)
+        root = config.claude_dir
+        store = default_agent_workdir("OWNER/REPO", "claude")
+        cv.verify_checkout(config, runner, path=root, agent="claude", purpose="agent turn")
+        other = tmp_path / "private-venv"
+        other.mkdir()
+        (root / ".venv").unlink()
+        (root / ".venv").symlink_to(other)
+        with pytest.raises(CheckoutVerificationError) as direct:
+            cv.check_worktree_links(config, runner, root)
+        cv.record_checkout_baseline(config, runner, root, source="agent turn")
+        with pytest.raises(CheckoutVerificationError) as poisoned:
+            cv.verify_checkout(config, runner, path=root, agent="claude", purpose="agent turn")
+    for message in (str(direct.value), str(poisoned.value)):
+        assert "worktree link .venv was removed, retargeted or reached through a symlink" in message
+        assert str(store / ".venv") in message
+        assert "PR-local dependency support" in message
+        assert "--<agent>-dir checkout" in message
+    assert "can no longer be trusted" in str(poisoned.value)
+
+
+def _push_branch_from(root: Path, branch: str) -> None:
+    git(root, "checkout", "-q", "-b", branch)
+    (root / "work.txt").write_text("work")
+    git(root, "add", "work.txt")
+    git(root, "commit", "-q", "-m", "work")
+
+
+def test_poisoned_after_push_stop_prints_resume_and_cleanup(tmp_path, monkeypatch):
+    from coding_review_agent_loop import checkout_verification as cv
+    from coding_review_agent_loop import issue_loop
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+    from coding_review_agent_loop.worktree_hints import add_pushed_branch_recovery
+
+    env = Env(tmp_path, monkeypatch)
+    env.seed_stores()
+    config = env.config()
+    branch = "agent-loop/managed-1651"
+    with workdir_claim_scope(command="task"):
+        runner = prepare_inline(config)
+        root = config.claude_dir
+        store = default_agent_workdir("OWNER/REPO", "claude")
+        _push_branch_from(root, branch)
+        cv.poison_checkout(root, "baseline capture after agent turn failed: link replaced")
+        with pytest.raises(CheckoutVerificationError) as caught:
+            cv.verify_checkout(config, runner, path=root, agent="claude", purpose="agent turn")
+        # Not pushed yet: no recovery text, the refusal is unchanged.
+        assert add_pushed_branch_recovery(caught.value, runner=runner, config=config, issue_number=1651) is None
+        git(root, "push", "-q", "origin", branch)
+        recovered = add_pushed_branch_recovery(caught.value, runner=runner, config=config, issue_number=1651)
+        assert isinstance(recovered, CheckoutVerificationError)
+        message = str(recovered)
+        assert message.startswith(str(caught.value))
+        assert f"agent-loop managed-pr --head {branch} --expected-closing-issue 1651" in message
+        assert f"git -C {store} worktree remove --force {root}" in message
+        # Applied once only, and never to an error that is not a checkout refusal.
+        assert add_pushed_branch_recovery(recovered, runner=runner, config=config, issue_number=1651) is None
+        assert add_pushed_branch_recovery(
+            AgentLoopError("x"), runner=runner, config=config, issue_number=1651
+        ) is None
+
+        # The issue-run stop carries the same text, and keeps refusing.
+        def refuse(*_args, **_kwargs):
+            raise caught.value
+
+        monkeypatch.setattr(issue_loop, "_normalize_requested_execution_policy", refuse)
+        with pytest.raises(CheckoutVerificationError) as stopped:
+            issue_loop.run_issue_loop(runner, issue_number=1651, config=config)
+        assert f"--head {branch} --expected-closing-issue 1651" in str(stopped.value)
+        assert "worktree remove --force" in str(stopped.value)
+        # The worktree is never removed automatically.
+        assert root.is_dir() and (root / "work.txt").exists()
+        assert cv.has_poisoned_entry(root)
+
+
+def test_unpoisoned_checkout_gets_no_pushed_branch_recovery(tmp_path, monkeypatch):
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+    from coding_review_agent_loop.worktree_hints import add_pushed_branch_recovery
+
+    env = Env(tmp_path, monkeypatch)
+    env.seed_stores()
+    config = env.config()
+    with workdir_claim_scope(command="task"):
+        runner = prepare_inline(config)
+        _push_branch_from(config.claude_dir, "feature-x")
+        git(config.claude_dir, "push", "-q", "origin", "feature-x")
+        error = CheckoutVerificationError("changed outside agent-loop")
+        assert add_pushed_branch_recovery(error, runner=runner, config=config, issue_number=7) is None

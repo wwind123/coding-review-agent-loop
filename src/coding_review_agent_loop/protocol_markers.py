@@ -454,6 +454,8 @@ EXCLUDED_PROTOCOL_LITERALS = frozenset(
         "AGENT_LOOP_TRUSTED_BASES",
         "AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1",
         "AGENT_LOOP_WORKDIR",
+        # Advisory per-run-worktree dependency remedy selector (#1651).
+        "AGENT_LOOP_WORKTREE_DEPENDENCY_HINT",
         "AGENT_LOOP_GIT_GUARD_PROBE_FD",
         "AGENT_LOOP_GIT_SSH_IDENTITY",
         # Operator capture-log retention setting (#1572).
