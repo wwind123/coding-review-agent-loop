@@ -1650,6 +1650,30 @@ never trips the client's receive timeout; stopping the broker cancels pending
 admission, no target launches after the owning turn ends, and a target that
 had already started is recorded as run but unattributed. Every broker send is
 bounded, so a client that stops reading cannot stall admission or shutdown.
+The wait notice says that the command holds this run's test lane while it
+waits; let it finish rather than killing it. A killed, disconnected or
+non-reading `run-tests` client is cancelled by the broker (issue #1653): the
+client acknowledges every heartbeat, and EOF, a reset, a stream send that
+wedges (10 s) or no acknowledged progress for 30 s marks it lost. A lost
+client's request that is still waiting for host capacity, probing or in
+fixture setup is cancelled without launching anything (a fixture supervisor
+that already started gets its graceful teardown), and its command lane,
+worker-budget lock and host reservation are released, so the identical command
+can run again at once. A lost client's running target is stopped like a
+watchdog expiry: the whole process group, including a descendant that ignores
+SIGTERM, is confirmed gone before the lane is released (if it cannot be
+confirmed, both the lane and the worker budget stay held until it is), a
+fixture's teardown and sweep finish before either lock is released, and the run is
+journaled as a `telemetry-unverified` `incomplete` row with the caveat
+`run-tests client disconnected; target stopped by the broker`, which is never
+an authoritative failure. A client that does not announce acknowledgements
+(an older `agent-loop`) gets a visible no-test refusal (exit 125) that names
+the run's pinned executable, before any lock is taken and with no local
+fallback. Every no-test refusal (`overlap-rejected`, `worker-budget-busy`,
+`worker-budget-refused`, `cancelled`) is streamed to the client and printed
+again after the receipt line as `agent-loop: no test ran (<outcome>):
+<reason>`; a lock held by another request of the same broker is named with
+its command, phase and age.
 Every reservation has its own record, so a
 share left behind by an earlier command of the same invocation keeps counting.
 The reservation is anchored to the target atomically at launch: the spawned

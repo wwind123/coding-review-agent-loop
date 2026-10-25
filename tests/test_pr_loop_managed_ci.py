@@ -4,6 +4,10 @@ import dataclasses
 
 import pytest
 
+# A private response root per test: the shared $TMPDIR one races across
+# xdist workers (#1653 CI).
+pytestmark = pytest.mark.usefixtures("private_response_tempdir")
+
 from coding_review_agent_loop.ci_health import CiInfrastructureStall, StalledCheck
 from coding_review_agent_loop.cli import AgentLoopError, run_pr_loop
 from coding_review_agent_loop.github import (

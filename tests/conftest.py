@@ -47,6 +47,27 @@ def _no_real_repair():
         yield
 
 
+@pytest.fixture
+def private_response_tempdir(tmp_path, monkeypatch):
+    """Give a test its own response root instead of $TMPDIR's shared one.
+
+    Every xdist worker otherwise hardens the same
+    ``$TMPDIR/coding-review-agent-loop/responses/OWNER-REPO`` tree, and one
+    worker's brief mode change can make another's listing fail (#1653 CI).
+    """
+    import tempfile
+
+    from coding_review_agent_loop import agent_permissions
+
+    private = tmp_path / "private-response-tmp"
+    private.mkdir()
+    private.chmod(0o700)
+    monkeypatch.setattr(tempfile, "tempdir", str(private))
+    agent_permissions.reset_sandbox_state()
+    yield private
+    agent_permissions.reset_sandbox_state()
+
+
 @pytest.fixture(autouse=True)
 def _isolated_agy_log_dir(monkeypatch, tmp_path_factory):
     """Never list or read the host's real agy CLI log directory (#1604)."""

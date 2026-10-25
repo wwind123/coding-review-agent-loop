@@ -491,6 +491,8 @@ EXCLUDED_PROTOCOL_LITERALS = frozenset(
         "AGENT_LOOP_RUN_TESTS_TOOL_COMMIT",
         "AGENT_LOOP_RUN_TESTS_TOOL_DIRTY",
         "AGENT_LOOP_RUN_TESTS_TOOL_PACKAGE",
+        # Broker client heartbeat-acknowledgement capability (#1653).
+        "AGENT_LOOP_BROKER_CLIENT_ACKS",
         "AGENT_STATE",
         "AGENT_PLAN_STATE",
         "AGENT_PR",

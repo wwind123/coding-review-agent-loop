@@ -5456,3 +5456,61 @@ def test_issue_run_refuses_misplaced_spool_before_any_coder_turn(tmp_path, monke
     assert "overlaps the agent checkout" in error
     assert "invocation start" in error
     assert not (codex / ".agent-loop" / "private").exists()
+
+
+# --- run-tests no-test refusal reasons (issue #1653) --------------------------
+
+
+@pytest.mark.parametrize(
+    "outcome, returncode",
+    [
+        ("overlap-rejected", 125),
+        ("worker-budget-busy", 125),
+        ("worker-budget-refused", 126),
+        ("cancelled", None),
+    ],
+)
+@pytest.mark.parametrize("fixture", [None, "fixture.py"], ids=["fixture-less", "fixture"])
+@pytest.mark.parametrize("source", ["diagnostic", "output_tail"])
+def test_run_tests_prints_the_no_test_reason_after_the_receipt_on_both_broker_branches(
+    tmp_path, monkeypatch, capsys, outcome, returncode, fixture, source
+):
+    """Row refusal-text-client: one shared helper on both CLI broker branches."""
+    from coding_review_agent_loop.fixture_runtime import fold_exit_code
+    from coding_review_agent_loop.local_test_evidence import BrokerRunResult
+
+    reason = f"agent-loop: {outcome} because another command holds the lane"
+    result = BrokerRunResult(
+        receipt_id="", execution_ref=None, outcome=outcome, returncode=returncode,
+        elapsed_seconds=0.0, inner_exec="not-attempted", suite_start="not-started",
+        **({"diagnostic": reason} if source == "diagnostic" else {"output_tail": reason}),
+    )
+
+    class FakeBroker:
+        def run(self, *args, **kwargs):
+            return result
+
+    recorded = []
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker())
+    monkeypatch.setattr(cli_module, "record_launcher_health", lambda *a, **k: recorded.append("health"))
+    monkeypatch.setattr(cli_module, "record_test_observation", lambda *a, **k: recorded.append("timing"))
+    monkeypatch.setattr(cli_module, "_record_run_tests_result", lambda *a, **k: recorded.append("timing"))
+    monkeypatch.chdir(tmp_path)
+    command = ["run-tests", "--timeout-seconds", "40", "--memory-dir", str(tmp_path / "memory")]
+    if fixture:
+        command += ["--fixture", fixture]
+    code = cli_module.main([*command, "--", sys.executable, "-c", "pass"])
+    err = capsys.readouterr().err
+    expected = (
+        fold_exit_code(
+            outcome=outcome, returncode=returncode, inner_exec="not-attempted", fixture=None,
+            cancelled_frame=outcome == "cancelled",
+        )
+        if fixture else (returncode if returncode is not None else 1)
+    )
+    assert code == expected
+    line = f"agent-loop: no test ran ({outcome}): {reason}"
+    assert line in err
+    if not fixture:
+        assert err.index("agent-loop test observation receipt:") < err.index(line)
+    assert recorded == []

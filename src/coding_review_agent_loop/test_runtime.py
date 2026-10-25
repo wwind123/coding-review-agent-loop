@@ -128,6 +128,22 @@ class TestRuntimeConfigurationError(AgentLoopError):
     """A wrapper policy was malformed or exceeded its inherited ceiling."""
 
 
+def command_lane_key(
+    argv: Sequence[str],
+    *,
+    cwd: Path,
+    env: Mapping[str, str] | None = None,
+    identity: str | None = None,
+) -> str:
+    """The exact key of the command lane ``argv`` would take in ``cwd``."""
+    values = env if env is not None else os.environ
+    invocation_id = values.get("AGENT_LOOP_INVOCATION_ID", "standalone")
+    # ``identity`` replaces only the normalized-argv component; cwd and
+    # the invocation stay in the key exactly as before.
+    normalized = identity if identity is not None else normalize_test_command(argv, cwd=cwd)
+    return f"{cwd.resolve()}\0{normalized}\0{invocation_id}"
+
+
 class CommandLaneLock:
     """Non-inherited advisory lock for one canonical test command lane."""
 
@@ -146,11 +162,7 @@ class CommandLaneLock:
         identity: str | None = None,
     ) -> "CommandLaneLock | None":
         values = env if env is not None else os.environ
-        invocation_id = values.get("AGENT_LOOP_INVOCATION_ID", "standalone")
-        # ``identity`` replaces only the normalized-argv component; cwd and
-        # the invocation stay in the key exactly as before.
-        normalized = identity if identity is not None else normalize_test_command(argv, cwd=cwd)
-        key = f"{cwd.resolve()}\0{normalized}\0{invocation_id}"
+        key = command_lane_key(argv, cwd=cwd, env=env, identity=identity)
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         root = Path(values.get("XDG_RUNTIME_DIR", "")) / "agent-loop" / COMMAND_LANE_LOCK_DIR
         if str(root) == f"agent-loop/{COMMAND_LANE_LOCK_DIR}":
