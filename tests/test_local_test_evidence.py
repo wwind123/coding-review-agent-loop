@@ -6492,25 +6492,67 @@ def test_connected_client_that_stops_reading_a_quiet_target_is_cancelled_by_the_
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="process-group census via /proc")
 def test_client_that_stops_reading_with_a_full_socket_is_lost_at_its_last_ack_deadline(tmp_path, monkeypatch):
-    """Row undeliverable-heartbeat-full-socket: no heartbeat can be delivered at all."""
-    timeout = 5.0
+    """Row undeliverable-heartbeat-full-socket: no heartbeat can be delivered at all.
+
+    The client reads and acks every heartbeat, then stops reading. A finite
+    output burst then fills the broker's send buffer, so no heartbeat is
+    outstanding and every later probe writes zero bytes; loss must still fire
+    one ack timeout after the last acknowledgement.
+    """
+    timeout = 4.0
     monkeypatch.setattr(evidence_module, "BROKER_CLIENT_ACK_TIMEOUT_SECONDS", timeout)
     monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 0.2)
-    _blocked_first_sender(monkeypatch)  # the socket is full of complete frames
+    real_sender = evidence_module._ConnectionSender
+    senders = []
+    probes = []
+
+    class Recording(real_sender):
+        def __init__(self, connection, cancel):
+            super().__init__(connection, cancel)
+            senders.append(self)
+
+        def send(self, payload, **kwargs):
+            result = super().send(payload, **kwargs)
+            if kwargs.get("skip_if_busy") and payload == {"type": "output", "data": ""}:
+                probes.append((time.monotonic(), result))
+            return result
+
+    monkeypatch.setattr(evidence_module, "_ConnectionSender", Recording)
     base, argv = _group_case(tmp_path)
     server = BrokerServer(root=tmp_path, turn_id="turn-1653-full").start()
     try:
         client = _open_client(server, _group_request(server, tmp_path, "e1" * 16, argv))
         client.settimeout(5)
-        for _ in range(2):  # read and acknowledge a burst, then stop reading
-            frame = evidence_module._recv_frame(client)
-            assert frame == {"type": "output", "data": ""}
-            evidence_module._send_frame(client, {"type": "ack"})
-        last_ack = time.monotonic()
         leader, child = _group_pids(base)
+        acked = 0
+        while acked < 3:  # a live client: every heartbeat so far is acknowledged
+            frame = evidence_module._recv_frame(client)
+            if frame == {"type": "output", "data": ""}:
+                evidence_module._send_frame(client, {"type": "ack"})
+                acked += 1
+        last_ack = time.monotonic()
+        sender = senders[0]
+        burst = 0
+        with sender._lock:  # the finite output burst, written as whole frames
+            for data in ("z" * 1024, "z"):
+                raw = json.dumps({"type": "output", "data": data}, separators=(",", ":")).encode()
+                frame_bytes = struct.pack(">I", len(raw)) + raw
+                while True:
+                    try:
+                        sent = sender._connection.send(frame_bytes, socket.MSG_DONTWAIT)
+                    except BlockingIOError:
+                        break
+                    assert sent == len(frame_bytes)
+                    burst += 1
+        filled_at = time.monotonic()
+        assert burst > 0
         assert _broker_idle(server, 30)
         elapsed = time.monotonic() - last_ack
         assert timeout - 1.0 <= elapsed < timeout + 8, elapsed
+        after_fill = [result for at, result in probes if at > filled_at]
+        assert len(after_fill) >= 3  # the monitor kept probing...
+        assert not any(after_fill)  # ...and no probe could deliver a single byte
+        assert not sender.wedged or elapsed >= timeout - 1.0
         assert not _pid_alive(leader) and not _pid_alive(child)
         _assert_lost_row(server)
         client.close()
@@ -6593,23 +6635,52 @@ def test_live_acking_client_survives_a_host_wait_longer_than_the_ack_timeout(tmp
         server.stop()
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="FIONREAD queue sampling")
 def test_draining_client_under_sustained_output_is_never_cancelled(tmp_path, monkeypatch):
-    """Row sustained-output-draining-client: liveness is acked drain progress."""
-    monkeypatch.setattr(evidence_module, "BROKER_CLIENT_ACK_TIMEOUT_SECONDS", 1.5)
+    """Row sustained-output-draining-client: liveness is acked drain progress.
+
+    The client drains slower than the target writes, so its receive queue
+    never empties during the run (sampled with FIONREAD at every frame); it
+    still reaches each heartbeat in FIFO order, acks it, and is never lost.
+    """
+    import fcntl
+    import termios
+
+    timeout = 3.0
+    monkeypatch.setattr(evidence_module, "BROKER_CLIENT_ACK_TIMEOUT_SECONDS", timeout)
     monkeypatch.setattr(workers_module, "HOST_WAIT_HEARTBEAT_SECONDS", 0.2)
     argv = (
         sys.executable, "-c",
-        "import time\nend = time.monotonic() + 5\n"
+        "import time\nend = time.monotonic() + 8\n"
         "while time.monotonic() < end:\n    print('y' * 512, flush=True)\n",
     )
     server = BrokerServer(root=tmp_path, turn_id="turn-1653-drain").start()
     try:
-        reader = _FrameReader(server, _group_request(server, tmp_path, "a9" * 16, argv, timeout=30))
-        reader.join(30)
-        assert reader.error is None and reader.final["outcome"] == "passed", reader.final
-        assert len(reader.beats) >= 5  # beats interleaved with the stream and were acked
+        client = _open_client(server, _group_request(server, tmp_path, "a9" * 16, argv, timeout=60))
+        client.settimeout(15)
+        samples = []
+        beats = []
+        started = time.monotonic()
+        while True:
+            frame = evidence_module._recv_frame(client)
+            pending = fcntl.ioctl(client.fileno(), termios.FIONREAD, struct.pack("i", 0))
+            samples.append((time.monotonic() - started, struct.unpack("i", pending)[0]))
+            if frame.get("type") != "output":
+                final = frame
+                break
+            if frame.get("data") == "":
+                beats.append(time.monotonic() - started)
+                # Best effort, as in the real client: the final beat may be
+                # read after the broker sent its result and closed.
+                evidence_module._send_ack(client, 15)
+            time.sleep(0.002)  # drain slower than the target writes
+        client.close()
+        assert final["outcome"] == "passed", final
+        window = [queued for at, queued in samples if 1.0 <= at <= 1.0 + 2 * timeout]
+        assert window and min(window) > 0  # the queue never emptied across two ack windows
+        assert len([at for at in beats if 1.0 <= at <= 1.0 + 2 * timeout]) >= 3
         (row,) = server.journal
-        assert row.provenance == "parent-observed"
+        assert row.provenance == "parent-observed" and row.outcome == "passed"
     finally:
         server.stop()
 
@@ -6831,3 +6902,45 @@ def test_legacy_shaped_cli_request_prints_the_reason_and_never_runs_locally(tmp_
     assert "agent-loop: no test ran (cancelled): agent-loop: this run-tests client predates" in err
     assert "running locally" not in err and local == [] and not marker.exists()
     assert server.journal == ()
+
+
+@pytest.mark.parametrize("kind", ["lane", "worker-budget"])
+def test_refusal_names_the_request_that_really_holds_the_lock(tmp_path, monkeypatch, kind):
+    """Item: an older request still in its before snapshot is never named as the holder."""
+    real_stable = evidence_module.stable_tracked_tree_snapshot
+    release = threading.Event()
+    stalled = threading.Event()
+    calls = []
+
+    def stall_first(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:  # request A: oldest, but never reaches the locks
+            stalled.set()
+            assert release.wait(60)
+        return real_stable(*args, **kwargs)
+
+    monkeypatch.setattr(evidence_module, "stable_tracked_tree_snapshot", stall_first)
+    server, _locks = _wait_server(tmp_path, f"turn-1653-holder-{kind}")
+    holder_argv = (sys.executable, "-c", "import time; time.sleep(4)  # holder B")
+    other_argv = (sys.executable, "-c", "pass  # refused C")
+    a_argv = holder_argv if kind == "lane" else (sys.executable, "-c", "pass  # stalled A")
+    c_argv = holder_argv if kind == "lane" else other_argv
+    try:
+        a = _FrameReader(server, _group_request(server, tmp_path, "f7" * 16, a_argv, timeout=30))
+        assert stalled.wait(15)
+        b = _FrameReader(server, _group_request(server, tmp_path, "f8" * 16, holder_argv, timeout=30))
+        assert _await(lambda: bool(server._active_processes), 15)
+        c = _FrameReader(server, _group_request(server, tmp_path, "f9" * 16, c_argv, timeout=30))
+        c.join(20)
+        expected = "overlap-rejected" if kind == "lane" else "worker-budget-busy"
+        assert c.final["outcome"] == expected, c.final
+        diagnostic = c.final["diagnostic"]
+        assert f"Held by: `{redact_test_command(holder_argv)[0]}` (running, " in diagnostic
+        assert "preparing" not in diagnostic
+        if kind != "lane":
+            assert redact_test_command(a_argv)[0] not in diagnostic
+        b.join(30)
+        assert b.final["outcome"] == "passed"
+    finally:
+        release.set()
+        server.stop()

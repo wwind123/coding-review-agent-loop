@@ -1661,7 +1661,9 @@ that already started gets its graceful teardown), and its command lane,
 worker-budget lock and host reservation are released, so the identical command
 can run again at once. A lost client's running target is stopped like a
 watchdog expiry: the whole process group, including a descendant that ignores
-SIGTERM, is confirmed gone before the lane is released, and the run is
+SIGTERM, is confirmed gone before the lane is released (if it cannot be
+confirmed, both the lane and the worker budget stay held until it is), a
+fixture's teardown and sweep finish before either lock is released, and the run is
 journaled as a `telemetry-unverified` `incomplete` row with the caveat
 `run-tests client disconnected; target stopped by the broker`, which is never
 an authoritative failure. A client that does not announce acknowledgements

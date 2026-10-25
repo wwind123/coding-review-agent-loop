@@ -330,14 +330,57 @@ def _close_held_fds(held_fds: tuple[int, int, int, int] | None) -> None:
             pass
 
 
+class _ObservedLock:
+    """A lock whose ownership is reported to a broker observer (issue #1653).
+
+    The observer learns the exact moment this command holds or releases the
+    command lane or the worker-budget lock, so a refusal can name the request
+    that really holds it.  Every other attribute is delegated.
+    """
+
+    def __init__(self, lock: Any, kind: str, observer: Callable[[str, bool], None]) -> None:
+        self._lock = lock
+        self._kind = kind
+        self._observer = observer
+        self._released = False
+        self._notify(True)
+
+    def _notify(self, held: bool) -> None:
+        try:
+            self._observer(self._kind, held)
+        except Exception:  # noqa: BLE001 - a diagnostic never changes locking
+            pass
+
+    def close(self) -> None:
+        try:
+            self._lock.close()
+        finally:
+            if not self._released:
+                self._released = True
+                self._notify(False)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._lock, name)
+
+
+def _observed(lock: Any, kind: str, observer: Callable[[str, bool], None] | None) -> Any:
+    return lock if lock is None or observer is None else _ObservedLock(lock, kind, observer)
+
+
 class _HeldTestLocks:
-    """The command lane plus the optional worker-budget lock for one command."""
+    """The command lane plus the optional worker-budget lock for one command.
+
+    ``pre_release`` callbacks (issue #1653: a fixture's teardown and sweep)
+    run before either lock is released, so an identical retry can never start
+    while the old command's cleanup still runs.
+    """
 
     def __init__(self, lane, worker_lock: WorkerBudgetLock | None, decision: WorkerDecision | None):
         self._lane = lane
         self._worker_lock = worker_lock
         self._decision = decision
         self.extra_cleanups: list[Callable[[], None]] = []
+        self.pre_release: list[Callable[[], None]] = []
 
     def record_process_group(self, pgid: int) -> None:
         if self._worker_lock is not None:
@@ -348,13 +391,38 @@ class _HeldTestLocks:
             self._worker_lock.hold_until_group_exits(pgid)
             self._worker_lock = None
 
+    def retain_until_group_exits(self, pgid: int) -> None:
+        """Keep both locks until no member of ``pgid`` survives (issue #1653)."""
+        self.retain_worker_lock_until_group_exits(pgid)
+        lane, self._lane = self._lane, None
+        if lane is None:
+            return
+
+        def release_when_gone() -> None:
+            try:
+                while process_group_alive(pgid):
+                    time.sleep(0.2)
+            finally:
+                lane.close()
+
+        threading.Thread(
+            target=release_when_gone, name=f"agent-loop-lane-hold-{pgid}", daemon=True,
+        ).start()
+
     def close(self) -> None:
         try:
+            pre_release, self.pre_release = self.pre_release, []
+            for callback in pre_release:
+                try:
+                    callback()
+                except Exception:  # noqa: BLE001 - cleanup failure never strands a lock
+                    pass
             if self._worker_lock is not None:
                 self._worker_lock.close()
         finally:
             try:
-                self._lane.close()
+                if self._lane is not None:
+                    self._lane.close()
             finally:
                 try:
                     if self._decision is not None:
@@ -529,7 +597,9 @@ def _run_foreground_test_body(
     host_wait_heartbeat: Callable[[], None] | None = None,
     host_wait_notify: Callable[[str], None] | None = None,
     host_launch_guard: Callable[[], Any] | None = None,
-    lock_holder_describer: Callable[[], str | None] | None = None,
+    lock_holder_describer: Callable[[str], str | None] | None = None,
+    lock_observer: Callable[[str, bool], None] | None = None,
+    before_lock_release: Callable[[], None] | None = None,
     package_script: Any = _UNRESOLVED_PACKAGE_SCRIPT,
     classify_pre_collection: bool = False,
     absolute_deadline: float | None = None,
@@ -568,8 +638,11 @@ def _run_foreground_test_body(
     hook the launcher probe bypasses the per-invocation cache and the launcher
     identity is re-read immediately before the guarded spawn.
 
-    ``lock_holder_describer`` (issue #1653) names the live holder of a lock
-    this command was refused for; the broker passes it.  Every refusal goes
+    ``lock_holder_describer`` (issue #1653) names the live holder of the lock
+    (``"lane"`` or ``"worker-budget"``) this command was refused for;
+    ``lock_observer`` reports when this command holds or releases each lock;
+    ``before_lock_release`` runs (once) before either lock is released, after
+    the post-admission hook was reached.  The broker passes all three.  Every refusal goes
     through ``notify`` so a broker client sees it in its own output.  When
     ``host_wait_cancel`` is set after launch, the target's whole process group
     is confirmed gone before the command lane is released.
@@ -670,12 +743,13 @@ def _run_foreground_test_body(
         env=env,
         identity=(worker_lane_identity(requested_cmd, cwd=cwd) if worker_budget is not None else None),
     )
+    lane_lock = _observed(lane_lock, "lane", lock_observer)
     if lane_lock is None:
         if handle is not None:
             handle.close()
         if decision is not None:
             decision.cleanup()
-        message = refusal_with_holder(OVERLAP_REJECTED_MESSAGE, lock_holder_describer)
+        message = refusal_with_holder(OVERLAP_REJECTED_MESSAGE, lock_holder_describer, "lane")
         notify(message)
         return ForegroundTestResult(
             cmd, cwd, "overlap-rejected", OVERLAP_REJECTED_EXIT_CODE,
@@ -700,6 +774,7 @@ def _run_foreground_test_body(
             cwd=cwd,
             root=worker_lock_root,
         )
+        worker_lock = _observed(worker_lock, "worker-budget", lock_observer)
         if worker_lock is None:
             tel.set_outcome("invocation-busy")
             lane_lock.close()
@@ -709,6 +784,7 @@ def _run_foreground_test_body(
                 decision.cleanup()
             message = refusal_with_holder(
                 worker_budget_busy_message(worker_budget, lock_problem), lock_holder_describer,
+                "worker-budget",
             )
             notify(message)
             return ForegroundTestResult(
@@ -841,6 +917,8 @@ def _run_foreground_test_body(
     # Command lane first, worker-budget lock second; every later release
     # path closes both in reverse order.
     lane_lock = _HeldTestLocks(lane_lock, worker_lock, decision)
+    if before_lock_release is not None:
+        lane_lock.pre_release.append(before_lock_release)
     selector = None
     inherited_scope = False
     inherited_cgroup: Path | None = None
@@ -1480,7 +1558,9 @@ def _run_foreground_test_body(
             # after its leader exited), so a retried identical command can
             # never overlap the old one.
             if not terminate_process_group_fully(proc.pid, proc=proc):
-                lane_lock.retain_worker_lock_until_group_exits(proc.pid)
+                # Unconfirmed: neither the lane nor the worker budget may be
+                # released while a member of the cancelled group survives.
+                lane_lock.retain_until_group_exits(proc.pid)
         if worker_budget is not None and worker_budget.enforcing:
             # Descendants count against the worker ceiling until they are gone:
             # terminate the target's process group before releasing the lock.
@@ -1632,12 +1712,14 @@ class _LauncherChangedBeforeRelease(AgentLoopError):
     """The authenticated launcher identity changed before the held release."""
 
 
-def refusal_with_holder(message: str, describer: Callable[[], str | None] | None) -> str:
+def refusal_with_holder(
+    message: str, describer: Callable[[str], str | None] | None, kind: str,
+) -> str:
     """A no-test refusal with its next step and, when known, its holder (#1653)."""
     holder = None
     if describer is not None:
         try:
-            holder = describer()
+            holder = describer(kind)
         except Exception:  # noqa: BLE001 - a diagnostic never changes the refusal
             holder = None
     text = message

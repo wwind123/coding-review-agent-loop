@@ -3046,6 +3046,8 @@ class _BrokerRequest:
         self.completing = False
         self.processes: dict[int, Any] = {}
         self.fixtures: dict[int, tuple[Any, float]] = {}
+        # The locks this request really holds, reported by the runner.
+        self.holds: set[str] = set()
 
 
 def _host_heartbeat_grace() -> float:
@@ -3817,17 +3819,24 @@ class TestBrokerServer:
         for supervisor, reserve in fixtures:
             supervisor.finish(budget=reserve)
 
-    def _describe_holder(self, state: _BrokerRequest) -> str | None:
-        """Name another live request of this broker that may hold a lock."""
+    def _describe_holder(self, state: _BrokerRequest, kind: str) -> str | None:
+        """Name the request of this broker that really holds ``kind`` (#1653).
+
+        Ownership is reported by the runner at acquisition and release, so a
+        request still in its before snapshot, or one whose locks are already
+        released, is never named.  ``None`` when no request here holds it.
+        """
         with self._journal_lock:
-            others = [
+            holders = [
                 request for request in self._requests.values()
-                if request is not state and not request.done.is_set()
+                if request is not state and kind in request.holds
             ]
-        if not others:
+        if not holders:
             return None
-        same = [request for request in others if request.normalized == state.normalized]
-        holder = min(same or others, key=lambda request: request.started)
+        if kind == "lane":
+            same = [request for request in holders if request.normalized == state.normalized]
+            holders = same or holders
+        holder = min(holders, key=lambda request: request.started)
         return (
             f"`{_bounded(holder.command, 200)}` ({holder.phase}, "
             f"{time.monotonic() - holder.started:.0f} s); it frees when that command finishes "
@@ -4136,6 +4145,13 @@ class TestBrokerServer:
             if self._process_started is not None:
                 self._process_started(proc)
 
+        def lock_observer(kind: str, held: bool) -> None:
+            with self._journal_lock:
+                if held:
+                    request_state.holds.add(kind)
+                else:
+                    request_state.holds.discard(kind)
+
         def finished(proc: Any) -> None:
             with self._journal_lock:
                 self._active_processes.pop(proc.pid, None)
@@ -4166,7 +4182,14 @@ class TestBrokerServer:
             host_wait_heartbeat=heartbeat,
             host_wait_notify=wait_notice,
             host_launch_guard=lambda: self._launch_lock,
-            lock_holder_describer=lambda: self._describe_holder(request_state),
+            lock_holder_describer=lambda kind: self._describe_holder(request_state, kind),
+            lock_observer=lock_observer,
+            # Issue #1653: a fixture's teardown and sweep finish before the
+            # lane or worker budget is released, on every path that reached
+            # the setup hook (cancel, failure or a completed target).
+            before_lock_release=(
+                (lambda: fixture_run.finish(self)) if fixture_run is not None else None
+            ),
             cwd=cwd,
             cwd_fd=cwd_fd,
             timeout_seconds=timeout_seconds,
@@ -4381,7 +4404,10 @@ class TestBrokerServer:
         journal_fixture_row = False
         if fixture_run is not None:
             fixture_record, fixture_diagnostic, result_outcome, fixture_caveats = fixture_run.fold(
-                result_outcome, inner_exec=inner_exec, shutdown=self._stop_event.is_set(),
+                # A lost client after the supervisor launched is an
+                # interruption like a stop, so the lifecycle is journaled.
+                result_outcome, inner_exec=inner_exec,
+                shutdown=self._stop_event.is_set() or client_lost,
                 diagnostic=str(result_diagnostic or ""),
             )
             journal_caveats = (*fixture_caveats, *journal_caveats)

@@ -7516,7 +7516,7 @@ def test_overlap_refusal_is_streamed_through_the_output_callback_with_its_holder
         result = run_foreground_test(
             command, cwd=tmp_path, timeout_seconds=5, env=env, environment_is_complete=True,
             output_callback=streamed.append, echo_output=False,
-            lock_holder_describer=lambda: "`pytest -q` (running, 3 s)",
+            lock_holder_describer=lambda kind: f"`pytest -q` ({kind}, running, 3 s)",
         )
     finally:
         lock.close()
@@ -7524,7 +7524,7 @@ def test_overlap_refusal_is_streamed_through_the_output_callback_with_its_holder
     assert result.returncode == runtime.OVERLAP_REJECTED_EXIT_CODE
     text = "".join(streamed)
     assert text.startswith(runtime.OVERLAP_REJECTED_MESSAGE)
-    assert "Held by: `pytest -q` (running, 3 s)." in text
+    assert "Held by: `pytest -q` (lane, running, 3 s)." in text
     assert "Retrying immediately will be refused again" in text
     assert result.diagnostic == text.strip()
     # Streamed to the requesting client, not only printed on the parent's stderr.
@@ -7707,6 +7707,152 @@ def test_fixture_client_lost_during_setup_gets_teardown_and_a_non_evidence_row(t
         assert fx_evidence.BROKER_CLIENT_LOST_CAVEAT in public["caveats"]
         _fx_set_mode(root, "")
         _fx_live_retry(server, root)  # the lane is reusable
+    finally:
+        server.stop()
+    _fx_assert_gone(_fx_pids(markers))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="process-group census via /proc")
+def test_unconfirmed_group_termination_keeps_the_command_lane_until_the_group_is_gone(tmp_path, monkeypatch):
+    """Item: a False confirmation must not release the lane, even with no worker budget."""
+    from coding_review_agent_loop import runner as runner_module
+
+    base = tmp_path / "group"
+    base.mkdir()
+    cancel = threading.Event()
+    real_terminate = runner_module.terminate_process_group_fully
+
+    def leader_only(pgid, *, proc=None, **_kwargs):
+        # Kill the leader but report the group unconfirmed: the child survives.
+        try:
+            os.kill(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if proc is not None:
+            proc.wait()
+        return False
+
+    monkeypatch.setattr(runner_module, "terminate_process_group_fully", leader_only)
+
+    def started(proc):
+        def watcher():
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and not (base / "child.pid").exists():
+                time.sleep(0.05)
+            cancel.set()
+
+        threading.Thread(target=watcher, daemon=True).start()
+
+    argv = [sys.executable, "-c", _RACE_GROUP_TARGET, str(base)]
+    env = dict(os.environ)
+    result = run_foreground_test(
+        argv, cwd=tmp_path, timeout_seconds=120, env=env, environment_is_complete=True,
+        echo_output=False, host_wait_cancel=cancel, process_started=started,
+    )
+    child = int((base / "child.pid").read_text())
+    try:
+        assert result.outcome != "passed" and _race_alive(child)
+        held = runtime.acquire_command_lane(argv, cwd=tmp_path, env=env)
+        assert held is None  # the survivor still holds the lane
+    finally:
+        os.kill(child, signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    relock = None
+    while time.monotonic() < deadline and relock is None:
+        relock = runtime.acquire_command_lane(argv, cwd=tmp_path, env=env)
+        time.sleep(0.1)
+    assert relock is not None  # released once the group is gone
+    relock.close()
+    assert real_terminate is not leader_only
+
+
+def test_held_locks_retain_both_locks_and_run_pre_release_first():
+    """Item: both locks are retained together; pre-release cleanup precedes any release."""
+    from coding_review_agent_loop.runner import _HeldTestLocks
+
+    order: list[str] = []
+
+    class Lock:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            order.append(f"close-{self.name}")
+
+        def hold_until_group_exits(self, pgid):
+            order.append(f"retain-{self.name}")
+
+    held = _HeldTestLocks(Lock("lane"), Lock("worker"), None)
+    held.pre_release.append(lambda: order.append("fixture-finish"))
+    held.close()
+    assert order == ["fixture-finish", "close-worker", "close-lane"]
+
+    order.clear()
+    retained = _HeldTestLocks(Lock("lane"), Lock("worker"), None)
+    retained.retain_until_group_exits(2 ** 22 + 12345)  # no such group: released at once
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and "close-lane" not in order:
+        time.sleep(0.05)
+    retained.close()
+    assert order == ["retain-worker", "close-lane"]
+
+
+@_FX_HOST
+@pytest.mark.parametrize("phase", ["setup", "pre-launch", "running"])
+def test_fixture_cancel_keeps_the_lane_until_teardown_finishes(tmp_path, monkeypatch, phase):
+    """Item: a lost fixture request releases its lane only after teardown and the sweep.
+
+    One parametrized test covers every cancel branch that reached the setup
+    hook: loss during setup, after setup but before the target launch, and
+    while the target runs.  A retry issued during the slow teardown must be
+    refused, never admitted beside the old fixture.
+    """
+    import socket as socket_module
+
+    from coding_review_agent_loop import runner as runner_module
+
+    modes = {"setup": "setup-block", "pre-launch": "", "running": "inner-block"}[phase]
+    root, markers = _fx_repo(tmp_path)
+    _fx_set_mode(root, f"{modes} teardown-slow".strip(), fx_teardown_seconds="6")
+    entered = threading.Event()
+    if phase == "pre-launch":
+        real_probe = runner_module.probe_inner_launcher
+
+        def waiting_probe(*args, **kwargs):
+            entered.set()
+            kwargs["cancel"].wait(30)
+            return real_probe(*args, **kwargs)
+
+        monkeypatch.setattr(runner_module, "probe_inner_launcher", waiting_probe)
+    server = _fx_server(root)
+    try:
+        client = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+        client.connect(server.endpoint)
+        fx_evidence._send_frame(client, _fx_raw_request(server, root, _FX_PYTEST, timeout=120))
+        marker = {"setup": "setup-blocking", "running": "inner-blocking"}.get(phase)
+        deadline = time.monotonic() + 40
+        while time.monotonic() < deadline and not (
+            entered.is_set() if marker is None else (markers / marker).exists()
+        ):
+            time.sleep(0.05)
+        assert entered.is_set() if marker is None else (markers / marker).exists()
+        client.close()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not (markers / "teardown-started").exists():
+            time.sleep(0.05)
+        assert (markers / "teardown-started").exists()
+        if phase == "pre-launch":
+            monkeypatch.setattr(runner_module, "probe_inner_launcher", real_probe)
+        retry = fx_evidence.TestBrokerClient(_fx_env(server)).run(
+            list(_FX_PYTEST), timeout_seconds=120, cwd=root, fixture="fixture.py",
+        )
+        assert not (markers / "teardown-done").exists()  # the old teardown still runs...
+        assert retry.outcome == "overlap-rejected", retry  # ...and holds the lane
+        assert _fx_idle(server)
+        assert (markers / "teardown-done").exists()
+        row = _fx_row(server)
+        assert row.provenance == "telemetry-unverified"
+        assert row.caveats[0] == fx_evidence.BROKER_CLIENT_LOST_CAVEAT
     finally:
         server.stop()
     _fx_assert_gone(_fx_pids(markers))
