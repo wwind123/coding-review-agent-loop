@@ -6966,6 +6966,30 @@ authenticated fresh-phase identity named it; the handoff plan hash remains the
 only binding. Documentation never excuses an implementation defect; the source
 remains authoritative.
 
+`agent-loop pr <number>` has no caller-supplied parent, so in PR mode both
+branches derive it before recovery (#1662). Only a child whose own issue carries
+a fresh-phase identity qualifies: its generated staged-parent marker names the
+parent, which is fetched once and used only after the child's fresh provenance
+authenticates against it. Invalid or conflicting identity fails closed before
+recovery. PR body text and handoff-record fields never select the parent. A
+non-fresh (split-materialized, hand-created, or legacy) staged child triggers no
+extra fetch, and its parent-held plan is still recovered only by
+`agent-loop issue <child>`, which supplies the inferred parent. When recovery
+still refuses, the message keeps its leading sentence and adds the issues it
+searched and the issue-scoped resume command: `agent-loop issue <child>`, or the
+`--plan-first --plan-execution-mode auto` form for a planning-routed fresh
+child.
+
+When an issue-created managed run is interrupted and the suppression label is
+retained, the log line names the resume command. With an authenticated or
+explicit issue scope it is the same command the decomposition relaunch list
+prints for that child. It adds "or equivalently `agent-loop pr <number>`" only
+when PR mode can recover that scope: an unstaged issue, or a fresh child
+authenticated against the already-loaded parent. A non-fresh staged child gets
+the issue command alone. Without an issue scope the line names
+`agent-loop pr <number>`. The hint reads only already-loaded state, performs no
+network I/O, and cannot mask the interrupting error.
+
 For a strictly protected base, no unprotected authorization record is needed
 and `--managed-ci-fresh` is not a valid remedy. If the response was rejected
 before its PR number was accepted, use the ordinary same-PR issue/PR discovery

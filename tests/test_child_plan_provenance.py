@@ -1114,8 +1114,15 @@ def managed_ci_resume(
     parent,
     parent_issue_context,
     approved_plan_context=None,
+    fresh_authorization=False,
+    revalidate_passes=False,
 ):
-    """Drive the managed-CI ordinary resume up to handoff revalidation."""
+    """Drive the managed-CI ordinary resume up to handoff revalidation.
+
+    ``fresh_authorization`` drives the PR-mode ``--managed-ci-fresh`` branch
+    instead and captures the fresh grant.  ``revalidate_passes`` lets the run
+    continue past revalidation instead of stopping there.
+    """
     fetched = []
 
     def fake_get_issue_context(_runner, *, config, issue_number):
@@ -1138,19 +1145,30 @@ def managed_ci_resume(
 
     def revalidate(*_args, **kwargs):
         captured.update(kwargs)
+        if revalidate_passes:
+            return kwargs["handoff"]
+        raise _ManagedResumeCaptured
+
+    def authorize(*_args, **kwargs):
+        captured.update(kwargs)
         raise _ManagedResumeCaptured
 
     monkeypatch.setattr(pr_loop, "revalidate_issue_created_handoff", revalidate)
+    monkeypatch.setattr(pr_loop, "authorize_fresh_issue_created_resume", authorize)
     runner = FakeRunner(
         pr_payload={
             "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
+    fresh = (
+        {"managed_ci_fresh_authorization": True, "managed_ci_issue_number": 56}
+        if fresh_authorization else {}
+    )
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_pr_mode=True,
         managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
-        reviewer=("codex",),
+        reviewer=("codex",), **fresh,
     )
 
     def run():
@@ -1273,20 +1291,303 @@ def test_managed_ci_resume_refreshes_stale_parent_snapshot_once(tmp_path, monkey
     assert_no_agent_process(runner)
 
 
-def test_managed_ci_resume_without_parent_context_still_fails_closed(tmp_path, monkeypatch):
+SPLIT_MARKER = "<!-- AGENT_SPLIT_CHILD: parent=55 key=" + "a" * 64 + " -->"
+
+
+def split_child(child, *, comments=None):
+    """A non-fresh staged child: a split-style parent marker, no fresh identity."""
+    return dataclasses.replace(
+        child,
+        body="Split child scope.\n\n" + SPLIT_MARKER,
+        comments=child.comments if comments is None else comments,
+    )
+
+
+def test_managed_ci_pr_mode_resume_derives_authenticated_parent(tmp_path, monkeypatch):
+    """#1662: ``pr N`` authenticates a fresh child's parent and recovers its plan."""
     plan = fresh_staged_plan()
     child, parent = fresh_child_contexts(plan)
-    run, runner, _captured, _fetched = managed_ci_resume(
+    run, runner, captured, fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=None
+    )
+
+    with pytest.raises(_ManagedResumeCaptured):
+        run()
+
+    assert captured["handoff"].approved_plan_hash == approved_plan_hash(plan)
+    assert fetched.count(parent.number) == 1
+    assert_no_agent_process(runner)
+
+
+def test_managed_ci_pr_mode_fresh_authorization_derives_authenticated_parent(
+    tmp_path, monkeypatch
+):
+    """#1662: PR-mode ``--managed-ci-fresh`` reaches the parent-held plan too."""
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    run, runner, captured, fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=None,
+        fresh_authorization=True,
+    )
+
+    with pytest.raises(_ManagedResumeCaptured):
+        run()
+
+    assert captured["approved_plan_hash"] == approved_plan_hash(plan)
+    assert captured["issue_number"] == 56
+    assert fetched.count(parent.number) == 1
+    assert_no_agent_process(runner)
+
+
+def test_managed_ci_pr_mode_resume_non_fresh_parent_held_refusal_names_issue_command(
+    tmp_path, monkeypatch
+):
+    """A non-fresh child's parent-held plan stays issue-mode only, and says so."""
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    child = split_child(child)
+    run, runner, _captured, fetched = managed_ci_resume(
         tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=None
     )
 
     with pytest.raises(
         AgentLoopError,
         match="Managed-CI ordinary resume could not recover the canonical approved plan.",
-    ):
+    ) as excinfo:
         run()
 
+    message = str(excinfo.value)
+    assert "`agent-loop issue 56`" in message
+    assert "Searched child issue #56 for the plan" in message
+    assert "parent issue" not in message
+    assert parent.number not in fetched
     assert_no_agent_process(runner)
+
+
+def test_managed_ci_pr_mode_resume_non_fresh_child_held_plan_fetches_parent_once(
+    tmp_path, monkeypatch
+):
+    """The fresh-identity gate precedes any fetch; the later block fetches once."""
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    child = split_child(child, comments=(comment(plan_record(plan)),) + child.comments)
+    recovered_from = []
+    real_recover = pr_loop_support.recover_approved_plan_context
+
+    def spy(comments, **kwargs):
+        recovered_from.append(comments)
+        return real_recover(comments, **kwargs)
+
+    monkeypatch.setattr(pr_loop_support, "recover_approved_plan_context", spy)
+    run, runner, captured, fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=None,
+        revalidate_passes=True,
+    )
+
+    with pytest.raises(Exception):
+        run()
+
+    assert captured["handoff"].approved_plan_hash == approved_plan_hash(plan)
+    # Plan recovery consulted only the child; the parent was never a fallback.
+    assert recovered_from[0] is child.comments
+    assert all(comments is not parent.comments for comments in recovered_from)
+    # The run reached the later staged-parent inference, which fetched once.
+    assert fetched.count(parent.number) == 1
+    assert_no_agent_process(runner)
+
+
+def test_managed_ci_pr_mode_derived_parent_hash_mismatch_fails_closed(
+    tmp_path, monkeypatch
+):
+    """A derived parent whose plan does not match the handoff hash is not adopted."""
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    other_plan = fresh_staged_plan(first_disposition="direct-implementation")
+    assert approved_plan_hash(other_plan) != approved_plan_hash(plan)
+    child = dataclasses.replace(
+        child,
+        comments=(comment(format_issue_pr_handoff_comment(
+            issue_number=56, pr_number=77,
+            pr_url="https://github.com/OWNER/REPO/pull/77",
+            pr_head_sha="abc123", flow="approved-plan-implementation",
+            plan_hash=approved_plan_hash(other_plan),
+        )),),
+    )
+    run, runner, captured, fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=None
+    )
+
+    with pytest.raises(
+        AgentLoopError,
+        match="Managed-CI ordinary resume could not recover the canonical approved plan.",
+    ) as excinfo:
+        run()
+
+    message = str(excinfo.value)
+    assert "Searched child issue #56 and parent issue #55" in message
+    assert "agent-loop issue 56" in message
+    assert "handoff" not in captured
+    assert fetched.count(parent.number) == 1
+    assert_no_agent_process(runner)
+
+
+@pytest.mark.parametrize("fault", ["conflicting_markers", "invalid_identity"])
+def test_managed_ci_pr_mode_invalid_fresh_identity_fails_closed(
+    tmp_path, monkeypatch, fault
+):
+    """Forged or conflicting child provenance raises before plan recovery."""
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    if fault == "conflicting_markers":
+        child = dataclasses.replace(
+            child,
+            body=child.body + "\n" + SPLIT_MARKER.replace("parent=55", "parent=99"),
+        )
+        expected = "conflicting generated staged-parent markers"
+    else:
+        child = dataclasses.replace(
+            child, body=replace_phase_plan_hash(child.body, "0" * 64)
+        )
+        expected = "approved parent plan"
+    recovered = []
+    monkeypatch.setattr(
+        pr_loop, "_recover_managed_ci_approved_plan",
+        lambda *a, **k: recovered.append(a) or pytest.fail("recovery must not run"),
+    )
+    run, runner, captured, _fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=None
+    )
+
+    with pytest.raises(AgentLoopError, match=expected):
+        run()
+
+    assert recovered == []
+    assert "handoff" not in captured
+    assert_no_agent_process(runner)
+
+
+class _InterruptedAfterActivation(AgentLoopError):
+    pass
+
+
+def test_interrupted_issue_created_managed_run_logs_issue_resume_command(
+    tmp_path, monkeypatch
+):
+    """#1662: the retaining-label line names the relaunch-list command."""
+    from coding_review_agent_loop.managed_ci import ManagedCiContract
+
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    run, runner, _captured, _fetched = managed_ci_resume(
+        tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=None,
+        revalidate_passes=True,
+    )
+    contract = ManagedCiContract(
+        protocol_version=2, issue_created_pr=True, origin="issue-created",
+        active_label_event_id=101, invocation_applied_label=True,
+        trusted_actor_login="agent-loop", trusted_actor_id=1,
+        protection_mode="voluntary", base_ref="main",
+    )
+    monkeypatch.setattr(pr_loop, "activate_managed_ci", lambda *a, **k: contract)
+
+    def interrupt(*_a, **_k):
+        raise _InterruptedAfterActivation("interrupted")
+
+    monkeypatch.setattr(pr_loop, "validate_open_pr", interrupt)
+    messages = []
+    real_log = pr_loop.log
+    monkeypatch.setattr(
+        pr_loop, "log", lambda config, message, *a, **k: (
+            messages.append(message), real_log(config, message, *a, **k)
+        ),
+    )
+
+    with pytest.raises(_InterruptedAfterActivation):
+        run()
+
+    (line,) = [m for m in messages if "after interrupted managed run" in m]
+    assert "resume with `agent-loop issue 56` (or equivalently `agent-loop pr 77`)" in line
+    assert "resume the exact PR" not in line
+    assert_no_agent_process(runner)
+
+
+def _hint(**kwargs):
+    return child_plan_binding._interrupted_managed_resume_hint(pr_number=77, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "disposition, expected",
+    [
+        (None, "agent-loop issue 56"),
+        ("requires-child-planning", "agent-loop issue 56 --plan-first --plan-execution-mode auto"),
+    ],
+)
+def test_interrupted_hint_for_fresh_child_matches_relaunch_command(
+    disposition, expected
+):
+    from coding_review_agent_loop.decomposition import child_relaunch_command
+
+    plan = fresh_staged_plan(first_disposition=disposition)
+    child, parent = fresh_child_contexts(plan, handoff_execution_disposition=disposition)
+    fresh = execution_policy._resolve_fresh_child_provenance(
+        issue_context=child, parent_issue_context=parent
+    )
+    phase = dataclasses.replace(
+        fresh.created.phase, execution_disposition=fresh.route.disposition
+    )
+    relaunch = child_relaunch_command(phase, 56)
+    assert relaunch == f"`{expected}`"
+
+    hint = _hint(issue_number=56, issue_context=child, parent_issue_context=parent)
+
+    assert hint == (
+        f"resume with {relaunch} (or equivalently `agent-loop pr 77`) "
+        "after correcting the reported condition"
+    )
+
+
+def test_interrupted_hint_non_fresh_staged_child_names_issue_command_only():
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+    child = split_child(child)
+
+    hint = _hint(issue_number=56, issue_context=child, parent_issue_context=parent)
+
+    assert hint == "resume with `agent-loop issue 56` after correcting the reported condition"
+
+
+def test_interrupted_hint_unstaged_issue_and_no_issue_scope():
+    issue = IssueContext(
+        number=56, repo="OWNER/REPO", title="Plain", body="Plain issue.",
+        url="https://github.com/OWNER/REPO/issues/56", comments=(),
+    )
+
+    assert _hint(issue_number=56, issue_context=issue, parent_issue_context=None) == (
+        "resume with `agent-loop issue 56` (or equivalently `agent-loop pr 77`) "
+        "after correcting the reported condition"
+    )
+    assert _hint(issue_number=None, issue_context=None, parent_issue_context=None) == (
+        "resume with `agent-loop pr 77` after correcting the reported condition"
+    )
+    # An issue known only by number (no loaded context) never claims PR support.
+    assert _hint(issue_number=56, issue_context=None, parent_issue_context=None) == (
+        "resume with `agent-loop issue 56` after correcting the reported condition"
+    )
+
+
+def test_interrupted_hint_never_raises_from_its_pure_reads(monkeypatch):
+    plan = fresh_staged_plan()
+    child, parent = fresh_child_contexts(plan)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("provenance read failed")
+
+    monkeypatch.setattr(child_plan_binding, "_fresh_phase_marker_payload", boom)
+    monkeypatch.setattr(child_plan_binding, "get_issue_context", boom)
+
+    hint = _hint(issue_number=56, issue_context=child, parent_issue_context=parent)
+
+    assert hint == "resume with `agent-loop issue 56` after correcting the reported condition"
 
 
 def test_managed_ci_resume_parent_without_matching_hash_fails_closed(tmp_path, monkeypatch):
@@ -1346,8 +1647,7 @@ def test_managed_ci_resume_divergent_child_records_never_consult_parent(
     child, parent = fresh_child_contexts(plan)
     seen = []
 
-    def divergent(comments, **kwargs):
-        seen.append(comments)
+    def unrecorded_divergent(_comments, **kwargs):
         return validated_agent.ApprovedPlanContext(
             plan_hash=kwargs["expected_hash"],
             availability="mismatched",
@@ -1355,7 +1655,14 @@ def test_managed_ci_resume_divergent_child_records_never_consult_parent(
             diagnostic="Multiple divergent canonical plan records match handoff hash.",
         )
 
+    def divergent(comments, **kwargs):
+        seen.append(comments)
+        return unrecorded_divergent(comments, **kwargs)
+
     patch_attr_in(monkeypatch, (execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_loop), "recover_approved_plan_context", divergent)
+    # Only plan recovery is observed; the refusal remedy's route lookup reads
+    # the parent's provenance (#1662) but never offers it as a plan source.
+    monkeypatch.setattr(execution_policy, "recover_approved_plan_context", unrecorded_divergent)
     run, runner, _captured, _fetched = managed_ci_resume(
         tmp_path, monkeypatch, child=child, parent=parent, parent_issue_context=parent
     )

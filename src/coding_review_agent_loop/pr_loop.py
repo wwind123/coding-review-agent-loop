@@ -426,6 +426,9 @@ from .execution_policy import (
 )
 from .child_plan_binding import (
     _PlanningChildBinding,
+    _derive_managed_ci_parent_context,
+    _interrupted_managed_resume_hint,
+    _managed_ci_plan_recovery_remedy,
     _managed_ci_retired_plan_hashes,
     _require_admissible_pr_child_plan,
     _reject_pending_child_plan_supersession,
@@ -1154,6 +1157,17 @@ def run_pr_loop(
                         canonical_handoff,
                         context="Managed-CI fresh authorization",
                     )
+                    # PR mode has no caller parent; authenticate a fresh
+                    # child's staged parent from its own identity (#1662).
+                    derived_parent = _derive_managed_ci_parent_context(
+                        runner,
+                        config=config,
+                        issue_context=issue_context,
+                        parent_issue_context=parent_issue_context,
+                    )
+                    if derived_parent is not parent_issue_context:
+                        parent_issue_context = derived_parent
+                        parent_issue_context_refreshed = True
                     recovered = _recover_managed_ci_approved_plan(
                         issue_context.comments,
                         expected_hash=canonical_handoff.plan_hash,
@@ -1167,6 +1181,10 @@ def run_pr_loop(
                         raise AgentLoopError(
                             "Managed-CI fresh authorization could not recover the canonical "
                             "approved plan for the explicit issue scope."
+                            + _managed_ci_plan_recovery_remedy(
+                                issue_context=issue_context,
+                                parent_issue_context=parent_issue_context,
+                            )
                         )
                     if (
                         approved_plan_context is not None
@@ -1311,6 +1329,17 @@ def run_pr_loop(
                             canonical_handoff,
                             context="Managed-CI ordinary resume",
                         )
+                        # PR mode has no caller parent; authenticate a fresh
+                        # child's staged parent from its own identity (#1662).
+                        derived_parent = _derive_managed_ci_parent_context(
+                            runner,
+                            config=config,
+                            issue_context=issue_context,
+                            parent_issue_context=parent_issue_context,
+                        )
+                        if derived_parent is not parent_issue_context:
+                            parent_issue_context = derived_parent
+                            parent_issue_context_refreshed = True
                         candidate_scope = _recover_managed_ci_approved_plan(
                             issue_context.comments,
                             expected_hash=canonical_handoff.plan_hash,
@@ -1323,6 +1352,10 @@ def run_pr_loop(
                         if not candidate_scope.is_available:
                             raise AgentLoopError(
                                 "Managed-CI ordinary resume could not recover the canonical approved plan."
+                                + _managed_ci_plan_recovery_remedy(
+                                    issue_context=issue_context,
+                                    parent_issue_context=parent_issue_context,
+                                )
                             )
                         recovered_scope = candidate_scope
                     elif canonical_handoff is None:
@@ -9897,7 +9930,18 @@ def run_pr_loop(
             log(
                 config,
                 f"PR #{pr_number}: retaining `{MANAGED_LABEL}` after interrupted managed run; "
-                "resume the exact PR after correcting the reported condition",
+                + _interrupted_managed_resume_hint(
+                    pr_number=pr_number,
+                    # Only authenticated or explicit issue scopes; a linked
+                    # issue inferred from PR body text never names a command.
+                    issue_number=(
+                        managed_ci_handoff.issue_number
+                        if managed_ci_handoff is not None
+                        else config.managed_ci_issue_number or managed_ci_issue_number
+                    ),
+                    issue_context=issue_context,
+                    parent_issue_context=parent_issue_context,
+                ),
             )
         try:
             if (
