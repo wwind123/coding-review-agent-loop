@@ -174,6 +174,9 @@ def test_runner_agent_launch_resolves_running_install_over_stale_path(tmp_path, 
 
 
 def test_runner_agent_launch_keeps_inherited_path_when_install_fails(tmp_path, monkeypatch, capsys):
+    # Running inside an agent-loop turn exports a pinned executable; the
+    # assertion is about this launch's overrides, not the ambient value.
+    monkeypatch.delenv(ae.EXECUTABLE_ENV, raising=False)
     _fail_install(monkeypatch)
     stale = _stale_agent_loop(tmp_path / "stale-bin")
     inherited = os.pathsep.join([str(stale.parent), os.environ.get("PATH", "")])

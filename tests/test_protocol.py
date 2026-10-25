@@ -2957,7 +2957,12 @@ def test_semantic_matrix_claim_dropped_ref_caveat_neutralizes_multiline_text():
         # Unknown or incomplete states: not authoritative, so still fatal.
         {"wrapper_bootstrap": "unknown", "inner_exec": "started", "suite_start": "verified"},
         {"wrapper_bootstrap": "verified", "inner_exec": "unknown", "suite_start": "verified"},
-        {"wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "unknown"},
+        {"wrapper_bootstrap": "verified", "inner_exec": "failed", "suite_start": "not-started"},
+        {"wrapper_bootstrap": "verified", "inner_exec": "not-attempted", "suite_start": "not-started"},
+        {"wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "not-started"},
+        # suite_start=unknown is terminal only beside another launch defect (#1659).
+        {"wrapper_bootstrap": "unknown", "inner_exec": "started", "suite_start": "unknown"},
+        {"wrapper_bootstrap": "verified", "inner_exec": "failed", "suite_start": "unknown"},
         # A partially supplied launch-integrity tuple leaves the rest unknown.
         {"wrapper_bootstrap": "verified"},
         {"suite_start": "verified"},
@@ -2982,6 +2987,149 @@ def test_semantic_matrix_claim_launch_integrity_failing_or_unknown_selector_stil
                 **launch_state,
             }],
         )
+
+
+@pytest.mark.parametrize("kind", ["issue_implementation", "coder_followup"])
+def test_sole_unverified_suite_start_selector_is_not_rejected_before_authentication_1659(kind):
+    """`no-authority-granted`: the selector is kept for the non-terminal post-auth check."""
+    parsed = _validate_claims_envelope(
+        kind,
+        [{"row_id": "row-1", "execution_refs": ["turn:observation-1"]}],
+        catalog=[{
+            "execution_ref": "turn:observation-1",
+            "outcome": "passed",
+            "provenance": "parent-observed",
+            "wrapper_bootstrap": "verified",
+            "inner_exec": "started",
+            "suite_start": "unknown",
+        }],
+    )
+    [claim] = parsed.risk_test_matrix_claims.claims
+    assert claim.execution_refs == ("turn:observation-1",)
+
+
+def _derive_1659(observation):
+    from types import SimpleNamespace
+
+    from coding_review_agent_loop.protocol import (
+        SemanticRiskCoverageClaim,
+        SemanticRiskCoverageClaims,
+        derive_risk_test_matrix_evidence,
+        parse_risk_test_matrix,
+        risk_test_matrix_identity,
+    )
+
+    matrix = parse_risk_test_matrix({
+        "applicability": "applicable",
+        "important_exclusions": [],
+        "rows": [{
+            "row_id": "row-1", "label": "Behaviour", "entry_path_or_mode": "agent-loop pr",
+            "initial_state": "approved plan", "event": "coder reports", "expected_outcome": "outcome",
+            "forbidden_side_effects": ["none"], "proposed_test_level": "unit",
+            "proposed_test_location": "tests/test_x.py", "applicability": "applicable",
+            "related_scope_item_ids": ["scope-1"], "execution_owner": "one-shot",
+        }],
+    })
+    values = dict(
+        execution_ref="ref-1", receipt_id="receipt-1",
+        command=("python3", "scripts/x.py"), normalized_command="python3 scripts/x.py",
+        outcome="passed", provenance="parent-observed", turn_id="turn-current",
+        attribution={
+            "state": "current-head", "head": "head-1", "tracked_digest": "tree-1",
+            "stable": True, "untracked_input": False, "caveats": [],
+        },
+        environment_state="not-compared", superseded_by=None, caveats=(),
+        wrapper_bootstrap="verified", inner_exec="started", suite_start="unknown",
+    )
+    values.update(observation)
+    observed = SimpleNamespace(**values)
+    claim = SemanticRiskCoverageClaim(
+        row_id="row-1", execution_refs=("ref-1",), test_identifiers=("tests/test_x.py::test_it",),
+        test_locations=("tests/test_x.py",), workflow_path_claim="agent-loop pr",
+        outcome_assertions=("holds",), forbidden_effect_assertions=("none",),
+    )
+    return derive_risk_test_matrix_evidence(
+        matrix=matrix, claims=SemanticRiskCoverageClaims((claim,)),
+        observations=(observed,), execution_catalog=(observed,), invocation_id="turn-current",
+        current_head="head-1", current_tree_digest="tree-1",
+        authenticated_checkout_head="head-1", authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+
+def test_sole_unverified_suite_start_is_refused_after_authentication_with_runner_advice_1659():
+    """`no-authority-granted`: unverified row, no citation, an explanatory diagnostic."""
+    from coding_review_agent_loop.protocol import capture_observation_class
+    from coding_review_agent_loop.test_runtime import CITABLE_TEST_RUNNERS_SUMMARY
+
+    derived = _derive_1659({})
+    [row] = derived.evidence.rows
+    assert row.status == "stale/unverified"
+    assert row.evidence_citations == ()
+    [diagnostic] = [item for item in derived.diagnostics if item.code == "inadmissible-execution"]
+    assert "suite_start=unknown" in diagnostic.message
+    assert CITABLE_TEST_RUNNERS_SUMMARY in diagnostic.message
+    assert "Wrap the check in a pytest test" in diagnostic.message
+    assert derived.row_capture_classifications["row-1"] == {
+        "class": "not-capture-limited",
+        "observation_classes": ["pass-unauthoritative"],
+        "disqualifiers": ["suite-start-unverified"],
+    }
+    assert capture_observation_class(
+        {"outcome": "passed", "provenance": "parent-observed", "wrapper_bootstrap": "verified",
+         "inner_exec": "started", "suite_start": "unknown",
+         "attribution": {"state": "current-head", "stable": True}}
+    ) == "pass-unauthoritative"
+
+
+def test_other_unauthoritative_pass_keeps_the_plain_diagnostic_and_capture_class_1659():
+    derived = _derive_1659({"wrapper_bootstrap": "unknown"})
+    [diagnostic] = [item for item in derived.diagnostics if item.code == "inadmissible-execution"]
+    assert "Citable runners" not in diagnostic.message
+    assert derived.row_capture_classifications["row-1"]["class"] == "capture-limited"
+
+
+def test_post_auth_unverified_suite_diagnostic_keeps_the_node_test_hint_1659():
+    """A plain ``node <file>`` keeps its #1294 rerun hint, now in the non-terminal diagnostic."""
+    from coding_review_agent_loop.local_test_evidence import LocalTestObservation
+    from coding_review_agent_loop.protocol import (
+        SemanticRiskCoverageClaim,
+        SemanticRiskCoverageClaims,
+        derive_risk_test_matrix_evidence,
+        parse_risk_test_matrix,
+        risk_test_matrix_identity,
+    )
+
+    observation = LocalTestObservation(
+        command=("node", "tests/test_x.js"), outcome="passed", provenance="parent-observed",
+        execution_ref="ref-1", cwd="/tmp/hint-workdir",
+        wrapper_bootstrap="verified", inner_exec="started", suite_start="unknown",
+    )
+    matrix = parse_risk_test_matrix({
+        "applicability": "applicable", "important_exclusions": [],
+        "rows": [{
+            "row_id": "row-1", "label": "Behaviour", "entry_path_or_mode": "agent-loop pr",
+            "initial_state": "approved plan", "event": "coder reports", "expected_outcome": "outcome",
+            "forbidden_side_effects": ["none"], "proposed_test_level": "unit",
+            "proposed_test_location": "tests/test_x.py", "applicability": "applicable",
+            "related_scope_item_ids": ["scope-1"], "execution_owner": "one-shot",
+        }],
+    })
+    claim = SemanticRiskCoverageClaim(
+        row_id="row-1", execution_refs=("ref-1",), test_identifiers=("tests/test_x.js",),
+        test_locations=("tests/test_x.js",), workflow_path_claim="agent-loop pr",
+        outcome_assertions=("holds",), forbidden_effect_assertions=("none",),
+    )
+    derived = derive_risk_test_matrix_evidence(
+        matrix=matrix, claims=SemanticRiskCoverageClaims((claim,)),
+        observations=(observation,), execution_catalog=(observation,), invocation_id=None,
+        current_head=None, current_tree_digest=None,
+        authenticated_checkout_head=None, authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+    [diagnostic] = [item for item in derived.diagnostics if item.code == "inadmissible-execution"]
+    assert "node --test tests/test_x.js" in diagnostic.message
+    assert derived.evidence.rows[0].evidence_citations == ()
 
 
 _FAILING_LAUNCH_CATALOG_926 = [
@@ -6577,7 +6725,6 @@ _CONDITION_PHRASES = {
     ("inner_exec", "not-attempted"): "inner test command was never executed (inner_exec=not-attempted)",
     ("inner_exec", "failed"): "inner test command failed to exec (inner_exec=failed)",
     ("suite_start", "not-started"): "test suite never started (suite_start=not-started)",
-    ("suite_start", "unknown"): "suite start was never verified (suite_start=unknown)",
 }
 
 
@@ -6619,7 +6766,7 @@ def test_launch_rejection_does_not_echo_unrecognized_values():
 
 
 def test_launch_rejection_renders_missing_command_and_timestamp():
-    message = _reject_message({**_PASSING, **_VERIFIED, "suite_start": "unknown"})
+    message = _reject_message({**_PASSING, **_VERIFIED, "suite_start": "not-started"})
     assert "command not recorded" in message
     assert "timestamp not recorded" in message
 
@@ -6627,7 +6774,7 @@ def test_launch_rejection_renders_missing_command_and_timestamp():
 def test_launch_rejection_distinguishes_same_command_by_timestamp():
     messages = [
         _reject_message({
-            **_PASSING, **_VERIFIED, "suite_start": "unknown",
+            **_PASSING, **_VERIFIED, "suite_start": "not-started",
             "command": "pytest -q", "timestamp": stamp,
         })
         for stamp in ("2026-09-30T01:00:00+00:00", "2026-09-30T02:00:00+00:00")
@@ -6682,7 +6829,7 @@ def test_rejection_redacts_secret_commands_for_mapping_and_projection_forms():
     argv = ["env", "SECRET_KEY=s3cr3t-value", "python", "-m", "pytest"]
     rendered = redact_test_command(argv)[0]
     assert "<redacted:" in rendered and "s3cr3t-value" not in rendered
-    mapping_message = _reject_message({**_PASSING, **_VERIFIED, "suite_start": "unknown", "command": argv})
+    mapping_message = _reject_message({**_PASSING, **_VERIFIED, "suite_start": "not-started", "command": argv})
     assert rendered in mapping_message and "s3cr3t-value" not in mapping_message
 
     class Projected:
@@ -6690,7 +6837,7 @@ def test_rejection_redacts_secret_commands_for_mapping_and_projection_forms():
         provenance = "parent-observed"
         wrapper_bootstrap = "verified"
         inner_exec = "started"
-        suite_start = "unknown"
+        suite_start = "not-started"
         execution_ref = "turn:observation-1"
 
         def public_projection(self):
@@ -6711,7 +6858,7 @@ def test_rejection_fails_closed_on_unparsable_secret_command():
     from coding_review_agent_loop.local_test_evidence import observation_from_mapping
 
     bad = 'env SECRET_KEY=s3cr3t-value "unterminated'
-    mapping = _reject_message({**_PASSING, **_VERIFIED, "suite_start": "unknown", "command": bad})
+    mapping = _reject_message({**_PASSING, **_VERIFIED, "suite_start": "not-started", "command": bad})
     outcome = _reject_message({"outcome": "failed", "provenance": "parent-observed", "command": bad})
     obs = observation_from_mapping({"command": bad, "outcome": "passed", "provenance": "parent-observed"})
     for message in (mapping, outcome):
@@ -6720,7 +6867,7 @@ def test_rejection_fails_closed_on_unparsable_secret_command():
     for kwargs in ({"wrapper_bootstrap": "failed"}, {"outcome": "failed"}):
         projected = type("P", (), {
             "execution_ref": "turn:observation-1", "outcome": "passed", "provenance": "parent-observed",
-            "wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "unknown",
+            "wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "not-started",
             "public_projection": lambda self: obs.public_projection(),
         })()
         if "outcome" in kwargs:
@@ -6743,7 +6890,7 @@ def test_rejection_keeps_truncated_projection_command_label():
     obs = observation_from_mapping({"command": argv, "outcome": "passed", "provenance": "parent-observed"})
     projected = type("P", (), {
         "outcome": "passed", "provenance": "parent-observed", "wrapper_bootstrap": "verified",
-        "inner_exec": "started", "suite_start": "unknown",
+        "inner_exec": "started", "suite_start": "not-started",
         "public_projection": lambda self: obs.public_projection(),
     })()
     with pytest.raises(NonRepairableEvidenceRejection) as excinfo:
@@ -6841,7 +6988,9 @@ def _node_hint_rejection(command, *, redact_first=False, cwd="/tmp/hint-workdir"
     observation = LocalTestObservation(
         command=tuple(command), outcome="passed", provenance="parent-observed",
         execution_ref="turn:observation-1", cwd=cwd,
-        wrapper_bootstrap="verified", inner_exec="started", suite_start="unknown",
+        # A sole suite_start=unknown is no longer terminal (#1659); the hint
+        # still decorates the remaining terminal launch-integrity rejections.
+        wrapper_bootstrap="unknown", inner_exec="started", suite_start="unknown",
     )
     if redact_first:
         observation = redact_observation(observation)

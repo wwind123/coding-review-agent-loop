@@ -2254,6 +2254,65 @@ _NO_RECORD_OUTCOMES = frozenset(
 )
 
 
+def _announce_no_test_reason(result) -> None:
+    """Print why a broker refusal ran no test, next to its receipt line (#1653).
+
+    Streamed broker output can be lost or interleaved; this line is the one
+    place every no-record outcome is explained on the client's own stderr.
+    """
+    outcome = str(getattr(result, "outcome", ""))
+    if outcome not in _NO_RECORD_OUTCOMES:
+        return
+    reason = str(getattr(result, "diagnostic", "") or "").strip()
+    if not reason:
+        reason = str(getattr(result, "output_tail", "") or "").strip()
+    if not reason:
+        reason = "the broker gave no reason"
+    print(f"agent-loop: no test ran ({outcome}): {reason}", file=sys.stderr, flush=True)
+
+
+UNCITABLE_RECEIPT_GENERIC_MESSAGE = (
+    "agent-loop: this receipt is not citable evidence: suite start was not verified "
+    "(suite_start=unknown); you may still report it in tests_run."
+)
+
+
+def _uncitable_receipt_unrecognized_message() -> str:
+    from .test_runtime import CITABLE_TEST_RUNNERS_SUMMARY
+
+    return (
+        "agent-loop: this receipt is not citable evidence: unrecognized test launcher, so "
+        "suite start was not verified (suite_start=unknown). Citable runners: "
+        f"{CITABLE_TEST_RUNNERS_SUMMARY}. Wrap the check in a pytest test to make it "
+        "citable; you may still report it in tests_run."
+    )
+
+
+def _announce_uncitable_receipt(result, raw_inner: Sequence[str]) -> None:
+    """Say next to the receipt line when it can never be cited (#1659).
+
+    Advisory only: it changes no exit code, observation, timing or launcher
+    health.  The launcher is classified with the same static recognizer the
+    broker's probe uses (package scripts resolved from package.json, nothing
+    spawned), so a recognized launcher whose probe merely failed to verify is
+    never called unrecognized.
+    """
+    if str(getattr(result, "outcome", "")) in _NO_RECORD_OUTCOMES:
+        return
+    if _broker_frame_is_pre_collection(result):
+        return
+    if getattr(result, "inner_exec", None) != "started" or getattr(result, "suite_start", None) != "unknown":
+        return
+    from .test_runtime import recognized_inner_probe
+
+    try:
+        probe = recognized_inner_probe(list(raw_inner), cwd=Path.cwd(), environment=os.environ)
+    except Exception:  # advisory only; a malformed package.json must not fail run-tests
+        probe = ()
+    message = UNCITABLE_RECEIPT_GENERIC_MESSAGE if probe is not None else _uncitable_receipt_unrecognized_message()
+    print(message, file=sys.stderr, flush=True)
+
+
 FIXTURE_NOT_DISPATCHED_MESSAGE = (
     "agent-loop: --fixture requires the test broker; nothing was run (not evidence)"
 )
@@ -2308,6 +2367,8 @@ def _run_fixture_tests(
         print(f"agent-loop test execution_ref: {result.execution_ref}", file=sys.stderr, flush=True)
     if result.receipt_id:
         print(f"agent-loop test observation receipt: {result.receipt_id}", file=sys.stderr, flush=True)
+    _announce_no_test_reason(result)
+    _announce_uncitable_receipt(result, raw_inner)
     record = dict(result.fixture or {})
     print(
         "agent-loop fixture: setup={setup} teardown={teardown} cleanup={cleanup}".format(
@@ -2456,6 +2517,8 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                     flush=True,
                 )
+                _announce_no_test_reason(broker_result)
+                _announce_uncitable_receipt(broker_result, raw_inner)
                 if broker_result.outcome == "timed_out":
                     print(timeout_advisory(chosen, policy), file=sys.stderr, flush=True)
                 if _broker_frame_is_pre_collection(broker_result):

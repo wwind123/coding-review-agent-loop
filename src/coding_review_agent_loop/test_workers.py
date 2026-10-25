@@ -1286,7 +1286,8 @@ class WorkerBudgetLock:
                             "agent-loop worker budget: another agent-loop run on this host is using "
                             f"the shared test-worker pool ({others[0]} reservation(s), {others[1]} "
                             f"worker(s)); this command will start when it finishes, waiting at most "
-                            f"{wait_seconds:g} s"
+                            f"{wait_seconds:g} s. This command holds this run's test lane while it "
+                            "waits; let it finish rather than killing it"
                         )
                         last_notice = now
                     elif now - last_notice >= HOST_WAIT_NOTICE_INTERVAL_SECONDS:

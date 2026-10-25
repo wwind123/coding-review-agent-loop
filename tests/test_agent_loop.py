@@ -5456,3 +5456,204 @@ def test_issue_run_refuses_misplaced_spool_before_any_coder_turn(tmp_path, monke
     assert "overlaps the agent checkout" in error
     assert "invocation start" in error
     assert not (codex / ".agent-loop" / "private").exists()
+
+
+# --- run-tests no-test refusal reasons (issue #1653) --------------------------
+
+
+@pytest.mark.parametrize(
+    "outcome, returncode",
+    [
+        ("overlap-rejected", 125),
+        ("worker-budget-busy", 125),
+        ("worker-budget-refused", 126),
+        ("cancelled", None),
+    ],
+)
+@pytest.mark.parametrize("fixture", [None, "fixture.py"], ids=["fixture-less", "fixture"])
+@pytest.mark.parametrize("source", ["diagnostic", "output_tail"])
+def test_run_tests_prints_the_no_test_reason_after_the_receipt_on_both_broker_branches(
+    tmp_path, monkeypatch, capsys, outcome, returncode, fixture, source
+):
+    """Row refusal-text-client: one shared helper on both CLI broker branches."""
+    from coding_review_agent_loop.fixture_runtime import fold_exit_code
+    from coding_review_agent_loop.local_test_evidence import BrokerRunResult
+
+    reason = f"agent-loop: {outcome} because another command holds the lane"
+    result = BrokerRunResult(
+        receipt_id="", execution_ref=None, outcome=outcome, returncode=returncode,
+        elapsed_seconds=0.0, inner_exec="not-attempted", suite_start="not-started",
+        **({"diagnostic": reason} if source == "diagnostic" else {"output_tail": reason}),
+    )
+
+    class FakeBroker:
+        def run(self, *args, **kwargs):
+            return result
+
+    recorded = []
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker())
+    monkeypatch.setattr(cli_module, "record_launcher_health", lambda *a, **k: recorded.append("health"))
+    monkeypatch.setattr(cli_module, "record_test_observation", lambda *a, **k: recorded.append("timing"))
+    monkeypatch.setattr(cli_module, "_record_run_tests_result", lambda *a, **k: recorded.append("timing"))
+    monkeypatch.chdir(tmp_path)
+    command = ["run-tests", "--timeout-seconds", "40", "--memory-dir", str(tmp_path / "memory")]
+    if fixture:
+        command += ["--fixture", fixture]
+    code = cli_module.main([*command, "--", sys.executable, "-c", "pass"])
+    err = capsys.readouterr().err
+    expected = (
+        fold_exit_code(
+            outcome=outcome, returncode=returncode, inner_exec="not-attempted", fixture=None,
+            cancelled_frame=outcome == "cancelled",
+        )
+        if fixture else (returncode if returncode is not None else 1)
+    )
+    assert code == expected
+    line = f"agent-loop: no test ran ({outcome}): {reason}"
+    assert line in err
+    if not fixture:
+        assert err.index("agent-loop test observation receipt:") < err.index(line)
+    assert recorded == []
+
+
+# --- run-tests not-citable receipt notice (issue #1659) ---------------------
+
+_UNRECOGNIZED_NOTICE = "agent-loop: this receipt is not citable evidence: unrecognized test launcher"
+_GENERIC_NOTICE = "agent-loop: this receipt is not citable evidence: suite start was not verified (suite_start=unknown)"
+
+
+def _run_tests_notice(tmp_path, monkeypatch, capsys, inner, *, fixture=None, **result_fields):
+    from coding_review_agent_loop.local_test_evidence import BrokerRunResult
+
+    values = dict(
+        receipt_id="receipt-1659", execution_ref="turn:observation-1", outcome="passed",
+        returncode=0, elapsed_seconds=0.1, wrapper_bootstrap="verified",
+        inner_exec="started", suite_start="unknown",
+    )
+    values.update(result_fields)
+    if fixture:
+        values.setdefault("fixture", {
+            "setup_status": "passed", "teardown_status": "passed", "cleanup": "confirmed",
+        })
+    result = BrokerRunResult(**values)
+
+    class FakeBroker:
+        def run(self, *args, **kwargs):
+            return result
+
+    recorded = []
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker())
+    monkeypatch.setattr(cli_module, "record_launcher_health", lambda *a, **k: recorded.append("health"))
+    monkeypatch.setattr(cli_module, "_record_run_tests_result", lambda *a, **k: recorded.append("timing"))
+    monkeypatch.chdir(tmp_path)
+    command = ["run-tests", "--timeout-seconds", "40", "--memory-dir", str(tmp_path / "memory")]
+    if fixture:
+        command += ["--fixture", fixture]
+    code = cli_module.main([*command, "--", *inner])
+    return code, capsys.readouterr().err, recorded
+
+
+def test_run_tests_prints_the_not_citable_notice_for_an_unrecognized_launcher(tmp_path, monkeypatch, capsys):
+    """Row notice-unrecognized-launcher: notice after the receipt; nothing else changes."""
+    from coding_review_agent_loop.test_runtime import CITABLE_TEST_RUNNERS_SUMMARY
+
+    code, err, recorded = _run_tests_notice(
+        tmp_path, monkeypatch, capsys, [sys.executable, "scripts/x.py"]
+    )
+    assert code == 0
+    assert _UNRECOGNIZED_NOTICE in err
+    assert "suite_start=unknown" in err
+    assert f"Citable runners: {CITABLE_TEST_RUNNERS_SUMMARY}." in err
+    assert "Wrap the check in a pytest test to make it citable" in err
+    assert err.index("agent-loop test observation receipt: receipt-1659") < err.index(_UNRECOGNIZED_NOTICE)
+    assert err.count("not citable evidence") == 1
+    # Same timing/health recording as before: the notice is advisory only.
+    assert recorded == ["timing"]
+
+
+def test_run_tests_prints_no_notice_for_a_verified_pytest_receipt(tmp_path, monkeypatch, capsys):
+    """Row notice-absent-verified."""
+    code, err, recorded = _run_tests_notice(
+        tmp_path, monkeypatch, capsys, [sys.executable, "-m", "pytest", "-q"], suite_start="verified",
+    )
+    assert code == 0
+    assert "not citable evidence" not in err
+    assert "Citable runners" not in err
+    assert recorded == ["health", "timing"]
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"outcome": "overlap-rejected", "returncode": 125},
+        {"outcome": "cancelled", "returncode": None},
+        {"outcome": "launch-failed", "returncode": 1, "diagnostic": "pre-collection launch failure; not evidence: bad flag"},
+    ],
+    ids=["overlap-rejected", "cancelled", "pre-collection"],
+)
+def test_run_tests_prints_no_notice_for_no_record_or_pre_collection_outcomes(tmp_path, monkeypatch, capsys, fields):
+    """Row notice-no-record-or-fixture: no notice when no observation is evidence-shaped."""
+    code, err, _recorded = _run_tests_notice(
+        tmp_path, monkeypatch, capsys, [sys.executable, "scripts/x.py"], **fields
+    )
+    assert "not citable evidence" not in err
+
+
+def test_run_tests_prints_the_generic_notice_for_a_recognized_but_unverified_launcher(tmp_path, monkeypatch, capsys):
+    """Row notice-no-record-or-fixture: a recognized launcher is never called unrecognized."""
+    code, err, _recorded = _run_tests_notice(
+        tmp_path, monkeypatch, capsys, [sys.executable, "-m", "pytest", "-q"]
+    )
+    assert code == 0
+    assert _GENERIC_NOTICE in err
+    assert "unrecognized" not in err
+    assert "Citable runners" not in err
+
+
+def test_run_tests_fixture_path_prints_the_full_notice(tmp_path, monkeypatch, capsys):
+    """Row notice-no-record-or-fixture: the --fixture path notices too."""
+    code, err, _recorded = _run_tests_notice(
+        tmp_path, monkeypatch, capsys, [sys.executable, "scripts/x.py"], fixture="fixture.sh"
+    )
+    assert _UNRECOGNIZED_NOTICE in err
+    assert err.index("agent-loop test observation receipt: receipt-1659") < err.index(_UNRECOGNIZED_NOTICE)
+
+
+@pytest.mark.parametrize(
+    "body, expected, absent",
+    [
+        ("pytest -q", _GENERIC_NOTICE, _UNRECOGNIZED_NOTICE),
+        ("python scripts/x.py", _UNRECOGNIZED_NOTICE, None),
+    ],
+    ids=["recognized-body", "unrecognized-body"],
+)
+def test_run_tests_classifies_package_scripts_statically(tmp_path, monkeypatch, capsys, body, expected, absent):
+    """Row notice-recognized-package-script: package.json is resolved, never executed."""
+    import json as _json
+
+    import coding_review_agent_loop.test_runtime as test_runtime_module
+
+    (tmp_path / "package.json").write_text(_json.dumps({"scripts": {"test": body}}), encoding="utf-8")
+    seen = []
+    original = test_runtime_module.resolve_package_script
+
+    def spy(argv, **kwargs):
+        seen.append(tuple(argv))
+        return original(argv, **kwargs)
+
+    monkeypatch.setattr(test_runtime_module, "resolve_package_script", spy)
+    # A package manager on PATH that leaves a trace if anything spawns it.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    marker = tmp_path / "npm-was-spawned"
+    fake_npm = bin_dir / "npm"
+    fake_npm.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    fake_npm.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    code, err, _recorded = _run_tests_notice(tmp_path, monkeypatch, capsys, ["npm", "run", "test"])
+    assert ("npm", "run", "test") in seen
+    assert not marker.exists()
+    assert expected in err
+    if absent:
+        assert absent not in err
+        assert "Citable runners" not in err

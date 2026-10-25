@@ -22,7 +22,11 @@ from .errors import (
 )
 from .protocol_markers import sanitize_historical_text
 from .review_scheduling import normalize_fix_scope
-from .test_runtime import TestRuntimeConfigurationError, parse_managed_test_command
+from .test_runtime import (
+    CITABLE_TEST_RUNNERS_SUMMARY,
+    TestRuntimeConfigurationError,
+    parse_managed_test_command,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -2603,6 +2607,10 @@ CAPTURE_DISQUALIFIERS = frozenset(
         "checkout-tree-unavailable",
         "journal-failure",
         "head-changed-during-correction",
+        # a passing receipt whose only launch defect is an unverified suite
+        # start (#1659): the coder can capture it as a pytest test, so it is
+        # never handed to a human by automatic evidence conversion
+        "suite-start-unverified",
     }
 )
 
@@ -3142,10 +3150,12 @@ def derive_risk_test_matrix_evidence(
                     valid_selected = False
                     selected_observation_valid = False
                     expected = _receipt_expected_status(observation, claim="current-result") or "stale/unverified"
-                    diagnostics.append(PostAuthClaimDiagnostic(
-                        row.row_id, "inadmissible-execution",
-                        f"Execution selector `{execution_ref}` is not an admissible passing receipt ({expected}).",
-                    ))
+                    message = f"Execution selector `{execution_ref}` is not an admissible passing receipt ({expected})."
+                    if _only_suite_start_unverified(observation):
+                        capture_disqualifiers.add("suite-start-unverified")
+                        message += " " + SUITE_START_UNVERIFIED_DIAGNOSTIC
+                        message += _node_test_hint(observation, message)  # shape-check: fatal:authentication-or-forgery
+                    diagnostics.append(PostAuthClaimDiagnostic(row.row_id, "inadmissible-execution", message))
                 else:
                     receipt_id = _observation_value(observation, "receipt_id")
                     if not isinstance(receipt_id, str) or not receipt_id.strip():
@@ -3924,6 +3934,31 @@ def _known_launch_integrity_passes(observation: object) -> bool:
         return True
     semantics, _rich = _observation_semantics(observation)
     return not _launch_integrity_failure_reasons(observation)
+
+
+SUITE_START_UNVERIFIED_DIAGNOSTIC = (
+    "Suite start was never verified (suite_start=unknown; an unrecognized or unverified "
+    "test launcher), so this receipt cannot be cited. Citable runners: "
+    f"{CITABLE_TEST_RUNNERS_SUMMARY}. Wrap the check in a pytest test to make it citable."
+)
+
+
+def _only_suite_start_unverified(observation: object) -> bool:
+    """A passing parent-observed receipt whose only launch defect is suite_start=unknown.
+
+    Issue #1659: such a selector is not an authority decision before
+    authentication.  It reaches post-authentication derivation, where
+    ``_authoritative_receipt_passes`` still refuses it non-terminally.  Every
+    launch field must be explicitly supplied.
+    """
+    semantics, _rich = _observation_semantics(observation)
+    return (
+        semantics["outcome"] == "passed"
+        and semantics["provenance"] == "parent-observed"
+        and semantics["wrapper_bootstrap"] == "verified"
+        and semantics["inner_exec"] == "started"
+        and semantics["suite_start"] == "unknown"
+    )
 
 
 def _receipt_expected_status(observation: object, *, claim: str) -> str | None:
@@ -5334,7 +5369,10 @@ def _parse_semantic_risk_coverage_claims(
     parent-observed observations, or whose supplied launch-integrity state
     is failing or unknown (any of wrapper bootstrap, inner exec, or suite
     start not authoritative) -- these are real broker handles, so selecting
-    one is an authority decision, not a format defect (#990).  Without a
+    one is an authority decision, not a format defect (#990).  The one
+    exception (#1659) is a passing selector whose only launch defect is
+    ``suite_start=unknown``: it is kept, and post-authentication derivation
+    refuses it non-terminally with an ``inadmissible-execution`` diagnostic.  Without a
     catalog (historical and unit callers) selectors are kept verbatim.
 
     An ``execution_refs`` list with more than eight well-typed items is
@@ -5527,7 +5565,7 @@ def _parse_semantic_risk_coverage_claims(
                         f"observed at {_observation_timestamp_label(observation)}.",
                         reason="non-passing-selector",
                     )
-                if not _known_launch_integrity_passes(observation):
+                if not _known_launch_integrity_passes(observation) and not _only_suite_start_unverified(observation):
                     launch_integrity_message = (
                         f"{refs_context} selector `{ref}` has known non-authoritative "
                         "launch-integrity state and cannot be selected before authentication: "

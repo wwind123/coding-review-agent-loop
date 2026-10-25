@@ -1710,6 +1710,41 @@ never trips the client's receive timeout; stopping the broker cancels pending
 admission, no target launches after the owning turn ends, and a target that
 had already started is recorded as run but unattributed. Every broker send is
 bounded, so a client that stops reading cannot stall admission or shutdown.
+The wait notice says that the command holds this run's test lane while it
+waits; let it finish rather than killing it. A killed, disconnected or
+non-reading `run-tests` client is cancelled by the broker (issue #1653): the
+client acknowledges every heartbeat, and EOF, a reset, a stream send that
+wedges (10 s) or no acknowledged progress for 30 s marks it lost. A lost
+client's request that is still waiting for host capacity, probing or in
+fixture setup is cancelled without launching anything (a fixture supervisor
+that already started gets its graceful teardown), and its command lane,
+worker-budget lock and host reservation are released, so the identical command
+can run again at once. A lost client's running target is stopped like a
+watchdog expiry: the whole process group, including a descendant that ignores
+SIGTERM, is confirmed gone before the lane is released (if it cannot be
+confirmed, both the lane and the worker budget stay held until it is), a
+fixture's teardown and sweep finish before either lock is released, and the run is
+journaled as a `telemetry-unverified` `incomplete` row with the caveat
+`run-tests client disconnected; target stopped by the broker`, which is never
+an authoritative failure. A client that does not announce acknowledgements
+(an older `agent-loop`) gets a visible no-test refusal (exit 125) that names
+the run's pinned executable, before any lock is taken and with no local
+fallback. Every no-test refusal (`overlap-rejected`, `worker-budget-busy`,
+`worker-budget-refused`, `cancelled`) is streamed to the client and printed
+again after the receipt line as `agent-loop: no test ran (<outcome>):
+<reason>`; a lock held by another request of the same broker is named with
+its command, phase and age.
+A receipt whose inner command started but whose suite start was never verified
+(`suite_start=unknown`) can never be cited, so `run-tests` says so right after
+the receipt line (#1659). For a launcher the inner-probe recognizer does not
+accept (for example `python scripts/x.py`) it prints
+`agent-loop: this receipt is not citable evidence: unrecognized test launcher, so suite start was not verified (suite_start=unknown). Citable runners: <runners>. Wrap the check in a pytest test to make it citable; you may still report it in tests_run.`
+For a recognized launcher whose probe merely did not verify (package scripts
+are resolved statically first, nothing is spawned) it prints the shorter
+`agent-loop: this receipt is not citable evidence: suite start was not verified (suite_start=unknown); you may still report it in tests_run.`
+No notice is printed for no-test refusals or pre-collection launch failures,
+and the notice changes no exit code, observation, timing row or launcher
+health. The fixture path prints the same notice.
 Every reservation has its own record, so a
 share left behind by an earlier command of the same invocation keeps counting.
 The reservation is anchored to the target atomically at launch: the spawned
@@ -2294,7 +2329,10 @@ authoritative receipt, an authoritative pass without a receipt ID, or an
 unknown, cross-turn or dropped selector (an empty selection also qualifies).
 An authoritative failed or timed-out observation, head, tree or checkout
 mismatch, an unsuperseded parent-observed failed or timed-out journal entry, a
-semantic-claim defect, or a verified row makes it `not-capture-limited`. The
+semantic-claim defect, a selected pass whose only launch defect is
+`suite_start=unknown` (disqualifier `suite-start-unverified`, #1659: the coder
+can capture it as a pytest test, so it is never auto-converted to a human
+obligation), or a verified row makes it `not-capture-limited`. The
 classification is persisted on each coder record as
 `risk_test_matrix_capture_classification`, bound to that record's head and
 evidence identity.
@@ -2399,7 +2437,10 @@ authority or are unbounded input:
   whose supplied launch-integrity state is failing or unknown (wrapper
   bootstrap, inner exec, and suite start must all be authoritative). It is a
   real broker handle, so selecting it is an authority decision, not a format
-  defect;
+  defect. The exception (#1659) is a passing parent-observed selector whose
+  only launch defect is `suite_start=unknown`: it does not reject the
+  response, and post-authentication derivation leaves the row unverified with
+  an `inadmissible-execution` diagnostic naming the citable runners;
 - legacy canonical evidence fields in a fresh response.
 
 A malformed `test_observations` citation in a follow-up or implementation

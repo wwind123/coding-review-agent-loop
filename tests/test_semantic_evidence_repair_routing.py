@@ -115,7 +115,7 @@ def _forbid_repair(*args, **kwargs):
 def test_non_authoritative_selector_skips_repair_and_reports_the_rejection(
     tmp_path, monkeypatch, response_text
 ):
-    catalog = [_observation(suite_start="unknown")]
+    catalog = [_observation(suite_start="not-started")]
     patch_attr_in(monkeypatch, (validated_agent_module, pr_loop, plan_first_loop), "_run_structured_repair", _forbid_repair)
     result = AgentResult(text=response_text, returncode=0)
     logged: list[str] = []
@@ -138,12 +138,12 @@ def test_non_authoritative_selector_skips_repair_and_reports_the_rejection(
     from coding_review_agent_loop.local_test_evidence import redact_test_command
 
     rendered = redact_test_command(_SECRET_COMMAND)[0]
-    assert "suite_start=unknown" in message
+    assert "suite_start=not-started" in message
     assert rendered in message
     assert _TIMESTAMP in message
     assert "s3cr3t-value" not in message
     rejected_line = next(line for line in logged if "semantic evidence rejected" in line)
-    assert "suite_start=unknown" in rejected_line
+    assert "suite_start=not-started" in rejected_line
     assert rendered in rejected_line
     assert _TIMESTAMP in rejected_line
     assert "s3cr3t-value" not in rejected_line
@@ -243,7 +243,7 @@ def no_repair(monkeypatch):
 
 @pytest.mark.parametrize(
     "bad",
-    [_observation(suite_start="unknown"), _observation(outcome="failed")],
+    [_observation(suite_start="not-started"), _observation(outcome="failed")],
     ids=["unverified", "failed"],
 )
 def test_reask_then_valid_citation_is_accepted(tmp_path, no_repair, bad):
@@ -264,7 +264,7 @@ def test_reask_then_valid_citation_is_accepted(tmp_path, no_repair, bad):
     [(None, "new-sess", "new-sess"), ("s0", None, "s0"), (None, None, None)],
 )
 def test_reask_session_selection(tmp_path, no_repair, caller, first, expected):
-    bad = [_observation(suite_start="unknown")]
+    bad = [_observation(suite_start="not-started")]
     response, error, invoke = _reask(
         tmp_path,
         [_result(session_id=first), _result()],
@@ -278,7 +278,7 @@ def test_reask_session_selection(tmp_path, no_repair, caller, first, expected):
 
 
 def test_reask_exhausted_stops_with_existing_classification(tmp_path, no_repair):
-    bad = [_observation(suite_start="unknown")]
+    bad = [_observation(suite_start="not-started")]
     response, error, invoke = _reask(tmp_path, [_result(), _result(), _result()], [bad])
     assert response is None
     assert invoke.call_count == 2
@@ -295,7 +295,7 @@ def test_collision_is_never_reasked(tmp_path, no_repair):
 
 def test_envelope_normalized_rejection_is_reasked(tmp_path, no_repair):
     masked = _implementation_with_claim() + "\ntrailing prose"
-    bad = [_observation(suite_start="unknown")]
+    bad = [_observation(suite_start="not-started")]
     response, error, invoke = _reask(
         tmp_path, [_result(masked), _result()], [bad, [_observation()]]
     )
@@ -304,7 +304,7 @@ def test_envelope_normalized_rejection_is_reasked(tmp_path, no_repair):
 
 
 def test_without_flag_single_attempt_unchanged(tmp_path, no_repair):
-    bad = [_observation(suite_start="unknown")]
+    bad = [_observation(suite_start="not-started")]
     result = _result()
     with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=result) as invoke:
         with pytest.raises(AgentInvocationError):
@@ -316,7 +316,7 @@ def test_protocol_rejection_reasons():
     for catalog, reason in [
         ([_observation(), _observation()], "catalog-collision"),
         ([_observation(outcome="failed")], "non-passing-selector"),
-        ([_observation(suite_start="unknown")], "launch-integrity"),
+        ([_observation(suite_start="not-started")], "launch-integrity"),
     ]:
         with pytest.raises(NonRepairableEvidenceRejection) as excinfo:
             _validator(catalog)(_implementation_with_claim())
@@ -391,7 +391,7 @@ def _run_real(tmp_path, results):
 
 def test_reask_validates_against_the_second_turns_own_catalog(tmp_path, no_repair):
     first = _turn_result(
-        _claim_text("turn1:obs-1"), "t1", [_obs_for("turn1:obs-1", "t1", suite_start="unknown")], "s1"
+        _claim_text("turn1:obs-1"), "t1", [_obs_for("turn1:obs-1", "t1", suite_start="not-started")], "s1"
     )
     fresh = _obs_for("turn2:obs-1", "t2")
     second = _turn_result(_claim_text("turn2:obs-1"), "t2", [fresh], "s1")
@@ -404,7 +404,7 @@ def test_reask_validates_against_the_second_turns_own_catalog(tmp_path, no_repai
 
 
 def test_reask_cannot_cite_the_rejected_turns_observation(tmp_path, no_repair):
-    bad = _obs_for("turn1:obs-1", "t1", suite_start="unknown")
+    bad = _obs_for("turn1:obs-1", "t1", suite_start="not-started")
     first = _turn_result(_claim_text("turn1:obs-1"), "t1", [bad])
     # The re-ask turn's closed catalog holds only turn 2; citing turn 1 again
     # must never be accepted as a verified claim.
@@ -590,7 +590,7 @@ def test_repair_surfaced_reaskable_rejection_reasks_coder_once_on_primary_sessio
     tmp_path, monkeypatch, real_repair
 ):
     calls = _cli_repair(monkeypatch, [(_REJECTED_CANDIDATE, 0)])
-    bad = [_observation(suite_start="unknown")]
+    bad = [_observation(suite_start="not-started")]
     response, error, invoke, logged = _run_masked(
         tmp_path,
         [bad, [_observation()]],
@@ -611,7 +611,7 @@ def test_repair_surfaced_reaskable_rejection_reasks_coder_once_on_primary_sessio
 
 def test_repair_surfaced_rejection_after_consumed_reask_stops(tmp_path, monkeypatch, real_repair):
     calls = _cli_repair(monkeypatch, [(_REJECTED_CANDIDATE, 0), (_REJECTED_CANDIDATE, 0)])
-    bad = [_observation(suite_start="unknown")]
+    bad = [_observation(suite_start="not-started")]
     response, error, invoke, _ = _run_masked(
         tmp_path,
         [bad],
@@ -687,9 +687,148 @@ def test_legacy_hook_rejection_routes_through_validated_agent(tmp_path, monkeypa
 
 def test_legacy_hook_reaskable_rejection_reasks_once(tmp_path, monkeypatch):
     monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
-    bad = [_observation(suite_start="unknown")]
+    bad = [_observation(suite_start="not-started")]
     response, error, invoke, _ = _run_masked(
         tmp_path, [bad, [_observation()]], [_result(_MASKED), _result()], reask=True, retries=0
     )
     assert error is None
     assert invoke.call_count == 2
+
+
+# --- #1659: a sole suite_start=unknown selector is refused non-terminally ---
+
+
+def _unverified_suite_catalog():
+    # Wrapper bootstrap verified and the inner command started; only the suite
+    # start was never verified (for example an unrecognized launcher).
+    return [_observation(suite_start="unknown", command="python scripts/x.py")]
+
+
+def _followup_with_claim() -> str:
+    from agent_loop_helpers import structured_coder_followup
+
+    text = structured_coder_followup()
+    body, footer = text.split("\n<!--", 1)
+    payload = json.loads(body)
+    payload["risk_test_matrix_claims"] = [dict(_CLAIM)]
+    return json.dumps(payload) + "\n<!--" + footer
+
+
+def _derive_for_row_1(claims, catalog):
+    from coding_review_agent_loop.protocol import (
+        derive_risk_test_matrix_evidence,
+        parse_risk_test_matrix,
+        risk_test_matrix_identity,
+    )
+
+    matrix = parse_risk_test_matrix({
+        "applicability": "applicable",
+        "important_exclusions": [],
+        "rows": [{
+            "row_id": "row-1", "label": "Behaviour", "entry_path_or_mode": "agent-loop pr",
+            "initial_state": "approved plan", "event": "coder reports", "expected_outcome": "outcome",
+            "forbidden_side_effects": ["none"], "proposed_test_level": "integration",
+            "proposed_test_location": "tests/test_example.py", "applicability": "applicable",
+            "related_scope_item_ids": ["scope-1"], "execution_owner": "one-shot",
+        }],
+    })
+    return derive_risk_test_matrix_evidence(
+        matrix=matrix, claims=claims, observations=tuple(catalog), execution_catalog=tuple(catalog),
+        invocation_id=None, current_head="head-1", current_tree_digest="tree-1",
+        authenticated_checkout_head="head-1", authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+
+
+def test_followup_citing_unverified_suite_start_continues_without_repair_1659(tmp_path, monkeypatch, no_repair):
+    """`followup-cites-unverified-suite`: the turn validates; post-auth refuses the citation."""
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+    from coding_review_agent_loop.test_runtime import CITABLE_TEST_RUNNERS_SUMMARY
+
+    catalog = _unverified_suite_catalog()
+    text = _followup_with_claim()
+    logged: list[str] = []
+    patch_attr_in(monkeypatch, (agent_failure, integration_close, architecture_contract, validated_agent_module, response_validation, panel_evidence, review_rounds, discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, issue_implementation_module, plan_first_loop, triage, issue_loop), "log", lambda config, text, *a, **k: logged.append(str(text)))
+
+    def validate(candidate):
+        return validate_structured_coder_followup(
+            candidate, delivered_risk_test_matrix_row_ids=["row-1"], execution_catalog=catalog,
+        )
+
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", return_value=AgentResult(text=text, returncode=0)) as invoke:
+        response = _run_validated_agent(
+            FakeRunner(),
+            agent="claude",
+            config=make_config(tmp_path, agent_max_retries=1),
+            prompt="Address the review.",
+            marker_description="structured coder_followup result",
+            validate=validate,
+            role="coder",
+            use_repair=True,
+            repair_expected_kind="coder_followup",
+        )
+    assert invoke.call_count == 1
+    assert not any("semantic evidence rejected" in line for line in logged)
+    claims = response.marker_value.risk_test_matrix_claims
+    assert claims.claims[0].execution_refs == (_SELECTOR,)
+    derived = _derive_for_row_1(claims, catalog)
+    [row] = derived.evidence.rows
+    assert row.status != "verified"
+    assert row.evidence_citations == ()
+    [diagnostic] = [item for item in derived.diagnostics if item.code == "inadmissible-execution"]
+    assert "suite_start=unknown" in diagnostic.message
+    assert CITABLE_TEST_RUNNERS_SUMMARY in diagnostic.message
+    classification = derived.row_capture_classifications["row-1"]
+    assert classification["class"] == "not-capture-limited"
+    assert classification["disqualifiers"] == ["suite-start-unverified"]
+
+
+def test_implementation_citing_unverified_suite_start_spends_no_reask_1659(tmp_path, no_repair):
+    """`impl-and-repair-cite-unverified-suite`: accepted on the first turn, no re-ask."""
+    response, error, invoke = _reask(tmp_path, [_result(), _result()], [_unverified_suite_catalog()], retries=0)
+    assert error is None
+    assert invoke.call_count == 1
+    assert response.marker_value.risk_test_matrix_claims.claims[0].execution_refs == (_SELECTOR,)
+
+
+def test_implementation_reask_budget_is_intact_for_a_later_real_rejection_1659(tmp_path, no_repair):
+    """The non-terminal citation does not consume the one-per-invocation re-ask."""
+    bad = [_observation(suite_start="not-started")]
+    response, error, invoke = _reask(
+        tmp_path, [_result(), _result()], [bad, _unverified_suite_catalog()], retries=0
+    )
+    assert error is None
+    assert invoke.call_count == 2
+    assert "Previous response not accepted: test evidence" in invoke.call_args_list[1].kwargs["prompt"]
+
+
+def test_repair_candidate_citing_unverified_suite_start_is_accepted_1659(tmp_path, monkeypatch, real_repair):
+    """`impl-and-repair-cite-unverified-suite`: the repair chain does not stop as a rejection."""
+    calls = _cli_repair(monkeypatch, [(_REJECTED_CANDIDATE, 0)])
+    response, error, invoke, logged = _run_masked(
+        tmp_path, [_unverified_suite_catalog()], [_result(_MASKED), _result()],
+        reask=True, retries=0, **_codex_repair(),
+    )
+    assert error is None
+    assert calls == ["model-a"]
+    assert invoke.call_count == 1
+    assert response.marker_value.risk_test_matrix_claims.claims[0].execution_refs == (_SELECTOR,)
+    assert not any("semantic_evidence_rejection" in line for line in logged)
+    assert not any("re-asking the coder once" in line for line in logged)
+
+
+def test_legacy_hook_candidate_citing_unverified_suite_start_is_accepted_1659(tmp_path, monkeypatch):
+    from coding_review_agent_loop.validated_agent import _run_structured_repair
+
+    monkeypatch.setattr(validated_agent_module, "attempt_repair", _legacy_hook(_REJECTED_CANDIDATE))
+    repaired, marker, attempts = _run_structured_repair(
+        _MASKED,
+        runner=FakeRunner(),
+        config=make_config(tmp_path),
+        usage_context=None,
+        validate=_validator(_unverified_suite_catalog()),
+        repair_kwargs={"expected_kind": "issue_implementation"},
+    )
+    assert repaired == _REJECTED_CANDIDATE
+    assert marker is not None
+    assert all(attempt.outcome != "semantic_evidence_rejection" for attempt in attempts)
