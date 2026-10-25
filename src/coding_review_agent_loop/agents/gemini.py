@@ -18,6 +18,7 @@ from .base import (
     with_public_response_file_instruction,
 )
 from .replacement import classify_provider_executable_replacement_interruption
+from ..worktree_hints import dependency_hint_environment
 from ..logging import agent_log_path, log
 from ..protocol import CLARIFY_RE, PLAN_STATE_RE, PUBLIC_RESPONSE_MARKER, STATE_RE
 from ..runner import CommandResult, Runner
@@ -313,6 +314,8 @@ class GeminiBackend:
             check=False,
             env={
                 "AGENT_LOOP_WORKDIR": str(config.gemini_dir.resolve()),
+                # Advisory remedy text only (#1651); never evidence or outcome.
+                **dependency_hint_environment(config, config.gemini_dir),
                 "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
                     config.coder_test_command_timeout_seconds
                 ),

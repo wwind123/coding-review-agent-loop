@@ -1563,3 +1563,69 @@ def test_every_backend_agent_launch_goes_through_the_pinned_runner_sites():
         window = runner_source[start:start + 700]
         assert "launch_env.update(agent_executable_environment(launch_env))" in window
         assert window.index("agent_executable_environment") < window.index("broker.environment")
+
+
+# ------------------------------------- worktree dependency hint variable (#1651)
+
+
+@pytest.mark.parametrize("shape", ["unlinked-run-worktree", "linked-run-worktree", "explicit-dir"])
+def test_backends_set_the_dependency_hint_only_for_an_unlinked_run_worktree(tmp_path, monkeypatch, shape):
+    import os
+    import tempfile
+
+    from coding_review_agent_loop import checkout_verification
+    from coding_review_agent_loop.agents.antigravity import BACKEND as ANTIGRAVITY_BACKEND
+    from coding_review_agent_loop.config import default_run_worktree
+    from coding_review_agent_loop.worktree_hints import (
+        WORKTREE_DEPENDENCY_HINT_ENV,
+        WORKTREE_DEPENDENCY_HINT_VALUE,
+        dependency_hint_requested,
+    )
+
+    agents = ("claude", "codex", "gemini", "antigravity")
+    # The orchestrator itself inherited the selector: a backend must still
+    # neutralize it whenever the parent-owned condition is false.
+    monkeypatch.setenv(WORKTREE_DEPENDENCY_HINT_ENV, WORKTREE_DEPENDENCY_HINT_VALUE)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
+    token = "tok1651"
+    dirs = {agent: tmp_path / agent for agent in agents}
+    overrides = {}
+    if shape != "explicit-dir":
+        dirs.update({agent: default_run_worktree("OWNER/REPO", agent, token) for agent in agents})
+        overrides = {
+            "run_token": token,
+            "default_checkout_stores": tuple((agent, tmp_path / "stores" / agent) for agent in agents),
+            "worktree_links": (".venv",) if shape == "linked-run-worktree" else (),
+        }
+    config = make_config(tmp_path, **{f"{agent}_dir": path for agent, path in dirs.items()}, **overrides)
+    # Registering a link in the process-local registry must not influence the
+    # decision: the hint comes from parent-owned config only.
+    checkout_verification.register_worktree_links(dirs["claude"], {".venv": "/nowhere"})
+
+    class EnvRunner(FakeRunner):
+        def __init__(self):
+            super().__init__(
+                claude_outputs=['{"result":"ok"}'],
+                codex_outputs=[{"public_response": "ok", "stdout": "", "returncode": 0}],
+                gemini_outputs=[json.dumps({"response": "ok", "session_id": "g"})],
+                antigravity_outputs=[("ok", 0)],
+            )
+            self.agent_envs = []
+
+        def run_with_log(self, args, *rest, **kwargs):
+            # The effective child environment, merged exactly as Runner does.
+            self.agent_envs.append((list(args), {**os.environ, **dict(kwargs.get("env") or {})}))
+            return super().run_with_log(args, *rest, **kwargs)
+
+    try:
+        for name, backend in (
+            ("claude", CLAUDE_BACKEND), ("codex", CODEX_BACKEND),
+            ("gemini", GEMINI_BACKEND), ("antigravity", ANTIGRAVITY_BACKEND),
+        ):
+            runner = EnvRunner()
+            backend.run(runner, config, "Prompt.", run_id="r", role="coder")
+            assert runner.agent_envs, name
+            for _args, env in runner.agent_envs:
+                assert dependency_hint_requested(env) is (shape == "unlinked-run-worktree"), name
+    finally:
+        checkout_verification.reset_checkout_baselines()

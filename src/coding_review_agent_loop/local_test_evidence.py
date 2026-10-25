@@ -75,6 +75,8 @@ MAX_PRIVATE_OBSERVATIONS = 64
 # authoritative failure and never in need of supersession.  The caveat grants
 # nothing on any other outcome.
 PRE_COLLECTION_LAUNCH_FAILURE_PREFIX = "pre-collection launch failure; not evidence"
+# Issue #1651: result-frame field for parent-selected advisory remedy text.
+BROKER_ADVISORY_FIELD = "advisory"
 # Issue #1329: the reserved ``superseded_by`` value for a parent-observed
 # failure stably attributed to a tracked tree other than the positively known
 # current one.  It is history, not an outstanding obligation.  The hyphenated
@@ -164,6 +166,9 @@ ENVIRONMENT_EXCLUSIONS = frozenset(
         "AGENT_LOOP_RUN_TESTS_TOOL_COMMIT",
         "AGENT_LOOP_RUN_TESTS_TOOL_DIRTY",
         "AGENT_LOOP_RUN_TESTS_TOOL_PACKAGE",
+        # Advisory per-run-worktree remedy selector (#1651): presentation
+        # only, so spoofing, stripping or changing it never splits identity.
+        "AGENT_LOOP_WORKTREE_DEPENDENCY_HINT",
         "PWD",
         "OLDPWD",
         "SHLVL",
@@ -3267,6 +3272,9 @@ class BrokerRunResult:
     # Issue #1326: the projected fixture record, decoded defensively; ``None``
     # for fixture-less responses.
     fixture: Mapping[str, object] | None = None
+    # Issue #1651: parent-selected advisory remedy text for a launch failure.
+    # Presentation only; never journaled, never part of the diagnostic.
+    advisory: str = ""
 
 
 def _bounded_argv(values: Sequence[object]) -> list[str]:
@@ -3377,6 +3385,7 @@ class TestBrokerServer:
         execute: Any | None = None,
         environment_registry: EnvironmentIdentityRegistry | None = None,
         telemetry_attribution: dict | None = None,
+        dependency_remedy: str | None = None,
     ) -> None:
         if root.is_symlink():
             raise BrokerProtocolError("broker root may not be a symlink")
@@ -3384,6 +3393,9 @@ class TestBrokerServer:
         if not self.root.is_dir():
             raise BrokerProtocolError("broker root is not a directory")
         self.turn_id = turn_id or uuid.uuid4().hex
+        # Issue #1651: chosen by the parent from its own config when it starts
+        # the broker; attached to launch-failure frames as presentation only.
+        self.dependency_remedy = dependency_remedy or None
         self.capability = uuid.uuid4().hex + uuid.uuid4().hex
         self.timeout_ceiling = float(timeout_ceiling)
         self.containment_policy = containment_policy
@@ -4528,6 +4540,8 @@ class TestBrokerServer:
         }
         if fixture_record is not None:
             response[BROKER_FIXTURE_FIELD] = fixture_record.to_dict()
+        if self.dependency_remedy and (result_outcome == "launch-failed" or inner_exec == "failed"):
+            response[BROKER_ADVISORY_FIELD] = _safe_text(self.dependency_remedy, 1024)
         return response
 
     def _worker_environment_summary(self, environment: Mapping[str, str]) -> dict[str, str]:
@@ -4693,6 +4707,10 @@ class TestBrokerClient:
                     fixture=(
                         decode_fixture_record(response[BROKER_FIXTURE_FIELD])[0].to_dict()
                         if BROKER_FIXTURE_FIELD in response else None
+                    ),
+                    advisory=(
+                        str(response[BROKER_ADVISORY_FIELD])
+                        if isinstance(response.get(BROKER_ADVISORY_FIELD), str) else ""
                     ),
                 )
 

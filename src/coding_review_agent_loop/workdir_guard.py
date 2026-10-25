@@ -961,11 +961,26 @@ def _check_path_role(
         # The caller degrades this report to out-of-checkout context instead
         # of rejecting the whole payload; every other check still applies.
         path_violations.append(raw_path)
+        if role == "program" and isinstance(path_violations, _PathLog):
+            path_violations.program_outside = True
         return
-    raise AgentLoopError(
+    raise (_OutsideProgramError if role == "program" else AgentLoopError)(
         "Coder reported tests from outside the assigned checkout: "
         f"{raw_path!r} in command {command!r}. Assigned checkout: {assigned}"
     )
+
+
+class _OutsideProgramError(AgentLoopError):
+    """An interpreter or executable outside the checkout; may carry a remedy (#1651)."""
+
+
+def _with_dependency_hint(exc: AgentLoopError, dependency_hint: str | None) -> AgentLoopError | None:
+    """The same refusal with the advisory remedy appended, or None to re-raise unchanged."""
+    if not dependency_hint or not isinstance(exc, _OutsideProgramError):
+        return None
+    from .worktree_hints import with_remedy
+
+    return _OutsideProgramError(with_remedy(str(exc), dependency_hint))
 
 
 def _windows_path_is_exempt(command: str, raw_windows: str, origin: Origin) -> bool:
@@ -1284,6 +1299,8 @@ class _PathLog(list):
         self.cwd_depth = 0
         # A target whose location cannot be proven blocks the context label.
         self.ambiguous_target = False
+        # An interpreter or executable outside the checkout was named.
+        self.program_outside = False
 
 
 # Options whose following operand is a value (config file, plugin, expression,
@@ -1573,12 +1590,24 @@ def validate_test_commands_within_workdir(
     *,
     assigned_workdir: Path,
     origin: Origin = "structured",
+    dependency_hint: str | None = None,
 ) -> None:
+    """Refuse out-of-checkout test commands.
+
+    ``dependency_hint`` is advisory text appended to an out-of-checkout
+    interpreter/executable refusal; it never changes whether a command is refused.
+    """
     if not tests_run:
         return
     assigned = _canonical(assigned_workdir)
     for command in tests_run:
-        _validate_single_command(command, assigned=assigned, origin=origin)
+        try:
+            _validate_single_command(command, assigned=assigned, origin=origin)
+        except AgentLoopError as exc:
+            hinted = _with_dependency_hint(exc, dependency_hint)
+            if hinted is None:
+                raise
+            raise hinted from exc
 
 
 @dataclass(frozen=True)
@@ -1593,6 +1622,7 @@ def partition_reported_tests_by_workdir(
     tests_run: Sequence[str] | None,
     *,
     assigned_workdir: Path,
+    dependency_hint: str | None = None,
 ) -> ReportedTestsPartition:
     """Separate out-of-checkout context runs from a display-only test report.
 
@@ -1622,7 +1652,7 @@ def partition_reported_tests_by_workdir(
         elif _tests_only_outside(violations):
             context.append(command)
         else:
-            raise AgentLoopError(
+            message = (
                 "Coder reported a test command that names a path outside the "
                 f"assigned checkout ({', '.join(repr(p) for p in violations)}) "
                 "but may also test the checkout itself, in command "
@@ -1631,6 +1661,11 @@ def partition_reported_tests_by_workdir(
                 "must name only outside test targets. Assigned checkout: "
                 f"{assigned}"
             )
+            if violations.program_outside and dependency_hint:
+                from .worktree_hints import with_remedy
+
+                message = with_remedy(message, dependency_hint)
+            raise AgentLoopError(message)
     return ReportedTestsPartition(in_checkout=tuple(kept), out_of_checkout=tuple(context))
 
 
@@ -1745,6 +1780,7 @@ def validate_test_observation_citations_within_workdir(
     citations: Sequence[object] | None,
     *,
     assigned_workdir: Path,
+    dependency_hint: str | None = None,
 ) -> None:
     """Apply the same checkout guard to structured receipt citations."""
     if not citations:
@@ -1753,7 +1789,9 @@ def validate_test_observation_citations_within_workdir(
         str(getattr(citation, "command", ""))
         for citation in citations
     )
-    validate_test_commands_within_workdir(commands, assigned_workdir=assigned_workdir)
+    validate_test_commands_within_workdir(
+        commands, assigned_workdir=assigned_workdir, dependency_hint=dependency_hint
+    )
 
 
 def extract_reported_tests_from_response(text: str) -> tuple[str, ...]:
@@ -1785,11 +1823,14 @@ def extract_reported_tests_from_response(text: str) -> tuple[str, ...]:
     return tuple(reports)
 
 
-def validate_response_tests_within_workdir(text: str, *, assigned_workdir: Path) -> None:
+def validate_response_tests_within_workdir(
+    text: str, *, assigned_workdir: Path, dependency_hint: str | None = None
+) -> None:
     validate_test_commands_within_workdir(
         extract_reported_tests_from_response(text),
         assigned_workdir=assigned_workdir,
         origin="response",
+        dependency_hint=dependency_hint,
     )
 
 

@@ -49,6 +49,7 @@ from .base import (
     with_public_response_file_instruction,
 )
 from .replacement import classify_provider_executable_replacement_interruption
+from ..worktree_hints import dependency_hint_environment
 from ..errors import AgentLoopError, AgentSettingsLockWaitTimeout, CheckoutVerificationError
 from ..logging import agent_log_path, log
 from ..protocol import PUBLIC_RESPONSE_MARKER
@@ -1388,6 +1389,7 @@ class AntigravityBackend:
                     check=False,
                     env={
                         "AGENT_LOOP_WORKDIR": str(Path(temp_dir).resolve()),
+                        **dependency_hint_environment(config, Path(temp_dir)),
                         "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
                             config.coder_test_command_timeout_seconds
                         ),
@@ -1628,6 +1630,8 @@ class AntigravityBackend:
                         check=False,
                         env={
                             "AGENT_LOOP_WORKDIR": str(config.antigravity_dir.resolve()),
+                            # Advisory remedy text only (#1651); never evidence or outcome.
+                            **dependency_hint_environment(config, config.antigravity_dir),
                             "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
                                 config.coder_test_command_timeout_seconds
                             ),

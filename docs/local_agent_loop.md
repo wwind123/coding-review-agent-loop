@@ -1393,6 +1393,20 @@ agent-loop issue 123 --repo OWNER/REPO \
   anything on its own.
 - A PR that changes a key file still runs against the base environment;
   per-PR dependency environments are planned separately (#1630, stage 3).
+- Without `--worktree-link`, a run-tests launch failure in a per-run worktree
+  (a missing `.venv/bin/python`, or an interpreter without pytest), a coder
+  test-gate launch failure and a refused out-of-checkout test executable add
+  one line naming `--worktree-link` and `--worktree-setup`, chosen from the
+  orchestrator's own configuration. The line is advice only; classification,
+  outcome, evidence identity and exit codes are unchanged.
+- A replaced or removed link is still refused; the message names the link
+  source in the shared clone and says that dependency changes inside a PR need
+  per-PR dependency support or an explicit `--<agent>-dir` checkout. When an
+  issue run stops after the coder pushed its branch and its checkout became
+  untrusted (a checkout refusal or a terminal result with no PR), the stop also
+  prints `agent-loop managed-pr --head <branch> --expected-closing-issue N` as
+  the resume and the manual `git -C <store> worktree remove --force <run-worktree>`
+  cleanup; agent-loop never removes that worktree itself.
 
 ### Process-tree containment
 

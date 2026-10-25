@@ -84,6 +84,7 @@ from .salvage import (
 )
 from .usage import RunUsageContext
 from .workdirs import active_workdir
+from .worktree_hints import add_pushed_branch_recovery, dependency_remedy
 from .workdir_guard import (
     validate_assigned_head_advanced,
     validate_test_observation_citations_within_workdir,
@@ -940,6 +941,7 @@ def run_issue_loop(
             validate_test_observation_citations_within_workdir(
                 implementation_result.parsed.test_observations,
                 assigned_workdir=active_workdir(config),
+                dependency_hint=dependency_remedy(config, active_workdir(config)),
             )
             _post_structured_issue_implementation_terminal_comment(
                 runner,
@@ -960,6 +962,7 @@ def run_issue_loop(
                 validate_test_observation_citations_within_workdir(
                     implementation_result.test_observations,
                     assigned_workdir=active_workdir(config),
+                    dependency_hint=dependency_remedy(config, active_workdir(config)),
                 )
                 _post_structured_issue_implementation_terminal_comment(
                     runner,
@@ -1202,6 +1205,12 @@ def run_issue_loop(
             pre_review_test_pending=True,
             managed_ci_handoff=managed_ci_handoff,
         )
+    except AgentLoopError as exc:
+        # A poisoned run worktree whose branch is already pushed: keep the
+        # same stop (checkout refusal or terminal no-PR result), but print the
+        # supported resume and manual cleanup with it (#1651).
+        add_pushed_branch_recovery(exc, runner=runner, config=config, issue_number=issue_number)
+        raise
     finally:
         _end_run_telemetry(runner, telemetry_token)
         if owned_usage_context:

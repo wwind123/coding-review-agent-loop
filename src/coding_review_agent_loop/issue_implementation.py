@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 from dataclasses import replace as dataclasses_replace
+from .worktree_hints import pushed_branch_recovery_scope
 from .agents.registry import agent_display_name
 from .config import (
     AgentLoopConfig,
@@ -265,7 +266,20 @@ def _approved_implementation_config(config: AgentLoopConfig) -> tuple[AgentLoopC
     return dataclasses_replace(config, **updates), reuse_session
 
 
-def _implement_approved_issue(
+def _implement_approved_issue(runner: Runner, *, issue_number: int, config: AgentLoopConfig, **kwargs) -> int:
+    """Approved-plan implementation; a stop after a pushed, poisoned run worktree gets recovery text (#1651)."""
+    # The stop concerns the implementation coder's checkout, which may differ
+    # from the planning coder's (--implementation-coder).
+    implementation_config, _reuse = _approved_implementation_config(config)
+    with pushed_branch_recovery_scope(
+        runner=runner, config=implementation_config, issue_number=issue_number
+    ):
+        return _implement_approved_issue_unscoped(
+            runner, issue_number=issue_number, config=config, **kwargs
+        )
+
+
+def _implement_approved_issue_unscoped(
     runner: Runner,
     *,
     issue_number: int,

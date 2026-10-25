@@ -2254,6 +2254,31 @@ _NO_RECORD_OUTCOMES = frozenset(
 )
 
 
+def _announce_worktree_dependency_hint(result) -> None:
+    """Advisory remedy after a launch failure in an unlinked per-run worktree (#1651).
+
+    The parent sets the hint variable only for a default per-run worktree with
+    no --worktree-link.  It selects this one extra stderr line and nothing
+    else: classification, outcome, evidence and exit code never read it.
+    """
+    from .worktree_hints import WORKTREE_DEPENDENCY_REMEDY, dependency_hint_requested
+
+    # A broker frame may carry the parent's own config-selected advisory, so
+    # the broker path does not depend on this process's selector (#1651).
+    advisory = str(getattr(result, "advisory", "") or "")
+    if not advisory and not dependency_hint_requested(os.environ):
+        return
+    outcome = str(getattr(result, "outcome", ""))
+    if outcome in _NO_RECORD_OUTCOMES:
+        return
+    pre_collection = _broker_frame_is_pre_collection(result) or (
+        bool(getattr(result, "pre_collection_launch_failure", None)) and outcome == "failed"
+    )
+    if not (pre_collection or outcome == "launch-failed" or getattr(result, "inner_exec", "") == "failed"):
+        return
+    print(f"agent-loop: {advisory or WORKTREE_DEPENDENCY_REMEDY}", file=sys.stderr, flush=True)
+
+
 def _announce_no_test_reason(result) -> None:
     """Print why a broker refusal ran no test, next to its receipt line (#1653).
 
@@ -2369,6 +2394,7 @@ def _run_fixture_tests(
         print(f"agent-loop test observation receipt: {result.receipt_id}", file=sys.stderr, flush=True)
     _announce_no_test_reason(result)
     _announce_uncitable_receipt(result, raw_inner)
+    _announce_worktree_dependency_hint(result)
     record = dict(result.fixture or {})
     print(
         "agent-loop fixture: setup={setup} teardown={teardown} cleanup={cleanup}".format(
@@ -2519,12 +2545,15 @@ def _run_tests_command(args: argparse.Namespace) -> int:
                 )
                 _announce_no_test_reason(broker_result)
                 _announce_uncitable_receipt(broker_result, raw_inner)
+                if not _broker_frame_is_pre_collection(broker_result):
+                    _announce_worktree_dependency_hint(broker_result)
                 if broker_result.outcome == "timed_out":
                     print(timeout_advisory(chosen, policy), file=sys.stderr, flush=True)
                 if _broker_frame_is_pre_collection(broker_result):
                     # Issue #1182: no test ran; neither timing nor launcher
                     # health describes the suite or the launcher.
                     _announce_pre_collection(broker_result.diagnostic)
+                    _announce_worktree_dependency_hint(broker_result)
                     return int(broker_result.returncode if broker_result.returncode is not None else 1)
                 if broker_result.outcome in _NO_RECORD_OUTCOMES:
                     # Coordination and pre-execution refusals are not evidence
@@ -2621,7 +2650,9 @@ def _run_tests_command(args: argparse.Namespace) -> int:
             print(timeout_advisory(chosen, policy), file=sys.stderr, flush=True)
         if result.pre_collection_launch_failure and result.outcome == "failed":
             _announce_pre_collection(result.pre_collection_launch_failure)
+            _announce_worktree_dependency_hint(result)
             return int(result.returncode if result.returncode is not None else 1)
+        _announce_worktree_dependency_hint(result)
         if result.overlap_rejected or result.outcome in _NO_RECORD_OUTCOMES:
             # Overlap, worker-budget-busy and direct refusals are coordination
             # or configuration, not launcher health or suite timing evidence.

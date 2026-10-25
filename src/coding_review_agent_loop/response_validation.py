@@ -78,6 +78,7 @@ from .risk_coverage_map import (
 )
 from .local_test_evidence import reconcile_test_observations, stable_tracked_tree_snapshot
 from .workdirs import active_workdir
+from .worktree_hints import dependency_remedy
 from .workdir_guard import (
     validate_response_tests_within_workdir,
     command_is_admissible_evidence,
@@ -1334,7 +1335,9 @@ def _validate_response_tests_with_post_pr_context(
 ) -> None:
     _validate_tests_with_post_pr_context(
         lambda: validate_response_tests_within_workdir(
-            text, assigned_workdir=active_workdir(config)
+            text,
+            assigned_workdir=active_workdir(config),
+            dependency_hint=dependency_remedy(config, active_workdir(config)),
         ),
         runner=runner,
         config=config,
@@ -1359,7 +1362,9 @@ def _degrade_out_of_checkout_tests(
     targets and other unvalidatable reports still raise.
     """
     partition = partition_reported_tests_by_workdir(
-        parsed.tests_run, assigned_workdir=active_workdir(config)
+        parsed.tests_run,
+        assigned_workdir=active_workdir(config),
+        dependency_hint=dependency_remedy(config, active_workdir(config)),
     )
     if not partition.out_of_checkout:
         return parsed
@@ -1406,6 +1411,7 @@ def _validate_structured_response_observations_with_post_pr_context(
         lambda: validate_test_observation_citations_within_workdir(
             test_observations,
             assigned_workdir=active_workdir(config),
+            dependency_hint=dependency_remedy(config, active_workdir(config)),
         ),
         runner=runner,
         config=config,
