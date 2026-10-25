@@ -6676,9 +6676,24 @@ def test_draining_client_under_sustained_output_is_never_cancelled(tmp_path, mon
             time.sleep(0.002)  # drain slower than the target writes
         client.close()
         assert final["outcome"] == "passed", final
-        window = [queued for at, queued in samples if 1.0 <= at <= 1.0 + 2 * timeout]
-        assert window and min(window) > 0  # the queue never emptied across two ack windows
-        assert len([at for at in beats if 1.0 <= at <= 1.0 + 2 * timeout]) >= 3
+        # Pressure interval: the queue is non-empty and non-decreasing across
+        # more than one ack window.  Per 0.5 s bucket the peak depth never
+        # falls (one frame of read/refill jitter allowed), so liveness could
+        # not have come from a shrinking queue; only acknowledgements kept the
+        # request alive.
+        start, end = 1.0, 1.0 + 2 * timeout
+        window = [queued for at, queued in samples if start <= at <= end]
+        assert window and min(window) > 0
+        frame_jitter = 1024
+        peaks = []
+        bucket = start
+        while bucket < end:
+            values = [queued for at, queued in samples if bucket <= at < bucket + 0.5]
+            assert values, bucket
+            peaks.append(max(values))
+            bucket += 0.5
+        assert all(later >= earlier - frame_jitter for earlier, later in zip(peaks, peaks[1:])), peaks
+        assert len([at for at in beats if start <= at <= end]) >= 3
         (row,) = server.journal
         assert row.provenance == "parent-observed" and row.outcome == "passed"
     finally:
@@ -6935,7 +6950,7 @@ def test_refusal_names_the_request_that_really_holds_the_lock(tmp_path, monkeypa
         expected = "overlap-rejected" if kind == "lane" else "worker-budget-busy"
         assert c.final["outcome"] == expected, c.final
         diagnostic = c.final["diagnostic"]
-        assert f"Held by: `{redact_test_command(holder_argv)[0]}` (running, " in diagnostic
+        assert f"Held by: `{redact_test_command(holder_argv)[0]}` in `.` (running, " in diagnostic
         assert "preparing" not in diagnostic
         if kind != "lane":
             assert redact_test_command(a_argv)[0] not in diagnostic
@@ -6943,4 +6958,60 @@ def test_refusal_names_the_request_that_really_holds_the_lock(tmp_path, monkeypa
         assert b.final["outcome"] == "passed"
     finally:
         release.set()
+        server.stop()
+
+
+
+@pytest.mark.parametrize("variant", ["worker-flags", "cwd"])
+def test_lane_refusal_names_the_holder_of_that_exact_lane(tmp_path, monkeypatch, variant):
+    """Item: a lane refusal names the request holding that lane key, not a similar command."""
+    server = BrokerServer(root=tmp_path, turn_id=f"turn-1653-lane-{variant}").start()
+    server._worker_lock_root = tmp_path.parent / f"{tmp_path.name}-locks"
+    server.set_execution_context(
+        containment_handle=None, process_started=None, process_finished=None,
+        worker_budget=WorkerBudget(
+            4, "inherited", "off", "cpu",
+            {"cpu_available": 4, "host_usable_bytes": 64 * _GIB, "per_worker_bytes": _GIB, "reserve_bytes": _GIB},
+            False,
+        ),
+    )
+    sleeper = (sys.executable, "-c", "import time; time.sleep(8)")
+    if variant == "worker-flags":
+        (tmp_path / "test_slow.py").write_text("def test_slow():\n    import time\n    time.sleep(5)\n")
+        pytest_argv = (sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_slow.py")
+        a_cwd, a_argv = tmp_path, sleeper  # an unrelated lane, held first
+        b_cwd, b_argv = tmp_path, (*pytest_argv, "-n", "0")
+        c_cwd, c_argv = tmp_path, (*pytest_argv, "-n", "1")  # same lane once worker flags are stripped
+        b_label = "."
+    else:
+        (tmp_path / "a").mkdir()
+        (tmp_path / "b").mkdir()
+        a_cwd, a_argv = tmp_path / "a", sleeper  # same command, other cwd: another lane
+        b_cwd, b_argv = tmp_path / "b", sleeper
+        c_cwd, c_argv = tmp_path / "b", sleeper
+        b_label = "b"
+
+    def request(nonce, argv, cwd):
+        payload = _group_request(server, tmp_path, nonce, argv, timeout=60)
+        payload["cwd"] = str(cwd)
+        return payload
+
+    try:
+        a = _FrameReader(server, request("a1" * 16, a_argv, a_cwd))
+        assert _await(lambda: any("lane" in r.holds and r.phase == "running" for r in list(server._requests.values())), 20)
+        b = _FrameReader(server, request("b1" * 16, b_argv, b_cwd))
+        assert _await(lambda: len([r for r in list(server._requests.values()) if r.phase == "running"]) == 2, 30)
+        c = _FrameReader(server, request("c1" * 16, c_argv, c_cwd))
+        c.join(30)
+        assert c.final["outcome"] == "overlap-rejected", c.final
+        diagnostic = c.final["diagnostic"]
+        assert f"Held by: `{redact_test_command(b_argv)[0]}` in `{b_label}` (running, " in diagnostic, diagnostic
+        if variant == "worker-flags":
+            assert redact_test_command(a_argv)[0] not in diagnostic
+        else:
+            assert "in `a`" not in diagnostic
+        b.join(30)
+        a.join(30)
+        assert b.final["outcome"] == "passed" and a.final["outcome"] == "passed"
+    finally:
         server.stop()

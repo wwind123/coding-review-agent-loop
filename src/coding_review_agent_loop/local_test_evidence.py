@@ -3046,8 +3046,10 @@ class _BrokerRequest:
         self.completing = False
         self.processes: dict[int, Any] = {}
         self.fixtures: dict[int, tuple[Any, float]] = {}
-        # The locks this request really holds, reported by the runner.
-        self.holds: set[str] = set()
+        # The locks this request really holds (kind -> exact key, if any),
+        # reported by the runner at acquisition and release.
+        self.holds: dict[str, str | None] = {}
+        self.cwd_label = "."
 
 
 def _host_heartbeat_grace() -> float:
@@ -3740,6 +3742,11 @@ class TestBrokerServer:
         except Exception:  # noqa: BLE001
             normalized = ""
         state = _BrokerRequest(self._stop_event, command=command, normalized=normalized)
+        try:
+            relative = os.path.relpath(str(validated.get("cwd")), str(self.root))
+            state.cwd_label = "." if relative == "." else relative
+        except (TypeError, ValueError):
+            state.cwd_label = "."
         with self._journal_lock:
             self._requests[id(state)] = state
             if self._stop_event.is_set():
@@ -3819,26 +3826,29 @@ class TestBrokerServer:
         for supervisor, reserve in fixtures:
             supervisor.finish(budget=reserve)
 
-    def _describe_holder(self, state: _BrokerRequest, kind: str) -> str | None:
-        """Name the request of this broker that really holds ``kind`` (#1653).
+    def _describe_holder(
+        self, state: _BrokerRequest, kind: str, key: str | None = None,
+    ) -> str | None:
+        """Name the request of this broker that really holds the refused lock (#1653).
 
         Ownership is reported by the runner at acquisition and release, so a
         request still in its before snapshot, or one whose locks are already
-        released, is never named.  ``None`` when no request here holds it.
+        released, is never named.  A refused lane is matched by its exact key
+        (cwd, lane identity and invocation), never by a similar command; the
+        worker budget has a single holder per invocation.  ``None`` when no
+        request here holds that lock.
         """
         with self._journal_lock:
             holders = [
                 request for request in self._requests.values()
                 if request is not state and kind in request.holds
+                and (kind != "lane" or (key is not None and request.holds[kind] == key))
             ]
         if not holders:
             return None
-        if kind == "lane":
-            same = [request for request in holders if request.normalized == state.normalized]
-            holders = same or holders
         holder = min(holders, key=lambda request: request.started)
         return (
-            f"`{_bounded(holder.command, 200)}` ({holder.phase}, "
+            f"`{_bounded(holder.command, 200)}` in `{_bounded(holder.cwd_label, 200)}` ({holder.phase}, "
             f"{time.monotonic() - holder.started:.0f} s); it frees when that command finishes "
             "or is cancelled, not by killing a run-tests client process, and a killed or "
             f"non-reading client is cancelled within about {BROKER_CLIENT_ACK_TIMEOUT_SECONDS:g} s"
@@ -4145,12 +4155,12 @@ class TestBrokerServer:
             if self._process_started is not None:
                 self._process_started(proc)
 
-        def lock_observer(kind: str, held: bool) -> None:
+        def lock_observer(kind: str, held: bool, key: str | None = None) -> None:
             with self._journal_lock:
                 if held:
-                    request_state.holds.add(kind)
+                    request_state.holds[kind] = key
                 else:
-                    request_state.holds.discard(kind)
+                    request_state.holds.pop(kind, None)
 
         def finished(proc: Any) -> None:
             with self._journal_lock:
@@ -4182,7 +4192,7 @@ class TestBrokerServer:
             host_wait_heartbeat=heartbeat,
             host_wait_notify=wait_notice,
             host_launch_guard=lambda: self._launch_lock,
-            lock_holder_describer=lambda kind: self._describe_holder(request_state, kind),
+            lock_holder_describer=lambda kind, key=None: self._describe_holder(request_state, kind, key),
             lock_observer=lock_observer,
             # Issue #1653: a fixture's teardown and sweep finish before the
             # lane or worker budget is released, on every path that reached

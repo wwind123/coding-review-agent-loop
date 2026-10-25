@@ -7516,7 +7516,7 @@ def test_overlap_refusal_is_streamed_through_the_output_callback_with_its_holder
         result = run_foreground_test(
             command, cwd=tmp_path, timeout_seconds=5, env=env, environment_is_complete=True,
             output_callback=streamed.append, echo_output=False,
-            lock_holder_describer=lambda kind: f"`pytest -q` ({kind}, running, 3 s)",
+            lock_holder_describer=lambda kind, key: f"`pytest -q` ({kind}, running, 3 s)" if key else None,
         )
     finally:
         lock.close()
@@ -7789,16 +7789,37 @@ def test_held_locks_retain_both_locks_and_run_pre_release_first():
 
     order.clear()
     retained = _HeldTestLocks(Lock("lane"), Lock("worker"), None)
-    retained.retain_until_group_exits(2 ** 22 + 12345)  # no such group: released at once
+    cleanup_may_finish = threading.Event()
+
+    def slow_fixture_finish():
+        order.append("fixture-finish-start")
+        assert cleanup_may_finish.wait(10)
+        order.append("fixture-finish-end")
+
+    retained.pre_release.append(slow_fixture_finish)
+    # No such group: a watcher would release at once, but only after cleanup.
+    retainer = threading.Thread(target=retained.retain_until_group_exits, args=(2 ** 22 + 12345,))
+    retainer.start()
+    time.sleep(0.5)
+    assert order == ["fixture-finish-start"]  # neither lock has left the holder yet
+    cleanup_may_finish.set()
+    retainer.join(10)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and "close-lane" not in order:
         time.sleep(0.05)
     retained.close()
-    assert order == ["retain-worker", "close-lane"]
+    assert order == ["fixture-finish-start", "fixture-finish-end", "retain-worker", "close-lane"]
+
+    order.clear()
+    worker_only = _HeldTestLocks(Lock("lane"), Lock("worker"), None)
+    worker_only.pre_release.append(lambda: order.append("fixture-finish"))
+    worker_only.retain_worker_lock_until_group_exits(2 ** 22 + 12345)
+    worker_only.close()
+    assert order == ["fixture-finish", "retain-worker", "close-lane"]
 
 
 @_FX_HOST
-@pytest.mark.parametrize("phase", ["setup", "pre-launch", "running"])
+@pytest.mark.parametrize("phase", ["setup", "pre-launch", "running", "running-unconfirmed"])
 def test_fixture_cancel_keeps_the_lane_until_teardown_finishes(tmp_path, monkeypatch, phase):
     """Item: a lost fixture request releases its lane only after teardown and the sweep.
 
@@ -7811,7 +7832,20 @@ def test_fixture_cancel_keeps_the_lane_until_teardown_finishes(tmp_path, monkeyp
 
     from coding_review_agent_loop import runner as runner_module
 
-    modes = {"setup": "setup-block", "pre-launch": "", "running": "inner-block"}[phase]
+    modes = {
+        "setup": "setup-block", "pre-launch": "", "running": "inner-block",
+        "running-unconfirmed": "inner-block",
+    }[phase]
+    if phase == "running-unconfirmed":
+        # The group really empties during teardown, but its termination is
+        # reported unconfirmed, so the retained-lock watchers are used.
+        real_terminate = runner_module.terminate_process_group_fully
+
+        def unconfirmed(pgid, **kwargs):
+            real_terminate(pgid, **kwargs)
+            return False
+
+        monkeypatch.setattr(runner_module, "terminate_process_group_fully", unconfirmed)
     root, markers = _fx_repo(tmp_path)
     _fx_set_mode(root, f"{modes} teardown-slow".strip(), fx_teardown_seconds="6")
     entered = threading.Event()
@@ -7829,7 +7863,10 @@ def test_fixture_cancel_keeps_the_lane_until_teardown_finishes(tmp_path, monkeyp
         client = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
         client.connect(server.endpoint)
         fx_evidence._send_frame(client, _fx_raw_request(server, root, _FX_PYTEST, timeout=120))
-        marker = {"setup": "setup-blocking", "running": "inner-blocking"}.get(phase)
+        marker = {
+            "setup": "setup-blocking", "running": "inner-blocking",
+            "running-unconfirmed": "inner-blocking",
+        }.get(phase)
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline and not (
             entered.is_set() if marker is None else (markers / marker).exists()
