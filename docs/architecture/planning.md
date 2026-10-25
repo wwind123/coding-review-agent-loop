@@ -242,6 +242,22 @@ stops the repair chain on that candidate with no fallback model and takes the
 same route (one opted-in re-ask, otherwise a `semantic-evidence-rejection`
 stop), whatever the repair transport outcome (#999).
 
+One launch state is not an authority decision at parse time (#1659): a passing,
+parent-observed selector whose only launch defect is `suite_start=unknown`
+(wrapper bootstrap verified, inner command started), typically from a launcher
+the probe does not recognize. It is kept and reaches post-authentication
+derivation, which still refuses it: the row stays unverified, no receipt
+citation is produced, and an `inadmissible-execution` diagnostic says the suite
+start was never verified and names the citable runners. The run does not stop,
+no re-ask budget is spent, and no repair runs, on the direct follow-up, the
+implementation hand-off or a structured-repair candidate. Such a row also
+carries the `suite-start-unverified` capture disqualifier, so it is
+`not-capture-limited` and automatic evidence conversion never hands it to a
+human: the coder can capture the check by wrapping it in a pytest test. Every
+other failing launch state keeps the re-ask/stop route above. `run-tests`
+prints a not-citable notice beside such a receipt, and the coder prompts list
+the citable runners from the same shared summary.
+
 Inner-launcher authentication also covers a local Playwright spelling:
 `npx [--no-install|--no] playwright test ...` is recognized only when
 `<cwd>/node_modules/.bin/playwright` exists, in which case both the bounded

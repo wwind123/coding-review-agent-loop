@@ -178,6 +178,54 @@ def test_passing_receipt_with_unverified_launch_is_a_capture_limitation():
     }
 
 
+def test_sole_unverified_suite_start_is_disqualified_not_capture_limited_1659():
+    """`no-authority-granted`: such a pass stays unauthoritative and never converts.
+
+    The coder can capture the check as a pytest test, so automatic conversion
+    must not hand the row to a human.  A different unauthoritative pass (an
+    unverified wrapper bootstrap) keeps its capture-limited classification.
+    """
+    matrix = _matrix("row-a", "row-b")
+    claims = [_claim("row-a", "ref-1"), _claim("row-b", "ref-2")]
+    observations = [
+        _observation("ref-1", outcome="passed", suite_start="unknown"),
+        _observation("ref-2", outcome="passed", wrapper_bootstrap="unknown", suite_start="unknown"),
+    ]
+    result = _derive(matrix, claims, observations)
+    row_a = result.evidence.rows[0]
+    assert row_a.status != "verified"
+    assert row_a.evidence_citations == ()
+    assert result.row_capture_classifications["row-a"] == {
+        "class": NOT_CAPTURE_LIMITED,
+        "observation_classes": ["pass-unauthoritative"],
+        "disqualifiers": ["suite-start-unverified"],
+    }
+    assert result.row_capture_classifications["row-b"] == {
+        "class": CAPTURE_LIMITED,
+        "observation_classes": ["pass-unauthoritative"],
+        "disqualifiers": [],
+    }
+    # N consecutive coder rounds, each at its own head, never convert row-a,
+    # and every persisted record passes the closed-vocabulary validator.
+    identity = risk_test_matrix_identity(matrix)
+    classifications = {}
+    for round_number in (1, 2, 3):
+        payload = capture_classification_payload(result, head_sha=f"head-{round_number}")
+        assert decode_capture_classification(
+            payload, subject=f"head-{round_number}", evidence_identity=identity
+        ) == payload
+        classifications[round_number] = payload
+    prior = {
+        1: {**_snapshot(1, 1, ["row-a", "row-b"]), "matrix_identity": identity},
+        2: {**_snapshot(2, 2, ["row-a", "row-b"]), "matrix_identity": identity},
+    }
+    current = dataclasses.replace(_current(3, 3, ["row-a", "row-b"]), matrix_identity=identity)
+    converted = auto_conversion_rows(current, prior, classifications, 2, identity)
+    assert "row-a" not in converted
+    # The contrasting capture-limited row still converts under the same rounds.
+    assert "row-b" in converted
+
+
 def test_unknown_and_cross_turn_selectors_are_capture_limitations():
     matrix = _matrix("row-unknown", "row-cross")
     result = _derive(
