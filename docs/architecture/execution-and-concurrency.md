@@ -68,7 +68,10 @@ all before the record is touched. It then deletes the record and fsyncs its
 directory (failing closed), runs a non-forced `checkout --detach <sha>`,
 re-verifies HEAD and the tracked tree, and runs the command through
 `/bin/sh -c` in the store as the operator in its own process group, bounded by
-the coder test-command timeout. A failure or timeout kills the group and raises
+the coder test-command timeout. The leader is observed with `waitid(WNOWAIT)`
+and left unreaped until the whole group has been killed, so however the command
+ends no background child survives the store-lock release and the group ID
+cannot have been reused when it is signalled. A failure or timeout raises
 with the output tail, leaving no record; a success that still leaves a link
 source missing raises "succeeded but did not create" without a record. Dry-run
 only logs. After linking, a read-only `git check-ignore --no-index` probe in the

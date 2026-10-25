@@ -389,8 +389,37 @@ def read_output_tail(handle: Any) -> bytes:
     return handle.read(_TAIL_READ_BYTES)
 
 
+_EXIT_POLL_SECONDS = 0.05
+
+
+def _wait_for_exit_unreaped(process: subprocess.Popen, timeout_seconds: float) -> None:
+    """Wait for the leader to exit but leave it a zombie, so its process group ID stays reserved.
+
+    Raises ``subprocess.TimeoutExpired`` when the leader is still running at the deadline.
+    """
+    if not hasattr(os, "waitid"):
+        process.wait(timeout=timeout_seconds)
+        return
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        info = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        if info is not None:
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+        time.sleep(min(_EXIT_POLL_SECONDS, remaining))
+
+
 def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> None:
-    """Run ``command`` via ``/bin/sh -c`` in ``store`` as the operator; raise with the output tail."""
+    """Run ``command`` via ``/bin/sh -c`` in ``store`` as the operator; raise with the output tail.
+
+    However the command ends, every process left in its group is killed before
+    the leader is reaped, so no background child of a failed (or finished)
+    setup can keep writing to the shared environment after the store lock is
+    released. The leader stays an unreaped zombie until then, which keeps its
+    PID, and so the group ID, from being reused by an unrelated process.
+    """
     with tempfile.TemporaryFile() as output:
         try:
             process = subprocess.Popen(
@@ -403,7 +432,7 @@ def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> N
                 "No setup record was written."
             ) from exc
         try:
-            returncode = process.wait(timeout=timeout_seconds)
+            _wait_for_exit_unreaped(process, timeout_seconds)
         except subprocess.TimeoutExpired:
             _kill_group(process)
             raise AgentLoopError(
@@ -413,8 +442,11 @@ def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> N
         except BaseException:
             _kill_group(process)
             raise
-        # The leader is already reaped, so its process group ID may be reused:
-        # never signal it after a normal exit.
+        # The leader has exited but is not reaped yet, so the group ID is still
+        # ours: stop any surviving descendants, then reap.
+        if hasattr(os, "waitid"):
+            _kill_group(process)
+        returncode = process.wait()
         if returncode != 0:
             raise AgentLoopError(
                 f"--worktree-setup exited {returncode} in the shared clone {store}; "

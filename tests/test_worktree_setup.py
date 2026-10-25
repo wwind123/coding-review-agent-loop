@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -835,12 +836,15 @@ def test_large_failure_output_is_tail_bounded(tmp_path, monkeypatch, mode):
     assert len(message) < 4 * worktree_setup.OUTPUT_TAIL_BYTES
 
 
-@pytest.mark.parametrize("command, signalled", [("true", False), ("exit 5", False), ("sleep 30", True)])
-def test_process_group_is_signalled_only_before_the_leader_is_reaped(tmp_path, monkeypatch, command, signalled):
+@pytest.mark.parametrize("command", ["true", "exit 5", "sleep 30"])
+def test_process_group_is_signalled_only_while_the_leader_is_unreaped(tmp_path, monkeypatch, command):
     calls: list[int] = []
     real_killpg = os.killpg
 
     def recording_killpg(pgid, sig):
+        # The leader (pid == pgid) must still exist, alive or as a zombie, so the
+        # group ID cannot have been reused by an unrelated process.
+        os.waitid(os.P_PID, pgid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
         calls.append(pgid)
         return real_killpg(pgid, sig)
 
@@ -849,4 +853,38 @@ def test_process_group_is_signalled_only_before_the_leader_is_reaped(tmp_path, m
         worktree_setup.run_setup_command(tmp_path, command, timeout_seconds=1)
     except AgentLoopError:
         pass
-    assert bool(calls) is signalled
+    assert calls
+
+
+@pytest.mark.parametrize("exit_command", ["exit 1", "exit 0", "sleep 30"])
+def test_surviving_setup_child_cannot_write_after_the_command_ends(tmp_path, exit_command):
+    """A background writer left by setup is killed before run_setup_command returns or raises."""
+    state = tmp_path / "state"
+    command = f"(sleep 1; echo damaged > {state}) & {exit_command}"
+    started = time.monotonic()
+    try:
+        worktree_setup.run_setup_command(tmp_path, command, timeout_seconds=0.5 if "sleep" in exit_command else 10)
+    except AgentLoopError:
+        assert exit_command != "exit 0"
+    else:
+        assert exit_command == "exit 0"
+    assert time.monotonic() - started < 1
+    time.sleep(1.5)
+    assert not state.exists()
+
+
+def test_failed_setup_child_cannot_damage_the_environment_after_a_retry(tmp_path, monkeypatch):
+    """A failed attempt's background writer cannot mutate the store after a retry records success."""
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    store = claude_store()
+    failing = setup_config(env, setup_command(counter, "(sleep 1; echo damaged > .venv-state) & exit 1"))
+    with pytest.raises(AgentLoopError, match="exited 1"):
+        run_worktrees.prepare_store(store, config=failing, runner=Runner())
+    assert worktree_setup.read_setup_record(store) is None
+    retry = setup_config(env, setup_command(counter))
+    run_worktrees.prepare_store(store, config=retry, runner=Runner())
+    assert worktree_setup.read_setup_record(store) is not None
+    assert runs_in(counter, store) == 2
+    time.sleep(1.5)
+    assert not (store / ".venv-state").exists()
