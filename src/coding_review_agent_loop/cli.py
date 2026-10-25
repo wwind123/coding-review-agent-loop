@@ -2263,7 +2263,10 @@ def _announce_worktree_dependency_hint(result) -> None:
     """
     from .worktree_hints import WORKTREE_DEPENDENCY_REMEDY, dependency_hint_requested
 
-    if not dependency_hint_requested(os.environ):
+    # A broker frame may carry the parent's own config-selected advisory, so
+    # the broker path does not depend on this process's selector (#1651).
+    advisory = str(getattr(result, "advisory", "") or "")
+    if not advisory and not dependency_hint_requested(os.environ):
         return
     outcome = str(getattr(result, "outcome", ""))
     if outcome in _NO_RECORD_OUTCOMES:
@@ -2273,7 +2276,7 @@ def _announce_worktree_dependency_hint(result) -> None:
     )
     if not (pre_collection or outcome == "launch-failed" or getattr(result, "inner_exec", "") == "failed"):
         return
-    print(f"agent-loop: {WORKTREE_DEPENDENCY_REMEDY}", file=sys.stderr, flush=True)
+    print(f"agent-loop: {advisory or WORKTREE_DEPENDENCY_REMEDY}", file=sys.stderr, flush=True)
 
 
 def _announce_no_test_reason(result) -> None:

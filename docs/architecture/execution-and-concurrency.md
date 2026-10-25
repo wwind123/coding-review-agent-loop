@@ -84,17 +84,23 @@ hint per run names dependency manifests found in the pinned tree.
 diagnostics add one sentence naming `--worktree-link` and `--worktree-setup`
 only for a default per-run worktree with no configured link, decided from
 parent-owned config (`run_worktree_store` and `config.worktree_links`), never
-from the process-local link registry. Parent-side sites (the coder test gate
-and the workdir guard's out-of-checkout executable refusal) read the config
-directly. A `run-tests` client cannot see that config, so each backend exports
-`AGENT_LOOP_WORKTREE_DEPENDENCY_HINT=unlinked-run-worktree` into the agent
-environment under the same condition; the client reads it only to print one
-extra stderr line after a launch failure or a pre-collection failure, and
-never for classification, outcome, evidence or exit code. A replaced-link
-refusal names the link source in the shared clone. When a poisoned run
-worktree stops an issue run and its branch has a remote-tracking ref, the stop
-appends a `managed-pr --head` resume and the manual worktree-removal command;
-the worktree is left in place.
+from the process-local link registry. Parent-side sites (the coder test gate,
+the workdir guard's out-of-checkout executable refusal on structured, citation
+and free-form reports) read the config directly. Every agent launch sets
+`AGENT_LOOP_WORKTREE_DEPENDENCY_HINT` explicitly: `unlinked-run-worktree` under
+the condition and empty otherwise, so a value inherited by the orchestrator is
+neutralized. The Runner passes the same parent-built decision to the test
+broker, which attaches it as a separate `advisory` field to launch-failure
+result frames (never to the journal or the stored diagnostic); the `run-tests`
+client prints that advisory, or the remedy selected by its own variable, once
+after a launch failure or a pre-collection failure. The variable is excluded
+from evidence environment identity, and nothing reads it for classification,
+outcome, evidence or exit code. A replaced-link refusal names the link source
+in the shared clone. When an issue run stops (a checkout refusal or a terminal
+no-PR result) while the coder's per-run worktree is poisoned and its branch
+has a remote-tracking ref, the stop's message gains a `managed-pr --head`
+resume and the manual worktree-removal command; the exception type, exit code
+and refusal are unchanged and the worktree is left in place.
 
 **Incremental import.** `import_ref` exports only objects not reachable from
 destination ref tips that the private fetch repository also holds as commits:

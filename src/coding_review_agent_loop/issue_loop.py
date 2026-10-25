@@ -26,7 +26,6 @@ from .decomposition import (
 from .protocol import EXECUTION_DISPOSITION_PLANNING
 from .errors import (
     AgentLoopError,
-    CheckoutVerificationError,
 )
 from .expected_closure import (
     reject_parent_from_contract,
@@ -1206,15 +1205,12 @@ def run_issue_loop(
             pre_review_test_pending=True,
             managed_ci_handoff=managed_ci_handoff,
         )
-    except CheckoutVerificationError as exc:
-        # A poisoned run worktree whose branch is already pushed: keep
-        # refusing, but print the supported resume and manual cleanup (#1651).
-        recovered = add_pushed_branch_recovery(
-            exc, runner=runner, config=config, issue_number=issue_number
-        )
-        if recovered is None:
-            raise
-        raise recovered from exc
+    except AgentLoopError as exc:
+        # A poisoned run worktree whose branch is already pushed: keep the
+        # same stop (checkout refusal or terminal no-PR result), but print the
+        # supported resume and manual cleanup with it (#1651).
+        add_pushed_branch_recovery(exc, runner=runner, config=config, issue_number=issue_number)
+        raise
     finally:
         _end_run_telemetry(runner, telemetry_token)
         if owned_usage_context:

@@ -1917,6 +1917,13 @@ def ensure_log_dir_ignored(log_dir: Path) -> None:
         gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
 
 
+
+def _broker_dependency_remedy(env: Mapping[str, str] | None) -> str | None:
+    """Parent-selected advisory remedy for broker launch-failure frames (#1651)."""
+    from .worktree_hints import WORKTREE_DEPENDENCY_REMEDY, dependency_hint_requested
+
+    return WORKTREE_DEPENDENCY_REMEDY if env is not None and dependency_hint_requested(env) else None
+
 class Runner:
     def __init__(self, *, dry_run: bool = False, containment_policy: ContainmentPolicy | None = None):
         self.dry_run = dry_run
@@ -2097,6 +2104,9 @@ class Runner:
                     if self.telemetry_attribution
                     else None
                 ),
+                # Issue #1651: the backend override env is built in this
+                # process from parent config, never from the agent's process.
+                dependency_remedy=_broker_dependency_remedy(env),
             ).start()
         except (OSError, ValueError, AgentLoopError) as exc:
             # Broker setup is infrastructure telemetry. A coder can still use

@@ -1027,19 +1027,22 @@ def test_poisoned_after_push_stop_prints_resume_and_cleanup(tmp_path, monkeypatc
         with pytest.raises(CheckoutVerificationError) as caught:
             cv.verify_checkout(config, runner, path=root, agent="claude", purpose="agent turn")
         # Not pushed yet: no recovery text, the refusal is unchanged.
-        assert add_pushed_branch_recovery(caught.value, runner=runner, config=config, issue_number=1651) is None
+        original = str(caught.value)
+        assert add_pushed_branch_recovery(caught.value, runner=runner, config=config, issue_number=1651) is False
+        assert str(caught.value) == original
         git(root, "push", "-q", "origin", branch)
-        recovered = add_pushed_branch_recovery(caught.value, runner=runner, config=config, issue_number=1651)
-        assert isinstance(recovered, CheckoutVerificationError)
+        recovered = CheckoutVerificationError(original)
+        assert add_pushed_branch_recovery(recovered, runner=runner, config=config, issue_number=1651) is True
         message = str(recovered)
-        assert message.startswith(str(caught.value))
+        assert message.startswith(original)
         assert f"agent-loop managed-pr --head {branch} --expected-closing-issue 1651" in message
         assert f"git -C {store} worktree remove --force {root}" in message
-        # Applied once only, and never to an error that is not a checkout refusal.
-        assert add_pushed_branch_recovery(recovered, runner=runner, config=config, issue_number=1651) is None
-        assert add_pushed_branch_recovery(
-            AgentLoopError("x"), runner=runner, config=config, issue_number=1651
-        ) is None
+        # Applied once only; a terminal no-PR stop (plain AgentLoopError) gets it too.
+        assert add_pushed_branch_recovery(recovered, runner=runner, config=config, issue_number=1651) is False
+        assert str(recovered) == message
+        no_pr = AgentLoopError("Coder did not create a valid PR; implementation is blocking.")
+        assert add_pushed_branch_recovery(no_pr, runner=runner, config=config, issue_number=1651) is True
+        assert type(no_pr) is AgentLoopError and f"--head {branch}" in str(no_pr)
 
         # The issue-run stop carries the same text, and keeps refusing.
         def refuse(*_args, **_kwargs):
@@ -1067,4 +1070,5 @@ def test_unpoisoned_checkout_gets_no_pushed_branch_recovery(tmp_path, monkeypatc
         _push_branch_from(config.claude_dir, "feature-x")
         git(config.claude_dir, "push", "-q", "origin", "feature-x")
         error = CheckoutVerificationError("changed outside agent-loop")
-        assert add_pushed_branch_recovery(error, runner=runner, config=config, issue_number=7) is None
+        assert add_pushed_branch_recovery(error, runner=runner, config=config, issue_number=7) is False
+        assert str(error) == "changed outside agent-loop"

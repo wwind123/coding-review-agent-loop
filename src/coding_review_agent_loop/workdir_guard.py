@@ -1823,11 +1823,14 @@ def extract_reported_tests_from_response(text: str) -> tuple[str, ...]:
     return tuple(reports)
 
 
-def validate_response_tests_within_workdir(text: str, *, assigned_workdir: Path) -> None:
+def validate_response_tests_within_workdir(
+    text: str, *, assigned_workdir: Path, dependency_hint: str | None = None
+) -> None:
     validate_test_commands_within_workdir(
         extract_reported_tests_from_response(text),
         assigned_workdir=assigned_workdir,
         origin="response",
+        dependency_hint=dependency_hint,
     )
 
 

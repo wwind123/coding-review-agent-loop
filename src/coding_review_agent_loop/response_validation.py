@@ -1335,7 +1335,9 @@ def _validate_response_tests_with_post_pr_context(
 ) -> None:
     _validate_tests_with_post_pr_context(
         lambda: validate_response_tests_within_workdir(
-            text, assigned_workdir=active_workdir(config)
+            text,
+            assigned_workdir=active_workdir(config),
+            dependency_hint=dependency_remedy(config, active_workdir(config)),
         ),
         runner=runner,
         config=config,

@@ -15,10 +15,11 @@ reads it only to decide whether to print one extra advisory line.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 WORKTREE_DEPENDENCY_HINT_ENV = "AGENT_LOOP_WORKTREE_DEPENDENCY_HINT"
 WORKTREE_DEPENDENCY_HINT_VALUE = "unlinked-run-worktree"
@@ -51,10 +52,15 @@ def dependency_remedy(config: Any, path: Path | str | None) -> str | None:
 
 
 def dependency_hint_environment(config: Any, path: Path | str | None) -> dict[str, str]:
-    """Agent subprocess environment entry for the advisory client-side hint."""
+    """Agent subprocess environment entry for the advisory client-side hint.
+
+    The entry is always present: Runner merges backend overrides over the
+    orchestrator's own environment, so an inherited selector is neutralized
+    with an empty value whenever the parent-owned condition does not hold.
+    """
     if unlinked_run_worktree(config, path):
         return {WORKTREE_DEPENDENCY_HINT_ENV: WORKTREE_DEPENDENCY_HINT_VALUE}
-    return {}
+    return {WORKTREE_DEPENDENCY_HINT_ENV: ""}
 
 
 def dependency_hint_requested(environment: Mapping[str, str]) -> bool:
@@ -126,30 +132,48 @@ def _pushed_branch(config: Any, runner: Any, path: Path) -> str | None:
 
 def add_pushed_branch_recovery(
     exc: BaseException, *, runner: Any, config: Any, issue_number: int
-) -> BaseException | None:
-    """Return ``exc`` with recovery text appended when a poisoned run worktree's branch is pushed.
+) -> bool:
+    """Append recovery text to ``exc`` in place when a poisoned run worktree's branch is pushed.
 
-    Read-only: it never removes the worktree or relaxes the refusal.  Returns
-    None when the recovery does not apply, so the caller re-raises unchanged.
+    Applies to every ``AgentLoopError`` stop with a plain message: a checkout
+    refusal and also a terminal no-PR stop after a coder turn that pushed and
+    then poisoned its baseline.  Only the message grows; the exception object,
+    its type and the exit code are unchanged.  Read-only: it never removes the
+    worktree or relaxes the refusal.  Returns whether the text was appended.
     """
     from .checkout_verification import has_poisoned_entry
     from .config import run_worktree_store
-    from .errors import CheckoutVerificationError
+    from .errors import AgentLoopError
     from .workdirs import active_workdir
 
-    if not isinstance(exc, CheckoutVerificationError) or PUSHED_BRANCH_RECOVERY_HEADING in str(exc):
-        return None
+    if not isinstance(exc, AgentLoopError) or PUSHED_BRANCH_RECOVERY_HEADING in str(exc):
+        return False
+    if type(exc).__str__ is not BaseException.__str__ or len(exc.args) != 1 or not isinstance(exc.args[0], str):
+        return False
     try:
         worktree = active_workdir(config)
         store = run_worktree_store(config, worktree)
     except Exception:  # noqa: BLE001 - advisory only
-        return None
+        return False
     if store is None or not has_poisoned_entry(worktree):
-        return None
+        return False
     branch = _pushed_branch(config, runner, worktree)
     if branch is None:
-        return None
+        return False
     text = pushed_branch_recovery(
         issue_number=issue_number, branch=branch, store=store, worktree=worktree
     )
-    return CheckoutVerificationError(f"{exc}\n{text}")
+    exc.args = (f"{exc.args[0]}\n{text}",)
+    return True
+
+
+@contextlib.contextmanager
+def pushed_branch_recovery_scope(*, runner: Any, config: Any, issue_number: int) -> Iterator[None]:
+    """Re-raise any stop from an issue run with the pushed-branch recovery appended (#1651)."""
+    from .errors import AgentLoopError
+
+    try:
+        yield
+    except AgentLoopError as exc:
+        add_pushed_branch_recovery(exc, runner=runner, config=config, issue_number=issue_number)
+        raise

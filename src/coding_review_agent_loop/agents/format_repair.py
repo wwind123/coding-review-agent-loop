@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from ..worktree_hints import dependency_hint_environment
 from ..coder_ci_guard import coder_ci_guard_environment
 from ..config import DEFAULT_REASONING_EFFORT
 from ..scratch import make_private_dirs, scratch_root
@@ -58,7 +59,7 @@ def run_cli_repair(
             progress_interval_seconds=config.progress_interval_seconds,
             check=False, input_text=prompt, timeout_seconds=config.repair_timeout_seconds,
             containment_role="repair",
-            env={"AGENT_LOOP_WORKDIR": str(cwd), **(
+            env={"AGENT_LOOP_WORKDIR": str(cwd), **dependency_hint_environment(config, cwd), **(
                 {"CLAUDE_CODE_EFFORT_LEVEL": effort} if backend == "claude" else {}
             ), **coder_ci_guard_environment(config, backend, "repair")},
         )

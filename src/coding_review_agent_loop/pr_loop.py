@@ -9280,6 +9280,7 @@ def run_pr_loop(
                     validate_response_tests_within_workdir(
                         coder_output,
                         assigned_workdir=active_workdir(config),
+                        dependency_hint=dependency_remedy(config, active_workdir(config)),
                     )
                     public_comment = normalize_freeform_signature(
                         coder_output, agent=config.coder, config=config, model_used=coder_response.model_used

@@ -1389,6 +1389,7 @@ class AntigravityBackend:
                     check=False,
                     env={
                         "AGENT_LOOP_WORKDIR": str(Path(temp_dir).resolve()),
+                        **dependency_hint_environment(config, Path(temp_dir)),
                         "AGENT_LOOP_CODER_TEST_TIMEOUT_CEILING_SECONDS": str(
                             config.coder_test_command_timeout_seconds
                         ),
