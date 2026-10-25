@@ -624,23 +624,29 @@ def test_direct_issue_terminal_no_pr_stop_prints_recovery_only_when_poisoned_aft
         cv.reset_checkout_baselines()
 
 
-def test_approved_plan_terminal_no_pr_stop_prints_recovery_after_push(tmp_path, monkeypatch):
+@pytest.mark.parametrize("implementation_coder", [None, "codex"])
+def test_approved_plan_terminal_no_pr_stop_prints_recovery_after_push(tmp_path, monkeypatch, implementation_coder):
     from coding_review_agent_loop import checkout_verification as cv
     from coding_review_agent_loop import worktree_hints
 
     from coverage_reask_helpers import CoverageHarness, response_text
 
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tmp"))
-    run_dir = default_run_worktree("OWNER/REPO", "claude", TOKEN)
+    implementing = implementation_coder or "claude"
+    run_dirs = {agent: default_run_worktree("OWNER/REPO", agent, TOKEN) for agent in ("claude", "codex")}
+    stores = {agent: tmp_path / f"store-{agent}" for agent in ("claude", "codex")}
     harness = CoverageHarness(
-        tmp_path, monkeypatch, claude_dir=run_dir, run_token=TOKEN,
-        default_checkout_stores=(("claude", tmp_path / "store"),),
+        tmp_path, monkeypatch, claude_dir=run_dirs["claude"], codex_dir=run_dirs["codex"],
+        run_token=TOKEN, default_checkout_stores=tuple(stores.items()),
+        **({"implementation_coder": implementation_coder} if implementation_coder else {}),
     )
     branch = "agent-loop/managed-56"
-    monkeypatch.setattr(worktree_hints, "_pushed_branch", lambda *_a: branch)
+    probed = []
+    monkeypatch.setattr(worktree_hints, "_pushed_branch", lambda _c, _r, path: probed.append(path) or branch)
 
     def coder_turn(h):
-        cv.poison_checkout(h.repo, "baseline capture after agent turn failed: link replaced")
+        # The implementation coder pushed, then its own checkout was poisoned.
+        cv.poison_checkout(run_dirs[implementing], "baseline capture after agent turn failed: link replaced")
         return h.response(response_text(pr_number=None))
 
     harness.script = [coder_turn]
@@ -651,8 +657,47 @@ def test_approved_plan_terminal_no_pr_stop_prints_recovery_after_push(tmp_path, 
         assert type(caught.value) is AgentLoopError
         assert "valid PR" in message
         assert f"agent-loop managed-pr --head {branch} --expected-closing-issue 56" in message
-        assert f"worktree remove --force {run_dir}" in message
+        assert f"git -C {stores[implementing]} worktree remove --force {run_dirs[implementing]}" in message
+        assert probed == [run_dirs[implementing]]
         assert harness.run_pr_calls == []
-        assert run_dir.is_dir()
+        assert run_dirs[implementing].is_dir()
+        if implementation_coder:
+            # The planning coder's clean checkout never drives the recovery.
+            assert not cv.has_poisoned_entry(run_dirs["claude"])
     finally:
         cv.reset_checkout_baselines()
+
+
+@pytest.mark.parametrize("advisory, selector", [(True, False), (False, True), (False, False), (True, True)])
+def test_fixture_run_tests_presents_the_remedy_on_launch_failure(tmp_path, monkeypatch, capsys, advisory, selector):
+    from dataclasses import replace
+
+    calls = _cli_fixtures(tmp_path, monkeypatch)
+    fixture_record = {"setup_status": "passed", "teardown_status": "passed", "cleanup": "confirmed"}
+    frame = replace(
+        FRAMES["launch-failed"], fixture=fixture_record,
+        advisory=WORKTREE_DEPENDENCY_REMEDY if advisory else "",
+    )
+    seen = []
+
+    class FakeBroker:
+        def run(self, *args, **kwargs):
+            seen.append(kwargs.get("fixture"))
+            return frame
+
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker())
+    if selector:
+        monkeypatch.setenv(WORKTREE_DEPENDENCY_HINT_ENV, WORKTREE_DEPENDENCY_HINT_VALUE)
+    fixture = tmp_path / "fixture.sh"
+    fixture.write_text("#!/bin/sh\n", encoding="utf-8")
+    code = main([
+        "run-tests", "--fixture", str(fixture), "--timeout-seconds", "60",
+        "--memory-dir", str(tmp_path / "memory"), "--", ".venv/bin/python", "-m", "pytest",
+    ])
+    err = capsys.readouterr().err
+    assert seen and seen[0] is not None
+    assert "agent-loop fixture: setup=passed teardown=passed cleanup=confirmed" in err
+    assert err.count(WORKTREE_DEPENDENCY_REMEDY) == (1 if advisory or selector else 0)
+    # Exit code and recorded launcher health do not depend on the remedy.
+    assert code == 1
+    assert ("health", "failed") in calls

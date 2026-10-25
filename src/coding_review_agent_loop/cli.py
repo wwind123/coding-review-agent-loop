@@ -2394,6 +2394,7 @@ def _run_fixture_tests(
         print(f"agent-loop test observation receipt: {result.receipt_id}", file=sys.stderr, flush=True)
     _announce_no_test_reason(result)
     _announce_uncitable_receipt(result, raw_inner)
+    _announce_worktree_dependency_hint(result)
     record = dict(result.fixture or {})
     print(
         "agent-loop fixture: setup={setup} teardown={teardown} cleanup={cleanup}".format(

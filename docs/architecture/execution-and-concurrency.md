@@ -92,12 +92,12 @@ the condition and empty otherwise, so a value inherited by the orchestrator is
 neutralized. The Runner passes the same parent-built decision to the test
 broker, which attaches it as a separate `advisory` field to launch-failure
 result frames (never to the journal or the stored diagnostic); the `run-tests`
-client prints that advisory, or the remedy selected by its own variable, once
+client (including `--fixture` runs) prints that advisory, or the remedy selected by its own variable, once
 after a launch failure or a pre-collection failure. The variable is excluded
 from evidence environment identity, and nothing reads it for classification,
 outcome, evidence or exit code. A replaced-link refusal names the link source
 in the shared clone. When an issue run stops (a checkout refusal or a terminal
-no-PR result) while the coder's per-run worktree is poisoned and its branch
+no-PR result) while the implementing coder's per-run worktree is poisoned and its branch
 has a remote-tracking ref, the stop's message gains a `managed-pr --head`
 resume and the manual worktree-removal command; the exception type, exit code
 and refusal are unchanged and the worktree is left in place.
