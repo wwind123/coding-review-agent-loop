@@ -1734,3 +1734,60 @@ def test_conversion_repeat_round_recognizes_unfinished_auto_and_operator_convers
     )
     assert foreign[0].metadata.evidence_conversion is None
     assert not conversion_repeat_round(foreign, round_number=3, head_sha=START_HEAD)
+
+
+
+
+def test_a_primary_only_publication_then_auto_conversion_reruns_the_gated_panel_fresh(
+    tmp_path, monkeypatch
+):
+    """`inproc-primary-only-conversion-repeat`: the primary is the round's only publisher.
+
+    Under primary-then-panel the panel waits for an exact-head primary
+    approval, so rounds 1 and 2 invoke only Codex and pause Gemini and
+    Antigravity.  Codex's round-2 evidence-only review is the only public
+    same-round record when the auto conversion forces the full board.
+    """
+    context = _plan_context("row-a", "row-b")
+    plan = {"row-a": "limited", "row-b": "verified"}
+    runner = FakeRunner(
+        claude_outputs=[_coder(1)],
+        codex_outputs=[_review([_tagged("row-a")]), _review(carried=["item-1"]), _repeat_review()],
+        gemini_outputs=[_repeat_review("Google Gemini")],
+        antigravity_outputs=[_repeat_review("Antigravity")],
+        pr_payload={"body": "Fixes #56", "comments": [_implementation_record(context, plan)]},
+        issue_payloads_by_number={56: {"number": 56}},
+        issue_comments_by_number={56: _issue_bound_plan(context)},
+        advance_pr_head_on_coder_followup=False,
+    )
+    _install_derivation(monkeypatch, context, [plan])
+    config = _config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="primary-then-panel", primary_reviewer="codex", review_parallel=True,
+    )
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123") as stopped:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert "partially published" not in str(stopped.value)
+    conversion = _conversion(runner)
+    assert conversion.metadata.round_number == 2
+    records = _records(runner)
+    before = [
+        r for r in records
+        if r.metadata.role == "reviewer" and r.metadata.round_number == 2 and r.index < conversion.index
+    ]
+    assert [(r.metadata.agent, r.metadata.scheduler_phase) for r in before] == [("Codex", "primary")]
+    # The repeat posted its own checkpoint, recording the board that actually ran.
+    [checkpoint] = [
+        r for r in records
+        if r.index > conversion.index and r.metadata.phase == "scheduler-prelaunch"
+    ]
+    assert set(checkpoint.metadata.scheduler_selected_reviewers) == {"Codex", "Gemini", "Antigravity"}
+    assert checkpoint.metadata.scheduler_paused_reviewers == ()
+    _assert_fresh_repeat(runner, conversion)
+    repeat = [r for r in records if r.index > conversion.index]
+    assert all(r.metadata.scheduler_metadata_status in {"valid", "absent"} for r in repeat)
+    # The round number and budgets did not advance; no coder ran after the conversion.
+    assert max(r.metadata.round_number for r in records) == 2
+    assert _agent_count(runner, "claude") == 1
+    assert runner.codex_outputs == runner.gemini_outputs == runner.antigravity_outputs == []
+    assert records[-1].metadata.phase == "evidence-freeze"

@@ -299,7 +299,12 @@ the round's review spool, so a pre-conversion withheld outcome is never replayed
 operator conversion refreshes the round snapshot (or, if that read fails, the visibility
 fallback carries the process's own conversion record). An unfinished admitted operator
 conversion (`conversion_review_round` unset) is recognized by its round on resume, so it
-restores the full-board repeat just as an auto conversion does.
+restores the full-board repeat just as an auto conversion does. When the complete board
+overrides a staged scheduler decision (a conversion repeat or an evidence pass), the
+decision itself is rewritten to that board, so the checkpoint, reviewer and
+reconciliation records never list a reviewer as both selected and paused. If recovery
+was asked for a conversion boundary that neither the REST history nor the snapshot can
+locate (for example during an identity-read outage), it lists no deletion targets at all.
 The evidence-response pass mints `SignedEvidenceReference`s for cleared converted rows
 (`mint_signed_evidence_references`), keeps a durable tombstone, and threads the
 cumulative set onto every terminal record. `reconcile_converted_obligations` runs after

@@ -356,7 +356,8 @@ def compute_partial_round_recovery(
     ``conversion_boundary`` resolves the guard's trusted conversion record in
     a given history and returns its index there (#1664).  It is called on the
     history actually analysed; a REST history without that record falls back
-    to the snapshot, and the result is then never verified.
+    to the snapshot, and the result is then never verified.  When neither
+    history locates it, no deletion target is listed.
     """
     complete = True
     try:
@@ -373,6 +374,18 @@ def compute_partial_round_recovery(
             comments = tuple(snapshot)
             complete = False
             boundary = conversion_boundary(comments)
+        if boundary is None:
+            # The guard read a trusted conversion, but no analysed history
+            # locates it now (for example an identity-read outage).  An
+            # unbounded listing would name the earlier pass and the conversion
+            # record itself, so advise no deletion at all.
+            return PartialRoundRecovery(
+                verified=False,
+                reason=(
+                    "the round's evidence-conversion record could not be located "
+                    "in the comment history, so no deletion set is advised"
+                ),
+            )
     try:
         return _compute(
             comments, complete=complete, flow=flow, round_number=round_number,

@@ -4728,6 +4728,20 @@ def run_pr_loop(
                     selected_reviewer_names = {
                         agent_display_name(reviewer) for reviewer in configured_reviewers
                     }
+                    # Record the board that actually runs, so the checkpoint,
+                    # reviewer and reconciliation records never list a
+                    # reviewer as both selected and paused (#1664).
+                    scheduler_decision = dataclasses_replace(
+                        scheduler_decision,
+                        selected_reviewers=tuple(
+                            name for name in scheduler_contract.required_reviewers
+                            if name in selected_reviewer_names
+                        ),
+                        paused_reviewers=tuple(
+                            (name, reason) for name, reason in scheduler_decision.paused_reviewers
+                            if name not in selected_reviewer_names
+                        ),
+                    )
                 log(
                     config,
                     f"Round {round_number}: {scheduler_contract.policy} scheduler phase="

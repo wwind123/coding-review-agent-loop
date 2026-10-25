@@ -4785,8 +4785,10 @@ listed for deletion. A reviewer whose withheld pre-conversion outcome is still s
 is invoked fresh, because staging the repeat discards that spool. Within the repeat the
 partial-publish guard is unchanged: once one repeat-pass review is public, a reviewer
 that still needs a fresh turn is refused, and the recovery listing names only records
-posted after the conversion. A conversion record not authored by the authenticated
-orchestrator account, or whose audit is rejected, sets no boundary. A review that raises nothing new is evidence-only and approving, so
+posted after the conversion. If the conversion record cannot be located in the
+comment history when the stop is rendered, the stop gives no deletion list. A
+conversion record not authored by the authenticated orchestrator account, or whose
+audit is rejected, sets no boundary. A review that raises nothing new is evidence-only and approving, so
 the run reaches the final freeze; a new code finding dispatches the coder instead.
 Converted rows leave the stall window's unsatisfied set and never re-mint.
 

@@ -226,3 +226,24 @@ def test_orphan_attachments_are_attributed_only_after_the_conversion():
     assert history.ids(orphans["post_other"]) <= uncertain
     assert history.ids([at["repeat_review"]]) <= listed
     assert not history.ids([at["conversion"], at["pre_review"]]) & listed
+
+
+def test_an_unlocatable_boundary_advises_no_deletion_at_all():
+    """item-1: the resolver fails in REST and in the snapshot (an identity-read outage)."""
+    from coding_review_agent_loop.review_rounds import _render_recovery
+
+    history, _at = _conversion_round()
+    calls = []
+
+    def unavailable(history_comments):
+        calls.append(len(history_comments))
+        return None
+
+    recovery = _recover(history.comments, history.comments, resolver=unavailable)
+    assert len(calls) == 2  # REST first, then the snapshot fallback
+    assert not recovery.verified
+    assert recovery.targets == () and recovery.uncertain == ()
+    assert "could not be located" in recovery.reason
+    rendered = _render_recovery(recovery)
+    assert "No deletion list is given" in rendered
+    assert "issuecomment" not in rendered and "c/10" not in rendered
