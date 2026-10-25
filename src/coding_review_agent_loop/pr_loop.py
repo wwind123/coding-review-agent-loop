@@ -267,6 +267,7 @@ from .followups import (
 )
 from .round_state import (
     ApprovedPlanContext,
+    EVIDENCE_CONVERSION_PHASE,
     EVIDENCE_FREEZE_PHASE,
     EVIDENCE_RELEASE_PHASE,
     EVIDENCE_RESPONSE_PHASE,
@@ -477,6 +478,7 @@ from .pr_loop_support import (
     preflight_operator_evidence_conversion,
     round_evidence_authority_records,
     conversion_repeat_round,
+    conversion_visibility_boundary,
     evidence_authority_from_records,
     freeze_signed_baseline,
     latest_conversion_index,
@@ -3121,6 +3123,31 @@ def run_pr_loop(
         # Conversion audits this process posted are trusted across rereads, so
         # a failed identity read never removes a conversion it just made.
         conversion_audits_state: list = []
+        # Conversion records this process posted, as (round, record metadata).
+        # Only these may be synthesized into a visibility fallback (#1664).
+        own_conversion_records: list[tuple[int, PostedRoundMetadata]] = []
+
+        def remember_own_conversion(round_number: int, head_sha: str | None, audit) -> None:
+            own_conversion_records.append((
+                round_number,
+                PostedRoundMetadata(
+                    flow="pr", role="summary", agent="Orchestrator",
+                    round_number=round_number, subject=str(head_sha or "unknown"),
+                    prior_items=(), state="blocking", phase=EVIDENCE_CONVERSION_PHASE,
+                    evidence_conversion=audit,
+                ),
+            ))
+
+        def discard_pre_conversion_spool(round_number: int, head_sha: str | None) -> None:
+            # A withheld outcome from the pre-conversion pass never saw the
+            # converted ledger, so the repeat must never replay it (#1664).
+            # Only staging discards: a resumed repeat's spool belongs to the
+            # repeat pass and is kept.
+            _review_round_spool(
+                config, surface="pr", number=pr_number,
+                round_number=round_number, subject=str(head_sha or "unknown"),
+            ).discard()
+
         round_history_references: tuple[SignedEvidenceReference, ...] = ()
         operator_conversion_pending = bool(config.pr_convert_evidence_rows)
         matrix_applies = bool(
@@ -3234,6 +3261,7 @@ def run_pr_loop(
             nonlocal parent_issue_context_refreshed
             context = get_pr_review_context(runner, config=config, pr_number=pr_number)
             pending_conversion_pass = True
+            discard_pre_conversion_spool(current_round, context.metadata.head_sha)
             resumed_round = None
             issue_context_refreshed = False
             parent_issue_context_refreshed = False
@@ -3558,11 +3586,35 @@ def run_pr_loop(
                     unresolved_items = list(operator_conversion.ledger)
                     next_unresolved_item_number = operator_conversion.next_item_number
                     conversion_audits_state.append(operator_conversion.audit)
+                    remember_own_conversion(
+                        round_number, pr_metadata.head_sha, operator_conversion.audit
+                    )
                     # Earlier same-head approvals and resumed reviews never saw
                     # the converted ledger, so every reviewer reviews fresh.
                     conversion_pass = True
                     if current_resume is not None:
                         current_resume = dataclasses_replace(current_resume, completed_reviews=())
+                    discard_pre_conversion_spool(round_number, pr_metadata.head_sha)
+                    # The round's base snapshot must hold the conversion record,
+                    # as the auto path's staging re-read already does, so its
+                    # visibility boundary resolves (#1664).  A failed refresh
+                    # keeps the old snapshot; the fallback then carries this
+                    # process's own record.
+                    try:
+                        refreshed_pr_context = get_pr_review_context(
+                            runner, config=config, pr_number=pr_number
+                        )
+                    except AgentLoopError as exc:
+                        log(
+                            config,
+                            f"Round {round_number}: PR #{pr_number} comment refresh after the "
+                            f"operator conversion failed ({exc}); keeping the earlier snapshot",
+                        )
+                    else:
+                        if refreshed_pr_context.metadata.head_sha == pr_metadata.head_sha:
+                            pr_context = refreshed_pr_context
+                            initial_pr_context = refreshed_pr_context
+                            pr_comments = refreshed_pr_context.comments
             # GitHub mergeability gate (#606): fetch and evaluate before starting
             # a review round so a confirmed conflict routes straight to the coder
             # instead of spending reviewer time (or later a full CI wait) on a
@@ -4676,6 +4728,20 @@ def run_pr_loop(
                     selected_reviewer_names = {
                         agent_display_name(reviewer) for reviewer in configured_reviewers
                     }
+                    # Record the board that actually runs, so the checkpoint,
+                    # reviewer and reconciliation records never list a
+                    # reviewer as both selected and paused (#1664).
+                    scheduler_decision = dataclasses_replace(
+                        scheduler_decision,
+                        selected_reviewers=tuple(
+                            name for name in scheduler_contract.required_reviewers
+                            if name in selected_reviewer_names
+                        ),
+                        paused_reviewers=tuple(
+                            (name, reason) for name, reason in scheduler_decision.paused_reviewers
+                            if name not in selected_reviewer_names
+                        ),
+                    )
                 log(
                     config,
                     f"Round {round_number}: {scheduler_contract.policy} scheduler phase="
@@ -5013,6 +5079,29 @@ def run_pr_loop(
             pr_launch_phase = (
                 scheduler_decision.phase if selective_policy and scheduler_decision is not None else None
             )
+            # A conversion repeat reads the pre-conversion pass through the
+            # converted ledger: a trusted conversion record bounds same-round
+            # peer visibility, resolved separately in every analysed history
+            # (#1664).  Publications after it are still peers.
+            pr_own_conversion = next(
+                (
+                    metadata for own_round, metadata in reversed(own_conversion_records)
+                    if own_round == round_number and metadata.subject == current_pr_subject
+                ),
+                None,
+            )
+            pr_base_conversion_boundary = (
+                conversion_visibility_boundary(
+                    runner, config, pr_number=pr_number, comments=pr_comments,
+                    round_number=round_number, head_sha=pr_metadata.head_sha,
+                )
+                if conversion_pass and evidence_pass is None
+                else None
+            )
+            pr_conversion_boundary_key = (
+                pr_base_conversion_boundary.key
+                if pr_base_conversion_boundary is not None else None
+            )
             # Today's peer set, built from every posted same-round record
             # including records resume rejected: their bodies are just as
             # public.  It is only ever widened below, never narrowed.
@@ -5021,6 +5110,10 @@ def run_pr_loop(
                 if (record := completed_by_name.get(agent_display_name(reviewer))) is not None
                 and record.metadata.phase == "publication"
                 and record.metadata.scheduler_phase == pr_launch_phase
+                and (
+                    pr_base_conversion_boundary is None
+                    or record.index > pr_base_conversion_boundary.index
+                )
             )
             pr_round_public_peers = pr_today_peers
             pr_recovery_context: RecoveryVisibilityContext | None = None
@@ -5076,12 +5169,39 @@ def run_pr_loop(
                             undecodable_history_message(exc), round_number=round_number
                         )
                     raise
+                pr_visibility_boundary_index: int | None = None
+                pr_visibility_own_conversion: PostedRoundMetadata | None = None
+                if conversion_pass:
+                    # Resolve the boundary in the exact history the peer set
+                    # is read from; an index never crosses histories.
+                    if pr_fresh_records is not None:
+                        pr_visibility_boundary = conversion_visibility_boundary(
+                            runner, config, pr_number=pr_number,
+                            comments=pr_fresh_comments, round_number=round_number,
+                            head_sha=pr_metadata.head_sha,
+                        )
+                    else:
+                        pr_visibility_boundary = pr_base_conversion_boundary
+                        if pr_visibility_boundary is None:
+                            pr_visibility_own_conversion = pr_own_conversion
+                    if pr_visibility_boundary is not None:
+                        pr_visibility_boundary_index = pr_visibility_boundary.index
+                        pr_conversion_boundary_key = pr_visibility_boundary.key
                 pr_visibility_records, _pr_checkpoint_present = _visibility_snapshot(
                     fresh_records=pr_fresh_records,
                     base_records=pr_base_records,
                     base_length=len(pr_comments),
                     checkpoint=pr_posted_checkpoint,
+                    own_conversion=pr_visibility_own_conversion,
                 )
+                if pr_visibility_own_conversion is not None:
+                    pr_visibility_boundary_index = next(
+                        (
+                            record.index for record in pr_visibility_records
+                            if record.metadata is pr_visibility_own_conversion
+                        ),
+                        None,
+                    )
                 pr_visibility_records = drop_inert_post_reconciliation_checkpoints(
                     pr_visibility_records
                 )
@@ -5104,6 +5224,7 @@ def run_pr_loop(
                         pr_visibility_records, flow="pr",
                         round_number=round_number, subject=current_pr_subject,
                     ),
+                    reopening_boundary_index=pr_visibility_boundary_index,
                 )
                 pr_round_public_peers = tuple(
                     reviewer for reviewer in configured_reviewers
@@ -5138,6 +5259,16 @@ def run_pr_loop(
                     getattr(opening, "body", None),
                 )
 
+            def _pr_conversion_resolver(history: Sequence[object]) -> int | None:
+                """The guard's conversion boundary, located by identity in ``history``."""
+                resolved = conversion_visibility_boundary(
+                    runner, config, pr_number=pr_number, comments=history,
+                    round_number=round_number, head_sha=pr_metadata.head_sha,
+                )
+                if resolved is None or resolved.key != pr_conversion_boundary_key:
+                    return None
+                return resolved.index
+
             def _pr_round_recovery() -> PartialRoundRecovery:
                 return compute_partial_round_recovery(
                     snapshot=pr_comments,
@@ -5162,6 +5293,10 @@ def run_pr_loop(
                         review_unrecorded_head=config.review_unrecorded_head,
                     ),
                     fingerprint=_pr_recovery_fingerprint,
+                    conversion_boundary=(
+                        _pr_conversion_resolver
+                        if pr_conversion_boundary_key is not None else None
+                    ),
                 )
 
             if closed_round_gate and any(
@@ -8850,6 +8985,9 @@ def run_pr_loop(
                 unresolved_items = list(evidence_stall_outcome.conversion.ledger)
                 next_unresolved_item_number = evidence_stall_outcome.conversion.next_item_number
                 conversion_audits_state.append(evidence_stall_outcome.conversion.audit)
+                remember_own_conversion(
+                    round_number, pr_metadata.head_sha, evidence_stall_outcome.conversion.audit
+                )
                 stage_same_head_conversion_review(current_round=round_number)
                 continue
             if deferred_non_convergence:

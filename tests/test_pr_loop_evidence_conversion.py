@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,7 @@ from coding_review_agent_loop.pr_loop_support import (
     authenticated_pr_comments,
     evidence_authority_from_records,
 )
+from coding_review_agent_loop.review_rounds import PartialReviewRoundError
 from coding_review_agent_loop.protocol import (
     SemanticRiskCoverageClaim,
     SemanticRiskCoverageClaims,
@@ -1361,3 +1363,431 @@ def test_a_failed_reread_after_an_untagged_operator_conversion_keeps_the_freeze(
     [frozen] = _evidence_items(_records(runner)[-1].metadata.prior_items, "row-b")
     assert frozen.lifecycle == "evidence_frozen"
     assert frozen.resolution_owners == ("Codex",)
+
+
+# --- conversion visibility boundary (#1664) ---------------------------------------
+
+
+def _agy(*args, **kwargs):
+    return _review(*args, reviewer="Antigravity", **kwargs)
+
+
+def _gem(*args, **kwargs):
+    return _review(*args, reviewer="Google Gemini", **kwargs)
+
+
+def _repeat_review(reviewer="OpenAI Codex"):
+    return _review(kept=["item-2"], state="blocking", reviewer=reviewer)
+
+
+def _carried_panel_runner(tmp_path, monkeypatch, context, *, plan=None, repeat=True, **config_overrides):
+    """The PR #1778 shape under primary-then-panel with parallel review.
+
+    Round 1: the primary Codex approves.  Round 2 (panel): Gemini approves and
+    Antigravity blocks on row-a.  Round 3 selects the full board but invokes
+    only Antigravity: Codex and Gemini are carried as approved at the unchanged
+    head.  Antigravity's evidence-only review is the round's only publication.
+    """
+    plan = plan or {"row-a": "limited", "row-b": "verified"}
+    runner = FakeRunner(
+        claude_outputs=[_coder(1)],
+        codex_outputs=[_review(), *([_repeat_review()] if repeat else [])],
+        gemini_outputs=[_gem(), *([_repeat_review("Google Gemini")] if repeat else [])],
+        antigravity_outputs=[
+            _agy([_tagged("row-a")]), _agy(carried=["item-1"]),
+            *([_repeat_review("Antigravity")] if repeat else []),
+        ],
+        pr_payload={"body": "Fixes #56", "comments": [_implementation_record(context, plan)]},
+        issue_payloads_by_number={56: {"number": 56}},
+        issue_comments_by_number={56: _issue_bound_plan(context)},
+        advance_pr_head_on_coder_followup=False,
+    )
+    _install_derivation(monkeypatch, context, [plan])
+    config = _config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="primary-then-panel", primary_reviewer="codex", review_parallel=True,
+        **config_overrides,
+    )
+    return runner, config
+
+
+_BOARD_COMMANDS = {"Codex": "codex", "Gemini": "gemini", "Antigravity": "agy"}
+
+
+def _conversion(runner):
+    return [r for r in _records(runner) if r.metadata.phase == "evidence-conversion"][-1]
+
+
+def _reviews_after(runner, index):
+    return [r for r in _records(runner) if r.metadata.role == "reviewer" and r.index > index]
+
+
+def _assert_fresh_repeat(runner, conversion):
+    repeat = _reviews_after(runner, conversion.index)
+    assert sorted(r.metadata.agent for r in repeat) == ["Antigravity", "Codex", "Gemini"]
+    assert {r.metadata.round_number for r in repeat} == {conversion.metadata.round_number}
+    for name, command in _BOARD_COMMANDS.items():
+        assert "converted row `row-a`" in _prompts(runner, command)[-1], name
+
+
+def _interrupt_repeat(monkeypatch, *, publish=0):
+    """Stop the run inside the conversion repeat, after its scheduler checkpoint.
+
+    ``publish`` reviewers of the repeat publish first, as a partial pass.
+    """
+    real = pr_loop_module._launch_reviewer_turns
+    armed = [True]
+
+    def launch(runner, reviewers, *args, **kwargs):
+        records = _records(runner)
+        conversions = [r for r in records if r.metadata.phase == "evidence-conversion"]
+        if armed[0] and conversions and not _reviews_after(runner, conversions[-1].index):
+            armed[0] = False
+            if publish:
+                real(runner, list(reviewers)[:publish], *args, **kwargs)
+            raise AgentLoopError("interrupted inside the conversion repeat")
+        return real(runner, reviewers, *args, **kwargs)
+
+    monkeypatch.setattr(pr_loop_module, "_launch_reviewer_turns", launch)
+
+
+def test_a_primary_only_round_then_auto_conversion_reruns_the_full_board_without_a_partial_stop(
+    tmp_path, monkeypatch
+):
+    """`inproc-primary-only-conversion-repeat` (#1664): the PR #1778 shape continues."""
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123") as stopped:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert "partially published" not in str(stopped.value)
+    conversion = _conversion(runner)
+    assert conversion.metadata.round_number == 3
+    assert conversion.metadata.evidence_conversion.source == "auto"
+    records = _records(runner)
+    before = [
+        r.metadata.agent for r in records
+        if r.metadata.role == "reviewer" and r.metadata.round_number == 3 and r.index < conversion.index
+    ]
+    assert before == ["Antigravity"]  # Codex and Gemini were carried, not invoked
+    _assert_fresh_repeat(runner, conversion)
+    # The round number and budgets did not advance; no coder ran after the conversion.
+    assert max(r.metadata.round_number for r in records) == 3
+    assert _agent_count(runner, "claude") == 1
+    assert runner.codex_outputs == runner.gemini_outputs == runner.antigravity_outputs == []
+    assert records[-1].metadata.phase == "evidence-freeze"
+
+
+def test_an_untrusted_conversion_record_does_not_move_the_visibility_boundary(tmp_path, monkeypatch):
+    """`forged-conversion-boundary`: a foreign conversion record hides no real peer."""
+    import coding_review_agent_loop.pr_loop_support as support
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+    real_apply = support._apply_evidence_conversion
+
+    def apply_then_forge(*args, **kwargs):
+        outcome = real_apply(*args, **kwargs)
+        # The record now reads as another account's: admission strips its audit.
+        runner.pr_payload["comments"][-1]["author"] = {"login": "mallory"}
+        runner.pr_payload["comments"][-1]["_rest_author_id"] = 999
+        return outcome
+
+    monkeypatch.setattr(support, "_apply_evidence_conversion", apply_then_forge)
+    with pytest.raises(PartialReviewRoundError) as refused:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert "Antigravity already posted" in str(refused.value)
+    conversion = _conversion(runner)
+    assert runner.pr_payload["comments"][conversion.index]["author"] == {"login": "mallory"}
+    assert _reviews_after(runner, conversion.index) == []
+    assert _agent_count(runner, "codex") == 1 and _agent_count(runner, "gemini") == 1
+
+
+def test_a_restart_after_the_repeat_checkpoint_runs_the_full_board_fresh(tmp_path, monkeypatch):
+    """`resume-after-repeat-checkpoint`: pre-conversion reviews are neither peers nor completed."""
+    from coding_review_agent_loop.round_state import _resume_pr_round
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+    _interrupt_repeat(monkeypatch)
+    with pytest.raises(AgentLoopError, match="interrupted inside the conversion repeat"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    conversion = _conversion(runner)
+    after = [r for r in _records(runner) if r.index > conversion.index]
+    assert [r.metadata.phase for r in after] == ["scheduler-prelaunch"]
+    resumed = _resume_pr_round(
+        [
+            SimpleNamespace(body=c["body"], author=c["author"]["login"], author_id=c["_rest_author_id"])
+            for c in runner.pr_payload["comments"]
+        ],
+        head_sha=START_HEAD, configured_reviewers=("codex", "gemini", "antigravity"),
+        trusted_actor=ACTOR,
+    )
+    assert resumed.round_number == 3
+    assert resumed.completed_reviews == ()  # no pre-conversion review is a repeat review
+    runner.simulate_new_process()
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    _assert_fresh_repeat(runner, conversion)
+    assert len([r for r in _records(runner) if r.metadata.phase == "evidence-conversion"]) == 1
+    assert _agent_count(runner, "claude") == 1
+
+
+def test_a_partial_repeat_pass_still_refuses_and_lists_only_post_conversion_records(tmp_path, monkeypatch):
+    """`repeat-pass-partial-isolation`: isolation still holds inside the repeat pass."""
+    from coding_review_agent_loop.review_rounds import _review_round_spool
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+    _interrupt_repeat(monkeypatch, publish=1)
+    with pytest.raises(AgentLoopError, match="interrupted inside the conversion repeat"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    conversion = _conversion(runner)
+    [published] = _reviews_after(runner, conversion.index)
+    peer = published.metadata.agent
+    # No withheld outcome survives for the remaining reviewers (another host).
+    _review_round_spool(
+        config, surface="pr", number=77, round_number=3, subject=START_HEAD
+    ).discard()
+    runner.simulate_new_process()
+    launches = {name: _agent_count(runner, command) for name, command in _BOARD_COMMANDS.items()}
+    with pytest.raises(PartialReviewRoundError) as refused:
+        run_pr_loop(
+            runner, pr_number=77, approved_plan_context=context,
+            config=dataclasses.replace(config, review_parallel=False),
+        )
+    message = str(refused.value)
+    assert f"({peer} already posted)" in message
+    assert "Antigravity already posted" not in message or peer == "Antigravity"
+    assert launches == {name: _agent_count(runner, command) for name, command in _BOARD_COMMANDS.items()}
+    # Only records after the conversion are deletion targets.
+    listed = [int(value) for value in re.findall(r"comment (\d+) https://", message)]
+    assert listed
+    conversion_id = 10_000 + conversion.index + 1
+    assert all(comment_id > conversion_id for comment_id in listed)
+
+
+def test_a_stale_pre_conversion_spool_outcome_is_discarded_and_never_replayed(tmp_path, monkeypatch):
+    """`parallel-stale-spool`: staging discards the round's spool."""
+    import coding_review_agent_loop.pr_loop_support as support
+    from coding_review_agent_loop.review_rounds import _review_round_spool
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+    stale = _review().replace('"summary": "review"', '"summary": "STALE pre-conversion outcome"')
+    real_apply = support._apply_evidence_conversion
+
+    def apply_with_a_stale_spool(*args, **kwargs):
+        outcome = real_apply(*args, **kwargs)
+        spool = _review_round_spool(
+            config, surface="pr", number=77, round_number=kwargs["round_number"], subject=kwargs["head_sha"]
+        )
+        spool.store("Codex", {"text": stale})
+        assert spool.has_records()
+        return outcome
+
+    monkeypatch.setattr(support, "_apply_evidence_conversion", apply_with_a_stale_spool)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert not any("STALE pre-conversion outcome" in c["body"] for c in runner.pr_payload["comments"])
+    assert _agent_count(runner, "codex") == 2  # freshly invoked in the repeat
+    _assert_fresh_repeat(runner, _conversion(runner))
+
+
+def _stalled_carried_panel(tmp_path, monkeypatch, context):
+    """The carried-panel shape whose row cannot auto-convert: it stops on the stall."""
+    runner, config = _carried_panel_runner(
+        tmp_path, monkeypatch, context, plan={"row-a": "failed", "row-b": "verified"}, repeat=False,
+    )
+    with pytest.raises(HumanDecisionRequiredError, match="stalled on evidence only"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    records = _records(runner)
+    assert [
+        r.metadata.agent for r in records if r.metadata.role == "reviewer" and r.metadata.round_number == 3
+    ] == ["Antigravity"]
+    runner.simulate_new_process()
+    runner.codex_outputs.append(_repeat_review())
+    runner.gemini_outputs.append(_repeat_review("Google Gemini"))
+    runner.antigravity_outputs.append(_repeat_review("Antigravity"))
+    return runner, dataclasses.replace(config, pr_convert_evidence_rows=("row-a",))
+
+
+@pytest.mark.parametrize("fresh_read", ["available", "failing"])
+def test_an_operator_conversion_beside_a_public_same_round_review_runs_the_board_fresh(
+    tmp_path, monkeypatch, fresh_read
+):
+    """`operator-conversion-visibility`: refreshed snapshot, or the own-record fallback."""
+    context = _plan_context("row-a", "row-b")
+    runner, config = _stalled_carried_panel(tmp_path, monkeypatch, context)
+    if fresh_read == "failing":
+        real_read = pr_loop_module.get_pr_review_context
+        failed = []
+
+        def read(*args, **kwargs):
+            records = _records(runner)
+            conversions = [r for r in records if r.metadata.phase == "evidence-conversion"]
+            if conversions and not _reviews_after(runner, conversions[-1].index):
+                failed.append(len(runner.pr_payload["comments"]))
+                raise AgentLoopError("GitHub read failed")
+            return real_read(*args, **kwargs)
+
+        monkeypatch.setattr(pr_loop_module, "get_pr_review_context", read)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    conversion = _conversion(runner)
+    assert conversion.metadata.evidence_conversion.source == "operator"
+    assert conversion.metadata.round_number == 3
+    _assert_fresh_repeat(runner, conversion)
+    if fresh_read == "failing":
+        # Both the post-conversion refresh and the post-checkpoint visibility read failed.
+        assert len(failed) >= 2
+
+
+def test_a_restart_after_an_unfinished_operator_conversion_restores_the_full_board_repeat(
+    tmp_path, monkeypatch
+):
+    """`operator-conversion-restart-full-board`: no one-shot flag on the restart."""
+    context = _plan_context("row-a", "row-b")
+    runner, config = _stalled_carried_panel(tmp_path, monkeypatch, context)
+    _interrupt_repeat(monkeypatch)
+    with pytest.raises(AgentLoopError, match="interrupted inside the conversion repeat"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    conversion = _conversion(runner)
+    assert conversion.metadata.conversion_review_round is None  # encoding unchanged
+    runner.simulate_new_process()
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+        run_pr_loop(
+            runner, pr_number=77, approved_plan_context=context,
+            config=dataclasses.replace(config, pr_convert_evidence_rows=()),
+        )
+    _assert_fresh_repeat(runner, conversion)
+    assert len([r for r in _records(runner) if r.metadata.phase == "evidence-conversion"]) == 1
+
+
+def test_a_partial_repeat_after_an_operator_conversion_restart_still_refuses(tmp_path, monkeypatch):
+    """`operator-conversion-restart-full-board`: a repeat-pass peer still isolates the rest."""
+    from coding_review_agent_loop.review_rounds import _review_round_spool
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _stalled_carried_panel(tmp_path, monkeypatch, context)
+    _interrupt_repeat(monkeypatch, publish=1)
+    with pytest.raises(AgentLoopError, match="interrupted inside the conversion repeat"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    conversion = _conversion(runner)
+    [published] = _reviews_after(runner, conversion.index)
+    _review_round_spool(
+        config, surface="pr", number=77, round_number=3, subject=START_HEAD
+    ).discard()
+    runner.simulate_new_process()
+    with pytest.raises(PartialReviewRoundError) as refused:
+        run_pr_loop(
+            runner, pr_number=77, approved_plan_context=context,
+            config=dataclasses.replace(config, pr_convert_evidence_rows=(), review_parallel=False),
+        )
+    assert f"({published.metadata.agent} already posted)" in str(refused.value)
+
+
+def _conversion_metadata(*, source, round_number, head=START_HEAD, review_round=None):
+    from coding_review_agent_loop.evidence_conversion import ConversionAuditRow, EvidenceConversionAudit
+
+    context = _plan_context("row-a")
+    identity = context.risk_test_matrix_identity
+    audit = EvidenceConversionAudit(
+        source=source, matrix_identity=identity, head=head,
+        rows=(ConversionAuditRow(
+            row_id="row-a", obligation_identity=f"human-exact-head-evidence:row:{identity}:row-a",
+            obligation_item_id="item-2", owners=("Codex",), converted_item_ids=(),
+            attempt_record_rounds=(),
+        ),),
+    )
+    return PostedRoundMetadata(
+        flow="pr", role="summary", agent="Orchestrator", round_number=round_number, subject=head,
+        prior_items=(), state="blocking", phase="evidence-conversion", evidence_conversion=audit,
+        conversion_review_round=review_round,
+    )
+
+
+def test_conversion_repeat_round_recognizes_unfinished_auto_and_operator_conversions():
+    """`operator-conversion-restart-full-board` (unit)."""
+    from coding_review_agent_loop.pr_loop_support import conversion_repeat_round
+    from coding_review_agent_loop.round_state import PostedRoundRecord, admit_evidence_authority_records
+
+    def recs(*metadatas):
+        return [PostedRoundRecord(index=i, metadata=m, body="") for i, m in enumerate(metadatas)]
+
+    auto = _conversion_metadata(source="auto", round_number=3, review_round=3)
+    operator = _conversion_metadata(source="operator", round_number=3)
+    for conversion in (auto, operator):
+        assert conversion_repeat_round(recs(conversion), round_number=3, head_sha=START_HEAD)
+        assert not conversion_repeat_round(recs(conversion), round_number=4, head_sha=START_HEAD)
+        assert not conversion_repeat_round(recs(conversion), round_number=3, head_sha="other")
+        for later in (
+            dataclasses.replace(conversion, phase="evidence-freeze", evidence_conversion=None),
+            PostedRoundMetadata(
+                flow="pr", role="coder", agent="Claude", round_number=3, subject=START_HEAD, prior_items=(),
+            ),
+        ):
+            assert not conversion_repeat_round(recs(conversion, later), round_number=3, head_sha=START_HEAD)
+    # A foreign operator record loses its audit at admission and never restores the repeat.
+    raw = recs(operator)
+    foreign = admit_evidence_authority_records(
+        raw, [SimpleNamespace(author="mallory", author_id=999)], ACTOR
+    )
+    assert foreign[0].metadata.evidence_conversion is None
+    assert not conversion_repeat_round(foreign, round_number=3, head_sha=START_HEAD)
+
+
+
+
+def test_a_primary_only_publication_then_auto_conversion_reruns_the_gated_panel_fresh(
+    tmp_path, monkeypatch
+):
+    """`inproc-primary-only-conversion-repeat`: the primary is the round's only publisher.
+
+    Under primary-then-panel the panel waits for an exact-head primary
+    approval, so rounds 1 and 2 invoke only Codex and pause Gemini and
+    Antigravity.  Codex's round-2 evidence-only review is the only public
+    same-round record when the auto conversion forces the full board.
+    """
+    context = _plan_context("row-a", "row-b")
+    plan = {"row-a": "limited", "row-b": "verified"}
+    runner = FakeRunner(
+        claude_outputs=[_coder(1)],
+        codex_outputs=[_review([_tagged("row-a")]), _review(carried=["item-1"]), _repeat_review()],
+        gemini_outputs=[_repeat_review("Google Gemini")],
+        antigravity_outputs=[_repeat_review("Antigravity")],
+        pr_payload={"body": "Fixes #56", "comments": [_implementation_record(context, plan)]},
+        issue_payloads_by_number={56: {"number": 56}},
+        issue_comments_by_number={56: _issue_bound_plan(context)},
+        advance_pr_head_on_coder_followup=False,
+    )
+    _install_derivation(monkeypatch, context, [plan])
+    config = _config(
+        tmp_path, reviewer=("codex", "gemini", "antigravity"),
+        pr_review_policy="primary-then-panel", primary_reviewer="codex", review_parallel=True,
+    )
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123") as stopped:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert "partially published" not in str(stopped.value)
+    conversion = _conversion(runner)
+    assert conversion.metadata.round_number == 2
+    records = _records(runner)
+    before = [
+        r for r in records
+        if r.metadata.role == "reviewer" and r.metadata.round_number == 2 and r.index < conversion.index
+    ]
+    assert [(r.metadata.agent, r.metadata.scheduler_phase) for r in before] == [("Codex", "primary")]
+    # The repeat posted its own checkpoint, recording the board that actually ran.
+    [checkpoint] = [
+        r for r in records
+        if r.index > conversion.index and r.metadata.phase == "scheduler-prelaunch"
+    ]
+    assert set(checkpoint.metadata.scheduler_selected_reviewers) == {"Codex", "Gemini", "Antigravity"}
+    assert checkpoint.metadata.scheduler_paused_reviewers == ()
+    _assert_fresh_repeat(runner, conversion)
+    repeat = [r for r in records if r.index > conversion.index]
+    assert all(r.metadata.scheduler_metadata_status in {"valid", "absent"} for r in repeat)
+    # The round number and budgets did not advance; no coder ran after the conversion.
+    assert max(r.metadata.round_number for r in records) == 2
+    assert _agent_count(runner, "claude") == 1
+    assert runner.codex_outputs == runner.gemini_outputs == runner.antigravity_outputs == []
+    assert records[-1].metadata.phase == "evidence-freeze"

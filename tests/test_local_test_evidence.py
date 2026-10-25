@@ -836,9 +836,22 @@ def test_broker_context_failure_returns_error_and_records_incomplete(monkeypatch
         server.stop()
 
 
-def test_runner_broker_preserves_turn_binding_and_collects_receipt(tmp_path):
+def _import_checkout_in_subprocesses(monkeypatch):
+    """Make a spawned ``python -c`` import the package under test.
+
+    pytest's ``pythonpath`` setting only reaches this process; an interpreter
+    with another editable install of the package would otherwise run that copy.
+    """
+    source = str(Path(__file__).resolve().parents[1] / "src")
+    inherited = os.environ.get("PYTHONPATH")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([source, inherited]) if inherited else source)
+
+
+def test_runner_broker_preserves_turn_binding_and_collects_receipt(tmp_path, monkeypatch):
     from coding_review_agent_loop.containment import default_policy
     from coding_review_agent_loop.runner import Runner
+
+    _import_checkout_in_subprocesses(monkeypatch)
 
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"], check=True)
@@ -863,9 +876,11 @@ def test_runner_broker_preserves_turn_binding_and_collects_receipt(tmp_path):
     assert observations[0].turn_id
 
 
-def test_runner_exceptional_teardown_preserves_broker_journal(tmp_path):
+def test_runner_exceptional_teardown_preserves_broker_journal(tmp_path, monkeypatch):
     from coding_review_agent_loop.containment import default_policy
     from coding_review_agent_loop.runner import Runner
+
+    _import_checkout_in_subprocesses(monkeypatch)
 
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     runner = Runner(containment_policy=default_policy(mode="off", cache_dir=tmp_path / ".runtime"))

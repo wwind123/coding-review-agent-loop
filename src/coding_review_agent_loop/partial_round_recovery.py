@@ -6,6 +6,11 @@ the whole round runs again.  This module works out *which* comments, from the
 same facts resume and the guard read, and verifies the answer by simulating
 resume on the history that would remain.  It never changes the guard's
 decision and never deletes anything.
+
+A conversion repeat (#1664) reopens a round at the same head.  The caller then
+passes a resolver that locates the trusted conversion record in whichever
+history is analysed; everything at or before it belongs to the earlier pass and
+is never listed, attributed or required to disappear.
 """
 
 from __future__ import annotations
@@ -106,12 +111,22 @@ def _snapshot_covered(
     return all(available[key] >= count for key, count in needed.items())
 
 
+def _after(index: int, boundary: int | None) -> bool:
+    return boundary is None or index > boundary
+
+
 def _reconciling_summaries(
-    records: Sequence[PostedRoundRecord], *, flow: str, round_number: int, subject: str
+    records: Sequence[PostedRoundRecord],
+    *,
+    flow: str,
+    round_number: int,
+    subject: str,
+    boundary: int | None = None,
 ) -> list[PostedRoundRecord]:
     return [
         record for record in records
-        if record.metadata.flow == flow
+        if _after(record.index, boundary)
+        and record.metadata.flow == flow
         and record.metadata.role == "summary"
         and record.metadata.round_number == round_number
         and record.metadata.subject == subject
@@ -126,8 +141,13 @@ def _frame(
     round_number: int,
     subject: str,
     context: RecoveryVisibilityContext | None,
+    boundary: int | None = None,
 ) -> tuple[frozenset[int], dict[int, str]]:
-    """Freeze the gate records and opening checkpoints from the original history."""
+    """Freeze the gate records and opening checkpoints from the original history.
+
+    An opening at or before a conversion ``boundary`` belongs to the earlier
+    pass and is retained, not reopened.
+    """
     if context is None:
         return frozenset(), {}
     records = _extract_round_metadata_records(comments, flow=flow)
@@ -140,10 +160,16 @@ def _frame(
         checkpoint_index=latest_round_checkpoint_index(
             records, flow=flow, round_number=round_number, subject=subject
         ),
+        reopening_boundary_index=boundary,
     )
     opening_targets: dict[int, str] = {}
     opening_index = getattr(evidence, "opening_index", None)
-    if context.target_opening and source == PRIMARY_APPROVAL_OPENING and opening_index is not None:
+    if (
+        context.target_opening
+        and source == PRIMARY_APPROVAL_OPENING
+        and opening_index is not None
+        and _after(opening_index, boundary)
+    ):
         opening = next((r for r in records if r.index == opening_index), None)
         if (
             opening is not None
@@ -172,12 +198,13 @@ def _plan(
     opening_targets: dict[int, str],
     reviewer_names: Sequence[str],
     widen: bool,
+    boundary: int | None = None,
 ) -> tuple[dict[int, str], dict[int, str], str | None, int | None]:
     """Return (targets, uncertain attachments, uncertainty reason) by comment index."""
     records = _extract_round_metadata_records(comments, flow=flow)
     publications = same_round_public_publications(
         records, flow=flow, round_number=round_number, subject=subject,
-        reviewer_names=reviewer_names,
+        reviewer_names=reviewer_names, reopening_boundary_index=boundary,
     )
     targets: dict[int, str] = {
         record.index: f"{record.metadata.agent} review (round {round_number})"
@@ -186,13 +213,14 @@ def _plan(
     }
     targets.update(opening_targets)
     for record in _reconciling_summaries(
-        records, flow=flow, round_number=round_number, subject=subject
+        records, flow=flow, round_number=round_number, subject=subject, boundary=boundary,
     ):
         targets[record.index] = f"round {round_number} reconciliation"
     if widen:
         for record in records:
             if (
-                record.metadata.round_number == round_number
+                _after(record.index, boundary)
+                and record.metadata.round_number == round_number
                 and record.metadata.subject == subject
                 and record.metadata.role != "coder"
                 and record.metadata.phase not in PRE_RECONCILIATION_PLAN_SUMMARY_PHASES
@@ -209,6 +237,7 @@ def _plan(
         if record.metadata.flow == flow
         and record.metadata.round_number == round_number
         and record.metadata.subject == subject
+        and _after(record.index, boundary)
     }
     first_in_round = min(round_indexes | set(targets))
     # Durable records of any flow (plan, pr, discuss) on the surface count.
@@ -237,6 +266,10 @@ def _plan(
             and last_earlier < record.index < min(targets)
         ]
         lower_bound = min(openings) if openings else last_earlier
+    if boundary is not None:
+        # The reopened pass starts after the conversion record: an orphan at or
+        # before it belongs to the earlier pass and is never attributed.
+        lower_bound = boundary if lower_bound is None else max(lower_bound, boundary)
 
     attachments = [
         index for index, comment in enumerate(comments)
@@ -311,6 +344,7 @@ def compute_partial_round_recovery(
     scheduler_phase: str | None = None,
     fingerprint: Callable[[Sequence[IssueComment]], object] | None = None,
     context: RecoveryVisibilityContext | None = None,
+    conversion_boundary: Callable[[Sequence[IssueComment]], int | None] | None = None,
 ) -> PartialRoundRecovery:
     """The comments whose deletion lets the round run again, verified or provisional.
 
@@ -318,6 +352,12 @@ def compute_partial_round_recovery(
     example the qualified panel opening); it must be equal before and after.
     ``scheduler_phase`` is accepted for compatibility and no longer selects
     peers: visibility, not phase, decides (#1156).
+
+    ``conversion_boundary`` resolves the guard's trusted conversion record in
+    a given history and returns its index there (#1664).  It is called on the
+    history actually analysed; a REST history without that record falls back
+    to the snapshot, and the result is then never verified.  When neither
+    history locates it, no deletion target is listed.
     """
     complete = True
     try:
@@ -327,11 +367,30 @@ def compute_partial_round_recovery(
     except AgentLoopError:
         comments = tuple(snapshot)
         complete = False
+    boundary: int | None = None
+    if conversion_boundary is not None:
+        boundary = conversion_boundary(comments)
+        if boundary is None and complete:
+            comments = tuple(snapshot)
+            complete = False
+            boundary = conversion_boundary(comments)
+        if boundary is None:
+            # The guard read a trusted conversion, but no analysed history
+            # locates it now (for example an identity-read outage).  An
+            # unbounded listing would name the earlier pass and the conversion
+            # record itself, so advise no deletion at all.
+            return PartialRoundRecovery(
+                verified=False,
+                reason=(
+                    "the round's evidence-conversion record could not be located "
+                    "in the comment history, so no deletion set is advised"
+                ),
+            )
     try:
         return _compute(
             comments, complete=complete, flow=flow, round_number=round_number,
             subject=subject, reviewer_names=reviewer_names, resume=resume,
-            fingerprint=fingerprint, context=context,
+            fingerprint=fingerprint, context=context, boundary=boundary,
         )
     except AgentLoopError:
         return PartialRoundRecovery(
@@ -351,9 +410,11 @@ def _compute(
     resume: Callable[[Sequence[IssueComment]], object],
     fingerprint: Callable[[Sequence[IssueComment]], object] | None = None,
     context: RecoveryVisibilityContext | None = None,
+    boundary: int | None = None,
 ) -> PartialRoundRecovery:
     gate_indices, opening_targets = _frame(
         comments, flow=flow, round_number=round_number, subject=subject, context=context,
+        boundary=boundary,
     )
 
     def state_of(result: object) -> object:
@@ -387,6 +448,15 @@ def _compute(
         except AgentLoopError:
             return False
         original_index = [i for i in range(len(comments)) if i not in targets]
+        # The conversion record is never a target, so it keeps a position in
+        # the remaining history; everything up to it is the earlier pass.
+        remaining_boundary = (
+            original_index.index(boundary)
+            if boundary is not None and boundary in original_index
+            else None
+        )
+        if boundary is not None and remaining_boundary is None:
+            return False
 
         def retained_gate(record_index: int) -> bool:
             return 0 <= record_index < len(original_index) and (
@@ -399,12 +469,13 @@ def _compute(
             not retained_gate(record.index)
             for record in same_round_public_publications(
                 records, flow=flow, round_number=round_number, subject=subject,
-                reviewer_names=reviewer_names,
+                reviewer_names=reviewer_names, reopening_boundary_index=remaining_boundary,
             )
         ):
             return False
         if _reconciling_summaries(
-            records, flow=flow, round_number=round_number, subject=subject
+            records, flow=flow, round_number=round_number, subject=subject,
+            boundary=remaining_boundary,
         ):
             return False
         # Every attachment a retained comment references must still exist.
@@ -432,15 +503,19 @@ def _compute(
             for record in records
         )
         if getattr(state, "round_number", None) == round_number:
-            if getattr(state, "reconciled", False):
+            # After a conversion the reopened round resumes from the retained
+            # (reconciled) earlier pass; only a reconciliation after the
+            # boundary, checked above, would close the repeat.
+            if remaining_boundary is None and getattr(state, "reconciled", False):
                 return False
             if any(
                 record.metadata.agent in reviewer_names
                 and not retained_gate(getattr(record, "index", -1))
+                and _after(getattr(record, "index", -1), remaining_boundary)
                 for record in getattr(state, "completed_reviews", ())
             ):
                 return False
-        elif anchored:
+        elif anchored or remaining_boundary is not None:
             # A round anchored by a retained coder record must still resume as
             # this round; only an unanchored round may fall back legitimately.
             return False
@@ -482,7 +557,7 @@ def _compute(
         targets, uncertain, reason, bound = _plan(
             comments, flow=flow, round_number=round_number, subject=subject,
             gate_indices=gate_indices, opening_targets=opening_targets,
-            reviewer_names=reviewer_names, widen=widen,
+            reviewer_names=reviewer_names, widen=widen, boundary=boundary,
         )
         if check(targets, bound):
             verified = True

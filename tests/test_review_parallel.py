@@ -1927,6 +1927,35 @@ def test_pr_partial_round_without_spool_record_stops_before_invoking(tmp_path, r
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
 
 
+@pytest.mark.parametrize("spool_state", ["missing", "invalid"])
+def test_ordinary_round_withheld_reviewer_is_not_reinvoked_blind_after_a_peer_published(
+    tmp_path, spool_state
+):
+    """`ordinary-withheld-isolation` (#1664): no conversion, so no visibility boundary.
+
+    Reviewer A was withheld (its outcome is missing or no longer validates)
+    and peer B published in round N; a sequential resume still refuses rather
+    than invoking A beside B's public findings.
+    """
+    runner, markers = _pr_partial_round_runner()
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
+    _interrupt_pr_round_between_publications(runner, config, markers)
+    withheld = _unpublished_reviewer_spool_file(config, markers, runner)
+    if spool_state == "missing":
+        withheld.unlink()
+    else:
+        payload = json.loads(withheld.read_text(encoding="utf-8"))
+        payload["response"]["text"] = "not a structured PR review"
+        withheld.write_text(json.dumps(payload), encoding="utf-8")
+    launches_before = list(runner.reviewer_launches)
+
+    with pytest.raises(review_rounds.PartialReviewRoundError, match="partially published"):
+        run_pr_loop(runner, pr_number=77, config=dataclasses.replace(config, review_parallel=False))
+
+    assert runner.reviewer_launches == launches_before
+    assert sorted(_published_count(runner, marker) for marker in markers) == [0, 1]
+
+
 @pytest.mark.parametrize("review_parallel", [True, False])
 def test_plan_partial_round_with_invalid_spool_record_stops_before_invoking(tmp_path, review_parallel):
     runner, markers = _plan_partial_round_runner()

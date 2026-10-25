@@ -1041,6 +1041,11 @@ def _render_recovery(recovery: PartialRoundRecovery) -> str:
             "authorization binding; the next resume may then need fresh managed-CI "
             "authorization (`--managed-ci-fresh`)."
         )
+    elif not recovery.targets and not recovery.uncertain:
+        lines.append(
+            f"No deletion list is given ({recovery.reason or 'unverified'}); inspect the "
+            "round's records before deleting anything."
+        )
     else:
         lines.append(
             "The comments below are a provisional list that could not be verified as a "

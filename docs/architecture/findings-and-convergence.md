@@ -283,6 +283,28 @@ posts one `evidence-conversion` record (audit, `conversion_stall_snapshot`,
 `conversion_review_round`, cumulative references), and `pr_loop.py` repeats the round
 at the same head with `conversion_pass`, which forces the complete board and blocks
 carried approvals; approvals older than the latest conversion at the head are dropped.
+The admitted conversion record is also a same-round visibility boundary (#1664),
+resolved separately in each analysed history (base snapshot, post-checkpoint fresh read,
+REST recovery history) by `pr_loop_support.conversion_visibility_boundary` from admitted
+records only, and matched across histories by comment identity, never by index.
+Publications before it belong to the pre-conversion pass, which the repeat reads through
+the converted ledger: they are not same-round peers for the partial-publish guard
+(`round_visibility.same_round_public_publications` takes the boundary and combines it with
+the coder boundary by max), are not resumed as completed repeat reviews, and are never
+recovery deletion targets, orphan-attachment attributions or verification blockers in
+`partial_round_recovery`. Isolation still holds within the repeat: a repeat-pass
+publication is a peer, so a reviewer still needing a fresh turn after it is refused.
+A foreign-authored or audit-rejected record yields no boundary. Staging a repeat discards
+the round's review spool, so a pre-conversion withheld outcome is never replayed, and an
+operator conversion refreshes the round snapshot (or, if that read fails, the visibility
+fallback carries the process's own conversion record). An unfinished admitted operator
+conversion (`conversion_review_round` unset) is recognized by its round on resume, so it
+restores the full-board repeat just as an auto conversion does. When the complete board
+overrides a staged scheduler decision (a conversion repeat or an evidence pass), the
+decision itself is rewritten to that board, so the checkpoint, reviewer and
+reconciliation records never list a reviewer as both selected and paused. If recovery
+was asked for a conversion boundary that neither the REST history nor the snapshot can
+locate (for example during an identity-read outage), it lists no deletion targets at all.
 The evidence-response pass mints `SignedEvidenceReference`s for cleared converted rows
 (`mint_signed_evidence_references`), keeps a durable tombstone, and threads the
 cumulative set onto every terminal record. `reconcile_converted_obligations` runs after
