@@ -1684,3 +1684,37 @@ def test_docs_describe_pr_local_dependency_environments():
         if getattr(action, "choices", None) and "issue" in action.choices
     )
     assert "--worktree-setup-pr-local" in issue_help
+
+
+def test_docs_describe_worktree_setup_generated_keys_and_timeout():
+    """#1649: generated key files and --worktree-setup-timeout are documented."""
+    import pathlib
+
+    from coding_review_agent_loop.cli import build_parser
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text()
+    guide = (root / "docs" / "local_agent_loop.md").read_text()
+    architecture = (root / "docs" / "architecture" / "execution-and-concurrency.md").read_text()
+    for document in (readme, guide):
+        assert "bounded by `--coder-test-command-timeout-seconds`" not in document
+        for term in (
+            "`--worktree-setup-timeout SECONDS`", "default 3600", "`npm install` writes",
+            "private ledger", "survives a failed or timed-out setup", "`--no-overwrite-ignore`",
+            "may have\n  been created by the setup command itself",
+        ):
+            assert term in document, term
+    for term in (
+        "setup-generated.json", "invalidate_store_setup_state", "--no-overwrite-ignore",
+        "--worktree-setup-timeout",
+    ):
+        assert term in architecture, term
+    assert "bounded by\nthe coder test-command timeout" not in architecture
+    decisions = (root / "docs" / "architecture" / "decisions" / "execution-and-concurrency.md").read_text()
+    assert "(#1649)" in decisions
+    issue_help = next(
+        action.choices["issue"].format_help()
+        for action in build_parser()._actions
+        if getattr(action, "choices", None) and "issue" in action.choices
+    )
+    assert "--worktree-setup-timeout" in issue_help

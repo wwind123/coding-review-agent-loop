@@ -197,11 +197,12 @@ def test_setup_timeout_kills_and_records_nothing(tmp_path, monkeypatch):
     counter = tmp_path / "counter"
     config = dataclasses.replace(
         setup_config(env, setup_command(counter, "echo started && sleep 30")),
-        coder_test_command_timeout_seconds=1,
+        worktree_setup_timeout_seconds=1,
     )
     store = claude_store()
     with pytest.raises(AgentLoopError, match="timed out after 1s") as caught:
         run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert "--worktree-setup-timeout" in str(caught.value)
     assert "started" in str(caught.value) and str(store) in str(caught.value)
     assert worktree_setup.read_setup_record(store) is None
 
@@ -217,7 +218,7 @@ def test_failed_different_setup_invalidates_prior_success(tmp_path, monkeypatch,
 
     damage = "echo damaged > .venv/state; " + ("exit 1" if mode == "nonzero" else "sleep 30")
     config_b = dataclasses.replace(
-        config_a, worktree_setup=setup_command(counter_b, damage), coder_test_command_timeout_seconds=2,
+        config_a, worktree_setup=setup_command(counter_b, damage), worktree_setup_timeout_seconds=2,
     )
     with pytest.raises(AgentLoopError):
         run_worktrees.prepare_store(store, config=config_b, runner=Runner())
@@ -323,8 +324,9 @@ def test_drifted_populated_submodule_is_refused(tmp_path, monkeypatch):
 def test_untracked_file_shadowing_absent_key_is_refused(tmp_path, monkeypatch):
     s = SubmoduleEnv(tmp_path, monkeypatch)
     (s.store / "absent.lock").write_text("planted\n")
-    with pytest.raises(AgentLoopError, match="absent.lock"):
+    with pytest.raises(AgentLoopError, match="absent.lock") as caught:
         run_worktrees.prepare_store(s.store, config=s.config(), runner=Runner())
+    assert "may have been created by the --worktree-setup command itself" in str(caught.value)
     assert runs_in(s.counter, s.store) == 0
     assert (s.store / "absent.lock").read_text() == "planted\n"
 
@@ -903,3 +905,509 @@ def test_setup_refuses_before_launch_without_unreaped_wait(tmp_path, monkeypatch
     assert worktree_setup.read_setup_record(store) is None
     time.sleep(1.5)
     assert not (store / ".venv-state").exists()
+
+
+# --- #1649: setup-created key files and --worktree-setup-timeout -----------------------
+
+
+LOCK = "package-lock.json"
+HINT = "may have been created by the --worktree-setup command itself"
+
+
+def lock_command(counter: Path, content: str = "gen-1", tail: str = "") -> str:
+    """Write the untracked lockfile (only while the repository tracks none), like npm install."""
+    write = f"if ! git ls-files --error-unmatch {LOCK} >/dev/null 2>&1; then printf {content} > {LOCK}; fi"
+    return setup_command(counter, f"{write}; mkdir -p .venv{tail}")
+
+
+def lock_config(env: Env, command: str):
+    return setup_config(env, command, keys=("requirements.txt", LOCK))
+
+
+def sha256(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def ledger(store: Path) -> dict[str, str]:
+    return worktree_setup.read_generated_ledger(store, ("requirements.txt", LOCK))
+
+
+def first_lock_setup(tmp_path, monkeypatch):
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    config = lock_config(env, lock_command(counter))
+    store = claude_store()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert runs_in(counter, store) == 1
+    assert (store / LOCK).read_text() == "gen-1"
+    return env, counter, config, store
+
+
+def test_setup_created_absent_key_does_not_block_a_later_setup(tmp_path, monkeypatch):
+    """gen-key-second-setup."""
+    env, counter, config, store = first_lock_setup(tmp_path, monkeypatch)
+    assert ledger(store) == {LOCK: sha256(b"gen-1")}
+    ledger_path = worktree_setup.generated_ledger_path(store)
+    assert ledger_path.parent == worktree_setup.setup_record_path(store).parent
+    assert oct(ledger_path.stat().st_mode & 0o777) == "0o600"
+    # The success record format is unchanged.
+    assert "generated_keys" not in worktree_setup.read_setup_record(store)
+
+    counter_b = tmp_path / "counter-b"
+    changed = dataclasses.replace(config, worktree_setup=lock_command(counter_b, "gen-2"))
+    run_worktrees.prepare_store(store, config=changed, runner=Runner())
+    assert runs_in(counter_b, store) == 1
+    assert ledger(store) == {LOCK: sha256(b"gen-2")}
+    assert worktree_setup.read_setup_record(store)["command_sha256"] == worktree_setup.command_hash(
+        changed.worktree_setup
+    )
+
+
+def test_unrecorded_key_is_not_exempted_by_the_ledger(tmp_path, monkeypatch):
+    """gen-key-second-setup: only keys named in the ledger are exempt."""
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    config = setup_config(env, lock_command(counter), keys=("requirements.txt", LOCK, "yarn.lock"))
+    store = claude_store()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    (store / "yarn.lock").write_text("operator\n")
+    changed = dataclasses.replace(config, worktree_setup=lock_command(tmp_path / "counter-b"))
+    with pytest.raises(AgentLoopError, match="yarn.lock") as caught:
+        run_worktrees.prepare_store(store, config=changed, runner=Runner())
+    assert HINT in str(caught.value) and LOCK + "," not in str(caught.value)
+    assert not (tmp_path / "counter-b").exists()
+
+
+def _edit_bytes(store: Path) -> None:
+    (store / LOCK).write_text("edited")
+
+
+def _symlink_same_bytes(store: Path) -> None:
+    target = store.parent / "lock-target"
+    target.write_text("gen-1")
+    (store / LOCK).unlink()
+    os.symlink(target, store / LOCK)
+
+
+def _directory(store: Path) -> None:
+    (store / LOCK).unlink()
+    (store / LOCK).mkdir()
+
+
+@pytest.mark.parametrize("tamper", [_edit_bytes, _symlink_same_bytes, _directory])
+def test_tampered_generated_key_is_refused_with_hint(tmp_path, monkeypatch, tamper):
+    """gen-key-tampered."""
+    env, counter, config, store = first_lock_setup(tmp_path, monkeypatch)
+    tamper(store)
+    record_bytes = worktree_setup.setup_record_path(store).read_bytes()
+    ledger_bytes = worktree_setup.generated_ledger_path(store).read_bytes()
+    counter_b = tmp_path / "counter-b"
+    changed = dataclasses.replace(config, worktree_setup=lock_command(counter_b))
+    with pytest.raises(AgentLoopError, match="absent at the base commit") as caught:
+        run_worktrees.prepare_store(store, config=changed, runner=Runner())
+    assert LOCK in str(caught.value) and HINT in str(caught.value)
+    assert "npm install writes package-lock.json" in str(caught.value)
+    assert worktree_setup.setup_record_path(store).read_bytes() == record_bytes
+    assert worktree_setup.generated_ledger_path(store).read_bytes() == ledger_bytes
+    assert not counter_b.exists()
+
+
+@pytest.mark.parametrize("before_first", [True, False])
+def test_operator_placed_absent_key_still_stops_with_hint(tmp_path, monkeypatch, before_first):
+    """foreign-untracked-key."""
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    config = lock_config(env, setup_command(counter))  # never writes the lockfile
+    store = claude_store()
+    if before_first:
+        run_worktrees.prepare_store(store, config=dataclasses.replace(config, worktree_setup=None), runner=Runner())
+    else:
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+        assert ledger(store) == {}
+        config = dataclasses.replace(config, worktree_setup=setup_command(counter, "mkdir -p .venv && true"))
+    runs = runs_in(counter, store)
+    (store / LOCK).write_text("planted")
+    with pytest.raises(AgentLoopError, match="absent at the base commit") as caught:
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert LOCK in str(caught.value) and HINT in str(caught.value)
+    assert runs_in(counter, store) == runs
+    assert (store / LOCK).read_text() == "planted"
+
+
+def _ledger_malformed(store, path):
+    path.write_text("{not json")
+
+
+def _ledger_wrong_version(store, path):
+    data = json_load(path)
+    data["version"] = 2
+    path.write_text(json_dump(data))
+
+
+def _ledger_foreign_identity(store, path):
+    data = json_load(path)
+    data["store_identity"] = [1, 2]
+    path.write_text(json_dump(data))
+
+
+def _ledger_unconfigured_key(store, path):
+    data = json_load(path)
+    data["generated_keys"]["other.lock"] = sha256(b"x")
+    path.write_text(json_dump(data))
+
+
+def _ledger_bad_hash(store, path):
+    data = json_load(path)
+    data["generated_keys"][LOCK] = data["generated_keys"][LOCK].upper()
+    path.write_text(json_dump(data))
+
+
+def _ledger_not_a_map(store, path):
+    data = json_load(path)
+    data["generated_keys"] = [LOCK]
+    path.write_text(json_dump(data))
+
+
+def _ledger_symlink(store, path):
+    target = path.with_name("elsewhere.json")
+    target.write_bytes(path.read_bytes())
+    path.unlink()
+    os.symlink(target, path)
+
+
+def _ledger_wrong_owner(store, path):
+    real = os.getuid()
+    worktree_setup_os = worktree_setup.os
+    return lambda monkeypatch: monkeypatch.setattr(worktree_setup_os, "getuid", lambda: real + 1)
+
+
+def json_load(path):
+    import json
+
+    return json.loads(path.read_text())
+
+
+def json_dump(data):
+    import json
+
+    return json.dumps(data)
+
+
+@pytest.mark.parametrize("corrupt", [
+    _ledger_malformed, _ledger_wrong_version, _ledger_foreign_identity, _ledger_unconfigured_key,
+    _ledger_bad_hash, _ledger_not_a_map, _ledger_symlink, _ledger_wrong_owner,
+], ids=lambda f: f.__name__.strip("_"))
+def test_untrusted_ledger_exempts_nothing(tmp_path, monkeypatch, corrupt):
+    """record-untrusted-ledger."""
+    env, counter, config, store = first_lock_setup(tmp_path, monkeypatch)
+    path = worktree_setup.generated_ledger_path(store)
+    patch = corrupt(store, path)
+    if patch is not None:
+        patch(monkeypatch)
+    assert ledger(store) == {}
+    if patch is not None:
+        return  # every later file check also sees the foreign owner
+    counter_b = tmp_path / "counter-b"
+    changed = dataclasses.replace(config, worktree_setup=lock_command(counter_b))
+    with pytest.raises(AgentLoopError, match=HINT):
+        run_worktrees.prepare_store(store, config=changed, runner=Runner())
+    assert not counter_b.exists()
+
+
+def test_store_recreation_deletes_record_and_ledger(tmp_path, monkeypatch):
+    """record-untrusted-ledger: a re-created store never inherits a ledger."""
+    env, counter, config, store = first_lock_setup(tmp_path, monkeypatch)
+    assert ledger(store) == {LOCK: sha256(b"gen-1")}
+    seen: list[tuple[bool, bool]] = []
+    real = worktree_setup.run_setup_command
+
+    def recording(*args, **kwargs):
+        seen.append((
+            worktree_setup.setup_record_path(store).exists(),
+            worktree_setup.generated_ledger_path(store).exists(),
+        ))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(worktree_setup, "run_setup_command", recording)
+    shutil.rmtree(store)
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert seen == [(False, False)]
+    worktree_setup.invalidate_store_setup_state(store)
+    assert not worktree_setup.setup_record_path(store).exists()
+    assert not worktree_setup.generated_ledger_path(store).exists()
+
+
+@pytest.mark.parametrize("mode", ["nonzero", "timeout"])
+@pytest.mark.parametrize("rewrites", [False, True])
+def test_ledger_survives_a_failed_later_setup(tmp_path, monkeypatch, mode, rewrites):
+    """ledger-survives-failed-setup."""
+    env, counter, config, store = first_lock_setup(tmp_path, monkeypatch)
+    ledger_bytes = worktree_setup.generated_ledger_path(store).read_bytes()
+    failure = "exit 1" if mode == "nonzero" else "sleep 30"
+    damage = f"printf rewritten > {LOCK}; " if rewrites else ""
+    failing = dataclasses.replace(
+        config, worktree_setup=setup_command(tmp_path / "counter-b", f"{damage}{failure}"),
+        worktree_setup_timeout_seconds=2,
+    )
+    with pytest.raises(AgentLoopError):
+        run_worktrees.prepare_store(store, config=failing, runner=Runner())
+    assert worktree_setup.read_setup_record(store) is None
+    assert worktree_setup.generated_ledger_path(store).read_bytes() == ledger_bytes
+    counter_c = tmp_path / "counter-c"
+    fixed = dataclasses.replace(config, worktree_setup=lock_command(counter_c))
+    if rewrites:
+        with pytest.raises(AgentLoopError, match=HINT):
+            run_worktrees.prepare_store(store, config=fixed, runner=Runner())
+        assert not counter_c.exists()
+        return
+    run_worktrees.prepare_store(store, config=fixed, runner=Runner())
+    assert runs_in(counter_c, store) == 1
+    assert ledger(store) == {LOCK: sha256(b"gen-1")}
+    assert worktree_setup.record_matches(
+        worktree_setup.read_setup_record(store), store=store,
+        digest=worktree_setup.setup_digest(
+            store, git(store, "rev-parse", "HEAD"), command=fixed.worktree_setup,
+            keys=fixed.worktree_setup_keys, runner=Runner(),
+        )[0],
+        command=fixed.worktree_setup,
+    )
+
+
+def test_failed_setup_that_created_a_key_is_not_exempted(tmp_path, monkeypatch):
+    """failed-setup-created-key."""
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    config = lock_config(env, setup_command(counter, f"printf partial > {LOCK}; exit 1"))
+    store = claude_store()
+    with pytest.raises(AgentLoopError, match="exited 1"):
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert worktree_setup.read_setup_record(store) is None
+    assert ledger(store) == {}
+    with pytest.raises(AgentLoopError, match=HINT):
+        run_worktrees.prepare_store(store, config=lock_config(env, lock_command(counter)), runner=Runner())
+    assert runs_in(counter, store) == 1
+    assert (store / LOCK).read_text() == "partial"
+
+
+def test_record_without_a_ledger_still_matches(tmp_path, monkeypatch):
+    """legacy-record: a pre-#1649 record (no ledger file) forces no rerun."""
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    config = setup_config(env, setup_command(counter))
+    store = claude_store()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    worktree_setup.generated_ledger_path(store).unlink()
+    record = worktree_setup.read_setup_record(store)
+    assert set(record) == {"version", "digest", "command_sha256", "base_sha", "store_identity", "completed_at"}
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert runs_in(counter, store) == 1
+
+
+def _exclude(store: Path, path: str) -> None:
+    with (store / ".git" / "info" / "exclude").open("a") as handle:
+        handle.write(f"/{path}\n")
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+def test_matching_generated_key_is_removed_when_the_base_starts_tracking_it(tmp_path, monkeypatch, ignored):
+    """gen-key-becomes-tracked: content-verified removal, then a successful checkout."""
+    env, counter, config, store = first_lock_setup(tmp_path, monkeypatch)
+    if ignored:
+        _exclude(store, LOCK)
+    new = env.commit(LOCK, "tracked\n")
+    runner = RecordingRunner()
+    assert run_worktrees.prepare_store(store, config=config, runner=runner) == new
+    assert git(store, "rev-parse", "HEAD") == new
+    assert (store / LOCK).read_text() == "tracked\n"
+    assert runs_in(counter, store) == 2
+    assert ledger(store) == {}
+    checkouts = [call for call in runner.calls if call[:2] == ("git", "checkout") and new in call]
+    assert checkouts and all("--no-overwrite-ignore" in call for call in checkouts)
+    assert all("--force" not in call and "-f" not in call for call in checkouts)
+
+
+def _changed_generated(store: Path) -> None:
+    (store / LOCK).write_text("edited")
+
+
+def _unrecorded(store: Path) -> None:
+    worktree_setup.generated_ledger_path(store).unlink()
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+@pytest.mark.parametrize("state", [_changed_generated, _unrecorded, _symlink_same_bytes])
+def test_unverified_file_at_newly_tracked_key_is_refused_before_invalidation(tmp_path, monkeypatch, ignored, state):
+    """gen-key-becomes-tracked: refusal before the record is touched or setup runs."""
+    env, counter, config, store = first_lock_setup(tmp_path, monkeypatch)
+    if ignored:
+        _exclude(store, LOCK)
+    state(store)
+    before = os.readlink(store / LOCK) if (store / LOCK).is_symlink() else (store / LOCK).read_bytes()
+    record_bytes = worktree_setup.setup_record_path(store).read_bytes()
+    head = git(store, "rev-parse", "HEAD")
+    env.commit(LOCK, "tracked\n")
+    with pytest.raises(AgentLoopError, match="that the base commit tracks") as caught:
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert LOCK in str(caught.value) and HINT in str(caught.value)
+    after = os.readlink(store / LOCK) if (store / LOCK).is_symlink() else (store / LOCK).read_bytes()
+    assert after == before
+    assert runs_in(counter, store) == 1
+    assert worktree_setup.setup_record_path(store).read_bytes() == record_bytes
+    assert git(store, "rev-parse", "HEAD") == head
+
+
+def test_operator_ignored_file_at_newly_tracked_key_is_refused(tmp_path, monkeypatch):
+    """gen-key-becomes-tracked: an operator file never recorded, ignored, is never overwritten."""
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    config = lock_config(env, setup_command(counter))
+    store = claude_store()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    _exclude(store, LOCK)
+    (store / LOCK).write_text("operator")
+    env.commit(LOCK, "tracked\n")
+    with pytest.raises(AgentLoopError, match="that the base commit tracks"):
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert (store / LOCK).read_text() == "operator"
+    assert runs_in(counter, store) == 1
+
+
+def test_removal_reverifies_bytes_immediately_before_unlink(tmp_path, monkeypatch):
+    """gen-key-becomes-tracked: a file changed after classification is refused, not removed."""
+    env, counter, config, store = first_lock_setup(tmp_path, monkeypatch)
+    env.commit(LOCK, "tracked\n")
+    real = worktree_setup.invalidate_setup_record
+
+    def invalidate_then_edit(path):
+        real(path)
+        (store / LOCK).write_text("raced")
+
+    monkeypatch.setattr(worktree_setup, "invalidate_setup_record", invalidate_then_edit)
+    with pytest.raises(AgentLoopError, match=HINT):
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert (store / LOCK).read_text() == "raced"
+    assert runs_in(counter, store) == 1
+
+
+def test_ignored_non_key_file_at_newly_tracked_path_is_never_overwritten(tmp_path, monkeypatch):
+    """ignored-nonkey-overwrite."""
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    config = setup_config(env, setup_command(counter))
+    store = claude_store()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    _exclude(store, "generated.txt")
+    (store / "generated.txt").write_text("operator\n")
+    env.commit("generated.txt", "tracked\n")
+    env.commit("requirements.txt", "pytest==7\n")
+    with pytest.raises(AgentLoopError, match="could not check out"):
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert (store / "generated.txt").read_text() == "operator\n"
+    assert worktree_setup.read_setup_record(store) is None
+    assert runs_in(counter, store) == 1
+
+
+def test_materialize_never_overwrites_ignored_files():
+    """ignored-nonkey-overwrite: the store checkout always passes --no-overwrite-ignore."""
+    calls: list[tuple[str, ...]] = []
+
+    class Fake:
+        def run(self, args, *, cwd, check):
+            calls.append(tuple(args))
+            if args[:2] == ("git", "rev-parse"):
+                stdout = "b" * 40 if len(calls) > 2 else "a" * 40
+                return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    worktree_setup._materialize(Path("/nonexistent"), "b" * 40, runner=Fake())
+    assert ("git", "checkout", "-q", "--detach", "--no-overwrite-ignore", "b" * 40) in calls
+
+
+def test_key_caused_checkout_refusal_carries_the_hint():
+    class Fake:
+        def run(self, args, *, cwd, check):
+            if args[:2] == ("git", "rev-parse"):
+                return subprocess.CompletedProcess(args, 0, stdout="a" * 40, stderr="")
+            return subprocess.CompletedProcess(
+                args, 1, stdout="", stderr=f"error: The following untracked working tree files would be overwritten by checkout:\n\t{LOCK}",
+            )
+
+    with pytest.raises(AgentLoopError, match=HINT):
+        worktree_setup._materialize(Path("/nonexistent"), "b" * 40, runner=Fake(), keys=(LOCK,))
+    with pytest.raises(AgentLoopError) as caught:
+        worktree_setup._materialize(Path("/nonexistent"), "b" * 40, runner=Fake(), keys=("other.lock",))
+    assert HINT not in str(caught.value)
+
+
+def test_cli_worktree_setup_timeout_default_and_value(tmp_path, monkeypatch):
+    """timeout-cli."""
+    env = Env(tmp_path, monkeypatch)
+    config = env.config(extra=("--worktree-setup", "true", "--coder-test-command-timeout-seconds", "5"))
+    assert config.worktree_setup_timeout_seconds == 3600 == worktree_setup.DEFAULT_WORKTREE_SETUP_TIMEOUT_SECONDS
+    assert config.coder_test_command_timeout_seconds == 5
+    assert worktree_setup.setup_timeout_seconds(config) == 3600
+    config = env.config(extra=("--worktree-setup", "true", "--worktree-setup-timeout", "7200"))
+    assert config.worktree_setup_timeout_seconds == 7200
+    assert worktree_setup.setup_timeout_seconds(config) == 7200
+
+
+@pytest.mark.parametrize("extra, match", [
+    (("--worktree-setup", "true", "--worktree-setup-timeout", "0"), "--worktree-setup-timeout must be a positive integer"),
+    (("--worktree-setup", "true", "--worktree-setup-timeout", "-5"), "--worktree-setup-timeout must be a positive integer"),
+    (("--worktree-setup", "true", "--worktree-setup-timeout", "1.5"), "--worktree-setup-timeout must be a positive integer"),
+    (("--worktree-setup", "true", "--worktree-setup-timeout", "abc"), "--worktree-setup-timeout must be a positive integer"),
+    (("--worktree-setup-timeout", "60"), "--worktree-setup-timeout requires --worktree-setup"),
+])
+def test_cli_rejects_invalid_worktree_setup_timeout(tmp_path, monkeypatch, extra, match):
+    """timeout-cli."""
+    env = Env(tmp_path, monkeypatch)
+    with pytest.raises(AgentLoopError, match=match):
+        env.config(extra=extra)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "60"])
+def test_config_rejects_invalid_worktree_setup_timeout_field(tmp_path, monkeypatch, value):
+    env = Env(tmp_path, monkeypatch)
+    config = env.config(extra=("--worktree-setup", "true"))
+    with pytest.raises(AgentLoopError, match="--worktree-setup-timeout must be a positive integer"):
+        dataclasses.replace(config, worktree_setup_timeout_seconds=value)
+
+
+def test_shared_clone_setup_timeout_names_the_flag(tmp_path, monkeypatch):
+    """timeout-exceeded: killed, no record, and the message names --worktree-setup-timeout."""
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    config = dataclasses.replace(
+        setup_config(env, setup_command(counter, "mkdir -p .venv; sleep 30 & sleep 30")),
+        worktree_setup_timeout_seconds=1, coder_test_command_timeout_seconds=600,
+    )
+    store = claude_store()
+    started = time.monotonic()
+    with pytest.raises(AgentLoopError) as caught:
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert time.monotonic() - started < 25
+    message = str(caught.value)
+    assert "timed out after 1s" in message
+    assert "--worktree-setup-timeout SECONDS (currently 1s)" in message
+    assert worktree_setup.read_setup_record(store) is None
+
+
+def test_recovery_commands_preserve_worktree_setup_timeout(tmp_path):
+    """timeout-recovery."""
+    from agent_loop_helpers import make_config
+
+    from coding_review_agent_loop.managed_ci import _RECOVERY_VALUE_OPTIONS, _render_recovery_command
+
+    assert "--worktree-setup-timeout" in _RECOVERY_VALUE_OPTIONS
+    config = make_config(tmp_path, invocation_argv=(
+        "agent-loop", "issue", "123", "--repo", "OWNER/REPO",
+        "--worktree-setup", "npm ci", "--worktree-setup-timeout", "7200",
+        "--worktree-setup-key", "package-lock.json", "--worktree-link", "node_modules",
+    ))
+    for target, identifier in (("pr", 456), ("issue", 123)):
+        command = _render_recovery_command(config, target=target, identifier=identifier, managed_ci=False)
+        args = build_parser().parse_args(shlex.split(command)[1:])
+        assert args.worktree_setup_timeout == "7200"
+        assert args.worktree_setup == "npm ci"

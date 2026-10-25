@@ -483,7 +483,7 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
     from .config import _is_stale_default_workdir, _validate_repo_remote
 
     from .agent_permissions import release_orphaned_admin_response_roots, remove_checkout_tree
-    from .worktree_setup import invalidate_setup_record
+    from .worktree_setup import invalidate_store_setup_state
 
     has_git = store.is_dir() and (store / ".git").exists()
     if has_git:
@@ -507,8 +507,9 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
 
             if (store / ".git" / "worktrees").is_dir():
                 release_unlistable_tree(store / ".git" / "worktrees")
-            # Before the re-creation, so a crash in between leaves no record (#1650).
-            invalidate_setup_record(store)
+            # Before the re-creation, so a crash in between leaves no record or
+            # generated-key ledger (#1650, #1649).
+            invalidate_store_setup_state(store)
             remove_checkout_tree(store)
             forget_checkout(store)
     if not store.exists():
@@ -522,7 +523,7 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
 
         origin = default_origin(config.repo, protocol=config.trusted_origin_protocol,
                                 local_origin=config.trusted_local_origin)
-        invalidate_setup_record(store)
+        invalidate_store_setup_state(store)
         store.mkdir(mode=0o700)
         _git(runner, store, "init", "-q", "-b", config.base or "main")
         _git(runner, store, "remote", "add", "origin", origin)
