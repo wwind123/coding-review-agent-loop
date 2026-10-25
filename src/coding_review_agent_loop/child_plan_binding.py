@@ -454,6 +454,123 @@ def _managed_ci_retired_plan_hashes(
     return retired, parent_issue_context
 
 
+def _derive_managed_ci_parent_context(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    issue_context: IssueContext,
+    parent_issue_context: IssueContext | None,
+) -> IssueContext | None:
+    """Authenticate a fresh child's staged parent for PR-mode plan recovery (#1662).
+
+    Issue mode infers the staged parent and passes it to ``run_pr_loop``; the
+    ``pr`` command never does, so a direct child's parent-held approved plan
+    was unreachable during managed-CI recovery.  This uses the same gate order
+    as ``_managed_ci_retired_plan_hashes``: the pure fresh-phase identity read
+    first, so a non-fresh (split-materialized, hand-created or legacy) child
+    returns ``None`` without any fetch and keeps today's behavior.  A fresh
+    child's generated staged-parent marker names the parent, which is fetched
+    once and returned only after ``_resolve_fresh_child_provenance``
+    authenticates the child against it.  Invalid or conflicting identity, and
+    a parent mismatch, raise the existing ``AgentLoopError``.  PR body text and
+    handoff-record fields never select the parent.
+
+    A caller-supplied parent is returned unchanged and never refetched.
+    """
+    if parent_issue_context is not None:
+        return parent_issue_context
+    if _fresh_phase_marker_payload(issue_context) is None:
+        return None
+    staged_parent = _infer_staged_parent_issue(issue_context)
+    if staged_parent is None or staged_parent == issue_context.number:
+        return None
+    parent = get_issue_context(runner, config=config, issue_number=staged_parent)
+    fresh_child = _resolve_fresh_child_provenance(
+        issue_context=issue_context, parent_issue_context=parent
+    )
+    if fresh_child is None or fresh_child.parent_issue != parent.number:
+        return None
+    return parent
+
+
+def _fresh_child_resume_command(
+    issue_context: IssueContext,
+    parent_issue_context: IssueContext | None,
+) -> tuple[str, bool]:
+    """Return the issue resume command and whether PR-mode recovery supports it.
+
+    Pure and non-raising: any provenance failure falls back to the plain
+    issue command without claiming PR-mode support.
+    """
+    issue_number = issue_context.number
+    plain = f"agent-loop issue {issue_number}"
+    try:
+        staged_parent = _infer_staged_parent_issue(issue_context)
+        if _fresh_phase_marker_payload(issue_context) is None:
+            # An unstaged issue holds its own plan; a non-fresh staged child's
+            # parent-held plan is reachable only through issue mode.
+            return plain, staged_parent is None
+        if parent_issue_context is None or staged_parent != parent_issue_context.number:
+            return plain, False
+        fresh_child = _resolve_fresh_child_provenance(
+            issue_context=issue_context, parent_issue_context=parent_issue_context
+        )
+    except Exception:  # noqa: BLE001 - advice must never mask the real failure
+        return plain, False
+    if fresh_child is None:
+        return plain, False
+    return _child_resume_hint(issue_number, fresh_child.route.disposition), True
+
+
+def _managed_ci_plan_recovery_remedy(
+    *,
+    issue_context: IssueContext,
+    parent_issue_context: IssueContext | None,
+) -> str:
+    """Name the issues searched and the command that resumes the work (#1662)."""
+    searched = f"child issue #{issue_context.number}"
+    if parent_issue_context is not None:
+        searched += f" and parent issue #{parent_issue_context.number}"
+    command, _pr_supported = _fresh_child_resume_command(
+        issue_context, parent_issue_context
+    )
+    return (
+        f" Searched {searched} for the plan bound by the canonical handoff record. "
+        f"Resume with `{command}`, which supplies a staged parent's plan; if that "
+        "reports the same failure, the canonical plan or handoff record needs human repair."
+    )
+
+
+def _interrupted_managed_resume_hint(
+    *,
+    pr_number: int,
+    issue_number: int | None,
+    issue_context: IssueContext | None,
+    parent_issue_context: IssueContext | None,
+) -> str:
+    """Render the resume command for an interrupted managed run (#1662).
+
+    Pure: it reads only the already-loaded contexts, performs no network I/O,
+    and never raises.  With an issue scope it names the same command the
+    decomposition relaunch list renders for that child, and adds the
+    equivalent ``agent-loop pr`` form only when PR-mode recovery supports the
+    scope: an unstaged issue (the plan is on the issue itself), or a fresh
+    child authenticated against the loaded parent that PR mode would derive.
+    """
+    pr_command = f"`agent-loop pr {pr_number}`"
+    if issue_number is None:
+        return f"resume with {pr_command} after correcting the reported condition"
+    command, pr_supported = f"agent-loop issue {issue_number}", False
+    if issue_context is not None and issue_context.number == issue_number:
+        command, pr_supported = _fresh_child_resume_command(
+            issue_context, parent_issue_context
+        )
+    hint = f"resume with `{command}`"
+    if pr_supported:
+        hint += f" (or equivalently {pr_command})"
+    return hint + " after correcting the reported condition"
+
+
 def _require_authorized_replan_state(
     comments: Sequence[object],
     *,

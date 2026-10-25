@@ -3673,8 +3673,10 @@ def _recover_managed_ci_approved_plan(
     that disagree on the plan text — set ``has_matching_candidate`` True, and
     those keep failing closed: the parent is never consulted.  The parent
     identity is only ever the in-process context supplied by the staged-child
-    dispatch; nothing is inferred from PR body text or from the handoff
-    record's own fields.
+    dispatch or, in PR mode, the parent authenticated from the child's own
+    fresh-phase identity (``_derive_managed_ci_parent_context``, #1662);
+    nothing is inferred from PR body text or from the handoff record's own
+    fields.
     """
 
     candidate = recover_approved_plan_context(

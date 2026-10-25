@@ -267,7 +267,9 @@ requires the authenticated strict PR tuple and an actor-owned historical
 managed-label event before the suppression label is reapplied. It does not
 mint or accept an unprotected grant merely because the waiver flag was supplied.
 PR-mode recovery fetches that issue from GitHub, resolves any canonical
-approved-plan identity from its durable comments, and requires a server-side
+approved-plan identity from its durable comments (for a fresh decomposition
+child, from the staged parent its own fresh-phase identity names and
+authenticates, never from PR body text), and requires a server-side
 issue timeline association to the exact PR; candidate-authored closing text is
 not the source of authorization. When no PR-side closing-contract record exists,
 the authenticated issue/plan scope supplies the expected set, and the current
