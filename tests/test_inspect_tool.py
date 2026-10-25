@@ -616,3 +616,16 @@ def test_failed_boundary_preflight_stops_before_consequential_probe(tmp_path, mo
     assert len(launched) == 1
     assert launched[0][:4] == [sys.executable, "-I", "-S", "-c"]
     assert git not in launched[0][:6]
+
+
+def test_inspector_path_ignores_the_agent_loop_executable_pin():
+    """#1632: the pinned agent launch PATH never leaks into the inspector."""
+    pinned_agent_env = {
+        **HOSTILE_ENV,
+        "PATH": "/tmp/coding-review-agent-loop/agent-loop-exe/0123456789abcdef:/usr/bin",
+        "AGENT_LOOP_EXECUTABLE": "/tmp/coding-review-agent-loop/agent-loop-exe/0123456789abcdef/agent-loop",
+    }
+    env = build_subprocess_env(pinned_agent_env, ["/usr/bin", "/opt/gh/bin"])
+    assert env["PATH"] == os.pathsep.join(["/usr/bin", "/opt/gh/bin"])
+    assert "agent-loop-exe" not in env["PATH"]
+    assert "AGENT_LOOP_EXECUTABLE" not in env

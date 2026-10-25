@@ -94,6 +94,7 @@ from .local_test_evidence import (
     CROSS_RESTART_SUPERSESSION_CAVEAT,
     TREE_CHANGE_SUPERSESSION,
     decode_bounded_evidence,
+    tool_identity_diagnostic,
     redact_test_command,
 )
 
@@ -221,6 +222,18 @@ def _render_test_observation_citations(
     }
     lines = ["### Test observation receipts"]
     cited: set[str] = set()
+    # Issue #1632: receipts whose rendered line already names its tool diagnostic.
+    tool_shown: set[str] = set()
+
+    def tool_suffix(item: object) -> str:
+        diagnostic = tool_identity_diagnostic(item)
+        receipt = getattr(item, "receipt_id", None)
+        if diagnostic is None:
+            return ""
+        if receipt:
+            tool_shown.add(receipt)
+        return f" — {diagnostic}"
+
     citation_uses: dict[str, set[tuple[str, str]]] = {}
     for citation in citations:
         receipt_id = sanitize_historical_text(str(getattr(citation, "receipt_id", "")))
@@ -277,6 +290,7 @@ def _render_test_observation_citations(
             cited.add(receipt_id)
         lines.append(
             f"- `{safe_command}` — receipt `{receipt_id[:256]}` — `{claim}` ({reason}; CI remains authoritative)"
+            + (tool_suffix(observed) if observed is not None else "")
         )
     if evidence is not None:
         for item in evidence.observations:
@@ -292,7 +306,7 @@ def _render_test_observation_citations(
                 lines.append(
                     f"- `{safe_command}` — receipt `{item.receipt_id[:256]}` — "
                     "historical failure at an obsolete tree (not an outstanding "
-                    f"obligation) `{item.outcome}`"
+                    f"obligation) `{item.outcome}`" + tool_suffix(item)
                 )
                 continue
             superseding = _cross_restart_superseding_receipt(item)
@@ -303,7 +317,7 @@ def _render_test_observation_citations(
                 lines.append(
                     f"- `{safe_command}` — receipt `{item.receipt_id[:256]}` — "
                     f"failure superseded across a restart by receipt `{superseding[:256]}`; "
-                    f"environment not compared `{item.outcome}`"
+                    f"environment not compared `{item.outcome}`" + tool_suffix(item)
                 )
                 continue
             if (
@@ -318,6 +332,7 @@ def _render_test_observation_citations(
                     lines.append(
                         f"- `{safe_command}` — receipt `{item.receipt_id[:256]}` — "
                         f"pre-collection launch failure (not evidence) `{item.outcome}`"
+                        + tool_suffix(item)
                     )
                     continue
                 label = (
@@ -327,7 +342,17 @@ def _render_test_observation_citations(
                 )
                 lines.append(
                     f"- `{safe_command}` — receipt `{item.receipt_id[:256]}` — {label} `{item.outcome}`"
+                    + tool_suffix(item)
                 )
+        for item in evidence.observations:
+            diagnostic = tool_identity_diagnostic(item)
+            if diagnostic is None or (item.receipt_id and item.receipt_id in tool_shown):
+                continue
+            # A flagged row not listed above (for example an uncited pass)
+            # still names its version split.
+            safe_command, _identifiers, _caveats = redact_test_command(item.command)
+            receipt = f"receipt `{item.receipt_id[:256]}`" if item.receipt_id else "no receipt"
+            lines.append(f"- `{safe_command}` — {receipt} — `{item.outcome}` — {diagnostic}")
     return "\n".join(lines)
 
 

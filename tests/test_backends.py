@@ -1525,3 +1525,41 @@ def test_seat_turn_directory_lives_under_the_seat_component(tmp_path, monkeypatc
     config = dataclasses.replace(make_config(tmp_path), active_reviewer_seat_id="seat-a")
     path = public_response_path(config, "codex")
     assert path.parent.parent == response_root(config) / "seat-a"
+
+
+def test_every_backend_agent_launch_goes_through_the_pinned_runner_sites():
+    """#1632: each backend spawns its agent only through ``Runner.run_with_log``.
+
+    Both launch-environment sites there (pipe and PTY) apply the agent-loop
+    executable pin after the backend env merge, so every backend's agent sees
+    the running install's ``agent-loop`` first on ``PATH`` (exercised end to
+    end in tests/test_agent_executable.py).
+    """
+    import re
+
+    import coding_review_agent_loop.agents as agents_package
+    import coding_review_agent_loop.runner as runner_module
+
+    agents_dir = Path(agents_package.__file__).parent
+    for name in ("claude", "codex", "gemini", "antigravity", "format_repair"):
+        source = (agents_dir / f"{name}.py").read_text(encoding="utf-8")
+        assert "runner.run_with_log(" in source, name
+        assert not re.search(r"subprocess\.(Popen|run|call|check_output)\(", source), name
+    # The only direct agent spawns outside the runner (Gemini repair and the
+    # legacy repair pass) build their environment with the same pin helper.
+    repair_source = (agents_dir.parent / "repair.py").read_text(encoding="utf-8")
+    spawns = [m.start() for m in re.finditer(r"subprocess\.(?:run|Popen)\(", repair_source)]
+    assert len(spawns) == 2
+    for start in spawns:
+        call = repair_source[start:repair_source.index("\n        )", start)]
+        assert "env=pinned_agent_environment(" in call, call
+    runner_source = Path(runner_module.__file__).read_text(encoding="utf-8")
+    merges = [
+        match.start()
+        for match in re.finditer(r"launch_env = \{\*\*os\.environ, \*\*env\}", runner_source)
+    ]
+    assert len(merges) == 2
+    for start in merges:
+        window = runner_source[start:start + 700]
+        assert "launch_env.update(agent_executable_environment(launch_env))" in window
+        assert window.index("agent_executable_environment") < window.index("broker.environment")

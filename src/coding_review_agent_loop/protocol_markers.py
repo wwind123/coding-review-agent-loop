@@ -486,6 +486,11 @@ EXCLUDED_PROTOCOL_LITERALS = frozenset(
         "AGENT_LOOP_CODER_CI_DISPATCH_GUARD",
         "AGENT_LOOP_CODER_GUARD_TARGET_GH",
         "AGENT_LOOP_CODER_GUARD_DIR",
+        # Agent-loop executable pin and run-tests client identity (#1632).
+        "AGENT_LOOP_EXECUTABLE",
+        "AGENT_LOOP_RUN_TESTS_TOOL_COMMIT",
+        "AGENT_LOOP_RUN_TESTS_TOOL_DIRTY",
+        "AGENT_LOOP_RUN_TESTS_TOOL_PACKAGE",
         "AGENT_STATE",
         "AGENT_PLAN_STATE",
         "AGENT_PR",

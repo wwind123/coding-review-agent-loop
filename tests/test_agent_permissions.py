@@ -30,6 +30,7 @@ from agent_loop_helpers import FakeRunner, make_config
 
 PACKAGE_DIR = str(Path(coding_review_agent_loop.__file__).resolve().parent)
 WRAPPER = ("/opt/tools/venv/bin/python", "-m", "coding_review_agent_loop.cli", "run-tests")
+_REAL_VERIFIED_WRAPPER_PREFIX = test_runtime.verified_wrapper_prefix
 
 
 @pytest.mark.parametrize("backend", ["agy", "gemini"])
@@ -367,6 +368,64 @@ def test_resolver_uses_verified_prefix_not_resolved_interpreter(tmp_path, sandbo
     invocation = test_runtime.resolve_coder_test_invocation(config)
     assert invocation.startswith("/opt/tools/venv/bin/python -m coding_review_agent_loop.cli run-tests")
     assert seen["cwd"] == config.claude_dir.resolve()
+
+
+def _stale_agent_loop(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    stale = directory / "agent-loop"
+    stale.write_text("#!/bin/sh\necho 'agent-loop preflight: verified'\n", encoding="utf-8")
+    stale.chmod(0o755)
+    return stale
+
+
+def test_sandboxed_grant_names_pinned_launcher_not_stale_path_install(tmp_path, sandbox, monkeypatch):
+    """#1632: the grant and prompt name the running install's pinned launcher."""
+    from coding_review_agent_loop import agent_executable
+
+    monkeypatch.setattr(agent_executable, "_LAUNCHER_CACHE", {})
+    monkeypatch.setattr(test_runtime, "verified_wrapper_prefix", _REAL_VERIFIED_WRAPPER_PREFIX)
+    stale = _stale_agent_loop(tmp_path / "stale-bin")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(stale.parent), os.environ.get("PATH", "")]))
+    config = sandboxed_config(tmp_path, test_command=("pytest", "-q"))
+    sandbox["establish"](config)
+    launcher = agent_executable.agent_loop_launcher()
+    assert launcher is not None and str(launcher).startswith(str(sandbox["tmp"]))
+    invocation = test_runtime.resolve_coder_test_invocation(config)
+    assert invocation == test_runtime.render_test_wrapper(
+        ("pytest", "-q"), memory_dir=config.agent_memory_dir, prefix=(str(launcher), "run-tests")
+    )
+    assert str(stale) not in invocation
+    assert "coding_review_agent_loop.cli" not in invocation
+    rules = _allowed_tools(list(ap.role_permission_args(config, "claude", "coder")))
+    assert [rule for rule in rules if "run-tests" in rule] == [f"Bash({invocation})"]
+    assert f"`{invocation}`" in _coder_workdir_guidance(config)
+
+
+def test_sandboxed_grant_omitted_when_launcher_unavailable_with_shadow_package(
+    tmp_path, sandbox, monkeypatch
+):
+    """#1632: no unpinned ``-m`` fallback is granted when the launcher cannot install."""
+    from coding_review_agent_loop import agent_executable
+
+    def refuse(_root=None):
+        raise OSError("scratch root is not writable")
+
+    monkeypatch.setattr(agent_executable, "_LAUNCHER_CACHE", {})
+    monkeypatch.setattr(agent_executable, "install_agent_loop_launcher", refuse)
+    monkeypatch.setattr(test_runtime, "verified_wrapper_prefix", _REAL_VERIFIED_WRAPPER_PREFIX)
+    shadow = tmp_path / "shadow"
+    (shadow / "coding_review_agent_loop").mkdir(parents=True)
+    (shadow / "coding_review_agent_loop" / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
+    logged = []
+    monkeypatch.setattr("coding_review_agent_loop.logging.log", lambda _c, message: logged.append(message))
+    config = sandboxed_config(tmp_path, test_command=("pytest", "-q"))
+    sandbox["establish"](config)
+    assert test_runtime.resolve_coder_test_invocation(config) is None
+    assert any("no agent-loop run-tests wrapper candidate verified" in m for m in logged)
+    rules = _allowed_tools(list(ap.role_permission_args(config, "claude", "coder")))
+    # Only the separately pinned inspect grant may name the module.
+    assert not any("run-tests" in rule for rule in rules)
 
 
 # ------------------------------------------------------ response-root boundary

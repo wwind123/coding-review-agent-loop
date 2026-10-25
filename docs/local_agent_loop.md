@@ -1947,6 +1947,66 @@ goes only in `exact_head_evidence_requests`. Planner prompts phrase
 verification rows that need captured evidence as
 `agent-loop run-tests -- <command>`.
 
+#### Agent-loop executable pin and receipt tool identity
+
+Every agent subprocess (coder, reviewer, repair, planner) resolves the
+orchestrator's own install when it runs `agent-loop`, whatever its inherited
+`PATH` holds (#1632). The orchestrator installs a private launcher named
+`agent-loop` under `<scratch>/agent-loop-exe/<digest>/`. The launcher
+re-executes the running interpreter in isolated mode (`-I`) with the
+orchestrator's import path frozen, so `PYTHONPATH`, the cwd and user-site
+installs cannot select another `coding_review_agent_loop`. Its directory goes
+first on each agent's `PATH` (only that directory, so `python` and `pytest`
+still resolve as before), and the agent environment carries:
+
+- `AGENT_LOOP_EXECUTABLE`: the absolute launcher path. Scripts and prompts can
+  run `"$AGENT_LOOP_EXECUTABLE" run-tests -- <command>` to name the install
+  explicitly.
+
+The pin composes with the managed-CI coder `gh` guard; the read-only inspector
+keeps its own closed `PATH`. The launcher is also the only run-tests wrapper
+the sandboxed coder grant and the rendered invocation guidance use. If it
+cannot be installed (for example an unwritable scratch root), agents keep
+their inherited `PATH`, a warning is logged, no wrapper is granted or
+rendered, and the turn proceeds. At startup, `issue`, `task`, `pr`, `discuss`
+and `managed-pr` warn, naming both paths, when the agent-visible `agent-loop`
+is not this install, and log an informational line when the inherited `PATH`'s
+`agent-loop` is a different file. Neither line blocks the run, and the
+preflight writes nothing: the first agent launch installs the launcher.
+
+Each `run-tests` client reports its own tool commit, dirty flag and package
+path to the broker through the reserved environment entries
+`AGENT_LOOP_RUN_TESTS_TOOL_COMMIT`, `AGENT_LOOP_RUN_TESTS_TOOL_DIRTY` and
+`AGENT_LOOP_RUN_TESTS_TOOL_PACKAGE`. The request schema is unchanged. The
+broker removes the entries before launching the target and excludes them from
+the environment identity. Every brokered observation carries a bounded
+`tool_identity` record: the client commit, dirty flag and package digest
+beside the orchestrator's, plus a status.
+
+| Status | Meaning |
+| --- | --- |
+| `match` | Both commits are known and equal (a dirty flag alone never mismatches). |
+| `mismatch` | Both commits are known and differ, or a commit is unknown (for example a wheel install) and the package digests differ. |
+| `unidentified` | The client sent no identity, as an older install does. |
+| `unknown` | Not enough was known to compare. |
+
+A `mismatch` renders `run-tests-tool-mismatch: receipt produced by agent-loop
+<client>, orchestrator is <orchestrator>`, naming short commits (with
+`dirty`) or package digests. An `unidentified` client renders
+`run-tests-tool-unidentified: run-tests client did not report its agent-loop
+identity (likely an older install)`. The diagnostic appears beside the
+affected receipt in the coder follow-up's receipts section, in the
+unchanged-head stop and in the evidence-stall decision. Raw package paths
+appear only in the orchestrator's own log.
+
+The policy is flag, not reject. The broker, not the client, executes the
+target, so a flagged receipt stays parent-observed. `tool_identity` never
+changes provenance, supersession or the evidence gate. It is unauthenticated
+diagnostic data, and historical receipts are never reclassified. Standalone
+(broker-less) `run-tests` rows in `test-runtime.json` additionally record
+`tool_commit`, `tool_dirty` and `tool_package_digest` and stay
+telemetry-unverified.
+
 #### Multi-process fixtures (`run-tests --fixture`)
 
 Some suites need long-lived helper processes, such as a web server, a worker,
@@ -7722,8 +7782,12 @@ its role (implemented in `agent_permissions.py`):
   and one exact, wildcard-free rule for the resolved `agent-loop run-tests`
   invocation, which is the same string the coder prompt shows. The invocation
   uses `--test-command`, else the first verified test-profile command, and the
-  preflight-verified, virtualenv-preserving wrapper. When nothing resolves the
-  test rule is omitted and a warning is logged.
+  preflight-verified, virtualenv-preserving wrapper. The only wrapper candidate
+  is the running install's pinned launcher (see
+  [Agent-loop executable pin and receipt tool identity](#agent-loop-executable-pin-and-receipt-tool-identity));
+  an ambient-`PATH` `agent-loop` or an unpinned `python -m
+  coding_review_agent_loop.cli` spelling is never granted. When nothing
+  resolves the test rule is omitted and a warning is logged.
 - A Claude non-coder gets `--restricted`, `--tools
   Read,Grep,Glob,Write,Edit,Bash`, an empty `--strict-mcp-config`,
   `--permission-mode dontAsk`, `--permission-prompts none`, `Write`/`Edit`
@@ -9439,10 +9503,12 @@ reports it as not run.
 
 ### Launcher preflight and health memory
 
-`run-tests --preflight` is a bounded, non-mutating wrapper probe. It checks at
-most two candidates—the absolute `agent-loop` console entry and the current
-interpreter's `-m coding_review_agent_loop.cli` fallback—once per invocation,
-with a five-second watchdog. Recognized inner launcher probes are separately
+`run-tests --preflight` is a bounded, non-mutating wrapper probe. It checks one
+candidate, the running install's pinned `agent-loop` launcher (see
+[Agent-loop executable pin and receipt tool identity](#agent-loop-executable-pin-and-receipt-tool-identity)),
+once per invocation, with a five-second watchdog. An ambient-`PATH`
+`agent-loop` and the unpinned `-m coding_review_agent_loop.cli` spelling are
+no longer candidates (#1632). Recognized inner launcher probes are separately
 limited to six distinct candidate identities per invocation. Inner probes use
 the effective target environment, including ambient values merged with a
 partial overlay. Candidates are executed directly, including the

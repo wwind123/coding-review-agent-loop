@@ -136,18 +136,91 @@ def test_wrapper_resolution_inherited_subceiling_and_policy_rejection(monkeypatc
     assert runtime.inherited_timeout_ceiling() == 7200
 
 
-def test_wrapper_module_fallback_preserves_lexical_virtualenv_interpreter(tmp_path, monkeypatch):
+@pytest.fixture
+def private_launcher(tmp_path, monkeypatch):
+    """Install the #1632 launcher under this test's tmp dir with a clean cache."""
+    from coding_review_agent_loop import agent_executable
+
+    tmp = tmp_path / "launcher-tmp"
+    tmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp))
+    monkeypatch.setattr(agent_executable, "_LAUNCHER_CACHE", {})
+    monkeypatch.setattr(agent_executable, "_WARNED", set())
+    runtime.reset_coder_test_invocations()
+    yield agent_executable
+    runtime.reset_coder_test_invocations()
+
+
+def _stale_wrapper(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    stale = directory / "agent-loop"
+    stale.write_text("#!/bin/sh\necho 'agent-loop preflight: verified'\n", encoding="utf-8")
+    stale.chmod(0o755)
+    return stale
+
+
+def test_wrapper_candidate_is_only_the_pinned_launcher_with_lexical_interpreter(
+    tmp_path, monkeypatch, private_launcher
+):
     venv = tmp_path / "virtualenv"
     interpreter = venv / "bin" / "python"
     interpreter.parent.mkdir(parents=True)
     interpreter.symlink_to(Path(sys.executable).resolve())
     (venv / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
     monkeypatch.setattr(runtime.sys, "executable", str(interpreter))
-    monkeypatch.setattr(runtime.shutil, "which", lambda _name, path=None: None)
+    stale = _stale_wrapper(tmp_path / "stale-bin")
 
-    assert runtime._wrapper_candidates({"PATH": ""}) == [
-        (str(interpreter), "-m", "coding_review_agent_loop.cli", "run-tests")
-    ]
+    candidates = runtime._wrapper_candidates({"PATH": str(stale.parent)})
+    launcher = private_launcher.agent_loop_launcher()
+    assert candidates == [(str(launcher), "run-tests")]
+    assert runtime.resolve_wrapper_prefix() == (str(launcher), "run-tests")
+    # The launcher execs the lexical virtualenv interpreter, not its target.
+    assert f"exec {shlex.quote(str(interpreter))} -I -c " in launcher.read_text(encoding="utf-8")
+    assert all(str(stale) not in candidate for candidate in candidates)
+    assert all("-m" not in candidate for candidate in candidates)
+
+
+def test_preflight_verifies_the_pinned_launcher_over_a_stale_path_wrapper(
+    tmp_path, monkeypatch, private_launcher
+):
+    stale = _stale_wrapper(tmp_path / "stale-bin")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(stale.parent), os.environ.get("PATH", "")]))
+    results = runtime.preflight_wrapper_candidates(cwd=tmp_path)
+    launcher = private_launcher.agent_loop_launcher()
+    assert [result.candidate for result in results] == [(str(launcher), "run-tests")]
+    assert results[0].state == "verified", results[0].diagnostic
+    assert runtime.verified_wrapper_prefix(cwd=tmp_path) == (str(launcher), "run-tests")
+
+
+def test_launcher_unavailable_with_shadow_package_grants_and_renders_no_wrapper(
+    tmp_path, monkeypatch, private_launcher
+):
+    def refuse(_root=None):
+        raise OSError("scratch root is not writable")
+
+    monkeypatch.setattr(private_launcher, "install_agent_loop_launcher", refuse)
+    shadow = tmp_path / "checkout"
+    (shadow / "coding_review_agent_loop").mkdir(parents=True)
+    (shadow / "coding_review_agent_loop" / "__init__.py").write_text("", encoding="utf-8")
+    (shadow / "coding_review_agent_loop" / "cli.py").write_text(
+        "def main():\n    print('agent-loop preflight: verified')\n    return 0\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(shadow))
+    stale = _stale_wrapper(tmp_path / "stale-bin")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(stale.parent), os.environ.get("PATH", "")]))
+    logged = []
+    monkeypatch.setattr("coding_review_agent_loop.logging.log", lambda _c, message: logged.append(message))
+
+    assert runtime._wrapper_candidates() == []
+    assert runtime.resolve_wrapper_prefix() is None
+    assert runtime.preflight_wrapper_candidates(cwd=shadow) == ()
+    assert runtime.render_test_wrapper(("pytest", "-q")) == "pytest -q"
+    config = make_config(tmp_path, test_command=("pytest", "-q"))
+    assert runtime.resolve_coder_test_invocation(config, cwd=shadow) is None
+    assert any(
+        "test grant omitted (no agent-loop run-tests wrapper candidate verified)" in message
+        for message in logged
+    )
 
 
 def test_managed_invocation_parses_absolute_entrypoint_and_module_forms(tmp_path):
@@ -471,6 +544,46 @@ def test_cli_without_broker_labels_standalone_telemetry_unverified(tmp_path, mon
         "--", sys.executable, "-c", "pass",
     ]) == 0
     assert "telemetry-unverified evidence" in capsys.readouterr().err
+
+
+def test_cli_without_broker_stamps_new_rows_with_tool_identity(tmp_path, monkeypatch, capsys):
+    from coding_review_agent_loop import agent_executable, tool_provenance
+
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "AGENT_LOOP_TEST_BROKER_ENDPOINT",
+        "AGENT_LOOP_TEST_BROKER_CAPABILITY",
+        "AGENT_LOOP_TEST_BROKER_PROTOCOL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        tool_provenance,
+        "capture_client_tool_provenance",
+        lambda **_kwargs: {"commit": "abcdef1234567", "dirty": True, "package_path": "/opt/agent-loop/pkg"},
+    )
+    memory = tmp_path / "memory"
+    existing = [sys.executable, "-c", "print('old')"]
+    assert runtime.record_test_observation(
+        memory, argv=existing, cwd=tmp_path, outcome="passed", elapsed_seconds=1,
+        attempted_timeout_seconds=10, policy_ceiling_seconds=1800,
+    )
+    before = [dict(row) for row in runtime.load_runtime_memory(memory)]
+    assert main([
+        "run-tests", "--timeout-seconds", "5", "--memory-dir", str(memory),
+        "--", sys.executable, "-c", "pass",
+    ]) == 0
+    assert "telemetry-unverified evidence" in capsys.readouterr().err
+    rows = runtime.load_runtime_memory(memory)
+    old = [row for row in rows if row in before]
+    assert old == before and all("tool_commit" not in row for row in old)
+    new = [row for row in rows if row not in before]
+    assert len(new) == 1
+    assert new[0]["tool_commit"] == "abcdef1234567"
+    assert new[0]["tool_dirty"] is True
+    assert new[0]["tool_package_digest"] == agent_executable.package_digest("/opt/agent-loop/pkg")
+    # The stamp never promotes a standalone row to broker evidence.
+    assert new[0].get("lane") != "broker"
+    assert "provenance" not in new[0]
 
 
 def test_runtime_sidecar_recommendations_timeout_lower_bound_and_success_clear(tmp_path):
@@ -3691,6 +3804,45 @@ def test_cli_broker_path_records_nothing_for_a_classified_frame(tmp_path, monkey
     monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker("ordinary"))
     assert main(command) == 1
     assert "result" in calls
+
+
+def test_cli_broker_requests_carry_the_client_tool_identity(tmp_path, monkeypatch):
+    """#1632: both broker call sites stamp the client identity as overrides."""
+    from coding_review_agent_loop import tool_provenance
+    from coding_review_agent_loop.local_test_evidence import (
+        TOOL_COMMIT_ENV, TOOL_DIRTY_ENV, TOOL_PACKAGE_ENV, BrokerRunResult,
+    )
+    import coding_review_agent_loop.cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        tool_provenance,
+        "capture_client_tool_provenance",
+        lambda **_kwargs: {"commit": "abcdef1234567", "dirty": None, "package_path": "/opt/pkg"},
+    )
+    seen = []
+
+    class FakeBroker:
+        def run(self, argv, **kwargs):
+            seen.append(kwargs)
+            return BrokerRunResult(
+                receipt_id="r1", execution_ref="e1", outcome="passed", returncode=0,
+                elapsed_seconds=1.0, wrapper_bootstrap="verified", inner_exec="started",
+                suite_start="unknown",
+                fixture={} if kwargs.get("fixture") else None,
+            )
+
+    monkeypatch.setattr(cli_module, "broker_client_from_environment", lambda: FakeBroker())
+    assert main(["run-tests", "--timeout-seconds", "5", "--", sys.executable, "-c", "pass"]) == 0
+    fixture = tmp_path / "fixture.sh"
+    fixture.write_text("#!/bin/sh\n", encoding="utf-8")
+    main(["run-tests", "--fixture", str(fixture), "--timeout-seconds", "60", "--", sys.executable, "-c", "pass"])
+    assert len(seen) == 2
+    for kwargs in seen:
+        overrides = kwargs["environment_overrides"]
+        assert overrides[TOOL_COMMIT_ENV] == "abcdef1234567"
+        assert overrides[TOOL_DIRTY_ENV] == "unknown"
+        assert overrides[TOOL_PACKAGE_ENV] == "/opt/pkg"
 
 
 # --- review round 1 regressions (issue #1182) --------------------------------

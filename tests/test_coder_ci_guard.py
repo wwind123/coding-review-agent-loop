@@ -365,3 +365,37 @@ def test_every_coder_launch_site_uses_the_shared_helper():
 
 def test_module_exports_are_stable():
     assert coder_ci_guard.GUARD_ROLES == frozenset({"coder", "repair"})
+
+
+# ------------------------------------------- agent-loop executable pin (#1632) ---
+
+
+def test_guard_composes_with_agent_loop_executable_pin(tmp_path, monkeypatch):
+    import shutil
+    import tempfile
+
+    from coding_review_agent_loop import agent_executable
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setattr(agent_executable, "_LAUNCHER_CACHE", {})
+    fake, record = _fake_gh(tmp_path / "bin", exit_code=7)
+    stale = tmp_path / "bin" / "agent-loop"
+    stale.write_text("#!/bin/sh\nexit 9\n", encoding="utf-8")
+    stale.chmod(0o755)
+    guarded = _guarded(tmp_path, path=str(fake.parent))
+    # The runner applies the pin after merging the backend (guard) env.
+    launch_env = {**guarded, **agent_executable.agent_executable_environment(guarded)}
+    entries = launch_env["PATH"].split(os.pathsep)
+    launcher = launch_env[agent_executable.EXECUTABLE_ENV]
+    guard_dir = launch_env[GUARD_DIR_ENV]
+    assert entries[:2] == [str(Path(launcher).parent), guard_dir]
+    assert shutil.which("gh", path=launch_env["PATH"]) == str(Path(guard_dir) / "gh")
+    assert shutil.which("agent-loop", path=launch_env["PATH"]) == launcher
+    # The guard still refuses triggers and strips only its own directory.
+    assert _run_gh(launch_env, "workflow", "run", "ci.yml").returncode == EXIT_REFUSED
+    result = _run_gh(launch_env, "pr", "checks", "5")
+    assert result.returncode == 7
+    seen = _calls(record)[0]["path"].split(os.pathsep)
+    assert os.path.realpath(guard_dir) not in [os.path.realpath(p) for p in seen if p]
+    assert str(Path(launcher).parent) in seen
+    assert str(fake.parent) in seen

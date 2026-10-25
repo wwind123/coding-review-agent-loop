@@ -5286,6 +5286,9 @@ def _guard_fake_gh(tmp_path, monkeypatch):
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     monkeypatch.setenv("AGENT_LOOP_REPAIR_AMBIENT_MARKER", "kept")
+    # An outer managed coder turn may export its own guard; never inherit it.
+    for name in _GUARD_VARS:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(scratch, "scratch_root", lambda: tmp_path / "scratch")
     return gh
 
@@ -5350,12 +5353,76 @@ def test_gemini_format_repair_subprocess_carries_guard_only_when_guarded(tmp_pat
         )
     assert repaired == valid
     env = run.call_args.kwargs["env"]
+    # The ambient environment is preserved, not replaced.
+    assert env["AGENT_LOOP_REPAIR_AMBIENT_MARKER"] == "kept"
+    # #1632: the executable pin is applied after the guard merge.
+    launcher_dir = str(Path(env["AGENT_LOOP_EXECUTABLE"]).parent)
+    entries = env["PATH"].split(os.pathsep)
+    assert entries[0] == launcher_dir
     if guarded:
-        _assert_guarded_env(env, gh)
-        # The ambient environment is preserved, not replaced.
-        assert env["AGENT_LOOP_REPAIR_AMBIENT_MARKER"] == "kept"
+        _assert_guarded_env({**env, "PATH": os.pathsep.join(entries[1:])}, gh)
     else:
-        assert env is None
+        assert not any(name in env for name in _GUARD_VARS)
+
+
+def _repair_launch_execute(tmp_path, guarded):
+    valid = structured_pr_review(state="approved", reviewer="Google Gemini")
+    proc = MagicMock(returncode=0, stdout=valid, stderr="")
+    config = replace(make_config(tmp_path, repair_backend="gemini"), coder_ci_dispatch_guard=guarded)
+    with patch("coding_review_agent_loop.repair.subprocess.run", return_value=proc) as run:
+        execute_repair(
+            malformed_pr_review_source(state="approved"),
+            runner=FakeRunner(),
+            config=config,
+            run_id="run-pin",
+            usage_context=None,
+            validate=lambda text: parse_structured_pr_review(text, reviewer="Google Gemini"),
+            expected_kind="pr_review",
+        )
+    return run.call_args.kwargs["env"]
+
+
+def _repair_launch_legacy(tmp_path, guarded):
+    from coding_review_agent_loop.repair import attempt_repair as real_attempt_repair
+
+    proc = MagicMock(returncode=0, stdout="repaired", stderr="")
+    with patch("coding_review_agent_loop.repair.subprocess.run", return_value=proc) as run:
+        real_attempt_repair("some malformed review text", "gemini")
+    return run.call_args.kwargs["env"]
+
+
+@pytest.mark.parametrize(
+    "launch,guarded",
+    [(_repair_launch_execute, True), (_repair_launch_execute, False), (_repair_launch_legacy, False)],
+    ids=["execute-repair-guarded", "execute-repair-unguarded", "legacy-attempt-repair"],
+)
+def test_direct_gemini_repair_launches_resolve_the_running_install(tmp_path, monkeypatch, launch, guarded):
+    """#1632: repair launches outside Runner.run_with_log get the executable pin too."""
+    import shutil
+
+    from coding_review_agent_loop import agent_executable
+
+    gh = _guard_fake_gh(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent_executable, "_LAUNCHER_CACHE", {})
+    stale_dir = tmp_path / "stale-bin"
+    stale_dir.mkdir()
+    stale = stale_dir / "agent-loop"
+    stale.write_text("#!/bin/sh\nexit 9\n", encoding="utf-8")
+    stale.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{stale_dir}{os.pathsep}{os.environ['PATH']}")
+    env = launch(tmp_path, guarded)
+    launcher = env["AGENT_LOOP_EXECUTABLE"]
+    assert launcher.startswith(str(tmp_path / "scratch"))
+    assert shutil.which("agent-loop", path=env["PATH"]) == launcher
+    assert env["PATH"].split(os.pathsep)[0] == str(Path(launcher).parent)
+    assert str(stale_dir) in env["PATH"].split(os.pathsep)
+    if guarded:
+        guard_dir = env["AGENT_LOOP_CODER_GUARD_DIR"]
+        assert env["PATH"].split(os.pathsep)[1] == guard_dir
+        assert shutil.which("gh", path=env["PATH"]) == str(Path(guard_dir) / "gh")
+    else:
+        assert not any(name in env for name in _GUARD_VARS)
+        assert shutil.which("gh", path=env["PATH"]) == str(gh)
 
 
 @pytest.mark.parametrize("guarded", [True, False])

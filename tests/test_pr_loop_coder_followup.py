@@ -2308,3 +2308,108 @@ def test_stop_message_is_byte_identical_without_a_non_array_drop_1626():
     )
     assert "(format repair attempted: no); 2 run-tests receipt(s)" in with_drop
     assert with_drop.endswith(" ROUTE")
+
+
+# --------------------------------------------- run-tests tool identity (#1632)
+
+
+def _tool_flagged_evidence_1632(*, status_client_commit="42340e7"):
+    from coding_review_agent_loop.local_test_evidence import (
+        TOOL_COMMIT_ENV,
+        TOOL_DIRTY_ENV,
+        TOOL_PACKAGE_ENV,
+        EnvironmentIdentityRegistry,
+        EvidenceScope,
+        LocalTestObservation,
+        TreeAttribution,
+        bounded_evidence_for_round,
+        build_tool_identity,
+        reconcile_test_observations,
+    )
+
+    orchestrator = {"commit": "bc60cc2" + "0" * 33, "dirty": False, "package_path": "/opt/release/pkg"}
+    client = {
+        TOOL_COMMIT_ENV: status_client_commit, TOOL_DIRTY_ENV: "false",
+        TOOL_PACKAGE_ENV: "/tmp/stale-clone/src/coding_review_agent_loop",
+    }
+    identity = build_tool_identity(client, orchestrator)
+
+    def row(receipt, outcome, timestamp):
+        return LocalTestObservation(
+            command=("python", "-m", "pytest", "tests/test_protocol.py", "-q"),
+            outcome=outcome,
+            provenance="parent-observed",
+            scope=EvidenceScope("suite", ("tests/test_protocol.py",)),
+            receipt_id=receipt,
+            turn_id="coder-turn",
+            timestamp=timestamp,
+            cwd="/checkout",
+            normalized_command="python -m pytest tests/test_protocol.py -q",
+            returncode=0 if outcome == "passed" else 1,
+            attribution=TreeAttribution(
+                state="current-head", head="abc123", pre_digest="p", post_digest="p",
+                tracked_digest="tree-a", stable=True,
+            ),
+            environment_state="not-compared",
+            tool_identity=identity,
+        )
+
+    registry = EnvironmentIdentityRegistry()
+    evidence = reconcile_test_observations(
+        [row("fail-1", "failed", "2026-10-23T10:00:00+00:00")], registry=registry
+    )
+    return bounded_evidence_for_round(evidence)
+
+
+def test_followup_receipts_section_shows_the_tool_mismatch_1632():
+    from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+
+    encoded = _tool_flagged_evidence_1632()
+    citation = SimpleNamespace(
+        receipt_id="fail-1", command="python -m pytest tests/test_protocol.py -q",
+        claim="current-result",
+    )
+    expected = (
+        "run-tests-tool-mismatch: receipt produced by agent-loop 42340e7, orchestrator is bc60cc2"
+    )
+    cited = _render_test_observation_citations(
+        [citation], local_test_evidence=encoded, current_test_turn_id="coder-turn"
+    )
+    assert expected in cited
+    assert cited.count("run-tests-tool-mismatch") == 1
+    uncited = _render_test_observation_citations(
+        [], local_test_evidence=encoded, current_test_turn_id="coder-turn"
+    )
+    assert expected in uncited and "uncited authoritative" in uncited
+    # GitHub-bound text never carries raw local package paths.
+    assert "/tmp/stale-clone" not in cited + uncited and "/opt/release" not in cited + uncited
+
+
+def test_unchanged_head_stop_names_the_tool_mismatch_1632():
+    from coding_review_agent_loop.pr_loop import unchanged_head_stop_message
+
+    encoded = _tool_flagged_evidence_1632()
+    message = unchanged_head_stop_message(
+        pr=77, coder_name="Claude", previous_head="abc123", turns=2, round_number=3,
+        evidence=encoded, route=" ROUTE",
+    )
+    assert "unsuperseded failure receipts" in message
+    assert (
+        "Run-tests tool identity: run-tests-tool-mismatch: receipt produced by agent-loop "
+        "42340e7, orchestrator is bc60cc2"
+    ) in message
+    assert message.endswith(" ROUTE")
+    assert "/tmp/stale-clone" not in message
+
+
+def test_evidence_stall_decision_names_the_tool_mismatch_1632():
+    encoded = _tool_flagged_evidence_1632()
+    text = pr_loop_support.render_evidence_stall_decision(
+        77, "abc123", "f" * 64, {"row-a": "no citation"}, 3, evidence=encoded
+    )
+    assert "run-tests-tool-mismatch: receipt produced by agent-loop 42340e7" in text
+    assert text.index("run-tests-tool-mismatch") < text.index("Decide how to proceed")
+    plain = pr_loop_support.render_evidence_stall_decision(
+        77, "abc123", "f" * 64, {"row-a": "no citation"}, 3
+    )
+    assert "run-tests-tool" not in plain

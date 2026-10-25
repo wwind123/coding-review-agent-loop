@@ -252,7 +252,11 @@ def _signal_when_waiting(signum, *, count=1):
         deadline = time.monotonic() + 20
         while quota_wait.active_wait_count() < count and time.monotonic() < deadline:
             time.sleep(0.01)
-        os.kill(os.getpid(), signum)
+        # Direct the signal at the main thread, as a terminal or supervisor
+        # signal effectively is.  A process-directed os.kill from this thread
+        # may be delivered to any other live thread in the test process, and
+        # then the main thread stays blocked in its 30s wait slice.
+        signal.pthread_kill(threading.main_thread().ident, signum)
 
     thread = threading.Thread(target=fire, daemon=True)
     thread.start()

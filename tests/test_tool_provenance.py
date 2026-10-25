@@ -26,6 +26,8 @@ import coding_review_agent_loop.validated_agent as validated_agent
 from agent_loop_helpers import patch_object_in
 
 GIT = shutil.which("git")
+# Bound before the autouse conftest stub replaces the module attribute (#1632).
+REAL_CAPTURE_CLIENT = tp.capture_client_tool_provenance
 pytestmark = pytest.mark.skipif(GIT is None, reason="git is required")
 
 
@@ -523,3 +525,96 @@ def test_status_probe_config_gate_refusal_voids_the_commit(repo, config):
     assert len(gate_calls) == 3
     assert result["error"] == "config-gate-refused"
     assert result["commit"] is None and result["dirty"] is None
+
+
+# -------------------------------------------- run-tests client capture (#1632)
+
+
+def test_client_capture_reads_the_package_checkout_without_config(repo):
+    result = REAL_CAPTURE_CLIENT(environment={}, cwd=None)
+    assert result["commit"] == _git(repo, "rev-parse", "HEAD")
+    assert result["dirty"] is False
+    assert result["package_path"] == str(repo / "src" / "coding_review_agent_loop")
+    assert tp.CLIENT_DEADLINE_SECONDS == 3.0
+
+
+def test_client_capture_never_raises(repo):
+    def boom(*_a):
+        raise OSError("nope")
+
+    def slow(*_a):
+        raise subprocess.TimeoutExpired("git", 1)
+
+    def weird(*_a):
+        raise RuntimeError("unexpected")
+
+    assert REAL_CAPTURE_CLIENT(environment={}, executor=boom)["error"] == "git-unavailable"
+    assert REAL_CAPTURE_CLIENT(environment={}, executor=slow)["error"] == "git-timeout"
+    assert REAL_CAPTURE_CLIENT(environment={}, executor=weird)["error"].startswith("capture-failed")
+    assert REAL_CAPTURE_CLIENT(environment={}, which=lambda _n: None)["error"] == "git-unavailable"
+    expired = REAL_CAPTURE_CLIENT(environment={}, deadline_seconds=0)
+    assert expired["commit"] is None and expired["error"] == "git-timeout"
+
+
+def test_client_capture_refuses_git_inside_the_assigned_workdir(repo, tmp_path):
+    workdir = tmp_path / "assigned"
+    fake_git = workdir / "bin" / "git"
+    fake_git.parent.mkdir(parents=True)
+    fake_git.write_text("#!/bin/sh\nexit 0\n")
+    fake_git.chmod(0o755)
+    which = lambda _name: str(fake_git)  # noqa: E731
+    for kwargs in ({"environment": {"AGENT_LOOP_WORKDIR": str(workdir)}}, {"environment": {}, "cwd": workdir}):
+        result = REAL_CAPTURE_CLIENT(which=which, **kwargs)
+        assert result["error"] == "git-untrusted-location"
+        assert result["commit"] is None
+
+
+def test_orchestrator_provenance_prefers_the_process_capture(monkeypatch):
+    monkeypatch.setattr(tp, "_PROCESS_PROVENANCE", {"commit": "abc1234", "package_path": "/x"})
+    assert tp.orchestrator_tool_provenance()["commit"] == "abc1234"
+    monkeypatch.setattr(tp, "_PROCESS_PROVENANCE", None)
+    monkeypatch.setattr(tp, "_ORCHESTRATOR_FALLBACK", None)
+    calls = []
+
+    def capture(**kwargs):
+        calls.append(kwargs)
+        return {"commit": None, "package_path": "/y"}
+
+    monkeypatch.setattr(tp, "capture_client_tool_provenance", capture)
+    assert tp.orchestrator_tool_provenance()["package_path"] == "/y"
+    assert tp.orchestrator_tool_provenance()["package_path"] == "/y"
+    assert len(calls) == 1
+
+
+def test_client_capture_refuses_git_anywhere_in_the_cwd_checkout(repo, tmp_path):
+    """The refusal root is the cwd's enclosing checkout, not just the cwd subtree."""
+    checkout = tmp_path / "other-checkout"
+    (checkout / "tests").mkdir(parents=True)
+    (checkout / ".git").mkdir()
+    sibling_git = checkout / "bin" / "git"
+    sibling_git.parent.mkdir()
+    sibling_git.write_text("#!/bin/sh\nexit 0\n")
+    sibling_git.chmod(0o755)
+    calls = []
+
+    def executor(*args):
+        calls.append(args)
+        raise AssertionError("checkout-controlled git must not run")
+
+    for cwd in (checkout / "tests", checkout):
+        result = REAL_CAPTURE_CLIENT(
+            environment={}, cwd=cwd, which=lambda _name: str(sibling_git), executor=executor
+        )
+        assert result["error"] == "git-untrusted-location"
+        assert result["commit"] is None
+    # A worktree-style ``.git`` file marks the checkout boundary as well.
+    (checkout / ".git").rmdir()
+    (checkout / ".git").write_text("gitdir: /elsewhere\n")
+    result = REAL_CAPTURE_CLIENT(
+        environment={}, cwd=checkout / "tests", which=lambda _name: str(sibling_git), executor=executor
+    )
+    assert result["error"] == "git-untrusted-location"
+    assert calls == []
+    # Git outside the checkout is still used.
+    outside = REAL_CAPTURE_CLIENT(environment={}, cwd=checkout / "tests")
+    assert outside["commit"] == _git(repo, "rev-parse", "HEAD")

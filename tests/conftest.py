@@ -119,6 +119,11 @@ def _stub_tool_provenance(monkeypatch):
     import coding_review_agent_loop.tool_provenance as tp
 
     monkeypatch.setattr(tp, "_PROCESS_PROVENANCE", dict(STUB_TOOL_PROVENANCE))
+    # The run-tests client's identity stamp (#1632) uses the same stub, so a
+    # client-side capture never probes git either.
+    monkeypatch.setattr(
+        tp, "capture_client_tool_provenance", lambda **_kwargs: dict(STUB_TOOL_PROVENANCE)
+    )
 
 
 @pytest.fixture(autouse=True)

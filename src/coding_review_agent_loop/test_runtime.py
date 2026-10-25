@@ -664,15 +664,24 @@ def parse_managed_test_command(
     )
 
 
+def _pinned_launcher_prefix() -> tuple[str, ...] | None:
+    """The import-pinned running-install launcher prefix (#1632), or None."""
+    from .agent_executable import agent_loop_launcher
+
+    launcher = agent_loop_launcher()
+    if launcher is None or not os.access(launcher, os.X_OK):
+        return None
+    return (str(launcher), "run-tests")
+
+
 def resolve_wrapper_prefix() -> tuple[str, ...] | None:
-    """Return a path-stable wrapper prefix suitable for a coder prompt."""
-    entry = shutil.which("agent-loop")
-    if entry and os.path.isabs(entry) and os.access(entry, os.X_OK):
-        return (str(Path(entry).resolve()), "run-tests")
-    executable = Path(sys.executable).resolve()
-    if executable.is_file() and os.access(executable, os.X_OK):
-        return (str(executable), "-m", "coding_review_agent_loop.cli", "run-tests")
-    return None
+    """Return the running install's pinned wrapper prefix for a coder prompt.
+
+    Neither an ambient-PATH ``agent-loop`` (possibly another install) nor an
+    unpinned ``sys.executable -m`` spelling (which a coder's ``PYTHONPATH`` or
+    checkout could shadow) is ever returned (#1632).
+    """
+    return _pinned_launcher_prefix()
 
 
 def render_test_wrapper(
@@ -1483,8 +1492,14 @@ def record_test_observation(
     launch_integrity: str | None = None,
     launch_state: Mapping[str, str] | None = None,
     fixture: Mapping[str, object] | None = None,
+    tool_identity: Mapping[str, object] | None = None,
 ) -> bool:
     """Append a bounded observation; persistence failure never affects execution.
+
+    ``tool_identity`` (issue #1632) stamps a new row with the run-tests
+    client's ``tool_commit``, ``tool_dirty`` and ``tool_package_digest``.  It
+    is diagnostic only, never promotes a row, and rows without it are
+    unchanged.
 
     ``fixture`` (issue #1326) stores the fixture path and digest on the row and
     keys its timing cohort apart from fixture-less runs of the same command.
@@ -1550,6 +1565,17 @@ def record_test_observation(
                 identity = _fixture_identity(fixture)
                 assert identity is not None
                 observation["fixture"] = {"path": identity[0], "digest": identity[1]}
+            if tool_identity is not None:
+                commit = tool_identity.get("tool_commit")
+                dirty = tool_identity.get("tool_dirty")
+                digest = tool_identity.get("tool_package_digest")
+                observation["tool_commit"] = (
+                    str(commit)[:64] if isinstance(commit, str) and commit else None
+                )
+                observation["tool_dirty"] = dirty if isinstance(dirty, bool) else None
+                observation["tool_package_digest"] = (
+                    str(digest)[:64] if isinstance(digest, str) and digest else None
+                )
             if containment is not None:
                 # Evidence is already bounded by the runner.  Keep only JSON
                 # values and expose unsupported telemetry explicitly.
@@ -1737,22 +1763,16 @@ def relevant_launcher_health(
 
 
 def _wrapper_candidates(environment: Mapping[str, str] | None = None) -> list[tuple[str, ...]]:
-    values = environment if environment is not None else os.environ
-    candidates: list[tuple[str, ...]] = []
-    entry = shutil.which("agent-loop", path=values.get("PATH"))
-    if entry and os.path.isabs(entry) and os.access(entry, os.X_OK):
-        candidates.append((str(Path(entry).resolve()), "run-tests"))
-    # Execute the interpreter spelling supplied by the running process.  A
-    # virtualenv commonly exposes ``bin/python`` as a symlink; resolving it
-    # here would execute the base interpreter and lose the virtualenv's
-    # site-packages, even though the resolved/stat identity remains part of
-    # the cache key in launcher_candidate_identity().
-    executable = _lexical_absolute(Path(sys.executable))
-    if executable.is_file() and os.access(executable, os.X_OK):
-        fallback = (str(executable), "-m", "coding_review_agent_loop.cli", "run-tests")
-        if fallback not in candidates:
-            candidates.append(fallback)
-    return candidates[:MAX_WRAPPER_PROBE_CANDIDATES]
+    """The only wrapper candidate: the running install's pinned launcher (#1632).
+
+    The launcher execs the lexical ``sys.executable`` (keeping a virtualenv's
+    ``bin/python`` symlink) in isolated mode with a frozen import path, so the
+    environment cannot select another ``coding_review_agent_loop``.  When it
+    cannot be installed there is no candidate and no wrapper is granted.
+    """
+    del environment  # the pinned launcher does not depend on the caller's PATH
+    prefix = _pinned_launcher_prefix()
+    return [prefix][:MAX_WRAPPER_PROBE_CANDIDATES] if prefix is not None else []
 
 
 _WRAPPER_PREFLIGHT_CACHE: dict[tuple[str, str], LauncherProbeResult] = {}
