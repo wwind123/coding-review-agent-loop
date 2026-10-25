@@ -5,6 +5,12 @@ which scheduler phase a record was published under.  The selector here returns
 every same-round reviewer publication already public; one narrowly defined
 record class (the primary's approved review that gates a panel launch) is
 excluded because the panel is designed to read it.
+
+A trusted record that reopens the round at the same head (an admitted
+evidence conversion, #1664) may be passed as ``reopening_boundary_index``:
+publications at or before it belong to the earlier pass, which the reopened
+pass legitimately reads, so they are not same-round peers.  The index is
+always an index into the same ``records`` history that is passed in.
 """
 
 from __future__ import annotations
@@ -25,12 +31,14 @@ def same_round_public_publications(
     round_number: int,
     subject: str,
     reviewer_names: Sequence[str],
+    reopening_boundary_index: int | None = None,
 ) -> list[PostedRoundRecord]:
     """Every published same-round reviewer record after the round's latest coder record.
 
     Reads the complete extracted history: no ledger-signature filter, no
     last-record-per-reviewer dedupe, no ``scheduler_phase`` filter, and no
-    reconciliation boundary.
+    reconciliation boundary.  A ``reopening_boundary_index`` raises the lower
+    bound; the coder and reopening boundaries combine by max.
     """
     coder_boundary = max(
         (
@@ -42,6 +50,10 @@ def same_round_public_publications(
         ),
         default=-1,
     )
+    lower_bound = max(
+        coder_boundary,
+        reopening_boundary_index if reopening_boundary_index is not None else -1,
+    )
     return [
         record for record in records
         if record.metadata.flow == flow
@@ -50,7 +62,7 @@ def same_round_public_publications(
         and record.metadata.agent in reviewer_names
         and record.metadata.role not in {"summary", "coder"}
         and record.metadata.phase == "publication"
-        and record.index > coder_boundary
+        and record.index > lower_bound
     ]
 
 
@@ -65,6 +77,7 @@ def primary_gate_records(
     launch_phase: str | None,
     launching: Sequence[str],
     checkpoint_index: int | None,
+    reopening_boundary_index: int | None = None,
 ) -> list[PostedRoundRecord]:
     """The primary's approved review that gates the current panel launch.
 
@@ -86,6 +99,7 @@ def primary_gate_records(
         for record in same_round_public_publications(
             records, flow=flow, round_number=round_number, subject=subject,
             reviewer_names=(primary_reviewer,),
+            reopening_boundary_index=reopening_boundary_index,
         )
         if record.metadata.state == "approved" and record.index < checkpoint_index
     ]
@@ -118,11 +132,13 @@ def visible_peer_names(
     launch_phase: str | None,
     launching: Sequence[str],
     checkpoint_index: int | None,
+    reopening_boundary_index: int | None = None,
 ) -> set[str]:
     """Reviewers with a same-round public publication, minus the gating record."""
     publications = same_round_public_publications(
         records, flow=flow, round_number=round_number, subject=subject,
         reviewer_names=reviewer_names,
+        reopening_boundary_index=reopening_boundary_index,
     )
     gates = {
         record.index for record in primary_gate_records(
@@ -130,6 +146,7 @@ def visible_peer_names(
             round_number=round_number, subject=subject,
             primary_reviewer=primary_reviewer, launch_phase=launch_phase,
             launching=launching, checkpoint_index=checkpoint_index,
+            reopening_boundary_index=reopening_boundary_index,
         )
     }
     return {

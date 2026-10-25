@@ -4778,7 +4778,15 @@ advance), every reviewer is invoked fresh with the converted obligation in its p
 an approval recorded before the conversion is never carried, and no signed-input
 response semantics apply. A restart between the conversion record and the repeated
 reviews resumes the repeat; a reviewer that already reviewed after the conversion is
-resumed normally. A review that raises nothing new is evidence-only and approving, so
+resumed normally. The conversion record is a same-round visibility boundary (#1664):
+reviews posted before it belong to the pre-conversion pass, so they never make the
+repeat a partially published round, are never resumed as repeat reviews, and are never
+listed for deletion. A reviewer whose withheld pre-conversion outcome is still spooled
+is invoked fresh, because staging the repeat discards that spool. Within the repeat the
+partial-publish guard is unchanged: once one repeat-pass review is public, a reviewer
+that still needs a fresh turn is refused, and the recovery listing names only records
+posted after the conversion. A conversion record not authored by the authenticated
+orchestrator account, or whose audit is rejected, sets no boundary. A review that raises nothing new is evidence-only and approving, so
 the run reaches the final freeze; a new code finding dispatches the coder instead.
 Converted rows leave the stall window's unsatisfied set and never re-mint.
 
@@ -4801,7 +4809,12 @@ nothing is posted for an invalid list. On the ordinary `agent-loop pr N` path it
 right after the PR-bound approved plan is recovered read-only from the linked issue's
 handoff. The conversion is persisted in the same audit record
 (`source: operator`), and every reviewer then reviews fresh. The flag is one-shot:
-rendered rerun commands never replay it.
+rendered rerun commands never replay it. A run interrupted after the operator
+conversion record but before the repeat finished resumes as the same full-board
+repeat without the flag: the admitted operator record names its round, so the board
+is not narrowed and no approval from before the conversion is carried (#1664). As with
+an automatic conversion, reviews posted in the round before the conversion record are
+not same-round peers of the repeat.
 
 **Authority.** Conversion audits, signed-evidence references, capture classifications
 and `bound_attempt_round` are admitted only from comments authored by the authenticated

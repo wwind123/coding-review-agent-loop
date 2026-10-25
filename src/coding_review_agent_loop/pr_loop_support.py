@@ -61,6 +61,7 @@ from .github import (
     merge_pr_comment_transport_identity,
     post_pr_comment,
     resolve_authenticated_github_actor,
+    strip_bot_login_suffix,
 )
 from .issue_pr_handoff import find_latest_issue_pr_handoff
 from .logging import log
@@ -2721,12 +2722,20 @@ def _visibility_snapshot(
     base_records: Sequence[PostedRoundRecord],
     base_length: int,
     checkpoint: PostedRoundMetadata | None,
+    own_conversion: PostedRoundMetadata | None = None,
 ) -> tuple[tuple[PostedRoundRecord, ...], bool]:
     """History as visible once this invocation's own scheduler checkpoint is posted (#1156).
 
     Prefers the refreshed history when it holds the checkpoint; otherwise the
     pre-post history plus a synthetic record for it, never the stale evidence
     alone.  Returns the records and whether the checkpoint is present.
+
+    ``own_conversion`` is a conversion record this invocation itself posted
+    and the base history lacks (#1664).  When the refreshed history is
+    unreadable it is added as a synthetic record before the checkpoint, so
+    the fallback keeps the conversion's visibility boundary.  Only a record
+    this process wrote may be passed; nothing read from history is ever
+    synthesized.
     """
     if checkpoint is None:
         return tuple(base_records), False
@@ -2748,10 +2757,13 @@ def _visibility_snapshot(
     # The refreshed history (when readable) keeps every publication it
     # exposed; only the checkpoint this invocation just posted is added.
     top = max((record.index for record in history), default=-1)
-    synthetic = PostedRoundRecord(
-        index=max(base_length, base_top + 1, top + 1), metadata=checkpoint, body=""
-    )
-    return (*history, synthetic), True
+    next_index = max(base_length, base_top + 1, top + 1)
+    added: list[PostedRoundRecord] = []
+    if own_conversion is not None and fresh_records is None:
+        added.append(PostedRoundRecord(index=next_index, metadata=own_conversion, body=""))
+        next_index += 1
+    added.append(PostedRoundRecord(index=next_index, metadata=checkpoint, body=""))
+    return (*history, *added), True
 
 
 def _latest_pr_reviewer_records(
@@ -5005,14 +5017,32 @@ def freeze_signed_baseline(
     return None
 
 
+def _conversion_repeat_round_number(metadata: PostedRoundMetadata) -> int | None:
+    """The round an admitted conversion record reopens, if it names one.
+
+    An auto conversion persists ``conversion_review_round``.  An operator
+    conversion deliberately leaves it unset; its admitted audit and its own
+    ``round_number`` identify the repeat instead (#1664), so the persisted
+    encoding is unchanged.
+    """
+    if metadata.conversion_review_round is not None:
+        return metadata.conversion_review_round
+    audit = metadata.evidence_conversion
+    if audit is not None and audit.source == "operator":
+        return metadata.round_number
+    return None
+
+
 def conversion_repeat_round(
     records: Sequence[PostedRoundRecord], *, round_number: int, head_sha: str | None
 ) -> bool:
     """Whether a resumed round is an unfinished conversion repeat (#1325).
 
     True when the latest admitted conversion record names this round as its
-    ``conversion_review_round`` at the live head and no later admitted freeze,
-    release, or coder record exists at that head.
+    repeat round (``conversion_review_round`` for an auto conversion, the
+    record's round for an admitted operator conversion, #1664) at the live
+    head and no later admitted freeze, release, or coder record exists at
+    that head.
     """
     if not head_sha:
         return False
@@ -5021,13 +5051,13 @@ def conversion_repeat_round(
             record
             for record in reversed(records)
             if record.metadata.phase == EVIDENCE_CONVERSION_PHASE
-            and record.metadata.conversion_review_round is not None
+            and _conversion_repeat_round_number(record.metadata) is not None
         ),
         None,
     )
     if (
         conversion is None
-        or conversion.metadata.conversion_review_round != round_number
+        or _conversion_repeat_round_number(conversion.metadata) != round_number
         or conversion.metadata.subject != head_sha
     ):
         return False
@@ -5048,6 +5078,99 @@ def latest_conversion_index(records: Sequence[PostedRoundRecord], *, head_sha: s
         if record.metadata.phase == EVIDENCE_CONVERSION_PHASE and record.metadata.subject == head_sha:
             return record.index
     return -1
+
+
+@dataclass(frozen=True)
+class ConversionVisibilityBoundary:
+    """A trusted conversion record bounding same-round peer visibility (#1664).
+
+    ``index`` is valid only in the comment history it was resolved from;
+    ``key`` (author, creation time, body) locates the same comment in another
+    history, which must resolve its own index.
+    """
+
+    index: int
+    key: tuple[str | None, str | None, str | None]
+
+
+def conversion_boundary_record(
+    records: Sequence[PostedRoundRecord], *, round_number: int, head_sha: str | None
+) -> PostedRoundRecord | None:
+    """The newest admitted conversion record of ``round_number`` at ``head_sha``.
+
+    ``records`` must already be admitted: a foreign-authored or audit-rejected
+    conversion has lost its audit and never qualifies.
+    """
+    if not head_sha:
+        return None
+    return next(
+        (
+            record
+            for record in reversed(records)
+            if record.metadata.flow == "pr"
+            and record.metadata.role == "summary"
+            and record.metadata.phase == EVIDENCE_CONVERSION_PHASE
+            and record.metadata.round_number == round_number
+            and record.metadata.subject == head_sha
+            and record.metadata.evidence_conversion is not None
+        ),
+        None,
+    )
+
+
+def comment_identity_key(comment: object) -> tuple[str | None, str | None, str | None]:
+    """Stable identity of a comment across GraphQL and REST histories."""
+    author = getattr(comment, "author", None)
+    return (
+        strip_bot_login_suffix(author) if author is not None else None,
+        getattr(comment, "created_at", None),
+        getattr(comment, "body", None),
+    )
+
+
+def conversion_visibility_boundary(
+    runner: Runner,
+    config: AgentLoopConfig,
+    *,
+    pr_number: int,
+    comments: Sequence[object],
+    round_number: int,
+    head_sha: str | None,
+) -> ConversionVisibilityBoundary | None:
+    """Resolve the trusted conversion boundary in exactly this comment history (#1664).
+
+    Publications at or before the boundary belong to the pre-conversion pass,
+    which the conversion repeat reads through the converted ledger, so they
+    are not same-round peers.  Admission runs over ``comments`` itself; an
+    undecodable history, a failed or incomplete identity read, or a
+    foreign-authored or audit-rejected record yields ``None`` and the guard
+    keeps its ordinary refusal.
+    """
+    comments = tuple(comments)
+    try:
+        raw = _extract_round_metadata_records(comments, flow="pr")
+    except AgentLoopError:
+        return None
+    if not any(
+        record.metadata.phase == EVIDENCE_CONVERSION_PHASE
+        and record.metadata.round_number == round_number
+        and record.metadata.subject == head_sha
+        for record in raw
+    ):
+        # No candidate: nothing to admit, so no identity read is made.
+        return None
+    try:
+        records, _complete = admitted_pr_records_status(
+            runner, config, pr_number=pr_number, comments=comments
+        )
+    except AgentLoopError:
+        return None
+    record = conversion_boundary_record(records, round_number=round_number, head_sha=head_sha)
+    if record is None or not 0 <= record.index < len(comments):
+        return None
+    return ConversionVisibilityBoundary(
+        index=record.index, key=comment_identity_key(comments[record.index])
+    )
 
 
 def round_evidence_authority_records(

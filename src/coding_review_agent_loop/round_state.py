@@ -6018,6 +6018,38 @@ def _resume_pr_round(
         )
 
 
+def _conversion_handoff_resume(
+    conversion_record: PostedRoundRecord,
+    *,
+    current_head_records: Sequence[PostedRoundRecord],
+    walk_records: Sequence[PostedRoundRecord],
+) -> ResumedReviewRound:
+    """Resume at a conversion record before any repeat-pass review (#1325)."""
+    conversion = conversion_record.metadata
+    latest_coder = next(
+        (record for record in reversed(current_head_records) if record.metadata.role == "coder"),
+        None,
+    )
+    return ResumedReviewRound(
+        round_number=conversion.round_number,
+        prior_items=tuple(conversion.prior_items),
+        coder_output=(
+            latest_coder.metadata.raw_structured_coder_response or latest_coder.body
+            if latest_coder is not None
+            else None
+        ),
+        coder_metadata=latest_coder.metadata if latest_coder is not None else None,
+        coder_comment_body=latest_coder.body if latest_coder is not None else None,
+        completed_reviews=(),
+        next_unresolved_item_number=_max_unresolved_item_number_from_records(
+            list(walk_records)
+        )
+        + 1,
+        reconciled=True,
+        qualification_checkpoint=None,
+    )
+
+
 def _resume_pr_round_from_records(
     comments: Sequence[object],
     *,
@@ -6060,28 +6092,10 @@ def _resume_pr_round_from_records(
         # The conversion record (#1325) was posted before the same-head repeat
         # started any reviewer: it is the handoff boundary carrying the
         # post-conversion ledger and round.  Its repeat re-runs every reviewer.
-        conversion = current_head_records[-1].metadata
-        latest_coder = next(
-            (record for record in reversed(current_head_records) if record.metadata.role == "coder"),
-            None,
-        )
-        return ResumedReviewRound(
-            round_number=conversion.round_number,
-            prior_items=tuple(conversion.prior_items),
-            coder_output=(
-                latest_coder.metadata.raw_structured_coder_response or latest_coder.body
-                if latest_coder is not None
-                else None
-            ),
-            coder_metadata=latest_coder.metadata if latest_coder is not None else None,
-            coder_comment_body=latest_coder.body if latest_coder is not None else None,
-            completed_reviews=(),
-            next_unresolved_item_number=_max_unresolved_item_number_from_records(
-                list(walk_records)
-            )
-            + 1,
-            reconciled=True,
-            qualification_checkpoint=None,
+        return _conversion_handoff_resume(
+            current_head_records[-1],
+            current_head_records=current_head_records,
+            walk_records=walk_records,
         )
     selection = _select_current_round_records(records, subject=head_sha)
     if selection is None:
@@ -6139,6 +6153,23 @@ def _resume_pr_round_from_records(
         ),
         None,
     )
+    # An admitted conversion record (#1325) reopens this round at the same head.
+    # Reviews and the reconciliation before it belong to the pre-conversion
+    # pass: they never saw the converted ledger, so the repeat resumes only its
+    # own records (#1664).  The round's coder record is kept.
+    conversion_boundary = next(
+        (
+            record
+            for record in reversed(records)
+            if record.metadata.subject == head_sha
+            and record.metadata.phase == EVIDENCE_CONVERSION_PHASE
+            and record.metadata.round_number == anchor_metadata.round_number
+            and record.metadata.evidence_conversion is not None
+            and record.index > superseded_below
+        ),
+        None,
+    )
+    reopened_below = conversion_boundary.index if conversion_boundary is not None else -1
     reviewer_records: dict[str, PostedRoundRecord] = {}
     reconciliation_record: PostedRoundRecord | None = None
     configured_reviewer_names = {agent_display_name(agent) for agent in configured_reviewers}
@@ -6149,13 +6180,22 @@ def _resume_pr_round_from_records(
             and metadata.phase == "reconciliation"
             and metadata.round_number == anchor_metadata.round_number
             and metadata.subject == head_sha
+            and record.index > reopened_below
         ):
             reconciliation_record = record
     for record in current_round_records:
         metadata = record.metadata
         if metadata.role != "reviewer" or metadata.agent not in configured_reviewer_names:
             continue
+        if record.index <= reopened_below:
+            continue
         reviewer_records[metadata.agent] = record
+    if conversion_boundary is not None and latest_coder_record is None and not reviewer_records:
+        return _conversion_handoff_resume(
+            conversion_boundary,
+            current_head_records=[r for r in records if r.metadata.subject == head_sha],
+            walk_records=walk_records,
+        )
     if latest_coder_record is None and not reviewer_records:
         if checkpoint_record is None:
             return None
@@ -6206,8 +6246,9 @@ def _resume_pr_round_from_records(
             tuple(
                 record
                 for record in current_round_records
-                if record.index >= superseded_below
+                if record.index >= max(superseded_below, reopened_below)
             )
+            + ((conversion_boundary,) if conversion_boundary is not None else ())
         ),
         local_test_evidence=(
             latest_coder_record.metadata.local_test_evidence
