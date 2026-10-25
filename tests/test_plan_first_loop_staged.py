@@ -7,6 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
+# A private response root per test: the shared $TMPDIR one races across
+# xdist workers (#1653 CI).
+pytestmark = pytest.mark.usefixtures("private_response_tempdir")
+
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 import coding_review_agent_loop.phase_progress as phase_progress_module
 from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
@@ -985,19 +989,20 @@ def _non_agent_command_count(runner):
 def test_history_adds_no_github_reads_under_either_planning_policy(tmp_path, monkeypatch):
     from coding_review_agent_loop.finding_history import FindingHistoryLedger
 
-    def counts():
-        compat = _m1273_run_all_reviewers(tmp_path / "c", declare=False, rounds=3)
+    def counts(label):
+        # Fresh directories per call: the second pass must not see the first's state.
+        compat = _m1273_run_all_reviewers(tmp_path / label / "c", declare=False, rounds=3)
         staged, _error = _m1251_run(
-            tmp_path / "s", last_round=3, max_rounds=3, plan_step_back_rounds=0,
+            tmp_path / label / "s", last_round=3, max_rounds=3, plan_step_back_rounds=0,
             plan_step_back_escalation_rounds=1,
         )
         return _non_agent_command_count(compat), _non_agent_command_count(staged)
 
-    with_history = counts()
+    with_history = counts("with-history")
     monkeypatch.setattr(FindingHistoryLedger, "observe_reconciled", lambda *a, **k: None)
     monkeypatch.setattr(FindingHistoryLedger, "record_fix", lambda *a, **k: None)
     monkeypatch.setattr(FindingHistoryLedger, "seed_from_records", lambda *a, **k: None)
-    assert counts() == with_history
+    assert counts("without-history") == with_history
 
 
 def _m1273_patch(n, base, summary, dispositions):
