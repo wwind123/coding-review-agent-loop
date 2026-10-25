@@ -7129,3 +7129,51 @@ def test_plan_review_prompt_flags_a_missing_or_weak_smallest_alternative(
     assert prompts_module.render_smallest_alternative_review_guidance() in prompt
     assert _SMALLEST_ALT_REVIEWER_LINE in prompt
     assert "raise that as a blocking finding" in prompt
+
+
+# --- citable-runner guidance (#1659) -----------------------------------------
+
+
+@pytest.mark.parametrize("builder", ["issue", "pr-followup"])
+def test_coder_prompts_carry_the_shared_citable_runner_sentence_1659(tmp_path, builder):
+    """`prompt-citable-runner-sentence`: both citing coder prompts name the runners."""
+    from coding_review_agent_loop.prompts import CITABLE_RECEIPT_GUIDANCE
+    from coding_review_agent_loop.test_runtime import CITABLE_TEST_RUNNERS_SUMMARY
+
+    prompt = _SET_BUILDERS[builder](make_config(tmp_path))
+    assert CITABLE_RECEIPT_GUIDANCE in prompt
+    assert CITABLE_TEST_RUNNERS_SUMMARY in CITABLE_RECEIPT_GUIDANCE
+    assert "in `tests_run`, but do not cite" in CITABLE_RECEIPT_GUIDANCE
+    assert "wrap it in a pytest test" in CITABLE_RECEIPT_GUIDANCE
+    # One shared list, never a second divergent copy.
+    assert prompt.count(CITABLE_TEST_RUNNERS_SUMMARY) == 1
+
+
+def test_citable_runner_summary_names_every_recognized_launcher_family_1659(tmp_path):
+    """The summary cannot silently drift from the inner-launcher recognizer."""
+    import inspect
+    import re
+    import sys
+
+    from coding_review_agent_loop import test_runtime
+    from coding_review_agent_loop.test_runtime import (
+        CITABLE_TEST_RUNNERS_SUMMARY,
+        _PACKAGE_MANAGERS,
+        recognized_inner_probe,
+    )
+
+    source = inspect.getsource(test_runtime._recognized_inner_probe_tokens)
+    heads: set[str] = set()
+    for group in re.findall(r"first in \{([^}]*)\}", source):
+        heads.update(re.findall(r'"([^"]+)"', group))
+    heads.update(re.findall(r'first == "([^"]+)"', source))
+    assert heads >= {"pytest", "py.test", "node", "nodejs", "playwright"}
+    for head in heads | set(_PACKAGE_MANAGERS):
+        assert f"`{head}" in CITABLE_TEST_RUNNERS_SUMMARY, head
+    assert "`<python> -m pytest`" in CITABLE_TEST_RUNNERS_SUMMARY
+    assert "-m\" and tokens[2] == \"pytest\"" in source
+    assert "npx playwright test" in CITABLE_TEST_RUNNERS_SUMMARY
+    # The named python form really is recognized; a plain script is not.
+    environment = {"PATH": ""}
+    assert recognized_inner_probe([sys.executable, "-m", "pytest"], cwd=tmp_path, environment=environment)
+    assert recognized_inner_probe([sys.executable, "scripts/x.py"], cwd=tmp_path, environment=environment) is None

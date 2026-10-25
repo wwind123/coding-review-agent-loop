@@ -147,7 +147,7 @@ def test_quota_on_evidence_reask_replays_the_reask_prompt_and_session(tmp_path, 
         _claude_limit(),
         AgentResult(text=_implementation_with_claim(), returncode=0),
     ]
-    catalogs = [[_observation(suite_start="unknown")], [_observation()], [_observation()]]
+    catalogs = [[_observation(suite_start="not-started")], [_observation()], [_observation()]]
     config = make_config(tmp_path, agent_max_retries=0, wait_for_quota_reset_seconds=SIX_HOURS)
     with patch_object_in(
         (validated_agent, response_validation), "run_agent_result", side_effect=results

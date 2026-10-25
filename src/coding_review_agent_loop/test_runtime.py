@@ -3185,6 +3185,18 @@ def _recognized_inner_probe_tokens(
     return None
 
 
+# Issue #1659: the one plain-text list of launchers whose receipts can be
+# cited, shared by the run-tests notice, the coder prompts and the post-auth
+# diagnostic.  It names exactly the families ``_recognized_inner_probe_tokens``
+# and package-script resolution accept; a test pins that they stay in step.
+CITABLE_TEST_RUNNERS_SUMMARY = (
+    "`pytest` or `py.test`, `<python> -m pytest`, `node --test <file>` (or `nodejs`, "
+    "with an empty NODE_OPTIONS), `playwright test` (including the local "
+    "`npx playwright test`), and `npm`/`pnpm`/`yarn run <script>` whose package.json "
+    "body is a single such command with no pre/post scripts"
+)
+
+
 PROBE_DEADLINE_DIAGNOSTIC = "inner probe truncated at the request deadline"
 # ``_terminate_probe_tree`` waits up to 2 × 0.5 s after the watchdog; with an
 # absolute deadline (#1326) that cleanup must also end by the deadline.

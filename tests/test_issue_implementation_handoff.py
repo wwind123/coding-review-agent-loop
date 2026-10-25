@@ -738,7 +738,7 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
         execution_ref="turn-1:observation-1", receipt_id="receipt-1", head="abc123"
     )
     unverified.turn_id = "turn-1"
-    unverified.suite_start = "unknown"
+    unverified.suite_start = "not-started"
     fresh = _workflow_observation(
         execution_ref="turn-2:observation-1", receipt_id="receipt-2", head="abc123"
     )
