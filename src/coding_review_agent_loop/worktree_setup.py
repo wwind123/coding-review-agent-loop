@@ -413,9 +413,8 @@ def run_setup_command(store: Path, command: str, *, timeout_seconds: float) -> N
         except BaseException:
             _kill_group(process)
             raise
-        # Reap anything the command left in its process group.
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.killpg(process.pid, signal.SIGKILL)
+        # The leader is already reaped, so its process group ID may be reused:
+        # never signal it after a normal exit.
         if returncode != 0:
             raise AgentLoopError(
                 f"--worktree-setup exited {returncode} in the shared clone {store}; "

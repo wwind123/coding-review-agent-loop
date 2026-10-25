@@ -833,3 +833,20 @@ def test_large_failure_output_is_tail_bounded(tmp_path, monkeypatch, mode):
     assert ("exited 4" in message) if mode == "nonzero" else ("timed out" in message)
     assert seen and max(seen) <= 2 * worktree_setup.OUTPUT_TAIL_BYTES
     assert len(message) < 4 * worktree_setup.OUTPUT_TAIL_BYTES
+
+
+@pytest.mark.parametrize("command, signalled", [("true", False), ("exit 5", False), ("sleep 30", True)])
+def test_process_group_is_signalled_only_before_the_leader_is_reaped(tmp_path, monkeypatch, command, signalled):
+    calls: list[int] = []
+    real_killpg = os.killpg
+
+    def recording_killpg(pgid, sig):
+        calls.append(pgid)
+        return real_killpg(pgid, sig)
+
+    monkeypatch.setattr(worktree_setup.os, "killpg", recording_killpg)
+    try:
+        worktree_setup.run_setup_command(tmp_path, command, timeout_seconds=1)
+    except AgentLoopError:
+        pass
+    assert bool(calls) is signalled
