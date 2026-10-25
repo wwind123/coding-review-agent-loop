@@ -42,6 +42,7 @@ from .runner import Runner
 from .scratch import make_private_dirs, scratch_root
 from .test_runtime import DEFAULT_TEST_TIMEOUT_SECONDS
 from .workdirs import active_workdir, agent_workdir
+from .worktree_setup import DEFAULT_WORKTREE_SETUP_TIMEOUT_SECONDS
 from .plan_review_scheduling import PLAN_REVIEW_POLICIES
 from .review_step_back import DEFAULT_PROVENANCE_BASELINE_MAX_CHARS
 from .review_scheduling import (
@@ -356,6 +357,7 @@ class AgentLoopConfig:
     worktree_setup_keys: tuple[str, ...] = ()
     # Operator-only PR-local dependency environments (#1652).
     worktree_setup_pr_local: bool = False
+    worktree_setup_timeout_seconds: int = DEFAULT_WORKTREE_SETUP_TIMEOUT_SECONDS
     trusted_local_origin: Path | None = None
     trusted_origin_protocol: str = "https"
     # Explicit operator SSH identity for trusted transport (#1380), and every
@@ -719,6 +721,9 @@ class AgentLoopConfig:
                 "--coder-test-command-timeout-seconds must be a positive finite integer."
             )
         object.__setattr__(self, "coder_test_command_timeout_seconds", int(timeout))
+        setup_timeout = self.worktree_setup_timeout_seconds
+        if isinstance(setup_timeout, bool) or not isinstance(setup_timeout, int) or setup_timeout <= 0:
+            raise AgentLoopError("--worktree-setup-timeout must be a positive integer.")
         if self.test_python is not None:
             object.__setattr__(self, "test_python", validate_test_python(self.test_python))
         if self.repair_backend not in {"antigravity", "gemini", "codex", "claude"}:
@@ -1413,6 +1418,24 @@ def normalize_worktree_link(value: str, *, option: str = "--worktree-link") -> s
         if part in (".", "..", ".git"):
             raise AgentLoopError(bad + f"component {part!r} is not allowed.")
     return text
+
+
+def _parse_worktree_setup_timeout(value: object) -> int | None:
+    """``--worktree-setup-timeout`` as a positive integer, or None when not given."""
+    if value is None:
+        return None
+    message = "--worktree-setup-timeout must be a positive integer."
+    if isinstance(value, bool):
+        raise AgentLoopError(message)
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+        parsed = int(value.strip())
+    else:
+        raise AgentLoopError(message)
+    if parsed <= 0:
+        raise AgentLoopError(message)
+    return parsed
 
 
 def normalize_worktree_setup_key(value: str) -> str:
@@ -2425,6 +2448,11 @@ def config_from_args(
     )
     if worktree_setup_keys and worktree_setup is None:
         raise AgentLoopError("--worktree-setup-key requires --worktree-setup.")
+    worktree_setup_timeout_seconds = _parse_worktree_setup_timeout(
+        getattr(args, "worktree_setup_timeout", None)
+    )
+    if worktree_setup_timeout_seconds is not None and worktree_setup is None:
+        raise AgentLoopError("--worktree-setup-timeout requires --worktree-setup.")
     worktree_setup_pr_local = bool(getattr(args, "worktree_setup_pr_local", False))
     if worktree_setup_pr_local and (worktree_setup is None or not worktree_setup_keys or not worktree_links):
         raise AgentLoopError(
@@ -2462,6 +2490,7 @@ def config_from_args(
         print(log_message, file=sys.stderr)
         worktree_setup = None
         worktree_setup_keys = ()
+        worktree_setup_timeout_seconds = None
     if worktree_setup_pr_local and not (active_roles & set(store_by_agent)):
         log_message = "--worktree-setup-pr-local is ignored: no active agent uses a default per-run worktree."
         print(log_message, file=sys.stderr)
@@ -2795,6 +2824,11 @@ def config_from_args(
         worktree_setup=worktree_setup,
         worktree_setup_keys=worktree_setup_keys,
         worktree_setup_pr_local=worktree_setup_pr_local,
+        worktree_setup_timeout_seconds=(
+            DEFAULT_WORKTREE_SETUP_TIMEOUT_SECONDS
+            if worktree_setup_timeout_seconds is None
+            else worktree_setup_timeout_seconds
+        ),
         containment_mode=getattr(args, "containment_mode", "auto"),
         containment_memory_high=getattr(args, "containment_memory_high", None),
         containment_memory_max=getattr(args, "containment_memory_max", None),

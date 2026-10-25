@@ -34,8 +34,9 @@ from typing import Any
 from . import checkout_verification as cv
 from .errors import AgentLoopError, CheckoutVerificationError
 from .logging import log
+from .worktree_setup import SETUP_CREATED_HINT
 
-_DEFAULT_SETUP_TIMEOUT_SECONDS = 1800
+_SHADOW_SUFFIX = " (untracked or ignored, absent at HEAD)"
 
 # Lexical worktree path -> note for the next coder prompt after a rebuild.
 _REBUILD_NOTES: dict[Path, str] = {}
@@ -152,7 +153,7 @@ def _uncommitted_inputs(alias: Path, entries: dict, *, runner: Any) -> list[str]
 
     dirty = store_tracked_tree_dirty_paths(alias)
     shadows = [
-        f"{key} (untracked or ignored, absent at HEAD)"
+        f"{key}{_SHADOW_SUFFIX}"
         for key in _untracked_absent_keys(alias, entries, runner=runner, tracked_at_head=False)
     ]
     return sorted(dirty) + shadows
@@ -192,7 +193,7 @@ def reconcile_pr_local_environment(config: Any, runner: Any, path: Path) -> Priv
     alias = _validated_root(path, registration)
     command = config.worktree_setup
     keys = tuple(config.worktree_setup_keys)
-    from .worktree_setup import run_setup_command, setup_digest
+    from .worktree_setup import run_setup_command, setup_digest, setup_timeout_seconds
 
     head = _head(runner, alias)
     digest, entries = setup_digest(alias, head, command=command, keys=keys, runner=runner)
@@ -208,19 +209,24 @@ def reconcile_pr_local_environment(config: Any, runner: Any, path: Path) -> Priv
     offending = _uncommitted_inputs(alias, entries, runner=runner)
     if offending:
         if cv.set_environment_deferred(path, tuple(offending)):
+            hint = ""
+            if any(entry.endswith(_SHADOW_SUFFIX) for entry in offending):
+                hint = (
+                    f" {SETUP_CREATED_HINT}; after confirming, remove the untracked key file from "
+                    "the worktree or commit it."
+                )
             log(
                 config,
                 f"PR-local dependency environment: deferred the rebuild in {path} because tracked "
-                f"paths are uncommitted or hidden: {', '.join(offending[:8])}; nothing was removed.",
+                f"paths are uncommitted or hidden: {', '.join(offending[:8])}; nothing was removed."
+                f"{hint}",
             )
         return None
     names = sorted(set(registration.links) | set(registration.private))
     _refuse_tracked(config, runner, alias, names)
     alias = _validated_root(path, registration)
     _remove_entries(alias, registration.identity, names, Path(path))
-    timeout = int(
-        getattr(config, "coder_test_command_timeout_seconds", 0) or _DEFAULT_SETUP_TIMEOUT_SECONDS
-    )
+    timeout = setup_timeout_seconds(config)
     display = ", ".join(os.fsdecode(name) for name in names)
     log(config, f"Running --worktree-setup in the run worktree {path} at {head} for {display}")
     run_setup_command(

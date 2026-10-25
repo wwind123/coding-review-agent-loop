@@ -13,6 +13,15 @@ any setup attempt and whenever agent-loop (re-)creates the store, and is
 written only after a zero exit.  A required setup refuses any tracked
 modification in the store, including initialized submodules, before it
 touches the record.
+
+A separate private generated-key ledger (``setup-generated.json``, #1649)
+records the SHA-256 of each ``--worktree-setup-key`` file that is absent at the
+pinned SHA but exists after a successful setup (for example the
+``package-lock.json`` that ``npm install`` writes when the repository tracks
+none).  Such a file is exempt from the untracked-shadow refusal on later
+setups only while its bytes still match.  The ledger survives pre-setup record
+invalidation and failed setups, and is deleted when agent-loop (re-)creates the
+store.
 """
 
 from __future__ import annotations
@@ -22,6 +31,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import stat
@@ -29,19 +39,28 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .errors import AgentLoopError
 from .logging import log
 
 SETUP_RECORD_NAME = "setup.json"
 SETUP_RECORD_VERSION = 1
+GENERATED_LEDGER_NAME = "setup-generated.json"
+GENERATED_LEDGER_VERSION = 1
+DEFAULT_WORKTREE_SETUP_TIMEOUT_SECONDS = 3600
 _SETUP_RECORD_MAX_BYTES = 65536
 OUTPUT_TAIL_LINES = 40
 OUTPUT_TAIL_BYTES = 4096
 DIRTY_PATH_LIMIT = 10
 _PROBE_TIMEOUT_SECONDS = 300.0
-_DEFAULT_SETUP_TIMEOUT_SECONDS = 1800
+_HASH_CHUNK_BYTES = 1 << 20
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+SETUP_CREATED_HINT = (
+    "This file may have been created by the --worktree-setup command itself (for example, "
+    "npm install writes package-lock.json when the repository tracks none)"
+)
 
 MANIFEST_NAMES = frozenset({
     "pyproject.toml", "setup.py", "Pipfile.lock", "poetry.lock", "uv.lock",
@@ -66,10 +85,9 @@ def command_hash(command: str) -> str:
     return hashlib.sha256(command.encode("utf-8")).hexdigest()
 
 
-def read_setup_record(store: Path) -> dict | None:
-    """The stored record, or None for anything missing, unreadable or malformed."""
+def _read_private_json(path: Path) -> dict | None:
+    """A private operator-owned JSON object, or None for anything missing, unreadable or malformed."""
     try:
-        path = setup_record_path(store)
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         descriptor = os.open(path, flags)
         try:
@@ -87,7 +105,17 @@ def read_setup_record(store: Path) -> dict | None:
         data = json.loads(raw.decode("utf-8"))
     except Exception:
         return None
-    if not isinstance(data, dict) or data.get("version") != SETUP_RECORD_VERSION:
+    return data if isinstance(data, dict) else None
+
+
+def read_setup_record(store: Path) -> dict | None:
+    """The stored record, or None for anything missing, unreadable or malformed."""
+    try:
+        path = setup_record_path(store)
+    except OSError:
+        return None
+    data = _read_private_json(path)
+    if data is None or data.get("version") != SETUP_RECORD_VERSION:
         return None
     return data
 
@@ -100,14 +128,22 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _unlink_private(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
 def invalidate_setup_record(store: Path) -> None:
-    """Delete the record (a missing one is fine); fail closed when that is impossible."""
+    """Delete the record (a missing one is fine); fail closed when that is impossible.
+
+    The generated-key ledger is kept: it describes files on disk, not the
+    success of a setup, so a failed retry still exempts unchanged files.
+    """
     try:
         path = setup_record_path(store)
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
+        _unlink_private(path)
         _fsync_directory(path.parent)
     except OSError as exc:
         raise AgentLoopError(
@@ -116,8 +152,21 @@ def invalidate_setup_record(store: Path) -> None:
         ) from exc
 
 
-def _write_setup_record(store: Path, data: dict) -> None:
-    path = setup_record_path(store)
+def invalidate_store_setup_state(store: Path) -> None:
+    """Delete the record and the generated-key ledger before the store is (re-)created."""
+    try:
+        path = setup_record_path(store)
+        _unlink_private(path)
+        _unlink_private(generated_ledger_path(store))
+        _fsync_directory(path.parent)
+    except OSError as exc:
+        raise AgentLoopError(
+            f"Could not invalidate the --worktree-setup state for the shared clone {store}: {exc}. "
+            "Refusing to continue."
+        ) from exc
+
+
+def _write_private_json(path: Path, data: dict) -> None:
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     descriptor = os.open(temporary, flags, 0o600)
@@ -132,6 +181,10 @@ def _write_setup_record(store: Path, data: dict) -> None:
             temporary.unlink()
         raise
     _fsync_directory(path.parent)
+
+
+def _write_setup_record(store: Path, data: dict) -> None:
+    _write_private_json(setup_record_path(store), data)
 
 
 def _store_identity(store: Path) -> list[int] | None:
@@ -149,6 +202,97 @@ def record_matches(record: dict | None, *, store: Path, digest: str, command: st
         # and the missing-link-source rule are the primary invalidations.
         and record.get("store_identity") == _store_identity(store)
     )
+
+
+# --- generated-key ledger (#1649) -------------------------------------------
+
+
+def generated_ledger_path(store: Path) -> Path:
+    from .run_worktrees import _records_dir
+
+    return _records_dir(store) / GENERATED_LEDGER_NAME
+
+
+def read_generated_ledger(store: Path, keys: tuple[str, ...] | list[str]) -> dict[str, str]:
+    """Validated ``{key: sha256}`` of setup-created absent keys; empty for anything untrusted."""
+    try:
+        data = _read_private_json(generated_ledger_path(store))
+    except OSError:
+        return {}
+    if data is None or data.get("version") != GENERATED_LEDGER_VERSION:
+        return {}
+    if data.get("store_identity") != _store_identity(store):
+        return {}
+    generated = data.get("generated_keys")
+    if not isinstance(generated, dict):
+        return {}
+    allowed = set(keys)
+    for key, value in generated.items():
+        if key not in allowed or not isinstance(value, str) or not _SHA256_HEX.fullmatch(value):
+            return {}
+    return dict(generated)
+
+
+def _write_generated_ledger(store: Path, generated: Mapping[str, str]) -> None:
+    _write_private_json(generated_ledger_path(store), {
+        "version": GENERATED_LEDGER_VERSION,
+        "store_identity": _store_identity(store),
+        "generated_keys": dict(sorted(generated.items())),
+    })
+
+
+def _regular_key_hash(store: Path, key: str) -> str | None:
+    """SHA-256 of ``store/key`` when it is an operator-owned regular file inside the store, else None.
+
+    The final component is opened without following a symlink, and the
+    resolved path must stay inside the store and be the opened file.
+    """
+    try:
+        root = os.path.realpath(store)
+        path = os.path.join(root, key)
+        resolved = os.path.realpath(path)
+        if resolved != path or os.path.commonpath((root, resolved)) != root:
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                return None
+            named = os.stat(resolved, follow_symlinks=False)
+            if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+                return None
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, _HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.close(descriptor)
+    except (OSError, ValueError):
+        return None
+    return digest.hexdigest()
+
+
+def _generated_key_matches(store: Path, key: str, expected_sha256: str | None) -> bool:
+    return bool(expected_sha256) and _regular_key_hash(store, key) == expected_sha256
+
+
+def _generated_after_setup(store: Path, entries: dict[str, tuple[str, str, str] | None]) -> dict[str, str]:
+    """Hashes of the keys absent at the SHA that exist as regular files after a successful setup.
+
+    The pre-run checks refused every other shadow (and verified each exempt
+    file), so whatever is present now was produced or rewritten by the setup.
+    """
+    generated: dict[str, str] = {}
+    for key, entry in entries.items():
+        if entry is not None:
+            continue
+        digest = _regular_key_hash(store, key)
+        if digest is not None:
+            generated[key] = digest
+    return generated
 
 
 # --- digest ----------------------------------------------------------------
@@ -297,22 +441,43 @@ def _flag_suppressed_paths(
     return flagged
 
 
-def _refuse_dirty(store: Path, paths: list[str], *, reason: str) -> None:
+_TRACKED_REMEDY = (
+    "Tracked files in the shared clone must match the base commit; restore or remove "
+    "those local changes (agent-loop never overwrites them) and rerun."
+)
+_ABSENT_KEY_REMEDY = (
+    f"{SETUP_CREATED_HINT}. After confirming, remove it from the shared clone or track it in "
+    "the repository, and rerun; agent-loop never removes it."
+)
+_TRACKED_KEY_REMEDY = (
+    f"{SETUP_CREATED_HINT}. The base commit now tracks it and agent-loop removes such a file "
+    "only while its bytes still match what a successful setup produced; after confirming, "
+    "remove it from the shared clone and rerun."
+)
+
+
+def _refuse_dirty(store: Path, paths: list[str], *, reason: str, remedy: str = _TRACKED_REMEDY) -> None:
     shown = ", ".join(paths[:DIRTY_PATH_LIMIT])
     more = f" (and {len(paths) - DIRTY_PATH_LIMIT} more)" if len(paths) > DIRTY_PATH_LIMIT else ""
     raise AgentLoopError(
-        f"--worktree-setup refused: the shared clone {store} {reason}: {shown}{more}. "
-        "Tracked files in the shared clone must match the base commit; restore or remove "
-        "those local changes (agent-loop never overwrites them) and rerun."
+        f"--worktree-setup refused: the shared clone {store} {reason}: {shown}{more}. {remedy}"
     )
 
 
 def _untracked_absent_keys(
-    store: Path, entries: dict[str, tuple[str, str, str] | None], *, runner: Any, tracked_at_head: bool
+    store: Path,
+    entries: dict[str, tuple[str, str, str] | None],
+    *,
+    runner: Any,
+    tracked_at_head: bool,
+    exempt: Mapping[str, str] | None = None,
 ) -> list[str]:
     shadows: list[str] = []
     for key, entry in entries.items():
         if entry is not None or not os.path.lexists(store / key):
+            continue
+        if exempt and key in exempt and _generated_key_matches(store, key, exempt[key]):
+            # Produced by an earlier successful setup and unchanged since (#1649).
             continue
         if tracked_at_head and key_entry(store, "HEAD", key, runner=runner) is not None:
             # Tracked at the older HEAD: the checkout to the pinned SHA removes it.
@@ -321,9 +486,44 @@ def _untracked_absent_keys(
     return shadows
 
 
+def _untracked_newly_tracked_keys(
+    store: Path,
+    entries: dict[str, tuple[str, str, str] | None],
+    *,
+    runner: Any,
+    generated: Mapping[str, str],
+    head_born: bool,
+) -> tuple[list[str], list[str]]:
+    """``(removable, refused)`` untracked files at keys the pinned SHA tracks but HEAD does not.
+
+    Only a recorded generated file whose bytes still match is removable; any
+    other file (ignored or not) is refused, because a non-forced checkout
+    would either refuse it or silently overwrite an ignored one.
+    """
+    removable: list[str] = []
+    refused: list[str] = []
+    for key, entry in entries.items():
+        if entry is None or not os.path.lexists(store / key):
+            continue
+        if head_born and key_entry(store, "HEAD", key, runner=runner) is not None:
+            continue
+        if key in generated and _generated_key_matches(store, key, generated[key]):
+            removable.append(key)
+        else:
+            refused.append(key)
+    return removable, refused
+
+
 def _check_store_clean(
-    store: Path, entries: dict[str, tuple[str, str, str] | None], *, runner: Any, at_sha: bool
-) -> None:
+    store: Path,
+    entries: dict[str, tuple[str, str, str] | None],
+    *,
+    runner: Any,
+    at_sha: bool,
+    generated: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Refuse an unsafe store; before the checkout, return generated keys to remove for it."""
+    generated = generated or {}
     dirty = store_tracked_tree_dirty_paths(store)
     if dirty:
         _refuse_dirty(store, dirty, reason="has locally modified, staged or deleted tracked paths")
@@ -332,24 +532,69 @@ def _check_store_clean(
         # An unborn HEAD (a freshly initialized store) tracks nothing yet.
         head = runner.run(("git", "rev-parse", "--verify", "--quiet", "HEAD"), cwd=store, check=False)
         tracked_at_head = head.returncode == 0
-    shadows = _untracked_absent_keys(store, entries, runner=runner, tracked_at_head=tracked_at_head)
+    shadows = _untracked_absent_keys(
+        store, entries, runner=runner, tracked_at_head=tracked_at_head, exempt=generated
+    )
     if shadows:
         _refuse_dirty(
             store, shadows,
             reason="has untracked files at --worktree-setup-key paths that are absent at the base commit",
+            remedy=_ABSENT_KEY_REMEDY,
         )
+    if at_sha:
+        return []
+    removable, refused = _untracked_newly_tracked_keys(
+        store, entries, runner=runner, generated=generated, head_born=tracked_at_head
+    )
+    if refused:
+        _refuse_dirty(
+            store, refused,
+            reason="has untracked files at --worktree-setup-key paths that the base commit tracks",
+            remedy=_TRACKED_KEY_REMEDY,
+        )
+    return removable
 
 
-def _materialize(store: Path, sha: str, *, runner: Any) -> None:
+def _remove_generated_keys(store: Path, keys: list[str], generated: Mapping[str, str]) -> None:
+    """Unlink each generated key, re-verifying its bytes immediately before the unlink."""
+    for key in keys:
+        if not _generated_key_matches(store, key, generated.get(key)):
+            _refuse_dirty(
+                store, [key],
+                reason="has untracked files at --worktree-setup-key paths that the base commit tracks",
+                remedy=_TRACKED_KEY_REMEDY,
+            )
+        try:
+            os.unlink(os.path.join(os.path.realpath(store), key))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise AgentLoopError(
+                f"--worktree-setup refused: could not remove the setup-created {key} in the shared "
+                f"clone {store} before checking out the base commit, which now tracks it: {exc}."
+            ) from exc
+
+
+def _materialize(store: Path, sha: str, *, runner: Any, keys: tuple[str, ...] = ()) -> None:
     head = runner.run(("git", "rev-parse", "HEAD"), cwd=store, check=False)
     if head.returncode == 0 and head.stdout.strip() == sha:
         return
-    # Non-forced: Git refuses rather than overwriting local changes.
-    moved = runner.run(("git", "checkout", "-q", "--detach", sha), cwd=store, check=False)
+    # Non-forced, and never overwriting ignored files: Git refuses rather
+    # than replacing local changes or ignored untracked content.
+    moved = runner.run(
+        ("git", "checkout", "-q", "--detach", "--no-overwrite-ignore", sha), cwd=store, check=False
+    )
     if moved.returncode != 0:
+        stderr = (moved.stderr or "").strip()
+        hint = ""
+        if any(key in stderr for key in keys):
+            hint = (
+                f" A refused --worktree-setup-key path may be an untracked file: {SETUP_CREATED_HINT}; "
+                "after confirming, remove it from the shared clone and rerun."
+            )
         raise AgentLoopError(
             f"--worktree-setup refused: could not check out {sha} in the shared clone {store} "
-            f"(git exited {moved.returncode}). {(moved.stderr or '').strip()}"
+            f"(git exited {moved.returncode}). {stderr}{hint}"
         )
     head = runner.run(("git", "rev-parse", "HEAD"), cwd=store, check=False)
     if head.returncode != 0 or head.stdout.strip() != sha:
@@ -453,7 +698,9 @@ def run_setup_command(
             _kill_group(process)
             raise AgentLoopError(
                 f"--worktree-setup timed out after {timeout_seconds:g}s in {where}; "
-                f"{consequence}. Output tail:\n{output_tail(read_output_tail(output))}"
+                f"{consequence}. Raise --worktree-setup-timeout SECONDS (currently "
+                f"{timeout_seconds:g}s) if the setup legitimately needs longer. "
+                f"Output tail:\n{output_tail(read_output_tail(output))}"
             ) from None
         except BaseException:
             _kill_group(process)
@@ -470,6 +717,14 @@ def run_setup_command(
 
 
 # --- entry point ------------------------------------------------------------
+
+
+def setup_timeout_seconds(config: Any) -> int:
+    """``--worktree-setup-timeout``; independent of every test-gate ceiling."""
+    value = getattr(config, "worktree_setup_timeout_seconds", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return DEFAULT_WORKTREE_SETUP_TIMEOUT_SECONDS
+    return value
 
 
 def ensure_store_setup(store: Path, sha: str, *, free: bool, config: Any, runner: Any) -> bool:
@@ -494,12 +749,14 @@ def ensure_store_setup(store: Path, sha: str, *, free: bool, config: Any, runner
         return False
     if not free:
         raise AgentLoopError(_held_store_message(store, "needs --worktree-setup to run"))
+    generated = read_generated_ledger(store, keys)
     # Refuse before the record is touched, so a refusal leaves everything as it was.
-    _check_store_clean(store, entries, runner=runner, at_sha=False)
+    removable = _check_store_clean(store, entries, runner=runner, at_sha=False, generated=generated)
     invalidate_setup_record(store)
-    _materialize(store, sha, runner=runner)
-    _check_store_clean(store, entries, runner=runner, at_sha=True)
-    timeout = int(getattr(config, "coder_test_command_timeout_seconds", 0) or _DEFAULT_SETUP_TIMEOUT_SECONDS)
+    _remove_generated_keys(store, removable, generated)
+    _materialize(store, sha, runner=runner, keys=keys)
+    _check_store_clean(store, entries, runner=runner, at_sha=True, generated=generated)
+    timeout = setup_timeout_seconds(config)
     log(config, f"Running --worktree-setup in the shared clone {store} at {sha}")
     run_setup_command(store, command, timeout_seconds=timeout)
     for link in links:
@@ -508,6 +765,8 @@ def ensure_store_setup(store: Path, sha: str, *, free: bool, config: Any, runner
                 f"--worktree-link '{link}': the --worktree-setup command succeeded but did not create "
                 f"{store / link} in the shared clone {store}; no setup record was written."
             )
+    # Before the success record, so a crash in between only forces a rerun.
+    _write_generated_ledger(store, _generated_after_setup(store, entries))
     _write_setup_record(store, {
         "version": SETUP_RECORD_VERSION,
         "digest": digest,

@@ -1362,7 +1362,11 @@ agent-loop issue 123 --repo OWNER/REPO \
 
 - The command runs via `/bin/sh -c` in the shared clone, as the operator with
   full privileges and the operator environment, outside any agent sandbox,
-  under the store lock and bounded by `--coder-test-command-timeout-seconds`.
+  under the store lock and bounded by `--worktree-setup-timeout SECONDS`
+  (operator CLI only, requires `--worktree-setup`, default 3600). The limit is
+  independent of `--coder-test-command-timeout-seconds`, so a slow `npm ci` or
+  `pip install` is not cut short by the test-gate ceiling; a timeout stops the
+  run with a message naming the flag. Managed-CI recovery commands keep it.
 - It runs again only when the command string or a key entry at the newly
   pinned base commit changes, when a `--worktree-link` source is missing or
   is a dangling symlink, or when agent-loop (re-)creates the clone. Without
@@ -1382,6 +1386,30 @@ agent-loop issue 123 --repo OWNER/REPO \
   staged or deleted tracked file, and any index entry flagged
   `assume-unchanged` or `skip-worktree`, stops the run without overwriting it.
   Untracked and ignored content there is operator-trusted.
+- An untracked file at a `--worktree-setup-key` path that is absent at the
+  base commit also stops a required setup, because the digest does not cover
+  it. A setup command may create such a file itself: `npm install` writes
+  `package-lock.json` when the repository tracks none. After a successful
+  setup agent-loop records the SHA-256 of each such generated key file in a
+  private ledger next to the success record, and later setups in the same
+  clone accept it while its bytes are unchanged and it is still a regular
+  file. The ledger survives a failed or timed-out setup and is deleted when
+  agent-loop re-creates the clone. An edited, replaced or symlinked generated
+  file, a file a failed setup created, and any file the operator placed there
+  still stop the run; the message names the path and says the file may have
+  been created by the setup command itself. Remove it after confirming, or
+  track it in the repository. A generated file that a later setup reads (npm
+  reusing its own lockfile) is an input the digest does not cover.
+- When a new base commit starts tracking a generated key file, agent-loop
+  removes it before the checkout only if its bytes still match the ledger,
+  re-verified just before the removal. Any other untracked file at that key
+  path, ignored or not, stops the run before the record is touched or the
+  setup runs, and is left unchanged.
+- The shared-clone checkout never overwrites ignored files
+  (`--no-overwrite-ignore`): an ignored file or directory, for example
+  `node_modules`, at a path a new base commit starts tracking stops the run
+  with Git's checkout error instead of being silently replaced. Remove it in
+  the shared clone and rerun.
 - Linked environments are shared and mutable across concurrent runs; a rerun
   of setup changes them under other runs' turns.
 - Keep each link ignored as a symlink: `/.venv` or `/node_modules`, without a
@@ -1448,7 +1476,10 @@ agent-loop issue 123 --repo OWNER/REPO \
   (`assume-unchanged`, `skip-worktree`) tracked change, a dirty or drifted
   initialized submodule, or an untracked or ignored file at a key path absent
   from HEAD defers the rebuild; nothing is removed and the remedy names the
-  paths.
+  paths. An untracked key file is never exempted here, even one an earlier
+  setup created; the deferral message says it may have been created by the
+  setup command itself.
+- Each PR-local rebuild is bounded by `--worktree-setup-timeout` too.
 - Deleting or replacing a private environment, or a link, without a committed
   key change is still refused, as is staging or committing it.
 - Read-only worktrees of a sandboxed run (agents that hold only CLI-enforced

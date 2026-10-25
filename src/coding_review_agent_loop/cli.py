@@ -262,7 +262,21 @@ def build_parser() -> argparse.ArgumentParser:
                 "'python3 -m venv .venv && .venv/bin/pip install -r requirements.txt'. It runs once per "
                 "clone and reruns only when the command or a --worktree-setup-key entry at the pinned "
                 "base commit changes, or a --worktree-link source is missing. A failure stops the run "
-                "with the output tail. Never read from repository configuration."
+                "with the output tail. A --worktree-setup-key file that is absent at the base commit "
+                "but was created by a successful setup (for example package-lock.json from npm "
+                "install) is recorded and does not block later setups while its bytes are unchanged. "
+                "Bounded by --worktree-setup-timeout. Never read from repository configuration."
+            ),
+        )
+        subparser.add_argument(
+            "--worktree-setup-timeout",
+            default=None,
+            metavar="SECONDS",
+            help=(
+                "Operator-only; requires --worktree-setup. Whole-command limit for each "
+                "--worktree-setup run, in the shared clone and for --worktree-setup-pr-local "
+                "rebuilds (default: 3600). Independent of --coder-test-command-timeout-seconds. "
+                "Never read from repository configuration."
             ),
         )
         subparser.add_argument(

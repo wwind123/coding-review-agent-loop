@@ -52,7 +52,7 @@ zero exit) and holds the digest, command hash, base SHA and the store root's
 dev/ino as a secondary check. Setup is required when the record is missing,
 unreadable or different, or when any `--worktree-link` source fails the shared
 `link_source_usable` predicate (`os.path.exists`, so a dangling source symlink
-counts as missing); `_prepare_store_locked` deletes the record before it
+counts as missing); `_prepare_store_locked` deletes the record and the generated-key ledger before it
 removes a stale store or clones a missing one. With `--worktree-setup`, a store whose
 index or HEAD commit still holds tracked paths (only an unborn HEAD with an
 empty index counts as artifact-only, and an inspection failure counts as
@@ -63,12 +63,33 @@ modified, staged or deleted tracked path, any index entry flagged
 assume-unchanged or skip-worktree (which status and diff trust), any dirty or drifted initialized
 submodule (separate confined per-submodule probes, the same inspection as
 test-evidence snapshots; parent probes keep the confined
-`--ignore-submodules=all`) and any untracked file at a key absent at the SHA,
-all before the record is touched. It then deletes the record and fsyncs its
-directory (failing closed), runs a non-forced `checkout --detach <sha>`,
-re-verifies HEAD and the tracked tree, and runs the command through
-`/bin/sh -c` in the store as the operator in its own process group, bounded by
-the coder test-command timeout. The leader is observed with `waitid(WNOWAIT)`
+`--ignore-submodules=all`) and any untracked file at a key absent at the SHA
+that the generated-key ledger does not exempt, all before the record is
+touched. The ledger, `setup-generated.json` beside `setup.json` (private, mode
+0600, written atomically, bound to the store dev/ino), maps each key absent at
+the SHA that exists as a regular file after a successful setup to its SHA-256.
+It is replaced just before the success record is written, is left untouched by
+pre-setup record invalidation and by failed or timed-out setups, and is
+deleted together with `setup.json` by `invalidate_store_setup_state` whenever
+`_prepare_store_locked` removes a stale store or clones a missing one. A
+malformed, foreign-identity, wrong-version, symlinked or foreign-owned ledger,
+or one naming an unconfigured key or a non-hex hash, exempts nothing. A key is
+exempt only when it opens without following a symlink as an operator-owned
+regular file inside the store whose streamed SHA-256 equals the ledger entry;
+PR-local worktrees never use the exemption. Untracked files at key paths the
+new SHA tracks but HEAD does not are classified in the same pre-invalidation
+check: a content-matching ledger entry is unlinked after the record is deleted
+and immediately before the checkout (re-verified first), and anything else is
+refused. Every remaining absent-key refusal says the file may have been
+created by the setup command itself. It then deletes the record and fsyncs its
+directory (failing closed), runs a non-forced
+`checkout --detach --no-overwrite-ignore <sha>` (so Git refuses rather than
+silently replacing an ignored untracked file), re-verifies HEAD and the
+tracked tree, and runs the command through `/bin/sh -c` in the store as the
+operator in its own process group, bounded by the operator-only
+`--worktree-setup-timeout` (default 3600 s, independent of the coder
+test-command timeout, kept by managed-CI recovery commands; the PR-local
+rebuild uses the same limit). The leader is observed with `waitid(WNOWAIT)`
 and left unreaped until the whole group has been killed, so however the command
 ends no background child survives the store-lock release and the group ID
 cannot have been reused when it is signalled; on a host without `os.waitid`
