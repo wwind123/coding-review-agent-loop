@@ -184,8 +184,34 @@ def test_runner_agent_launch_keeps_inherited_path_when_install_fails(tmp_path, m
     assert "agent-loop executable pin not installed" in capsys.readouterr().err
 
 
-def test_preflight_is_silent_when_pinned(tmp_path):
+@pytest.fixture
+def unwritable_scratch(_private_launcher_root):
+    """A scratch root the first agent launch could not install into."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses directory permissions")
+    _private_launcher_root.chmod(0o500)
+    try:
+        yield _private_launcher_root
+    finally:
+        _private_launcher_root.chmod(0o700)
+
+
+def test_preflight_is_silent_when_pinned(tmp_path, _private_launcher_root):
     assert ae.preflight_messages({"PATH": str(tmp_path / "empty")}) == []
+    # Installed launcher: still silent, now resolved on the real agent PATH.
+    ae.install_agent_loop_launcher()
+    assert ae.preflight_messages({"PATH": str(tmp_path / "empty")}) == []
+
+
+@pytest.mark.parametrize("inherited", ["empty", "stale"])
+def test_preflight_never_writes_to_the_scratch_root(tmp_path, _private_launcher_root, inherited):
+    """The startup preflight is read-only; only an agent launch installs the launcher."""
+    path = str(tmp_path / "empty") if inherited == "empty" else str(_stale_agent_loop(tmp_path / "stale-bin").parent)
+    ae.preflight_messages({"PATH": path})
+    assert list(_private_launcher_root.iterdir()) == []
+    assert not ae.expected_launcher_path().exists()
+    # The computed path is exactly where an agent launch installs it.
+    assert ae.install_agent_loop_launcher() == ae.expected_launcher_path()
 
 
 def test_preflight_notes_a_different_inherited_agent_loop(tmp_path):
@@ -199,6 +225,7 @@ def test_preflight_notes_a_different_inherited_agent_loop(tmp_path):
 
 def test_preflight_warns_when_agents_resolve_elsewhere(tmp_path):
     stale = _stale_agent_loop(tmp_path / "stale-bin")
+    launcher = ae.install_agent_loop_launcher()
 
     def which(name, path=None):
         return str(stale)
@@ -206,17 +233,16 @@ def test_preflight_warns_when_agents_resolve_elsewhere(tmp_path):
     lines = ae.preflight_messages({"PATH": ""}, which=which)
     warning = [line for line in lines if line.startswith("Warning")]
     assert len(warning) == 1
-    launcher = ae.agent_loop_launcher()
     assert str(stale) in warning[0] and str(launcher) in warning[0] and str(PACKAGE_DIR) in warning[0]
 
 
-def test_preflight_warns_when_launcher_is_unavailable(tmp_path, monkeypatch):
-    _fail_install(monkeypatch)
+def test_preflight_warns_when_launcher_is_unavailable(tmp_path, unwritable_scratch):
     stale = _stale_agent_loop(tmp_path / "stale-bin")
     lines = ae.preflight_messages({"PATH": str(stale.parent)})
     assert len(lines) == 1
     assert lines[0].startswith("Warning: agents will resolve agent-loop to " + str(stale))
     assert "launcher unavailable" in lines[0] and str(PACKAGE_DIR) in lines[0]
+    assert list(unwritable_scratch.iterdir()) == []
 
 
 def test_preflight_never_raises(tmp_path):
@@ -227,8 +253,7 @@ def test_preflight_never_raises(tmp_path):
     assert lines == ["Warning: agent-loop executable preflight failed (RuntimeError)"]
 
 
-def test_log_preflight_logs_and_never_blocks(tmp_path, monkeypatch):
-    _fail_install(monkeypatch)
+def test_log_preflight_logs_and_never_blocks(tmp_path, monkeypatch, unwritable_scratch):
     logged = []
     monkeypatch.setattr("coding_review_agent_loop.logging.log", lambda _config, line: logged.append(line))
     ae.log_preflight(object())

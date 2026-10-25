@@ -1971,7 +1971,8 @@ their inherited `PATH`, a warning is logged, no wrapper is granted or
 rendered, and the turn proceeds. At startup, `issue`, `task`, `pr`, `discuss`
 and `managed-pr` warn, naming both paths, when the agent-visible `agent-loop`
 is not this install, and log an informational line when the inherited `PATH`'s
-`agent-loop` is a different file. Neither line blocks the run.
+`agent-loop` is a different file. Neither line blocks the run, and the
+preflight writes nothing: the first agent launch installs the launcher.
 
 Each `run-tests` client reports its own tool commit, dirty flag and package
 path to the broker through the reserved environment entries

@@ -70,19 +70,44 @@ def launcher_text() -> str:
     return f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -I -c {shlex.quote(code)} \"$@\"\n"
 
 
+def expected_launcher_path(root: Path | None = None) -> Path:
+    """Where this install's launcher lives, computed without touching the disk."""
+    from .scratch import scratch_root
+
+    digest = hashlib.sha256(launcher_text().encode("utf-8")).hexdigest()[:16]
+    return (root or scratch_root() / LAUNCHER_DIR_NAME) / digest / LAUNCHER_NAME
+
+
+def _installable(launcher: Path) -> bool:
+    """Whether the launcher exists or its nearest existing ancestor is writable.
+
+    A read-only proxy for "the first agent launch can install it", so the
+    startup preflight never writes to the scratch root itself.
+    """
+    if os.name != "posix":
+        return False
+    if launcher.is_file():
+        return os.access(launcher, os.X_OK)
+    candidate = launcher.parent
+    while not os.path.lexists(candidate):
+        if candidate.parent == candidate:
+            return False
+        candidate = candidate.parent
+    return candidate.is_dir() and os.access(candidate, os.W_OK | os.X_OK)
+
+
 def install_agent_loop_launcher(root: Path | None = None) -> Path:
     """Write the launcher into a private, content-addressed directory; return its path.
 
     The digest covers the whole launcher text, so different interpreters or
     import paths never share a directory.  Raises ``OSError`` on failure.
     """
-    from .scratch import make_private_dirs, scratch_root
+    from .scratch import make_private_dirs
 
     if os.name != "posix":
         raise OSError("the agent-loop launcher requires a POSIX shell")
     text = launcher_text()
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-    directory = make_private_dirs((root or scratch_root() / LAUNCHER_DIR_NAME) / digest)
+    directory = make_private_dirs(expected_launcher_path(root).parent)
     launcher = directory / LAUNCHER_NAME
     if not launcher.is_file() or launcher.read_text(encoding="utf-8") != text:
         staging = directory / f".{LAUNCHER_NAME}.{os.getpid()}.tmp"
@@ -193,17 +218,27 @@ def preflight_messages(
     lines: list[str] = []
     try:
         identity = running_install_identity()
-        launcher = agent_loop_launcher(root)
+        # Read-only: the launcher is computed, never installed here; the first
+        # agent launch installs it (and warns if that fails).
+        launcher = expected_launcher_path(root)
         inherited = which("agent-loop", path=values.get("PATH"))
-        if launcher is None:
+        if not _installable(launcher):
             lines.append(
                 "Warning: agents will resolve agent-loop to "
-                f"{inherited or '<not found>'}, not this install (launcher unavailable -> "
-                f"{identity['package_path']})"
+                f"{inherited or '<not found>'}, not this install (launcher unavailable at "
+                f"{launcher} -> {identity['package_path']})"
             )
             return lines
-        agent_env = agent_executable_environment(values, root=root)
-        found = which("agent-loop", path=agent_env.get("PATH", values.get("PATH")))
+        agent_path = os.pathsep.join(
+            [str(launcher.parent), *_kept_entries(values.get("PATH", ""), str(launcher.parent))]
+            if values.get("PATH") is not None else [str(launcher.parent)]
+        )
+        if launcher.is_file():
+            found = which("agent-loop", path=agent_path)
+        else:
+            # Not installed yet: the launcher dir is first on the agent PATH,
+            # so once installed it resolves first.
+            found = str(launcher)
         if found is None or os.path.realpath(found) != os.path.realpath(launcher):
             lines.append(
                 f"Warning: agents will resolve agent-loop to {found or '<not found>'}, not this "

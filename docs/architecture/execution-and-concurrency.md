@@ -387,7 +387,11 @@ wrapper is rendered. Report-side parsing still recognizes coder-typed `-m` and
 bare spellings. At startup, issue, task, pr, discuss and managed-pr log a
 warning naming both paths when the agent-visible `agent-loop` is not the
 launcher, and an informational line when the inherited `PATH` holds another
-`agent-loop`. Neither line blocks the run.
+`agent-loop`. Neither line blocks the run. The preflight is read-only: it
+computes the content-addressed launcher path and checks that it is installed
+or installable without writing to the scratch root, because a run writes
+nothing there before it needs to; the first agent launch installs the
+launcher.
 
 **Receipt tool identity.** The `run-tests` client captures its own tool
 commit, dirty flag and package path (bounded at 3 s, never raising, and
