@@ -498,7 +498,7 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
             # artifact-only directory: keep the checkout and the setup record
             # so the setup gate refuses the deletions instead of re-cloning
             # over them (#1650).
-            log(config, f"Shared store {store} has tracked files deleted; keeping it for --worktree-setup.")
+            log(config, f"Shared store {store} has tracked content deleted; keeping it for --worktree-setup.")
         elif not free:
             raise AgentLoopError(_held_store_message(store, "is stale and cannot be recreated"))
         else:
@@ -539,9 +539,23 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
 
 
 def _store_tracks_paths(store: Path, runner: Any) -> bool:
-    """True when the store's index lists tracked paths (an unreadable index counts as tracked)."""
+    """True when the store holds tracked content: index entries or a non-empty HEAD tree.
+
+    A store whose every tracked file was deleted, unstaged or staged, still
+    has a HEAD commit with paths, so it is never mistaken for an artifact-only
+    directory. Only an unborn HEAD with an empty index counts as untracked, and
+    any inspection failure counts as tracked (fail closed).
+    """
     listed = _git(runner, store, "ls-files", "-z", check=False)
-    return listed.returncode != 0 or bool((listed.stdout or "").strip("\0"))
+    if listed.returncode != 0 or (listed.stdout or "").strip("\0"):
+        return True
+    head = _git(runner, store, "rev-parse", "--verify", "--quiet", "HEAD^{commit}", check=False)
+    if head.returncode != 0:
+        # Unborn HEAD only when the symbolic ref resolves; anything else is broken.
+        symbolic = _git(runner, store, "symbolic-ref", "-q", "HEAD", check=False)
+        return symbolic.returncode != 0
+    tree = _git(runner, store, "ls-tree", "-z", "--name-only", head.stdout.strip(), check=False)
+    return tree.returncode != 0 or bool((tree.stdout or "").strip("\0"))
 
 
 def _held_store_message(store: Path, what: str) -> str:

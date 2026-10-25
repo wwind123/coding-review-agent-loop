@@ -519,11 +519,12 @@ def test_stale_store_recreation_deletes_record_before_reclone(tmp_path, monkeypa
         return real_remove(path)
 
     monkeypatch.setattr(agent_permissions, "remove_checkout_tree", remove)
-    # Genuinely artifact-only: no working-tree content and no index entries.
+    # Genuinely artifact-only: no working-tree content, no index and an unborn HEAD.
     for entry in store.iterdir():
         if entry.name != ".git":
             shutil.rmtree(entry) if entry.is_dir() and not entry.is_symlink() else entry.unlink()
     (store / ".git" / "index").unlink()
+    git(store, "symbolic-ref", "HEAD", "refs/heads/unborn")
     assert config_module._is_stale_default_workdir(store)
     run_worktrees.prepare_store(store, config=config, runner=Runner())
     assert record_seen == [False]
@@ -694,7 +695,8 @@ def test_dry_run_only_logs_setup(tmp_path, monkeypatch):
 # --- review round 1: tracked deletions, index flags, bounded tails ----------------
 
 
-def test_tracked_deletions_are_refused_not_recloned_as_stale_store(tmp_path, monkeypatch):
+@pytest.mark.parametrize("deletion", ["unstaged", "staged"])
+def test_tracked_deletions_are_refused_not_recloned_as_stale_store(tmp_path, monkeypatch, deletion):
     """A real repository whose tracked files were all deleted is not an artifact-only store."""
     from coding_review_agent_loop import config as config_module
 
@@ -706,9 +708,13 @@ def test_tracked_deletions_are_refused_not_recloned_as_stale_store(tmp_path, mon
     record_bytes = worktree_setup.setup_record_path(store).read_bytes()
     git_marker = store / ".git" / "agent-loop-test-marker"
     git_marker.write_text("kept\n")
+    if deletion == "staged":
+        git(store, "rm", "-rq", ".")
+        assert git(store, "ls-files") == ""  # an empty index: ls-files alone looks untracked
     for entry in store.iterdir():
         if entry.name != ".git":
             shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+    staged_before = git(store, "diff", "--cached", "--name-status")
     assert config_module._is_stale_default_workdir(store)
     changed = dataclasses.replace(config, worktree_setup=setup_command(counter_b, "true"))
     with pytest.raises(AgentLoopError, match="refused") as caught:
@@ -717,7 +723,28 @@ def test_tracked_deletions_are_refused_not_recloned_as_stale_store(tmp_path, mon
     assert worktree_setup.setup_record_path(store).read_bytes() == record_bytes
     assert git_marker.read_text() == "kept\n"  # the clone was not re-created
     assert not (store / "requirements.txt").exists()  # nothing was restored
+    assert git(store, "diff", "--cached", "--name-status") == staged_before  # staged state kept
     assert not counter_b.exists()
+
+
+@pytest.mark.parametrize("state, tracked", [
+    ("unborn-empty-index", False),
+    ("index-entries", True),
+    ("head-tree-only", True),
+    ("broken-head", True),
+])
+def test_store_tracks_paths_fails_closed(tmp_path, monkeypatch, state, tracked):
+    env = seeded(tmp_path, monkeypatch)
+    store = env.seed_store("claude", venv=False).resolve()
+    if state == "unborn-empty-index":
+        (store / ".git" / "index").unlink()
+        git(store, "symbolic-ref", "HEAD", "refs/heads/unborn")
+    elif state == "head-tree-only":
+        git(store, "rm", "-rq", "--cached", ".")
+    elif state == "broken-head":
+        (store / ".git" / "index").unlink()
+        (store / ".git" / "HEAD").write_text("0" * 40 + "\n")
+    assert run_worktrees._store_tracks_paths(store, Runner()) is tracked
 
 
 def _assume_unchanged(store: Path) -> str:

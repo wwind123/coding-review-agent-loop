@@ -54,8 +54,10 @@ unreadable or different, or when any `--worktree-link` source fails the shared
 `link_source_usable` predicate (`os.path.exists`, so a dangling source symlink
 counts as missing); `_prepare_store_locked` deletes the record before it
 removes a stale store or clones a missing one. With `--worktree-setup`, a store whose
-index still lists tracked paths is never treated as stale, so tracked
-deletions reach the setup gate instead of being re-cloned over. A required setup needs a free
+index or HEAD commit still holds tracked paths (only an unborn HEAD with an
+empty index counts as artifact-only, and an inspection failure counts as
+tracked) is never treated as stale, so staged or unstaged tracked deletions
+reach the setup gate instead of being re-cloned over. A required setup needs a free
 store claim (otherwise the held-store message), then refuses any locally
 modified, staged or deleted tracked path, any index entry flagged
 assume-unchanged or skip-worktree (which status and diff trust), any dirty or drifted initialized
