@@ -33,7 +33,7 @@ document holds the full description.
 | Issue/PR association | Bind the issue set, approved plan, and canonical PR. | `issue_pr_handoff.py`, `issue_pr_provenance.py`, `pr_contract.py`, `managed_pr.py` | [managed CI and merge](docs/architecture/managed-ci-and-merge.md) |
 | CI and merge gates | Interpret the check board, qualify exact heads, guard merges. | `checks.py`, `ci_health.py`, `managed_ci.py`, `managed_ci_recovery_commands.py`, `managed_ci_intent_validation.py`, `coder_ci_guard.py` | [managed CI and merge](docs/architecture/managed-ci-and-merge.md) |
 | Checkouts and process execution | Per-run worktrees, the Git boundary, containment, test workers. | `run_worktrees.py`, `secure_git.py`, `git_transport.py`, `runner.py`, `containment.py`, `test_workers.py` | [execution and concurrency](docs/architecture/execution-and-concurrency.md) |
-| Architecture and prompt context | Render issue, plan, feedback and bounded advisory architecture context. | `prompts.py`, `memory.py`, `architecture_context.py`, `architecture_contract.py` | [testing and doc maintenance](docs/architecture/testing-and-doc-maintenance.md) |
+| Architecture and prompt context | Render issue, plan, feedback and bounded advisory architecture context. | `prompts.py`, `prompt_context.py`, `memory.py`, `architecture_context.py`, `architecture_contract.py` | [testing and doc maintenance](docs/architecture/testing-and-doc-maintenance.md) |
 | Local evidence, history and triage | Test evidence, salvage, usage, history export and advisory triage. | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `history_export.py`, `triage.py` | [components](docs/architecture/components.md) |
 
 ## System-wide invariants
