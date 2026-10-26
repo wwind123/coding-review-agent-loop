@@ -40,7 +40,9 @@ from test_run_worktrees import STORE_HOLDER, Env, RecordingRunner, child_env, gi
 
 
 def setup_command(counter: Path, tail: str = "mkdir -p .venv") -> str:
-    return f'echo "$PWD" >> {shlex.quote(str(counter))} && {tail}'
+    # Keep a tail's background operator from also backgrounding the counter
+    # write: process-group cleanup may kill that job before it records the run.
+    return f'echo "$PWD" >> {shlex.quote(str(counter))} && {{ {tail}\n}}'
 
 
 def runs_in(counter: Path, store: Path) -> int:
