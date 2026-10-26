@@ -283,36 +283,59 @@ import stat as _stat
 _REAL_LSTAT, _REAL_CHMOD, _REAL_LISTDIR = _os.lstat, _os.chmod, _os.listdir
 
 
-def _restore_owner_listing(root):
-    """Give the owner read+search back on every directory below ``root``.
+_REAL_JOIN = _os.path.join
+_REAL_EUID = _os.geteuid() if hasattr(_os, "geteuid") else None
 
-    agent-loop makes response and spool ancestors non-listable (0o300, #1560);
-    pytest's own tmp_path cleanup cannot descend into them.
-    """
+
+def _directory_walk(root, *, restore):
+    errors = []
     pending = [str(root)]
     while pending:
         current = pending.pop()
         try:
             info = _REAL_LSTAT(current)
-        except OSError:
+        except FileNotFoundError:
             continue
-        if _stat.S_ISLNK(info.st_mode) or not _stat.S_ISDIR(info.st_mode):
+        except OSError as exc:
+            errors.append(f"lstat {current}: {exc}")
+            continue
+        if not _stat.S_ISDIR(info.st_mode):
+            continue  # lstat never follows a symlink, including the selected root.
+        if _REAL_EUID is not None and info.st_uid != _REAL_EUID:
             continue
         if (info.st_mode & 0o700) != 0o700:
-            try:
-                _REAL_CHMOD(current, _stat.S_IMODE(info.st_mode) | 0o700)
-            except OSError:
-                continue
+            if restore:
+                try:
+                    _REAL_CHMOD(current, _stat.S_IMODE(info.st_mode) | 0o700)
+                except OSError as exc:
+                    errors.append(f"chmod {current}: {exc}")
+            else:
+                errors.append(f"owner rwx missing: {current}")
         try:
             names = _REAL_LISTDIR(current)
-        except OSError:
+        except OSError as exc:
+            errors.append(f"listdir {current}: {exc}")
             continue
-        pending.extend(_os.path.join(current, name) for name in names)
+        pending.extend(_REAL_JOIN(current, name) for name in names)
+    return errors
 
 
-@pytest.fixture(autouse=True)
-def _tmp_path_stays_removable(request):
-    root = request.getfixturevalue("tmp_path") if "tmp_path" in request.fixturenames else None
-    yield
-    if root is not None:
-        _restore_owner_listing(root)
+def _restore_owner_listing(root):
+    return _directory_walk(root, restore=True)
+
+
+def _verify_owner_listing(root):
+    return _directory_walk(root, restore=False)
+
+
+@pytest.fixture(name="tmp_path")
+def _tmp_path_stays_removable(tmp_path):
+    # Wrapping pytest's fixture makes every tmp_path-dependent resource finish
+    # before release, even resources that re-harden paths in their finalizer.
+    yield tmp_path
+    restoration_errors = _restore_owner_listing(tmp_path)
+    verification_errors = _verify_owner_listing(tmp_path)
+    if restoration_errors or verification_errors:
+        pytest.fail("tmp_path cleanup failed:\n" + "\n".join(
+            restoration_errors + verification_errors
+        ), pytrace=False)

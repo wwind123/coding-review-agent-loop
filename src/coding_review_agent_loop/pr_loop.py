@@ -435,6 +435,14 @@ from .child_plan_binding import (
     _reject_pending_child_plan_supersession,
 )
 from .pr_loop_support import (
+    _reconciliation_dispositions_by_item,
+    PR_SCHEDULING_DIAGNOSTIC_TEMPLATE,
+    PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT,
+    render_pr_scheduling_diagnostic,
+    render_pr_human_decision_diagnostic,
+    _pr_human_decision_omission_note,
+    _managed_v1_dispatch_records,
+    unchanged_head_stop_message,
     ExactHeadCiProof,
     _pr_step_back_approach_alternative_stop,
     _pr_step_back_carried_entries,
@@ -522,55 +530,6 @@ from .pr_loop_support import (
 )
 
 
-# Plain PR pre-panel stop diagnostic; history_export recognizes posted stops by it.
-PR_SCHEDULING_DIAGNOSTIC_TEMPLATE = "PR review scheduling diagnostic ({label}): {message}"
-
-
-def render_pr_scheduling_diagnostic(label: str, message: str) -> str:
-    """The exact body ``stop_pre_panel`` posts."""
-    return PR_SCHEDULING_DIAGNOSTIC_TEMPLATE.format(label=label, message=message)
-
-
-# Public size bound for a posted PR human-decision diagnostic (#1640): well
-# under the transport's plain-body limit, so carrier neutralization and host
-# footers cannot push it into RoundCommentOverflowError.
-PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT = 40_000
-
-
-def _pr_human_decision_omission_note(omitted: int) -> str:
-    return (
-        f"… ({omitted} characters of detail omitted from this diagnostic; the full text is "
-        "in the CLI output of this run)"
-    )
-
-
-def render_pr_human_decision_diagnostic(label: str, message: str) -> str:
-    """The PR scheduling diagnostic for a human-decision stop, bounded in size.
-
-    Within :data:`PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT` this is exactly
-    :func:`render_pr_scheduling_diagnostic`.  Otherwise the template, the first
-    line and as many following whole lines as fit are kept verbatim, then an
-    omission note.  The raised exception and the CLI text are never bounded.
-    """
-    full = render_pr_scheduling_diagnostic(label, message)
-    if len(full) <= PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT:
-        return full
-    prefix = render_pr_scheduling_diagnostic(label, "")
-    # The note's digit count can only shrink from this upper bound.
-    reserve = len("\n" + _pr_human_decision_omission_note(len(message)))
-    budget = max(PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT - len(prefix) - reserve, 0)
-    first, *rest = message.split("\n")
-    if len(first) > budget:
-        kept = first[:budget]
-    else:
-        kept = first
-        for line in rest:
-            if len(kept) + 1 + len(line) > budget:
-                break
-            kept += "\n" + line
-    return prefix + kept + "\n" + _pr_human_decision_omission_note(len(message) - len(kept))
-
-
 def _classify_pr_reviewer_prelaunch(
     reviewer_name: str,
     *,
@@ -646,67 +605,6 @@ def _settle_pr_round_ledger(
         )
         future_from_prior_items = []
     return list(ledger_view([*settled, *round_new_items])), future_from_prior_items
-
-
-def _reconciliation_dispositions_by_item(
-    reconciliation: PostedRoundMetadata,
-) -> dict[str, list[ReviewItemDisposition]]:
-    """Round dispositions keyed by carried item, as the round end built them.
-
-    A disposition naming an item the reconciliation did not carry cannot be
-    replayed faithfully, so it refuses instead of silently losing ledger state.
-    """
-    by_item: dict[str, list[ReviewItemDisposition]] = {
-        item.item_id: [] for item in reconciliation.prior_items
-    }
-    for disposition in reconciliation.dispositions:
-        if disposition.item_id not in by_item:
-            raise AgentLoopError(
-                f"PR round {reconciliation.round_number} reconciliation at "
-                f"{reconciliation.subject} records a disposition for {disposition.item_id}, "
-                "which its carried ledger does not hold; refusing to settle the closed "
-                "round. No agent was invoked."
-            )
-        by_item[disposition.item_id].append(disposition)
-    return by_item
-
-
-def _managed_v1_dispatch_records(managed_ci) -> tuple:
-    """This process's own managed v1 dispatches, for the coder-turn audit (#1414)."""
-    if managed_ci is None or managed_ci.protocol_version != 1:
-        return ()
-    return tuple(managed_ci.v1_dispatch_records)
-
-
-def unchanged_head_stop_message(
-    *, pr, coder_name, previous_head, turns, round_number, evidence, route,
-    citation_diagnosis: FollowupCitationDiagnosis | None = None,
-) -> str:
-    """The unchanged-head stop text; receipts (issue #1182) go before the route.
-
-    When the last follow-up's test_observations were dropped as a non-array
-    (#1626), the message names that and the uncited receipt count, so an
-    operator can see the blocker may be a tool format problem.
-    """
-    citation_sentence = ""
-    if citation_diagnosis is not None and citation_diagnosis.non_array_drop:
-        citation_sentence = (
-            " The coder's test_observations were not a JSON array (format repair "
-            f"attempted: {'yes' if citation_diagnosis.repair_attempted else 'no'}); "
-            f"{citation_diagnosis.uncited_receipts} run-tests receipt(s) from that turn "
-            "went uncited, so the blocker may be a tool format problem rather than a "
-            "code defect."
-        )
-    return (
-        f"PR #{pr}: {coder_name} left head {previous_head} unchanged in "
-        f"{turns} consecutive follow-up rounds, so another "
-        "review of the same diff cannot change the verdict. Stopping before round "
-        f"{round_number + 1}; human review required."
-        f"{unsuperseded_receipts_sentence(evidence)}"
-        f"{tool_identity_clause(evidence)}"
-        f"{citation_sentence}"
-        f"{route}"
-    )
 
 
 def _enforce_pr_board_floor(
