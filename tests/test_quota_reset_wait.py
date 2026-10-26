@@ -245,6 +245,31 @@ def test_no_owner_budget_is_local():
     )
 
 
+def test_slice_timeout_observes_signal_cancellation(tmp_path, monkeypatch, logs):
+    slices = []
+
+    def timed_slice(seconds):
+        assert quota_wait.active_wait_count() == 1
+        assert not quota_wait._cancelled()
+        slices.append(seconds)
+        # Model a signal becoming pending after the wait's interrupt window:
+        # the timed wait returns normally, without raising KeyboardInterrupt.
+        monkeypatch.setattr(quota_wait, "_signal_cancel_requested", True)
+
+    monkeypatch.setattr(quota_wait, "_sleeper", timed_slice)
+    response, error, invoke, runner = _turn(tmp_path, [_claude_limit(), OK])
+
+    assert response is None
+    assert isinstance(error, QuotaResetExceededError)
+    assert "quota reset wait interrupted" in str(error)
+    assert len(slices) == 1
+    assert 0 < slices[0] <= 1
+    assert invoke.call_count == 1  # cancellation prevents replay
+    assert quota_wait.active_wait_count() == 0
+    assert not any("quota reset wait finished" in line for line in logs)
+    assert runner.comments == []
+
+
 # --- signals -------------------------------------------------------------------
 
 def _signal_when_waiting(signum, *, count=1):
@@ -255,7 +280,7 @@ def _signal_when_waiting(signum, *, count=1):
         # Direct the signal at the main thread, as a terminal or supervisor
         # signal effectively is.  A process-directed os.kill from this thread
         # may be delivered to any other live thread in the test process, and
-        # then the main thread stays blocked in its 30s wait slice.
+        # then the main thread can stay blocked until its timed slice ends.
         signal.pthread_kill(threading.main_thread().ident, signum)
 
     thread = threading.Thread(target=fire, daemon=True)
@@ -290,6 +315,7 @@ def test_signal_during_main_thread_wait_is_a_clean_quota_stop(tmp_path, monkeypa
     assert signal.getsignal(signal.SIGTERM) == previous
     assert runner.comments == []  # the wait writes nothing to GitHub
     assert not quota_wait.wait_was_interrupted()  # cleared for the next command
+    assert quota_wait.active_wait_count() == 0
 
 
 def _record_terminations(runner):
@@ -334,7 +360,7 @@ def test_signal_cancels_a_waiting_reviewer_worker(tmp_path, monkeypatch, capsys,
     firing = _signal_when_waiting(signum)
     assert cli.main(PR_ARGS) == QuotaResetExceededError.EXIT_CODE
     firing.join(5)
-    assert time.monotonic() - started < quota_wait.QUOTA_WAIT_SLICE_SECONDS
+    assert time.monotonic() - started < 20
     assert terminations == [True]
     assert len(outcomes) == 1 and "wait interrupted" in str(outcomes[0])
     assert "quota reset wait interrupted" in capsys.readouterr().err
@@ -373,7 +399,7 @@ def test_signal_cancels_waiting_discuss_debaters(tmp_path, monkeypatch, capsys, 
         ["discuss", "56", "--repo", "OWNER/REPO", "--wait-for-quota-reset", "6h"]
     ) == QuotaResetExceededError.EXIT_CODE
     firing.join(5)
-    assert time.monotonic() - started < quota_wait.QUOTA_WAIT_SLICE_SECONDS
+    assert time.monotonic() - started < 20
     assert terminations == [True]
     # The second debater records its cancellation only once its thread has
     # unwound, which can land just after main() returns; wait briefly for it.
@@ -381,6 +407,7 @@ def test_signal_cancels_waiting_discuss_debaters(tmp_path, monkeypatch, capsys, 
     while len(outcomes) < 2 and time.monotonic() < deadline:
         time.sleep(0.01)
     assert len(outcomes) == 2
+    assert quota_wait.active_wait_count() == 0
     assert "quota reset wait interrupted" in capsys.readouterr().err
 
 

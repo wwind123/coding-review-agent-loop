@@ -464,7 +464,10 @@ ordinary allowance. For Antigravity it waits only when
 `stop_is_verified_long_reset()` holds and the latest group reset is within
 DURATION. A pre-dispatch all-exhausted wait builds the next invocation
 normally, and a post-failure wait replays the failed one. Waits sleep in
-slices of at most 30 s on a process-level cancel event in a waiter registry.
+requested slices of at most one second on a process-level cancel event in a
+waiter registry. Short timed slices bound deferred pending-signal observation
+when the blocking wait misses an interrupt. Scheduling and executor cleanup
+can add overhead; this is not an absolute one-second wall-clock shutdown guarantee.
 The CLI installs a SIGTERM handler for the command only when the option is
 set. The handler is lock-free (it reads the registry and sets a flag), because
 it may run while the main thread is inside the registry. The handler, and SIGINT's own `KeyboardInterrupt`, reach the main
