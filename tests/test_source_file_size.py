@@ -26,7 +26,6 @@ ALLOWLIST: dict[str, int] = {
     "src/coding_review_agent_loop/protocol.py": 10252,
     "src/coding_review_agent_loop/pr_loop.py": 10037,
     "src/coding_review_agent_loop/round_state.py": 6387,
-    "src/coding_review_agent_loop/github.py": 6158,
 }
 
 SPLIT_GUIDANCE = (

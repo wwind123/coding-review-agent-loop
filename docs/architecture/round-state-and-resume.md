@@ -2,13 +2,21 @@
 
 Where workflow state lives and how a run resumes: the GitHub and local state table, durable comment carriers and write read-back, transient GitHub failure handling, the known host comment footer, evidence freeze records, rejected coder follow-up recovery, and the context and trust contracts that every prompt and resume path must preserve.
 
-Source paths: `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
+Source paths: `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
 
 Scheduler metadata decoding and its key sets live in `round_state_scheduler.py`,
 with explicit re-exports from `round_state.py`. Round entry points, encoding,
 authentication and reconstruction remain in `round_state.py`; the extraction
 preserves serialized bytes, legacy defaults and conservative invalid-record
 handling, with no change to persistence or approval authority.
+
+Pure issue-reference parsing and its evidence types live in
+`github_issue_references.py`, with explicit compatibility re-exports from
+`github.py`. The leaf depends only on the standard library and `errors.py`;
+GitHub I/O, authorization, provenance decisions, publication/recovery entry
+points and patched-name lookups remain in `github.py`. The extraction preserves
+reference grammar, Markdown exclusions and existing import identities without
+changing the trust or persistence contracts.
 
 ## State and Recovery
 
