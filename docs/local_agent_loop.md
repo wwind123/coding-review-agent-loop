@@ -4669,6 +4669,20 @@ remains in the cluster. The orchestrator records the step-back as reviewer-owned
 rebuilds the sweep for any reviewer whose review of that head is unpublished and
 never re-requests a published one.
 
+**Posted diagnostic.** The sibling escalation, the non-convergence stop below, and
+the `Approach alternative:` stop each also post one plain
+`PR review scheduling diagnostic (round N): ...` comment to the PR, after the
+stop's existing writes (for the approach alternative, after the coder record and
+any managed-CI continuity grant), so the stop is visible in PR history and in the
+[outcome history export](#outcome-history-export). The comment repeats the stop
+message; a message over 40,000 characters is cut to its first line and as many
+following whole lines as fit, then an omission note, while the CLI output keeps
+the full text. It is audit text only: resume re-derives every stop from round
+records, and a rerun that stops again posts one more. Posting is best-effort: a
+GitHub, transport or local temp-file failure is logged as a warning, and the run
+still stops with exit code 4 and the same message. Disabled gates
+(`--pr-step-back-rounds 0`, `--pr-non-convergence-rounds 0`) post nothing.
+
 #### PR non-convergence stop
 
 The clustered step-back counts only **new** findings near one file span, so a
@@ -4698,8 +4712,10 @@ row set, or `--pr-evidence-stall-rounds 0`), this stop fires before any coder
 turn. A tag naming a satisfied row, no usable row set, or any untagged persisting
 item never defers. Under `--review-parallel` the reviewer's blocking set is resolved
 through the round's reconciliation, and only the reviewer's own dispositions apply.
-The stop is derived from posted round records only and persists nothing, so a
-resumed run reaches the same decision with the same text.
+The stop is derived from posted round records only and persists no state (the
+plain diagnostic described under the step-back above is audit text), so a
+resumed run reaches the same decision with the same text. A deferred stop that
+the evidence stall owns posts no non-convergence diagnostic.
 
 **Precedence.** A clustered-sibling escalation stops first; otherwise this stop
 wins over a fresh clustered step-back turn, and both run before the round-limit
@@ -5521,8 +5537,12 @@ ignored and only counted in `ignored_foreign_records`. Each row reports:
   the scheduler contract's required reviewers), otherwise every seat seen; a
   seat that never posted is still expected.
 - Human-decision stops are the planning scheduling diagnostics that carry the
-  step-back or primary-stall human-decision text; step-back entries alone
-  never count as stops.
+  step-back or primary-stall human-decision text, and the PR scheduling
+  diagnostics that carry the PR step-back sibling (`pr-step-back-sibling`),
+  non-convergence (`pr-non-convergence`, matched on the first line only) or
+  approach-alternative (`pr-step-back-approach-alternative`) text; step-back
+  entries alone never count as stops. A rerun that stops again at the same head
+  posts another diagnostic, so the count is per invocation.
 - `infrastructure_failures` lists recognized agent-unavailable comments
   (classified as `auth-expiry`, `quota`, `settings-lock`, `backend-outage`,
   `billing`, `environment` or `agent-unavailable-<category>`, including

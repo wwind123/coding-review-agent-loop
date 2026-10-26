@@ -1486,3 +1486,65 @@ def test_a_deferred_non_convergence_stop_still_beats_the_round_limit(tmp_path, m
     assert True in deferrals
     assert "not converging" in message and "Reached max rounds" not in message
     assert _coder_count(runner) == 3
+
+
+# --- Durable PR human-decision diagnostics (#1640) ---------------------------
+
+
+def _hd_diagnostics(runner):
+    return [
+        comment["body"] for comment in runner.pr_payload.get("comments", [])
+        if comment["body"].startswith("PR review scheduling diagnostic (")
+    ]
+
+
+def _assert_non_convergence_diagnostic(runner, message, *, label):
+    from coding_review_agent_loop.history_export import recognize_diagnostic
+    from coding_review_agent_loop.pr_loop import render_pr_human_decision_diagnostic
+
+    diagnostics = _hd_diagnostics(runner)
+    assert diagnostics == [render_pr_human_decision_diagnostic(label, message)]
+    assert recognize_diagnostic(diagnostics[0]).reason == "pr-non-convergence"
+
+
+def test_a_deferred_non_convergence_stop_on_the_final_round_posts_once(tmp_path, monkeypatch):
+    """`nonconv-deferred-posts`: the final-round raise site posts exactly one diagnostic."""
+    deferrals = _spy_deferral(monkeypatch)
+    runner = _evidence_only_runner(4, 3)
+    config = _config(
+        tmp_path, max_rounds=4, pr_evidence_stall_rounds=3, pr_non_convergence_rounds=3
+    )
+    message = _nc_stop_message(runner, config, _plan_context("row-a"))
+    assert True in deferrals and "not converging" in message
+    _assert_non_convergence_diagnostic(runner, message, label="round 4")
+
+
+def test_a_deferred_non_convergence_stop_after_the_stall_decision_posts_once(
+    tmp_path, monkeypatch
+):
+    """`nonconv-deferred-posts`: the post-evidence-stall raise site posts exactly once."""
+    deferrals = _spy_deferral(monkeypatch)
+    runner = _evidence_only_runner(6, 5)
+    _checks_switch(monkeypatch, runner, {3: _STALLED_RUNS})
+    config = _config(tmp_path, pr_evidence_stall_rounds=3, pr_non_convergence_rounds=3)
+    message = _nc_stop_message(runner, config, _plan_context("row-a"))
+    assert True in deferrals and "not converging" in message
+    _assert_non_convergence_diagnostic(runner, message, label="round 4")
+    assert _coder_count(runner) == 3
+
+
+def test_an_evidence_stall_that_owns_the_window_posts_no_non_convergence_diagnostic(
+    tmp_path, monkeypatch
+):
+    """`nonconv-superseded-silent`: the deferred stop never fires, so nothing is posted."""
+    deferrals = _spy_deferral(monkeypatch)
+    runner = _evidence_only_runner(4, 3)
+    config = _config(tmp_path, pr_evidence_stall_rounds=3, pr_non_convergence_rounds=3)
+    message = _nc_stop_message(runner, config, _plan_context("row-a"))
+    assert True in deferrals
+    assert "is stalled on evidence only" in message and "not converging" not in message
+    assert not any("not converging" in body for body in _hd_diagnostics(runner))
+    assert not any(
+        "kept the same item(s) blocking" in comment["body"]
+        for comment in runner.pr_payload.get("comments", [])
+    )

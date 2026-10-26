@@ -60,7 +60,10 @@ from .review_step_back import (
     BASELINE_FORM_FULL,
     BASELINE_FORM_UNAVAILABLE,
     PLAN_STEP_BACK_HUMAN_DECISION_PREFIX,
+    PR_NON_CONVERGENCE_DECISION_LEAD,
+    PR_NON_CONVERGENCE_DECISION_MARK,
     PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT,
+    PR_STEP_BACK_SIBLING_PREFIX_TEXT,
     effective_new_items,
     eligible_new_mandatory_items,
     first_plan_review_round,
@@ -173,6 +176,15 @@ _PR_SCHEDULING_RE = _template_regex(
     PR_SCHEDULING_DIAGNOSTIC_TEMPLATE, {"label": _LABEL_GROUP, "message": r".*"}
 )
 _PR_NUMBER_PREFIX_RE = re.compile(r"^PR #[1-9][0-9]*: ")
+# First-line only: no wildcard crosses a newline, so a reviewer item line
+# further down the message cannot make a stop look like non-convergence.
+_PR_NON_CONVERGENCE_RE = re.compile(
+    r"\A"
+    + re.escape(PR_NON_CONVERGENCE_DECISION_LEAD)
+    + r"[^\n]+?"
+    + re.escape(PR_NON_CONVERGENCE_DECISION_MARK)
+    + r"[0-9]+ consecutive coder turns"
+)
 _CI_COMMENT_RE = _template_regex(CI_INFRASTRUCTURE_COMMENT_HEADLINE, {"pr_number": r"[1-9][0-9]*"})
 _CI_STOP_RE = _template_regex(CI_INFRASTRUCTURE_STOP_HEADLINE, {"pr_number": r"[1-9][0-9]*"})
 _INCOMPLETE_ROUND_RE = _template_regex(
@@ -287,14 +299,22 @@ def recognize_diagnostic(body: str) -> RecognizedDiagnostic | None:
             return RecognizedDiagnostic(
                 KIND_HUMAN_DECISION_STOP, "plan-primary-stall", round_number, terminal=True
             )
-        # The PR approach-alternative stop (#1628) is rendered after a
-        # ``PR #N: `` prefix.
-        if _PR_NUMBER_PREFIX_RE.sub("", message, count=1).startswith(
-            PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT
-        ):
+        # The PR approach-alternative (#1628), step-back sibling and
+        # non-convergence (#1640) stops are rendered after a ``PR #N: `` prefix.
+        pr_message = _PR_NUMBER_PREFIX_RE.sub("", message, count=1)
+        if pr_message.startswith(PR_STEP_BACK_APPROACH_ALTERNATIVE_PREFIX_TEXT):
             return RecognizedDiagnostic(
                 KIND_HUMAN_DECISION_STOP, "pr-step-back-approach-alternative", round_number,
                 terminal=True,
+            )
+        # The sibling prefix shares the non-convergence lead, so it goes first.
+        if pr_message.startswith(PR_STEP_BACK_SIBLING_PREFIX_TEXT):
+            return RecognizedDiagnostic(
+                KIND_HUMAN_DECISION_STOP, "pr-step-back-sibling", round_number, terminal=True
+            )
+        if _PR_NON_CONVERGENCE_RE.match(pr_message):
+            return RecognizedDiagnostic(
+                KIND_HUMAN_DECISION_STOP, "pr-non-convergence", round_number, terminal=True
             )
         return RecognizedDiagnostic(kind, "scheduling-stop", round_number, terminal=True)
     first_line = body.split("\n", 1)[0]

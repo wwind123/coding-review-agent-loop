@@ -216,8 +216,32 @@ read. The decision text lists each item with its attempt count and first line, t
 `git diff --shortstat` growth since the head of the earliest counted attempt (the
 attempt scan may reach past the K window) and the PR size from the merge
 base (each `unavailable` when Git fails), flags items asking for evidence, and
-offers the override options. Nothing is persisted, so a resumed run stops with the
-same text.
+offers the override options. No state is persisted (the posted diagnostic below
+is audit text only), so a resumed run stops with the same text.
+
+**Durable human-decision diagnostics** (#1640). The sibling escalation, the
+non-convergence stop (immediate inside `_pr_step_back_decision`, or deferred where
+the PR loop raises it on the final or merge-conflict round or after
+`_pr_evidence_stall_decision`), and the approach-alternative stop (at round start
+or live) each go through `pr_loop`'s `stop_for_human_decision` closure. It posts
+one plain `PR review scheduling diagnostic (round N): ...` comment and re-raises
+the original exception object. The diagnostic is posted after the stop's existing
+writes (for the live approach alternative, after the coder record and the
+managed-CI continuity grant) and only where a stop actually raises, so a deferred
+stop that the evidence stall owns posts nothing. It carries no round metadata and
+resume never reads it; a rerun that stops again posts one more. The body is
+`render_pr_human_decision_diagnostic`: the unchanged message within
+`PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT` (40,000 characters, under the transport's
+plain-body limit), otherwise the template, the first line and as many following
+whole lines as fit, then an omission note; the exception and CLI text stay
+complete. The post is best-effort: an `AgentLoopError` (GitHub, transport
+overflow) or `OSError` (local temp file) is logged as a warning and never changes
+the stop or exit 4. History export classifies the three stops as human-decision
+stops (`pr-step-back-sibling`, `pr-non-convergence`,
+`pr-step-back-approach-alternative`) from shared `review_step_back` message
+constants; the non-convergence match reads only the first line, so item text
+further down cannot change the classification. The evidence-stall,
+evidence-freeze, disputed-items and finalization stops are unchanged.
 
 **Unchanged-head stop and evidence progress.** `_UnchangedHeadTracker` counts
 consecutive PR follow-ups that leave one head unchanged and stops at
