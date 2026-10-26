@@ -1791,3 +1791,49 @@ def test_a_primary_only_publication_then_auto_conversion_reruns_the_gated_panel_
     assert _agent_count(runner, "claude") == 1
     assert runner.codex_outputs == runner.gemini_outputs == runner.antigravity_outputs == []
     assert records[-1].metadata.phase == "evidence-freeze"
+
+
+# --- Durable PR human-decision diagnostics (#1640) ---------------------------
+
+
+def test_an_evidence_conversion_that_owns_a_deferred_non_convergence_window_posts_nothing(
+    tmp_path, monkeypatch
+):
+    """`nonconv-superseded-silent`: conversion wins at the dispatch where a real
+    non-convergence window was deferred, so no non-convergence diagnostic is
+    posted and no coder turn intervenes before the same-head review."""
+    import coding_review_agent_loop.review_step_back as step_back_module
+
+    deferrals = []
+    real_defers = step_back_module.defers_to_evidence_stall
+
+    def spy(result, rows):
+        decision = real_defers(result, rows)
+        deferrals.append(decision)
+        return decision
+
+    monkeypatch.setattr(step_back_module, "defers_to_evidence_stall", spy)
+    context = _plan_context("row-a", "row-b")
+    runner = _auto_converted_runner(tmp_path, monkeypatch, context)
+    config = _config(tmp_path, pr_non_convergence_rounds=1)
+    with pytest.raises(HumanDecisionRequiredError) as stopped:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    message = str(stopped.value)
+    assert True in deferrals  # a qualifying non-convergence window was deferred
+    assert "frozen at head abc123-coder-1" in message and "not converging" not in message
+    assert _agent_count(runner, "claude") == 1  # no coder turn after the conversion
+    records = _records(runner)
+    phases = [(r.metadata.role, r.metadata.phase, r.metadata.round_number) for r in records]
+    conversion_index = next(
+        i for i, r in enumerate(records) if r.metadata.phase == "evidence-conversion"
+    )
+    after = phases[conversion_index:]
+    assert after[0] == ("summary", "evidence-conversion", 2)
+    assert any(role == "reviewer" and number == 2 for role, _phase, number in after[1:-1])
+    assert not any(role == "coder" for role, _phase, _number in after)
+    bodies = [comment["body"] for comment in runner.pr_payload["comments"]]
+    assert not any("kept the same item(s) blocking" in body for body in bodies)
+    assert not any(
+        body.startswith("PR review scheduling diagnostic (") and "not converging" in body
+        for body in bodies
+    )
