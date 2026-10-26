@@ -42,6 +42,7 @@ from coding_review_agent_loop.config import (
 )
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from coding_review_agent_loop.github import IssueComment
+from coding_review_agent_loop.workdirs import github_api_cwd
 from coding_review_agent_loop.managed_ci import ManagedCiReadiness, ProtectionAssessment
 from coding_review_agent_loop.managed_pr import ManagedPrHandoff
 from coding_review_agent_loop.runner import ExecutableIdentity
@@ -586,9 +587,13 @@ def test_missing_gemini_workdir_is_created_when_configured(tmp_path):
     assert gemini_dir.is_dir()
 
 
-def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path):
+@pytest.mark.parametrize(
+    "coder,reviewer", [("claude", "gemini"), ("gemini", "claude"), ("antigravity", "claude")]
+)
+def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path, coder, reviewer):
     runner = FakeRunner(
         gemini_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Google Gemini"],
+        claude_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"],
     )
     codex_dir = tmp_path / "inactive" / "codex"
     config = make_config(
@@ -596,8 +601,8 @@ def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path):
         claude_dir=tmp_path / "missing" / "claude",
         codex_dir=codex_dir,
         gemini_dir=tmp_path / "missing" / "gemini",
-        coder="claude",
-        reviewer="gemini",
+        coder=coder,
+        reviewer=reviewer,
         test_command=("pytest", "tests/test_agent_loop.py"),
         create_dirs=False,
     )
@@ -605,10 +610,16 @@ def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path):
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert not codex_dir.exists()
+    coder_dir = getattr(config, f"{coder}_dir")
+    actor_cwds = [
+        cwd for cmd, cwd in runner.commands if cmd == ["gh", "api", "user"]
+    ]
+    assert actor_cwds == [github_api_cwd()]
     github_or_test_cwds = [
         cwd
         for cmd, cwd in runner.commands
-        if cmd[:1] == ["gh"] or cmd == ["pytest", "tests/test_agent_loop.py"]
+        if (cmd[:1] == ["gh"] and cmd != ["gh", "api", "user"])
+        or cmd == ["pytest", "tests/test_agent_loop.py"]
     ]
     assert github_or_test_cwds
     bootstrap_pr_queries = [
@@ -616,10 +627,13 @@ def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path):
         for cmd, cwd in runner.commands
         if cmd[:3] == ["gh", "pr", "view"]
         and "number,title,headRefName,baseRefName,headRefOid,url,body,comments,reviews" in cmd
-        and cwd != config.claude_dir
+        and cwd != coder_dir
     ]
     assert bootstrap_pr_queries == [Path.cwd()]
-    assert set(github_or_test_cwds) == {Path.cwd(), config.claude_dir}
+    assert set(github_or_test_cwds) == {Path.cwd(), coder_dir}
+    assert [
+        cwd for cmd, cwd in runner.commands if cmd == ["pytest", "tests/test_agent_loop.py"]
+    ] == [coder_dir]
 
 
 def test_omitted_agent_dirs_default_to_repo_scoped_temp_checkouts(monkeypatch, tmp_path):

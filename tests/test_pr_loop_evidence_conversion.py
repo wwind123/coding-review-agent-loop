@@ -1917,3 +1917,123 @@ def test_an_evidence_conversion_that_owns_a_deferred_non_convergence_window_post
         body.startswith("PR review scheduling diagnostic (") and "not converging" in body
         for body in bodies
     )
+
+
+# Fresh configured workdirs must not be needed by read-only preflight.
+def _fresh_conversion_entry(tmp_path, monkeypatch, plan_source):
+    context = _plan_context("row-a", "row-b")
+    runner = _history_before_conversion(tmp_path / "history", monkeypatch, context)
+    if plan_source == "recovered":
+        runner.pr_payload["body"] = "Fixes #56"
+        runner.issue_payloads_by_number[56] = {"number": 56}
+        runner.issue_comments_by_number[56] = _issue_bound_plan(context)
+    config = _config(tmp_path / "fresh", create_dirs=False, pr_convert_evidence_rows=("row-a",))
+    paths = (config.claude_dir, config.codex_dir, config.gemini_dir, config.antigravity_dir)
+    assert not any(path.exists() for path in paths)
+    assert not hasattr(runner, "_agent_loop_authenticated_actor")
+    runner.commands.clear()
+    events = []
+    original_run = runner.run
+
+    def run(args, **kwargs):
+        if list(args)[:3] == ["gh", "api", "user"]:
+            assert not any(path.exists() for path in paths)
+            assert kwargs["cwd"].is_dir() and kwargs["cwd"] not in paths
+            events.append("actor")
+        cmd = list(args)
+        if cmd[:3] in (["gh", "pr", "comment"], ["gh", "pr", "edit"],
+                       ["gh", "pr", "ready"]):
+            assert events == ["actor", "workdirs"]
+        # Preserve FakeRunner's cwd existence check and actual REST hydration.
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(runner, "run", run)
+    original_ensure = pr_loop_module.ensure_agent_workdirs
+
+    def ensure(*args, **kwargs):
+        assert events == ["actor"]
+        assert any(cmd[:2] == ["gh", "api"] and "/comments?per_page=" in cmd[2]
+                   for cmd, _cwd in runner.commands)
+        events.append("workdirs")
+        return original_ensure(*args, **kwargs)
+
+    monkeypatch.setattr(pr_loop_module, "ensure_agent_workdirs", ensure)
+    return runner, config, context if plan_source == "supplied" else None, events
+
+
+def _assert_fresh_entry_read_only(runner, before, config, events):
+    assert runner.pr_payload == before
+    assert events in (["actor"], [])
+    assert not config.claude_dir.exists()
+    assert not any(_agent_count(runner, name) for name in ("claude", "codex", "gemini", "agy"))
+    for cmd, _cwd in runner.commands:
+        assert cmd[:3] not in (["gh", "pr", "comment"], ["gh", "pr", "edit"],
+                               ["gh", "pr", "ready"], ["gh", "pr", "merge"])
+        assert not any(method in cmd for method in ("POST", "PATCH", "PUT", "DELETE"))
+    assert not any(r.metadata.phase == "evidence-conversion" for r in _records(runner))
+
+
+@pytest.mark.parametrize("plan_source", ["supplied", "recovered"])
+def test_fresh_operator_conversion_authenticates_before_workdir_setup(tmp_path, monkeypatch, plan_source):
+    runner, config, context, events = _fresh_conversion_entry(tmp_path, monkeypatch, plan_source)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123-coder-1"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert events == ["actor", "workdirs"]
+    assert any(cmd[:2] == ["gh", "api"] and "/comments?per_page=" in cmd[2]
+               for cmd, _cwd in runner.commands)
+    [conversion] = [r for r in _records(runner) if r.metadata.phase == "evidence-conversion"]
+    assert conversion.metadata.evidence_conversion.source == "operator"
+    assert conversion.metadata.evidence_conversion.row_ids == ("row-a",)
+
+
+@pytest.mark.parametrize("plan_source", ["supplied", "recovered"])
+def test_fresh_invalid_conversion_refuses_before_pending_board_write(tmp_path, monkeypatch, plan_source):
+    import copy
+
+    runner, config, context, events = _fresh_conversion_entry(tmp_path, monkeypatch, plan_source)
+    config = dataclasses.replace(config, reviewer=("codex", "antigravity"),
+                                 pr_convert_evidence_rows=("row-a", "row-z"))
+    before = copy.deepcopy(runner.pr_payload)
+    with pytest.raises(AgentLoopError, match="rejected: row-z"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert events == ["actor"]
+    _assert_fresh_entry_read_only(runner, before, config, events)
+
+
+@pytest.mark.parametrize("plan_source", ["supplied", "recovered"])
+@pytest.mark.parametrize("failure", ["actor-failed", "actor-malformed", "rest-unavailable", "uncovered-record"])
+def test_fresh_conversion_identity_failure_refuses_before_writes(tmp_path, monkeypatch, plan_source, failure):
+    import copy
+    from coding_review_agent_loop.runner import CommandResult
+
+    runner, config, context, events = _fresh_conversion_entry(tmp_path, monkeypatch, plan_source)
+    config = dataclasses.replace(config, reviewer=("codex", "antigravity"))
+    if failure == "actor-malformed":
+        runner.authenticated_actor = (ACTOR[0], True)
+    elif failure == "actor-failed":
+        original_run = runner.run
+
+        def run(args, **kwargs):
+            result = original_run(args, **kwargs)
+            if list(args)[:3] == ["gh", "api", "user"]:
+                return CommandResult(result.args, result.cwd, "", "identity unavailable", 1)
+            return result
+
+        monkeypatch.setattr(runner, "run", run)
+    elif failure == "rest-unavailable":
+        runner.serve_rest_issue_comments = False
+    else:
+        for comment in runner.pr_payload["comments"]:
+            comment.pop("_rest_author_id", None)
+    before = copy.deepcopy(runner.pr_payload)
+    with pytest.raises(AgentLoopError) as raised:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert not isinstance(raised.value, HumanDecisionRequiredError)
+    expected = {
+        "actor-failed": "Unable to resolve the authenticated GitHub actor",
+        "actor-malformed": "lacked a login and immutable user ID",
+        "rest-unavailable": "returned a non-list page",
+        "uncovered-record": "REST comment read did not cover",
+    }
+    assert expected[failure] in str(raised.value)
+    _assert_fresh_entry_read_only(runner, before, config, events)
