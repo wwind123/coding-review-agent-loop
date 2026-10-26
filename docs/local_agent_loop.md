@@ -9609,8 +9609,12 @@ example `3600`, `90m`, `6h` or `1h30m`. It must be positive and no longer than
 - **Interrupts.** SIGINT or SIGTERM during a wait stops the run cleanly as a
   quota stop: `<agent> quota reset wait interrupted; rerun to resume ...` with
   exit code 3, so the run can be resumed. This also applies to waits in parallel
-  reviewer or debater threads. The main thread wakes them within 30 s, still
-  terminates active agent processes, and then exits. With the option set, the
+  reviewer or debater threads. Waits request slices of at most one second so
+  a pending signal missed by the blocking wait is observed after a short slice.
+  Once the main thread handles the interrupt, it cancels waiting workers,
+  terminates active agent processes, and then exits. Scheduling and executor
+  cleanup add overhead; the slice limit is not an absolute one-second
+  wall-clock shutdown guarantee. With the option set, the
   CLI installs its SIGTERM handler for the duration of the command and restores
   the previous handler afterwards. A SIGTERM that arrives when no wait is active
   keeps its previous behaviour, as does every other interrupt.

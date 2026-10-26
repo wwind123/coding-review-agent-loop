@@ -32,7 +32,9 @@ from .logging import log
 
 QUOTA_WAIT_MAX_WAITS = 2
 QUOTA_WAIT_MARGIN_SECONDS = 60
-QUOTA_WAIT_SLICE_SECONDS = 30
+# A pending signal can miss the blocking wait's interrupt window. Short timed
+# slices bound how long that wait defers Python's next signal check.
+QUOTA_WAIT_SLICE_SECONDS = 1
 
 
 @dataclass(frozen=True)
@@ -116,7 +118,8 @@ def _event_sleep(seconds: float) -> None:
 
 
 # Tests substitute this; it is called once per slice of at most
-# QUOTA_WAIT_SLICE_SECONDS and must return early once cancellation is set.
+# QUOTA_WAIT_SLICE_SECONDS. The event wakes early for ordinary cancellation;
+# signal cancellation may only be observed after the timed slice returns.
 _sleeper: Callable[[float], None] = _event_sleep
 
 
