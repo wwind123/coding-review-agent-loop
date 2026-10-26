@@ -1058,6 +1058,99 @@ def test_poisoned_after_push_stop_prints_resume_and_cleanup(tmp_path, monkeypatc
         assert cv.has_poisoned_entry(root)
 
 
+def _pre_1670_recovery(*, issue_number: int, branch: str, store: Path, worktree: Path) -> str:
+    return (
+        f"Recovery after a pushed branch: branch {branch} was already pushed, so the work "
+        f"is not lost. Resume with `agent-loop managed-pr --head {branch} --expected-closing-issue "
+        f"{issue_number}` plus your usual --managed-ci/--auto-merge and "
+        "--managed-ci-trusted-actor options (or `agent-loop pr <PR> --expected-closing-issue "
+        f"{issue_number}` when a PR for that branch already exists). The untrusted run "
+        "worktree is left in place for inspection; agent-loop does not remove it. Remove it "
+        f"manually with `git -C {store} worktree remove --force {worktree}`."
+    )
+
+
+@pytest.mark.parametrize("state", ["ahead", "equal", "behind", "count-fails"])
+def test_pushed_branch_recovery_compares_local_tip_with_tracking_ref(tmp_path, monkeypatch, state):
+    """Local-only commits after the push are named instead of claiming the work is not lost (#1670)."""
+    from coding_review_agent_loop import checkout_verification as cv
+    from coding_review_agent_loop import worktree_hints
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+
+    env = Env(tmp_path, monkeypatch)
+    env.seed_stores()
+    config = env.config()
+    branch = "agent-loop/managed-1670"
+    with workdir_claim_scope(command="task"):
+        runner = prepare_inline(config)
+        root = config.claude_dir
+        store = default_agent_workdir("OWNER/REPO", "claude")
+        _push_branch_from(root, branch)
+        git(root, "push", "-q", "origin", branch)
+        if state == "ahead":
+            for name in ("later-1.txt", "later-2.txt"):
+                (root / name).write_text(name)
+                git(root, "add", name)
+                git(root, "commit", "-q", "-m", name)
+        elif state == "behind":
+            pushed = git(root, "rev-parse", "HEAD")
+            (root / "later.txt").write_text("later")
+            git(root, "add", "later.txt")
+            git(root, "commit", "-q", "-m", "later")
+            git(root, "push", "-q", "origin", branch)
+            git(root, "reset", "-q", "--hard", pushed)
+        elif state == "count-fails":
+            real_probe = cv._probe
+
+            def failing_probe(config_, runner_, path, args):
+                if args[:1] == ("rev-list",):
+                    raise cv._Incomplete("probe `git rev-list` exited 128")
+                return real_probe(config_, runner_, path, args)
+
+            monkeypatch.setattr(cv, "_probe", failing_probe)
+        head_before = git(root, "rev-parse", "HEAD")
+        branches_before = git(store, "branch", "--list")
+        cv.poison_checkout(root, "baseline capture after agent turn failed: link replaced")
+        error = CheckoutVerificationError("changed outside agent-loop")
+        assert worktree_hints.add_pushed_branch_recovery(
+            error, runner=runner, config=config, issue_number=1670
+        ) is True
+        assert type(error) is CheckoutVerificationError
+        text = str(error).split("\n", 1)[1]
+        # Read-only: no Git write and no worktree removal.
+        assert git(root, "rev-parse", "HEAD") == head_before
+        assert git(store, "branch", "--list") == branches_before
+        assert root.is_dir()
+    if state in ("equal", "behind"):
+        assert text == _pre_1670_recovery(issue_number=1670, branch=branch, store=store, worktree=root)
+        return
+    assert "is not lost" not in text
+    assert f"agent-loop managed-pr --head {branch} --expected-closing-issue 1670" in text
+    assert f"git -C {store} worktree remove --force {root}" in text
+    assert (
+        "discards uncommitted changes in it but keeps the local branch "
+        f"{branch} and its commits in the shared repository"
+    ) in text
+    assert "git push" not in text  # never advise pushing from the untrusted worktree
+    if state == "ahead":
+        assert f"the local branch has 2 commits that are not on origin/{branch}" in text
+        assert "resuming from the pushed branch omits them" in text
+    else:
+        assert f"could not be compared with origin/{branch}" in text
+        assert (
+            f"`git -C {store} --no-pager log refs/remotes/origin/{branch}..refs/heads/{branch}`"
+        ) in text
+        # The store-rooted check resolves both refs in the shared repository.
+        advised = subprocess.run(
+            ["git", "-C", str(store), "--no-pager", "log",
+             f"refs/remotes/origin/{branch}..refs/heads/{branch}"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        )
+        assert advised.returncode == 0, advised.stderr
+    # No command is ever advised inside the untrusted worktree except removal from the store.
+    assert f"git -C {root}" not in text
+
+
 def test_unpoisoned_checkout_gets_no_pushed_branch_recovery(tmp_path, monkeypatch):
     from coding_review_agent_loop.errors import CheckoutVerificationError
     from coding_review_agent_loop.worktree_hints import add_pushed_branch_recovery

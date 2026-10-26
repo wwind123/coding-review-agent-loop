@@ -5130,6 +5130,26 @@ def comment_identity_key(comment: object) -> tuple[str | None, str | None, str |
     )
 
 
+def conversion_boundary_candidate_present(
+    comments: Sequence[object], *, round_number: int, head_sha: str | None
+) -> bool:
+    """Whether ``comments`` hold an unadmitted conversion record of this round and head.
+
+    Pure: no identity read.  Lets the guard tell a conversion boundary that
+    could not be admitted from a round with no conversion record (#1676).
+    """
+    try:
+        raw = _extract_round_metadata_records(tuple(comments), flow="pr")
+    except AgentLoopError:
+        return False
+    return any(
+        record.metadata.phase == EVIDENCE_CONVERSION_PHASE
+        and record.metadata.round_number == round_number
+        and record.metadata.subject == head_sha
+        for record in raw
+    )
+
+
 def conversion_visibility_boundary(
     runner: Runner,
     config: AgentLoopConfig,
@@ -5149,15 +5169,8 @@ def conversion_visibility_boundary(
     keeps its ordinary refusal.
     """
     comments = tuple(comments)
-    try:
-        raw = _extract_round_metadata_records(comments, flow="pr")
-    except AgentLoopError:
-        return None
-    if not any(
-        record.metadata.phase == EVIDENCE_CONVERSION_PHASE
-        and record.metadata.round_number == round_number
-        and record.metadata.subject == head_sha
-        for record in raw
+    if not conversion_boundary_candidate_present(
+        comments, round_number=round_number, head_sha=head_sha
     ):
         # No candidate: nothing to admit, so no identity read is made.
         return None

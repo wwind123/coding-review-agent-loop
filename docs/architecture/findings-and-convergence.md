@@ -234,8 +234,13 @@ that passes three checks:
 - a surviving `test_observations` citation of the accepted follow-up cites it.
 
 A failed citation repair therefore never earns the grant. A different head
-resets it, and like the count it is in memory only. The bounded round evidence
-projection stays display-only; no gate or count reads it. When the stop fires
+resets it, and like the count it is in memory only. The live reconciliation's
+prior-round input is the previous round's bounded projection
+(`prior_local_test_evidence`, decoded in `Runner.render_local_test_evidence`),
+so after a resume a parent-observed failure evicted from that projection cannot
+be seen as superseded and cannot earn the grant; this is conservative (#1639).
+The bounded round evidence projection stays display-only; no gate or count
+reads it. When the stop fires
 after the last follow-up's `test_observations` were dropped as a non-array,
 the message names that, says whether repair was attempted, and gives the
 number of uncited receipts from the frozen catalog.

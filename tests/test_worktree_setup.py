@@ -730,6 +730,32 @@ def test_tracked_deletions_are_refused_not_recloned_as_stale_store(tmp_path, mon
     assert not counter_b.exists()
 
 
+def test_kept_stale_store_logs_restore_remedy(tmp_path, monkeypatch):
+    """Keeping a store whose tracked files were deleted names the restore command (#1655)."""
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / "counter"
+    config = setup_config(env, setup_command(counter, "true"), links=())
+    store = claude_store()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    git_marker = store / ".git" / "agent-loop-test-marker"
+    git_marker.write_text("kept\n")
+    for entry in store.iterdir():
+        if entry.name != ".git":
+            shutil.rmtree(entry) if entry.is_dir() else entry.unlink()
+    messages: list[str] = []
+    monkeypatch.setattr(run_worktrees, "log", lambda _config, message: messages.append(message))
+    try:
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    except AgentLoopError:
+        pass  # the setup gate may still refuse; only the keep-path log matters here
+    kept = [message for message in messages if "has tracked content deleted" in message]
+    assert len(kept) == 1
+    assert shlex.join(["git", "-C", str(store), "checkout", "--", "."]) in kept[0]
+    assert "Per-run worktrees are unaffected" in kept[0]
+    assert git_marker.read_text() == "kept\n"  # the store was kept, not re-cloned
+    assert not (store / "requirements.txt").exists()  # nothing was restored automatically
+
+
 @pytest.mark.parametrize("state, tracked", [
     ("unborn-empty-index", False),
     ("index-entries", True),
@@ -1411,3 +1437,25 @@ def test_recovery_commands_preserve_worktree_setup_timeout(tmp_path):
         args = build_parser().parse_args(shlex.split(command)[1:])
         assert args.worktree_setup_timeout == "7200"
         assert args.worktree_setup == "npm ci"
+
+
+def test_tracked_tree_probe_failure_names_the_checkout(tmp_path, monkeypatch):
+    """The dirty-tree probe names the shared clone by default and the run worktree from PR-local setup (#1673)."""
+    from coding_review_agent_loop import local_test_evidence, worktree_pr_env
+
+    def fail(*_args, **_kwargs):
+        raise AgentLoopError("probe exploded")
+
+    monkeypatch.setattr(local_test_evidence, "_run_git", fail)
+    with pytest.raises(AgentLoopError) as shared:
+        worktree_setup.store_tracked_tree_dirty_paths(tmp_path)
+    assert str(shared.value).startswith(
+        f"Could not verify the tracked tree of the shared clone {tmp_path} before --worktree-setup: "
+        "probe exploded"
+    )
+    run_path = tmp_path / "run-worktree"
+    with pytest.raises(AgentLoopError) as run:
+        worktree_pr_env._uncommitted_inputs(tmp_path, {}, runner=Runner(), path=run_path)
+    message = str(run.value)
+    assert message.startswith(f"Could not verify the tracked tree of the run worktree {run_path} ")
+    assert "shared clone" not in message

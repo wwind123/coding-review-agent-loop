@@ -761,8 +761,18 @@ class LocalTestObservation:
     # Issue #1633: set only by ``decode_bounded_evidence``.  Never projected,
     # so a persisted payload cannot claim it.
     restored: bool = field(default=False, repr=False, compare=False)
+    # Issue #1661: why a launched run's suite start stayed ``unknown``.
+    # Diagnostic only: equality, the observation key, admission and
+    # citability never read it.  Anything outside the closed set, or beside
+    # another suite start, is normalized to ``None``.
+    suite_start_reason: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
+        if self.suite_start_reason is not None:
+            object.__setattr__(
+                self, "suite_start_reason",
+                coerce_suite_start_reason(self.suite_start_reason, self.suite_start),
+            )
         if self.outcome not in OUTCOMES:
             raise AgentLoopError(f"unknown local test outcome: {self.outcome}")
         if self.provenance not in PROVENANCES:
@@ -848,6 +858,10 @@ class LocalTestObservation:
                 inner_exec=self.inner_exec,
                 suite_start=self.suite_start,
             )
+        reason = coerce_suite_start_reason(self.suite_start_reason, self.suite_start)
+        if reason is not None:
+            # Only rows that carry one grow; legacy projections are unchanged.
+            projection["suite_start_reason"] = reason
         if self.fixture is not None:
             projection["fixture"] = self.fixture.to_dict()
         if self.restart_command_digest is not None and _RESTART_COMMAND_DIGEST_RE.match(
@@ -1119,6 +1133,9 @@ def observation_from_mapping(
         wrapper_bootstrap=str(value.get("wrapper_bootstrap", "unknown")),
         inner_exec=str(value.get("inner_exec", "not-attempted")),
         suite_start=str(value.get("suite_start", "not-started")),
+        suite_start_reason=coerce_suite_start_reason(
+            value.get("suite_start_reason"), value.get("suite_start", "not-started")
+        ),
         # A restored row cannot prove its tokens were never altered.
         command_verbatim=value.get("command_verbatim") is True,
         fixture=fixture,
@@ -2799,6 +2816,7 @@ from .test_runtime import (
     EXECUTED_ARGV_MAX_ITEM_BYTES as BROKER_MAX_ARG_BYTES,
     EXECUTED_ARGV_MAX_ITEMS as BROKER_MAX_ARGV,
     EXECUTED_ARGV_MAX_TOTAL_BYTES as BROKER_MAX_ARGV_TOTAL,
+    coerce_suite_start_reason,
 )
 BROKER_MAX_CWD_BYTES = 4 * 1024
 BROKER_MAX_ENV = 256
@@ -3289,6 +3307,9 @@ class BrokerRunResult:
     suite_start: str = "not-started"
     diagnostic: str = ""
     executed_argv: tuple[str, ...] = ()
+    # Issue #1661: diagnostic reason beside ``suite_start=unknown``; ``None``
+    # from an older broker or whenever the suite start is not unknown.
+    suite_start_reason: str | None = None
     workers_cohort: str | None = None
     worker_enforcement: str | None = None
     worker_caveats: tuple[str, ...] = ()
@@ -4445,6 +4466,9 @@ class TestBrokerServer:
         else:
             pre_collection = None
         inner_exec = str(getattr(result, "inner_exec", "not-attempted"))
+        suite_start_reason = coerce_suite_start_reason(
+            getattr(result, "suite_start_reason", None), suite_start
+        )
         fixture_record: FixtureRecord | None = None
         fixture_diagnostic = ""
         journal_fixture_row = False
@@ -4491,6 +4515,7 @@ class TestBrokerServer:
                 wrapper_bootstrap=str(getattr(result, "wrapper_bootstrap", "unknown")),
                 inner_exec=inner_exec,
                 suite_start=suite_start,
+                suite_start_reason=suite_start_reason,
                 executed_command=tuple(
                     str(item) for item in (getattr(result, "args", ()) or ())
                 ),
@@ -4562,6 +4587,10 @@ class TestBrokerServer:
             "worker_caveats": list(worker_caveats)[:16],
             "worker_environment": self._worker_environment_summary(environment),
         }
+        if suite_start_reason is not None:
+            # Issue #1661: present only beside ``suite_start=unknown``, so
+            # every other frame is unchanged for older clients.
+            response["suite_start_reason"] = suite_start_reason
         if fixture_record is not None:
             response[BROKER_FIXTURE_FIELD] = fixture_record.to_dict()
         if self.dependency_remedy and (result_outcome == "launch-failed" or inner_exec == "failed"):
@@ -4707,6 +4736,9 @@ class TestBrokerClient:
                     wrapper_bootstrap=str(response.get("wrapper_bootstrap", "unknown")),
                     inner_exec=str(response.get("inner_exec", "not-attempted")),
                     suite_start=str(response.get("suite_start", "not-started")),
+                    suite_start_reason=coerce_suite_start_reason(
+                        response.get("suite_start_reason"), response.get("suite_start", "not-started")
+                    ),
                     diagnostic=str(response.get("diagnostic", "")),
                     executed_argv=tuple(
                         str(item) for item in (response.get("executed_argv") or ())

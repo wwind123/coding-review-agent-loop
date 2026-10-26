@@ -498,7 +498,18 @@ def _prepare_store_locked(store: Path, *, free: bool, config: Any, runner: Any) 
             # artifact-only directory: keep the checkout and the setup record
             # so the setup gate refuses the deletions instead of re-cloning
             # over them (#1650).
-            log(config, f"Shared store {store} has tracked content deleted; keeping it for --worktree-setup.")
+            # When the setup record still matches and no --worktree-link is
+            # unusable, setup is skipped and the store stays without its
+            # tracked files, so name the remedy here (#1655).
+            restore = shlex.join(["git", "-C", os.fspath(store), "checkout", "--", "."])
+            log(
+                config,
+                f"Shared store {store} has tracked content deleted; keeping it for --worktree-setup. "
+                "If the setup record still matches and no --worktree-link is unusable, setup is "
+                "skipped and the store stays without its tracked files. Per-run worktrees are "
+                "unaffected because they come from the object store. To restore the store's "
+                f"tracked files, run: {restore}",
+            )
         elif not free:
             raise AgentLoopError(_held_store_message(store, "is stale and cannot be recreated"))
         else:
