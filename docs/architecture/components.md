@@ -143,7 +143,8 @@ Source paths below are relative to
 | Execution policy | `execution_policy.py` | Execution-policy resolution, child routing and provenance, staged reporting, typed plan-stage extraction, and fresh-topology preflights. |
 | Child plan binding | `child_plan_binding.py` | Inherited-matrix replan state, child-plan rebind and supersession, and structured plan-round assembly. |
 | PR loop support | `pr_loop_support.py` | Exact-head merge proof, finalization, evidence freeze, qualification snapshot, and PR transition observation; evidence conversion and signed-evidence references, read through the one authenticated comment accessor `authenticated_pr_comments`. |
-| PR review loop | `pr_loop.py` | The PR review loop entry point (`run_pr_loop`). |
+| PR loop decisions | `pr_loop_decisions.py` | Pure reviewer prelaunch classification, round-ledger settlement and CI plumbing routing, rerun-budget decisions and observation formatting; explicitly re-exported by `pr_loop.py`. |
+| PR review loop | `pr_loop.py` | The PR review loop entry point (`run_pr_loop`), patch-sensitive lifecycle callers and effectful managed-plumbing routing. The decision-helper extraction preserves execution, persistence and trust contracts. |
 | Approved-plan implementation | `issue_implementation.py` | Approved-plan implementation handoff and plan decomposition. |
 | Plan-first loop | `plan_first_loop.py` | The plan-first loop together with staged child dispatch and child planning cycles (one mutually recursive group, kept in one module). |
 | Issue and task loops | `issue_loop.py` | The issue and task loop entry points. |
