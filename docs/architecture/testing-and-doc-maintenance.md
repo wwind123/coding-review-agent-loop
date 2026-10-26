@@ -2,7 +2,7 @@
 
 How the test suite exercises the orchestrator, when the architecture set must change, how architecture context is injected, and how semantic-claim validation degrades the narrowest offending element: architecture-impact parser modes and canonicalization, the reviewer status re-ask, `test_observations` citation degradation, and the `protocol.py` shape-check audit.
 
-Source paths: `src/coding_review_agent_loop/architecture_context.py`, `src/coding_review_agent_loop/architecture_contract.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/validated_agent.py`, `src/coding_review_agent_loop/repair_preservation.py`, `src/coding_review_agent_loop/shape_check_audit.py`, `tests/`, `tests/test_architecture_context.py`, `tests/test_architecture_set_validation.py`, `tests/test_shape_check_audit.py`, `tests/test_docs_guidance.py`.
+Source paths: `src/coding_review_agent_loop/architecture_context.py`, `src/coding_review_agent_loop/architecture_contract.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/validated_agent.py`, `src/coding_review_agent_loop/repair_preservation.py`, `src/coding_review_agent_loop/shape_check_audit.py`, `tests/`, `tests/test_architecture_context.py`, `tests/test_architecture_set_validation.py`, `tests/test_shape_check_audit.py`, `tests/test_docs_guidance.py`, `tests/test_source_file_size.py`.
 
 ## Tests and Document Maintenance
 
@@ -40,6 +40,18 @@ identity, size and heading index with a split recommendation; coder
 `canonical_document_path` values are validated against the set by a semantic
 re-ask; and the PR comparison reports a detail-doc-only edit as a set change.
 See `docs/local_agent_loop.md` for the layout and size budget.
+
+`tests/test_source_file_size.py` caps every `.py` file under
+`src/coding_review_agent_loop/` at `DEFAULT_LIMIT` (6,000) lines, counted as
+`len(text.splitlines())`. Files already over the limit when the guard landed
+sit in its `ALLOWLIST` with their measured size as their own ceiling, so each
+entry is a ratchet: the file may shrink but not grow. A failure names the
+file, its size and limit, and whether the limit is the default or an
+allowlist ceiling, and points to #1623. A second test rejects an entry whose
+file is gone, is back at or under the default, or whose ceiling is not above
+it. To split a file, move cohesive groups to sibling modules without behavior
+changes, re-export the moved names, list the moved symbols in the PR, and
+lower or delete the entry in the same PR.
 
 Each detail doc's decision history lives in a paired, append-only log at
 `docs/architecture/decisions/<same-name>.md`; the detail doc's final
