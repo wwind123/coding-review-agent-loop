@@ -7893,3 +7893,98 @@ def test_fixture_cancel_keeps_the_lane_until_teardown_finishes(tmp_path, monkeyp
     finally:
         server.stop()
     _fx_assert_gone(_fx_pids(markers))
+
+
+# --- #1661: persisted suite_start_reason ------------------------------------
+
+
+def _write_passing_pytest_file(tmp_path: Path) -> Path:
+    test_file = tmp_path / "test_reason_1661.py"
+    test_file.write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    return test_file
+
+
+def test_unrecognized_launched_run_records_the_unrecognized_reason_1661(tmp_path, no_ambient_invocation):
+    """`reason-fresh-unrecognized`: a launched unrecognized command keeps its exit code and outcome."""
+    from coding_review_agent_loop import runner as runner_module
+
+    script = tmp_path / "check.py"
+    script.write_text("print('checked')\n", encoding="utf-8")
+    result = runner_module.run_foreground_test(
+        [sys.executable, str(script)], cwd=tmp_path, timeout_seconds=60, echo_output=False
+    )
+    assert (result.outcome, result.returncode) == ("passed", 0)
+    assert result.inner_exec == "started" and result.suite_start == "unknown"
+    assert result.suite_start_reason == runtime.SUITE_START_REASON_UNRECOGNIZED
+    assert runtime.launch_integrity_state(result, wrapper_boundary=False) == "unverified"
+
+
+def test_recognized_launcher_with_unavailable_probe_records_probe_unavailable_1661(
+    tmp_path, monkeypatch, no_ambient_invocation
+):
+    """`reason-probe-unavailable`: a recognized launcher whose probe returned unknown."""
+    from coding_review_agent_loop import runner as runner_module
+
+    test_file = _write_passing_pytest_file(tmp_path)
+    monkeypatch.setenv("AGENT_LOOP_INVOCATION_ID", "probe-unavailable-1661")
+    monkeypatch.setattr(runtime, "MAX_INNER_PROBE_CANDIDATES", 0)
+    result = runner_module.run_foreground_test(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(test_file)],
+        cwd=tmp_path, timeout_seconds=120, echo_output=False,
+    )
+    assert result.outcome == "passed" and result.inner_exec == "started"
+    assert result.suite_start == "unknown"
+    assert result.suite_start_reason == runtime.SUITE_START_REASON_PROBE_UNAVAILABLE
+    assert runtime.launch_integrity_state(result, wrapper_boundary=False) == "unverified"
+
+
+def test_verified_run_records_no_suite_start_reason_1661(tmp_path, no_ambient_invocation):
+    from coding_review_agent_loop import runner as runner_module
+
+    test_file = _write_passing_pytest_file(tmp_path)
+    result = runner_module.run_foreground_test(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(test_file)],
+        cwd=tmp_path, timeout_seconds=120, echo_output=False,
+    )
+    assert result.suite_start == "verified"
+    assert result.suite_start_reason is None
+
+
+def test_request_deadline_truncated_probe_never_spawns_and_records_no_reason_1661(
+    tmp_path, monkeypatch, no_ambient_invocation
+):
+    """`probe-deadline-no-launch`: unchanged no-launch result, with no reason recorded."""
+    from coding_review_agent_loop import runner as runner_module
+
+    marker = tmp_path / "target-ran"
+    script = tmp_path / "check.py"
+    script.write_text(f"open({str(marker)!r}, 'w').write('ran')\n", encoding="utf-8")
+
+    def truncated_probe(argv, **_kwargs):
+        return runtime.LauncherProbeResult(tuple(argv), "unknown", runtime.PROBE_DEADLINE_DIAGNOSTIC, "id")
+
+    monkeypatch.setattr(runner_module, "probe_inner_launcher", truncated_probe)
+    result = runner_module.run_foreground_test(
+        [sys.executable, str(script)], cwd=tmp_path, timeout_seconds=60, echo_output=False,
+        absolute_deadline=time.monotonic() + 60,
+    )
+    assert result.outcome == "timed_out"
+    assert result.inner_exec == "not-attempted" and result.suite_start == "not-started"
+    assert result.suite_start_reason is None
+    assert not marker.exists()
+
+
+def test_suite_start_reason_helpers_are_closed_set_1661():
+    probe = runtime.LauncherProbeResult
+    assert runtime.suite_start_reason_for_probe(
+        probe(("x",), "unknown", runtime.UNRECOGNIZED_INNER_LAUNCHER_DIAGNOSTIC)
+    ) == runtime.SUITE_START_REASON_UNRECOGNIZED
+    assert runtime.suite_start_reason_for_probe(
+        probe(("x",), "unknown", "probe containment unavailable")
+    ) == runtime.SUITE_START_REASON_PROBE_UNAVAILABLE
+    assert runtime.suite_start_reason_for_probe(probe(("x",), "verified")) is None
+    assert runtime.suite_start_reason_for_probe(probe(("x",), "failed", "boom")) is None
+    assert runtime.coerce_suite_start_reason("probe-unavailable", "unknown") == "probe-unavailable"
+    assert runtime.coerce_suite_start_reason("probe-unavailable", "verified") is None
+    assert runtime.coerce_suite_start_reason("made-up", "unknown") is None
+    assert runtime.coerce_suite_start_reason(None, "unknown") is None

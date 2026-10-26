@@ -7148,3 +7148,92 @@ def test_restored_evidence_from_another_registration_never_matches_a_fresh_build
     same = _run_a_failure(head=head, digest=digests["fresh-registration-1"])
     evidence = _reconcile_b([*same, passing], registry=registry, current_head=head, snapshot=fresh)
     _assert_cross_restart_superseded(evidence)
+
+
+# --- #1661: persisted suite_start_reason -------------------------------------
+
+
+def test_broker_persists_the_unrecognized_reason_on_the_row_response_and_notice_1661(tmp_path):
+    """`reason-fresh-unrecognized`: result, journaled row and receipt notice agree."""
+    from coding_review_agent_loop.protocol import _authoritative_receipt_passes
+
+    _git_checkout(tmp_path)
+    script = tmp_path / "check.py"
+    script.write_text("print('checked')\n", encoding="utf-8")
+    runner, result, _row, log = _brokered_run_tests(tmp_path, [sys.executable, str(script)])
+    assert result.returncode == 0, log
+    (observation,) = runner.local_test_observations()
+    assert (observation.outcome, observation.returncode) == ("passed", 0)
+    assert observation.suite_start == "unknown"
+    assert observation.suite_start_reason == "unrecognized-launcher"
+    assert observation.public_projection()["suite_start_reason"] == "unrecognized-launcher"
+    assert not _authoritative_receipt_passes(observation, claim="current-result")
+    assert "not citable evidence: unrecognized test launcher" in log
+
+
+def test_broker_persists_the_probe_unavailable_reason_1661(tmp_path, monkeypatch):
+    """`reason-probe-unavailable`: a recognized launcher is never called unrecognized."""
+    from coding_review_agent_loop import test_runtime as runtime
+    from coding_review_agent_loop.protocol import _authoritative_receipt_passes
+
+    _git_checkout(tmp_path)
+    (tmp_path / "test_ok_1661.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    # The broker probes in this process: no candidate may be probed.
+    monkeypatch.setattr(runtime, "MAX_INNER_PROBE_CANDIDATES", 0)
+    runner, result, _row, log = _brokered_run_tests(
+        tmp_path, [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "test_ok_1661.py"],
+    )
+    assert result.returncode == 0, log
+    (observation,) = runner.local_test_observations()
+    assert observation.suite_start == "unknown"
+    assert observation.suite_start_reason == "probe-unavailable"
+    assert not _authoritative_receipt_passes(observation, claim="current-result")
+    assert "bootstrap probe could not verify it" in log
+    assert "unrecognized test launcher" not in log
+
+
+def test_suite_start_reason_round_trips_and_legacy_rows_decode_to_none_1661():
+    """`reason-legacy-restore`: decode never fails, and equality and keys ignore the reason."""
+    from coding_review_agent_loop.local_test_evidence import _observation_key, observation_from_mapping
+
+    base = dict(
+        command=("python3", "scripts/x.py"), outcome="passed", provenance="parent-observed",
+        receipt_id="receipt-1661", wrapper_bootstrap="verified", inner_exec="started",
+        suite_start="unknown",
+    )
+    live = LocalTestObservation(**base, suite_start_reason="probe-unavailable")
+    projection = live.public_projection()
+    assert projection["suite_start_reason"] == "probe-unavailable"
+    restored = observation_from_mapping(json.loads(json.dumps(projection)))
+    assert restored.suite_start_reason == "probe-unavailable"
+
+    legacy = dict(projection)
+    del legacy["suite_start_reason"]
+    for value, suite_start in ((legacy, "unknown"),
+                               ({**projection, "suite_start_reason": "made-up"}, "unknown"),
+                               ({**projection, "suite_start_reason": 7}, "unknown"),
+                               ({**projection, "suite_start": "verified"}, "verified")):
+        decoded = observation_from_mapping(value)
+        assert decoded.suite_start == suite_start
+        assert decoded.suite_start_reason is None
+        assert "suite_start_reason" not in decoded.public_projection()
+
+    plain = LocalTestObservation(**base)
+    assert plain == live
+    assert _observation_key(plain) == _observation_key(live)
+    assert "suite_start_reason" not in plain.public_projection()
+    # A reason beside another suite start is normalized away, never raised.
+    assert LocalTestObservation(
+        **{**base, "suite_start": "verified"}, suite_start_reason="unrecognized-launcher"
+    ).suite_start_reason is None
+
+
+def test_client_decodes_the_reason_fail_closed_1661():
+    """An older broker's frame carries no reason; an out-of-set value is dropped."""
+    from coding_review_agent_loop.local_test_evidence import BrokerRunResult
+    from coding_review_agent_loop.test_runtime import coerce_suite_start_reason
+
+    assert BrokerRunResult(
+        receipt_id="r", execution_ref=None, outcome="passed", returncode=0, elapsed_seconds=0.0,
+    ).suite_start_reason is None
+    assert coerce_suite_start_reason({"x": 1}, "unknown") is None

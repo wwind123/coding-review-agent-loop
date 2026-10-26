@@ -1068,16 +1068,32 @@ def _partial_round_refusal(
     public_peers: Sequence[str],
     cause: str = "",
     recovery: Callable[[], PartialRoundRecovery] | None = None,
+    unresolved_conversion_boundary: bool = False,
 ) -> PartialReviewRoundError:
     target = f"PR #{number}" if surface == "pr" else f"issue #{number}"
-    message = (
+    prefix = (
         f"Review round {round_number} on {target} is partially published "
-        f"({', '.join(public_peers)} already posted) but {reviewer_name}'s withheld "
-        "same-round outcome is missing or no longer validates, so invoking it now would "
-        "let it read its peers' findings."
+        f"({', '.join(public_peers)} already posted)"
     )
-    if cause:
-        message += f" {cause}"
+    if unresolved_conversion_boundary:
+        # Neutral about the cause: an identity read that failed and an
+        # untrusted record both leave the boundary unresolved (#1676).
+        message = (
+            f"{prefix}, and this round's evidence-conversion record could not be admitted "
+            "as a trusted boundary: either its identity could not be read or it is not a "
+            "trusted, accepted conversion record. So the earlier pass's publications cannot "
+            f"be excluded from the peer set, and invoking {reviewer_name} now could let it "
+            "read them; the run stopped fail-closed. Retry once GitHub comment reads "
+            "succeed, or inspect the conversion record if reads were healthy."
+        )
+    else:
+        message = (
+            f"{prefix} but {reviewer_name}'s withheld "
+            "same-round outcome is missing or no longer validates, so invoking it now would "
+            "let it read its peers' findings."
+        )
+        if cause:
+            message += f" {cause}"
     if recovery is not None:
         try:
             listing = _render_recovery(recovery())
@@ -1107,6 +1123,7 @@ def _refuse_partial_round_before_sequential_turns(
     public_peers: Sequence[AgentName],
     already_posted: Sequence[AgentName] = (),
     recovery: Callable[[], PartialRoundRecovery] | None = None,
+    unresolved_conversion_boundary: bool = False,
 ) -> None:
     """Stop before any sequential turn when one of them would face a public peer.
 
@@ -1124,8 +1141,9 @@ def _refuse_partial_round_before_sequential_turns(
                 reviewer_name=agent_display_name(reviewer), public_peers=peers,
                 cause=_replay_unavailable_cause(
                     spool, agent_display_name(reviewer), own_posted=reviewer in already_posted
-                ),
+                ) if not unresolved_conversion_boundary else "",
                 recovery=recovery,
+                unresolved_conversion_boundary=unresolved_conversion_boundary,
             )
 
 
@@ -1140,6 +1158,7 @@ def _same_round_replay_or_invoke(
     invoke: Callable[[], ValidatedAgentResponse],
     already_posted: bool = False,
     recovery: Callable[[], PartialRoundRecovery] | None = None,
+    unresolved_conversion_boundary: bool = False,
 ) -> ValidatedAgentResponse:
     """Sequential-mode seam: never invoke a reviewer against public same-round peers.
 
@@ -1168,8 +1187,9 @@ def _same_round_replay_or_invoke(
         cause=_replay_unavailable_cause(
             spool, reviewer_name, own_posted=already_posted,
             loaded_unreplayable=fields is not None,
-        ),
+        ) if not unresolved_conversion_boundary else "",
         recovery=recovery,
+        unresolved_conversion_boundary=unresolved_conversion_boundary,
     )
 
 
@@ -1191,6 +1211,7 @@ def _launch_reviewer_turns(
     max_workers: int | None = None,
     prepare_fallback: Callable[[AgentName], None] | None = None,
     recovery: Callable[[], PartialRoundRecovery] | None = None,
+    unresolved_conversion_boundary: bool = False,
 ) -> dict[AgentName, _ReviewerTurnResult]:
     """Run workers concurrently, then deliver results in completion order.
 
@@ -1288,8 +1309,9 @@ def _launch_reviewer_turns(
                         spool, agent_display_name(reviewer),
                         own_posted=reviewer in already_posted,
                         loaded_unreplayable=reviewer in replay_fallbacks,
-                    ),
+                    ) if not unresolved_conversion_boundary else "",
                     recovery=recovery,
+                    unresolved_conversion_boundary=unresolved_conversion_boundary,
                 )
     if prepare_fallback is not None:
         for reviewer in [r for r in replay_fallbacks if r in to_launch]:

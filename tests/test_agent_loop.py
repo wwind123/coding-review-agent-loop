@@ -5659,6 +5659,52 @@ def test_run_tests_classifies_package_scripts_statically(tmp_path, monkeypatch, 
         assert "Citable runners" not in err
 
 
+@pytest.mark.parametrize(
+    "reason, inner, expected, absent",
+    [
+        # A recognized pytest argv still gets the unrecognized wording when the
+        # broker says so: the persisted reason wins over re-classification.
+        ("unrecognized-launcher", [sys.executable, "-m", "pytest", "-q"], _UNRECOGNIZED_NOTICE, "bootstrap probe"),
+        ("probe-unavailable", [sys.executable, "scripts/x.py"],
+         "the test launcher is recognized, but its bootstrap probe could not verify it", "unrecognized"),
+    ],
+    ids=["unrecognized", "probe-unavailable"],
+)
+def test_run_tests_notice_uses_the_persisted_reason_without_reclassifying_1661(
+    tmp_path, monkeypatch, capsys, reason, inner, expected, absent
+):
+    import coding_review_agent_loop.test_runtime as test_runtime_module
+
+    calls = []
+    monkeypatch.setattr(
+        test_runtime_module, "recognized_inner_probe", lambda *a, **k: calls.append(a) or ()
+    )
+    code, err, recorded = _run_tests_notice(
+        tmp_path, monkeypatch, capsys, inner, suite_start_reason=reason
+    )
+    assert code == 0
+    assert calls == []
+    assert expected in err and absent not in err
+    assert err.index("agent-loop test observation receipt: receipt-1659") < err.index(expected)
+    assert err.count("not citable evidence") == 1
+    assert recorded == ["timing"]
+
+
+def test_run_tests_notice_falls_back_to_the_recognizer_without_a_reason_1661(tmp_path, monkeypatch, capsys):
+    """`reason-legacy-restore`: an older broker's frame keeps the #1659 behaviour."""
+    import coding_review_agent_loop.test_runtime as test_runtime_module
+
+    calls = []
+    original = test_runtime_module.recognized_inner_probe
+    monkeypatch.setattr(
+        test_runtime_module, "recognized_inner_probe",
+        lambda *a, **k: calls.append(a) or original(*a, **k),
+    )
+    code, err, _recorded = _run_tests_notice(tmp_path, monkeypatch, capsys, [sys.executable, "scripts/x.py"])
+    assert code == 0 and calls
+    assert _UNRECOGNIZED_NOTICE in err
+
+
 # --- #1652: --worktree-setup-pr-local validation and recovery passthrough ---
 
 _PR_LOCAL_COMPANIONS = (

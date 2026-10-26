@@ -1837,11 +1837,20 @@ again after the receipt line as `agent-loop: no test ran (<outcome>):
 its command, phase and age.
 A receipt whose inner command started but whose suite start was never verified
 (`suite_start=unknown`) can never be cited, so `run-tests` says so right after
-the receipt line (#1659). For a launcher the inner-probe recognizer does not
-accept (for example `python scripts/x.py`) it prints
+the receipt line (#1659). The broker persists why the suite start stayed
+unknown as a diagnostic-only `suite_start_reason` on the result and its
+journaled observation (#1661): `unrecognized-launcher` or `probe-unavailable`.
+It never changes admission, citability or a disqualifier. For a launcher the
+inner-probe recognizer does not accept (for example `python scripts/x.py`,
+reason `unrecognized-launcher`) it prints
 `agent-loop: this receipt is not citable evidence: unrecognized test launcher, so suite start was not verified (suite_start=unknown). Citable runners: <runners>. Wrap the check in a pytest test to make it citable; you may still report it in tests_run.`
-For a recognized launcher whose probe merely did not verify (package scripts
-are resolved statically first, nothing is spawned) it prints the shorter
+For a recognized launcher whose bootstrap probe could not verify it (reason
+`probe-unavailable`, for example unavailable probe containment) it prints
+`agent-loop: this receipt is not citable evidence: the test launcher is recognized, but its bootstrap probe could not verify it in this run, so suite start was not verified (suite_start=unknown). Rerunning the same command may make it citable; you may still report it in tests_run.`
+The post-authentication `inadmissible-execution` diagnostic uses the same
+reason. Without a reason (an older broker or a legacy row) the client
+classifies the launcher statically as before (package scripts are resolved,
+nothing is spawned) and a recognized launcher gets the shorter
 `agent-loop: this receipt is not citable evidence: suite start was not verified (suite_start=unknown); you may still report it in tests_run.`
 No notice is printed for no-test refusals or pre-collection launch failures,
 and the notice changes no exit code, observation, timing row or launcher
@@ -4889,6 +4898,11 @@ receipt from its own turn meets both conditions:
 The run logs `unchanged head but authoritative cited evidence progress;
 granting one review round` with the receipt IDs. A later unchanged follow-up at
 the same head stops as before, and the grant is not persisted across a resume.
+After a resume the live reconciliation sees earlier rounds only through the
+previous round's bounded evidence projection, so a parent-observed failure
+evicted from that projection cannot be seen as superseded and cannot earn the
+grant. This is conservative: the run stops at the limit as it would without
+the exception.
 When the stop fires and the last follow-up's `test_observations` were dropped
 as a non-array, the stop message adds: `The coder's test_observations were not
 a JSON array (format repair attempted: yes|no); N run-tests receipt(s) from

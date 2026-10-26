@@ -36,6 +36,7 @@ from .test_runtime import (
     INNER_EXEC_STATES,
     OVERLAP_REJECTED_EXIT_CODE,
     OVERLAP_REJECTED_MESSAGE,
+    SUITE_START_REASONS,
     SUITE_START_STATES,
     WRAPPER_BOOTSTRAP_STATES,
     PROBE_DEADLINE_DIAGNOSTIC,
@@ -45,6 +46,7 @@ from .test_runtime import (
     inner_launcher_identity_key,
     probe_inner_launcher,
     resolve_adopted_package_script,
+    suite_start_reason_for_probe,
 )
 from .test_workers import (
     CAVEAT_DESCENDANTS,
@@ -259,6 +261,10 @@ class ForegroundTestResult:
     # Only set when the caller asked for classification; the outcome and
     # returncode keep their ordinary values.
     pre_collection_launch_failure: str | None = None
+    # Issue #1661: why a launched run's suite start stayed ``unknown``
+    # (``unrecognized-launcher`` or ``probe-unavailable``).  Diagnostic only;
+    # ``None`` whenever no probe decided it or the suite start is not unknown.
+    suite_start_reason: str | None = None
 
     def __post_init__(self) -> None:
         if self.wrapper_bootstrap not in WRAPPER_BOOTSTRAP_STATES:
@@ -267,6 +273,10 @@ class ForegroundTestResult:
             raise ValueError(f"unknown inner exec state: {self.inner_exec}")
         if self.suite_start not in SUITE_START_STATES:
             raise ValueError(f"unknown suite start state: {self.suite_start}")
+        if self.suite_start_reason is not None and (
+            self.suite_start_reason not in SUITE_START_REASONS or self.suite_start != "unknown"
+        ):
+            raise ValueError(f"invalid suite start reason: {self.suite_start_reason}")
 
     @property
     def passed(self) -> bool:
@@ -944,6 +954,7 @@ def _run_foreground_test_body(
     target_exec_error = False
     proc: subprocess.Popen[bytes] | None = None
     inner_probe_state = "unknown"
+    inner_probe_reason: str | None = None
     held_fds: tuple[int, int, int, int] | None = None
     probe_setup = None
     launch_source = cmd
@@ -1005,6 +1016,7 @@ def _run_foreground_test_body(
                 cmd, cwd, timeout_seconds, wrapper_bootstrap, health_provenance,
             )
         inner_probe_state = inner_probe.state
+        inner_probe_reason = suite_start_reason_for_probe(inner_probe)
         if absolute_deadline is not None and (
             inner_probe.diagnostic == PROBE_DEADLINE_DIAGNOSTIC
             or time.monotonic() >= absolute_deadline
@@ -1672,6 +1684,7 @@ def _run_foreground_test_body(
             if outcome == "failed" and not analysis_direct_refusal
             else None
         ),
+        suite_start_reason=inner_probe_reason if suite_start == "unknown" else None,
     )
 
 

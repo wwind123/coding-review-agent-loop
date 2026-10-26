@@ -147,11 +147,14 @@ def _refuse_tracked(config: Any, runner: Any, alias: Path, names: list[bytes]) -
             raise AgentLoopError(f"refusing PR-local setup: {exc}") from exc
 
 
-def _uncommitted_inputs(alias: Path, entries: dict, *, runner: Any) -> list[str]:
+def _uncommitted_inputs(
+    alias: Path, entries: dict, *, runner: Any, path: Path | str | None = None,
+) -> list[str]:
     """Every tracked change Git could hide from a HEAD-only setup, plus shadowed absent keys."""
     from .worktree_setup import _untracked_absent_keys, store_tracked_tree_dirty_paths
 
-    dirty = store_tracked_tree_dirty_paths(alias)
+    shown = alias if path is None else path
+    dirty = store_tracked_tree_dirty_paths(alias, where=f"the run worktree {shown}")
     shadows = [
         f"{key}{_SHADOW_SUFFIX}"
         for key in _untracked_absent_keys(alias, entries, runner=runner, tracked_at_head=False)
@@ -206,7 +209,7 @@ def reconcile_pr_local_environment(config: Any, runner: Any, path: Path) -> Priv
     if not initial and digest == reference_digest:
         cv.set_environment_deferred(path, ())
         return None
-    offending = _uncommitted_inputs(alias, entries, runner=runner)
+    offending = _uncommitted_inputs(alias, entries, runner=runner, path=path)
     if offending:
         if cv.set_environment_deferred(path, tuple(offending)):
             hint = ""

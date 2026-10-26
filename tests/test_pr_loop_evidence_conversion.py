@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -1477,6 +1478,32 @@ def test_a_primary_only_round_then_auto_conversion_reruns_the_full_board_without
     assert records[-1].metadata.phase == "evidence-freeze"
 
 
+def _assert_unresolved_boundary_refusal(message: str) -> None:
+    """The refusal names the unresolved conversion boundary, neutral about why (#1676)."""
+    assert message.startswith("Review round 3 on PR #77 is partially published (Antigravity already posted), ")
+    assert "this round's evidence-conversion record could not be admitted as a trusted boundary" in message
+    assert "either its identity could not be read or it is not a trusted, accepted conversion record" in message
+    assert "withheld" not in message
+    assert "missing or no longer validates" not in message
+
+
+def _fail_boundary_identity_reads(monkeypatch) -> None:
+    """Only the visibility boundary's identity read fails from now on.
+
+    The evidence gate still admits the conversion, so the repeat pass starts.
+    """
+    import coding_review_agent_loop.pr_loop_support as support
+
+    real_admit = support.admitted_pr_records_status
+
+    def boundary_read_fails(*args, **kwargs):
+        if sys._getframe(1).f_code.co_name == "conversion_visibility_boundary":
+            raise AgentLoopError("comment identity read failed")
+        return real_admit(*args, **kwargs)
+
+    monkeypatch.setattr(support, "admitted_pr_records_status", boundary_read_fails)
+
+
 def test_an_untrusted_conversion_record_does_not_move_the_visibility_boundary(tmp_path, monkeypatch):
     """`forged-conversion-boundary`: a foreign conversion record hides no real peer."""
     import coding_review_agent_loop.pr_loop_support as support
@@ -1496,8 +1523,31 @@ def test_an_untrusted_conversion_record_does_not_move_the_visibility_boundary(tm
     with pytest.raises(PartialReviewRoundError) as refused:
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
     assert "Antigravity already posted" in str(refused.value)
+    _assert_unresolved_boundary_refusal(str(refused.value))
     conversion = _conversion(runner)
     assert runner.pr_payload["comments"][conversion.index]["author"] == {"login": "mallory"}
+    assert _reviews_after(runner, conversion.index) == []
+    assert _agent_count(runner, "codex") == 1 and _agent_count(runner, "gemini") == 1
+
+
+def test_a_failed_identity_read_names_the_unresolved_conversion_boundary(tmp_path, monkeypatch):
+    """`conversion-unresolved-refusal` (#1676): the guard still fires, with boundary wording."""
+    import coding_review_agent_loop.pr_loop_support as support
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+    real_apply = support._apply_evidence_conversion
+
+    def apply_then_lose_reads(*args, **kwargs):
+        outcome = real_apply(*args, **kwargs)
+        _fail_boundary_identity_reads(monkeypatch)
+        return outcome
+
+    monkeypatch.setattr(support, "_apply_evidence_conversion", apply_then_lose_reads)
+    with pytest.raises(PartialReviewRoundError) as refused:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    _assert_unresolved_boundary_refusal(str(refused.value))
+    conversion = _conversion(runner)
     assert _reviews_after(runner, conversion.index) == []
     assert _agent_count(runner, "codex") == 1 and _agent_count(runner, "gemini") == 1
 
@@ -1564,6 +1614,36 @@ def test_a_partial_repeat_pass_still_refuses_and_lists_only_post_conversion_reco
     assert listed
     conversion_id = 10_000 + conversion.index + 1
     assert all(comment_id > conversion_id for comment_id in listed)
+
+
+def test_a_sequential_resume_with_a_failed_boundary_read_names_the_unresolved_boundary(
+    tmp_path, monkeypatch
+):
+    """`conversion-unresolved-refusal`, sequential guard (#1676): wording only, still no launch."""
+    from coding_review_agent_loop.review_rounds import _review_round_spool
+
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+    _interrupt_repeat(monkeypatch, publish=1)
+    with pytest.raises(AgentLoopError, match="interrupted inside the conversion repeat"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    _review_round_spool(
+        config, surface="pr", number=77, round_number=3, subject=START_HEAD
+    ).discard()
+    runner.simulate_new_process()
+    _fail_boundary_identity_reads(monkeypatch)
+    launches = {name: _agent_count(runner, command) for name, command in _BOARD_COMMANDS.items()}
+    with pytest.raises(PartialReviewRoundError) as refused:
+        run_pr_loop(
+            runner, pr_number=77, approved_plan_context=context,
+            config=dataclasses.replace(config, review_parallel=False),
+        )
+    message = str(refused.value)
+    assert message.startswith("Review round 3 on PR #77 is partially published (")
+    assert "Antigravity" in message.split(" already posted)", 1)[0]
+    assert "this round's evidence-conversion record could not be admitted as a trusted boundary" in message
+    assert "withheld" not in message and "missing or no longer validates" not in message
+    assert launches == {name: _agent_count(runner, command) for name, command in _BOARD_COMMANDS.items()}
 
 
 def test_a_stale_pre_conversion_spool_outcome_is_discarded_and_never_replayed(tmp_path, monkeypatch):

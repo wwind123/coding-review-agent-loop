@@ -2331,6 +2331,14 @@ UNCITABLE_RECEIPT_GENERIC_MESSAGE = (
 )
 
 
+UNCITABLE_RECEIPT_PROBE_UNAVAILABLE_MESSAGE = (
+    "agent-loop: this receipt is not citable evidence: the test launcher is recognized, but "
+    "its bootstrap probe could not verify it in this run, so suite start was not verified "
+    "(suite_start=unknown). Rerunning the same command may make it citable; you may still "
+    "report it in tests_run."
+)
+
+
 def _uncitable_receipt_unrecognized_message() -> str:
     from .test_runtime import CITABLE_TEST_RUNNERS_SUMMARY
 
@@ -2346,10 +2354,12 @@ def _announce_uncitable_receipt(result, raw_inner: Sequence[str]) -> None:
     """Say next to the receipt line when it can never be cited (#1659).
 
     Advisory only: it changes no exit code, observation, timing or launcher
-    health.  The launcher is classified with the same static recognizer the
-    broker's probe uses (package scripts resolved from package.json, nothing
-    spawned), so a recognized launcher whose probe merely failed to verify is
-    never called unrecognized.
+    health.  The broker's persisted ``suite_start_reason`` (#1661) selects the
+    wording.  Only when it is absent (an older broker) is the launcher
+    classified with the same static recognizer the broker's probe uses
+    (package scripts resolved from package.json, nothing spawned), so a
+    recognized launcher whose probe merely failed to verify is never called
+    unrecognized.
     """
     if str(getattr(result, "outcome", "")) in _NO_RECORD_OUTCOMES:
         return
@@ -2357,7 +2367,20 @@ def _announce_uncitable_receipt(result, raw_inner: Sequence[str]) -> None:
         return
     if getattr(result, "inner_exec", None) != "started" or getattr(result, "suite_start", None) != "unknown":
         return
-    from .test_runtime import recognized_inner_probe
+    from .test_runtime import (
+        SUITE_START_REASON_PROBE_UNAVAILABLE,
+        SUITE_START_REASON_UNRECOGNIZED,
+        coerce_suite_start_reason,
+        recognized_inner_probe,
+    )
+
+    reason = coerce_suite_start_reason(getattr(result, "suite_start_reason", None), "unknown")
+    if reason == SUITE_START_REASON_UNRECOGNIZED:
+        print(_uncitable_receipt_unrecognized_message(), file=sys.stderr, flush=True)
+        return
+    if reason == SUITE_START_REASON_PROBE_UNAVAILABLE:
+        print(UNCITABLE_RECEIPT_PROBE_UNAVAILABLE_MESSAGE, file=sys.stderr, flush=True)
+        return
 
     try:
         probe = recognized_inner_probe(list(raw_inner), cwd=Path.cwd(), environment=os.environ)

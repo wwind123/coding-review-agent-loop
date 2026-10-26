@@ -569,3 +569,51 @@ def test_home_exemption_does_not_cover_ancestors_of_home(tmp_path, spool_config,
     config = _make_spool_config(tmp_path, agent_memory_dir=home / ".cache" / "agent-loop" / "memory")
     with pytest.raises(_SpoolError, match="repository checkout"):
         review_rounds.validate_review_spool_placement(config)
+
+
+def test_partial_round_refusal_wording_with_and_without_an_unresolved_conversion_boundary():
+    """The ordinary refusal is unchanged; an unresolved boundary drops the withheld-outcome diagnosis (#1676)."""
+    recovery_calls = []
+
+    def recovery():
+        recovery_calls.append(True)
+        raise RuntimeError("listing unavailable")
+
+    ordinary = review_rounds._partial_round_refusal(
+        surface="pr", number=77, round_number=3, reviewer_name="Codex",
+        public_peers=["Antigravity", "Gemini"], cause="Some cause.",
+    )
+    assert str(ordinary) == (
+        "Review round 3 on PR #77 is partially published (Antigravity, Gemini already posted) "
+        "but Codex's withheld same-round outcome is missing or no longer validates, so "
+        "invoking it now would let it read its peers' findings. Some cause."
+    )
+    unresolved = review_rounds._partial_round_refusal(
+        surface="pr", number=77, round_number=3, reviewer_name="Codex",
+        public_peers=["Antigravity"], cause="Ignored cause.", recovery=recovery,
+        unresolved_conversion_boundary=True,
+    )
+    assert type(unresolved) is review_rounds.PartialReviewRoundError
+    message = str(unresolved)
+    first, listing = message.split("\n", 1)
+    assert first == (
+        "Review round 3 on PR #77 is partially published (Antigravity already posted), and "
+        "this round's evidence-conversion record could not be admitted as a trusted boundary: "
+        "either its identity could not be read or it is not a trusted, accepted conversion "
+        "record. So the earlier pass's publications cannot be excluded from the peer set, and "
+        "invoking Codex now could let it read them; the run stopped fail-closed. Retry once "
+        "GitHub comment reads succeed, or inspect the conversion record if reads were healthy."
+    )
+    assert recovery_calls == [True] and "comment list is unavailable" in listing
+    assert "withheld" not in message and "Ignored cause" not in message
+
+
+def test_sequential_guard_threads_the_unresolved_conversion_boundary():
+    spool = SimpleNamespace(surface="pr", number=77, round_number=3)
+    with pytest.raises(review_rounds.PartialReviewRoundError) as refused:
+        review_rounds._refuse_partial_round_before_sequential_turns(
+            spool=spool, fresh_turn_reviewers=["codex"], public_peers=["antigravity"],
+            unresolved_conversion_boundary=True,
+        )
+    assert "evidence-conversion record could not be admitted" in str(refused.value)
+    assert "withheld" not in str(refused.value)

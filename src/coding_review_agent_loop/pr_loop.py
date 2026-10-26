@@ -481,6 +481,7 @@ from .pr_loop_support import (
     preflight_operator_evidence_conversion,
     round_evidence_authority_records,
     conversion_repeat_round,
+    conversion_boundary_candidate_present,
     conversion_visibility_boundary,
     evidence_authority_from_records,
     freeze_signed_baseline,
@@ -5135,6 +5136,17 @@ def run_pr_loop(
                 pr_base_conversion_boundary.key
                 if pr_base_conversion_boundary is not None else None
             )
+            # A conversion record that exists but could not be admitted leaves
+            # the pre-conversion publications in the peer set; the guard then
+            # names that unresolved boundary instead of a withheld outcome
+            # (#1676).  Only the wording depends on it.
+            pr_conversion_boundary_unresolved = (
+                conversion_pass and evidence_pass is None
+                and pr_base_conversion_boundary is None
+                and conversion_boundary_candidate_present(
+                    pr_comments, round_number=round_number, head_sha=pr_metadata.head_sha
+                )
+            )
             # Today's peer set, built from every posted same-round record
             # including records resume rejected: their bodies are just as
             # public.  It is only ever widened below, never narrowed.
@@ -5234,6 +5246,16 @@ def run_pr_loop(
                             if record.metadata is pr_visibility_own_conversion
                         ),
                         None,
+                    )
+                if conversion_pass:
+                    # Re-derived from the history the peer set is read from:
+                    # a boundary resolved here clears the flag.
+                    pr_conversion_boundary_unresolved = (
+                        pr_visibility_boundary_index is None
+                        and conversion_boundary_candidate_present(
+                            pr_fresh_comments if pr_fresh_records is not None else pr_comments,
+                            round_number=round_number, head_sha=pr_metadata.head_sha,
+                        )
                     )
                 pr_visibility_records = drop_inert_post_reconciliation_checkpoints(
                     pr_visibility_records
@@ -5353,6 +5375,7 @@ def run_pr_loop(
                         if agent_display_name(reviewer) in completed_by_name
                     ),
                     recovery=_pr_round_recovery,
+                    unresolved_conversion_boundary=pr_conversion_boundary_unresolved,
                 )
             if pr_round_parallel and not skip_reviewers_this_round:
                 pending_pr_reviewers = [
@@ -5575,6 +5598,7 @@ def run_pr_loop(
                             public_peers=pr_round_public_peers,
                             recovery=_pr_round_recovery,
                             retry_bound=_pr_retry_bound,
+                            unresolved_conversion_boundary=pr_conversion_boundary_unresolved,
                             max_workers=None if config.review_parallel else 1,
                             # A spooled reviewer skipped the pre-review sync
                             # above; sync it if its replay falls back to a turn.
@@ -5776,6 +5800,7 @@ def run_pr_loop(
                             public_peers=pr_round_public_peers,
                             recovery=_pr_round_recovery,
                             validators=sequential_pr_validators,
+                            unresolved_conversion_boundary=pr_conversion_boundary_unresolved,
                             already_posted=reviewer_name in completed_by_name,
                             invoke=lambda: _run_validated_agent(
                             runner,

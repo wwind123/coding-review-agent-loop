@@ -81,6 +81,14 @@ _DIAGNOSTIC_URL_USERINFO_RE = re.compile(
 WRAPPER_BOOTSTRAP_STATES = frozenset({"verified", "failed", "unknown"})
 INNER_EXEC_STATES = frozenset({"not-attempted", "started", "failed"})
 SUITE_START_STATES = frozenset({"not-started", "verified", "unknown"})
+# Issue #1661: why a launched run's suite start stayed ``unknown``.  Diagnostic
+# only: no admission, citability or disqualifier decision ever reads it.
+SUITE_START_REASON_UNRECOGNIZED = "unrecognized-launcher"
+SUITE_START_REASON_PROBE_UNAVAILABLE = "probe-unavailable"
+SUITE_START_REASONS = frozenset(
+    {SUITE_START_REASON_UNRECOGNIZED, SUITE_START_REASON_PROBE_UNAVAILABLE}
+)
+UNRECOGNIZED_INNER_LAUNCHER_DIAGNOSTIC = "unrecognized inner launcher"
 LAUNCHER_HEALTH_PROVENANCES = frozenset(
     {"wrapper-probe", "parent-runner", "broker-parent", "agent-reported"}
 )
@@ -122,6 +130,22 @@ class LaunchState:
             raise ValueError(f"unknown inner exec state: {self.inner_exec}")
         if self.suite_start not in SUITE_START_STATES:
             raise ValueError(f"unknown suite start state: {self.suite_start}")
+
+
+def suite_start_reason_for_probe(probe: "LauncherProbeResult") -> str | None:
+    """The closed-set reason an ``unknown`` probe leaves a launched suite start unverified."""
+    if probe.state != "unknown":
+        return None
+    if probe.diagnostic == UNRECOGNIZED_INNER_LAUNCHER_DIAGNOSTIC:
+        return SUITE_START_REASON_UNRECOGNIZED
+    return SUITE_START_REASON_PROBE_UNAVAILABLE
+
+
+def coerce_suite_start_reason(value: object, suite_start: object) -> str | None:
+    """Decode a persisted reason fail-closed: only a closed-set value beside ``unknown``."""
+    if suite_start == "unknown" and isinstance(value, str) and value in SUITE_START_REASONS:
+        return value
+    return None
 
 
 class TestRuntimeConfigurationError(AgentLoopError):
@@ -3290,7 +3314,7 @@ def probe_inner_launcher(
         environment_is_complete=environment_is_complete, package_script=package_script,
     )
     if recognized is None or identity_key is None:
-        return LauncherProbeResult(reported, "unknown", "unrecognized inner launcher")
+        return LauncherProbeResult(reported, "unknown", UNRECOGNIZED_INNER_LAUNCHER_DIAGNOSTIC)
     probe, target, env_assignments, launch_argv, env_prefix = recognized
     rebound = launch_argv if package_script is not None or launch_argv != original else ()
 

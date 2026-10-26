@@ -138,19 +138,46 @@ def pushed_branch_recovery(
     branch: str,
     store: Path,
     worktree: Path,
+    local_only_commits: int | None = 0,
 ) -> str:
-    """Resume and manual cleanup text for a poisoned run worktree whose branch is pushed."""
+    """Resume and manual cleanup text for a poisoned run worktree whose branch is pushed.
+
+    ``local_only_commits`` is the number of local commits not on
+    ``origin/<branch>``; None means the comparison failed (#1670).  With zero
+    the text claims the work is not lost; otherwise it never does.
+    """
     resume = shlex.join(
         ["agent-loop", "managed-pr", "--head", branch, "--expected-closing-issue", str(issue_number)]
     )
     cleanup = shlex.join(["git", "-C", os.fspath(store), "worktree", "remove", "--force", os.fspath(worktree)])
+    if local_only_commits == 0:
+        pushed = f"branch {branch} was already pushed, so the work is not lost."
+        kept = ""
+    else:
+        if local_only_commits is None:
+            check = shlex.join(["git", "-C", os.fspath(worktree), "log", f"origin/{branch}..HEAD"])
+            pushed = (
+                f"branch {branch} was already pushed, but the local branch could not be compared "
+                f"with origin/{branch}, so agent-loop cannot tell whether every commit was pushed; "
+                f"check with `{check}`."
+            )
+        else:
+            noun = "commit" if local_only_commits == 1 else "commits"
+            pushed = (
+                f"branch {branch} was already pushed, but the local branch has {local_only_commits} "
+                f"{noun} that are not on origin/{branch}, and resuming from the pushed branch "
+                "omits them."
+            )
+        kept = (
+            " Removing the worktree with that command discards uncommitted changes in it but "
+            f"keeps the local branch {branch} and its commits in the shared repository."
+        )
     return (
-        f"{PUSHED_BRANCH_RECOVERY_HEADING} branch {branch} was already pushed, so the work "
-        f"is not lost. Resume with `{resume}` plus your usual --managed-ci/--auto-merge and "
-        "--managed-ci-trusted-actor options (or `agent-loop pr <PR> --expected-closing-issue "
-        f"{issue_number}` when a PR for that branch already exists). The untrusted run "
-        "worktree is left in place for inspection; agent-loop does not remove it. Remove it "
-        f"manually with `{cleanup}`."
+        f"{PUSHED_BRANCH_RECOVERY_HEADING} {pushed} Resume with `{resume}` plus your usual "
+        "--managed-ci/--auto-merge and --managed-ci-trusted-actor options (or `agent-loop pr "
+        f"<PR> --expected-closing-issue {issue_number}` when a PR for that branch already "
+        "exists). The untrusted run worktree is left in place for inspection; agent-loop does "
+        f"not remove it. Remove it manually with `{cleanup}`.{kept}"
     )
 
 
@@ -168,6 +195,18 @@ def _pushed_branch(config: Any, runner: Any, path: Path) -> str | None:
     except (_Incomplete, OSError):
         return None
     return branch
+
+
+def _local_only_commits(config: Any, runner: Any, path: Path, branch: str) -> int | None:
+    """How many commits at HEAD are not on ``origin/<branch>``; None when the count fails (#1670)."""
+    from .checkout_verification import _Incomplete, _probe
+
+    try:
+        raw = _probe(config, runner, path, ("rev-list", "--count", f"refs/remotes/origin/{branch}..HEAD"))
+        count = int(raw.decode("ascii").strip())
+    except (_Incomplete, OSError, UnicodeDecodeError, ValueError):
+        return None
+    return count if count >= 0 else None
 
 
 def add_pushed_branch_recovery(
@@ -201,7 +240,8 @@ def add_pushed_branch_recovery(
     if branch is None:
         return False
     text = pushed_branch_recovery(
-        issue_number=issue_number, branch=branch, store=store, worktree=worktree
+        issue_number=issue_number, branch=branch, store=store, worktree=worktree,
+        local_only_commits=_local_only_commits(config, runner, worktree, branch),
     )
     exc.args = (f"{exc.args[0]}\n{text}",)
     return True

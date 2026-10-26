@@ -3153,7 +3153,7 @@ def derive_risk_test_matrix_evidence(
                     message = f"Execution selector `{execution_ref}` is not an admissible passing receipt ({expected})."
                     if _only_suite_start_unverified(observation):
                         capture_disqualifiers.add("suite-start-unverified")
-                        message += " " + SUITE_START_UNVERIFIED_DIAGNOSTIC
+                        message += " " + suite_start_unverified_diagnostic(observation)
                         message += _node_test_hint(observation, message)  # shape-check: fatal:authentication-or-forgery
                     diagnostics.append(PostAuthClaimDiagnostic(row.row_id, "inadmissible-execution", message))
                 else:
@@ -3625,6 +3625,9 @@ def _observation_semantics(observation: object) -> tuple[dict[str, object], bool
         "wrapper_bootstrap": value("wrapper_bootstrap"),
         "inner_exec": value("inner_exec"),
         "suite_start": value("suite_start"),
+        # Issue #1661: diagnostic only; never part of ``rich`` or any
+        # admission predicate.
+        "suite_start_reason": value("suite_start_reason"),
         # Issue #1326: absent for fixture-less rows; any present value must
         # decode as a clean lifecycle before the row can be verified.
         "fixture_present": (
@@ -3941,6 +3944,40 @@ SUITE_START_UNVERIFIED_DIAGNOSTIC = (
     "test launcher), so this receipt cannot be cited. Citable runners: "
     f"{CITABLE_TEST_RUNNERS_SUMMARY}. Wrap the check in a pytest test to make it citable."
 )
+
+
+SUITE_START_UNRECOGNIZED_DIAGNOSTIC = (
+    "Suite start was never verified (suite_start=unknown): the test launcher is not "
+    "recognized, so this receipt cannot be cited. Citable runners: "
+    f"{CITABLE_TEST_RUNNERS_SUMMARY}. Wrap the check in a pytest test to make it citable."
+)
+SUITE_START_PROBE_UNAVAILABLE_DIAGNOSTIC = (
+    "Suite start was never verified (suite_start=unknown): the test launcher is recognized, "
+    "but its bootstrap probe could not verify it in this run (for example probe containment "
+    "was unavailable), so this receipt cannot be cited. Rerunning the same command through "
+    "`agent-loop run-tests` may make it citable."
+)
+
+
+def suite_start_unverified_diagnostic(observation: object) -> str:
+    """The suite-start wording selected by the persisted reason (#1661).
+
+    Presentation only.  A row without a reason (legacy, or an older broker)
+    keeps the generic #1659 text.
+    """
+    from .test_runtime import (
+        SUITE_START_REASON_PROBE_UNAVAILABLE,
+        SUITE_START_REASON_UNRECOGNIZED,
+        coerce_suite_start_reason,
+    )
+
+    semantics, _rich = _observation_semantics(observation)
+    reason = coerce_suite_start_reason(semantics["suite_start_reason"], semantics["suite_start"])
+    if reason == SUITE_START_REASON_UNRECOGNIZED:
+        return SUITE_START_UNRECOGNIZED_DIAGNOSTIC
+    if reason == SUITE_START_REASON_PROBE_UNAVAILABLE:
+        return SUITE_START_PROBE_UNAVAILABLE_DIAGNOSTIC
+    return SUITE_START_UNVERIFIED_DIAGNOSTIC
 
 
 def _only_suite_start_unverified(observation: object) -> bool:

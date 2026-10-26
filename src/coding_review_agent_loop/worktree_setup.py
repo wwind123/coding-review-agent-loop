@@ -359,8 +359,11 @@ def _porcelain_paths(raw: bytes) -> list[str]:
     return paths
 
 
-def store_tracked_tree_dirty_paths(store: Path) -> list[str]:
+def store_tracked_tree_dirty_paths(store: Path, *, where: str | None = None) -> list[str]:
     """Every modified, staged or deleted tracked path, including drifted or dirty submodules.
+
+    ``where`` only names the checkout in the failure message, like
+    ``run_setup_command``; it defaults to the shared clone (#1673).
 
     Parent probes run through the confined Git boundary, which injects
     ``--ignore-submodules=all``; submodule state comes only from separate
@@ -391,8 +394,8 @@ def store_tracked_tree_dirty_paths(store: Path) -> list[str]:
         )
     except AgentLoopError as exc:
         raise AgentLoopError(
-            f"Could not verify the tracked tree of the shared clone {store} before --worktree-setup: "
-            f"{exc}. Refusing to run setup."
+            f"Could not verify the tracked tree of {where or f'the shared clone {store}'} "
+            f"before --worktree-setup: {exc}. Refusing to run setup."
         ) from exc
     return sorted(dirty)
 

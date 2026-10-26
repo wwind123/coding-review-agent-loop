@@ -8077,3 +8077,31 @@ def test_over_bound_malformed_items_raise_a_non_degradable_shape_error_1626():
 def test_unknown_test_observations_mode_is_rejected_1626():
     with pytest.raises(ValueError):
         _validate_citations_1626("coder_followup", [], mode="lenient")
+
+
+@pytest.mark.parametrize(
+    "reason, expected, absent",
+    [
+        ("unrecognized-launcher", "the test launcher is not recognized", "bootstrap probe"),
+        ("probe-unavailable", "its bootstrap probe could not verify it", "not recognized"),
+        (None, "an unrecognized or unverified test launcher", "bootstrap probe"),
+    ],
+    ids=["unrecognized", "probe-unavailable", "legacy"],
+)
+def test_post_auth_suite_start_diagnostic_follows_the_persisted_reason_1661(reason, expected, absent):
+    """`reason-fresh-unrecognized` / `reason-probe-unavailable`: wording only; authority unchanged."""
+    from coding_review_agent_loop.test_runtime import CITABLE_TEST_RUNNERS_SUMMARY
+
+    derived = _derive_1659({"suite_start_reason": reason})
+    [row] = derived.evidence.rows
+    assert row.status == "stale/unverified" and row.evidence_citations == ()
+    [diagnostic] = [item for item in derived.diagnostics if item.code == "inadmissible-execution"]
+    assert expected in diagnostic.message
+    assert absent not in diagnostic.message
+    assert "suite_start=unknown" in diagnostic.message
+    assert (CITABLE_TEST_RUNNERS_SUMMARY in diagnostic.message) is (reason != "probe-unavailable")
+    assert derived.row_capture_classifications["row-1"] == {
+        "class": "not-capture-limited",
+        "observation_classes": ["pass-unauthoritative"],
+        "disqualifiers": ["suite-start-unverified"],
+    }
