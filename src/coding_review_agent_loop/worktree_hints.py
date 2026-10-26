@@ -155,7 +155,14 @@ def pushed_branch_recovery(
         kept = ""
     else:
         if local_only_commits is None:
-            check = shlex.join(["git", "-C", os.fspath(worktree), "log", f"origin/{branch}..HEAD"])
+            # Rooted at the trusted shared store, never the untrusted worktree:
+            # its .git file and config are coder-writable, and `git log` on a
+            # terminal would run a planted core.pager.  The branch ref lives
+            # in the shared repository.
+            check = shlex.join([
+                "git", "-C", os.fspath(store), "--no-pager", "log",
+                f"refs/remotes/origin/{branch}..refs/heads/{branch}",
+            ])
             pushed = (
                 f"branch {branch} was already pushed, but the local branch could not be compared "
                 f"with origin/{branch}, so agent-loop cannot tell whether every commit was pushed; "

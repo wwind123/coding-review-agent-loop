@@ -1137,7 +1137,18 @@ def test_pushed_branch_recovery_compares_local_tip_with_tracking_ref(tmp_path, m
         assert "resuming from the pushed branch omits them" in text
     else:
         assert f"could not be compared with origin/{branch}" in text
-        assert f"`git -C {root} log origin/{branch}..HEAD`" in text
+        assert (
+            f"`git -C {store} --no-pager log refs/remotes/origin/{branch}..refs/heads/{branch}`"
+        ) in text
+        # The store-rooted check resolves both refs in the shared repository.
+        advised = subprocess.run(
+            ["git", "-C", str(store), "--no-pager", "log",
+             f"refs/remotes/origin/{branch}..refs/heads/{branch}"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        )
+        assert advised.returncode == 0, advised.stderr
+    # No command is ever advised inside the untrusted worktree except removal from the store.
+    assert f"git -C {root}" not in text
 
 
 def test_unpoisoned_checkout_gets_no_pushed_branch_recovery(tmp_path, monkeypatch):
