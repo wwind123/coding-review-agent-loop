@@ -24,7 +24,7 @@ DEFAULT_LIMIT = 6000
 ALLOWLIST: dict[str, int] = {
     "src/coding_review_agent_loop/managed_ci.py": 10533,
     "src/coding_review_agent_loop/protocol.py": 10475,
-    "src/coding_review_agent_loop/pr_loop.py": 10177,
+    "src/coding_review_agent_loop/pr_loop.py": 10157,
     "src/coding_review_agent_loop/prompts.py": 6780,
     "src/coding_review_agent_loop/round_state.py": 6764,
     "src/coding_review_agent_loop/github.py": 6158,

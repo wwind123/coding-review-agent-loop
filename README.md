@@ -2189,3 +2189,8 @@ directory is refused at startup with `<option> is not a git checkout`. Before
 every agent turn agent-loop verifies the checkout still matches what it last
 left there and fails closed, naming the observed branch and unexpected paths,
 if something else modified it.
+
+For private directories left by completed or interrupted runs, see
+[Removing stopped private directory trees](docs/local_agent_loop.md#removing-stopped-private-directory-trees).
+Release only a trusted tree after all its writers have stopped; deletion is a
+separate operator step.

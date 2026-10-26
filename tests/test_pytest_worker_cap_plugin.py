@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -105,13 +106,15 @@ def _run(
     for key, value in list(child_env.items()):
         if value is None:
             del child_env[key]
+    session_root = Path(tempfile.mkdtemp(prefix="pytest-sessions-", dir=project.parent))
+    child_env["WORKER_TEST_TEMP_ROOT"] = str(session_root)
     argv = command or [
         sys.executable, "-m", "pytest", *(["-p", PLUGIN_MODULE] if inject_token else []),
-        "-p", "no:cacheprovider", "-q", *args,
+        "-p", "no:cacheprovider", "-q", "--basetemp=" + str(session_root / "direct"), *args,
     ]
-    proc = subprocess.run(
-        argv, cwd=project, env=child_env, capture_output=True, text=True, timeout=timeout,
-    )
+    from private_directory_helpers import run_owned_child
+
+    proc = run_owned_child(argv, cwd=project, env=child_env, timeout=timeout, owned=session_root)
     rows = []
     if report.exists():
         rows = [json.loads(line) for line in report.read_text().splitlines() if line.strip()]
@@ -422,12 +425,15 @@ def test_wrapper_resolved_plain_pytest_runs_with_budget_workers(tmp_path):
     base_env = {key: value for key, value in os.environ.items() if key not in _SCRUB}
     base_env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
     decision = apply_worker_budget(
-        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q"],
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q",
+         "--basetemp=" + str(tmp_path / "wrapper-temp")],
         base_env, project, budget,
         report_location=(report_dir, report_dir / "report.jsonl"),
     )
-    proc = subprocess.run(
-        list(decision.argv), cwd=project, env=decision.env, capture_output=True, text=True, timeout=120,
+    from private_directory_helpers import run_owned_child
+    proc = run_owned_child(
+        list(decision.argv), cwd=project, env=decision.env, timeout=120,
+        owned=tmp_path / "wrapper-temp",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     rows = [json.loads(line) for line in decision.report_path.read_text().splitlines() if line.strip()]
@@ -449,9 +455,14 @@ def test_sequential_pytest_main_sessions_each_claim_and_report(tmp_path):
     runner.write_text(
         textwrap.dedent(
             """
-            import sys, pytest
-            first = pytest.main(["-p", "_agent_loop_worker_cap", "-p", "no:cacheprovider", "-q", "-n", sys.argv[1]])
-            second = pytest.main(["-p", "_agent_loop_worker_cap", "-p", "no:cacheprovider", "-q", "-n", sys.argv[2]])
+            import os, sys, tempfile, pytest
+            first_temp, second_temp = [tempfile.mkdtemp(dir=os.environ["WORKER_TEST_TEMP_ROOT"]) for _ in range(2)]
+            assert first_temp != second_temp
+            first = pytest.main(["--basetemp=" + first_temp, "-p", "_agent_loop_worker_cap", "-p", "no:cacheprovider", "-q", "-n", sys.argv[1]])
+            sentinel = os.path.join(first_temp, "session-sentinel")
+            with open(sentinel, "w") as stream: stream.write("retained")
+            second = pytest.main(["--basetemp=" + second_temp, "-p", "_agent_loop_worker_cap", "-p", "no:cacheprovider", "-q", "-n", sys.argv[2]])
+            with open(sentinel) as stream: assert stream.read() == "retained"
             sys.exit(int(first) or int(second))
             """
         ),
@@ -476,7 +487,7 @@ def test_sequential_pytest_main_sessions_each_claim_and_report(tmp_path):
 
 
 NESTED_TEST = """
-import os, subprocess, sys
+import os, subprocess, sys, tempfile
 import pytest
 
 def test_env_entry_withdrawn():
@@ -485,14 +496,14 @@ def test_env_entry_withdrawn():
 
 def test_nested_in_process(tmp_path):
     (tmp_path / "test_inner.py").write_text("def test_inner():\\n    pass\\n")
-    assert pytest.main(["-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")]) == 0
+    assert pytest.main(["--basetemp=" + tempfile.mkdtemp(dir=os.environ["WORKER_TEST_TEMP_ROOT"]), "-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")]) == 0
 
 def test_nested_child(tmp_path):
     (tmp_path / "test_inner.py").write_text("def test_inner():\\n    pass\\n")
     env = dict(os.environ)
     assert "AGENT_LOOP_WORKER_CAP_SPEC" not in env
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")],
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "--basetemp=" + tempfile.mkdtemp(dir=os.environ["WORKER_TEST_TEMP_ROOT"]), str(tmp_path / "test_inner.py")],
         env=env,
     )
     assert proc.returncode == 0
@@ -502,7 +513,7 @@ def test_nested_child_with_replaced_pythonpath(tmp_path):
     env = dict(os.environ)
     env["PYTHONPATH"] = str(tmp_path)
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")],
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "--basetemp=" + tempfile.mkdtemp(dir=os.environ["WORKER_TEST_TEMP_ROOT"]), str(tmp_path / "test_inner.py")],
         env=env, capture_output=True, text=True,
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -530,11 +541,11 @@ def test_nested_sessions_do_not_inherit_the_plugin_env(tmp_path, inject_token, c
 
 def test_in_process_nested_session_with_explicit_token_writes_nested_marker(tmp_path):
     nested_test = """
-    import pytest
+    import os, tempfile, pytest
 
     def test_nested_in_process(tmp_path):
         (tmp_path / "test_inner.py").write_text("def test_inner():\\n    pass\\n")
-        args = ["-p", "_agent_loop_worker_cap", "-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")]
+        args = ["--basetemp=" + tempfile.mkdtemp(dir=os.environ["WORKER_TEST_TEMP_ROOT"]), "-p", "_agent_loop_worker_cap", "-p", "no:cacheprovider", "-q", str(tmp_path / "test_inner.py")]
         assert pytest.main(args) == 0
     """
     project = _project(tmp_path, {"test_nested.py": nested_test})
@@ -554,10 +565,15 @@ def test_env_only_sequential_sessions_each_claim_after_withdrawal(tmp_path):
     runner.write_text(
         textwrap.dedent(
             """
-            import os, sys, pytest
-            first = pytest.main(["-p", "no:cacheprovider", "-q", "-n", sys.argv[1]])
+            import os, sys, tempfile, pytest
+            first_temp, second_temp = [tempfile.mkdtemp(dir=os.environ["WORKER_TEST_TEMP_ROOT"]) for _ in range(2)]
+            assert first_temp != second_temp
+            first = pytest.main(["--basetemp=" + first_temp, "-p", "no:cacheprovider", "-q", "-n", sys.argv[1]])
             assert "_agent_loop_worker_cap" in os.environ.get("PYTEST_PLUGINS", "")
-            second = pytest.main(["-p", "no:cacheprovider", "-q", "-n", sys.argv[2]])
+            sentinel = os.path.join(first_temp, "session-sentinel")
+            with open(sentinel, "w") as stream: stream.write("retained")
+            second = pytest.main(["--basetemp=" + second_temp, "-p", "no:cacheprovider", "-q", "-n", sys.argv[2]])
+            with open(sentinel) as stream: assert stream.read() == "retained"
             sys.exit(int(first) or int(second))
             """
         ),
@@ -577,12 +593,12 @@ def test_env_only_session_after_early_usage_error_still_claims(tmp_path):
     runner.write_text(
         textwrap.dedent(
             """
-            import os, sys, pytest
-            early = pytest.main(["--no-such-agent-loop-option"])
+            import os, sys, tempfile, pytest
+            early = pytest.main(["--basetemp=" + tempfile.mkdtemp(dir=os.environ["WORKER_TEST_TEMP_ROOT"]), "--no-such-agent-loop-option"])
             assert int(early) == 4, early
             assert "_agent_loop_worker_cap" in sys.modules
             assert "_agent_loop_worker_cap" in os.environ.get("PYTEST_PLUGINS", "")
-            sys.exit(int(pytest.main(["-p", "no:cacheprovider", "-q", "-n", "16"])))
+            sys.exit(int(pytest.main(["--basetemp=" + tempfile.mkdtemp(dir=os.environ["WORKER_TEST_TEMP_ROOT"]), "-p", "no:cacheprovider", "-q", "-n", "16"])))
             """
         ),
         encoding="utf-8",
@@ -596,13 +612,13 @@ def test_env_only_session_after_early_usage_error_still_claims(tmp_path):
 
 def test_filtered_child_pytest_is_unobservable_top_level_only(tmp_path):
     child_test = """
-    import os, subprocess, sys
+    import os, subprocess, sys, tempfile
 
     def test_child(tmp_path):
         (tmp_path / "test_inner.py").write_text("def test_inner():\\n    pass\\n")
-        env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": os.environ.get("PYTHONPATH", "")}
+        env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": os.environ.get("PYTHONPATH", ""), "WORKER_TEST_TEMP_ROOT": os.environ["WORKER_TEST_TEMP_ROOT"]}
         proc = subprocess.run(
-            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", "2", str(tmp_path / "test_inner.py")],
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", "2", "--basetemp=" + tempfile.mkdtemp(dir=os.environ["WORKER_TEST_TEMP_ROOT"]), str(tmp_path / "test_inner.py")],
             env=env,
         )
         assert proc.returncode == 0
@@ -618,7 +634,7 @@ def test_filtered_child_pytest_is_unobservable_top_level_only(tmp_path):
 def test_script_wrapper_other_command_is_capped_through_env(tmp_path):
     project = _project(tmp_path)
     script = project.parent / "run.sh"
-    script.write_text(f"#!/bin/sh\nexec {sys.executable} -m pytest -p no:cacheprovider -q -n 8\n", encoding="utf-8")
+    script.write_text(f"#!/bin/sh\nexec {sys.executable} -m pytest -p no:cacheprovider -q -n 8 --basetemp \"$WORKER_TEST_TEMP_ROOT/shell\"\n", encoding="utf-8")
     script.chmod(0o755)
     proc, rows, _ran = _run(project, [], budget=2, command=[str(script)])
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -942,7 +958,9 @@ def _fallback_run(tmp_path, args, *, mode, held, env=None, command=None, reports
         "RAN_MARKER": str(tmp_path / "ran.txt"), "PYTEST_XDIST_AUTO_NUM_WORKERS": "8",
     })
     environment.update(env or {})
-    argv = command or [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", *args]
+    session_root = Path(tempfile.mkdtemp(prefix="pytest-sessions-", dir=project.parent))
+    environment["WORKER_TEST_TEMP_ROOT"] = str(session_root)
+    argv = command or [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "--basetemp=" + str(session_root / "direct"), *args]
     from coding_review_agent_loop import runner as runner_module
 
     real_analyze = runner_module.analyze_worker_report
@@ -963,6 +981,8 @@ def _fallback_run(tmp_path, args, *, mode, held, env=None, command=None, reports
     finally:
         runner_module.analyze_worker_report = real_analyze
         holder.close()
+        from private_directory_helpers import release_owned_tree
+        release_owned_tree(session_root)
     ran = (tmp_path / "ran.txt").read_text().split() if (tmp_path / "ran.txt").exists() else []
     return result, len(_gateway_log(project)), ran
 
@@ -1024,29 +1044,31 @@ def test_fallback_grant_tx_gateways(tmp_path, mode):
 
 @pytest.mark.parametrize("mode", ["clamp", "refuse"])
 @pytest.mark.parametrize("held", [3, 4])
-def test_fallback_grant_reaches_printer_and_wrapper_targets(tmp_path, mode, held):
+def test_fallback_grant_reaches_printer_and_wrapper_targets(tmp_path, mode, held, dirty_pytest_root):
     printer = [sys.executable, "-c", (
         "import os; print('workers=' + os.environ['AGENT_LOOP_TEST_WORKERS']); "
         "print('auto=' + os.environ.get('PYTEST_XDIST_AUTO_NUM_WORKERS', 'unset'))"
     )]
-    result, _gateways, _ran = _fallback_run(tmp_path, [], mode=mode, held=held, command=printer)
+    result, _gateways, _ran = _fallback_run(tmp_path, [], mode=mode, held=held, command=printer,
+        env={"PYTEST_DEBUG_TEMPROOT": str(dirty_pytest_root[0])})
     assert result.returncode == 0 and "workers=1" in result.output_tail
     if mode == "clamp":
         assert "auto=1" in result.output_tail
     (tmp_path / "w").mkdir()
     wrapper = [sys.executable, "-c", _textwrap.dedent("""
-        import os, subprocess, sys
+        import os, subprocess, sys, tempfile
         count = os.environ["AGENT_LOOP_TEST_WORKERS"]
         print("wrapper-workers=" + count)
         print("wrapper-auto=" + os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS", "unset"))
         sys.stdout.flush()
-        sys.exit(subprocess.call([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "-n", count]))
+        sys.exit(subprocess.call([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "--basetemp=" + tempfile.mkdtemp(dir=os.environ["WORKER_TEST_TEMP_ROOT"]), "-n", count]))
     """)]
     reports = []
     result, gateways, ran = _fallback_run(
         tmp_path / "w", [], mode=mode, held=held, command=wrapper, reports=reports,
+        env={"PYTEST_DEBUG_TEMPROOT": str(dirty_pytest_root[0])},
     )
-    assert result.returncode == 0 and gateways <= 1 and len(ran) == 4
+    assert result.returncode == 0 and gateways == 1 and len(ran) == 4
     assert "wrapper-workers=1" in result.output_tail
     if mode == "clamp":
         assert "wrapper-auto=1" in result.output_tail
@@ -1055,3 +1077,54 @@ def test_fallback_grant_reaches_printer_and_wrapper_targets(tmp_path, mode, held
     assert reports, "the nested pytest wrote no worker-cap report"
     assert {row["budget"] for row in reports} == {4}
     assert all(row.get("effective", 0) <= 1 for row in reports if row.get("kind") == "confirmed")
+    assert any(row.get("kind") == "confirmed" and row["effective"] == 1 for row in reports)
+    for path, inode, mode_bits, contents in dirty_pytest_root[1]:
+        assert (path.stat().st_ino, path.stat().st_mode) == (inode, mode_bits)
+        if contents is not None:
+            assert path.read_bytes() == contents
+
+
+@pytest.fixture
+def dirty_pytest_root():
+    """Eligible debris in a short, private simulated shared root, never the host root."""
+    import getpass
+    import shutil
+    from coding_review_agent_loop.agent_permissions import release_unlistable_tree
+
+    if os.name != "posix" or os.geteuid() == 0:
+        pytest.skip("requires non-root POSIX directory permissions")
+    root = Path(tempfile.mkdtemp(prefix="pc-", dir="/tmp"))
+    shared = root / ("pytest-of-" + getpass.getuser())
+    shared.mkdir(mode=0o700)
+    seeds = [shared / f"pytest-{i}" for i in range(8)]
+    seeds.append(shared / "garbage-12345678-1234-1234-1234-123456789abc")
+    for seed in seeds:
+        private = seed / "private"
+        private.mkdir(parents=True)
+        (private / "evidence").write_text("retained")
+        private.chmod(0o300)
+    snapshot = [
+        (p, p.stat().st_ino, p.stat().st_mode, p.read_bytes() if p.name == "evidence" else None)
+        for seed in seeds for p in (seed, seed / "private", seed / "private/evidence")
+    ]
+    try:
+        yield root, snapshot
+    finally:
+        release_unlistable_tree(root)
+        shutil.rmtree(root)
+
+
+def test_dirty_root_control_exercises_rotation(tmp_path, dirty_pytest_root):
+    root, snapshot = dirty_pytest_root
+    project = _project(tmp_path, {"test_cases.py": "def test_allocate(tmp_path): assert tmp_path.is_dir()"})
+    environment = {k: v for k, v in os.environ.items() if k not in _SCRUB}
+    environment["PYTEST_DEBUG_TEMPROOT"] = str(root)
+    from private_directory_helpers import run_child
+    proc = run_child(
+        [sys.executable, "-m", "pytest", "-n", "1", "-q", "-p", "no:cacheprovider"],
+        cwd=project, env=environment, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    changed = any(not p.exists() or (p.stat().st_ino, p.stat().st_mode) != (ino, mode)
+                  for p, ino, mode, _contents in snapshot)
+    assert changed or ("rm_rf" in proc.stderr and str(root) in proc.stderr), proc.stdout + proc.stderr

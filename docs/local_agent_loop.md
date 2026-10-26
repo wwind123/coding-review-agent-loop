@@ -10034,3 +10034,40 @@ existing git checkouts of the repository; a leftover agent-loop `GEMINI.md`
 injection from a killed run is recognised by its ownership header and removed
 automatically, while operator-authored `GEMINI.md` content is reported as an
 unexpected change. See `ARCHITECTURE.md` for the full contract.
+
+### Removing stopped private directory trees
+
+Response ancestors and private caches deliberately use mode `0300` while in
+use. Normal completion can leave shared ancestors non-listable; interrupted
+runs can also leave their private directories behind. Do not automatically
+release a shared root on normal exit: concurrent invocations may still use it.
+
+Select a trusted tree and stop **all invocations and other writers using that
+tree** before releasing it. With `path` set to that selected directory, use:
+
+```sh
+python -c 'import sys; from coding_review_agent_loop.agent_permissions import release_unlistable_tree; release_unlistable_tree(sys.argv[1])' "$path"
+```
+
+Use the Python interpreter belonging to the installed agent-loop package. For a
+virtualenv or isolated installation (including pipx or uv tool), replace
+`python` with that environment's `bin/python`; the system Python may not have
+the package installed. This best-effort helper recursively adds owner access to
+real owned directories, without following symlinks, changing files, or deleting
+retained evidence. Repeated release and missing paths are harmless. It is for
+trusted, stopped trees, not hostile concurrent path replacement.
+
+Deletion is a separate explicit operator step, for example `rm -r -- "$path"`.
+Keep its errors visible: release is best-effort and does not certify deletion.
+
+The regression investigation for issue #1688 observes existing successful and
+blocking PR-loop cases from a parent after their real repository fixtures
+finish. Ordinary fixture restoration already handles these cases. The shared
+fixture now verifies its post-condition and releases after dependent resource
+finalizers, including late re-hardening. Generated projects lacking the
+repository conftest and processes killed before teardown need cleanup by a
+surviving enclosing harness; no function finalizer can run after SIGKILL.
+The historical debris's receipts and original generated `test_probe0` producer
+could not be recovered from current source, so its precise cause remains
+uncertain. The regressions reproduce those concrete lifecycle classes using
+isolated response roots, without sweeping host debris.

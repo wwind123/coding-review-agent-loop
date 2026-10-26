@@ -80,6 +80,17 @@ flowchart LR
   `find`, globbing) by a same-UID agent, not a deliberate one that re-modes the
   ancestors, and give no protection under euid 0, where a run proceeds with one
   warning; real isolation needs an OS-level filesystem sandbox.
+- Operators can explicitly call `agent_permissions.release_unlistable_tree` on
+  a trusted stopped tree before separate deletion (see the CLI guide). All
+  writers must have stopped: completed and interrupted runs can leave shared
+  ancestors non-listable, and normal exit never releases those ancestors
+  automatically because another invocation may still use them. Release is
+  best-effort, restores owner access to real owned directories without following
+  symlinks, and preserves files and evidence. Tests wrap `tmp_path` so dependent
+  resource finalizers finish before restoration and an independent verification
+  walk reports path-specific teardown failures. Pure PR stop diagnostics and
+  reconciliation-disposition indexing live in `pr_loop_support.py`, re-exported
+  from `pr_loop.py` to preserve existing imports.
 - `agent-loop inspect` (`inspect_tool.py`, standard library only) is the
   read-only git/gh boundary for Claude non-coders. Its argument allowlist,
   forced git config, closed environment allowlist with a `PATH` built from the

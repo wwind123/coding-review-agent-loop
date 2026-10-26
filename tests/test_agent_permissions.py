@@ -2012,3 +2012,54 @@ def test_home_exemption_does_not_apply_to_the_response_root_boundary(tmp_path, m
     with pytest.raises(AgentLoopError, match="overlaps repository checkout"):
         ap.establish_response_root_boundary(config)
     ap.reset_sandbox_state()
+
+
+@pytest.mark.skipif(os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="requires non-root POSIX removal permissions")
+def test_documented_stopped_tree_release(tmp_path):
+    root = tmp_path / "stopped"
+    nested = root / "responses" / "repo" / "private"
+    nested.mkdir(parents=True)
+    evidence = nested / "evidence"
+    evidence.write_bytes(b"retained evidence")
+    evidence.chmod(0o400)
+    for directory in (nested, nested.parent, nested.parent.parent, root):
+        directory.chmod(0o300)
+    command = (
+        "import sys; from coding_review_agent_loop.agent_permissions import "
+        "release_unlistable_tree; release_unlistable_tree(sys.argv[1])"
+    )
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"))
+    for path in (root, root, tmp_path / "missing"):
+        subprocess.run([sys.executable, "-c", command, str(path)], env=env,
+                       check=True, capture_output=True, text=True, timeout=30)
+    for directory in (root, nested.parent.parent, nested.parent, nested):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert evidence.read_bytes() == b"retained evidence"
+    assert stat.S_IMODE(evidence.stat().st_mode) == 0o400
+    shutil.rmtree(root)
+    assert not root.exists()
+
+
+def test_release_symlink_boundaries(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir(mode=0o300)
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"untouched")
+    sentinel.chmod(0o400)
+    before = (external.lstat().st_mode, sentinel.lstat().st_mode, sentinel.read_bytes())
+    root = tmp_path / "stopped"
+    nested = root / "private"
+    nested.mkdir(parents=True)
+    (nested / "directory").symlink_to(external, target_is_directory=True)
+    (nested / "file").symlink_to(sentinel)
+    (nested / "dangling").symlink_to(tmp_path / "absent")
+    alias = tmp_path / "root-link"
+    alias.symlink_to(external, target_is_directory=True)
+    nested.chmod(0o300)
+    root.chmod(0o300)
+    ap.release_unlistable_tree(root)
+    ap.release_unlistable_tree(alias)
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o700
+    assert before == (external.lstat().st_mode, sentinel.lstat().st_mode, sentinel.read_bytes())
+    shutil.rmtree(root)
