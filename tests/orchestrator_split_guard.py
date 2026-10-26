@@ -33,7 +33,7 @@ PACKAGE = "coding_review_agent_loop"
 FACADE = f"{PACKAGE}.orchestrator"
 
 # Ordered: an extracted module may import only modules listed before it.
-EXTRACTED_MODULES: tuple[str, ...] = ("managed_ci_recovery_commands", "managed_ci_intent_validation", "agent_failure", "managed_ci_bases", "integration_close", "architecture_contract", "reviewer_seats", "validated_agent", "response_validation", "panel_evidence", "review_rounds", "discuss_loop", "execution_policy", "child_plan_binding", "evidence_stall", "evidence_conversion", "pr_loop_support", "pr_loop", "issue_implementation", "plan_issue_scope", "plan_first_loop", "history_export", "triage", "triage_backtest", "issue_loop", "scope_declarations")
+EXTRACTED_MODULES: tuple[str, ...] = ("protocol_discuss_types", "managed_ci_recovery_commands", "managed_ci_intent_validation", "agent_failure", "managed_ci_bases", "integration_close", "architecture_contract", "reviewer_seats", "validated_agent", "response_validation", "panel_evidence", "review_rounds", "discuss_loop", "execution_policy", "child_plan_binding", "evidence_stall", "evidence_conversion", "pr_loop_support", "pr_loop", "issue_implementation", "plan_issue_scope", "plan_first_loop", "history_export", "triage", "triage_backtest", "issue_loop", "scope_declarations")
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
