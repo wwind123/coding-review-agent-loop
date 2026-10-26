@@ -1240,3 +1240,35 @@ def test_get_issue_state_reads_with_check_disabled(tmp_path):
     with pytest.raises(AgentLoopError, match=re.escape("`gh` exited 1")):
         get_issue_state(_Runner(), config=make_config(tmp_path), issue_number=99)
     assert seen["check"] is False
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_actor_resolution_without_workdirs_preserves_cache_and_dry_run(tmp_path, dry_run):
+    config = make_config(tmp_path, create_dirs=False, dry_run=dry_run)
+    runner = _FakeRunner(authenticated_actor=ACTOR)
+    resolve = github_module.resolve_authenticated_github_actor
+    if dry_run:
+        with pytest.raises(AgentLoopError, match="dry-run"):
+            resolve(runner, config=config)
+        assert runner.commands == []
+        runner._agent_loop_authenticated_actor = ACTOR
+    else:
+        assert resolve(runner, config=config) == ACTOR
+        assert runner.commands == [(["gh", "api", "user"], github_module.github_api_cwd())]
+    before = list(runner.commands)
+    assert resolve(runner, config=config) == ACTOR
+    assert runner.commands == before
+    assert not any(path.exists() for path in (
+        config.claude_dir, config.codex_dir, config.gemini_dir, config.antigravity_dir,
+    ))
+
+
+@pytest.mark.parametrize("actor_id", [None, True, 0, -1, "7", 1.5])
+def test_actor_resolution_without_workdirs_rejects_malformed_ids(tmp_path, actor_id):
+    config = make_config(tmp_path, create_dirs=False)
+    runner = _FakeRunner(authenticated_actor=("agent-loop", actor_id))
+    with pytest.raises(AgentLoopError, match="immutable user ID"):
+        github_module.resolve_authenticated_github_actor(runner, config=config)
+    assert runner.commands == [(["gh", "api", "user"], github_module.github_api_cwd())]
+    assert not hasattr(runner, "_agent_loop_authenticated_actor")
+    assert not config.claude_dir.exists()

@@ -3467,7 +3467,7 @@ def resolve_authenticated_github_actor(
     result = run_gh_read(
         runner,
         [config.gh_cmd, "api", "user"],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode != 0:
