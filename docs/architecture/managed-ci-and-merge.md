@@ -2,9 +2,18 @@
 
 How agent-loop observes CI and merges: the counted check board, managed exact-head CI and its hosted workflow boundary, managed-label handling, base-workflow dispatch authorization, sharded and split layouts, integration targets, preflight 403 fallbacks and protection states, issue-created managed-CI authorization, the authorization continuity chain across coder, merge-conflict, CI-repair and rejected-coder recovery heads, and the coder CI-dispatch guard.
 
-Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
+Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
 
 ## CI and Merge
+
+Recovery command rendering lives in the pure `managed_ci_recovery_commands.py`
+sibling, and workflow-mirrored intent envelope, schema and lifecycle validation
+lives in the pure `managed_ci_intent_validation.py` sibling. Both import
+independently without a back-reference to `managed_ci.py` or the orchestrator.
+`managed_ci.py` explicitly re-exports their definitions and catalogs, retains
+all GitHub I/O, freshness and dispatch authorization gates, and keeps callers
+of patched names in their original namespace. Persistence formats and
+authorization decisions are unchanged by this pure move (#1692).
 
 Ordinary CI observes the current-head check board. Known failures can join
 review feedback without waiting for unfinished checks. Post-approval watching
