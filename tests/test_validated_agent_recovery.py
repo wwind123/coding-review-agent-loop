@@ -2163,3 +2163,48 @@ def test_codex_usage_limit_with_auth_is_not_retried(tmp_path, error):
     n, sleeps, out = _drive_codex(tmp_path, [_codex_stream(error=error)], retries=2)
     assert n == 1 and sleeps == []
     assert out.failure_category == "non-retryable"
+
+
+def test_guard_correction_freezes_its_own_acquisition_catalog(tmp_path):
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+    rejected = structured_coder_followup(tests_run=['pytest tests/test_api.py /outside/test_api.py'])
+    accepted = structured_coder_followup(tests_run=['pytest tests/test_api.py'])
+    first, second = object(), object()
+    results = [
+        AgentResult(text=rejected, returncode=0, session_id='coder-session', test_turn_id='rejected', test_turn_observations=(first,)),
+        AgentResult(text=accepted, returncode=0, session_id='coder-session', test_turn_id='correction', test_turn_observations=(second,)),
+    ]
+    runner = FakeRunner()
+    config = make_config(tmp_path, agent_max_retries=0)
+    seen = []
+    def validate(text):
+        seen.append(response_validation._current_test_turn_observations(runner))
+        return response_validation._validate_followup_workdir_report(
+            validate_structured_coder_followup(text), config=config,
+        )
+    with patch_object_in((validated_agent, response_validation), 'run_agent_result', side_effect=results) as invoke:
+        response = _run_validated_agent(
+            runner, agent='claude', config=config, prompt='Correct PR feedback.',
+            marker_description='structured coder followup', validate=validate,
+            role='coder', use_repair=True, repair_expected_kind='coder_followup',
+            reask_on_evidence_rejection=True,
+        )
+    assert invoke.call_count == 2
+    assert len(seen) >= 2
+    assert all(catalog == (first,) for catalog in seen[:-1])
+    assert seen[-1] == (second,)
+    assert response.acquisition_test_turn_id == 'correction'
+    assert response.acquisition_test_observations == (second,)
+    assert invoke.call_args_list[1].kwargs['session_id'] == 'coder-session'
+
+
+def test_followup_workdir_composition_preserves_operational_errors(tmp_path, monkeypatch):
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+    parsed = validate_structured_coder_followup(structured_coder_followup())
+    failure = AgentLoopError('Operational context unavailable')
+    def fail(*args, **kwargs):
+        raise failure
+    monkeypatch.setattr(response_validation, '_degrade_out_of_checkout_tests', fail)
+    with pytest.raises(AgentLoopError) as caught:
+        response_validation._validate_followup_workdir_report(parsed, config=make_config(tmp_path))
+    assert caught.value is failure

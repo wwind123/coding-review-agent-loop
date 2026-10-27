@@ -1672,7 +1672,7 @@ def test_pr_loop_rejects_structured_followup_live_target_tests_before_posting(tm
                 tests_run=["pytest tests/test_foo.py https://live.example"],
                 reviewer="OpenAI Codex",
             ),
-        ],
+        ] * 2,
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
 
@@ -1707,7 +1707,7 @@ def test_pr_loop_refuses_structured_followup_mixed_outside_tests(tmp_path, comma
                 tests_run=[command],
                 reviewer="OpenAI Codex",
             ),
-        ],
+        ] * 2,
     )
     config = make_config(tmp_path, coder="codex", reviewer="claude")
 
@@ -2217,3 +2217,82 @@ def test_1388_addressed_item_without_resolution_history_still_fails_closed(
     assert not any(
         "Acknowledged the new signed requirement." in comment for comment in runner.comments
     )
+
+
+@pytest.mark.parametrize('mode', ['display', 'partition', 'citation', 'normalized', 'escape'])
+def test_scratch_report_followup_workflow(tmp_path, monkeypatch, mode):
+    """#1738: drive acquisition, refusal/correction, publication and review."""
+    import coding_review_agent_loop.workdir_guard as guard
+    root = tmp_path / 'coding-review-agent-loop'
+    monkeypatch.setattr(guard, 'scratch_root', lambda: root)
+    audit = (
+        'python scripts/dependency_audit.py evaluate --policy .github/dependency-audit-policy.json '
+        f'--python-report {root}/scratch/1837/pip-audit.json '
+        f'--npm-report {root}/scratch/1837/npm-audit.json'
+    )
+    bad_command = audit
+    if mode == 'partition':
+        bad_command = 'pytest tests/test_api.py /outside/test_api.py'
+    if mode == 'escape':
+        bad_command = audit + f' {root}/scratch/1837/pip-audit.json'
+    raw = structured_coder_followup(
+        summary='Rejected acquisition claim.', addressed_items=['item-1'],
+        tests_run=[bad_command], reviewer='OpenAI Codex',
+    )
+    if mode == 'citation':
+        payload, end = json.JSONDecoder().raw_decode(raw)
+        payload['test_observations'] = [{
+            'command': audit, 'receipt_id': 'scratch-audit', 'claim': 'current-result',
+        }]
+        raw = json.dumps(payload) + raw[end:]
+    if mode == 'normalized':
+        raw = raw.replace(audit, 'pytest tests/test_api.py /outside/test_api.py') + '\ntrailing prose'
+    corrected = structured_coder_followup(
+        summary='Accepted replacement claim.', addressed_items=['item-1'],
+        tests_run=[audit], reviewer='OpenAI Codex',
+    )
+    runner = FakeRunner(
+        claude_outputs=[
+            structured_pr_review(state='blocking', blocking_items=['Add coverage.'], reviewer='Anthropic Claude'),
+            structured_pr_review(state='approved', prior_item_dispositions=[
+                {'item_id': 'item-1', 'disposition': 'resolved'}
+            ], reviewer='Anthropic Claude'),
+        ],
+        codex_outputs=[corrected] if mode == 'display' else [raw, corrected],
+    )
+    config = make_config(tmp_path, coder='codex', reviewer='claude', agent_max_retries=0)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ['codex']]
+    assert len(prompts) == (1 if mode == 'display' else 2)
+    if mode != 'display':
+        assert 'Previous response not accepted: test evidence' in prompts[1]
+        assert 'Add coverage.' in prompts[1]
+    if mode == 'citation':
+        assert 'without hiding failing observations' in prompts[1]
+    assert not any('Rejected acquisition claim.' in comment for comment in runner.comments)
+    published = next(comment for comment in runner.comments if 'Accepted replacement claim.' in comment)
+    assert audit in published
+    assert 'Out-of-checkout context runs' not in published
+    assert 'scratch-audit' not in published
+
+
+def test_resumed_scratch_report_classification(tmp_path, monkeypatch):
+    import coding_review_agent_loop.workdir_guard as guard
+    root = tmp_path / 'coding-review-agent-loop'
+    monkeypatch.setattr(guard, 'scratch_root', lambda: root)
+    audit = f'python scripts/dependency_audit.py evaluate --input={root}/scratch/1837/audit.json'
+    baseline = 'python -m pytest /outside/tests/'
+    raw = structured_coder_followup(tests_run=[audit, baseline])
+    metadata = PostedRoundMetadata(
+        flow='pr', role='coder', agent='Codex', round_number=2,
+        subject='abc123', raw_structured_coder_response=raw,
+    )
+    context = pr_loop_support._coder_followup_review_context(
+        raw, metadata, head_sha='abc123', assigned_workdir=tmp_path / 'checkout',
+    )
+    assert json.dumps(audit) in context
+    payload, _ = json.JSONDecoder().raw_decode(context[context.index("{"):])
+    assert payload['tests_run'] == [audit]
+    assert payload['out_of_checkout_context_runs_not_evidence'] == [baseline]
+    assert payload['local_test_evidence'] is None
+    assert metadata.raw_structured_coder_response == raw

@@ -832,3 +832,84 @@ def test_legacy_hook_candidate_citing_unverified_suite_start_is_accepted_1659(tm
     assert repaired == _REJECTED_CANDIDATE
     assert marker is not None
     assert all(attempt.outcome != "semantic_evidence_rejection" for attempt in attempts)
+
+
+@pytest.mark.parametrize('order', [
+    ('report-workdir', 'non-passing-selector'),
+    ('launch-integrity', 'report-workdir'),
+    ('report-workdir', 'report-workdir'),
+])
+@pytest.mark.parametrize('repair_surfaced', [False, True])
+def test_followup_guard_shared_allowance(tmp_path, monkeypatch, real_repair, order, repair_surfaced):
+    """#1738: real acquisition and repair routing share one reason-agnostic budget."""
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+    from agent_loop_helpers import structured_coder_followup
+    valid = structured_coder_followup(summary='Rejected report.')
+    masked = valid.replace('Rejected report.', '')
+    calls = _cli_repair(monkeypatch, [(valid, 0)]) if repair_surfaced else []
+    results = [_result(masked if repair_surfaced else valid, session_id='acquired'), _result(valid)]
+    with patch_object_in((validated_agent_module, response_validation), 'run_agent_result', side_effect=results) as invoke:
+        def validate(text):
+            parsed = validate_structured_coder_followup(text)
+            reason = order[min(invoke.call_count, 2) - 1]
+            if reason == 'report-workdir':
+                parsed = __import__('dataclasses').replace(
+                    parsed, tests_run=('pytest tests/test_api.py /outside/test_api.py',),
+                )
+                return response_validation._validate_followup_workdir_report(parsed, config=config)
+            raise NonRepairableEvidenceRejection('Selected observation refused.', reason=reason)
+        config = make_config(tmp_path, agent_max_retries=0, **_codex_repair())
+        with pytest.raises(AgentInvocationError, match='semantic-evidence-rejection'):
+            _run_validated_agent(
+                FakeRunner(), agent='claude', config=config, prompt='Address PR feedback.',
+                marker_description='structured coder_followup result', validate=validate,
+                role='coder', use_repair=True, repair_expected_kind='coder_followup',
+                reask_on_evidence_rejection=True,
+            )
+    assert invoke.call_count == 2
+    assert invoke.call_args_list[1].kwargs['session_id'] == 'acquired'
+    assert invoke.call_args_list[1].kwargs['prompt'].startswith('Address PR feedback.')
+    assert len(calls) == (1 if repair_surfaced else 0)
+
+
+def test_repair_surfaced_scratch_citation_reasks_with_fresh_catalog(tmp_path, monkeypatch, real_repair):
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+    from agent_loop_helpers import structured_coder_followup
+    import coding_review_agent_loop.workdir_guard as guard
+    root = tmp_path / 'coding-review-agent-loop'
+    monkeypatch.setattr(guard, 'scratch_root', lambda: root)
+    audit = f'python scripts/dependency_audit.py evaluate --input {root}/scratch/1837/audit.json'
+    raw = structured_coder_followup(summary='Audit reported.', tests_run=[audit])
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload['test_observations'] = [{'command': audit, 'receipt_id': 'audit', 'claim': 'current-result'}]
+    candidate = json.dumps(payload) + raw[end:]
+    masked = candidate.replace('Audit reported.', '')
+    corrected = structured_coder_followup(summary='Replacement evidence.')
+    repair_calls = _cli_repair(monkeypatch, [(candidate, 0)])
+    runner = FakeRunner()
+    config = make_config(tmp_path, agent_max_retries=0, **_codex_repair())
+    first, second = object(), object()
+    results = [
+        _turn_result(masked, 'rejected', [first], session_id='coder-session'),
+        _turn_result(corrected, 'accepted', [second], session_id='coder-session'),
+    ]
+    seen = []
+    def validate(text):
+        seen.append(response_validation._current_test_turn_observations(runner))
+        return response_validation._validate_followup_workdir_report(
+            validate_structured_coder_followup(text), config=config,
+        )
+    with patch_object_in((validated_agent_module, response_validation), 'run_agent_result', side_effect=results) as invoke:
+        response = _run_validated_agent(
+            runner, agent='claude', config=config, prompt='Address PR feedback.',
+            marker_description='structured coder_followup result', validate=validate,
+            role='coder', use_repair=True, repair_expected_kind='coder_followup',
+            reask_on_evidence_rejection=True,
+        )
+    assert invoke.call_count == 2 and len(repair_calls) == 1
+    assert 'without hiding failing observations' in invoke.call_args_list[1].kwargs['prompt']
+    assert invoke.call_args_list[1].kwargs['session_id'] == 'coder-session'
+    assert all(catalog == (first,) for catalog in seen[:-1])
+    assert seen[-1] == (second,)
+    assert response.acquisition_test_observations == (second,)
+    assert not response.marker_value.test_observations

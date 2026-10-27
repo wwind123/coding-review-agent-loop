@@ -7277,3 +7277,26 @@ def test_client_decodes_the_reason_fail_closed_1661():
         receipt_id="r", execution_ref=None, outcome="passed", returncode=0, elapsed_seconds=0.0,
     ).suite_start_reason is None
     assert coerce_suite_start_reason({"x": 1}, "unknown") is None
+
+
+@pytest.mark.parametrize('outcome', ['passed', 'failed'])
+def test_scratch_display_does_not_grant_evidence_or_hide_failure(tmp_path, monkeypatch, outcome):
+    import dataclasses
+    import shlex
+    import coding_review_agent_loop.workdir_guard as guard
+    from coding_review_agent_loop.local_test_evidence import mark_out_of_checkout_context, OUT_OF_CHECKOUT_CONTEXT_CAVEAT
+    from coding_review_agent_loop.response_validation import _admissible_evidence_observations
+    root = tmp_path / 'coding-review-agent-loop'
+    monkeypatch.setattr(guard, 'scratch_root', lambda: root)
+    checkout = tmp_path / 'checkout'
+    command = f'python scripts/dependency_audit.py evaluate --input {root}/scratch/1837/report.json'
+    row = dataclasses.replace(_observation(
+        outcome=outcome, timestamp='2026-10-27T20:00:00Z', receipt_id='audit',
+        registry=EnvironmentIdentityRegistry(),
+    ), command=tuple(shlex.split(command)), normalized_command=command, cwd=str(checkout))
+    assert guard.partition_reported_tests_by_workdir([command], assigned_workdir=checkout).in_checkout == (command,)
+    (marked,) = mark_out_of_checkout_context([row], assigned_workdir=checkout)
+    assert OUT_OF_CHECKOUT_CONTEXT_CAVEAT not in marked.caveats
+    assert not _admissible_evidence_observations([marked], assigned_workdir=checkout, selectable=True)
+    evidence = reconcile_test_observations([marked], current_head='head-a', cwd=checkout)
+    assert ('audit' in evidence.authoritative_failures) == (outcome == 'failed')

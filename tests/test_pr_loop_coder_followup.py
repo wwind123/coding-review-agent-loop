@@ -663,7 +663,10 @@ def _approving_review_1292():
 def _rejected_push_runner_1292(*, coder_outputs=(_LIVE_TARGET_FOLLOWUP,), reviews=None, **kwargs):
     return FakeRunner(
         claude_outputs=list(reviews or [_blocking_review_1292(), _approving_review_1292()]),
-        codex_outputs=list(coder_outputs),
+        # A terminal report refusal now exhausts one semantic correction first.
+        codex_outputs=[value for output in coder_outputs for value in (
+            (output, output) if 'https://live.example' in output else (output,)
+        )],
         authenticated_actor=_ACTOR_1292,
         **kwargs,
     )
@@ -697,7 +700,7 @@ def test_post_push_rejection_records_the_pushed_head_and_resumes_a_coder_recover
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    recovery_prompt = _coder_prompts_1292(runner)[1]
+    recovery_prompt = _coder_prompts_1292(runner)[2]
     assert "live remote target" in recovery_prompt
     assert "attempt 1" in recovery_prompt
     assert "`abc123`" in recovery_prompt and f"`{pushed}`" in recovery_prompt
@@ -796,7 +799,7 @@ def test_rejection_record_post_failure_keeps_the_original_error_and_the_attempt_
     with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as raised:
         run_pr_loop(runner, pr_number=77, config=config)
     assert "consecutive" in str(raised.value)
-    assert len(_coder_prompts_1292(runner)) == 2  # no third coder dispatch
+    assert len(_coder_prompts_1292(runner)) == 4  # two acquisitions per refused dispatch
 
 
 _A_1292, _B_1292, _C_1292 = "a" * 40, "b" * 40, "c" * 40
@@ -1015,7 +1018,7 @@ def test_rejection_survives_a_further_head_advance_and_keeps_its_attempt(tmp_pat
     records = [*_history_1292("Claude"), _dispatch_1292(), _rejection_1292()]
     runner = FakeRunner(
         claude_outputs=[_approving_review_1292()],
-        codex_outputs=[_LIVE_TARGET_FOLLOWUP],
+        codex_outputs=[_LIVE_TARGET_FOLLOWUP, _LIVE_TARGET_FOLLOWUP],
         pr_payload={"headRefOid": _C_1292, "comments": _seed_1292(*records)},
         authenticated_actor=_ACTOR_1292,
         advance_pr_head_on_coder_followup=False,
@@ -1032,7 +1035,7 @@ def test_rejection_survives_a_further_head_advance_and_keeps_its_attempt(tmp_pat
     assert [r.dispatch_attempt for r in _records_1292(runner, "coder-followup-rejected")][-1] == 2
     with pytest.raises(AgentLoopError, match="--review-unrecorded-head"):
         run_pr_loop(runner, pr_number=77, config=config)
-    assert len(_coder_prompts_1292(runner)) == 1
+    assert len(_coder_prompts_1292(runner)) == 2
 
 
 def test_last_round_rejection_after_a_watcher_extension_still_dispatches_the_recovery_coder(tmp_path):
@@ -1188,7 +1191,7 @@ def test_recovery_rejected_without_a_push_then_operator_recovery_and_interruptio
     with pytest.raises(AgentLoopError, match="--review-unrecorded-head") as limit:
         run_pr_loop(runner, pr_number=77, config=config)
     assert "consecutive" in str(limit.value)
-    assert len(_coder_prompts_1292(runner)) == 2  # the limit stops a third dispatch
+    assert len(_coder_prompts_1292(runner)) == 4  # the limit stops a third dispatch
 
     flagged = make_config(tmp_path, coder="codex", reviewer="claude", review_unrecorded_head=True)
     runner.claude_outputs.clear()  # interrupt right after the handoff: no reviewer output
@@ -1200,7 +1203,7 @@ def test_recovery_rejected_without_a_push_then_operator_recovery_and_interruptio
     runner.claude_outputs.append(_approving_review_1292())
     assert run_pr_loop(runner, pr_number=77, config=config) == 0  # no flag needed
     assert len(_records_1292(runner, "head-review-recovery")) == 1  # resumed from the handoff
-    assert len(_coder_prompts_1292(runner)) == 2  # no further coder dispatch
+    assert len(_coder_prompts_1292(runner)) == 4  # no further coder dispatch
 
 
 def test_review_unrecorded_head_flag_parses_on_pr_only_and_defaults_off(tmp_path):
@@ -1421,6 +1424,10 @@ def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_t
                 summary="Fixed CI.", addressed_items=["item-1"],
                 tests_run=["pytest tests/test_foo.py https://live.example"],
             ),
+            structured_coder_followup(
+                summary="Fixed CI.", addressed_items=["item-1"],
+                tests_run=["pytest tests/test_foo.py https://live.example"],
+            ),
             structured_coder_followup(summary="Fixed CI in checkout.", addressed_items=["item-1"]),
         ],
         authenticated_actor=_ACTOR_1292,
@@ -1472,7 +1479,7 @@ def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_t
     ]
     assert reviews  # the following reviewer round published for the recovered head
     assert "managed-exact-head-ci" in str(refused.value)  # refused: no second extension
-    assert len([c for c, _ in runner.commands if c[:1] == ["claude"]]) == 2  # no third coder
+    assert len([c for c, _ in runner.commands if c[:1] == ["claude"]]) == 3  # correction plus recovery acquisitions
     assert len(_records_1292(runner, "coder-dispatch")) == 2  # no second extension was granted
 
 

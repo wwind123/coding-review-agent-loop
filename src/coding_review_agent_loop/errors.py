@@ -237,7 +237,13 @@ class NonRepairableEvidenceRejection(AgentLoopError):
         self.reason = reason
 
 
-CITATION_REASKABLE_REASONS = frozenset({"non-passing-selector", "launch-integrity"})
+class ReportWorkdirRefusal(AgentLoopError):
+    """A structured display partition or receipt workdir guard refused a report."""
+
+
+CITATION_REASKABLE_REASONS = frozenset({
+    "non-passing-selector", "launch-integrity", "report-workdir",
+})
 
 
 class TestObservationsShapeError(AgentLoopError):

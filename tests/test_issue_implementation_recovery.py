@@ -1363,3 +1363,22 @@ def test_issue_loop_plan_first_one_shot_rerun_resumes_pr_loop(tmp_path):
     claude_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
     assert len(claude_calls) == 0
     assert any(cmd[:2] == ["codex", "exec"] for cmd, _cwd in runner.commands)
+
+
+def test_issue_scratch_input_report_stays_in_checkout(tmp_path, monkeypatch):
+    import coding_review_agent_loop.workdir_guard as guard
+    root = tmp_path / 'coding-review-agent-loop'
+    monkeypatch.setattr(guard, 'scratch_root', lambda: root)
+    audit = (
+        'python scripts/dependency_audit.py evaluate --policy .github/dependency-audit-policy.json '
+        f'--python-report {root}/scratch/1837/pip-audit.json '
+        f'--npm-report {root}/scratch/1837/npm-audit.json'
+    )
+    runner = FakeRunner(
+        codex_outputs=[structured_issue_implementation(tests_run=[audit], reviewer='OpenAI Codex')],
+        claude_outputs=[structured_pr_review(state='approved', reviewer='Anthropic Claude')],
+    )
+    config = make_config(tmp_path, coder='codex', reviewer='claude')
+    assert run_issue_loop(runner, issue_number=56, config=config) == 0
+    assert any(audit in comment for comment in runner.comments)
+    assert not any('Out-of-checkout context runs' in comment for comment in runner.comments)

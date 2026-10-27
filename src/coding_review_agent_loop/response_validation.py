@@ -17,6 +17,8 @@ from .config import AgentLoopConfig
 from .errors import (
     CheckoutVerificationError,
     AgentLoopError,
+    ReportWorkdirRefusal,
+    NonRepairableEvidenceRejection,
     IssueImplementationConflictError,
     SemanticPatchPayloadRejection,
     SemanticPatchUnknownPriorItemDispositionError,
@@ -1352,6 +1354,24 @@ def _validate_response_tests_with_post_pr_context(
 _StructuredTestReport = TypeVar(
     "_StructuredTestReport", StructuredIssueImplementation, StructuredCoderFollowup
 )
+
+
+def _validate_followup_workdir_report(
+    parsed: object, *, config: AgentLoopConfig,
+) -> object:
+    """Compose structured report guards inside every validated candidate path."""
+    if not isinstance(parsed, StructuredCoderFollowup):
+        return parsed
+    try:
+        partitioned = _degrade_out_of_checkout_tests(parsed, config=config)
+        validate_test_observation_citations_within_workdir(
+            partitioned.test_observations,
+            assigned_workdir=active_workdir(config),
+            dependency_hint=dependency_remedy(config, active_workdir(config)),
+        )
+        return partitioned
+    except ReportWorkdirRefusal as exc:
+        raise NonRepairableEvidenceRejection(str(exc), reason="report-workdir") from exc
 
 
 def _degrade_out_of_checkout_tests(
