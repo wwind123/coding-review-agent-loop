@@ -123,7 +123,7 @@ MANAGED_LABEL = "agent-loop-managed"
 MANAGED_OPT_OUT_LABEL = "agent-loop-managed-opt-out"
 QUALIFIED_LABEL = "agent-loop-exact-head-qualified"
 QUALIFICATION_MARKER = "AGENT_LOOP_MANAGED_CI_QUALIFIED_V2"
-FINAL_CONTEXT = "final-ci/exact-head"
+from .managed_ci_status import FINAL_CONTEXT
 # Plumbing job identity (#1477): the exact managed workflow job names that
 # validate, attest and publish rather than test.  A contract test pins each
 # name to a ``name:`` in the managed workflows; callers extend the catalog

@@ -1,7 +1,7 @@
 """Read-only correlation predicates shared by managed CI observers."""
 from __future__ import annotations
 import json
-from datetime import datetime
+from datetime import datetime as _datetime
 from urllib.parse import urlparse
 from .config import AgentLoopConfig
 from .workdirs import active_workdir
@@ -70,7 +70,7 @@ def _v2_correlated_status(
         created = created_value if isinstance(created_value, str) else None
         if created is not None:
             try:
-                datetime.fromisoformat(created.replace("Z", "+00:00"))
+                _datetime.fromisoformat(created.replace("Z", "+00:00"))
             except ValueError:
                 continue
         matches.append((position, created, raw))
