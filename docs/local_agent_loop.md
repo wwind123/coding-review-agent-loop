@@ -1030,7 +1030,11 @@ A coder push alone cannot create another opportunity. An independently broken
 later terminal freeze starts a new boundary. Interrupted unpublished turns use
 normal recovery; execution before publication is not guaranteed exactly once.
 Missing legacy bindings, ambiguous head advances or unavailable authority history
-grant no retry or evidence authority. Round limits still apply. Unverified rows
+grant no retry or evidence authority. Optional recovery capture is skipped when
+no coder follow-up fits the restored effective round ceiling, including existing
+authorized watcher allowances. It consumes no opportunity in that case; a clean
+reviewed head reaches the normal exact-head evidence freeze and human-decision
+stop. Ordinary code blockers still stop at the round limit. Unverified rows
 retain their IDs, owners and conversion fallback, reaching a clean final freeze
 after normal review and machine gates; a same-head rerun stays frozen. Native
 human-only evidence never starts a coder capture turn. A converted obligation

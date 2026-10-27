@@ -2214,19 +2214,124 @@ def test_subset_recovery_capture_freezes_only_unverified_rows(tmp_path, monkeypa
     assert _agent_count(runner, "claude") == 2
 
 
-def test_broken_converted_freeze_respects_exhausted_round_budget(tmp_path, monkeypatch):
+def _bounded_broken_freeze(tmp_path, monkeypatch, *, policy="all-reviewers", allowed=2):
+    # This synthetic plan has no issue handoff; retain it across qualification.
+    real_qualify = pr_loop_module._fresh_pr_qualification_snapshot
+
+    def qualify(*args, **kwargs):
+        plan = kwargs.pop("approved_plan_context", None)
+        fresh, requirements, _plan, fresh_config = real_qualify(*args, **kwargs)
+        return fresh, requirements, plan, fresh_config
+
+    monkeypatch.setattr(pr_loop_module, "_fresh_pr_qualification_snapshot", qualify)
     context = _plan_context("row-a", "row-b")
-    runner, config = _frozen_after_auto_conversion(tmp_path, monkeypatch, context)
+    runner, config = _frozen_after_auto_conversion(
+        tmp_path, monkeypatch, context, config=_config(tmp_path, pr_review_policy=policy),
+    )
     config = dataclasses.replace(config, max_rounds=2)
     freeze = _records(runner)[-1]
     bounded = dataclasses.replace(freeze.metadata, evidence_freeze=dataclasses.replace(
-        freeze.metadata.evidence_freeze, allowed_rounds=2,
+        freeze.metadata.evidence_freeze, allowed_rounds=allowed,
+        watch_failure_extension_used=allowed > 2,
     ))
     runner.pr_payload["comments"][freeze.index]["body"] = _attach_round_metadata("Bounded freeze", bounded)
     _push_external_head(runner, "fedcba9")
+    return runner, config, context, bounded
+
+
+@pytest.mark.parametrize("policy", ["all-reviewers", "selective-intermediate"])
+def test_broken_converted_freeze_respects_exhausted_round_budget(tmp_path, monkeypatch, policy):
+    runner, config, context, source = _bounded_broken_freeze(tmp_path, monkeypatch, policy=policy)
     runner.codex_outputs.append(_review(kept=["item-2"], state="blocking"))
-    with pytest.raises(AgentLoopError):
+    before = len(_records(runner))
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head fedcba9"):
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    frozen = _records(runner)[-1].metadata
+    assert frozen.phase == "evidence-freeze" and frozen.subject == "fedcba9"
+    assert frozen.round_number == frozen.evidence_freeze.allowed_rounds == 2
+    assert frozen.evidence_freeze.watch_failure_extension_used is False
+    assert frozen.evidence_freeze.watch_head_extension_used == source.evidence_freeze.watch_head_extension_used
+    [row] = _evidence_items(frozen.prior_items)
+    [original] = _evidence_items(source.prior_items)
+    assert (row.item_id, row.converted_row_id, row.resolution_owners) == (
+        original.item_id, original.converted_row_id, original.resolution_owners,
+    )
+    assert row.lifecycle == "evidence_frozen"
+    assert row.obligation_identity == original.obligation_identity
+    assert frozen.evidence_freeze.evidence_identities == source.evidence_freeze.evidence_identities
+    assert frozen.signed_evidence_references == source.signed_evidence_references
+    assert not any(r.metadata.role == "coder" for r in _records(runner)[before:])
+    snapshot = list(runner.comments)
+    agents = _agent_count(runner, "codex")
+    runner.simulate_new_process()
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head fedcba9"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert runner.comments == snapshot
+    assert _agent_count(runner, "codex") == agents
+    assert _agent_count(runner, "claude") == 1
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize("policy", ["all-reviewers", "selective-intermediate"])
+def test_broken_converted_freeze_uses_restored_watcher_slot(tmp_path, monkeypatch, policy):
+    runner, config, context, _ = _bounded_broken_freeze(tmp_path, monkeypatch, policy=policy, allowed=3)
+    _install_derivation(monkeypatch, context, [{"row-a": "verified", "row-b": "verified"}])
+    runner.advance_pr_head_on_coder_followup = False
+    runner.claude_outputs.append(_coder())
+    runner.codex_outputs.extend([
+        _review(kept=["item-2"], state="blocking"), _review(resolved=["item-2"]),
+    ])
+    assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
+    records = _records(runner)
+    capture = next(r for r in reversed(records) if r.metadata.role == "coder")
+    # Coder publications name the next review round; admission occurred at R=2.
+    assert capture.metadata.round_number == 3
+    preceding = [r for r in records if r.index < capture.index
+                 and r.metadata.role == "reviewer" and r.metadata.subject == "fedcba9"]
+    assert preceding and preceding[-1].metadata.round_number == config.max_rounds
+    [semantic] = _reviews_after(runner, capture.index)
+    assert semantic.metadata.round_number == 3 and semantic.metadata.state == "approved"
+    assert all(r.metadata.round_number <= 3 for r in records)
+    assert not any(r.metadata.phase == "evidence-freeze" for r in records if r.index > capture.index)
+    assert "Bounded recovery capture" in _prompts(runner, "claude")[-1]
+    assert _agent_count(runner, "claude") == 2
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+
+def test_broken_converted_freeze_with_code_blocker_keeps_round_limit(tmp_path, monkeypatch):
+    runner, config, context, _ = _bounded_broken_freeze(tmp_path, monkeypatch)
+    runner.codex_outputs.append(_review(["Repair the real code defect."], kept=["item-2"], state="blocking"))
+    before = len(_records(runner))
+    with pytest.raises(AgentLoopError) as raised:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert not isinstance(raised.value, HumanDecisionRequiredError)
+    assert "round" in str(raised.value).lower()
+    assert not any(r.metadata.phase == "evidence-freeze" or r.metadata.role == "coder"
+                   for r in _records(runner)[before:])
+    assert _agent_count(runner, "claude") == 1
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+
+def test_skipped_capture_revalidates_live_head_at_final_gate(tmp_path, monkeypatch):
+    runner, config, context, _ = _bounded_broken_freeze(tmp_path, monkeypatch)
+    runner.codex_outputs.append(_review(kept=["item-2"], state="blocking"))
+    real_gate = pr_loop_module._evidence_freeze_gate
+    outcomes = []
+
+    def gate(*args, **kwargs):
+        _push_external_head(runner, "abcdef0")
+        result = real_gate(*args, **kwargs)
+        outcomes.append(result)
+        return result
+
+    monkeypatch.setattr(pr_loop_module, "_evidence_freeze_gate", gate)
+    before = len(_records(runner))
+    with pytest.raises(AgentLoopError) as raised:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    assert not isinstance(raised.value, HumanDecisionRequiredError)
+    assert [outcome.action for outcome in outcomes] == ["head_changed"]
+    assert not any(r.metadata.phase == "evidence-freeze" or r.metadata.role == "coder"
+                   for r in _records(runner)[before:])
     assert _agent_count(runner, "claude") == 1
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
 

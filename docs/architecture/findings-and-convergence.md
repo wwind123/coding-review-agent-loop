@@ -348,8 +348,13 @@ bindings consumes the opportunity even without evidence or after a coder push.
 Legacy or uncertain history grants no retry. Tool evidence at the live head
 supersedes conversions through existing reconciliation; unresolved rows keep
 their identities and owners and reach the final freeze after normal gates.
-Native evidence and live freezes never dispatch capture, and round ceilings
-remain in force. No new recovery payload is persisted.
+Optional recovery capture is admitted only when a coder follow-up fits the
+restored effective round ceiling, including authorized watcher allowances. At
+the ceiling it is skipped without consuming the opportunity: unresolved rows
+reach the normal clean-head evidence freeze and human-decision stop. Ordinary
+code blockers retain the round-limit stop. Native evidence and live freezes
+never dispatch capture, and round ceilings remain in force. No new recovery
+payload is persisted.
 
 `converted_capture_state.py` owns the pure capture eligibility rules shared by
 round-state approval readers, qualification and capture dispatch.

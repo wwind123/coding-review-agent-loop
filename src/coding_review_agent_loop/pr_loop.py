@@ -6392,7 +6392,7 @@ def run_pr_loop(
             recovery_capture_items = recovery_capture(
                 runner, config, pr_number=pr_number, items=unresolved_items,
                 head=pr_metadata.head_sha, plan=approved_plan_context,
-            )
+            ) if round_number < allowed_rounds else ()
             must_fix_items = list(item_partitions["coder_blockers"]) + list(recovery_capture_items)
             carried_panel_ids = (
                 set(carried_secondary_obligations(
