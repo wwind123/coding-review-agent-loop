@@ -2,7 +2,7 @@
 
 How agent-loop observes CI and merges: the counted check board, managed exact-head CI and its hosted workflow boundary, managed-label handling, base-workflow dispatch authorization, sharded and split layouts, integration targets, preflight 403 fallbacks and protection states, issue-created managed-CI authorization, the authorization continuity chain across coder, merge-conflict, CI-repair and rejected-coder recovery heads, and the coder CI-dispatch guard.
 
-Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
+Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_reconciliation.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/managed_ci_status.py`, `src/coding_review_agent_loop/pr_loop_plumbing.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
 
 ## CI and Merge
 
@@ -80,6 +80,38 @@ Qualification requires correlated exact-head evidence and the full counted
 check board, not a model's statement that CI passed. Head changes invalidate the
 proof. Automatic merge uses `--match-head-commit`; explicit managed CI can
 qualify for manual merging instead.
+
+A repair checkpoint has a separate observation path in
+`managed_ci_reconciliation.py` (#1709). `FailedManagedRun` binds the original
+completed audit record, nonce, run, failed attempt, generation and workflow
+revision to the repository, PR, target head, base and obligation. Before repair
+routing and immediately before a coder handoff, a bounded read can verify a
+later successful attempt of that same run. It uses the shared status predicates
+in `managed_ci_status.py`, validates the original authenticated record and
+workflow actors/ref/revision, follows the run's current positive attempt, and
+requires the complete passing counted board and live managed authorization.
+The workflow run's default-branch head is distinct from the target PR head.
+Pending, incomplete, excluded, superseded or unrelated observations cannot
+settle the obligation. A pending or unreadable rerun stops before another
+coder handoff, retaining the obligation and its budget. Observation never
+renews an audit record or dispatches CI.
+
+`VerifiedManagedResult` is immutable result provenance, separate from the fresh
+activation contract. Settlement persists it with the remaining ledger before
+finalization. Both `prepare_v2_merge` and manual qualification accept it through
+an explicit optional `verified_result` argument and re-observe it before their
+side effects. The settlement evidence, manual qualification record and
+`ExactHeadCiProof.managed_result` name the observed nonce, run, successful
+attempt, original generation and source audit-record reference. The fresh
+contract continues to govern live authorization, protection, label ownership
+and cleanup; its nonce, attachment, attempt, generation and intent/audit
+references are never replaced with historical result identity. Manual publication
+keeps its publication receipt separate on this path. Existing approval, plan,
+requirements, architecture, evidence and head-guarded merge gates still apply,
+and settlement clears only the matching managed obligation. Unrelated qualifying
+checkpoints retain the fresh-generation dispatch behavior above. Post-approval
+plumbing routing is extracted into `pr_loop_plumbing.py` with the loop's existing
+dependencies supplied explicitly; retry policy is unchanged.
 
 The installed `CI` workflow is the hosted execution boundary for this
 repository's managed route. Its literal v2 and unlabeled-recovery declarations

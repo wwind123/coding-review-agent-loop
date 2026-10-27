@@ -7859,6 +7859,28 @@ validation runs again. The qualification wait then ignores attempt N until
 attempt N+1 is observed. A second plumbing failure, or a refused rerun, stops
 on infrastructure.
 
+When a managed test failure has left a same-head repair checkpoint, an operator
+rerun that actually publishes a correlated later-attempt success can settle that
+checkpoint on `agent-loop issue N` or `agent-loop pr N` resume. The loop checks
+again before each repair handoff, so a completed rerun can also prevent another
+unchanged-head coder turn during an invocation. The result must belong to the
+recorded nonce, run, target head and base, come from the trusted workflow and
+publisher, and have a complete passing check board. A green context by itself
+is insufficient. This recovery consumes existing evidence; it does not request
+or authorize a rerun. A later failure still follows the repair path, while
+pending or unreadable evidence leaves the obligation unresolved and stops
+before consuming another coder turn.
+
+The observed historical result is carried separately from the new invocation's
+dispatch authority. Automatic merge remains head-guarded. Manual qualification
+publishes the observed run, attempt, nonce, original generation and source audit
+reference, retaining the normal readiness and label rules. Current reviewer,
+plan, requirement, architecture and evidence gates still apply. Older repair
+checkpoints recover only when authenticated history uniquely establishes the
+failed-run binding; if it does not, recovery stays unresolved rather than
+selecting an arbitrary green run. A restart revalidates recorded settlement
+against live GitHub evidence.
+
 A managed run that published a failure status although only plumbing jobs
 failed leaves a plain `completed` audit record, which the validator rejects
 for N+1. The loop therefore stops on infrastructure without a rerun or a

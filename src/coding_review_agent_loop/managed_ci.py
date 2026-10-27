@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from .managed_ci_result import VerifiedManagedResult
+from .managed_ci_reconciliation import require_verified_result, historical_qualification_fields
+
 import base64
 import functools
 import json
@@ -120,7 +123,7 @@ MANAGED_LABEL = "agent-loop-managed"
 MANAGED_OPT_OUT_LABEL = "agent-loop-managed-opt-out"
 QUALIFIED_LABEL = "agent-loop-exact-head-qualified"
 QUALIFICATION_MARKER = "AGENT_LOOP_MANAGED_CI_QUALIFIED_V2"
-FINAL_CONTEXT = "final-ci/exact-head"
+from .managed_ci_status import FINAL_CONTEXT
 # Plumbing job identity (#1477): the exact managed workflow job names that
 # validate, attest and publish rather than test.  A contract test pins each
 # name to a ``name:`` in the managed workflows; callers extend the catalog
@@ -7782,6 +7785,7 @@ def publish_manual_v2_qualification(
     expected_head_sha: str,
     contract: ManagedCiContract,
     reviewers: tuple[str, ...],
+    verified_result: VerifiedManagedResult | None = None,
 ) -> str:
     """Publish a SHA-bound manual result on a ready PR that keeps its label.
 
@@ -7799,6 +7803,7 @@ def publish_manual_v2_qualification(
             expected_head_sha=expected_head_sha,
             contract=contract,
             reviewers=reviewers,
+            verified_result=verified_result,
         )
     except BaseException as original:
         fragment = _release_label_after_failed_publication(
@@ -7817,9 +7822,13 @@ def _publish_manual_v2_qualification(
     expected_head_sha: str,
     contract: ManagedCiContract,
     reviewers: tuple[str, ...],
+    verified_result: VerifiedManagedResult | None = None,
 ) -> str:
     if contract.protocol_version != 2:
         raise AgentLoopError("Explicit managed-CI manual qualification requires protocol v2.")
+    if verified_result is not None:
+        require_verified_result(runner, config=config, pr_number=pr_number,
+                                expected_head_sha=expected_head_sha, contract=contract, result=verified_result)
     if get_pr_head_sha(runner, config, pr_number) != expected_head_sha:
         raise AgentLoopError(
             f"PR #{pr_number} head changed before manual qualification publication; no merge is safe."
@@ -7896,6 +7905,9 @@ def _publish_manual_v2_qualification(
     )
     run_text = str(contract.attached_run_id) if contract.attached_run_id is not None else "unknown"
     attempt_text = str(contract.run_attempt) if contract.run_attempt is not None else "unknown"
+    result_fields = (historical_qualification_fields(verified_result) if verified_result else
+                     f"nonce={contract.nonce or 'unknown'} run_id={run_text} attempt={attempt_text} "
+                     f"generation={contract.intent_generation or 'unknown'}")
     reviewer_text = ",".join(reviewers) or "unknown"
     qualification_label = protocol_record_label(
         "managed_ci_qualified_head", pr_number=pr_number, head_sha=expected_head_sha
@@ -7904,8 +7916,7 @@ def _publish_manual_v2_qualification(
         f"{qualification_label}\n\n"
         f"<!-- {QUALIFICATION_MARKER} repo={config.repo} pr={pr_number} base={contract.base_ref or config.base} "
         f"protocol=2 qualified_head={expected_head_sha} reviewers={reviewer_text} "
-        f"protection={contract.protection_mode or 'unknown'} nonce={contract.nonce or 'unknown'} "
-        f"run_id={run_text} attempt={attempt_text} generation={contract.intent_generation or 'unknown'} -->\n\n"
+        f"protection={contract.protection_mode or 'unknown'} {result_fields} -->\n\n"
         f"Managed exact-head CI qualified `{expected_head_sha}` for manual merge. "
         "The managed label is retained so ordinary CI does not re-run on this qualified head; "
         "it has no effect while the PR is ready. Removing the label, or re-running agent-loop "
@@ -7919,7 +7930,7 @@ def _publish_manual_v2_qualification(
     trusted_body = TrustedBody.canonical(body, expected_tokens=(QUALIFICATION_MARKER,))
     # The qualified-head record has no parser or recovery consumer; its canonical
     # marker span is preserved and the write is verified before it is adopted.
-    contract.audit_comment_id = post_verified_trusted_pr_protocol_comment(
+    publication_id = post_verified_trusted_pr_protocol_comment(
         runner,
         config=config,
         pr_number=pr_number,
@@ -7931,6 +7942,8 @@ def _publish_manual_v2_qualification(
         raise AgentLoopError(
             f"PR #{pr_number} head changed after qualification publication; rerun review and exact-head CI."
         )
+    if verified_result is None:
+        contract.audit_comment_id = publication_id
     return expected_head_sha
 
 
@@ -8708,7 +8721,7 @@ def _intent_producer_id(contract: ManagedCiContract) -> int:
 
 
 def _ensure_v2_intent(
-    runner: Runner, *, config: AgentLoopConfig, pr_number: int, expected_head_sha: str, contract: ManagedCiContract
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, expected_head_sha: str, contract: ManagedCiContract,
 ) -> None:
     contract.pr_number = pr_number
     contract.expected_head_sha = expected_head_sha
@@ -9088,7 +9101,8 @@ def _discover_v2_run(
 
 
 def _refresh_v2_attached_run(
-    runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract
+    runner: Runner, *, config: AgentLoopConfig, contract: ManagedCiContract,
+    strict_provenance: bool = False,
 ) -> ManagedCiRunSnapshot | None:
     """Read the current attempt for the already-attached workflow run.
 
@@ -9114,6 +9128,17 @@ def _refresh_v2_attached_run(
     except json.JSONDecodeError:
         return None
     if not isinstance(run, dict) or run.get("id") != contract.attached_run_id:
+        return None
+    if strict_provenance and (
+        run.get("head_branch") != (contract.dispatch_ref or contract.base_ref)
+        or run.get("head_sha") != contract.workflow_revision
+        or not isinstance(run.get("path"), str)
+        or run["path"].split("@", 1)[0] != f".github/workflows/{WORKFLOW_FILE}"
+        or any(not isinstance(run.get(field), dict)
+               or run[field].get("login") != contract.trusted_actor_login
+               or type(run[field].get("id")) is not int
+               or run[field]["id"] != contract.trusted_actor_id for field in ("actor", "triggering_actor"))
+    ):
         return None
     run_name = _v2_run_name(contract)
     if not _is_v2_intent_run(run, contract=contract, run_name=run_name):
@@ -9268,14 +9293,7 @@ def wait_for_final_qualification(
         status = final.status.lower() if final is not None else "pending"
         last_status = status if final is not None else "absent"
         log(config, f"Managed CI context '{FINAL_CONTEXT}' status: {status}")
-        complete_board = (
-            latest.check_query_status == "ok"
-            and latest.branch_protection_status in {"configured", "not_found", "forbidden"}
-            and latest.state == "passing"
-            and bool(latest.passing)
-            and not latest.pending
-            and not latest.missing_required
-        )
+        complete_board = complete_managed_board(latest)
         if status == "success" and complete_board:
             if contract is not None and contract.protocol_version == 2:
                 _patch_intent(runner, config=config, contract=contract, state="completed")
@@ -9367,137 +9385,10 @@ def wait_for_final_qualification(
     )
 
 
-def _v2_correlated_status(
-    runner: Runner, *, config: AgentLoopConfig, expected_head: str, contract: ManagedCiContract
-) -> PullRequestCheck | None:
-    """Return only the status published by the attached, current run.
-
-    A context name is deliberately insufficient: an older duplicate or a
-    contributor-created status must remain pending, including if it is red.
-    """
-    if (
-        contract.attached_run_id is None
-        or not contract.nonce
-        or not _v2_attempt_is_correlatable(contract.run_attempt)
-    ):
-        return None
-    result = runner.run(
-        [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/commits/{expected_head}/statuses?per_page=100"],
-        cwd=active_workdir(config), check=False,
-    )
-    if result.returncode != 0:
-        return None
-    try:
-        pages = _decode_paginated_json(result.stdout)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    statuses = [item for page in pages for item in page]
-    required = {f"nonce={contract.nonce}", f"run_id={contract.attached_run_id}"}
-    if isinstance(contract.run_attempt, int):
-        required.add(f"attempt={contract.run_attempt}")
-    excluded = _v2_terminal_attempt_excluded(
-        contract.attached_run_id, contract.run_attempt, contract.terminal_attempts
-    )
-    matches: list[tuple[int, str | None, dict[str, object]]] = []
-    for position, raw in enumerate(statuses):
-        if not isinstance(raw, dict) or raw.get("context") != FINAL_CONTEXT:
-            continue
-        description = raw.get("description") if isinstance(raw.get("description"), str) else ""
-        target = raw.get("target_url") if isinstance(raw.get("target_url"), str) else ""
-        creator = raw.get("creator") if isinstance(raw.get("creator"), dict) else {}
-        login = creator.get("login") if isinstance(creator.get("login"), str) else None
-        creator_id = creator.get("id") if isinstance(creator.get("id"), int) else None
-        allowed_publisher = (
-            (login or "").casefold() == "github-actions[bot]"
-            or (login == contract.trusted_actor_login and creator_id == contract.trusted_actor_id)
-        )
-        description_tokens = {token.strip() for token in description.split(";") if token.strip()}
-        if not allowed_publisher or not required.issubset(description_tokens):
-            continue
-        target_path = urlparse(target).path.rstrip("/")
-        target_segments = target_path.split("/")
-        if (
-            len(target_segments) < 3
-            or target_segments[-3:-1] != ["actions", "runs"]
-            or target_segments[-1] != str(contract.attached_run_id)
-        ):
-            continue
-        if excluded:
-            continue
-        created_value = raw.get("created_at")
-        created = created_value if isinstance(created_value, str) else None
-        if created is not None:
-            try:
-                datetime.fromisoformat(created.replace("Z", "+00:00"))
-            except ValueError:
-                continue
-        matches.append((position, created, raw))
-    if not matches:
-        return None
-    def sort_key(item: tuple[int, str | None, dict[str, object]]) -> tuple[int, str, int]:
-        pos, created, _ = item
-        return (1 if created else 0, created or "", -pos)
-    raw = sorted(matches, key=sort_key)[-1][2]
-    description = raw.get("description") if isinstance(raw.get("description"), str) else ""
-    target = raw.get("target_url") if isinstance(raw.get("target_url"), str) else ""
-    creator = raw.get("creator") if isinstance(raw.get("creator"), dict) else {}
-    login = creator.get("login") if isinstance(creator.get("login"), str) else None
-    creator_id = creator.get("id") if isinstance(creator.get("id"), int) else None
-    return PullRequestCheck(
-        name=FINAL_CONTEXT,
-        kind="status_context",
-        status=str(raw.get("state") or "pending"),
-        url=target or None,
-        run_id=str(contract.attached_run_id),
-        created_at=raw.get("created_at") if isinstance(raw.get("created_at"), str) else None,
-        completed_at=raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else None,
-        creator_login=login,
-        creator_id=creator_id,
-        description=description,
-    )
-
-
-def _decode_paginated_json(text: str) -> list[list[object]]:
-    """Decode gh --paginate output, including concatenated JSON arrays."""
-    decoder = json.JSONDecoder()
-    pages: list[list[object]] = []
-    offset = 0
-    while offset < len(text):
-        while offset < len(text) and text[offset].isspace():
-            offset += 1
-        if offset >= len(text):
-            break
-        value, end = decoder.raw_decode(text, offset)
-        if not isinstance(value, list):
-            raise json.JSONDecodeError("page is not an array", text, offset)
-        pages.append(value)
-        offset = end
-    return pages
-
-
-def _v2_terminal_attempt_excluded(
-    run_id: object, attempt: object, exclusions: object
-) -> bool:
-    if not isinstance(run_id, int) or not isinstance(exclusions, (set, tuple, list)):
-        return False
-    for entry in exclusions:
-        if not isinstance(entry, (tuple, list)) or len(entry) != 2:
-            continue
-        rid, stored_attempt = entry
-        if rid != run_id or not isinstance(rid, int):
-            continue
-        # An omitted terminal attempt cannot prove that any later attempt of
-        # the same run is a legitimate rerun. Keep the whole run excluded;
-        # only a different fresh run ID can be correlated safely.
-        if stored_attempt is None:
-            return True
-        if isinstance(stored_attempt, int) and stored_attempt == attempt:
-            return True
-    return False
-
-
-def _v2_attempt_is_correlatable(attempt: object) -> bool:
-    return type(attempt) is int and attempt > 0
+from .managed_ci_status import (
+    _v2_correlated_status, _decode_paginated_json, complete_managed_board,
+    _v2_terminal_attempt_excluded, _v2_attempt_is_correlatable,
+)
 
 
 def _v2_jobs(
@@ -9705,11 +9596,15 @@ def rerun_managed_attempt(
 
 @_surfaces_list_failures
 def prepare_v2_merge(
-    runner: Runner, *, config: AgentLoopConfig, pr_number: int, expected_head_sha: str, contract: ManagedCiContract
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int, expected_head_sha: str, contract: ManagedCiContract,
+    verified_result: VerifiedManagedResult | None = None,
 ) -> None:
     """Publish continuity before readying the PR, then re-check its exact head."""
     if contract.protocol_version != 2:
         return
+    if verified_result is not None:
+        require_verified_result(runner, config=config, pr_number=pr_number,
+                                expected_head_sha=expected_head_sha, contract=contract, result=verified_result)
     require_recorded_base(
         runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
         repository=contract.repository or config.repo, head_sha=expected_head_sha,
