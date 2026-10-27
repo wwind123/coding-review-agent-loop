@@ -15431,12 +15431,18 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
             state="blocking", summary="Needs a test.", blocking_items=["Add a regression test."],
         )
     ]
-    runner.claude_outputs = [_LIVE_TARGET_FOLLOWUP_1367]
+    # Exhaust the shared semantic correction before testing durable recovery.
+    runner.claude_outputs = [_LIVE_TARGET_FOLLOWUP_1367] * 2
     with pytest.raises(AgentLoopError, match="live remote target"):
         pr_loop.run_pr_loop(
             runner, pr_number=7, config=config, managed_ci_handoff=root,
             managed_ci_issue_number=643,
         )
+    coder_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    assert len(coder_calls) == 2
+    assert "live remote target" in coder_calls[1][-1]
+    assert not runner.claude_outputs
+    assert not events  # Rejected reports cannot qualify or merge.
     stranded = runner.pr_payload["headRefOid"]
     assert stranded != "abc123"
     runner.rest_pr["head"]["sha"] = stranded
@@ -15641,12 +15647,18 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     runner.codex_outputs = [_m1376_review(
         "gpt-a", state="blocking", summary="Needs a test.", blocking_items=["Add a regression test."],
     )]
-    runner.claude_outputs = [_LIVE_TARGET_FOLLOWUP_1367]
+    # Exhaust the shared semantic correction before testing durable recovery.
+    runner.claude_outputs = [_LIVE_TARGET_FOLLOWUP_1367] * 2
     with pytest.raises(AgentLoopError, match="live remote target"):
         pr_loop.run_pr_loop(
             runner, pr_number=7, config=config_a, managed_ci_handoff=root,
             managed_ci_issue_number=643, **plan_bound,
         )
+    coder_calls = [cmd for cmd, _cwd in runner.commands if cmd[:1] == ["claude"]]
+    assert len(coder_calls) == 2
+    assert "live remote target" in coder_calls[1][-1]
+    assert not runner.claude_outputs
+    assert not events  # Rejected reports cannot qualify or merge.
     stranded = runner.pr_payload["headRefOid"]
     runner.rest_pr["head"]["sha"] = stranded
     runner.compare_payload = {
