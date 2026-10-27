@@ -1,6 +1,7 @@
 import shlex
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1662,10 +1663,47 @@ def test_scratch_option_display_only(tmp_path, monkeypatch, flag, equals, wrappe
     partition = workdir_guard.partition_reported_tests_by_workdir([command], assigned_workdir=checkout)
     assert partition.in_checkout == (command,)
     assert partition.out_of_checkout == ()
-    assert not workdir_guard.command_is_admissible_evidence(command, assigned_workdir=checkout)
+    assert workdir_guard.command_is_admissible_evidence(command, assigned_workdir=checkout) is equals
     assert not workdir_guard.command_targets_outside_workdir(command, assigned_workdir=checkout)
-    with pytest.raises(AgentLoopError):
+    if equals:
         validate_test_commands_within_workdir([command], assigned_workdir=checkout)
+    else:
+        with pytest.raises(AgentLoopError):
+            validate_test_commands_within_workdir([command], assigned_workdir=checkout)
+
+
+@pytest.mark.parametrize("flag,refused", [
+    ("--junitxml", False), ("--junit-xml", False), ("--basetemp", False),
+    ("--log-file", False), ("--html", False), ("--custom-report", False),
+    ("-c", True), ("--config", True), ("--config-file", True),
+    ("--confcutdir", True), ("--ignore", True), ("--ignore-glob", True),
+    ("--cov-config", True), ("--rootdir", True),
+])
+@pytest.mark.parametrize("wrapper", ["{}", "agent-loop run-tests -- {}", "bash -c {}"])
+def test_equals_option_path_contracts(tmp_path, flag, refused, wrapper):
+    """#1738/item-1: generic values must not become execution inputs."""
+    command = f"python -m pytest tests/test_api.py {flag}=/outside/report.xml"
+    command = wrapper.format(shlex.quote(command) if wrapper == "bash -c {}" else command)
+    checkout = tmp_path / "checkout"
+    validators = [
+        lambda: workdir_guard.partition_reported_tests_by_workdir([command], assigned_workdir=checkout),
+        lambda: validate_test_commands_within_workdir([command], assigned_workdir=checkout),
+        lambda: workdir_guard.validate_response_tests_within_workdir(
+            f"Tests: {command}", assigned_workdir=checkout),
+        lambda: workdir_guard.validate_test_observation_citations_within_workdir(
+            [SimpleNamespace(command=command)], assigned_workdir=checkout),
+    ]
+    for validate in validators:
+        if refused:
+            with pytest.raises(AgentLoopError):
+                validate()
+        else:
+            result = validate()
+            if isinstance(result, workdir_guard.ReportedTestsPartition):
+                assert result.in_checkout == (command,)
+                assert result.out_of_checkout == ()
+    assert workdir_guard.command_is_admissible_evidence(command, assigned_workdir=checkout) is not refused
+    assert not workdir_guard.command_targets_outside_workdir(command, assigned_workdir=checkout)
 
 
 @pytest.mark.parametrize('operand', [

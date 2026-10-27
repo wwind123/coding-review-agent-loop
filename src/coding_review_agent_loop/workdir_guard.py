@@ -985,7 +985,13 @@ def _path_roles(clause: _Clause, *, display_partition: bool = False) -> list[tup
             idx += 2
             continue
 
-        if token.startswith("-") and "=" in token:
+        # Generic equals-form values retain their pre-existing strict behavior.
+        # Display-only scratch occurrences were handled above; only known
+        # execution inputs need value extraction here (as in separate form).
+        if token.partition("=")[0] in {
+            "-c", "--config", "--config-file", "--confcutdir",
+            "--ignore", "--ignore-glob", "--cov-config",
+        } and "=" in token:
             value = token.split("=", 1)[1]
             if _is_path_shaped(value):
                 results.append((value, "argument"))
