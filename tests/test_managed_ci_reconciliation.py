@@ -44,6 +44,7 @@ class RecoveryRunner(ManualQualificationRunner):
         )
         self.run_error = False
         self.status_error = False
+        self.status_head = None
         self.run_reads = 0
         self.after_run_read = None
 
@@ -65,12 +66,20 @@ class RecoveryRunner(ManualQualificationRunner):
         if '/statuses?' in endpoint and self.status_error:
             cmd, cwd_path = self._record_command(args, cwd)
             return CommandResult(cmd, cwd_path, '', 'unavailable', 1)
+        if ('/statuses?' in endpoint and self.status_head is not None
+            and f'/commits/{self.status_head}/' not in endpoint):
+            cmd, cwd_path = self._record_command(args, cwd)
+            return CommandResult(cmd, cwd_path, '[]', '', 0)
         before = len(self.pr_payload['comments'])
         result = super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
         if cmd[:3] == ['gh', 'pr', 'comment'] and len(self.pr_payload['comments']) > before:
-            self.intent_comments.append({'id': self._next_comment_id(),
+            comment = self.pr_payload['comments'][-1]
+            comment_id = self._next_comment_id()
+            comment.update(id=comment_id, databaseId=comment_id, author={'login': 'agent-loop'},
+                           _rest_author_id=1)
+            self.intent_comments.append({'id': comment_id,
                                          'user': {'login': 'agent-loop', 'id': 1},
-                                         'body': self.pr_payload['comments'][-1]['body']})
+                                         'body': comment['body'], 'created_at': comment.get('createdAt')})
         return result
 
 
@@ -556,3 +565,190 @@ def test_failed_reference_source_round_must_match_obligation(tmp_path):
     result, checkpoint, items = reconcile_repair_checkpoint(runner, config=config, pr_number=7, metadata=metadata,
         contract=contract, checkpoint=cp, items=[item])
     assert result is None and items == [item] and checkpoint.verified_managed_result is None
+
+
+def _baseline_race(tmp_path):
+    fixture = recovery(tmp_path)
+    runner = fixture[1]
+    runner.workflow_runs[0].update(run_attempt=1, status='in_progress', conclusion=None)
+    runner.pr_status_payload = {'state': 'failure', 'statuses': [_status(1, 'failure')]}
+    return fixture
+
+
+def _handoff(fixture):
+    from coding_review_agent_loop.managed_ci_reconciliation import require_repair_handoff_failure
+    config, runner, metadata, contract, checkpoint, *_ = fixture
+    return require_repair_handoff_failure(runner, config=config, pr_number=7, metadata=metadata,
+                                          contract=contract, checkpoint=checkpoint)
+
+
+ATTEMPT_CASES = ['omitted', None, '1', True, 0, -1, 1, 2]
+
+
+def _set_attempt(runner, attempt):
+    if attempt == 'omitted':
+        runner.workflow_runs[0].pop('run_attempt')
+    else:
+        runner.workflow_runs[0]['run_attempt'] = attempt
+
+
+@pytest.mark.parametrize('attempt', ATTEMPT_CASES)
+def test_baseline_race_requires_explicit_live_attempt(tmp_path, attempt):
+    fixture = _baseline_race(tmp_path)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    _set_attempt(runner, attempt)
+    view = dataclasses.replace(contract, nonce=ref.nonce, attached_run_id=100, run_attempt=1)
+    snapshot = ci._refresh_v2_attached_run(runner, config=config, contract=view, strict_provenance=True)
+    expected_live = attempt if type(attempt) is int and attempt > 0 else None
+    assert snapshot.live_run_attempt == expected_live
+    assert snapshot.run_attempt == (attempt if isinstance(attempt, int) else 1)
+    assert ci.ManagedCiRunSnapshot(100, 1, 'completed', 'failure').live_run_attempt is None
+    runner.run_reads = 0
+    before = dataclasses.asdict(contract)
+    if type(attempt) is int and attempt == 1:
+        _handoff(fixture)
+    else:
+        with pytest.raises(ci.AgentLoopError, match='repair remains unresolved'):
+            _handoff(fixture)
+    assert runner.run_reads == 1
+    assert dataclasses.asdict(contract) == before
+    _no_dispatch_or_agents(runner)
+
+
+@pytest.mark.parametrize('attempt', ATTEMPT_CASES)
+def test_baseline_race_real_resume_revalidates_each_handoff(tmp_path, monkeypatch, attempt):
+    fixture = _baseline_race(tmp_path)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    _set_attempt(runner, attempt)
+    captured = _capture_activation(monkeypatch)
+    calls = _stop_at_agent(monkeypatch, runner)
+    monkeypatch.setattr(support, 'merge_pr', lambda *a, **k: pytest.fail('unqualified merge'))
+    accepted = type(attempt) is int and attempt == 1
+    # Restart the real loop from the persisted checkpoint, with no cached authority.
+    for evidence in ('original', 'missing-status', 'newer-pending'):
+        if evidence == 'missing-status':
+            runner.pr_status_payload['statuses'] = []
+        elif evidence == 'newer-pending':
+            runner.workflow_runs[0]['run_attempt'] = 2
+            runner.pr_status_payload['statuses'] = [_status(1, 'failure')]
+        permitted = accepted and evidence == 'original'
+        before_calls = len(calls)
+        with pytest.raises(RepairReached if permitted else ci.AgentLoopError):
+            pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+        assert len(calls) == before_calls + int(permitted)
+        if permitted:
+            assert calls[-1][0] == 'claude'
+        records = _extract_round_metadata_records(
+            [type('C', (), {'body': c['body']})() for c in runner.pr_payload['comments']], flow='pr')
+        latest = [r.metadata for r in records if r.metadata.qualification_checkpoint][-1]
+        checkpoint = latest.qualification_checkpoint
+        assert checkpoint.failed_managed_run == ref
+        assert checkpoint.allowed_rounds == cp.allowed_rounds
+        assert checkpoint.watch_failure_extension_used
+        assert checkpoint.verified_managed_result is None
+        assert any(i.obligation_identity == item.obligation_identity and i.status == 'blocking'
+                   for i in latest.prior_items)
+        assert runner.dispatch_count == 0
+    for live, before in captured:
+        assert dataclasses.asdict(live) == before
+
+
+@pytest.mark.parametrize('mutation', [
+    'absent', 'pending', 'success', 'nonce', 'run', 'attempt', 'head', 'publisher',
+    'url', 'http', 'excluded', 'queued', 'conclusion', 'newer-failure', 'unreadable',
+])
+def test_baseline_race_rejects_untrusted_correlation(tmp_path, mutation):
+    fixture = _baseline_race(tmp_path)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    status = runner.pr_status_payload['statuses'][0]
+    run = runner.workflow_runs[0]
+    if mutation == 'absent': runner.pr_status_payload['statuses'] = []
+    elif mutation in {'pending', 'success'}: status.update(_status(1, mutation))
+    elif mutation == 'nonce': status['description'] = status['description'].replace(V2_NONCE, 'wrong')
+    elif mutation == 'run': status['description'] = status['description'].replace('run_id=100', 'run_id=101')
+    elif mutation == 'attempt': status.update(_status(2, 'failure'))
+    elif mutation == 'head':
+        runner.status_head = 'f'*40
+        contract.expected_head_sha = runner.status_head
+        # The fresh contract head cannot replace the historical target head.
+    elif mutation == 'publisher': status['creator'] = {'login': 'attacker', 'id': 5}
+    elif mutation == 'url': status['target_url'] += '/attempts/1'
+    elif mutation == 'http': status['target_url'] = status['target_url'].replace('https:', 'http:')
+    elif mutation == 'excluded':
+        runner.intent_comments[1] = v2_intent_comment(state='completed', run_id=100, run_attempt=1,
+                                                    terminal_attempts=[(100, 1)])
+    elif mutation == 'queued': run['status'] = 'queued'
+    elif mutation == 'conclusion': run['conclusion'] = 'failure'
+    elif mutation == 'newer-failure': run['run_attempt'] = 2; status.update(_status(2, 'failure'))
+    elif mutation == 'unreadable': runner.run_error = True
+    with pytest.raises(ci.AgentLoopError): _handoff(fixture)
+    _no_dispatch_or_agents(runner)
+    assert cp.failed_managed_run == ref and cp.watch_failure_extension_used
+
+
+@pytest.mark.parametrize('mutation', [
+    'actor-missing', 'actor-login', 'actor-id', 'triggering_actor-missing',
+    'triggering_actor-login', 'triggering_actor-id', 'actor-no-login', 'actor-no-id',
+    'triggering_actor-no-login', 'triggering_actor-no-id', 'advertised', 'path', 'revision', 'ref',
+])
+def test_baseline_race_preserves_strict_provenance(tmp_path, mutation):
+    fixture = _baseline_race(tmp_path)
+    runner = fixture[1]
+    run = runner.workflow_runs[0]
+    if '-no-' in mutation:
+        field, missing = mutation.split('-no-')
+        del run[field][missing]
+    elif '-' in mutation:
+        field, change = mutation.rsplit('-', 1)
+        if change == 'missing': del run[field]
+        else: run[field][change] = 'other' if change == 'login' else 5
+    elif mutation == 'advertised': runner.advertised_actor = 'other'
+    elif mutation == 'path': run['path'] = '.github/workflows/other.yml'
+    elif mutation == 'revision': run['head_sha'] = 'f'*40
+    elif mutation == 'ref': run['head_branch'] = 'other'
+    with pytest.raises(ci.AgentLoopError): _handoff(fixture)
+    _no_dispatch_or_agents(runner)
+
+
+@pytest.mark.parametrize('conclusion', ['failure', 'timed_out', 'cancelled'])
+@pytest.mark.parametrize('attempt', [1, 2, 'omitted'])
+@pytest.mark.parametrize('correlated', [False, True])
+def test_completed_failure_handoff_compatibility(tmp_path, conclusion, attempt, correlated):
+    fixture = _baseline_race(tmp_path)
+    runner = fixture[1]
+    runner.workflow_runs[0].update(status='completed', conclusion=conclusion)
+    _set_attempt(runner, attempt)
+    runner.pr_status_payload['statuses'] = [_status(attempt, 'failure')] if correlated else []
+    if attempt == 2 and not correlated:
+        with pytest.raises(ci.AgentLoopError): _handoff(fixture)
+    else:
+        _handoff(fixture)
+    _no_dispatch_or_agents(runner)
+
+
+@pytest.mark.parametrize('state', ['incomplete-board', 'in-progress-success'])
+def test_green_without_full_qualification_never_hands_off_or_merges(tmp_path, monkeypatch, state):
+    config, runner, *_ = recovery(tmp_path)
+    if state == 'incomplete-board': runner.pr_branch_protection_payload['contexts'].append('missing')
+    else: runner.workflow_runs[0].update(status='in_progress', conclusion=None)
+    _capture_activation(monkeypatch)
+    calls = _stop_at_agent(monkeypatch, runner)
+    monkeypatch.setattr(support, 'merge_pr', lambda *a, **k: pytest.fail('unqualified merge'))
+    with pytest.raises(ci.AgentLoopError):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert calls == []
+    _no_dispatch_or_agents(runner)
+
+
+@pytest.mark.parametrize('state', ['failure', 'error', 'timed_out', 'cancelled'])
+def test_baseline_failure_classification_and_normalized_url(tmp_path, state):
+    fixture = _baseline_race(tmp_path)
+    runner = fixture[1]
+    status = _status(1, state)
+    status['target_url'] += '/?view=logs#summary'
+    runner.pr_status_payload['statuses'] = [status]
+    _handoff(fixture)
+    assert runner.run_reads == 1
+    assert any(f'/commits/{V2_HEAD}/statuses?' in part
+               for cmd, _ in runner.commands for part in cmd)
+    _no_dispatch_or_agents(runner)

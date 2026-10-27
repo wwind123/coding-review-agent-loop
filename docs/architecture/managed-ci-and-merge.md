@@ -96,6 +96,18 @@ settle the obligation. A pending or unreadable rerun stops before another
 coder handoff, retaining the obligation and its budget. Observation never
 renews an audit record or dispatches CI.
 
+The baseline failure can authorize repair during the publication race: the
+strictly authenticated live run must be `in_progress` with no conclusion and
+explicitly report a positive integer attempt equal to the recorded failed
+attempt. A matching authenticated failure status must bind the nonce, run,
+attempt and target head to the HTTPS GitHub repository/run URL. Missing or
+malformed live attempt identity cannot use the effective snapshot fallback to
+authorize this exception. Both actor and triggering-actor login/ID validation
+remain strict. Later attempts still require completion before failure can
+justify repair. This exception retains the obligation and spent budget; it
+neither settles success nor authorizes a rerun, dispatch or merge. Resume and
+each coder handoff revalidate live evidence.
+
 `VerifiedManagedResult` is immutable result provenance, separate from the fresh
 activation contract. Settlement persists it with the remaining ledger before
 finalization. Both `prepare_v2_merge` and manual qualification accept it through

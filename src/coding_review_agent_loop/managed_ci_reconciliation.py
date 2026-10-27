@@ -269,6 +269,14 @@ def require_repair_handoff_failure(runner, *, config, pr_number, metadata, contr
                        run_attempt=ref.failed_attempt, workflow_revision=ref.workflow_revision,
                        terminal_attempts=tuple((x['run_id'], x['run_attempt']) for x in record['terminal_attempts']))
         snapshot = ci._refresh_v2_attached_run(runner, config=config, contract=view, strict_provenance=True)
+        if (snapshot is not None and snapshot.live_run_attempt == ref.failed_attempt
+            and snapshot.run_attempt == ref.failed_attempt and snapshot.status == 'in_progress'
+            and snapshot.conclusion is None):
+            final = ci._v2_correlated_status(runner, config=config, expected_head=ref.head_sha, contract=view)
+            if (final is not None and final.status in {'failure', 'error', 'timed_out', 'cancelled'}
+                and final.url and urlparse(final.url)._replace(query='', fragment='').geturl().rstrip('/')
+                == f'https://github.com/{ref.repository}/actions/runs/{ref.run_id}'):
+                return  # publication can precede completion of the baseline run
         if (snapshot is not None and type(snapshot.run_attempt) is int
             and snapshot.run_attempt >= ref.failed_attempt and snapshot.status == 'completed'
             and snapshot.conclusion in {'failure', 'timed_out', 'cancelled'}):
