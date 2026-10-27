@@ -1,6 +1,7 @@
 import shlex
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1642,4 +1643,127 @@ def test_command_targets_outside_workdir_only_for_pure_outside_runs(
         # Runs naming any outside path remain unselectable as evidence.
         assert not workdir_guard.command_is_admissible_evidence(
             command, assigned_workdir=tmp_path
+        )
+
+
+@pytest.mark.parametrize('flag', ['--python-report', '--npm-report', '--input', '--baseline', '--sarif'])
+@pytest.mark.parametrize('equals', [False, True])
+@pytest.mark.parametrize('wrapper', ['{}', 'agent-loop run-tests -- {}', 'bash -c {}'])
+def test_scratch_option_display_only(tmp_path, monkeypatch, flag, equals, wrapper):
+    root = tmp_path / 'coding-review-agent-loop'
+    monkeypatch.setattr(workdir_guard, 'scratch_root', lambda: root)
+    report = root / 'scratch/1837/report.json'
+    option = f'{flag}={report}' if equals else f'{flag} {report}'
+    command = f'python scripts/dependency_audit.py evaluate --policy .github/dependency-audit-policy.json {option}'
+    if wrapper == 'bash -c {}':
+        command = wrapper.format(shlex.quote(command))
+    else:
+        command = wrapper.format(command)
+    checkout = tmp_path / 'checkout'
+    partition = workdir_guard.partition_reported_tests_by_workdir([command], assigned_workdir=checkout)
+    assert partition.in_checkout == (command,)
+    assert partition.out_of_checkout == ()
+    assert workdir_guard.command_is_admissible_evidence(command, assigned_workdir=checkout) is equals
+    assert not workdir_guard.command_targets_outside_workdir(command, assigned_workdir=checkout)
+    if equals:
+        validate_test_commands_within_workdir([command], assigned_workdir=checkout)
+    else:
+        with pytest.raises(AgentLoopError):
+            validate_test_commands_within_workdir([command], assigned_workdir=checkout)
+
+
+@pytest.mark.parametrize("flag,refused", [
+    ("--junitxml", False), ("--junit-xml", False), ("--basetemp", False),
+    ("--log-file", False), ("--html", False), ("--custom-report", False),
+    ("-c", True), ("--config", True), ("--config-file", True),
+    ("--confcutdir", True), ("--ignore", True), ("--ignore-glob", True),
+    ("--cov-config", True), ("--rootdir", True),
+])
+@pytest.mark.parametrize("wrapper", ["{}", "agent-loop run-tests -- {}", "bash -c {}"])
+def test_equals_option_path_contracts(tmp_path, flag, refused, wrapper):
+    """#1738/item-1: generic values must not become execution inputs."""
+    command = f"python -m pytest tests/test_api.py {flag}=/outside/report.xml"
+    command = wrapper.format(shlex.quote(command) if wrapper == "bash -c {}" else command)
+    checkout = tmp_path / "checkout"
+    validators = [
+        lambda: workdir_guard.partition_reported_tests_by_workdir([command], assigned_workdir=checkout),
+        lambda: validate_test_commands_within_workdir([command], assigned_workdir=checkout),
+        lambda: workdir_guard.validate_response_tests_within_workdir(
+            f"Tests: {command}", assigned_workdir=checkout),
+        lambda: workdir_guard.validate_test_observation_citations_within_workdir(
+            [SimpleNamespace(command=command)], assigned_workdir=checkout),
+    ]
+    for validate in validators:
+        if refused:
+            with pytest.raises(AgentLoopError):
+                validate()
+        else:
+            result = validate()
+            if isinstance(result, workdir_guard.ReportedTestsPartition):
+                assert result.in_checkout == (command,)
+                assert result.out_of_checkout == ()
+    assert workdir_guard.command_is_admissible_evidence(command, assigned_workdir=checkout) is not refused
+    assert not workdir_guard.command_targets_outside_workdir(command, assigned_workdir=checkout)
+
+
+@pytest.mark.parametrize('operand', [
+    '{p}', '--input {p} {p}', '--input {p} -- {p}', '-- --input {p}',
+    '-c {p}', '--config={p}', '--ignore {p}',
+    '--input {root}/repos/report.json', '--input {root}/runs/report.json',
+    '--input {root}/scratch/../repos/report.json', '--input /arbitrary/report.json',
+    '--input {p} https://live.example/test',
+])
+def test_scratch_option_execution_boundaries(tmp_path, monkeypatch, operand):
+    root = tmp_path / 'coding-review-agent-loop'
+    monkeypatch.setattr(workdir_guard, 'scratch_root', lambda: root)
+    command = 'python -m pytest tests/test_api.py ' + operand.format(p=root / 'scratch/report.json', root=root)
+    with pytest.raises(AgentLoopError):
+        workdir_guard.partition_reported_tests_by_workdir([command], assigned_workdir=tmp_path / 'checkout')
+
+
+@pytest.mark.parametrize('redirect_root', [False, True])
+def test_scratch_symlink_escapes(tmp_path, monkeypatch, redirect_root):
+    root = tmp_path / 'coding-review-agent-loop'
+    root.mkdir()
+    store = root / 'repos'
+    store.mkdir()
+    scratch = root / 'scratch'
+    if redirect_root:
+        scratch.symlink_to(store, target_is_directory=True)
+        report = scratch / 'report.json'
+    else:
+        scratch.mkdir()
+        (scratch / 'escape').symlink_to(store, target_is_directory=True)
+        report = scratch / 'escape/report.json'
+    monkeypatch.setattr(workdir_guard, 'scratch_root', lambda: root)
+    with pytest.raises(AgentLoopError):
+        workdir_guard.partition_reported_tests_by_workdir(
+            [f'python -m pytest tests/test_api.py --input {report}'],
+            assigned_workdir=tmp_path / 'checkout',
+        )
+
+
+def test_scratch_display_honors_tmpdir(tmp_path, monkeypatch):
+    import tempfile
+    from coding_review_agent_loop.scratch import scratch_root
+    monkeypatch.setattr(tempfile, 'tempdir', str(tmp_path))
+    report = scratch_root() / 'scratch/1837/report.json'
+    command = f'python scripts/dependency_audit.py evaluate --input={report}'
+    assert workdir_guard.partition_reported_tests_by_workdir(
+        [command], assigned_workdir=tmp_path / 'checkout',
+    ).in_checkout == (command,)
+
+
+def test_scratch_input_does_not_hide_outside_cwd_or_program(tmp_path, monkeypatch):
+    root = tmp_path / 'coding-review-agent-loop'
+    monkeypatch.setattr(workdir_guard, 'scratch_root', lambda: root)
+    report = root / 'scratch/report.json'
+    outside = f'python -m pytest --cwd={root}/scratch tests/test_api.py --input {report}'
+    partition = workdir_guard.partition_reported_tests_by_workdir([outside], assigned_workdir=tmp_path / 'checkout')
+    assert partition.out_of_checkout == (outside,)
+    assert not partition.in_checkout
+    with pytest.raises(AgentLoopError):
+        workdir_guard.partition_reported_tests_by_workdir(
+            [f'{root}/scratch/run-audit.py tests/test_api.py --input {report}'],
+            assigned_workdir=tmp_path / 'checkout',
         )

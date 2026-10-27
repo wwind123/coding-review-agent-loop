@@ -389,7 +389,7 @@ from .response_validation import (
     _reviewer_requirement_coverage_matches,
     _resumed_pr_reviewer_matches_requirements,
     _drop_repeated_carried_future_followups,
-    _degrade_out_of_checkout_tests,
+    _validate_followup_workdir_report,
 )
 from .panel_evidence import (
     PrPanelEvidence,
@@ -9347,7 +9347,7 @@ def run_pr_loop(
                     marker_description="<!-- AGENT_STATE: approved|blocking -->",
                     require_architecture_impact_contract=True,
                     architecture_document_paths=_architecture_document_paths_hook(runner, coder_config),
-                    **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids: _validate_coder_followup_response(
+                    **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text, items=tuple(coder_followup_items), human_requirements=human_requirements, optional_ids=coder_optional_item_ids, resolved_ids=coder_resolved_item_ids: _validate_followup_workdir_report(_validate_coder_followup_response(
                         text,
                         unresolved_items=items,
                         optional_item_ids=optional_ids,
@@ -9378,7 +9378,7 @@ def run_pr_loop(
                             else None
                         ), architecture_status_mode=mode,
                         test_observations_mode=observations_mode,
-                    )),
+                    ), config=config)),
                     usage_context=usage_context,
                     role="coder",
                     use_repair=True,
@@ -9394,6 +9394,7 @@ def run_pr_loop(
                         agent=config.coder,
                         run_id=usage_context.run_id,
                     ),
+                    reask_on_evidence_rejection=True,
                     operation_description="PR feedback follow-up",
                 )
                 coder_output = coder_response.text
@@ -9411,17 +9412,6 @@ def run_pr_loop(
                 public_comment = coder_output
                 raw_structured_coder_response: str | None = None
                 if isinstance(coder_response.marker_value, StructuredCoderFollowup):
-                    coder_response = dataclasses_replace(
-                        coder_response,
-                        marker_value=_degrade_out_of_checkout_tests(
-                            coder_response.marker_value, config=config
-                        ),
-                    )
-                    validate_test_observation_citations_within_workdir(
-                        coder_response.marker_value.test_observations,
-                        assigned_workdir=active_workdir(config),
-                        dependency_hint=dependency_remedy(config, active_workdir(config)),
-                    )
                     raw_structured_coder_response = coder_output
                     if coder_response.marker_value.dropped_resolved_addressed_items:
                         dropped_names = ", ".join(

@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Callable, Literal, Sequence
 from urllib.parse import urlsplit
 
-from .errors import AgentLoopError
+from .errors import AgentLoopError, ReportWorkdirRefusal
+from .scratch import scratch_root
 from .protocol import DiscussEvidenceClaim
 from .test_runtime import (
     ManagedWrapperTraversal,
@@ -820,6 +821,7 @@ def _grep_pattern_indices(tokens: Sequence[str], head: int | None) -> set[int]:
             index += 2
             continue
         if token.startswith("--regexp=") or re.match(r"^-[A-Za-z]*e.+", token):
+            patterns.add(index)
             has_pattern = True
             index += 1
             continue
@@ -851,7 +853,46 @@ def _grep_pattern_indices(tokens: Sequence[str], head: int | None) -> set[int]:
     return patterns
 
 
-def _path_roles(clause: _Clause) -> list[tuple[str, str]]:
+def _scratch_option_values(tokens: Sequence[str], head: int | None) -> dict[int, str]:
+    """Eligible occurrences only; never grant a path-wide exemption."""
+    root = scratch_root()
+    confined = root / "scratch"
+    values: dict[int, str] = {}
+    try:
+        if confined.resolve() != root.parent.resolve() / root.name / "scratch":
+            return values
+        index = (head + 1) if head is not None else len(tokens)
+        while index < len(tokens):
+            token = tokens[index]
+            if token == "--":
+                break
+            flag, equals, value = token.partition("=")
+            guarded = (
+                _VALUE_TAKING_OPTIONS | WORKDIR_FLAGS | INTERPRETER_VALUE_FLAGS
+                | OUTPUT_VALUE_FLAGS | _BOOLEAN_LONG_FLAGS
+            )
+            if token.startswith("--") and flag not in guarded:
+                value_index = index if equals else index + 1
+                if not equals and value_index < len(tokens):
+                    value = tokens[value_index]
+                    if value == "--":
+                        break
+                path = Path(value).expanduser()
+                if (
+                    value and path.is_absolute() and ".." not in path.parts
+                    and path.is_relative_to(confined)
+                    and path.resolve().is_relative_to(confined.resolve())
+                ):
+                    values[value_index] = value
+                if not equals:
+                    index += 1
+            index += 1
+    except (OSError, RuntimeError, ValueError):
+        return {}
+    return values
+
+
+def _path_roles(clause: _Clause, *, display_partition: bool = False) -> list[tuple[str, str]]:
     tokens = clause.tokens
     n = len(tokens)
     program_positions, head = _program_position_indices(tokens)
@@ -866,10 +907,26 @@ def _path_roles(clause: _Clause) -> list[tuple[str, str]]:
             promoted_idx = first_path_idx
 
     results: list[tuple[str, str]] = []
+    option_values = _scratch_option_values(tokens, head) if display_partition else {}
     idx = 0
+    terminated = False
     while idx < n:
         token = tokens[idx]
         if idx in grep_patterns:
+            idx += 1
+            continue
+        if token == "--" and (head is None or idx > head):
+            terminated = True
+            idx += 1
+            continue
+        if terminated:
+            value = token.split("=", 1)[-1] if token.startswith("-") else token
+            if _is_path_shaped(value):
+                results.append((value, "argument"))
+            idx += 1
+            continue
+        if idx in option_values:
+            results.append((option_values[idx], "scratch_input"))
             idx += 1
             continue
 
@@ -928,6 +985,19 @@ def _path_roles(clause: _Clause) -> list[tuple[str, str]]:
             idx += 2
             continue
 
+        # Generic equals-form values retain their pre-existing strict behavior.
+        # Display-only scratch occurrences were handled above; only known
+        # execution inputs need value extraction here (as in separate form).
+        if token.partition("=")[0] in {
+            "-c", "--config", "--config-file", "--confcutdir",
+            "--ignore", "--ignore-glob", "--cov-config",
+        } and "=" in token:
+            value = token.split("=", 1)[1]
+            if _is_path_shaped(value):
+                results.append((value, "argument"))
+                idx += 1
+                continue
+
         if _is_path_shaped(token):
             if idx in program_positions or idx == promoted_idx:
                 results.append((token, "program"))
@@ -955,7 +1025,7 @@ def _check_path_role(
         return
     if role == "interpreter_value":
         return
-    if role == "output":
+    if role in {"output", "scratch_input"}:
         return
     if path_violations is not None:
         # The caller degrades this report to out-of-checkout context instead
@@ -1472,6 +1542,7 @@ def _validate_command_contents(
     assigned: Path,
     origin: Origin,
     path_violations: list[str] | None = None,
+    display_partition: bool = False,
 ) -> None:
     for raw_windows in WINDOWS_PATH_RE.findall(command):
         if _windows_path_is_exempt(command, raw_windows, origin):
@@ -1490,12 +1561,12 @@ def _validate_command_contents(
         if not _validate_managed_command(
             shlex.join(clause.tokens), assigned=assigned,
             origin="structured" if clause.mode in {"structured", "code"} else "response",
-            path_violations=path_violations,
+            path_violations=path_violations, display_partition=display_partition,
         ):
             ordinary_clauses.append(clause)
 
     for clause in ordinary_clauses:
-        for raw_path, role in _path_roles(clause):
+        for raw_path, role in _path_roles(clause, display_partition=display_partition):
             _check_path_role(
                 raw_path,
                 role,
@@ -1535,6 +1606,7 @@ def _validate_managed_command(
     assigned: Path,
     origin: Origin,
     path_violations: list[str] | None = None,
+    display_partition: bool = False,
 ) -> bool:
     # The managed wrapper itself is an absolute executable outside the checkout
     # by design, and its memory directory is an output location.  Once the
@@ -1558,13 +1630,13 @@ def _validate_managed_command(
                 shlex.join(tokens[:prefix_len]),
                 assigned=assigned,
                 origin="structured",
-                path_violations=path_violations,
+                path_violations=path_violations, display_partition=display_partition,
             )
         _validate_single_command(
             shlex.join(managed.inner_argv),
             assigned=assigned,
             origin=origin,
-            path_violations=path_violations,
+            path_violations=path_violations, display_partition=display_partition,
         )
         return True
     return False
@@ -1576,12 +1648,13 @@ def _validate_single_command(
     assigned: Path,
     origin: Origin,
     path_violations: list[str] | None = None,
+    display_partition: bool = False,
 ) -> None:
     if not _validate_managed_command(
-        command, assigned=assigned, origin=origin, path_violations=path_violations
+        command, assigned=assigned, origin=origin, path_violations=path_violations, display_partition=display_partition
     ):
         _validate_command_contents(
-            command, assigned=assigned, origin=origin, path_violations=path_violations
+            command, assigned=assigned, origin=origin, path_violations=path_violations, display_partition=display_partition
         )
 
 
@@ -1619,6 +1692,18 @@ class ReportedTestsPartition:
 
 
 def partition_reported_tests_by_workdir(
+    tests_run: Sequence[str] | None, *, assigned_workdir: Path,
+    dependency_hint: str | None = None,
+) -> ReportedTestsPartition:
+    try:
+        return _partition_reported_tests_by_workdir(
+            tests_run, assigned_workdir=assigned_workdir, dependency_hint=dependency_hint
+        )
+    except AgentLoopError as exc:
+        raise ReportWorkdirRefusal(str(exc)) from exc
+
+
+def _partition_reported_tests_by_workdir(
     tests_run: Sequence[str] | None,
     *,
     assigned_workdir: Path,
@@ -1645,7 +1730,8 @@ def partition_reported_tests_by_workdir(
     for command in tests_run:
         violations = _PathLog()
         _validate_single_command(
-            command, assigned=assigned, origin="structured", path_violations=violations
+            command, assigned=assigned, origin="structured", path_violations=violations,
+            display_partition=True,
         )
         if not violations:
             kept.append(command)
@@ -1789,9 +1875,16 @@ def validate_test_observation_citations_within_workdir(
         str(getattr(citation, "command", ""))
         for citation in citations
     )
-    validate_test_commands_within_workdir(
-        commands, assigned_workdir=assigned_workdir, dependency_hint=dependency_hint
-    )
+    try:
+        validate_test_commands_within_workdir(
+            commands, assigned_workdir=assigned_workdir, dependency_hint=dependency_hint
+        )
+    except AgentLoopError as exc:
+        raise ReportWorkdirRefusal(
+            "Receipt citations must be admissible checkout evidence; scratch-input "
+            "display acceptance grants no receipt authority. Supply admissible replacement "
+            "evidence without hiding failing observations. " + str(exc)
+        ) from exc
 
 
 def extract_reported_tests_from_response(text: str) -> tuple[str, ...]:

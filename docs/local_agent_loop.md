@@ -5982,12 +5982,38 @@ or be superseded by an in-checkout run, and renders as "out-of-checkout
 context (not evidence)" instead of "uncited authoritative". When the journal
 is trimmed for transport, context rows yield to every in-checkout row. A broker
 run the guard cannot validate is never a selectable execution ref, but its
-failure still counts against risk-matrix rows. Test-observation receipt
+failure still counts against risk-matrix rows.
+
+Structured test reports accept non-execution option values confined both lexically
+and canonically to `scratch_root() / "scratch"` for display (#1738). Generic
+options such as `--input`, `--baseline`, and `--sarif` support separate and equals
+forms, including managed wrappers and nested shells. Traversal and symlink
+escapes fail closed; repository stores and run checkouts under the shared root
+are excluded. Each occurrence is checked: targets, operands after `--`, programs,
+working directories, and execution-affecting config/ignore options retain their
+guards. Fresh handoffs and resumed reviewer context share this display policy.
+It grants no receipt or matrix authority. Strict citations, freeform reports,
+and failure reconciliation retain their existing checkout requirements.
+
+On PR follow-ups, structured partition and strict citation workdir refusals run
+inside validated acquisition and share the existing single semantic-evidence
+coder re-ask with re-askable selector refusals. This allowance is independent of
+ordinary retries and shared across direct, normalized and repair-surfaced
+responses. Repair stops when it exposes a semantic refusal. Correction resumes
+the rejected acquisition's session when available, keeps the original task and
+bounded sanitized feedback, and validates against its own closed catalog before
+publication or finding settlement. A scratch-input receipt remains inadmissible;
+replacement evidence must not hide failing observations. Repeated refusals stop
+with existing rejection recording and pushed-head recovery. Initial handoffs
+receive the display classification without any new retry policy. Operational
+and authorization failures retain their existing handling.
+
+Test-observation receipt
 citations remain strict, and so do freeform `Tests:` reports that are not
 converted to a structured result: if an explicit
 test location is outside the assigned checkout there, or a live remote target
-is detected anywhere (including in a structured `tests_run` entry), the loop
-fails with an `AgentLoopError` naming the offending
+is detected anywhere (including in a structured `tests_run` entry), the guard refuses the report. After any available PR follow-up correction,
+an uncorrected refusal stops with an `AgentLoopError` naming the offending
 command/URL and assigned checkout. When that failure happens after a PR was
 already created or detected, the error also confirms the PR state and tells
 the user to continue with `agent-loop pr <number>` instead of rerunning

@@ -242,6 +242,21 @@ stops the repair chain on that candidate with no fallback model and takes the
 same route (one opted-in re-ask, otherwise a `semantic-evidence-rejection`
 stop), whatever the repair transport outcome (#999).
 
+PR follow-ups also opt into the same single semantic-evidence re-ask (#1738).
+Structured report partition and strict citation workdir guards run inside the
+validated acquisition, including normalized and repaired candidates. Only their
+typed report refusals join the re-askable reasons; operational and authorization
+errors retain existing handling. A scratch-input receipt remains inadmissible:
+feedback requests admissible replacement evidence without hiding failures.
+Guard and selector refusals share one allowance in either order, outside ordinary
+retries. A repair-surfaced refusal stops repair and spends only an unused
+allowance. A semantic refusal exposed by the post-repair observation-field
+fallback takes that same route; dropping a malformed field cannot swallow a
+refusal or reset the allowance. Correction resumes the acquisition session when available and uses
+its own closed catalog. Only a fully validated replacement may publish progress
+or settle findings; terminal rejection and pushed-head recovery remain intact.
+Initial implementation handoffs gain no new retry policy.
+
 One launch state is not an authority decision at parse time (#1659): a passing,
 parent-observed selector whose only launch defect is `suite_start=unknown`
 (wrapper bootstrap verified, inner command started), typically from a launcher

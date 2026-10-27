@@ -555,6 +555,22 @@ decision render the derived `run-tests-tool-mismatch` or
 rows record `tool_commit`, `tool_dirty` and `tool_package_digest` and stay
 telemetry-unverified.
 
+
+Structured test reports accept non-execution option values confined both lexically
+and canonically to `scratch_root() / "scratch"` for display (#1738). Generic
+options such as `--input`, `--baseline`, and `--sarif` support separate and equals
+forms, including managed wrappers and nested shells. Traversal and symlink
+escapes fail closed; repository stores and run checkouts under the shared root
+are excluded. Each occurrence is checked: targets, operands after `--`, programs,
+working directories, and execution-affecting config/ignore options retain their
+guards. Fresh handoffs and resumed reviewer context share this display policy.
+It grants no receipt or matrix authority. Strict citations, freeform reports,
+and failure reconciliation retain their existing checkout requirements.
+Generic equals-form values such as `--junitxml=/tmp/report.xml` and
+`--basetemp=/tmp/pytest` retain their prior classification; the display policy
+does not turn them into execution inputs. Known config and ignore option values
+remain guarded in both separate and equals forms.
+
 ## Other Entry Paths
 
 - `discuss` coordinates non-implementation debate, with optional research,
