@@ -1132,7 +1132,11 @@ every machine gate are clean at a head: it posts one freeze comment naming that
 head and stops with exit code 4, and it pushes nothing while frozen. Supply the
 evidence for that head, or withdraw the request, in a signed comment and rerun.
 The requesting reviewer then re-reviews the same head without spending a round.
-See [the evidence freeze](docs/local_agent_loop.md#exact-head-human-evidence-freeze).
+See [the evidence freeze](docs/local_agent_loop.md#exact-head-human-evidence-freeze). When an external push breaks a converted-row freeze,
+the coder gets one bounded capture opportunity from admitted freeze and coder
+history. Live-head tool evidence supersedes conversions; missing or failed
+capture preserves the final human evidence barrier. Native human-only evidence
+does not dispatch the coder.
 
 The signature certifies that a human wrote the requirement, and nothing verifies
 authorship. An agent must not apply it on its own initiative; when an operator

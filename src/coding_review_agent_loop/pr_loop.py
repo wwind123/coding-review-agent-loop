@@ -6,6 +6,9 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .converted_capture import recovery_capture, capture_feedback, recheck_capture
+from .pr_restart import checkpoint_restart
+from .review_rounds import _normalize_evidence_only_approval
 from .managed_ci_reconciliation import (
     observe_repair_result, reconcile_repair_checkpoint, historical_outcome,
     historical_qualification_fields, require_repair_handoff_failure,
@@ -5464,7 +5467,7 @@ def run_pr_loop(
                                     current_head_sha=current_pr_subject,
                                 )
                             if _is_evidence_only_blocking_review(parsed, prior_unresolved_items):
-                                parsed = dataclasses_replace(parsed, state="approved")
+                                parsed = _normalize_evidence_only_approval(parsed, prior_unresolved_items)
                             return parsed
 
                         def _pr_failure_is_fatal(error: AgentLoopError) -> bool:
@@ -5885,6 +5888,7 @@ def run_pr_loop(
                         parsed_review = normalized_review
                         review_state = parsed_review.state
 
+                evidence_dispositions = parsed_review.dispositions
                 if review_state == "blocking" and _is_evidence_only_blocking_review(
                     parsed_review, prior_unresolved_items
                 ):
@@ -5896,7 +5900,7 @@ def run_pr_loop(
                         "exact-head evidence; treating the code review as approved and keeping "
                         "the evidence as a deferred final barrier",
                     )
-                    parsed_review = dataclasses_replace(parsed_review, state="approved")
+                    parsed_review = _normalize_evidence_only_approval(parsed_review, prior_unresolved_items)
                     review_state = parsed_review.state
 
                 if _is_incomplete_pr_review(parsed_review):
@@ -5929,7 +5933,7 @@ def run_pr_loop(
                         round_number=summary_round,
                         head_sha=summary_head,
                     )
-                for disposition in parsed_review.dispositions:
+                for disposition in evidence_dispositions:
                     _record_prior_item_disposition(
                         prior_dispositions,
                         disposition,
@@ -6363,10 +6367,13 @@ def run_pr_loop(
             )
             revalidation_candidates = list(item_partitions["revalidation_candidates"])
             finalization_blockers = list(item_partitions["finalization_blockers"])
-            # Only human findings and machine obligations that explicitly need
-            # repair go to the coder.  A current, fully reviewed CI candidate
-            # proceeds to source-authoritative qualification instead.
-            must_fix_items = list(item_partitions["coder_blockers"])
+            # Converted recovery capture can accompany ordinary coder blockers;
+            # deferred native evidence remains a finalization barrier.
+            recovery_capture_items = recovery_capture(
+                runner, config, pr_number=pr_number, items=unresolved_items,
+                head=pr_metadata.head_sha, plan=approved_plan_context,
+            )
+            must_fix_items = list(item_partitions["coder_blockers"]) + list(recovery_capture_items)
             carried_panel_ids = (
                 set(carried_secondary_obligations(
                     pr_ledger_view(unresolved_items),
@@ -6780,37 +6787,14 @@ def run_pr_loop(
                         board_check=pr_qualification_board_check,
                     )
                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
-                        log(
-                            config,
-                            f"Round {round_number}: PR head changed during reviewer reconciliation; "
-                            "restarting exact-head scheduling",
-                        )
-                        unresolved_items = _advance_machine_obligations_for_head(
-                            unresolved_items,
-                            current_head_sha=fresh_context.metadata.head_sha,
-                        )
-                        qualification_checkpoint = _machine_obligation_checkpoint(
-                            unresolved_items,
-                            previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
-                            current_head_sha=fresh_context.metadata.head_sha,
-                            base_branch=fresh_context.metadata.base_branch or config.base,
-                            allowed_rounds=allowed_rounds,
+                        unresolved_items, qualification_checkpoint = checkpoint_restart(
+                            runner, config=config, pr_number=pr_number, round_number=round_number,
+                            previous_head=pr_metadata.head_sha, context=fresh_context,
+                            items=unresolved_items, checkpoint=qualification_checkpoint,
+                            managed_contract=managed_ci, allowed_rounds=allowed_rounds,
                             watch_failure_extension_used=watch_failure_extension_used,
                             watch_head_extension_used=watch_head_extension_used,
-                            lifecycle="awaiting_current_head_review",
-                        )
-                        _persist_qualification_checkpoint(
-                            runner,
-                            config=config,
-                            pr_number=pr_number,
-                            round_number=round_number + 1,
-                            head_sha=fresh_context.metadata.head_sha,
-                            unresolved_items=unresolved_items,
-                            checkpoint=qualification_checkpoint,
-                            message=(
-                                f"PR #{pr_number} qualification checkpoint: head changed during "
-                                "review reconciliation; current-head review is required."
-                            ),
+                            phase="during reviewer reconciliation",
                         )
                         prefetched_pr_context = fresh_context
                         final_sweep_pending = False
@@ -7404,32 +7388,14 @@ def run_pr_loop(
                                 board_check=pr_qualification_board_check,
                             )
                             if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
-                                unresolved_items = _advance_machine_obligations_for_head(
-                                    unresolved_items,
-                                    current_head_sha=fresh_context.metadata.head_sha,
-                                )
-                                qualification_checkpoint = _machine_obligation_checkpoint(
-                                    unresolved_items,
-                                    previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
-                                    current_head_sha=fresh_context.metadata.head_sha,
-                                    base_branch=fresh_context.metadata.base_branch or config.base,
-                                    allowed_rounds=allowed_rounds,
+                                unresolved_items, qualification_checkpoint = checkpoint_restart(
+                                    runner, config=config, pr_number=pr_number, round_number=round_number,
+                                    previous_head=pr_metadata.head_sha, context=fresh_context,
+                                    items=unresolved_items, checkpoint=qualification_checkpoint,
+                                    managed_contract=managed_ci, allowed_rounds=allowed_rounds,
                                     watch_failure_extension_used=watch_failure_extension_used,
                                     watch_head_extension_used=watch_head_extension_used,
-                                    lifecycle="awaiting_current_head_review",
-                                )
-                                _persist_qualification_checkpoint(
-                                    runner,
-                                    config=config,
-                                    pr_number=pr_number,
-                                    round_number=round_number + 1,
-                                    head_sha=fresh_context.metadata.head_sha,
-                                    unresolved_items=unresolved_items,
-                                    checkpoint=qualification_checkpoint,
-                                    message=(
-                                        f"PR #{pr_number} qualification checkpoint: head changed after "
-                                        "ordinary CI success; current-head review is required."
-                                    ),
+                                    phase="during qualification",
                                 )
                                 prefetched_pr_context = fresh_context
                                 final_sweep_pending = False
@@ -7956,6 +7922,15 @@ def run_pr_loop(
                             board_check=pr_qualification_board_check,
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
+                            unresolved_items, qualification_checkpoint = checkpoint_restart(
+                                runner, config=config, pr_number=pr_number, round_number=round_number,
+                                previous_head=pr_metadata.head_sha, context=fresh_context,
+                                items=unresolved_items, checkpoint=qualification_checkpoint,
+                                managed_contract=managed_ci, allowed_rounds=allowed_rounds,
+                                watch_failure_extension_used=watch_failure_extension_used,
+                                watch_head_extension_used=watch_head_extension_used,
+                                phase="during qualification",
+                            )
                             prefetched_pr_context = fresh_context
                             final_sweep_pending = False
                             continue
@@ -7993,37 +7968,14 @@ def run_pr_loop(
                             board_check=pr_qualification_board_check,
                         )
                         if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
-                            log(
-                                config,
-                                f"Round {round_number}: PR head changed before managed qualification; "
-                                "restarting review scheduling",
-                            )
-                            unresolved_items = _advance_machine_obligations_for_head(
-                                unresolved_items,
-                                current_head_sha=fresh_context.metadata.head_sha,
-                            )
-                            qualification_checkpoint = _machine_obligation_checkpoint(
-                                unresolved_items,
-                                previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
-                                current_head_sha=fresh_context.metadata.head_sha,
-                                base_branch=fresh_context.metadata.base_branch or config.base,
-                                allowed_rounds=allowed_rounds,
+                            unresolved_items, qualification_checkpoint = checkpoint_restart(
+                                runner, config=config, pr_number=pr_number, round_number=round_number,
+                                previous_head=pr_metadata.head_sha, context=fresh_context,
+                                items=unresolved_items, checkpoint=qualification_checkpoint,
+                                managed_contract=managed_ci, allowed_rounds=allowed_rounds,
                                 watch_failure_extension_used=watch_failure_extension_used,
                                 watch_head_extension_used=watch_head_extension_used,
-                                lifecycle="awaiting_current_head_review",
-                            )
-                            _persist_qualification_checkpoint(
-                                runner,
-                                config=config,
-                                pr_number=pr_number,
-                                round_number=round_number + 1,
-                                head_sha=fresh_context.metadata.head_sha,
-                                unresolved_items=unresolved_items,
-                                checkpoint=qualification_checkpoint,
-                                message=(
-                                    f"PR #{pr_number} qualification checkpoint: head changed before "
-                                    "managed qualification; current-head review is required."
-                                ),
+                                phase="during qualification",
                             )
                             prefetched_pr_context = fresh_context
                             final_sweep_pending = False
@@ -8350,6 +8302,15 @@ def run_pr_loop(
                                         board_check=pr_qualification_board_check,
                                     )
                                     if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
+                                        unresolved_items, qualification_checkpoint = checkpoint_restart(
+                                            runner, config=config, pr_number=pr_number, round_number=round_number,
+                                            previous_head=pr_metadata.head_sha, context=fresh_context,
+                                            items=unresolved_items, checkpoint=qualification_checkpoint,
+                                            managed_contract=managed_ci, allowed_rounds=allowed_rounds,
+                                            watch_failure_extension_used=watch_failure_extension_used,
+                                            watch_head_extension_used=watch_head_extension_used,
+                                            phase="during qualification",
+                                        )
                                         prefetched_pr_context = fresh_context
                                         final_sweep_pending = False
                                         continue
@@ -9095,6 +9056,12 @@ def run_pr_loop(
             # call receives this config, so retries and format repair inherit
             # it and reviewer launches stay unguarded.
             coder_ci_guarded = managed_ci_active(pr_metadata)
+            if recovery_capture_items:
+                recheck_capture(
+                    runner, config, pr_number=pr_number, items=unresolved_items,
+                    head=pr_metadata.head_sha, plan=approved_plan_context, expected=recovery_capture_items,
+                )
+            summary_context = capture_feedback(recovery_capture_items) + summary_context
             coder_config = dataclasses_replace(config, coder_ci_dispatch_guard=coder_ci_guarded)
             if has_merge_conflict_item:
                 other_items = [

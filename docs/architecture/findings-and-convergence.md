@@ -2,7 +2,7 @@
 
 How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline and future follow-ups, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the PR step-back, sweep and sibling escalation, the non-convergence stop, the evidence-only stall stop and evidence conversion.
 
-Source paths: `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
+Source paths: `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
 
 ## Findings, evidence and convergence
 
@@ -338,6 +338,27 @@ The evidence-response pass mints `SignedEvidenceReference`s for cleared converte
 (`mint_signed_evidence_references`), keeps a durable tombstone, and threads the
 cumulative set onto every terminal record. `reconcile_converted_obligations` runs after
 the round-start ledger assignment and inside `_evidence_freeze_gate`.
+
+After an external push breaks a converted-row freeze, `converted_capture.py`
+derives one bounded capture opportunity from the admitted source freeze,
+conversion audits and ordered coder records. The normal coder feedback names
+the approved rows; code fixes can share the turn without manufacturing a code
+finding. A completed publication with dispatch/result and converted-ledger
+bindings consumes the opportunity even without evidence or after a coder push.
+Legacy or uncertain history grants no retry. Tool evidence at the live head
+supersedes conversions through existing reconciliation; unresolved rows keep
+their identities and owners and reach the final freeze after normal gates.
+Native evidence and live freezes never dispatch capture, and round ceilings
+remain in force. No new recovery payload is persisted.
+
+`review_rounds._normalize_evidence_only_approval` constructs a public approval
+carrier after the original evidence dispositions have been retained for ledger
+settlement. It omits only eligible active evidence dispositions, retaining
+requests and final barriers without resolving them for serialization. Both
+publication modes use this carrier; generic model approval completeness stays
+strict. `pr_restart.py` checkpoints qualification restarts with their actual
+head and architecture causes, advancing head-bound obligations only when the
+head moves.
 
 ## Decisions
 

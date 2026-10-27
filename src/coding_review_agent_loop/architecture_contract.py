@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace as dataclasses_replace
 
+from .review_approval import _contradictory_evidence_approval
 from .agents.base import AgentResult
 from .architecture_context import (
     architecture_material,
@@ -162,7 +163,7 @@ def _latest_pr_approval_architecture_identity(
         return None
     for record in reversed(records):
         metadata = record.metadata
-        if metadata.role != "reviewer" or metadata.state != "approved":
+        if metadata.role != "reviewer" or metadata.state != "approved" or _contradictory_evidence_approval(metadata):
             continue
         if head_sha is not None and metadata.subject != head_sha:
             continue
@@ -180,6 +181,11 @@ def _latest_pr_architecture_observation(
     observation makes the invalidation transition idempotent: once the new
     identity is persisted, an identical gate does not schedule another review.
     """
+    record = _pr_architecture_observation_record(comments, head_sha=head_sha)
+    return record.metadata.architecture_identity if record is not None else None
+
+
+def _pr_architecture_observation_record(comments, *, head_sha=None):
     try:
         records = _extract_round_metadata_records(comments, flow="pr")
     except AgentLoopError:
@@ -188,9 +194,23 @@ def _latest_pr_architecture_observation(
         metadata = record.metadata
         if head_sha is not None and metadata.subject != head_sha:
             continue
-        if isinstance(metadata.architecture_identity, dict):
-            return metadata.architecture_identity
+        identity = metadata.architecture_identity
+        if not isinstance(identity, dict):
+            continue
+        # Coder metadata describes its prompt acquisition. After a push this
+        # remains H1 context, not an observation of its H2 result subject.
+        if metadata.role == "coder" and identity.get("candidate_revision", metadata.subject) != metadata.subject:
+            continue
+        return record
     return None
+
+
+def _architecture_identity_differences(previous, fresh, prefix=""):
+    if isinstance(previous, dict) and isinstance(fresh, dict):
+        return [path for key in sorted(previous.keys() | fresh.keys())
+                for path in _architecture_identity_differences(
+                    previous.get(key), fresh.get(key), f"{prefix}.{key}" if prefix else key)]
+    return [prefix] if previous != fresh else []
 
 
 def _revalidate_pr_architecture_identity(
