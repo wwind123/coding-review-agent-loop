@@ -13,3 +13,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - The PR and plan boards change only through recorded board lineages, while the planning policy stays immutable (#1376, #1377).
 - A growth-independent plan sweep asks the primary for one exhaustive pass after K consecutive new-finding blocks, sharing the step-back's retirement walk; findings carry an advisory, orchestrator-persisted provenance tag so drip-feeding can be measured in the history export (#1505).
 - The provenance baseline is chosen by a tiered selector (unified diff, sentence-level compact diff, full previous plan as data, unavailable) under a plan-relative diff budget and a hard character budget, because long canonical plan lines made a fixed 12k line-diff cap always fail (#1516).
+
+- Converted captures invalidate only preceding approvals; scope-only latches preserve carry across non-capture digest changes and fresh semantic approval survives restart (#1734).

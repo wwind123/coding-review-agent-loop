@@ -3655,6 +3655,28 @@ def _fresh_pr_qualification_snapshot(
         for requirement in requirements.effective_requirements
     )
     requirement_ids = tuple(result)
+    from .converted_capture import evidence_review_boundary, admitted_capture_history
+    records, complete = admitted_capture_history(
+        runner, config, pr_number=pr_number, comments=context.comments,
+    )
+    boundary = evidence_review_boundary(
+        records, head=context.metadata.head_sha,
+        matrix_identity=(fresh_approved_plan_context.risk_test_matrix_identity
+                         if fresh_approved_plan_context is not None else None),
+    )
+    if not complete and evidence_review_boundary(
+        _extract_round_metadata_records(context.comments, flow="pr"), head=context.metadata.head_sha,
+    ) >= 0:
+        raise AgentLoopError("Converted capture history is incomplete; semantic approval cannot be qualified.")
+    if boundary >= 0:
+        names = {agent_display_name(agent) for agent in config.reviewer}
+        latest = {}
+        for record in records:
+            if record.metadata.role == "reviewer" and record.metadata.subject == context.metadata.head_sha:
+                latest[record.metadata.agent] = record
+        if not complete or any(name not in latest or latest[name].index <= boundary
+                               or latest[name].metadata.state != "approved" for name in names):
+            context = dataclasses_replace(context, converted_capture_review_pending=True)
     return context, requirement_ids, fresh_approved_plan_context, config
 
 
@@ -4420,6 +4442,12 @@ def _tool_verified_rows_at_head(
     """Rows tool-verified by the canonical evidence of the coder record at ``head_sha``."""
     bound = _head_bound_coder_record(records, head_sha)
     if bound is None or bound.metadata.risk_test_matrix_evidence is None:
+        return frozenset()
+    # A converted capture's canonical evidence is authority only alongside
+    # its admitted, head-bound derivation. Legacy or foreign publications keep
+    # the converted barrier rather than clearing it without a review boundary.
+    if (any(item.converted_row_id for item in bound.metadata.prior_items)
+        and bound.metadata.risk_test_matrix_capture_classification is None):
         return frozenset()
     try:
         evidence = parse_risk_test_matrix_evidence(

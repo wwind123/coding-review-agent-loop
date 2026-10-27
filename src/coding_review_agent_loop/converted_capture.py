@@ -106,3 +106,123 @@ def recheck_capture(runner, config, *, pr_number, items, head, plan, expected):
     fresh = recovery_capture(runner, config, pr_number=pr_number, items=items, head=head, plan=plan)
     if context.metadata.head_sha != head or tuple(i.item_id for i in fresh) != tuple(i.item_id for i in expected):
         raise HumanDecisionRequiredError("Converted capture inputs changed before dispatch; evidence barriers retained.")
+
+
+def evidence_review_boundary(records, *, head, matrix_identity=None):
+    """Newest converted capture publication whose evidence needs semantic review.
+
+    Runner callers pass admitted history. Pure approval readers may reject
+    approvals conservatively on decoded history, but never grant authority.
+    Replacement evidence in the same recovery episode needs review too.
+    Neither an obligation digest nor a round number establishes freshness.
+    """
+    from .protocol import EVIDENCE_SOURCE_TOOL_CAPTURED, parse_risk_test_matrix_evidence
+    from .errors import AgentLoopError
+
+    boundary = -1
+    episodes = set()
+    published_evidence = {}
+    for position, record in enumerate(records):
+        m = record.metadata
+        if (m.role != "coder" or m.subject != head or not m.followup_dispatch_head
+            or m.risk_test_matrix_capture_classification is None):
+            continue
+        audits = [r.metadata.evidence_conversion for r in records[:position]
+                  if r.metadata.evidence_conversion is not None
+                  and (matrix_identity is None
+                       or r.metadata.evidence_conversion.matrix_identity == matrix_identity)]
+        for audit in audits:
+            candidates = capture_candidates(
+                records[:position], items=m.prior_items,
+                head=m.followup_dispatch_head, matrix_identity=audit.matrix_identity,
+            )
+            backed = {(row.obligation_item_id, row.obligation_identity, row.row_id)
+                      for row in audit.rows}
+            bound_rows = {i.converted_row_id for i in m.prior_items
+                          if (i.item_id, i.obligation_identity, i.converted_row_id) in backed}
+            episode = (audit.matrix_identity, head)
+            if not candidates and episode not in episodes:
+                continue
+            episodes.add(episode)
+            if not m.risk_test_matrix_evidence:
+                continue
+            try:
+                evidence = parse_risk_test_matrix_evidence(
+                    m.risk_test_matrix_evidence, expected_identity=audit.matrix_identity,
+                )
+            except AgentLoopError:
+                continue
+            for row in evidence.rows:
+                if (row.row_id not in bound_rows or row.status != "verified"
+                    or row.evidence_source != EVIDENCE_SOURCE_TOOL_CAPTURED
+                    or not row.evidence_citations):
+                    continue
+                key = (audit.matrix_identity, row.row_id)
+                if published_evidence.get(key) != row:
+                    boundary = record.index
+                    published_evidence[key] = row
+    return boundary
+
+
+def capture_eligible_records(records, *, head, plan=None):
+    """Apply the capture-only freshness rule without consulting scheduler state."""
+    boundary = evidence_review_boundary(
+        records, head=head,
+        matrix_identity=plan.risk_test_matrix_identity if plan is not None else None,
+    )
+    return tuple(record for record in records if record.index > boundary)
+
+
+def capture_review_context(records, *, head, plan):
+    """Keep captured claims and tool evidence visible even on summary-only resume."""
+    import json
+
+    boundary = evidence_review_boundary(
+        records, head=head, matrix_identity=plan.risk_test_matrix_identity if plan else None,
+    )
+    if boundary < 0:
+        return ""
+    publication = next(record for record in records if record.index == boundary)
+    return (
+        "\nConverted-row capture awaiting semantic review: the tool verified the "
+        "receipts, but reviewers must judge whether the cited tests exercise the "
+        "affected rows. Earlier approvals do not approve this capture. Report "
+        "coverage gaps as ordinary evidence-tagged findings; do not run commands "
+        "or clear machine obligations.\n"
+        + json.dumps(publication.metadata.risk_test_matrix_evidence, sort_keys=True)
+        + "\n"
+    )
+
+
+def capture_stale_reviewers(records, *, head, boundary):
+    """Latest exact-head approvals that have not judged the capture."""
+    if boundary < 0:
+        return ()
+    latest = {}
+    for record in records:
+        if record.metadata.role == "reviewer" and record.metadata.subject == head:
+            latest[record.metadata.agent] = record
+    return tuple(name for name, record in latest.items()
+                 if record.index <= boundary and record.metadata.state == "approved")
+
+
+def admitted_capture_history(runner, config, *, pr_number, comments):
+    """Admit the entire capture chain, including freezes without references.
+
+    Conversion admission strips authority fields on foreign records but keeps
+    ordinary content. A capture additionally needs authenticated coder and
+    freeze publications, so do not reconstruct it from that ordinary content.
+    """
+    from .pr_loop_support import _authenticated_pr_comments_status
+    from .round_state import _extract_round_metadata_records, _recovery_record_admitted
+
+    records = _extract_round_metadata_records(comments, flow="pr")
+    if not any(record.metadata.evidence_conversion is not None for record in records):
+        return records, True
+    hydrated, actor, complete = _authenticated_pr_comments_status(
+        runner, config, pr_number=pr_number, comments=comments,
+    )
+    records = _extract_round_metadata_records(hydrated, flow="pr")
+    return tuple(record for record in records
+                 if record.metadata.role == "reviewer"
+                 or _recovery_record_admitted(record, hydrated, actor)), complete

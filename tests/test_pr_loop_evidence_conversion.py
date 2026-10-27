@@ -2049,7 +2049,9 @@ def test_fresh_conversion_identity_failure_refuses_before_writes(tmp_path, monke
 
 
 @pytest.mark.parametrize("policy", ["all-reviewers", "selective-intermediate"])
-def test_broken_converted_freeze_captures_at_live_head(tmp_path, monkeypatch, policy):
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("context_mode", ["full", "compact"])
+def test_broken_converted_freeze_captures_at_live_head(tmp_path, monkeypatch, policy, parallel, context_mode):
     """Empty external push: full review, capture without code finding, tool supersession."""
     context = _plan_context("row-a", "row-b")
     real_qualify = pr_loop_module._fresh_pr_qualification_snapshot
@@ -2061,7 +2063,8 @@ def test_broken_converted_freeze_captures_at_live_head(tmp_path, monkeypatch, po
 
     monkeypatch.setattr(pr_loop_module, "_fresh_pr_qualification_snapshot", qualify)
     runner, config = _frozen_after_auto_conversion(
-        tmp_path, monkeypatch, context, config=_config(tmp_path, pr_review_policy=policy),
+        tmp_path, monkeypatch, context, config=_config(tmp_path, pr_review_policy=policy, review_parallel=parallel,
+                                                       pr_review_context_mode=context_mode),
     )
     _push_external_head(runner, "fedcba9")
     runner.advance_pr_head_on_coder_followup = False
@@ -2085,6 +2088,20 @@ def test_broken_converted_freeze_captures_at_live_head(tmp_path, monkeypatch, po
     assert row.lifecycle == "cleared" and row.candidate_head_sha == "fedcba9"
     assert "tool" in " ".join(row.notes).lower()
     assert "Bounded recovery capture" in _prompts(runner, "claude")[-1]
+    capture = next(r for r in reversed(records) if r.metadata.role == "coder")
+    fresh = _reviews_after(runner, capture.index)
+    assert len(fresh) == 1 and fresh[0].metadata.state == "approved"
+    assert capture.metadata.subject == fresh[0].metadata.subject == "fedcba9"
+    prompt = _prompts(runner, "codex")[-1]
+    for evidence in ("row-a", "tests/test_row-a.py::test_it", "risk_test_matrix_evidence", "evidence_citations"):
+        assert evidence in prompt
+    # Reconstructing the same history does not invalidate the fresh approval.
+    from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
+    approvals = _latest_pr_approved_reviews_for_head(
+        authenticated_pr_comments(runner, config, pr_number=77)[0], head_sha="fedcba9",
+        configured_reviewers=config.reviewer, approved_plan_context=context,
+    )
+    assert approvals["Codex"].index == fresh[0].index
     from coding_review_agent_loop.protocol import parse_review
     for record in records:
         if record.metadata.role == "reviewer" and record.metadata.state == "approved":
@@ -2188,6 +2205,9 @@ def test_subset_recovery_capture_freezes_only_unverified_rows(tmp_path, monkeypa
     [b] = _evidence_items(frozen.prior_items, "row-b")
     assert a.lifecycle == "cleared" and b.lifecycle == "evidence_frozen"
     assert b.item_id == "item-3" and b.resolution_owners == ("Codex",)
+    capture = next(r for r in reversed(_records(runner)) if r.metadata.role == "coder")
+    assert _reviews_after(runner, capture.index)
+    assert "tests/test_row-a.py::test_it" in _prompts(runner, "codex")[-1]
     runner.simulate_new_process()
     with pytest.raises(HumanDecisionRequiredError, match="frozen at head fedcba9"):
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
@@ -2209,3 +2229,164 @@ def test_broken_converted_freeze_respects_exhausted_round_budget(tmp_path, monke
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
     assert _agent_count(runner, "claude") == 1
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
+
+
+def _prepare_verified_recovery(tmp_path, monkeypatch, *, policy="all-reviewers"):
+    context = _plan_context("row-a", "row-b")
+    real_qualify = pr_loop_module._fresh_pr_qualification_snapshot
+
+    def qualify(*args, **kwargs):
+        plan = kwargs.pop("approved_plan_context", None)
+        fresh, requirements, _plan, fresh_config = real_qualify(*args, **kwargs)
+        return fresh, requirements, plan, fresh_config
+
+    monkeypatch.setattr(pr_loop_module, "_fresh_pr_qualification_snapshot", qualify)
+    runner, config = _frozen_after_auto_conversion(
+        tmp_path, monkeypatch, context, config=_config(tmp_path, pr_review_policy=policy),
+    )
+    _push_external_head(runner, "fedcba9")
+    runner.advance_pr_head_on_coder_followup = False
+    runner.claude_outputs.append(_coder())
+    runner.codex_outputs.append(_review(kept=["item-2"], state="blocking"))
+    _install_derivation(monkeypatch, context, [{"row-a": "verified", "row-b": "verified"}])
+    return runner, config, context
+
+
+@pytest.mark.parametrize("policy,seam", [
+    ("all-reviewers", "coder"), ("all-reviewers", "reviewer"),
+    ("selective-intermediate", "coder"), ("selective-intermediate", "scheduler-prelaunch"),
+    ("selective-intermediate", "reviewer"), ("selective-intermediate", "reconciliation"),
+])
+def test_verified_capture_restart_requires_then_reuses_semantic_review(tmp_path, monkeypatch, seam, policy):
+    runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch, policy=policy)
+    runner.codex_outputs.append(_review(resolved=["item-2"]))
+    original_post = pr_loop_module.post_pr_comment
+    source = _records(runner)[-1].index
+
+    def post(*args, **kwargs):
+        result = original_post(*args, **kwargs)
+        records = _records(runner)
+        captures = [r for r in records if r.index > source and r.metadata.role == "coder"]
+        if captures:
+            latest = records[-1]
+            if (seam == "coder" and latest == captures[-1]
+                or latest.index > captures[-1].index
+                and (latest.metadata.role == seam or latest.metadata.phase == seam)):
+                raise KeyboardInterrupt()
+        return result
+
+    monkeypatch.setattr(pr_loop_module, "post_pr_comment", post)
+    with pytest.raises(KeyboardInterrupt):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    captures = [r for r in _records(runner) if r.index > source and r.metadata.role == "coder"]
+    assert len(captures) == 1
+    capture = captures[0]
+    # The exact-head reader rejects every pre-capture approval even before restart.
+    from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
+    before = _latest_pr_approved_reviews_for_head(
+        authenticated_pr_comments(runner, config, pr_number=77)[0], head_sha="fedcba9",
+        configured_reviewers=config.reviewer, approved_plan_context=context,
+    )
+    assert all(record.index > capture.index for record in before.values())
+    if seam == "coder":
+        fresh, _, _, _ = pr_loop_module._fresh_pr_qualification_snapshot(
+            runner, config=config, pr_number=77, issue_context=None, parent_issue_context=None,
+            approved_plan_context=context,
+        )
+        assert fresh.converted_capture_review_pending
+    monkeypatch.setattr(pr_loop_module, "post_pr_comment", original_post)
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
+    assert len(_reviews_after(runner, capture.index)) == 1
+    assert _agent_count(runner, "claude") == 2
+    assert "tests/test_row-a.py::test_it" in _prompts(runner, "codex")[-1]
+
+
+def test_verified_capture_can_be_rejected_for_semantic_coverage(tmp_path, monkeypatch):
+    runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch)
+    config = dataclasses.replace(config, auto_merge=True)
+    runner.codex_outputs.append(_review(["The cited test never exercises the required row-a transition."]))
+    real_run = pr_loop_module._run_validated_agent
+    coders = []
+
+    def run(*args, **kwargs):
+        if kwargs.get("role") == "coder":
+            coders.append(kwargs)
+            if len(coders) == 2:
+                raise KeyboardInterrupt()
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(pr_loop_module, "_run_validated_agent", run)
+    with pytest.raises(KeyboardInterrupt):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    capture = next(r for r in reversed(_records(runner)) if r.metadata.role == "coder")
+    [review] = _reviews_after(runner, capture.index)
+    assert review.metadata.state == "blocking"
+    assert any("never exercises" in item.text for item in review.metadata.new_items)
+    assert "tests/test_row-a.py::test_it" in _prompts(runner, "codex")[-1]
+    assert len(coders) == 2  # ordinary finding handling, despite valid receipts
+    assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("operator", [False, True])
+def test_post_panel_capture_reviews_policy_selected_board(tmp_path, monkeypatch, parallel, operator):
+    context = _plan_context("row-a", "row-b")
+    runner, config = _carried_panel_runner(tmp_path, monkeypatch, context)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    config = dataclasses.replace(config, review_parallel=parallel, pr_review_force_full=operator)
+    _push_external_head(runner, "fedcba9")
+    runner.advance_pr_head_on_coder_followup = False
+    runner.claude_outputs.append(_coder())
+    for name, outputs in [("OpenAI Codex", runner.codex_outputs),
+                          ("Google Gemini", runner.gemini_outputs),
+                          ("Antigravity", runner.antigravity_outputs)]:
+        outputs.extend([_repeat_review(name), _review(resolved=["item-2"], reviewer=name)])
+    _install_derivation(monkeypatch, context, [{"row-a": "verified", "row-b": "verified"}])
+    assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
+    capture = next(r for r in reversed(_records(runner)) if r.metadata.role == "coder")
+    fresh = _reviews_after(runner, capture.index)
+    assert {r.metadata.agent for r in fresh} == {"Codex", "Gemini", "Antigravity"}
+    for command in ("codex", "gemini", "agy"):
+        assert "tests/test_row-a.py::test_it" in _prompts(runner, command)[-1]
+
+
+def test_capture_boundary_replacement_and_identical_evidence(tmp_path, monkeypatch):
+    """Real recovery history underlies every pure eligibility mutation below."""
+    from coding_review_agent_loop.converted_capture import evidence_review_boundary
+    runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch)
+    runner.codex_outputs.append(_review(resolved=["item-2"]))
+    assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
+    records = list(admitted_pr_records(runner, config, pr_number=77))
+    capture = next(r for r in reversed(records) if r.metadata.role == "coder")
+    boundary = lambda history: evidence_review_boundary(history, head="fedcba9",
+                                                        matrix_identity=context.risk_test_matrix_identity)
+    assert boundary(records) == capture.index
+    repeated = dataclasses.replace(capture, index=records[-1].index + 1)
+    assert boundary([*records, repeated]) == capture.index
+    changed = json.loads(json.dumps(capture.metadata.risk_test_matrix_evidence))
+    changed["rows"][0]["outcome_assertions"] = ["A replacement semantic coverage claim."]
+    replacement = dataclasses.replace(repeated, metadata=dataclasses.replace(
+        repeated.metadata, risk_test_matrix_evidence=changed,
+    ))
+    assert boundary([*records, replacement]) == replacement.index
+    # A claim, mismatched matrix, or missing dispatch cannot establish a boundary.
+    for invalid in [dataclasses.replace(capture.metadata, followup_dispatch_head=None),
+                    dataclasses.replace(capture.metadata, risk_test_matrix_evidence=None),
+                    dataclasses.replace(capture.metadata, risk_test_matrix_evidence={**changed, "matrix_identity": "0" * 64})]:
+        history = [dataclasses.replace(r, metadata=invalid) if r.index == capture.index else r for r in records]
+        assert boundary(history) == -1
+
+
+def test_verified_capture_that_moves_head_gets_exact_head_review(tmp_path, monkeypatch):
+    runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch)
+    runner.advance_pr_head_on_coder_followup = True
+    runner.codex_outputs.append(_review(resolved=["item-2"]))
+    assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
+    capture = next(r for r in reversed(_records(runner)) if r.metadata.role == "coder")
+    assert capture.metadata.followup_dispatch_head == "fedcba9"
+    assert capture.metadata.subject != "fedcba9"
+    [fresh] = _reviews_after(runner, capture.index)
+    assert fresh.metadata.subject == capture.metadata.subject
+    assert fresh.metadata.state == "approved"

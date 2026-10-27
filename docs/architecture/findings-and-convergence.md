@@ -351,6 +351,18 @@ their identities and owners and reach the final freeze after normal gates.
 Native evidence and live freezes never dispatch capture, and round ceilings
 remain in force. No new recovery payload is persisted.
 
+A completed converted capture with new tool-verified evidence also establishes
+an ordered semantic-review boundary. Conversion audits, the source freeze,
+dispatch/result binding and the coder's authoritative row evidence reconstruct
+that boundary after restart; neither a coder claim nor a ledger tombstone can
+establish it. Approvals preceding the capture cannot approve its evidence.
+Replacement evidence establishes a later boundary, while identical evidence
+and fresh post-boundary approvals remain reusable. The existing policy-selected
+reviewers receive row claims and tool citations in full and compact contexts,
+including summary-only resumes, and can block semantically inadequate tests.
+Machine supersession alone does not supply semantic approval. Partial captures
+still retain every unresolved row's final barrier.
+
 `review_rounds._normalize_evidence_only_approval` constructs a public approval
 carrier after the original evidence dispositions have been retained for ledger
 settlement. It omits only eligible active evidence dispositions, retaining

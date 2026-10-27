@@ -6,8 +6,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
-from .converted_capture import recovery_capture, capture_feedback, recheck_capture
-from .pr_restart import checkpoint_restart
+from .converted_capture import recovery_capture, capture_feedback, recheck_capture, capture_review_context, admitted_capture_history
+from .pr_restart import checkpoint_restart, review_inputs_changed
 from .review_rounds import _normalize_evidence_only_approval
 from .managed_ci_reconciliation import (
     observe_repair_result, reconcile_repair_checkpoint, historical_outcome,
@@ -3832,6 +3832,8 @@ def run_pr_loop(
                 # to reviewers, so their dispositions are optional.
                 item.item_id for item in prior_unresolved_items if item.is_inert_ledger_record
             )
+            capture_records, _capture_complete = admitted_capture_history(
+                runner, config, pr_number=pr_number, comments=pr_comments) if matrix_applies else ((), True)
             coder_followup_context = _coder_followup_review_context(
                 latest_coder_output,
                 latest_coder_metadata,
@@ -3841,7 +3843,8 @@ def run_pr_loop(
                 signed_evidence_references=current_signed_references(),
             ) + _evidence_review_context(
                 prior_unresolved_items, response_head=evidence_response_head
-            )
+            ) + capture_review_context(capture_records,
+                                       head=pr_metadata.head_sha, plan=approved_plan_context)
             # Step-back sweeps (#1251) bind to the step-back coder record's
             # resulting head and this round only; rebuilt from durable records.
             pr_step_back_sweeps = _pr_step_back_sweep_contexts(
@@ -3864,6 +3867,20 @@ def run_pr_loop(
             # The accepted carrier beside each approved text, keyed by reviewer, so
             # an acknowledgement repair can pin its assessment and records (#925).
             accepted_review_carriers: dict[str, ParsedPlanReview | ParsedReview] = {}
+            from .converted_capture import evidence_review_boundary, capture_stale_reviewers
+            capture_boundary_index = evidence_review_boundary(
+                capture_records,
+                head=pr_metadata.head_sha,
+                matrix_identity=(approved_plan_context.risk_test_matrix_identity
+                                 if approved_plan_context is not None else None),
+            )
+            if capture_boundary_index >= 0:
+                log(config, f"Round {round_number}: converted capture publication at comment "
+                    f"{capture_boundary_index} bounds semantic approval eligibility; "
+                    "scope selection alone does not invalidate approval carry")
+            if capture_stale_reviewers(capture_records,
+                                       head=pr_metadata.head_sha, boundary=capture_boundary_index):
+                request_automatic_scheduler_fallback("converted capture evidence requires semantic review")
             completed_by_name = {
                 record.metadata.agent: record
                 for record in (current_resume.completed_reviews if current_resume is not None else ())
@@ -3871,7 +3888,8 @@ def run_pr_loop(
             resumed_by_name = {
                 name: record
                 for name, record in completed_by_name.items()
-                if _resumed_pr_reviewer_matches_requirements(
+                if record.index > capture_boundary_index
+                and _resumed_pr_reviewer_matches_requirements(
                     record,
                     human_requirements,
                     approved_plan_context,
@@ -4021,6 +4039,7 @@ def run_pr_loop(
                 _extract_round_metadata_records(pr_comments, flow="pr"),
                 head_sha=pr_metadata.head_sha,
             )
+            conversion_boundary_index = max(conversion_boundary_index, capture_boundary_index)
             if conversion_boundary_index >= 0:
                 unchanged_head_approvals = {
                     name: record
@@ -4232,6 +4251,7 @@ def run_pr_loop(
                     validation_context=publication_context_digest(
                         head=current_pr_subject,
                         surfaced=sorted(str(item) for item in surfaced_reviewer_requirement_ids),
+                        **({"capture_boundary": capture_boundary_index} if capture_boundary_index >= 0 else {}),
                         **({"seat_binding": seat_binding} if seat_binding is not None else {}),
                     ),
                 )
@@ -6786,7 +6806,7 @@ def run_pr_loop(
                         plan_binding_reviewers=operator_reviewers,
                         board_check=pr_qualification_board_check,
                     )
-                    if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
+                    if review_inputs_changed(pr_metadata.head_sha, fresh_context):
                         unresolved_items, qualification_checkpoint = checkpoint_restart(
                             runner, config=config, pr_number=pr_number, round_number=round_number,
                             previous_head=pr_metadata.head_sha, context=fresh_context,
@@ -7387,7 +7407,7 @@ def run_pr_loop(
                                 plan_binding_reviewers=operator_reviewers,
                                 board_check=pr_qualification_board_check,
                             )
-                            if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
+                            if review_inputs_changed(pr_metadata.head_sha, fresh_context):
                                 unresolved_items, qualification_checkpoint = checkpoint_restart(
                                     runner, config=config, pr_number=pr_number, round_number=round_number,
                                     previous_head=pr_metadata.head_sha, context=fresh_context,
@@ -7921,7 +7941,7 @@ def run_pr_loop(
                             plan_binding_reviewers=operator_reviewers,
                             board_check=pr_qualification_board_check,
                         )
-                        if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
+                        if review_inputs_changed(pr_metadata.head_sha, fresh_context):
                             unresolved_items, qualification_checkpoint = checkpoint_restart(
                                 runner, config=config, pr_number=pr_number, round_number=round_number,
                                 previous_head=pr_metadata.head_sha, context=fresh_context,
@@ -7967,7 +7987,7 @@ def run_pr_loop(
                             plan_binding_reviewers=operator_reviewers,
                             board_check=pr_qualification_board_check,
                         )
-                        if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
+                        if review_inputs_changed(pr_metadata.head_sha, fresh_context):
                             unresolved_items, qualification_checkpoint = checkpoint_restart(
                                 runner, config=config, pr_number=pr_number, round_number=round_number,
                                 previous_head=pr_metadata.head_sha, context=fresh_context,
@@ -8301,7 +8321,7 @@ def run_pr_loop(
                                         plan_binding_reviewers=operator_reviewers,
                                         board_check=pr_qualification_board_check,
                                     )
-                                    if fresh_context.metadata.head_sha != pr_metadata.head_sha or fresh_context.architecture_identity_changed:
+                                    if review_inputs_changed(pr_metadata.head_sha, fresh_context):
                                         unresolved_items, qualification_checkpoint = checkpoint_restart(
                                             runner, config=config, pr_number=pr_number, round_number=round_number,
                                             previous_head=pr_metadata.head_sha, context=fresh_context,
@@ -9898,7 +9918,13 @@ def run_pr_loop(
                 # across an interruption without latching normal broad paths.
                 final_sweep_pending = True
             resumed_round = None
-            prefetched_pr_context = updated_pr_context
+            # The result snapshot predates the coder publication. Capture
+            # eligibility must see that publication on the very next pass.
+            prefetched_pr_context = (
+                get_pr_review_context(runner, config=config, pr_number=pr_number)
+                if any(item.converted_row_id for item in latest_coder_metadata.prior_items)
+                else updated_pr_context
+            )
 
         raise AgentLoopError(
             f"Reached max rounds ({config.max_rounds}) for PR #{pr_number}; human review required."

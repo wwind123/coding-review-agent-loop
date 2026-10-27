@@ -9,6 +9,8 @@ def restart_reason(previous_head, context):
         changes.append("PR head changed")
     if context.architecture_identity_changed:
         changes.append("architecture identity changed")
+    if getattr(context, "converted_capture_review_pending", False):
+        changes.append("converted capture requires fresh semantic review")
     return " and ".join(changes)
 
 
@@ -39,3 +41,12 @@ def checkpoint_restart(
         message=f"PR #{pr_number} qualification checkpoint: {reason} {phase}; fresh review is required.",
     )
     return items, checkpoint
+
+
+def review_inputs_changed(previous_head, context):
+    """All qualification readers return to scheduling on these fresh inputs."""
+    return (
+        previous_head != context.metadata.head_sha
+        or context.architecture_identity_changed
+        or getattr(context, "converted_capture_review_pending", False)
+    )

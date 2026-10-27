@@ -79,6 +79,18 @@ states. Phase,
 owner, selection, approval-head, and scheduler-policy call-accounting metadata
 are optional extensions to the legacy scheduler core, so old records remain
 decodable and grant no staged phase authority.
+Converted recovery captures add a freshness boundary shared by approval carry,
+resumed reviews and qualification. Selected reviewers whose approvals predate
+the admitted capture must review the captured row claims and tool evidence.
+Published fresh approvals can be reused after restart; a stale local response
+checkpoint cannot bypass the boundary. A fresh qualification read returns to
+scheduling if post-capture semantic approval is incomplete. The force-full
+latch selects policy-authorized scope only: ordinary same-head coder follow-ups
+and non-capture obligation-digest changes preserve otherwise eligible carry,
+including approvals without a recorded digest. Persistent latches do not
+re-invalidate fresh post-capture approvals. Automatic pre-panel recovery stays
+primary-only; post-panel and explicit operator scope rules still apply.
+
 See [selective and staged review](../local_agent_loop.md#selective-intermediate-pr-review).
 
 Issue plan review has its own scheduling component, `plan_review_scheduling.py`,
