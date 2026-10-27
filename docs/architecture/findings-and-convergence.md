@@ -351,6 +351,13 @@ their identities and owners and reach the final freeze after normal gates.
 Native evidence and live freezes never dispatch capture, and round ceilings
 remain in force. No new recovery payload is persisted.
 
+`converted_capture_state.py` owns the pure capture eligibility rules shared by
+round-state approval readers, qualification and capture dispatch.
+`pr_loop_support.py` owns authenticated capture-history admission;
+`converted_capture.py` composes those lower layers for recovery dispatch.
+This keeps qualification and dispatch on the same rules without a cyclic
+dependency between their orchestration modules.
+
 A completed converted capture with new tool-verified evidence also establishes
 an ordered semantic-review boundary. Conversion audits, the source freeze,
 dispatch/result binding and the coder's authoritative row evidence reconstruct

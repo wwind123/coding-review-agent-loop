@@ -3655,7 +3655,7 @@ def _fresh_pr_qualification_snapshot(
         for requirement in requirements.effective_requirements
     )
     requirement_ids = tuple(result)
-    from .converted_capture import evidence_review_boundary, admitted_capture_history
+    from .converted_capture_state import evidence_review_boundary
     records, complete = admitted_capture_history(
         runner, config, pr_number=pr_number, comments=context.comments,
     )
@@ -4373,6 +4373,27 @@ def _authenticated_pr_comments_status(
             + " were not covered by the REST identity read and are not admitted",
         )
     return merged, actor, not missing
+
+
+def admitted_capture_history(runner, config, *, pr_number, comments):
+    """Admit the entire capture chain, including freezes without references.
+
+    Conversion admission strips authority fields on foreign records but keeps
+    ordinary content. A capture additionally needs authenticated coder and
+    freeze publications, so do not reconstruct it from that ordinary content.
+    """
+    from .round_state import _extract_round_metadata_records, _recovery_record_admitted
+
+    records = _extract_round_metadata_records(comments, flow="pr")
+    if not any(record.metadata.evidence_conversion is not None for record in records):
+        return records, True
+    hydrated, actor, complete = _authenticated_pr_comments_status(
+        runner, config, pr_number=pr_number, comments=comments,
+    )
+    records = _extract_round_metadata_records(hydrated, flow="pr")
+    return tuple(record for record in records
+                 if record.metadata.role == "reviewer"
+                 or _recovery_record_admitted(record, hydrated, actor)), complete
 
 
 def admitted_pr_records(
