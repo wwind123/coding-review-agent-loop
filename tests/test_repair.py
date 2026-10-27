@@ -1701,13 +1701,14 @@ def test_cli_repair_backends_do_not_apply_antigravity_transient_signature(
     assert calls == ["model-x"]
 
 
-def test_runner_pty_timeout_is_opt_in_and_retains_combined_log(tmp_path):
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_runner_pty_timeout_is_opt_in_and_retains_combined_log(tmp_path, stream):
     log_path = tmp_path / "logs" / "timeout.log"
     result = Runner().run_with_log(
         [
             sys.executable,
             "-c",
-            "import sys,time; print('stderr diagnostic', file=sys.stderr, flush=True); time.sleep(5)",
+            f"import sys,time; print('timeout diagnostic', file=sys.{stream}, flush=True); time.sleep(60)",
         ],
         cwd=tmp_path,
         log_path=log_path,
@@ -1715,13 +1716,14 @@ def test_runner_pty_timeout_is_opt_in_and_retains_combined_log(tmp_path):
         progress_interval_seconds=30,
         check=False,
         use_pty=True,
-        timeout_seconds=0.2,
+        # Allow interpreter startup under CI load before testing timeout capture.
+        timeout_seconds=5,
     )
 
     assert result.returncode is None
     assert result.stderr == ""
-    assert "stderr diagnostic" in result.stdout
-    assert "stderr diagnostic" in log_path.read_text(encoding="utf-8")
+    assert "timeout diagnostic" in result.stdout
+    assert "timeout diagnostic" in log_path.read_text(encoding="utf-8")
 
 def test_run_pr_loop_uses_repair_pass_on_format_failure(tmp_path):
     """Repair pass is invoked when schema validation fails; repaired output is used."""

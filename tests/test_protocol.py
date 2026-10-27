@@ -3008,6 +3008,86 @@ def test_sole_unverified_suite_start_selector_is_not_rejected_before_authenticat
     assert claim.execution_refs == ("turn:observation-1",)
 
 
+@pytest.mark.parametrize(
+    "environment_change, expected_state",
+    [(None, "equivalent"), ("TEST_INPUT", "different"),
+     ("CODEX_TOOL_CALL_ID_SUFFIX", "different"), ("missing-identity", "unknown")],
+)
+def test_reconciled_codex_rerun_matrix_admission(environment_change, expected_state):
+    from coding_review_agent_loop.local_test_evidence import (
+        EnvironmentIdentityRegistry, LocalTestObservation, TreeAttribution,
+        reconcile_test_observations,
+    )
+    from coding_review_agent_loop.protocol import (
+        SemanticRiskCoverageClaim, SemanticRiskCoverageClaims,
+        derive_risk_test_matrix_evidence, parse_risk_test_matrix, risk_test_matrix_identity,
+    )
+
+    registry = EnvironmentIdentityRegistry()
+    stable = {"TEST_INPUT": "one", "CODEX_TOOL_CALL_ID_SUFFIX": "one"}
+    first_environment = {**stable, "CODEX_TOOL_CALL_ID": "call-one"}
+    later_environment = {**stable, "CODEX_TOOL_CALL_ID": "call-two"}
+    if environment_change in stable:
+        later_environment[environment_change] = "two"
+    observations = []
+    for index, environment in enumerate((first_environment, later_environment)):
+        observations.append(LocalTestObservation(
+            command=("python", "-m", "pytest", "tests/test_protocol.py"),
+            normalized_command="python -m pytest tests/test_protocol.py",
+            outcome="passed", returncode=0, provenance="parent-observed",
+            receipt_id=f"receipt-{index}", execution_ref=f"ref-{index}",
+            turn_id="turn-current", timestamp=f"2026-09-10T10:0{index}:00+00:00",
+            attribution=TreeAttribution(
+                state="current-head", head="head-1", tracked_digest="tree-1", stable=True,
+            ),
+            environment_identity=(
+                None if index == 1 and environment_change == "missing-identity"
+                else registry.capture(environment)
+            ),
+            wrapper_bootstrap="verified", inner_exec="started", suite_start="verified",
+        ))
+    reconciled = reconcile_test_observations(observations, registry=registry)
+    later = reconciled.observations[1]
+    assert later.environment_state == expected_state
+    matrix = parse_risk_test_matrix({
+        "applicability": "applicable", "important_exclusions": [],
+        "rows": [{
+            "row_id": "codex-rerun", "label": "Codex rerun", "entry_path_or_mode": "reconciliation",
+            "initial_state": "earlier receipt", "event": "passing rerun", "expected_outcome": "admitted",
+            "forbidden_side_effects": ["no real environment divergence admitted"],
+            "proposed_test_level": "unit", "proposed_test_location": "tests/test_protocol.py",
+            "applicability": "applicable", "related_scope_item_ids": ["scope-rerun"],
+            "execution_owner": "one-shot",
+        }],
+    })
+    claim = SemanticRiskCoverageClaim(
+        row_id="codex-rerun", execution_refs=("ref-1",),
+        test_identifiers=("tests/test_protocol.py::test_reconciled_codex_rerun_matrix_admission",),
+        test_locations=("tests/test_protocol.py",), workflow_path_claim="reconciliation",
+        outcome_assertions=("passing rerun is admitted",),
+        forbidden_effect_assertions=("no real environment divergence admitted",), test_level="unit",
+    )
+    derived = derive_risk_test_matrix_evidence(
+        matrix=matrix, claims=SemanticRiskCoverageClaims((claim,)),
+        observations=reconciled.observations, execution_catalog=reconciled.observations,
+        invocation_id="turn-current", current_head="head-1", current_tree_digest="tree-1",
+        authenticated_checkout_head="head-1", authenticated_tree_clean=True,
+        expected_identity=risk_test_matrix_identity(matrix),
+    )
+    [row] = derived.evidence.rows
+    if expected_state == "equivalent":
+        assert row.status == "verified"
+        [citation] = row.evidence_citations
+        assert citation.receipt_id == "receipt-1"
+        assert citation.claim == "current-result"
+        assert later.caveats == ()
+        assert derived.diagnostics == ()
+    else:
+        assert row.status == "stale/unverified"
+        assert row.evidence_citations == ()
+        assert any(item.code == "inadmissible-execution" for item in derived.diagnostics)
+
+
 def _derive_1659(observation):
     from types import SimpleNamespace
 

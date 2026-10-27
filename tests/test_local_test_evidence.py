@@ -111,21 +111,22 @@ def test_failed_full_suite_then_subset_remains_visible_and_exact_rerun_supersede
     assert evidence.authoritative_failures == ()
 
 
-def test_environment_divergence_and_unknown_do_not_supersede_a_failure():
+@pytest.mark.parametrize("variable", ["TEST_INPUT", "CODEX_TOOL_CALL_ID_SUFFIX"])
+def test_environment_divergence_and_unknown_do_not_supersede_a_failure(variable):
     registry = EnvironmentIdentityRegistry()
     failure = _observation(
         outcome="failed",
         timestamp="2026-09-10T10:00:00+00:00",
         receipt_id="failure",
         registry=registry,
-        environment={"TEST_INPUT": "one"},
+        environment={variable: "one"},
     )
     different = _observation(
         outcome="passed",
         timestamp="2026-09-10T10:01:00+00:00",
         receipt_id="different",
         registry=registry,
-        environment={"TEST_INPUT": "two"},
+        environment={variable: "two"},
     )
     unknown = _observation(
         outcome="passed",
@@ -264,7 +265,8 @@ def test_per_turn_session_variables_keep_environment_identity_equivalent():
 
 
 @pytest.mark.parametrize(
-    "lookalike", ["CLAUDE_CODE_MESSAGING_OTHER", "CLAUDE_PID_SUFFIX", "INVOCATION_ID_X"]
+    "lookalike", ["CLAUDE_CODE_MESSAGING_OTHER", "CLAUDE_PID_SUFFIX", "INVOCATION_ID_X",
+                  "CODEX_TOOL_CALL_ID_SUFFIX"]
 )
 def test_lookalike_session_variable_names_remain_in_environment_identity(lookalike):
     assert lookalike not in ENVIRONMENT_EXCLUSIONS
@@ -273,6 +275,44 @@ def test_lookalike_session_variable_names_remain_in_environment_identity(lookali
     assert canonical_environment_bytes(base) != canonical_environment_bytes(changed)
     registry = EnvironmentIdentityRegistry()
     assert registry.compare(registry.capture(base), registry.capture(changed)) == "different"
+
+
+@pytest.mark.parametrize("first_outcome", ["passed", "failed"])
+@pytest.mark.parametrize(
+    "first_metadata, second_metadata",
+    [({"CODEX_TOOL_CALL_ID": "call-one"}, {"CODEX_TOOL_CALL_ID": "call-two"}),
+     ({}, {"CODEX_TOOL_CALL_ID": "call-two"}),
+     ({"CODEX_TOOL_CALL_ID": "call-one"}, {})],
+    ids=["changed", "added", "removed"],
+)
+def test_codex_tool_call_metadata_keeps_reruns_equivalent(
+    first_outcome, first_metadata, second_metadata
+):
+    registry = EnvironmentIdentityRegistry()
+    first = _observation(
+        outcome=first_outcome, timestamp="2026-09-10T10:00:00+00:00",
+        receipt_id="first", registry=registry,
+        environment={"TEST_INPUT": "stable", **first_metadata},
+    )
+    passing = _observation(
+        outcome="passed", timestamp="2026-09-10T10:01:00+00:00",
+        receipt_id="passing", registry=registry,
+        environment={"TEST_INPUT": "stable", **second_metadata},
+    )
+    assert registry.compare(first.environment_identity, passing.environment_identity) == "equivalent"
+    evidence = reconcile_test_observations([first, passing], registry=registry)
+    assert evidence.observations[1].environment_state == "equivalent"
+    assert evidence_module.ENVIRONMENT_DIFFERS_CAVEAT not in evidence.observations[1].caveats
+    assert evidence.observations[1].caveats == ()
+    assert evidence.observations[0].superseded_by == (
+        "passing" if first_outcome == "failed" else None
+    )
+    assert evidence.authoritative_failures == ()
+    # Environment identity stays live-only, including after this exclusion.
+    encoded = json.dumps(evidence.to_dict())
+    assert "CODEX_TOOL_CALL_ID" not in encoded
+    assert "environment_identity" not in encoded
+    assert "call-one" not in encoded and "call-two" not in encoded
 
 
 def test_restart_evidence_without_a_command_digest_is_identity_unknown_and_never_supersedes():

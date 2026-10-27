@@ -36,6 +36,8 @@ import coding_review_agent_loop.response_validation as response_validation
 import coding_review_agent_loop.validated_agent as validated_agent
 from agent_loop_helpers import patch_attr_in
 
+pytestmark = pytest.mark.usefixtures("private_response_tempdir")
+
 
 def plan_record(plan):
     return _attach_round_metadata(plan, PostedRoundMetadata(

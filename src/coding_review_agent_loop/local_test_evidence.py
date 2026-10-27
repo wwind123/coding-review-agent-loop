@@ -177,6 +177,8 @@ ENVIRONMENT_EXCLUSIONS = frozenset(
         "CLAUDE_CODE_CHILD_SESSION",
         "CODEX_SESSION_ID",
         "CODEX_THREAD_ID",
+        # Codex changes this metadata on every shell tool call (#1720).
+        "CODEX_TOOL_CALL_ID",
         # Per-process and per-session agent and systemd values (#1346): they
         # change with every coder process or systemd invocation and would split
         # identity between turns running the same command, the #1329 deadlock
