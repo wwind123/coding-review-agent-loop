@@ -3051,3 +3051,59 @@ def test_refresh_pass_with_unavailable_reviewer_publishes_no_release_and_reruns_
     assert runner.codex_outputs == [] and runner.gemini_outputs == []
     reasons = [record.metadata.evidence_release.reason for record in _release_records(runner)]
     assert reasons == ["evidence-cleared", "refresh-clean"]
+
+
+@pytest.mark.parametrize("policy", ["selective-intermediate", "primary-then-panel"])
+@pytest.mark.parametrize("parallel", [False, True])
+@pytest.mark.parametrize("persistent_latch", [False, True])
+def test_non_capture_digest_change_preserves_carry_after_restart(tmp_path, monkeypatch, policy, parallel, persistent_latch):
+    """An ordinary same-head follow-up changes obligations, not approval eligibility."""
+    runner = FakeRunner(
+        advance_pr_head_on_coder_followup=False,
+        claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
+        codex_outputs=[_staged_review(reviewer="OpenAI Codex")],
+        gemini_outputs=[
+            _staged_review(reviewer="Google Gemini", state="blocking",
+                           blocking_items=[{"text": "Repair the cleanup defect."}]),
+            _staged_review(reviewer="Google Gemini",
+                           dispositions=[{"item_id": "item-1", "disposition": "resolved"}]),
+        ],
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), pr_review_policy=policy,
+                         primary_reviewer="codex" if policy == "primary-then-panel" else None,
+                         review_parallel=parallel, max_rounds=8)
+    real_post = pr_loop.post_pr_comment
+
+    def post(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        if pr_loop._extract_round_metadata_records(
+            [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr",
+        )[-1].metadata.role == "coder":
+            raise KeyboardInterrupt()
+        return result
+
+    monkeypatch.setattr(pr_loop, "post_pr_comment", post)
+    with pytest.raises(KeyboardInterrupt):
+        run_pr_loop(runner, pr_number=77, config=config)
+    monkeypatch.setattr(pr_loop, "post_pr_comment", real_post)
+
+    def change(payload):
+        if payload.get("role") == "reviewer" and payload.get("state") == "approved":
+            # A legacy approval has no scheduler obligation digest at all.
+            return {k: v for k, v in payload.items() if not k.startswith("scheduler_")}
+        if payload.get("role") == "coder":
+            return {**payload, "scheduler_obligation_digest": "0" * 16,
+                    "scheduler_force_full": persistent_latch,
+                    "scheduler_force_full_source": "automatic" if persistent_latch else None}
+        return None
+
+    _rewrite_pr_metadata(runner, change)
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _agent_sequence(runner).count("codex") == 1
+    assert _agent_sequence(runner).count("gemini") == 2
+    assert any(item.scheduler_force_full for item in _posted_scheduler_metadata(runner))
+    before = list(_agent_sequence(runner))
+    runner.simulate_new_process()
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    assert _agent_sequence(runner) == before

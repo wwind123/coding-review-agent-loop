@@ -3534,8 +3534,10 @@ def _latest_pr_approved_reviews_for_head(
     if not head_sha:
         return {}
     configured_names = {agent_display_name(agent) for agent in configured_reviewers}
+    from .converted_capture_state import capture_eligible_records
     latest_by_reviewer: dict[str, PostedRoundRecord] = {}
-    for record in reversed(_extract_round_metadata_records(comments, flow="pr")):
+    records = _extract_round_metadata_records(comments, flow="pr")
+    for record in reversed(capture_eligible_records(records, head=head_sha, plan=approved_plan_context)):
         metadata = record.metadata
         if (
             metadata.subject != head_sha

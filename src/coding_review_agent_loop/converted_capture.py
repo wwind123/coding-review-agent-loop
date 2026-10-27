@@ -2,63 +2,14 @@
 
 from .errors import HumanDecisionRequiredError
 from .logging import log
-from .round_state import EVIDENCE_FREEZE_PHASE
-
-
-def capture_candidates(records, *, items, head, matrix_identity, diagnostic=None):
-    """Only ordered, admitted freeze/coder history can grant an opportunity.
-
-    Every completed coder turn with the source ledger and a dispatch/result
-    binding consumes it, even when it reports no evidence or pushes a new head.
-    No round arithmetic or commit ordering is evidence of causal linkage.
-    """
-    def stop(reason):
-        if diagnostic is not None:
-            diagnostic(reason)
-        return ()
-
-    candidates = [i for i in items if i.converted_matrix_identity == matrix_identity
-                  and i.converted_row_id and i.lifecycle == "evidence_deferred"]
-    if not candidates:
-        return ()
-    audits = [r.metadata.evidence_conversion for r in records
-              if r.metadata.evidence_conversion is not None
-              and r.metadata.evidence_conversion.matrix_identity == matrix_identity]
-    backed = {(row.obligation_item_id, row.obligation_identity)
-              for audit in audits for row in audit.rows}
-    candidates = [i for i in candidates if (i.item_id, i.obligation_identity) in backed]
-    freezes = [r for r in records if r.metadata.phase == EVIDENCE_FREEZE_PHASE
-               and r.metadata.evidence_freeze is not None
-               and r.metadata.evidence_freeze.valid
-               and r.metadata.evidence_freeze.frozen_head == r.metadata.subject
-               and any((i.item_id, i.obligation_identity) in backed
-                       for i in r.metadata.prior_items)]
-    if not freezes or not candidates:
-        return ()
-    source = freezes[-1]
-    if source.metadata.subject == head:
-        return ()
-    identities = {(i.item_id, i.obligation_identity) for i in source.metadata.prior_items
-                  if (i.item_id, i.obligation_identity) in backed
-                  and i.obligation_identity in source.metadata.evidence_freeze.evidence_identities}
-    candidates = [i for i in candidates if (i.item_id, i.obligation_identity) in identities]
-    after = [r for r in records if r.index > source.index]
-    advanced = next((r.metadata.subject for r in after
-                     if r.metadata.subject != source.metadata.subject), head)
-    for record in after:
-        m = record.metadata
-        if m.role != "coder":
-            continue
-        bound = {(i.item_id, i.obligation_identity) for i in m.prior_items}
-        # A completed publication consumes the opportunity. Missing causal
-        # bindings cannot authorize a retry, including on legacy records.
-        if m.followup_dispatch_head == advanced and identities.intersection(bound):
-            return stop("A completed coder publication consumed converted recovery capture")
-        return stop("Coder history lacks causal capture bindings; retaining the final evidence barrier")
-    # Unrecorded second advances are ambiguous, not another capture episode.
-    if advanced != head:
-        return stop("Unrecorded head advance in capture history; retaining the final evidence barrier")
-    return tuple(candidates)
+from .converted_capture_state import (
+    capture_candidates,
+    evidence_review_boundary,
+    capture_eligible_records,
+    capture_review_context,
+    capture_stale_reviewers,
+)
+from .pr_loop_support import admitted_capture_history
 
 
 def recovery_capture(runner, config, *, pr_number, items, head, plan):
