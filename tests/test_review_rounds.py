@@ -617,3 +617,26 @@ def test_sequential_guard_threads_the_unresolved_conversion_boundary():
         )
     assert "evidence-conversion record could not be admitted" in str(refused.value)
     assert "withheld" not in str(refused.value)
+
+
+@pytest.mark.parametrize("mixed", ["code-finding", "same-pr", "unknown-disposition", "none"])
+def test_evidence_approval_normalizer_preserves_real_blockers_and_requests(mixed):
+    from coding_review_agent_loop.protocol import ParsedReview, ApprovedFollowups
+    from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
+    items, _ = _upsert_evidence_obligation([], item_number=1, reviewer="Codex", text="Attach the live run.",
+                                          source_round=1, current_head_sha="abc123")
+    finding = ApprovedFollowup(reviewer="Codex", text="Fix an actual defect.")
+    disposition = ReviewItemDisposition(item_id="item-2" if mixed == "unknown-disposition" else "item-1",
+                                        reviewer="Codex", disposition="blocking", note="Still needed.")
+    parsed = ParsedReview(state="blocking", summary="Review complete.",
+                          blocking_items=(finding,) if mixed == "code-finding" else (),
+                          followups=ApprovedFollowups(same_pr=(finding,) if mixed == "same-pr" else (), future=()),
+                          dispositions=(disposition,), exact_head_evidence_requests=("Attach the second live run.",))
+    normalized = review_rounds._normalize_evidence_only_approval(parsed, items)
+    if mixed != "none":
+        assert normalized is parsed
+    else:
+        assert normalized.state == "approved" and normalized.dispositions == ()
+        assert normalized.exact_head_evidence_requests == parsed.exact_head_evidence_requests
+        assert parsed.dispositions == (disposition,)
+        assert items[0].status == "blocking" and items[0].lifecycle == "evidence_deferred"

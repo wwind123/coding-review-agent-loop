@@ -925,3 +925,62 @@ def test_refresh_pass_with_deferred_evidence_survives_a_pending_check_stop(tmp_p
     assert set(freezes[0].metadata.evidence_freeze.signed_requirement_ids_at_freeze) == set(
         released.evidence_release.signed_requirement_ids_surfaced
     )
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_evidence_only_approval_publication_roundtrips_without_clearing_barrier(tmp_path, parallel):
+    from coding_review_agent_loop.protocol import parse_review
+    runner = _frozen_runner(tmp_path)
+    config = make_config(tmp_path, review_parallel=parallel)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    runner.pr_payload["headRefOid"] = "def456"
+    runner.git_head = "def456"
+    runner.simulate_new_process()
+    runner.codex_outputs.append(_evidence_review(state="blocking", dispositions=[_keep()]))
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head def456"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    records = _pr_records(runner)
+    reviews = [r for r in records if r.metadata.role == "reviewer" and r.metadata.state == "approved"]
+    assert reviews
+    for record in reviews:
+        assert parse_review(record.body, reviewer=record.metadata.agent).state == "approved"
+        assert not any(d.disposition in {"blocking", "same-pr"} for d in record.metadata.dispositions)
+    frozen = _freeze_records(runner)[-1].metadata.prior_items
+    assert frozen[0].lifecycle == "evidence_frozen"
+    assert frozen[0].resolution_owners == _freeze_records(runner)[0].metadata.prior_items[0].resolution_owners
+
+
+@pytest.mark.parametrize("policy", ["all-reviewers", "selective-intermediate"])
+def test_legacy_contradictory_approval_forces_fresh_native_evidence_review(tmp_path, policy):
+    from coding_review_agent_loop.protocol import parse_review
+    from coding_review_agent_loop.comment_rendering import render_public_agent_comment
+    runner = _frozen_runner(tmp_path)
+    config = make_config(tmp_path, pr_review_policy=policy)
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    original = next(r for r in _pr_records(runner) if r.metadata.role == "reviewer")
+    freeze = _freeze_records(runner)[-1]
+    runner.pr_payload["headRefOid"] = "def456"
+    runner.git_head = "def456"
+    from coding_review_agent_loop.protocol import ReviewItemDisposition
+    disposition = ReviewItemDisposition(item_id="item-1", reviewer="Codex", disposition="blocking", note="Still needed.")
+    approved = dataclasses.replace(parse_review(original.body, reviewer="Codex"), dispositions=(disposition,))
+    body = render_public_agent_comment(kind="pr_review", parsed=approved, agent="codex", config=config,
+                                      prior_items=freeze.metadata.prior_items, dispositions=(disposition,))
+    with pytest.raises(AgentLoopError, match="fully complete"):
+        parse_review(body, reviewer="Codex")
+    metadata = dataclasses.replace(original.metadata, subject="def456", round_number=2,
+                                   prior_items=freeze.metadata.prior_items, dispositions=(disposition,),
+                                   scheduler_current_sha="def456" if policy == "selective-intermediate" else None)
+    runner.pr_payload["comments"].append({"body": _attach_round_metadata(body, metadata),
+                                         "author": {"login": "coding-review-agent-loop"},
+                                         "createdAt": "2026-10-01T00:00:00Z"})
+    before = len([cmd for cmd, _ in runner.commands if cmd[:2] == ["codex", "exec"]])
+    runner.simulate_new_process()
+    runner.codex_outputs.append(_evidence_review(state="blocking", dispositions=[_keep()]))
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head def456"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert len([cmd for cmd, _ in runner.commands if cmd[:2] == ["codex", "exec"]]) == before + 1
+    assert not any(cmd[:1] == ["claude"] for cmd, _ in runner.commands)
+    assert _freeze_records(runner)[-1].metadata.prior_items[0].lifecycle == "evidence_frozen"

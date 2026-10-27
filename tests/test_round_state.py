@@ -2095,3 +2095,30 @@ def test_1559_startup_latch_reads_activation_but_not_stray():
             _comments(*history, latched(None, source)), flow="pr"
         )
         assert startup_force_full_latch(stray, requires_primary=staged) == (False, False)
+
+
+def test_legacy_contradictory_approval_is_not_carried_or_resumed_and_keeps_evidence(tmp_path):
+    from coding_review_agent_loop.protocol import (
+        ParsedReview, ApprovedFollowups, ReviewItemDisposition, parse_review,
+    )
+    from coding_review_agent_loop.comment_rendering import render_public_agent_comment
+    from coding_review_agent_loop.round_state import _resume_pr_round
+    from coding_review_agent_loop.response_validation import _resumed_pr_reviewer_matches_requirements
+    ledger = _evidence_ledger(frozen=False)
+    disposition = ReviewItemDisposition(item_id="item-1", reviewer="Codex", disposition="blocking", note="Evidence remains needed.")
+    contradictory = ParsedReview(state="approved", summary="Code approved, evidence deferred.",
+                                 blocking_items=(), followups=ApprovedFollowups(same_pr=(), future=()), dispositions=(disposition,))
+    body = render_public_agent_comment(kind="pr_review", parsed=contradictory, agent="codex",
+                                      prior_items=ledger, dispositions=(disposition,), config=make_config(tmp_path))
+    with pytest.raises(AgentLoopError, match="fully complete"):
+        parse_review(body, reviewer="Codex")
+    metadata = PostedRoundMetadata(flow="pr", role="reviewer", agent="Codex", round_number=2,
+                                   subject=_FROZEN_HEAD, state="approved", prior_items=ledger, dispositions=(disposition,))
+    comments = [SimpleNamespace(body=_attach_round_metadata(body, metadata))]
+    assert _latest_pr_approved_reviews_for_head(comments, head_sha=_FROZEN_HEAD, configured_reviewers=("codex",)) == {}
+    resumed = _resume_pr_round(comments, head_sha=_FROZEN_HEAD, configured_reviewers=("codex",))
+    assert resumed is not None and resumed.completed_reviews == ()
+    assert resumed.prior_items == ledger
+    assert resumed.prior_items[0].resolution_owners == ledger[0].resolution_owners
+    record = PostedRoundRecord(metadata=metadata, body=body, index=0)
+    assert not _resumed_pr_reviewer_matches_requirements(record, ())

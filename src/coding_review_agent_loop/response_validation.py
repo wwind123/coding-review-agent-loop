@@ -1061,6 +1061,9 @@ def _resumed_pr_reviewer_matches_requirements(
     resumable, while a non-empty current set requires both the resolution marker
     and digest-backed identities from the persisted metadata.
     """
+    from .round_state import _contradictory_evidence_approval
+    if _contradictory_evidence_approval(record.metadata):
+        return False
     plan_matches = approved_plan_context is None or (
         record.metadata.approved_plan_hash == approved_plan_context.plan_hash
         and record.metadata.approved_plan_subject == approved_plan_context.plan_subject

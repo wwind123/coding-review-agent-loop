@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+from .review_approval import _contradictory_evidence_approval
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
 from .errors import AgentLoopError, IssueImplementationConflictError
@@ -3117,9 +3118,7 @@ def _decode_round_metadata(encoded: str) -> PostedRoundMetadata:
 def followup_head_unchanged_sha(metadata: PostedRoundMetadata | None) -> str | None:
     """Return the PR head a coder follow-up left unchanged, else ``None`` (#1034).
 
-    The signal is purely SHA-based: a coder record whose persisted dispatch
-    head equals its recorded subject.  Historical records without the
-    dispatch head never qualify, so their rendering and context stay as-is.
+    Only a persisted dispatch head equal to the result subject qualifies.
     """
     if metadata is None or metadata.role != "coder":
         return None
@@ -3532,7 +3531,6 @@ def _latest_pr_approved_reviews_for_head(
     reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None = None,
     require_architecture_contract: bool = False,
 ) -> dict[str, PostedRoundRecord]:
-    """Return each reviewer's latest approval for the current immutable PR head."""
     if not head_sha:
         return {}
     configured_names = {agent_display_name(agent) for agent in configured_reviewers}
@@ -3546,9 +3544,6 @@ def _latest_pr_approved_reviews_for_head(
             or metadata.agent in latest_by_reviewer
         ):
             continue
-        # A fresh architecture-aware resume must be explicitly bound to the
-        # current response contract.  Legacy records remain decodable, but
-        # their missing discriminator cannot satisfy a newly prompted turn.
         if require_architecture_contract and metadata.architecture_contract_version != 1:
             continue
         latest_by_reviewer[metadata.agent] = record
@@ -3572,6 +3567,7 @@ def _latest_pr_approved_reviews_for_head(
         reviewer: record
         for reviewer, record in latest_by_reviewer.items()
         if record.metadata.state == "approved"
+        and not _contradictory_evidence_approval(record.metadata)
         and acquisition_contract_matches(record)
         and (
             approved_plan_context is None
@@ -5656,20 +5652,22 @@ def _resume_pr_round_from_records(
             continue
         if record.index <= reopened_below:
             continue
-        reviewer_records[metadata.agent] = record
+        if _contradictory_evidence_approval(metadata):
+            reviewer_records.pop(metadata.agent, None)
+        else:
+            reviewer_records[metadata.agent] = record
     if conversion_boundary is not None and latest_coder_record is None and not reviewer_records:
         return _conversion_handoff_resume(
             conversion_boundary,
             current_head_records=[r for r in records if r.metadata.subject == head_sha],
             walk_records=walk_records,
         )
-    if latest_coder_record is None and not reviewer_records:
+    if latest_coder_record is None and not reviewer_records and not any(
+        _contradictory_evidence_approval(r.metadata) for r in current_round_records
+    ):
         if checkpoint_record is None:
             return None
-        # A qualification checkpoint is a deliberate handoff boundary.  It is
-        # valid even when it is the only record for the current round: recovery
-        # must retain its ledger, round number, and budget instead of treating
-        # the summary-only record as an incomplete review transcript.
+        # A summary-only checkpoint retains its ledger and round budget.
         anchor_metadata = checkpoint_record.metadata
         current_round_records = (checkpoint_record,)
         reconciliation_record = None

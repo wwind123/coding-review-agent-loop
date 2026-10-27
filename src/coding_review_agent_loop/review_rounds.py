@@ -153,6 +153,24 @@ def _normalize_approval_gated_managed_ci_review(
     return dataclasses_replace(parsed_review, state="approved", dispositions=dispositions)
 
 
+def _normalize_evidence_only_approval(
+    parsed: ParsedReview, prior_items: Sequence[UnresolvedReviewItem]
+) -> ParsedReview:
+    """Serialize code approval without resolving the separate evidence ledger."""
+    from .unresolved_items import _is_evidence_obligation
+
+    if parsed.state != "blocking" or parsed.blocking_items or parsed.followups.same_pr:
+        return parsed
+    evidence_ids = {item.item_id for item in prior_items if _is_evidence_obligation(item)}
+    active = {d.item_id for d in parsed.dispositions if d.disposition in {"blocking", "same-pr"}}
+    if not active.issubset(evidence_ids) or not (active or parsed.exact_head_evidence_requests):
+        return parsed
+    return dataclasses_replace(
+        parsed, state="approved",
+        dispositions=tuple(d for d in parsed.dispositions if d.item_id not in active),
+    )
+
+
 def _coder_infrastructure_stall_notice(stalls: Sequence[StalledCheck]) -> str:
     """Prepended to a coder follow-up review when checks are wholly
     infrastructure-blocked (#602), so the coder never has to discover this

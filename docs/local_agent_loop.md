@@ -1018,8 +1018,22 @@ A tombstone is satisfied only by an admitted reference for the live head, or by
 tool-captured evidence bound to the live head that verifies the row (the
 obligation is then tombstoned as superseded by tool evidence). Any other
 tombstone, or a freeze at another head, reopens in place as deferred, so the
-answer for one head never satisfies another, and an approving review at the new
-head reaches a new freeze there with no coder turn. A converted obligation
+answer for one head never satisfies another. After full review of an external
+push that breaks a converted-row freeze, the coder gets one bounded opportunity
+to capture the approved rows through the normal captured-test evidence pipeline.
+This can accompany real code fixes and requires no invented finding or conversion
+reversal. A causally bound completed coder publication consumes the opportunity,
+even with failed, missing or subset evidence, an unchanged head, or a coder push.
+The bound is reconstructed from admitted conversion audits, the source freeze,
+and ordered coder dispatch/result records, including their carried ledger.
+A coder push alone cannot create another opportunity. An independently broken
+later terminal freeze starts a new boundary. Interrupted unpublished turns use
+normal recovery; execution before publication is not guaranteed exactly once.
+Missing legacy bindings, ambiguous head advances or unavailable authority history
+grant no retry or evidence authority. Round limits still apply. Unverified rows
+retain their IDs, owners and conversion fallback, reaching a clean final freeze
+after normal review and machine gates; a same-head rerun stays frozen. Native
+human-only evidence never starts a coder capture turn. A converted obligation
 missing from the ledger but recorded in an admitted conversion audit is
 restored with its audit item ID and owners; conversion state that no admitted
 audit backs (for example a ledger adopted from a record whose audit was

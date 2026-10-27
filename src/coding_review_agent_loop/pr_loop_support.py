@@ -3396,16 +3396,7 @@ def _fresh_pr_qualification_snapshot(
         # invent an identity for legacy records.
         stored_identity = approved_identity
     if stored_identity is None:
-        # There may be no current-head approval yet. Retain the latest durable
-        # observation as a compatibility fallback, but never use raw prose.
-        stored_identity = next(
-            (
-                record.metadata.architecture_identity
-                for record in reversed(_extract_round_metadata_records(context.comments, flow="pr"))
-                if isinstance(record.metadata.architecture_identity, dict)
-            ),
-            None,
-        )
+        stored_identity = _latest_pr_architecture_observation(context.comments)
     fresh_architecture, architecture_changed = _revalidate_pr_architecture_identity(
         runner, config=config, metadata=context.metadata, stored_identity=stored_identity
     )
@@ -3414,6 +3405,15 @@ def _fresh_pr_qualification_snapshot(
         # instead of mutating the captured instance during a qualification gate.
         config = dataclasses_replace(config, architecture_context=fresh_architecture)
     if architecture_changed and fresh_architecture is not None:
+        from .architecture_contract import _pr_architecture_observation_record, _architecture_identity_differences
+        source = _pr_architecture_observation_record(context.comments, head_sha=context.metadata.head_sha)
+        source = source or _pr_architecture_observation_record(context.comments)
+        provenance = (
+            f"{source.metadata.role} round {source.metadata.round_number} subject {source.metadata.subject}"
+            if source is not None else "in-memory acquisition"
+        )
+        differences = _architecture_identity_differences(stored_identity, fresh_architecture.identity())
+        log(config, f"Architecture identity changed from {provenance}; differing fields: {', '.join(differences)}")
         context = dataclasses_replace(context, architecture_identity_changed=True)
     if scheduler_contract is not None:
         # Scheduler metadata is an optimization over the immutable required
