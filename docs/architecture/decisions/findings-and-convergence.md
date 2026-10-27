@@ -19,3 +19,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - The unchanged-head evidence-progress grant reads earlier rounds only through the previous round's bounded evidence projection, so after a resume a parent-observed failure evicted from it cannot earn the grant; this stays as documented conservative behaviour rather than persisting more evidence (#1639, 2026-10-25).
 
 - Tool-verified converted capture publications require semantic review after their ordered boundary, reconstructed from existing admitted history without a new persisted payload (#1734).
+
+- Optional converted recovery capture requires a coder slot within the restored effective ceiling; at an exhausted ceiling unresolved rows instead reach the normal clean-head evidence freeze, preserving ordinary blocker stops and existing budgets without new state (#1730, 2026-10-27).
