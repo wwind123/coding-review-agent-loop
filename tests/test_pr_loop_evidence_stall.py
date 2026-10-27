@@ -193,7 +193,7 @@ def test_k_zero_disables_the_stop_but_still_writes_snapshots(tmp_path):
     assert [snapshots[n]["qualifies"] for n in (1, 2, 3)] == [False, True, True]
 
 
-def test_rerun_after_the_stop_recomputes_the_same_stop_without_a_comment(tmp_path):
+def test_rerun_after_the_stop_recomputes_the_same_stop_with_one_audit_per_invocation(tmp_path):
     """`stall-resume`: state comes only from posted records."""
     runner = FakeRunner(
         claude_outputs=[_coder(1), _coder(1)],
@@ -209,7 +209,8 @@ def test_rerun_after_the_stop_recomputes_the_same_stop_without_a_comment(tmp_pat
         run_pr_loop(runner, pr_number=77, config=_config(tmp_path), approved_plan_context=context)
     assert str(first.value) == str(second.value)
     assert _coder_count(runner) == coders_after_first
-    assert not any("stalled on evidence only" in comment for comment in runner.comments)
+    assert len(_hd_diagnostics(runner)) == 2
+    assert all("stalled on evidence only" in body for body in _hd_diagnostics(runner))
 
 
 def test_changed_approved_matrix_identity_unbinds_evidence_and_resets_the_window(tmp_path):
@@ -1542,9 +1543,45 @@ def test_an_evidence_stall_that_owns_the_window_posts_no_non_convergence_diagnos
     config = _config(tmp_path, pr_evidence_stall_rounds=3, pr_non_convergence_rounds=3)
     message = _nc_stop_message(runner, config, _plan_context("row-a"))
     assert True in deferrals
+    from coding_review_agent_loop.pr_loop import render_pr_human_decision_diagnostic
+    assert _hd_diagnostics(runner) == [render_pr_human_decision_diagnostic("round 4", message)]
     assert "is stalled on evidence only" in message and "not converging" not in message
     assert not any("not converging" in body for body in _hd_diagnostics(runner))
     assert not any(
         "kept the same item(s) blocking" in comment["body"]
         for comment in runner.pr_payload.get("comments", [])
     )
+
+
+@pytest.mark.parametrize("error_type", [AgentLoopError, OSError])
+def test_stall_diagnostic_failure_preserves_identical_stop(tmp_path, monkeypatch, capsys, error_type):
+    import coding_review_agent_loop.pr_loop as loop
+    runner = _evidence_only_runner(4, 3)
+    config = _config(tmp_path, pr_evidence_stall_rounds=3, pr_non_convergence_rounds=3, quiet=False)
+    real_decision = loop._pr_evidence_stall_decision
+    original = []
+    attempts = []
+    real_post = loop.post_pr_comment
+
+    def decision(*args, **kwargs):
+        try:
+            return real_decision(*args, **kwargs)
+        except HumanDecisionRequiredError as exc:
+            original.append(exc)
+            raise
+
+    def post(*args, **kwargs):
+        if str(kwargs["body"]).startswith("PR review scheduling diagnostic ("):
+            attempts.append(kwargs["body"])
+            raise error_type("audit unavailable")
+        return real_post(*args, **kwargs)
+
+    monkeypatch.setattr(loop, "_pr_evidence_stall_decision", decision)
+    monkeypatch.setattr(loop, "post_pr_comment", post)
+    with pytest.raises(HumanDecisionRequiredError) as raised:
+        run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=_plan_context("row-a"))
+    assert len(original) == 1 and raised.value is original[0]
+    assert raised.value.EXIT_CODE == 4
+    assert attempts == [loop.render_pr_human_decision_diagnostic("round 4", str(raised.value))]
+    assert "Warning: could not post the human-decision diagnostic" in capsys.readouterr().err
+    assert _coder_count(runner) == 3

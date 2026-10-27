@@ -299,6 +299,15 @@ def recognize_diagnostic(body: str) -> RecognizedDiagnostic | None:
             return RecognizedDiagnostic(
                 KIND_HUMAN_DECISION_STOP, "plan-primary-stall", round_number, terminal=True
             )
+        # Evidence stops use their existing colon-free PR-number openings.
+        for opening, reason in (
+            (r"^PR #[1-9][0-9]* is stalled on evidence only at head ", "pr-evidence-stall"),
+            (r"^PR #[1-9][0-9]* is frozen at head ", "pr-evidence-freeze"),
+        ):
+            if re.match(opening, message):
+                return RecognizedDiagnostic(
+                    KIND_HUMAN_DECISION_STOP, reason, round_number, terminal=True
+                )
         # The PR approach-alternative (#1628), step-back sibling and
         # non-convergence (#1640) stops are rendered after a ``PR #N: `` prefix.
         pr_message = _PR_NUMBER_PREFIX_RE.sub("", message, count=1)

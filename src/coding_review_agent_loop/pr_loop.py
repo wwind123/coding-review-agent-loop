@@ -449,6 +449,7 @@ from .pr_loop_support import (
     render_pr_scheduling_diagnostic,
     render_pr_human_decision_diagnostic,
     _pr_human_decision_omission_note,
+    _stop_for_human_decision,
     _managed_v1_dispatch_records,
     unchanged_head_stop_message,
     ExactHeadCiProof,
@@ -2421,28 +2422,16 @@ def run_pr_loop(
         def stop_for_human_decision(
             exc: HumanDecisionRequiredError, *, round_number: int
         ) -> NoReturn:
-            """Post a best-effort PR scheduling diagnostic, then re-raise ``exc`` (#1640).
+            _stop_for_human_decision(
+                runner, config=config, pr_number=pr_number, exc=exc,
+                round_number=round_number, post_comment=post_pr_comment,
+            )
 
-            Plain audit text only, never state: resume re-derives these stops
-            from round records.  A failed post never changes the stop or exit 4.
-            """
-            message = str(exc)
-            log(config, f"Round {round_number}: {message}")
+        def evidence_freeze_gate(*args, round_number: int, **kwargs):
             try:
-                post_pr_comment(
-                    runner,
-                    config=config,
-                    pr_number=pr_number,
-                    body=render_pr_human_decision_diagnostic(f"round {round_number}", message),
-                )
-            except (AgentLoopError, OSError) as post_error:
-                log(
-                    config,
-                    "Warning: could not post the human-decision diagnostic to "
-                    f"PR #{pr_number} ({type(post_error).__name__}: {post_error}); "
-                    "the stop stands.",
-                )
-            raise exc
+                return _evidence_freeze_gate(*args, round_number=round_number, **kwargs)
+            except HumanDecisionRequiredError as exc:
+                stop_for_human_decision(exc, round_number=round_number)
 
         # A scheduler contract written by an earlier run is immutable. Missing
         # legacy scheduler fields intentionally mean "use the full board".
@@ -3756,13 +3745,13 @@ def run_pr_loop(
                                 f"Round {round_number}: PR #{pr_number} remains frozen at "
                                 f"{pr_metadata.head_sha}; no new signed human input",
                             )
-                            raise HumanDecisionRequiredError(
+                            stop_for_human_decision(HumanDecisionRequiredError(
                                 _evidence_freeze_diagnostic(
                                     pr_number=pr_number,
                                     head_sha=pr_metadata.head_sha,
                                     items=unresolved_items,
                                 )
-                            )
+                            ), round_number=round_number)
                         evidence_pass = "response"
                         log(
                             config,
@@ -6576,7 +6565,7 @@ def run_pr_loop(
                     # Evidence kept at the frozen head: no CI wait or
                     # qualification; revalidate and re-persist the freeze.
                     recheck_pending_child_plan_supersession()
-                    gate_outcome = _evidence_freeze_gate(
+                    gate_outcome = evidence_freeze_gate(
                         runner,
                         config=config,
                         pr_number=pr_number,
@@ -7013,7 +7002,7 @@ def run_pr_loop(
                     # finalization side effect; publishes the single freeze when evidence
                     # is pending, and otherwise revalidates head and signed input.
                     if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
-                        gate_outcome = _evidence_freeze_gate(
+                        gate_outcome = evidence_freeze_gate(
                             runner,
                             config=config,
                             pr_number=pr_number,
@@ -7478,7 +7467,7 @@ def run_pr_loop(
                         # finalization side effect; publishes the single freeze when evidence
                         # is pending, and otherwise revalidates head and signed input.
                         if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
-                            gate_outcome = _evidence_freeze_gate(
+                            gate_outcome = evidence_freeze_gate(
                                 runner,
                                 config=config,
                                 pr_number=pr_number,
@@ -8157,7 +8146,7 @@ def run_pr_loop(
                                 # finalization side effect; publishes the single freeze when evidence
                                 # is pending, and otherwise revalidates head and signed input.
                                 if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
-                                    gate_outcome = _evidence_freeze_gate(
+                                    gate_outcome = evidence_freeze_gate(
                                         runner,
                                         config=config,
                                         pr_number=pr_number,
@@ -8406,7 +8395,7 @@ def run_pr_loop(
                                 # finalization side effect; publishes the single freeze when evidence
                                 # is pending, and otherwise revalidates head and signed input.
                                 if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
-                                    gate_outcome = _evidence_freeze_gate(
+                                    gate_outcome = evidence_freeze_gate(
                                         runner,
                                         config=config,
                                         pr_number=pr_number,
@@ -8727,7 +8716,7 @@ def run_pr_loop(
                             # finalization side effect; publishes the single freeze when evidence
                             # is pending, and otherwise revalidates head and signed input.
                             if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
-                                gate_outcome = _evidence_freeze_gate(
+                                gate_outcome = evidence_freeze_gate(
                                     runner,
                                     config=config,
                                     pr_number=pr_number,
@@ -8790,7 +8779,7 @@ def run_pr_loop(
                         # finalization side effect; publishes the single freeze when evidence
                         # is pending, and otherwise revalidates head and signed input.
                         if evidence_revalidation_required or _evidence_gate_needed(unresolved_items):
-                            gate_outcome = _evidence_freeze_gate(
+                            gate_outcome = evidence_freeze_gate(
                                 runner,
                                 config=config,
                                 pr_number=pr_number,
@@ -8971,25 +8960,28 @@ def run_pr_loop(
             # Evidence-only stall (#1324): decided after the check snapshot and
             # CI reconciliation above, before any coder invocation.  Not
             # evaluated on the merge-conflict path, which makes no check calls.
-            evidence_stall_outcome = (
-                None
-                if has_merge_conflict_item
-                else _pr_evidence_stall_decision(
-                    runner,
-                    config,
-                    pr_number=pr_number,
-                    round_number=round_number,
-                    head_sha=pr_metadata.head_sha,
-                    approved_plan_context=approved_plan_context,
-                    open_items=unresolved_items,
-                    pr_checks=pr_checks,
-                    configured_reviewers=tuple(
-                        agent_display_name(reviewer) for reviewer in configured_reviewers
-                    ),
-                    next_item_number=next_unresolved_item_number,
-                    signed_evidence_references=current_signed_references(),
+            try:
+                evidence_stall_outcome = (
+                    None
+                    if has_merge_conflict_item
+                    else _pr_evidence_stall_decision(
+                        runner,
+                        config,
+                        pr_number=pr_number,
+                        round_number=round_number,
+                        head_sha=pr_metadata.head_sha,
+                        approved_plan_context=approved_plan_context,
+                        open_items=unresolved_items,
+                        pr_checks=pr_checks,
+                        configured_reviewers=tuple(
+                            agent_display_name(reviewer) for reviewer in configured_reviewers
+                        ),
+                        next_item_number=next_unresolved_item_number,
+                        signed_evidence_references=current_signed_references(),
+                    )
                 )
-            )
+            except HumanDecisionRequiredError as exc:
+                stop_for_human_decision(exc, round_number=round_number)
             evidence_stall_snapshot = (
                 evidence_stall_outcome.snapshot if evidence_stall_outcome is not None else None
             )

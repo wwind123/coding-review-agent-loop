@@ -955,7 +955,8 @@ The obligation is a final barrier:
    check snapshot and one mergeability reading at the frozen head. A failing
    check or merge conflict releases the freeze with one release comment, and
    the repair runs as the next round. With no new signed input the rerun exits
-   with the same diagnostic, invokes no agent, and posts nothing. New signed
+   with the same diagnostic, invokes no agent, and posts one best-effort audit
+   diagnostic without rewriting the freeze record or budgets. New signed
    input is detected by signed-requirement identity, not by timestamps. An
    edited signed comment counts as new input and a deleted one does not.
 
@@ -4816,7 +4817,8 @@ matrix, or a missing or invalid snapshot resets the window, so a code-finding ro
 followed by one evidence-only round never stops the run. Snapshots are written even when
 K is `0`, so re-enabling the stop evaluates history deterministically. Nothing is taken
 from agent output, so a resumed run (or a rerun after the stop) reaches the same
-decision from posted records; the stop posts no GitHub comment.
+decision from posted records; the stop attempts one bounded best-effort GitHub
+audit diagnostic before re-raising the full human-decision exception.
 
 **Stop message.** It names the PR, the exact head, the approved matrix identity prefix,
 K, and each unsatisfied row with its explanation, then offers: (1) continue so the
@@ -5557,10 +5559,13 @@ ignored and only counted in `ignored_foreign_records`. Each row reports:
 - Human-decision stops are the planning scheduling diagnostics that carry the
   step-back or primary-stall human-decision text, and the PR scheduling
   diagnostics that carry the PR step-back sibling (`pr-step-back-sibling`),
-  non-convergence (`pr-non-convergence`, matched on the first line only) or
+  non-convergence (`pr-non-convergence`), evidence-stall (`pr-evidence-stall`),
+  evidence-freeze (`pr-evidence-freeze`) or
   approach-alternative (`pr-step-back-approach-alternative`) text; step-back
   entries alone never count as stops. A rerun that stops again at the same head
-  posts another diagnostic, so the count is per invocation.
+  posts another diagnostic, so the count is per invocation. Recognition is anchored
+  to the first message line. Audit comments never authorize work or restore freeze
+  state; failed posts and historical stderr-only stops cannot be backfilled.
 - `infrastructure_failures` lists recognized agent-unavailable comments
   (classified as `auth-expiry`, `quota`, `settings-lock`, `backend-outage`,
   `billing`, `environment` or `agent-unavailable-<category>`, including

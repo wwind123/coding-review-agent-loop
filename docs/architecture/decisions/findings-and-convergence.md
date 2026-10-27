@@ -21,3 +21,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Tool-verified converted capture publications require semantic review after their ordered boundary, reconstructed from existing admitted history without a new persisted payload (#1734).
 
 - Optional converted recovery capture requires a coder slot within the restored effective ceiling; at an exhausted ceiling unresolved rows instead reach the normal clean-head evidence freeze, preserving ordinary blocker stops and existing budgets without new state (#1730, 2026-10-27).
+
+- Evidence-stall and evidence-freeze stops publish one bounded best-effort audit diagnostic per stopped invocation for history export; mandatory freeze publication remains authoritative and precedes the audit, whose failure preserves the identical exit-4 exception (#1685, 2026-10-27).
