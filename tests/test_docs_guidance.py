@@ -1128,7 +1128,8 @@ def test_operator_docs_document_the_pr_evidence_stall_stop():
     for term in ("`evidence_row_ids`", "`evidence_stall`", "`review_round`", "canonical-status:"):
         assert term in text
     assert "evidence_stall.py" in architecture
-    assert "no GitHub comment" in text
+    assert "one bounded best-effort GitHub" in text
+    assert "diagnostic without rewriting the freeze record or budgets" in text
 
 
 def test_operator_docs_document_evidence_conversion_and_the_stall_option():

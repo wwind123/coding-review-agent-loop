@@ -1475,3 +1475,65 @@ def test_item_text_on_a_later_line_cannot_make_a_stop_look_like_non_convergence(
     assert recognize_diagnostic(
         render_pr_scheduling_diagnostic("round 5", mimic)
     ).reason == "pr-non-convergence"
+
+
+# Evidence-stop diagnostics retain the real lifecycle message bytes (#1685).
+def _evidence_stop_messages(oversized=False):
+    from coding_review_agent_loop.pr_loop_support import (
+        _evidence_freeze_diagnostic, render_evidence_stall_decision,
+    )
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+    items = [UnresolvedReviewItem(
+        item_id=f"item-{index}", reviewer="Human requester" * (100 if oversized else 1),
+        text="Run the live suite", source_round=1, status="blocking", authority="machine",
+        obligation_kind="human-exact-head-evidence", lifecycle="evidence_frozen",
+        candidate_head_sha="abc123", obligation_identity=f"request-{index}",
+    ) for index in range(100 if oversized else 1)]
+    return (
+        (render_evidence_stall_decision(
+            PR, "abc123", "matrix", {f"row-{i}": "missing" for i in range(5000 if oversized else 1)}, 2
+        ), "pr-evidence-stall"),
+        (_evidence_freeze_diagnostic(pr_number=PR, head_sha="abc123", items=items), "pr-evidence-freeze"),
+    )
+
+
+def test_evidence_stop_renderers_classify_and_bound_short_and_oversized_messages():
+    from coding_review_agent_loop.pr_loop import (
+        PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT, render_pr_human_decision_diagnostic,
+    )
+    for oversized in (False, True):
+        for message, reason in _evidence_stop_messages(oversized):
+            body = render_pr_human_decision_diagnostic("round 5", message)
+            stop = recognize_diagnostic(body)
+            assert (stop.kind, stop.reason, stop.round_number, stop.terminal) == (
+                KIND_HUMAN_DECISION_STOP, reason, 5, True,
+            )
+            assert len(body) <= PR_HUMAN_DECISION_DIAGNOSTIC_LIMIT
+            if oversized:
+                assert "characters of detail omitted" in body
+            else:
+                assert body == render_pr_scheduling_diagnostic("round 5", message)
+            assert recognize_diagnostic(message) is None
+            assert recognize_diagnostic(body + "\n<!-- AGENT_LOOP_" + "META: e30= -->") is None
+            for negative in ("unrelated stop\n" + message, "Detail: " + message, "PR #0 is frozen at head abc123"):
+                other = recognize_diagnostic(render_pr_scheduling_diagnostic("round 5", negative))
+                assert other.reason == "scheduling-stop"
+
+
+def test_history_counts_two_frozen_invocations_without_manufacturing_rounds():
+    from coding_review_agent_loop.pr_loop import render_pr_human_decision_diagnostic
+    message, _ = _evidence_stop_messages()[1]
+    body = render_pr_human_decision_diagnostic("round 5", message)
+    for linked, expected, complete in (
+        (open_pr(), {"value": None, "evidence": "unavailable"}, False),
+        (dataclasses.replace(open_pr(), state="CLOSED", closed_at=at(50, 12)),
+         {"value": 0, "evidence": "verified"}, True),
+    ):
+        row = derive(
+            history(linked=(linked,)), issue_view(handoff(1)),
+            {PR: pr_view(pr_comment(2, body), pr_comment(3, body))},
+        )
+        assert row["human_decision_stops"] == {"value": 2, "evidence": "verified"}
+        assert row["pr_rounds"] == expected
+        assert row["outcome_complete"] is complete
+        assert row["missing_reviewer_records"] == []

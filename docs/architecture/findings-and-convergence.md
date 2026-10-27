@@ -240,8 +240,8 @@ the stop or exit 4. History export classifies the three stops as human-decision
 stops (`pr-step-back-sibling`, `pr-non-convergence`,
 `pr-step-back-approach-alternative`) from shared `review_step_back` message
 constants; the non-convergence match reads only the first line, so item text
-further down cannot change the classification. The evidence-stall,
-evidence-freeze, disputed-items and finalization stops are unchanged.
+further down cannot change the classification. Evidence-stall and evidence-freeze
+coverage is described below; disputed-items and finalization stops are unchanged.
 
 **Unchanged-head stop and evidence progress.** `_UnchangedHeadTracker` counts
 consecutive PR follow-ups that leave one head unchanged and stops at
@@ -297,6 +297,21 @@ invalid unless it equals the record number minus one and its content is consiste
 and a qualifying snapshot names its head, identity, and rows). An invalid or missing
 snapshot ends the window walk. History that cannot be decoded suppresses the stop with a log
 line. State is orchestrator-owned, so a resumed run recomputes the same decision.
+
+Evidence-stall and evidence-freeze human-decision stops use the shared
+best-effort bounded diagnostic publisher in `pr_loop_support.py`, bound locally
+by `pr_loop.py`. Every actual stop, including a frozen rerun without new signed
+input and a still-frozen response pass, attempts one plain audit comment and
+re-raises the identical full exception with exit 4. The mandatory freeze write
+precedes the diagnostic; a freeze-write failure retains its failure semantics
+and never produces a successful-freeze diagnostic. An audit-post failure only
+warns and cannot resume work. Non-stopping gate actions remain unchanged.
+`history_export.py` recognizes the anchored first-line evidence openings as
+`pr-evidence-stall` and `pr-evidence-freeze`. Each stopped invocation counts,
+including repeated frozen reruns, without manufacturing review rounds. These
+comments carry no authoritative state, authorization or budget; only the freeze
+record restores the boundary. Failed posts and historical stderr-only stops
+cannot be recovered retroactively. Other human-decision families are unchanged.
 
 **Evidence conversion** (`--pr-evidence-capture-attempts` N, default 2, `0`
 disables; `--pr-convert-evidence-rows`). `protocol.derive_risk_test_matrix_evidence`

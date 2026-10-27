@@ -2266,7 +2266,9 @@ def test_broken_converted_freeze_respects_exhausted_round_budget(tmp_path, monke
     runner.simulate_new_process()
     with pytest.raises(HumanDecisionRequiredError, match="frozen at head fedcba9"):
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
-    assert runner.comments == snapshot
+    assert runner.comments[:-1] == snapshot
+    assert runner.comments[-1].startswith("PR review scheduling diagnostic (round 2): PR #77 is frozen")
+    assert _records(runner)[-1].metadata == frozen
     assert _agent_count(runner, "codex") == agents
     assert _agent_count(runner, "claude") == 1
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)

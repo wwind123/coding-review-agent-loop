@@ -24,7 +24,7 @@ from dataclasses import (
     replace as dataclasses_replace,
 )
 from pathlib import Path
-from typing import Literal
+from typing import Literal, NoReturn
 from .local_test_evidence import tool_identity_clause, unsuperseded_receipts_sentence
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
@@ -5416,3 +5416,31 @@ def _reconciliation_dispositions_by_item(
             )
         by_item[disposition.item_id].append(disposition)
     return by_item
+
+
+def _stop_for_human_decision(
+    runner: Runner, *, config: AgentLoopConfig, pr_number: int,
+    exc: HumanDecisionRequiredError, round_number: int, post_comment: Callable,
+) -> NoReturn:
+    """Post a best-effort PR scheduling diagnostic, then re-raise ``exc`` (#1640).
+
+    Plain audit text only, never state: resume re-derives these stops
+    from round records.  A failed post never changes the stop or exit 4.
+    """
+    message = str(exc)
+    log(config, f"Round {round_number}: {message}")
+    try:
+        post_comment(
+            runner,
+            config=config,
+            pr_number=pr_number,
+            body=render_pr_human_decision_diagnostic(f"round {round_number}", message),
+        )
+    except (AgentLoopError, OSError) as post_error:
+        log(
+            config,
+            "Warning: could not post the human-decision diagnostic to "
+            f"PR #{pr_number} ({type(post_error).__name__}: {post_error}); "
+            "the stop stands.",
+        )
+    raise exc

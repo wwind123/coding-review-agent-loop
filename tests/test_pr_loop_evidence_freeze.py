@@ -57,14 +57,31 @@ def _frozen_runner(tmp_path, *, codex_outputs=(), **runner_kwargs):
     return runner
 
 
-def test_clean_board_with_evidence_publishes_one_freeze_and_exits_at_decision_boundary(tmp_path):
+def _diagnostics(runner):
+    return [body for body in runner.comments
+            if body.startswith("PR review scheduling diagnostic (")]
+
+
+def _assert_freeze_diagnostic(runner, message, count=1):
+    from coding_review_agent_loop.history_export import recognize_diagnostic
+    bodies = _diagnostics(runner)
+    assert len(bodies) == count
+    assert bodies[-1] == pr_loop.render_pr_human_decision_diagnostic("round 1", message)
+    assert recognize_diagnostic(bodies[-1]).reason == "pr-evidence-freeze"
+    last_diagnostic = max(i for i, body in enumerate(runner.comments) if body == bodies[-1])
+    assert last_diagnostic > runner.comments.index(_freeze_records(runner)[-1].body)
+
+
+@pytest.mark.parametrize("merge", [True, False])
+def test_clean_board_with_evidence_publishes_one_freeze_and_exits_at_decision_boundary(tmp_path, merge):
     """Row freeze-on-clean-board (main)."""
     runner = _frozen_runner(tmp_path)
-    config = make_config(tmp_path)
+    config = make_config(tmp_path, auto_merge=merge)
 
     with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     assert excinfo.value.EXIT_CODE == 4
+    _assert_freeze_diagnostic(runner, str(excinfo.value))
 
     freezes = _freeze_records(runner)
     assert len(freezes) == 1
@@ -93,14 +110,15 @@ def test_clean_board_with_evidence_publishes_one_freeze_and_exits_at_decision_bo
     assert reviewer_records[0].metadata.evidence_requests == (_EVIDENCE_TEXT,)
 
 
-def test_frozen_rerun_without_new_signed_input_invokes_no_agent_and_posts_nothing(tmp_path):
+@pytest.mark.parametrize("max_rounds", [1, 5])
+def test_frozen_rerun_without_new_signed_input_adds_only_one_diagnostic(tmp_path, max_rounds):
     """Rows frozen-rerun-signed-input and new-obligation-while-frozen (pending variant)."""
     runner = _frozen_runner(
         tmp_path,
         pr_payload={"comments": [_signed("Keep backwards compatibility.", 1)]},
     )
     runner.codex_outputs[0] = _evidence_review(evidence=[_EVIDENCE_TEXT], hr=True)
-    config = make_config(tmp_path)
+    config = make_config(tmp_path, max_rounds=max_rounds)
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
     posted = len(runner.pr_payload["comments"])
@@ -112,10 +130,13 @@ def test_frozen_rerun_without_new_signed_input_invokes_no_agent_and_posts_nothin
     # A deleted signed comment is not new input either.
     runner.pr_payload["comments"].pop(0)
     posted -= 1
+    frozen_before = _freeze_records(runner)[0].metadata
     commands_before = len(runner.commands)
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
-    assert len(runner.pr_payload["comments"]) == posted
+    assert len(runner.pr_payload["comments"]) == posted + 1
+    _assert_freeze_diagnostic(runner, str(excinfo.value), count=2)
+    assert _freeze_records(runner)[0].metadata == frozen_before
     assert not any(
         cmd[:1] in (["codex"], ["claude"]) for cmd, _cwd in runner.commands[commands_before:]
     )
@@ -158,6 +179,7 @@ def test_failed_freeze_write_leaves_no_freeze_and_rerun_posts_exactly_one(tmp_pa
     with pytest.raises(AgentLoopError, match="simulated GitHub outage"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert failures
+    assert _diagnostics(runner) == []
     assert "evidence-freeze" not in _phases(runner)
     assert not any(record.metadata.evidence_freeze for record in _pr_records(runner))
 
@@ -212,6 +234,7 @@ def test_evidence_stays_deferred_across_heads_while_code_findings_remain(tmp_pat
 
     assert "evidence-freeze" not in _phases(runner)
     assert not any("Exact-head evidence freeze" in comment for comment in runner.comments)
+    assert _diagnostics(runner) == []
     prompts = _claude_prompts(runner)
     assert len(prompts) == 1
     assert _EVIDENCE_TEXT not in prompts[0]
@@ -319,6 +342,7 @@ def test_managed_qualification_completes_before_the_freeze(tmp_path, monkeypatch
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
     assert events == ["dispatch", "wait", "freeze"]
+    assert len(_diagnostics(runner)) == 1
 
 
 def test_managed_qualification_failure_is_repaired_without_a_freeze(tmp_path, monkeypatch):
@@ -424,8 +448,9 @@ def test_kept_evidence_reposts_a_still_frozen_record_and_reexits(tmp_path):
         run_pr_loop(runner, pr_number=77, config=config)
     runner.pr_payload["comments"].append(_signed("Live suite at abc123: 10 passed, 1 failed.", 1))
     runner.codex_outputs.append(_evidence_review(state="blocking", dispositions=[_keep()], hr=True))
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
+    _assert_freeze_diagnostic(runner, str(excinfo.value), count=2)
     freezes = _freeze_records(runner)
     assert len(freezes) == 2
     assert "still in effect" in freezes[-1].body
@@ -462,6 +487,7 @@ def test_cleared_evidence_with_signed_input_during_the_pass_refreshes_at_the_cei
     assert injected and runner.codex_outputs == []
     reasons = [record.metadata.evidence_release.reason for record in _release_records(runner)]
     assert reasons == ["evidence-cleared", "refresh-clean"]
+    assert len(_diagnostics(runner)) == 1
     assert {record.metadata.round_number for record in _release_records(runner)} == {1}
 
 
@@ -495,6 +521,7 @@ def test_restart_after_cleared_release_refreshes_for_newer_signed_input(tmp_path
     assert runner.codex_outputs == []
     reasons = [record.metadata.evidence_release.reason for record in _release_records(runner)]
     assert reasons == ["evidence-cleared", "refresh-clean"]
+    assert len(_diagnostics(runner)) == 1
 
 
 def _retag_freeze_budget(runner, **budget):
@@ -864,6 +891,7 @@ def test_head_moving_at_the_gate_read_publishes_no_freeze(tmp_path, monkeypatch)
     assert "final barrier" in str(excinfo.value) or "exact-head evidence" in str(excinfo.value)
     assert "evidence-freeze" not in _phases(runner)
     assert not any("Exact-head evidence freeze" in comment for comment in runner.comments)
+    assert _diagnostics(runner) == []
 
 
 def test_refresh_pass_with_deferred_evidence_survives_a_pending_check_stop(tmp_path, monkeypatch):
@@ -984,3 +1012,37 @@ def test_legacy_contradictory_approval_forces_fresh_native_evidence_review(tmp_p
     assert len([cmd for cmd, _ in runner.commands if cmd[:2] == ["codex", "exec"]]) == before + 1
     assert not any(cmd[:1] == ["claude"] for cmd, _ in runner.commands)
     assert _freeze_records(runner)[-1].metadata.prior_items[0].lifecycle == "evidence_frozen"
+
+
+@pytest.mark.parametrize("resumed", [False, True])
+@pytest.mark.parametrize("error_type", [AgentLoopError, OSError])
+def test_freeze_diagnostic_failure_preserves_original_stop(tmp_path, monkeypatch, capsys, resumed, error_type):
+    runner = _frozen_runner(tmp_path)
+    config = make_config(tmp_path, quiet=False)
+    if resumed:
+        with pytest.raises(HumanDecisionRequiredError):
+            run_pr_loop(runner, pr_number=77, config=config)
+    original = []
+    real_stop = pr_loop._stop_for_human_decision
+
+    def capture(*args, **kwargs):
+        original.append(kwargs["exc"])
+        return real_stop(*args, **kwargs)
+
+    real_post = pr_loop.post_pr_comment
+
+    def fail_post(*args, **kwargs):
+        if str(kwargs["body"]).startswith("PR review scheduling diagnostic ("):
+            raise error_type("audit unavailable")
+        return real_post(*args, **kwargs)
+
+    monkeypatch.setattr(pr_loop, "_stop_for_human_decision", capture)
+    monkeypatch.setattr(pr_loop, "post_pr_comment", fail_post)
+    with pytest.raises(HumanDecisionRequiredError) as raised:
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert original == [raised.value] and original[0] is raised.value
+    assert raised.value.EXIT_CODE == 4
+    assert "frozen at head abc123" in str(raised.value)
+    assert len(_freeze_records(runner)) == 1
+    assert "Warning: could not post the human-decision diagnostic" in capsys.readouterr().err
+    assert not _claude_prompts(runner)
