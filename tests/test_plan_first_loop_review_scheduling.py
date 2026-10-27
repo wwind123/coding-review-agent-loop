@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("private_response_tempdir")
+
 import coding_review_agent_loop.plan_first_loop as plan_first_loop_module
 from coding_review_agent_loop.cli import AgentLoopError, run_issue_loop
 from coding_review_agent_loop.comment_rendering import render_canonical_plan_state
