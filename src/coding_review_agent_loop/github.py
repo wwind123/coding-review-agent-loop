@@ -290,7 +290,7 @@ def _query_pr_commit_connection(
     ]
     if after is not None:
         args.extend(("-f", f"after={after}"))
-    result = run_gh_read(runner, args, cwd=active_workdir(config), check=False)
+    result = run_gh_read(runner, args, cwd=github_api_cwd(), check=False)
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         error_type = _GraphQLRefusedError if is_graphql_refusal(detail) else AgentLoopError
@@ -440,7 +440,7 @@ def _rest_pr_object(runner: Runner, *, config: AgentLoopConfig, pr_number: int) 
     result = run_gh_read(
         runner,
         [config.gh_cmd, "api", f"repos/{config.repo}/pulls/{pr_number}"],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode != 0:
@@ -488,7 +488,7 @@ def _read_pull_request_commit_metadata_rest(
                 "api",
                 f"repos/{config.repo}/pulls/{pr_number}/commits?per_page={page_size}&page={page}",
             ],
-            cwd=active_workdir(config),
+            cwd=github_api_cwd(),
             check=False,
         )
         if result.returncode != 0:
@@ -1454,7 +1454,7 @@ def _fetch_branch_protection_required_checks(
             "api",
             f"repos/{config.repo}/branches/{base_branch}/protection/required_status_checks",
         ],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode == 0:
@@ -1513,7 +1513,7 @@ def _fetch_head_dispatch_runs(
             "api",
             f"repos/{config.repo}/actions/runs?event=workflow_dispatch&head_sha={head_sha}&per_page=100",
         ],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     prefix = "workflow_dispatch run lookup failed, so no check was excluded: "
@@ -1622,7 +1622,7 @@ def _list_dispatch_runs(
     result = run_gh_read(
         runner,
         [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/actions/runs?{query}&per_page=100"],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode != 0:
@@ -1969,7 +1969,7 @@ def _fetch_check_run_history(
             "--paginate",
             f"repos/{config.repo}/commits/{head_sha}/check-runs?filter=all&per_page=100",
         ],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode != 0:
@@ -2098,7 +2098,7 @@ def get_pr_checks(
             "api",
             f"repos/{config.repo}/commits/{metadata.head_sha}/check-runs",
         ],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     statuses_result = run_gh_read(
@@ -2108,7 +2108,7 @@ def get_pr_checks(
             "api",
             f"repos/{config.repo}/commits/{metadata.head_sha}/status",
         ],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
 
@@ -3501,7 +3501,7 @@ def _read_comment_pages(
                 f"repos/{config.repo}/issues/{number}/comments?per_page={page_size}&page={page}"
                 + since_query,
             ],
-            cwd=active_workdir(config),
+            cwd=github_api_cwd(),
             check=False,
         )
         if result.returncode != 0:
@@ -4140,7 +4140,7 @@ def patch_verified_trusted_protocol_comment_observed(
         reread = run_gh_read(
             runner,
             [config.gh_cmd, "api", f"repos/{config.repo}/issues/comments/{comment_id}"],
-            cwd=active_workdir(config),
+            cwd=github_api_cwd(),
             check=False,
         )
         envelope: object = None
@@ -4554,7 +4554,7 @@ def _read_creator_issue_pages(
                 f"repos/{config.repo}/issues?creator={creator}&state=all&since={since_text}"
                 f"&sort=created&direction=desc&per_page={page_size}&page={page}",
             ],
-            cwd=active_workdir(config),
+            cwd=github_api_cwd(),
             check=False,
         )
         if result.returncode != 0:
@@ -5007,7 +5007,7 @@ def read_actions_run(runner: Runner, config: AgentLoopConfig, run_id: int | str)
     result = run_gh_read(
         runner,
         [config.gh_cmd, "api", f"repos/{config.repo}/actions/runs/{run_id}"],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode != 0:
@@ -5025,7 +5025,7 @@ def _run_id_for_check_suite(runner: Runner, config: AgentLoopConfig, suite_id: i
     result = run_gh_read(
         runner,
         [config.gh_cmd, "api", f"repos/{config.repo}/actions/runs?check_suite_id={suite_id}"],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode != 0:
@@ -5449,7 +5449,7 @@ def read_run_jobs(
     result = run_gh_read(
         runner,
         [config.gh_cmd, "api", "--paginate", f"repos/{config.repo}/actions/runs/{run_id}/jobs?filter=latest&per_page=100"],
-        cwd=active_workdir(config),
+        cwd=github_api_cwd(),
         check=False,
     )
     if result.returncode != 0:

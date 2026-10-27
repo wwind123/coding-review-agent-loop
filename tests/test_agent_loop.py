@@ -42,7 +42,6 @@ from coding_review_agent_loop.config import (
 )
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from coding_review_agent_loop.github import IssueComment
-from coding_review_agent_loop.workdirs import github_api_cwd
 from coding_review_agent_loop.managed_ci import ManagedCiReadiness, ProtectionAssessment
 from coding_review_agent_loop.managed_pr import ManagedPrHandoff
 from coding_review_agent_loop.runner import ExecutableIdentity
@@ -590,7 +589,11 @@ def test_missing_gemini_workdir_is_created_when_configured(tmp_path):
 @pytest.mark.parametrize(
     "coder,reviewer", [("claude", "gemini"), ("gemini", "claude"), ("antigravity", "claude")]
 )
-def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path, coder, reviewer):
+def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path, monkeypatch, coder, reviewer):
+    # Keep the API directory distinct even when TMPDIR is the repository cwd.
+    api_cwd = tmp_path / "neutral-api"
+    api_cwd.mkdir()
+    monkeypatch.setattr("coding_review_agent_loop.github.github_api_cwd", lambda: api_cwd)
     runner = FakeRunner(
         gemini_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Google Gemini"],
         claude_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- Anthropic Claude"],
@@ -614,11 +617,20 @@ def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path, coder
     actor_cwds = [
         cwd for cmd, cwd in runner.commands if cmd == ["gh", "api", "user"]
     ]
-    assert actor_cwds == [github_api_cwd()]
+    assert actor_cwds == [api_cwd]
+    # Managed-PR discovery still explicitly uses the invocation directory.
+    bootstrap_api = ["gh", "api", "repos/OWNER/REPO/pulls/77"]
+    assert [cwd for cmd, cwd in runner.commands if cmd == bootstrap_api] == [Path.cwd()]
+    api_read_cwds = [
+        cwd for cmd, cwd in runner.commands
+        if cmd[:2] == ["gh", "api"] and "--method" not in cmd and cmd != bootstrap_api
+    ]
+    assert len(api_read_cwds) > len(actor_cwds)
+    assert set(api_read_cwds) == {api_cwd}
     github_or_test_cwds = [
         cwd
         for cmd, cwd in runner.commands
-        if (cmd[:1] == ["gh"] and cmd != ["gh", "api", "user"])
+        if (cmd[:1] == ["gh"] and (cmd[1] != "api" or "--method" in cmd))
         or cmd == ["pytest", "tests/test_agent_loop.py"]
     ]
     assert github_or_test_cwds
