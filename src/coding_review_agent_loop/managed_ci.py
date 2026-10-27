@@ -880,7 +880,7 @@ class ManagedCiRunSnapshot:
     run_attempt: int | None
     status: str | None
     conclusion: str | None
-
+    live_run_attempt: int | None = None
 
 @_surfaces_list_failures
 def activate_managed_ci(
@@ -9149,8 +9149,8 @@ def _refresh_v2_attached_run(
         attempt if isinstance(attempt, int) else contract.run_attempt,
         run.get("status") if isinstance(run.get("status"), str) else None,
         run.get("conclusion") if isinstance(run.get("conclusion"), str) else None,
+        attempt if type(attempt) is int and attempt > 0 else None,
     )
-
 
 def _v2_run_name(contract: ManagedCiContract) -> str:
     return f"{V2_RUN_NAME_PREFIX}{contract.nonce}"

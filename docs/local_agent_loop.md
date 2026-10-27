@@ -7915,6 +7915,18 @@ or authorize a rerun. A later failure still follows the repair path, while
 pending or unreadable evidence leaves the obligation unresolved and stops
 before consuming another coder turn.
 
+The baseline failure can authorize repair during the publication race: the
+strictly authenticated live run must be `in_progress` with no conclusion and
+explicitly report a positive integer attempt equal to the recorded failed
+attempt. A matching authenticated failure status must bind the nonce, run,
+attempt and target head to the HTTPS GitHub repository/run URL. Missing or
+malformed live attempt identity cannot use the effective snapshot fallback to
+authorize this exception. Both actor and triggering-actor login/ID validation
+remain strict. Later attempts still require completion before failure can
+justify repair. This exception retains the obligation and spent budget; it
+neither settles success nor authorizes a rerun, dispatch or merge. Resume and
+each coder handoff revalidate live evidence.
+
 The observed historical result is carried separately from the new invocation's
 dispatch authority. Automatic merge remains head-guarded. Manual qualification
 publishes the observed run, attempt, nonce, original generation and source audit
