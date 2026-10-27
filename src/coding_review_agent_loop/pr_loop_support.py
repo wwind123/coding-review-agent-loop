@@ -7,6 +7,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .managed_ci_result import VerifiedManagedResult
+
 import hashlib
 import json
 import re
@@ -221,6 +223,7 @@ class ExactHeadCiProof:
     # sources that predate the recorded-base guard.
     base_ref: str | None = None
     repository: str | None = None
+    managed_result: VerifiedManagedResult | None = None
 
 
 def _render_ci_rerun_command(config: AgentLoopConfig, *, pr_number: int) -> str:
@@ -273,6 +276,12 @@ def _merge_with_exact_head_proof(
     # the full live PR tuple and require that authoritative view to agree with
     # the proof too; neither cached review metadata nor an old check board is
     # accepted.
+    if proof.managed_result is not None:
+        try:
+            proof.managed_result.require_binding(repository=config.repo, pr_number=pr_number,
+                                                head_sha=proof.head_sha, base_ref=proof.base_ref)
+        except ValueError as exc:
+            raise AgentLoopError(str(exc)) from exc
     live_head = get_pr_head_sha(runner, config, pr_number)
     if live_head != proof.head_sha:
         live_head = get_pr_review_context(
@@ -1172,6 +1181,8 @@ def _machine_obligation_checkpoint(
     requirements_digest: str | None = None,
     acquisition_digest: str | None = None,
     scheduler_digest: str | None = None,
+    previous_checkpoint: QualificationCheckpoint | None = None,
+    managed_contract: ManagedCiContract | None = None,
 ) -> QualificationCheckpoint | None:
     """Create a bounded checkpoint from the active source-specific obligation."""
     candidates = [
@@ -1203,7 +1214,20 @@ def _machine_obligation_checkpoint(
         or item.lifecycle == "repair_required"
     ):
         effective_lifecycle = "repair_required"
-    return QualificationCheckpoint(
+    from .managed_ci_reconciliation import capture_failed_run
+    reference = None
+    if (previous_checkpoint is not None and previous_checkpoint.valid
+        and previous_checkpoint.obligation_identity == (item.obligation_identity or item.item_id)
+        and previous_checkpoint.failed_head_sha == item.failed_head_sha
+        and previous_checkpoint.base_branch == base_branch):
+        reference = previous_checkpoint.failed_managed_run
+    if reference is not None and previous_checkpoint is not None and current_head_sha == previous_checkpoint.failed_head_sha:
+        approval_digest = approval_digest or previous_checkpoint.approval_digest
+        plan_digest = plan_digest or previous_checkpoint.plan_digest
+        requirements_digest = requirements_digest or previous_checkpoint.requirements_digest
+        acquisition_digest = acquisition_digest or previous_checkpoint.acquisition_digest
+        scheduler_digest = scheduler_digest or _qualification_digest(_prior_item_ledger_signature(items))
+    checkpoint = QualificationCheckpoint(
         obligation_kind=item.obligation_kind or "unknown",
         obligation_identity=item.obligation_identity or item.item_id,
         lifecycle=effective_lifecycle,
@@ -1219,7 +1243,11 @@ def _machine_obligation_checkpoint(
         watch_failure_extension_used=watch_failure_extension_used,
         watch_head_extension_used=watch_head_extension_used,
         allowed_rounds=allowed_rounds,
+        failed_managed_run=reference,
     )
+    if reference is None:
+        reference = capture_failed_run(managed_contract, checkpoint, item.source_round)
+    return dataclasses_replace(checkpoint, failed_managed_run=reference)
 
 
 def _qualification_digest(value: object) -> str:
@@ -1269,6 +1297,7 @@ def _qualification_checkpoint_review_identity_matches(
     expected_requirements_digest: str,
     expected_acquisition_digest: str,
     expected_qualification_attempt_id: str | None = None,
+    historical_result: bool = False,
 ) -> bool:
     """Check the durable proof needed to skip a resumed reviewer board.
 
@@ -1279,7 +1308,7 @@ def _qualification_checkpoint_review_identity_matches(
     a summary-only checkpoint or a checkpoint with a changed ledger must force
     the normal full-board recovery path.
     """
-    if checkpoint.lifecycle not in {"qualification_ready", "qualifying"}:
+    if not historical_result and checkpoint.lifecycle not in {"qualification_ready", "qualifying"}:
         return True
     expected_reviewers = {
         agent_display_name(reviewer) for reviewer in configured_reviewers

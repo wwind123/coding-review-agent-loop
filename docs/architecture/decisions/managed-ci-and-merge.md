@@ -21,3 +21,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - The post-turn dispatch audit claims a run as the orchestrator's own v1 dispatch only when an in-process dispatch record uniquely matches it; unconfirmed matches are listed with a typed reason and no named creator (#1414).
 - PR-mode managed-CI resume derives a fresh decomposition child's staged parent from the child's own authenticated fresh-phase identity before the hash-only plan fallback; non-fresh children keep issue-mode-only parent recovery, and refusals and interrupted-run hints name the command that resumes the work (#1662).
 - Recovery rendering and workflow-mirrored intent validation are pure sibling modules; `managed_ci.py` retains I/O, freshness and authorization gates and re-exports every moved binding (#1692).
+
+- Same-head managed repair recovery observes an authenticated later successful attempt of the recorded run through a separate immutable result, preserving fresh-generation dispatch authority and carrying original result identity into automatic proof and manual publication (#1709).

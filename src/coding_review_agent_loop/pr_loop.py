@@ -6,6 +6,11 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .managed_ci_reconciliation import (
+    observe_repair_result, reconcile_repair_checkpoint, historical_outcome,
+    historical_qualification_fields, require_repair_handoff_failure,
+)
+
 import datetime
 import hashlib
 import shlex
@@ -3271,6 +3276,7 @@ def run_pr_loop(
                 pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
             initial_pr_context = pr_context
             pr_metadata = pr_context.metadata
+            historical_inputs_stale = False
             if qualification_checkpoint is not None and qualification_checkpoint.valid:
                 checkpoint_base = pr_metadata.base_branch or config.base
                 checkpoint_item = next(
@@ -3425,9 +3431,14 @@ def run_pr_loop(
                     )
                 )
                 if checkpoint_inputs_stale:
-                    qualification_checkpoint = QualificationCheckpoint.invalid(
-                        "qualification inputs changed during resume"
+                    historical_inputs_stale = (
+                        qualification_checkpoint.obligation_kind == "managed-exact-head-ci"
+                        and qualification_checkpoint.lifecycle == "repair_required"
                     )
+                    if not historical_inputs_stale:
+                        qualification_checkpoint = QualificationCheckpoint.invalid(
+                            "qualification inputs changed during resume"
+                        )
                     request_automatic_scheduler_fallback("qualification inputs changed during resume")
                     final_sweep_pending = True
             current_resume = resumed_round if resumed_round is not None and round_number == resumed_round.round_number else None
@@ -4099,6 +4110,24 @@ def run_pr_loop(
                     "qualification checkpoint review identities are incomplete or stale"
                 )
                 final_sweep_pending = True
+            observed_result = observe_repair_result(
+                runner, config=config, pr_number=pr_number, metadata=pr_metadata,
+                contract=managed_ci, checkpoint=qualification_checkpoint,
+            )
+            historical_reviews_current = observed_result is None or _qualification_checkpoint_review_identity_matches(
+                qualification_checkpoint, configured_reviewers=configured_reviewers,
+                current_approvals=unchanged_head_approvals, unresolved_items=unresolved_items,
+                expected_plan_digest=checkpoint_expected_plan_digest,
+                expected_requirements_digest=checkpoint_expected_requirements_digest,
+                expected_acquisition_digest=checkpoint_expected_acquisition_digest, historical_result=True,
+            )
+            if historical_inputs_stale or not historical_reviews_current:
+                # A green rerun cannot restore approvals invalidated by mutable inputs.
+                final_sweep_pending = True
+                current_resume = None
+                resumed_by_name.clear()
+                unchanged_head_approvals.clear()
+                request_automatic_scheduler_fallback("historical result review inputs changed")
             skip_reviewers_for_recovery = bool(
                 current_resume is not None
                 and (
@@ -6301,6 +6330,29 @@ def run_pr_loop(
                     unresolved_items = _clear_machine_obligations(
                         unresolved_items, kind="alembic-migration"
                     )
+            observed_result, qualification_checkpoint, unresolved_items = reconcile_repair_checkpoint(
+                runner, config=config, pr_number=pr_number, metadata=pr_metadata,
+                contract=managed_ci if managed_ci_active(pr_metadata) else None,
+                checkpoint=qualification_checkpoint, items=unresolved_items,
+            )
+            if observed_result is not None:
+                qualification_checkpoint = dataclasses_replace(
+                    qualification_checkpoint,
+                    approval_digest=_qualification_digest(tuple(sorted({
+                        *unchanged_head_approvals, *(name for name, _ in approved_review_outputs),
+                    }))),
+                    plan_digest=checkpoint_expected_plan_digest,
+                    requirements_digest=checkpoint_expected_requirements_digest,
+                    acquisition_digest=checkpoint_expected_acquisition_digest,
+                    scheduler_digest=_qualification_digest(_prior_item_ledger_signature(unresolved_items)),
+                )
+                _persist_qualification_checkpoint(
+                    runner, config=config, pr_number=pr_number, round_number=round_number,
+                    head_sha=pr_metadata.head_sha, unresolved_items=unresolved_items,
+                    checkpoint=qualification_checkpoint,
+                    message="Managed repair settled by live later-attempt success: "
+                            + historical_qualification_fields(observed_result),
+                )
             item_partitions = _partition_unresolved_items(
                 unresolved_items,
                 current_head_sha=pr_metadata.head_sha,
@@ -6739,6 +6791,7 @@ def run_pr_loop(
                         )
                         qualification_checkpoint = _machine_obligation_checkpoint(
                             unresolved_items,
+                            previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
                             current_head_sha=fresh_context.metadata.head_sha,
                             base_branch=fresh_context.metadata.base_branch or config.base,
                             allowed_rounds=allowed_rounds,
@@ -7072,6 +7125,7 @@ def run_pr_loop(
                     )
                     qualification_checkpoint = _machine_obligation_checkpoint(
                         unresolved_items,
+                        previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
                         current_head_sha=pr_metadata.head_sha,
                         base_branch=pr_metadata.base_branch or config.base,
                         allowed_rounds=allowed_rounds,
@@ -7356,6 +7410,7 @@ def run_pr_loop(
                                 )
                                 qualification_checkpoint = _machine_obligation_checkpoint(
                                     unresolved_items,
+                                    previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
                                     current_head_sha=fresh_context.metadata.head_sha,
                                     base_branch=fresh_context.metadata.base_branch or config.base,
                                     allowed_rounds=allowed_rounds,
@@ -7644,6 +7699,7 @@ def run_pr_loop(
                         )
                         qualification_checkpoint = _machine_obligation_checkpoint(
                             unresolved_items,
+                            previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
                             current_head_sha=prefetched_pr_context.metadata.head_sha,
                             base_branch=prefetched_pr_context.metadata.base_branch or config.base,
                             allowed_rounds=allowed_rounds,
@@ -7948,6 +8004,7 @@ def run_pr_loop(
                             )
                             qualification_checkpoint = _machine_obligation_checkpoint(
                                 unresolved_items,
+                                previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
                                 current_head_sha=fresh_context.metadata.head_sha,
                                 base_branch=fresh_context.metadata.base_branch or config.base,
                                 allowed_rounds=allowed_rounds,
@@ -7996,120 +8053,122 @@ def run_pr_loop(
                         if managed_ci_active(pr_metadata):
                             assert pr_metadata.head_sha is not None
                             assert pr_metadata.head_branch is not None
-                            unresolved_items = _set_machine_obligation_lifecycle(
-                                unresolved_items,
-                                kind="managed-exact-head-ci",
-                                lifecycle="qualifying",
-                            )
-                            qualification_checkpoint = _machine_obligation_checkpoint(
-                                unresolved_items,
-                                current_head_sha=pr_metadata.head_sha,
-                                base_branch=pr_metadata.base_branch or config.base,
-                                allowed_rounds=allowed_rounds,
-                                watch_failure_extension_used=watch_failure_extension_used,
-                                watch_head_extension_used=watch_head_extension_used,
-                                approval_digest=_qualification_digest(
-                                    tuple(sorted({
-                                        *unchanged_head_approvals,
-                                        *(name for name, _output in approved_review_outputs),
-                                    }))
-                                ),
-                                plan_digest=(
-                                    approved_plan_context.plan_hash
-                                    if approved_plan_context is not None else None
-                                ),
-                                requirements_digest=_qualification_digest(
-                                    tuple(requirement.requirement_id for requirement in human_requirements)
-                                ),
-                                acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
-                                scheduler_digest=_qualification_digest(
-                                    _prior_item_ledger_signature(unresolved_items)
-                                ),
-                            )
-                            if qualification_checkpoint is not None:
-                                post_pr_comment(
-                                    runner,
-                                    config=config,
-                                    pr_number=pr_number,
-                                    body=_attach_round_metadata(
-                                        (
-                                            f"PR #{pr_number} qualification checkpoint: "
-                                            "authoritative exact-head validation is in progress."
-                                        ),
-                                        bound_pr_metadata(
-                                            flow="pr",
-                                            role="summary",
-                                            agent="Orchestrator",
-                                            round_number=round_number,
-                                            subject=pr_metadata.head_sha,
-                                            prior_items=tuple(unresolved_items),
-                                            phase="qualification-checkpoint",
-                                            qualification_checkpoint=qualification_checkpoint,
-                                            **_architecture_metadata_fields(config),
-                                        ),
+                            if observed_result is None:
+                                unresolved_items = _set_machine_obligation_lifecycle(
+                                    unresolved_items,
+                                    kind="managed-exact-head-ci",
+                                    lifecycle="qualifying",
+                                )
+                                qualification_checkpoint = _machine_obligation_checkpoint(
+                                    unresolved_items,
+                                    previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
+                                    current_head_sha=pr_metadata.head_sha,
+                                    base_branch=pr_metadata.base_branch or config.base,
+                                    allowed_rounds=allowed_rounds,
+                                    watch_failure_extension_used=watch_failure_extension_used,
+                                    watch_head_extension_used=watch_head_extension_used,
+                                    approval_digest=_qualification_digest(
+                                        tuple(sorted({
+                                            *unchanged_head_approvals,
+                                            *(name for name, _output in approved_review_outputs),
+                                        }))
+                                    ),
+                                    plan_digest=(
+                                        approved_plan_context.plan_hash
+                                        if approved_plan_context is not None else None
+                                    ),
+                                    requirements_digest=_qualification_digest(
+                                        tuple(requirement.requirement_id for requirement in human_requirements)
+                                    ),
+                                    acquisition_digest=_qualification_digest(reviewer_acquisition_contract),
+                                    scheduler_digest=_qualification_digest(
+                                        _prior_item_ledger_signature(unresolved_items)
                                     ),
                                 )
-                            release_stale_managed_ci_attachment(
-                                managed_ci,
-                                head_sha=pr_metadata.head_sha,
-                                config=config,
-                                pr_number=pr_number,
-                            )
-                            attached_attempt = (
-                                qualification_checkpoint is not None
-                                and qualification_checkpoint.valid
-                                and qualification_checkpoint.lifecycle == "qualifying"
-                                and qualification_checkpoint.candidate_head_sha == pr_metadata.head_sha
-                                and managed_ci_attachment_matches_head(
-                                    managed_ci, pr_metadata.head_sha
-                                )
-                            )
-                            if attached_attempt:
-                                log(
-                                    config,
-                                    f"PR #{pr_number}: resuming attached qualification attempt "
-                                    f"{managed_ci.attached_run_id}/{managed_ci.run_attempt}",
-                                )
-                            else:
-                                dispatch_final_qualification(
-                                    runner,
-                                    config=config,
-                                    pr_number=pr_number,
-                                    expected_head_sha=pr_metadata.head_sha,
-                                    head_ref=pr_metadata.head_branch,
-                                    contract=managed_ci,
-                                )
-                            if (
-                                qualification_checkpoint is not None
-                                and qualification_checkpoint.valid
-                                and managed_ci.attached_run_id is not None
-                                and managed_ci.run_attempt is not None
-                            ):
-                                qualification_checkpoint = dataclasses_replace(
-                                    qualification_checkpoint,
-                                    qualification_attempt_id=(
-                                        f"{managed_ci.attached_run_id}/{managed_ci.run_attempt}"
-                                    ),
-                                )
-                                post_pr_comment(
-                                    runner,
-                                    config=config,
-                                    pr_number=pr_number,
-                                    body=_attach_round_metadata(
-                                        f"PR #{pr_number} qualification checkpoint: attached attempt "
-                                        f"{qualification_checkpoint.qualification_attempt_id}.",
-                                        bound_pr_metadata(
-                                            flow="pr",
-                                            role="summary",
-                                            agent="Orchestrator",
-                                            round_number=round_number,
-                                            subject=pr_metadata.head_sha,
-                                            prior_items=tuple(unresolved_items),
-                                            phase="qualification-checkpoint",
-                                            qualification_checkpoint=qualification_checkpoint,
+                                if qualification_checkpoint is not None:
+                                    post_pr_comment(
+                                        runner,
+                                        config=config,
+                                        pr_number=pr_number,
+                                        body=_attach_round_metadata(
+                                            (
+                                                f"PR #{pr_number} qualification checkpoint: "
+                                                "authoritative exact-head validation is in progress."
+                                            ),
+                                            bound_pr_metadata(
+                                                flow="pr",
+                                                role="summary",
+                                                agent="Orchestrator",
+                                                round_number=round_number,
+                                                subject=pr_metadata.head_sha,
+                                                prior_items=tuple(unresolved_items),
+                                                phase="qualification-checkpoint",
+                                                qualification_checkpoint=qualification_checkpoint,
+                                                **_architecture_metadata_fields(config),
+                                            ),
                                         ),
-                                    ),
+                                    )
+                                release_stale_managed_ci_attachment(
+                                    managed_ci,
+                                    head_sha=pr_metadata.head_sha,
+                                    config=config,
+                                    pr_number=pr_number,
                                 )
+                                attached_attempt = (
+                                    qualification_checkpoint is not None
+                                    and qualification_checkpoint.valid
+                                    and qualification_checkpoint.lifecycle == "qualifying"
+                                    and qualification_checkpoint.candidate_head_sha == pr_metadata.head_sha
+                                    and managed_ci_attachment_matches_head(
+                                        managed_ci, pr_metadata.head_sha
+                                    )
+                                )
+                                if attached_attempt:
+                                    log(
+                                        config,
+                                        f"PR #{pr_number}: resuming attached qualification attempt "
+                                        f"{managed_ci.attached_run_id}/{managed_ci.run_attempt}",
+                                    )
+                                else:
+                                    dispatch_final_qualification(
+                                        runner,
+                                        config=config,
+                                        pr_number=pr_number,
+                                        expected_head_sha=pr_metadata.head_sha,
+                                        head_ref=pr_metadata.head_branch,
+                                        contract=managed_ci,
+                                    )
+                                if (
+                                    qualification_checkpoint is not None
+                                    and qualification_checkpoint.valid
+                                    and managed_ci.attached_run_id is not None
+                                    and managed_ci.run_attempt is not None
+                                ):
+                                    qualification_checkpoint = dataclasses_replace(
+                                        qualification_checkpoint,
+                                        qualification_attempt_id=(
+                                            f"{managed_ci.attached_run_id}/{managed_ci.run_attempt}"
+                                        ),
+                                    )
+                                    post_pr_comment(
+                                        runner,
+                                        config=config,
+                                        pr_number=pr_number,
+                                        body=_attach_round_metadata(
+                                            f"PR #{pr_number} qualification checkpoint: attached attempt "
+                                            f"{qualification_checkpoint.qualification_attempt_id}.",
+                                            bound_pr_metadata(
+                                                flow="pr",
+                                                role="summary",
+                                                agent="Orchestrator",
+                                                round_number=round_number,
+                                                subject=pr_metadata.head_sha,
+                                                prior_items=tuple(unresolved_items),
+                                                phase="qualification-checkpoint",
+                                                qualification_checkpoint=qualification_checkpoint,
+                                            ),
+                                        ),
+                                    )
                             if managed_ci.activation_path == "ordinary_fallback":
                                 ordinary_recovery_selected = True
                                 ordinary_recovery = managed_ci.ordinary_recovery
@@ -8176,16 +8235,22 @@ def run_pr_loop(
                             managed_min_attempt: int | None = None
                             managed_plumbing_stop: int | None = None
                             while True:
-                                managed_outcome = wait_for_final_qualification(
-                                    runner,
-                                    config=config,
-                                    pr_number=pr_number,
-                                    metadata=pr_metadata,
-                                    contract=managed_ci,
-                                    attempts=managed_attempts_left,
-                                    min_run_attempt=managed_min_attempt,
-                                    deadline=managed_deadline,
-                                )
+                                if observed_result is not None:
+                                    managed_outcome = historical_outcome(
+                                        runner, config=config, pr_number=pr_number, metadata=pr_metadata,
+                                        contract=managed_ci, result=observed_result,
+                                    )
+                                else:
+                                    managed_outcome = wait_for_final_qualification(
+                                        runner,
+                                        config=config,
+                                        pr_number=pr_number,
+                                        metadata=pr_metadata,
+                                        contract=managed_ci,
+                                        attempts=managed_attempts_left,
+                                        min_run_attempt=managed_min_attempt,
+                                        deadline=managed_deadline,
+                                    )
                                 managed_attempts_left -= managed_outcome.attempts_used
                                 managed_plumbing_stop = _route_managed_plumbing_outcome(
                                     runner,
@@ -8246,6 +8311,7 @@ def run_pr_loop(
                                     )
                                     qualification_checkpoint = _machine_obligation_checkpoint(
                                         unresolved_items,
+                                        previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
                                         current_head_sha=prefetched_pr_context.metadata.head_sha,
                                         base_branch=prefetched_pr_context.metadata.base_branch or config.base,
                                         allowed_rounds=allowed_rounds,
@@ -8399,6 +8465,7 @@ def run_pr_loop(
                                         pr_number=pr_number,
                                         expected_head_sha=pr_metadata.head_sha,
                                         contract=managed_ci,
+                                        **({"verified_result": observed_result} if observed_result else {}),
                                     )
                                     _merge_with_exact_head_proof(
                                         runner,
@@ -8409,6 +8476,7 @@ def run_pr_loop(
                                             source="managed exact-head",
                                             base_ref=managed_ci.base_ref,
                                             repository=managed_ci.repository or config.repo,
+                                            managed_result=observed_result,
                                         ),
                                     )
                                     print(
@@ -8428,6 +8496,7 @@ def run_pr_loop(
                                         pr_number=pr_number,
                                         expected_head_sha=pr_metadata.head_sha,
                                         contract=managed_ci,
+                                        **({"verified_result": observed_result} if observed_result else {}),
                                         reviewers=tuple(str(reviewer) for reviewer in configured_reviewers),
                                     )
                                     managed_ci_qualified = True
@@ -8468,6 +8537,7 @@ def run_pr_loop(
                                 )
                                 qualification_checkpoint = _machine_obligation_checkpoint(
                                     unresolved_items,
+                                    previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
                                     current_head_sha=prefetched_pr_context.metadata.head_sha,
                                     base_branch=prefetched_pr_context.metadata.base_branch or config.base,
                                     allowed_rounds=allowed_rounds,
@@ -9188,6 +9258,7 @@ def run_pr_loop(
             # same extension again.
             qualification_checkpoint = _machine_obligation_checkpoint(
                 unresolved_items,
+                previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
                 current_head_sha=pr_metadata.head_sha,
                 base_branch=pr_metadata.base_branch or config.base,
                 allowed_rounds=allowed_rounds,
@@ -9211,6 +9282,15 @@ def run_pr_loop(
                     _prior_item_ledger_signature(unresolved_items)
                 ),
             )
+            if observe_repair_result(
+                runner, config=config, pr_number=pr_number, metadata=pr_metadata,
+                contract=managed_ci, checkpoint=qualification_checkpoint,
+            ) is not None:
+                # A rerun may have finished since the repair partition was built.
+                # Re-enter all review/input/finalization gates without a coder turn.
+                round_sequence.repeat_current()
+                prefetched_pr_context = pr_context
+                continue
             _persist_qualification_checkpoint(
                 runner,
                 config=config,
@@ -9223,6 +9303,10 @@ def run_pr_loop(
                     f"PR #{pr_number} qualification checkpoint: machine obligation state "
                     "persisted before coder handoff."
                 ),
+            )
+            require_repair_handoff_failure(
+                runner, config=config, pr_number=pr_number, metadata=pr_metadata,
+                contract=managed_ci, checkpoint=qualification_checkpoint,
             )
             # Record the slot, ledger, budget and attempt before the coder can
             # push, so a rejected or interrupted turn is resumable (#1292).  If
@@ -9545,6 +9629,7 @@ def run_pr_loop(
 
                 qualification_checkpoint = _machine_obligation_checkpoint(
                     unresolved_items,
+                    previous_checkpoint=qualification_checkpoint, managed_contract=managed_ci,
                     current_head_sha=updated_pr_context.metadata.head_sha,
                     base_branch=updated_pr_context.metadata.base_branch or config.base,
                     allowed_rounds=allowed_rounds,
@@ -9922,116 +10007,9 @@ def run_pr_loop(
                 raise cleanup_failure
 
 
-# --- Post-approval plumbing routing (#1477) ---------------------------------
+from .pr_loop_plumbing import _ManagedRerunContinue, MANAGED_PUBLISHED_FAILURE_RECOVERY
+from .pr_loop_plumbing import _route_managed_plumbing_outcome as _route_plumbing
 
 
-class _ManagedRerunContinue:
-    """Watch the managed qualification again from ``min_attempt``."""
-
-    def __init__(self, min_attempt: int) -> None:
-        self.min_attempt = min_attempt
-
-
-MANAGED_PUBLISHED_FAILURE_RECOVERY = (
-    "No automatic retry exists for a managed run that published a failure status. "
-    "Rerunning this command on the same head reattaches the same failed run and stops "
-    "here again. Recovery needs a new head commit on the PR (current-head review then "
-    "mints a fresh head-scoped managed intent and dispatch) or the managed resume and "
-    "ordinary-recovery options described in docs/local_agent_loop.md."
-)
-
-
-def _route_managed_plumbing_outcome(
-    runner: Runner,
-    *,
-    config: AgentLoopConfig,
-    pr_number: int,
-    round_number: int,
-    head_sha: str | None,
-    outcome,
-    contract,
-    reruns_used: set[str],
-    budget_left: bool,
-    deadline: float | None = None,
-):
-    """Apply the plumbing rerun-once rule to one managed qualification outcome.
-
-    Returns ``None`` to keep the existing outcome handling, ``"coder"`` for a
-    classified test failure (board or run jobs; test precedence), an exit code
-    for an infrastructure stop, or ``_ManagedRerunContinue`` after a verified
-    rerun.  Plumbing-only also requires an authoritative complete PR-head board.
-    """
-    if outcome.status not in {"terminal_without_status", "failed"} or not head_sha:
-        return None
-    names = plumbing_check_names(config)
-    board = classify_managed_board(outcome.checks, names)
-    jobs = classify_managed_jobs(outcome.jobs, names)
-    if board == "test-failure" or jobs == "test-failure":
-        return "coder"
-    if board != "ok" or jobs != "plumbing-only":
-        return None
-    failed_jobs = [
-        f"{name}: {conclusion}" + (f" ({url})" if url else "")
-        for name, conclusion, url in (outcome.jobs or ())
-        if conclusion not in {"success", "skipped", "neutral"}
-    ]
-    run_url = managed_run_url(config, outcome.run_id)
-    run_urls = (run_url,) if run_url else ()
-
-    def stop(reason: str, final_state: str, recovery: str | None = None) -> int:
-        return _stop_on_ci_plumbing_failure(
-            runner,
-            config=config,
-            pr_number=pr_number,
-            round_number=round_number,
-            reason=reason,
-            run_urls=run_urls,
-            plumbing=failed_jobs,
-            final_line=final_context_state_line(None, managed_status=final_state),
-            recovery=recovery,
-        )
-
-    if outcome.status == "failed":
-        # The record is plain ``completed``; the dispatch validator rejects
-        # attempt N+1 against it, so no rerun and no record rewrite (#1477).
-        return stop(
-            f"Managed run {outcome.run_id} published a failure status although only "
-            "plumbing jobs failed and every test job passed.",
-            "failure",
-            MANAGED_PUBLISHED_FAILURE_RECOVERY,
-        )
-    if head_sha in reruns_used:
-        return stop(
-            "Plumbing failed again after the single automatic managed rerun.",
-            "absent (run completed without a correlated status)",
-        )
-    if not budget_left:
-        # The shared attempts or deadline are spent: never issue a rerun that
-        # nothing will observe; the existing terminal handling applies.
-        return None
-    reruns_used.add(head_sha)
-    rerun = rerun_managed_attempt(
-        runner, config=config, contract=contract, expected_head_sha=head_sha,
-        deadline=deadline,
-    )
-    if rerun.status == "expired":
-        # Verification reads used up the shared deadline: no write; the
-        # existing terminal handling applies with no coder or merge.
-        return None
-    if rerun.status != "rerun_started" or rerun.prior_attempt is None:
-        return stop(
-            f"The single automatic managed rerun could not be performed: {rerun.reason}.",
-            "absent (run completed without a correlated status)",
-        )
-    message = (
-        f"PR #{pr_number}: managed run {rerun.run_url or rerun.run_id} attempt "
-        f"{rerun.prior_attempt} completed without a correlated `{FINAL_CONTEXT}` status "
-        "and only plumbing jobs failed; re-ran the whole run once (validation runs again "
-        "in the new attempt); no coder round."
-    )
-    log(config, f"Round {round_number}: {message}")
-    post_pr_comment(
-        runner, config=config, pr_number=pr_number,
-        body=message + "\n\n-- coding-review-agent-loop",
-    )
-    return _ManagedRerunContinue(rerun.prior_attempt + 1)
+def _route_managed_plumbing_outcome(runner, **kwargs):
+    return _route_plumbing(runner, sys.modules[__name__], **kwargs)

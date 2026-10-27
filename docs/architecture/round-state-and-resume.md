@@ -2,7 +2,7 @@
 
 Where workflow state lives and how a run resumes: the GitHub and local state table, durable comment carriers and write read-back, transient GitHub failure handling, the known host comment footer, evidence freeze records, rejected coder follow-up recovery, and the context and trust contracts that every prompt and resume path must preserve.
 
-Source paths: `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
+Source paths: `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
 
 Scheduler metadata decoding and its key sets live in `round_state_scheduler.py`,
 with explicit re-exports from `round_state.py`. Round entry points, encoding,
@@ -109,6 +109,33 @@ sessions). The one byte-exact suffix `KNOWN_HOST_COMMENT_FOOTER` in
   terminal, recovery-exempt error. That is `pre-dispatch` unless a dispatch was
   issued or a run attached.
 - Observation is logged once per owned usage context.
+
+Managed repair checkpoints can retain an optional typed failed-run reference
+and a verified later-attempt result (#1709). The checkpoint type lives in
+`qualification_checkpoint.py`, re-exported by `round_state.py`; shared immutable
+result types live in `managed_ci_result.py`. Partial references, nonpositive IDs
+or attempts, and contradictory head/base/obligation bindings invalidate a
+checkpoint. Existing checkpoint shapes remain readable, and consumed watcher
+extensions and qualification attempt identities retain their meanings. The
+failed-head guard is unchanged: a repair checkpoint cannot create a qualification
+candidate equal to its failed head.
+
+For an older repair checkpoint without a reference, reconciliation reads
+actor-authenticated history. It requires one completed intent between the
+source round's authenticated reviewer records and its first matching repair
+checkpoint. Repository, PR, target head, base and obligation must match, and the
+workflow-mirrored intent validator must accept the record. Missing or ambiguous
+history and model prose cannot establish correlation. The recovered reference
+is observation evidence and grants no authority to dispatch an old generation.
+
+A successful later attempt records settlement and its source audit linkage in
+round metadata together with the remaining ledger and spent budget, before
+readiness, publication or merge. A restart before that write observes again; a
+restart after it reconstructs provenance and rechecks the live run, current
+attempt, counted board, authorization and review/input identities. Recorded
+clearance alone cannot qualify a head. If the live result is no longer valid,
+the matching repair obligation is restored. Other blockers remain active, and
+already completed merges use the existing post-merge recovery path.
 
 An evidence freeze or release comment is a PR-round handoff boundary like a
 qualification checkpoint. Its round metadata carries the ledger, round number,
