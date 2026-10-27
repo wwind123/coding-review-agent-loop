@@ -913,3 +913,73 @@ def test_repair_surfaced_scratch_citation_reasks_with_fresh_catalog(tmp_path, mo
     assert seen[-1] == (second,)
     assert response.acquisition_test_observations == (second,)
     assert not response.marker_value.test_observations
+
+
+@pytest.mark.parametrize("already_spent", [False, True])
+@pytest.mark.parametrize("fallback_source", ["original", "repaired"])
+@pytest.mark.parametrize("refusal", ["partition", "citation"])
+def test_fallback_workdir_refusal_shares_semantic_allowance(
+    tmp_path, monkeypatch, real_repair, already_spent, fallback_source, refusal,
+):
+    """#1738: fallback candidates cannot swallow or reset semantic refusals."""
+    from agent_loop_helpers import structured_coder_followup
+    from coding_review_agent_loop.protocol import validate_structured_coder_followup
+
+    config = make_config(tmp_path, agent_max_retries=0, **_codex_repair(repair_models=("model-a",)))
+    command = "pytest tests/test_api.py /outside/test_api.py"
+    raw = structured_coder_followup(summary="Rejected fallback claim.", tests_run=[command])
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["test_observations"] = {}
+    if refusal == "citation":
+        payload["tests_run"] = []
+    candidate = json.dumps(payload) + raw[end:]
+    source = candidate if fallback_source == "original" else candidate.replace("Rejected fallback claim.", "")
+    corrected = structured_coder_followup(summary="Accepted replacement claim.")
+    repair_calls = _cli_repair(monkeypatch, [(candidate, 0)])
+    runner = FakeRunner()
+    first, second, third = object(), object(), object()
+    results = []
+    if already_spent:
+        results.append(_turn_result(raw, "initial", [first], session_id="coder-session"))
+    results += [
+        _turn_result(source, "fallback", [second], session_id="coder-session"),
+        _turn_result(corrected, "replacement", [third], session_id="coder-session"),
+    ]
+    fallback_seen = []
+
+    def factory(architecture_mode, observations_mode):
+        def validate(text):
+            parsed = validate_structured_coder_followup(
+                text, architecture_status_mode=architecture_mode,
+                test_observations_mode=observations_mode,
+            )
+            if observations_mode == "degrade-after-repair":
+                fallback_seen.append(response_validation._current_test_turn_observations(runner))
+                if refusal == "citation":
+                    # Isolate the common routing rule for all typed semantic refusals.
+                    raise NonRepairableEvidenceRejection("Citation workdir refused.", reason="report-workdir")
+            return response_validation._validate_followup_workdir_report(parsed, config=config)
+        return validate
+
+    validators = architecture_contract._architecture_and_test_observation_mode_validators(factory)
+    with patch_object_in((validated_agent_module, response_validation), "run_agent_result", side_effect=results) as invoke:
+        def run():
+            return _run_validated_agent(
+                runner, agent="claude", config=config, prompt="Address PR feedback.",
+                marker_description="structured coder_followup result", role="coder",
+                use_repair=True, repair_expected_kind="coder_followup",
+                reask_on_evidence_rejection=True, **validators,
+            )
+        if already_spent:
+            with pytest.raises(AgentInvocationError, match="semantic-evidence-rejection"):
+                run()
+        else:
+            response = run()
+            assert response.marker_value.summary == "Accepted replacement claim."
+            assert "Rejected fallback claim." not in response.text
+            assert response.acquisition_test_observations == (third,)
+    assert invoke.call_count == 2
+    assert invoke.call_args_list[1].kwargs["session_id"] == "coder-session"
+    assert invoke.call_args_list[1].kwargs["prompt"].startswith("Address PR feedback.")
+    assert fallback_seen == [(second,)]
+    assert repair_calls == ["model-a"]

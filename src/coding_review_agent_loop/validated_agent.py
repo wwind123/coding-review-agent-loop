@@ -1322,6 +1322,8 @@ def _run_validated_agent_in_scope(
                 runner=runner,
                 acquisition=validation_acquisition,
             )
+        except NonRepairableEvidenceRejection:
+            raise
         except AgentLoopError as fallback_exc:
             log(
                 config,
@@ -2981,6 +2983,32 @@ def _run_validated_agent_in_scope(
                         terminal_evidence_rejection = _terminal_repair_evidence_rejection(
                             repair_attempts
                         )
+                        fallback = None
+                        if (
+                            test_observations_shape_defect
+                            and terminal_evidence_rejection is None
+                            and repaired_marker is None
+                        ):
+                            # Dropping a malformed observation field may expose
+                            # an authority refusal. Use the shared correction route.
+                            try:
+                                fallback = (
+                                    accept_test_observations_fallback(
+                                        normalized if normalized is not None else text
+                                    )
+                                    if isinstance(exc, TestObservationsShapeError)
+                                    and exc.fallback_degradable
+                                    else None
+                                )
+                                if fallback is None:
+                                    fallback = accept_repaired_test_observations_fallback(
+                                        normalized if normalized is not None else text,
+                                        repaired=repaired,
+                                        attempts=repair_attempts,
+                                        repair_kwargs=repair_kwargs,
+                                    )
+                            except NonRepairableEvidenceRejection as fallback_exc:
+                                terminal_evidence_rejection = fallback_exc
                         # A refused contract candidate outranks every later
                         # non-accepting failure in the same chain: it is a complete
                         # response whose only defect is the contract.
@@ -3215,28 +3243,7 @@ def _run_validated_agent_in_scope(
                             test_observations_shape_defect
                             and terminal_evidence_rejection is None
                         ):
-                            # Repair produced no accepted candidate: fall back
-                            # to today's drop, recorded as after a repair
-                            # attempt.  Never spends an agent retry (#1626).
-                            # The original is tried first; then a repair
-                            # candidate that fixed every other defect but
-                            # kept the non-array field, held to today's
-                            # unflagged preservation rules.
-                            fallback = (
-                                accept_test_observations_fallback(
-                                    normalized if normalized is not None else text
-                                )
-                                if isinstance(exc, TestObservationsShapeError)
-                                and exc.fallback_degradable
-                                else None
-                            )
-                            if fallback is None:
-                                fallback = accept_repaired_test_observations_fallback(
-                                    normalized if normalized is not None else text,
-                                    repaired=repaired,
-                                    attempts=repair_attempts,
-                                    repair_kwargs=repair_kwargs,
-                                )
+                            # Accept only a fallback that passed every guard.
                             if fallback is not None:
                                 log(
                                     config,

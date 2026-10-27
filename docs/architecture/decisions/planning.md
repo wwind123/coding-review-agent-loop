@@ -17,3 +17,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - A passing selector whose only launch defect is `suite_start=unknown` is refused non-terminally at post-authentication with the `suite-start-unverified` capture disqualifier, instead of stopping the run as a `semantic-evidence-rejection`; the evidence rule is unchanged, and `run-tests` and the coder prompts say which runners are citable (#1659, 2026-10-25).
 
 - PR follow-up report partition and citation workdir refusals use the existing single shared semantic-evidence correction allowance inside validated acquisition (#1738).
+
+- Semantic refusals exposed by the post-repair test-observations fallback use the same shared correction allowance and terminal classification as direct and repaired candidates (#1738).

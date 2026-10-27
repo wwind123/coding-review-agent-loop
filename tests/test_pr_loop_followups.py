@@ -2219,7 +2219,7 @@ def test_1388_addressed_item_without_resolution_history_still_fails_closed(
     )
 
 
-@pytest.mark.parametrize('mode', ['display', 'partition', 'citation', 'normalized', 'escape'])
+@pytest.mark.parametrize('mode', ['display', 'partition', 'citation', 'normalized', 'escape', 'fallback', 'fallback-spent'])
 def test_scratch_report_followup_workflow(tmp_path, monkeypatch, mode):
     """#1738: drive acquisition, refusal/correction, publication and review."""
     import coding_review_agent_loop.workdir_guard as guard
@@ -2231,7 +2231,7 @@ def test_scratch_report_followup_workflow(tmp_path, monkeypatch, mode):
         f'--npm-report {root}/scratch/1837/npm-audit.json'
     )
     bad_command = audit
-    if mode == 'partition':
+    if mode in {'partition', 'fallback', 'fallback-spent'}:
         bad_command = 'pytest tests/test_api.py /outside/test_api.py'
     if mode == 'escape':
         bad_command = audit + f' {root}/scratch/1837/pip-audit.json'
@@ -2247,6 +2247,13 @@ def test_scratch_report_followup_workflow(tmp_path, monkeypatch, mode):
         raw = json.dumps(payload) + raw[end:]
     if mode == 'normalized':
         raw = raw.replace(audit, 'pytest tests/test_api.py /outside/test_api.py') + '\ntrailing prose'
+    initial = raw
+    if mode.startswith('fallback'):
+        import coding_review_agent_loop.validated_agent as validated_agent
+        payload, end = json.JSONDecoder().raw_decode(raw)
+        payload['test_observations'] = {}
+        raw = json.dumps(payload) + raw[end:]
+        monkeypatch.setattr(validated_agent, 'attempt_repair', lambda raw, *a, **k: raw)
     corrected = structured_coder_followup(
         summary='Accepted replacement claim.', addressed_items=['item-1'],
         tests_run=[audit], reviewer='OpenAI Codex',
@@ -2258,9 +2265,18 @@ def test_scratch_report_followup_workflow(tmp_path, monkeypatch, mode):
                 {'item_id': 'item-1', 'disposition': 'resolved'}
             ], reviewer='Anthropic Claude'),
         ],
-        codex_outputs=[corrected] if mode == 'display' else [raw, corrected],
+        codex_outputs=([corrected] if mode == 'display' else
+                       [initial, raw, corrected] if mode == 'fallback-spent' else [raw, corrected]),
     )
     config = make_config(tmp_path, coder='codex', reviewer='claude', agent_max_retries=0)
+    if mode == 'fallback-spent':
+        with pytest.raises(AgentLoopError, match='semantic-evidence-rejection'):
+            run_pr_loop(runner, pr_number=77, config=config)
+        prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ['codex']]
+        assert len(prompts) == 2
+        assert not any('Rejected acquisition claim.' in comment or
+                       'Accepted replacement claim.' in comment for comment in runner.comments)
+        return
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ['codex']]
     assert len(prompts) == (1 if mode == 'display' else 2)

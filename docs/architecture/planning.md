@@ -250,7 +250,9 @@ errors retain existing handling. A scratch-input receipt remains inadmissible:
 feedback requests admissible replacement evidence without hiding failures.
 Guard and selector refusals share one allowance in either order, outside ordinary
 retries. A repair-surfaced refusal stops repair and spends only an unused
-allowance. Correction resumes the acquisition session when available and uses
+allowance. A semantic refusal exposed by the post-repair observation-field
+fallback takes that same route; dropping a malformed field cannot swallow a
+refusal or reset the allowance. Correction resumes the acquisition session when available and uses
 its own closed catalog. Only a fully validated replacement may publish progress
 or settle findings; terminal rejection and pushed-head recovery remain intact.
 Initial implementation handoffs gain no new retry policy.
