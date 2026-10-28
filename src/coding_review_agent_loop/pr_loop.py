@@ -7,7 +7,7 @@ orchestrator re-exports every name defined here.
 from __future__ import annotations
 
 from .review_scope import is_complete_code_review
-from .capture_dispatch import narrow_capture_scopes, scoped_review_items, scoped_validator, select_capture_reviewers
+from .capture_dispatch import narrow_capture_scopes, scoped_review_items, scoped_validator, select_capture_reviewers, capture_review_recovery
 from .converted_capture import recovery_capture, capture_feedback, recheck_capture, capture_review_context, admitted_capture_history
 from .pr_restart import checkpoint_restart, review_inputs_changed
 from .review_rounds import _normalize_evidence_only_approval
@@ -4016,19 +4016,13 @@ def run_pr_loop(
                           and not pending_automatic_fallback_reasons
                           and (panel_evidence is None or panel_evidence.opened)),
             )
-            for name in capture_scopes:
-                resumed_by_name.pop(name, None)
-            capture_full_review_pending = False
-            if capture_boundary_index >= 0 and not capture_scopes:
-                # Conservative fallback still needs fresh capture-aware complete
-                # reviews; complete approvals remain independent of this gate.
-                from .capture_acceptance import capture_pending
-                if capture_pending(capture_records, head=pr_metadata.head_sha,
+            capture_resumed_reviews = dict(resumed_by_name)
+            def refresh_capture_recovery():
+                return capture_review_recovery(capture_records, head=pr_metadata.head_sha,
                     plan=approved_plan_context, required_reviewers=scheduler_contract.required_reviewers,
-                    primary=scheduler_contract.primary_reviewer, approvals=unchanged_head_approvals):
-                    capture_full_review_pending = True
-                    resumed_by_name = {name: record for name, record in resumed_by_name.items()
-                                       if record.index > capture_boundary_index}
+                    primary=scheduler_contract.primary_reviewer, approvals=unchanged_head_approvals,
+                    scopes=capture_scopes, resumed=capture_resumed_reviews, boundary=capture_boundary_index)
+            capture_full_review_pending, resumed_by_name = refresh_capture_recovery()
             checkpoint_expected_plan_digest = (
                 approved_plan_context.plan_hash
                 if approved_plan_context is not None
@@ -4121,6 +4115,8 @@ def run_pr_loop(
                 final_sweep_pending = True
                 current_resume = None
                 resumed_by_name.clear()
+                capture_resumed_reviews.clear()
+                capture_scopes.clear()
                 unchanged_head_approvals.clear()
                 request_automatic_scheduler_fallback("historical result review inputs changed")
             skip_reviewers_for_recovery = bool(
@@ -4549,6 +4545,13 @@ def run_pr_loop(
                             "a returning reviewer's history could not be reconstructed",
                             tuple(sorted(unreconstructible_history)),
                         )
+                if capture_scopes and (scheduler_operator_force_full or not classification.narrow):
+                    capture_scopes = {}
+                capture_full_review_pending, resumed_by_name = refresh_capture_recovery()
+                if capture_full_review_pending:
+                    automatic_fallback_reasons.append("converted capture evidence requires semantic review")
+                    if not scheduler_capabilities.requires_primary:
+                        scheduler_force_full = True
                 scheduler_fallback_notes: tuple[str, ...] = ()
                 if scheduler_capabilities.requires_primary:
                     assert panel_evidence is not None
@@ -4705,13 +4708,10 @@ def run_pr_loop(
                         ),
                     )
                 if capture_scopes:
-                    if scheduler_operator_force_full or not classification.narrow:
-                        capture_scopes = {}
-                    else:
-                        final_sweep = False
-                        selected_reviewer_names = set(capture_scopes)
-                        scheduler_decision = select_capture_reviewers(
-                            scheduler_decision, capture_scopes, scheduler_contract.required_reviewers)
+                    final_sweep = False
+                    selected_reviewer_names = set(capture_scopes)
+                    scheduler_decision = select_capture_reviewers(
+                        scheduler_decision, capture_scopes, scheduler_contract.required_reviewers)
                 log(
                     config,
                     f"Round {round_number}: {scheduler_contract.policy} scheduler phase="

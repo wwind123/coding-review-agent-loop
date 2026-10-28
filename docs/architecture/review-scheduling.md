@@ -45,8 +45,13 @@ Resume reuses only admitted published matching acceptance. Identical evidence
 keeps its binding; replacement claims or citations reopen acceptance. Ordinary
 complete reviews can satisfy both gates when their durable context binding
 proves that their prompt included the current capture. Ambiguous legacy history
-requires fresh ordinary review. Final CI/merge qualification checks the same
-semantic predicate against live inputs. Capture attempt limits and unresolved
+requires fresh capture-bound ordinary reviews from the required board. Conflicting
+requester histories disable narrow assignment without discarding the evidence
+binding. Conservative pending capture work requests the existing automatic
+scheduler fallback, including when transition classification cancels provisional
+scopes; carry and resumed-review eligibility are recalculated at that point.
+Strict pre-panel primary ordering still applies. Final CI/merge qualification
+checks the same semantic predicate against live inputs. Capture attempt limits and unresolved
 partial-capture barriers remain unchanged; no new CLI option is needed.
 
 ## Reviewer selection and scheduling

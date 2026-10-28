@@ -50,8 +50,9 @@ def _capture_inputs(records, *, head, matrix_identity):
             if (row.row_id in rows
                 and (row.obligation_item_id, row.obligation_identity, row.row_id) in backed):
                 if row.row_id in owners and owners[row.row_id] != row.owners:
-                    return None
-                owners[row.row_id] = row.owners
+                    owners[row.row_id] = None
+                else:
+                    owners[row.row_id] = row.owners
     if not owners:
         return None
     episode = {"round": publication.metadata.round_number,
@@ -77,6 +78,8 @@ def capture_assignments(records, *, head, matrix_identity, required_reviewers, p
     binding, owners = inputs
     assigned = {}
     for row, requesting in sorted(owners.items()):
+        if requesting is None:
+            return None
         owner = primary if primary in required_reviewers else next(
             (name for name in required_reviewers if name in requesting), None)
         if owner is None or approvals is None or owner not in approvals:
@@ -159,6 +162,6 @@ def evidence_prompt(scope, *, plan=None):
 
 
 def full_capture_binding(records, *, head, matrix_identity):
-    """Durable proof that an ordinary prompt carried this capture's claims."""
+    """Bind ordinary review to evidence even when requesting owners conflict."""
     inputs = _capture_inputs(records, head=head, matrix_identity=matrix_identity)
     return inputs[0] if inputs is not None else None

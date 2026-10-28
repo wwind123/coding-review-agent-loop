@@ -120,3 +120,16 @@ def resume_capture_round(records, *, comments, trusted_actor, head):
         coder_comment_body=coder.body if coder else None,
         next_unresolved_item_number=_max_unresolved_item_number_from_records(records) + 1,
         reconciled=False, qualification_checkpoint=None)
+
+
+def capture_review_recovery(records, *, head, plan, required_reviewers, primary,
+                            approvals, scopes, resumed, boundary):
+    """Recompute carry/resume whenever final scheduling changes capture scope."""
+    from .capture_acceptance import capture_pending, full_capture_binding
+    pending = not scopes and capture_pending(records, head=head, plan=plan,
+        required_reviewers=required_reviewers, primary=primary, approvals=approvals)
+    binding = full_capture_binding(records, head=head,
+        matrix_identity=plan.risk_test_matrix_identity if plan else None)
+    return pending, {name: record for name, record in resumed.items()
+        if name not in scopes and (not pending or (binding is not None and record.index > boundary
+            and record.metadata.capture_review_binding == binding))}
