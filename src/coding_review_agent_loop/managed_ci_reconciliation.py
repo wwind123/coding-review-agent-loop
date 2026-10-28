@@ -5,6 +5,8 @@ attachment, dispatch or rerun is performed by this module.
 """
 from __future__ import annotations
 
+from .review_scope import is_complete_code_review
+
 from dataclasses import replace
 import json
 from types import SimpleNamespace
@@ -71,7 +73,7 @@ def resolve_legacy_reference(page, contract, checkpoint):
         return None
     lower = [trusted[r.index].get('id', 0) for r in records
              if r.metadata.round_number == item.source_round and r.metadata.subject == checkpoint.failed_head_sha
-             and r.metadata.role == 'reviewer' and trusted[r.index].get('id', 0) < anchor.get('id', 0)]
+             and is_complete_code_review(r.metadata) and trusted[r.index].get('id', 0) < anchor.get('id', 0)]
     if not lower:
         return None
     candidates = []

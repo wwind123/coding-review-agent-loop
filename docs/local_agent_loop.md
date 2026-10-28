@@ -10190,3 +10190,25 @@ The historical debris's receipts and original generated `test_probe0` producer
 could not be recovered from current source, so its precise cause remains
 uncertain. The regressions reproduce those concrete lifecycle classes using
 isolated response roots, without sweeping host debris.
+
+### Evidence-only review after converted recovery capture
+
+When a recovery capture verifies converted rows at an already code-approved
+head, agent-loop requests semantic review from the configured primary under
+`primary-then-panel`, or each row's first active requesting owner under the other
+PR policies. Several rows can select several reviewers. The prompt includes the
+assigned row requirements, claims, captured citations and related findings even
+in compact or summary-only contexts. Reviewers keep the no-execution policy.
+
+These verdicts accept capture evidence only. They cannot supply complete code
+approval, open the secondary panel, satisfy a required code sweep, clear machine
+obligations or settle unrelated findings. Invalid or unknown durable scope fails
+closed. Published matching acceptance survives restart and identical evidence;
+changed claims, citations or governing inputs require fresh acceptance. Private
+unpublished checkpoints never count. Existing code approval remains a separate
+exact-head gate before CI qualification or merge.
+
+Operator `--pr-review-force-full`, missing code approvals, uncertain ownership,
+changed code heads and unrelated code findings retain ordinary policy review.
+Partial or failed captures preserve unresolved evidence barriers and the existing
+capture-attempt limits. This behavior adds no flag or plan-review mode.

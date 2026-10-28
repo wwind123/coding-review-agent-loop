@@ -117,11 +117,9 @@ def evidence_review_boundary(records, *, head, matrix_identity=None):
 
 def capture_eligible_records(records, *, head, plan=None):
     """Apply the capture-only freshness rule without consulting scheduler state."""
-    boundary = evidence_review_boundary(
-        records, head=head,
-        matrix_identity=plan.risk_test_matrix_identity if plan is not None else None,
-    )
-    return tuple(record for record in records if record.index > boundary)
+    from .review_scope import is_complete_code_review
+
+    return tuple(record for record in records if is_complete_code_review(record.metadata))
 
 
 def capture_review_context(records, *, head, plan):

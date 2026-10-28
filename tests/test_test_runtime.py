@@ -323,7 +323,8 @@ def test_foreground_runner_reports_visible_success_failure_timeout_and_tail(tmp_
     assert "before" in timed_out.output_tail
 
 
-def test_foreground_timeout_does_not_wait_for_escaped_descendant(tmp_path):
+@pytest.mark.parametrize("keeps_writing", [False, True], ids=["silent", "writing"])
+def test_foreground_timeout_does_not_wait_for_escaped_descendant(tmp_path, keeps_writing):
     pid_file = tmp_path / "escaped-child.pid"
     script = f"""
 import os
@@ -332,67 +333,37 @@ from pathlib import Path
 
 pid = os.fork()
 if pid == 0:
+    # Publish cleanup identity atomically before escaping the process group.
+    # A timeout during the write can then only kill a still-contained child.
+    pending = Path({str(pid_file.with_suffix('.pending'))!r})
+    pending.write_text(str(os.getpid()))
+    pending.replace({str(pid_file)!r})
     os.setsid()
-    time.sleep(5)
-else:
-    Path({str(pid_file)!r}).write_text(str(pid))
-    time.sleep(5)
-"""
-    result = None
-    escaped_pid = None
-    started = time.monotonic()
-    try:
-        result = run_foreground_test(
-            [sys.executable, "-c", script], cwd=tmp_path, timeout_seconds=0.1
-        )
-    finally:
-        if pid_file.exists():
-            escaped_pid = int(pid_file.read_text(encoding="utf-8"))
-        if escaped_pid is not None:
-            try:
-                os.kill(escaped_pid, 9)
-            except ProcessLookupError:
-                pass
-    assert result is not None
-    assert result.outcome == "timed_out"
-    assert time.monotonic() - started < 2
-
-
-def test_foreground_timeout_stops_when_escaped_descendant_keeps_writing(tmp_path):
-    pid_file = tmp_path / "writing-escaped-child.pid"
-    script = f"""
-import os
-import time
-from pathlib import Path
-
-pid = os.fork()
-if pid == 0:
-    os.setsid()
+    print("escaped-ready", flush=True)
     while True:
-        os.write(1, b"x")
+        if {keeps_writing!r}:
+            os.write(1, b"x")
         time.sleep(0.01)
 else:
-    Path({str(pid_file)!r}).write_text(str(pid))
-    time.sleep(5)
+    time.sleep(10)
 """
     result = None
     escaped_pid = None
     started = time.monotonic()
     try:
         result = run_foreground_test(
-            [sys.executable, "-c", script], cwd=tmp_path, timeout_seconds=0.1
+            [sys.executable, "-c", script], cwd=tmp_path, timeout_seconds=1
         )
     finally:
         if pid_file.exists():
             escaped_pid = int(pid_file.read_text(encoding="utf-8"))
         if escaped_pid is not None:
-            try:
-                os.kill(escaped_pid, 9)
-            except ProcessLookupError:
-                pass
+            _kill_if_active(escaped_pid)
+    assert escaped_pid is not None, "timeout must exercise an escaped descendant"
     assert result is not None
+    assert "escaped-ready" in result.output_tail
     assert result.outcome == "timed_out"
-    assert time.monotonic() - started < 2
+    assert time.monotonic() - started < 3
 
 
 def test_cli_wrapper_records_omitted_ceiling_and_rejects_over_policy_before_spawn(tmp_path, monkeypatch):

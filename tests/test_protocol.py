@@ -6126,8 +6126,9 @@ def test_every_parser_call_site_in_src_chooses_its_mode_explicitly():
                 continue
             unclassified.append(f"{path.name}:{node.lineno} {name}")
     assert unclassified == []
-    # Seven required-contract invocations plus four live review invocations.
-    assert degradable_factories == 11
+    # Seven required-contract factories plus three live review factories.
+    # Sequential and parallel PR reviews share _pr_review_validators.
+    assert degradable_factories == 10
     # The fresh coder follow-up and both fresh issue-implementation turns
     # also carry the test_observations fallback pair (#1626).
     assert test_observation_factories == 3

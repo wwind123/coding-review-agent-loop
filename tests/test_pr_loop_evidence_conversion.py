@@ -2071,8 +2071,8 @@ def test_broken_converted_freeze_captures_at_live_head(tmp_path, monkeypatch, po
     runner.claude_outputs.append(_coder())
     runner.codex_outputs.extend([
         _review(kept=["item-2"], state="blocking"),
-        _review(resolved=["item-2"]),
-        _review(resolved=["item-2"]),
+        _review(),
+        _review(),
     ])
     _install_derivation(monkeypatch, context, [{"row-a": "verified", "row-b": "verified"}])
     assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
@@ -2101,7 +2101,8 @@ def test_broken_converted_freeze_captures_at_live_head(tmp_path, monkeypatch, po
         authenticated_pr_comments(runner, config, pr_number=77)[0], head_sha="fedcba9",
         configured_reviewers=config.reviewer, approved_plan_context=context,
     )
-    assert approvals["Codex"].index == fresh[0].index
+    assert approvals["Codex"].index < capture.index
+    assert fresh[0].metadata.review_scope is not None
     from coding_review_agent_loop.protocol import parse_review
     for record in records:
         if record.metadata.role == "reviewer" and record.metadata.state == "approved":
@@ -2195,7 +2196,7 @@ def test_subset_recovery_capture_freezes_only_unverified_rows(tmp_path, monkeypa
     ))
     runner.codex_outputs.extend([
         _review(kept=["item-2", "item-3"], state="blocking", hr=True),
-        _review(resolved=["item-2"], kept=["item-3"], state="blocking", hr=True),
+        _review(hr=True),
     ])
     _install_derivation(monkeypatch, context, [{"row-a": "verified", "row-b": "missing"}])
     with pytest.raises(HumanDecisionRequiredError, match="frozen at head fedcba9"):
@@ -2281,7 +2282,7 @@ def test_broken_converted_freeze_uses_restored_watcher_slot(tmp_path, monkeypatc
     runner.advance_pr_head_on_coder_followup = False
     runner.claude_outputs.append(_coder())
     runner.codex_outputs.extend([
-        _review(kept=["item-2"], state="blocking"), _review(resolved=["item-2"]),
+        _review(kept=["item-2"], state="blocking"), _review(),
     ])
     assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
     records = _records(runner)
@@ -2366,7 +2367,7 @@ def _prepare_verified_recovery(tmp_path, monkeypatch, *, policy="all-reviewers")
 ])
 def test_verified_capture_restart_requires_then_reuses_semantic_review(tmp_path, monkeypatch, seam, policy):
     runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch, policy=policy)
-    runner.codex_outputs.append(_review(resolved=["item-2"]))
+    runner.codex_outputs.append(_review())
     original_post = pr_loop_module.post_pr_comment
     source = _records(runner)[-1].index
 
@@ -2388,13 +2389,14 @@ def test_verified_capture_restart_requires_then_reuses_semantic_review(tmp_path,
     captures = [r for r in _records(runner) if r.index > source and r.metadata.role == "coder"]
     assert len(captures) == 1
     capture = captures[0]
-    # The exact-head reader rejects every pre-capture approval even before restart.
+    # Code approvals are independent of capture freshness; the semantic gate
+    # below still refuses a capture without published acceptance.
     from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
     before = _latest_pr_approved_reviews_for_head(
         authenticated_pr_comments(runner, config, pr_number=77)[0], head_sha="fedcba9",
         configured_reviewers=config.reviewer, approved_plan_context=context,
     )
-    assert all(record.index > capture.index for record in before.values())
+    assert before and all(record.metadata.subject == "fedcba9" for record in before.values())
     if seam == "coder":
         fresh, _, _, _ = pr_loop_module._fresh_pr_qualification_snapshot(
             runner, config=config, pr_number=77, issue_context=None, parent_issue_context=None,
@@ -2412,7 +2414,7 @@ def test_verified_capture_restart_requires_then_reuses_semantic_review(tmp_path,
 def test_verified_capture_can_be_rejected_for_semantic_coverage(tmp_path, monkeypatch):
     runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch)
     config = dataclasses.replace(config, auto_merge=True)
-    runner.codex_outputs.append(_review(["The cited test never exercises the required row-a transition."]))
+    runner.codex_outputs.append(_review([_tagged("row-a", text="The cited test never exercises the required row-a transition.")]))
     real_run = pr_loop_module._run_validated_agent
     coders = []
 
@@ -2449,13 +2451,13 @@ def test_post_panel_capture_reviews_policy_selected_board(tmp_path, monkeypatch,
     for name, outputs in [("OpenAI Codex", runner.codex_outputs),
                           ("Google Gemini", runner.gemini_outputs),
                           ("Antigravity", runner.antigravity_outputs)]:
-        outputs.extend([_repeat_review(name), _review(resolved=["item-2"], reviewer=name)])
+        outputs.extend([_repeat_review(name), _review(resolved=["item-2"] if operator else [], reviewer=name)])
     _install_derivation(monkeypatch, context, [{"row-a": "verified", "row-b": "verified"}])
     assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
     capture = next(r for r in reversed(_records(runner)) if r.metadata.role == "coder")
     fresh = _reviews_after(runner, capture.index)
-    assert {r.metadata.agent for r in fresh} == {"Codex", "Gemini", "Antigravity"}
-    for command in ("codex", "gemini", "agy"):
+    assert {r.metadata.agent for r in fresh} == ({"Codex", "Gemini", "Antigravity"} if operator else {"Codex"})
+    for command in (("codex", "gemini", "agy") if operator else ("codex",)):
         assert "tests/test_row-a.py::test_it" in _prompts(runner, command)[-1]
 
 

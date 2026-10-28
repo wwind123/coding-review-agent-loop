@@ -1762,6 +1762,14 @@ marginal findings, and escaped plan defects before any proposal to change the
 default. See
 [staged issue plan review](docs/local_agent_loop.md#staged-issue-plan-review).
 
+After a converted recovery capture at a code-approved head, PR review can request
+only semantic evidence acceptance from the configured primary or the captured
+rows' active requesting reviewers. These evidence-only verdicts preserve the
+independent code-approval gate and cannot open a panel, satisfy a code sweep or
+clear machine obligations. Operator force-full and unsafe states keep ordinary
+policy review. See the [evidence-only review guide](docs/local_agent_loop.md#evidence-only-review-after-converted-recovery-capture).
+
+
 Planning also applies a plan-growth gate (#886). When a one-shot plan reaches a
 growth threshold, it cannot be approved until a revision restructures it as
 staged or carries a reviewed `one_shot_growth_justification` that names exactly

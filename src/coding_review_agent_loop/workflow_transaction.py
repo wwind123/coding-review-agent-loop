@@ -1954,6 +1954,9 @@ def _plan_carrying_pr_records(
     carrying: list[tuple[PostedRoundRecord, AuthenticatedComment]] = []
     for record in _extract_round_metadata_records(view.authored, flow="pr"):
         metadata = record.metadata
+        from .review_scope import is_complete_code_review
+        if metadata.role == "reviewer" and not is_complete_code_review(metadata):
+            continue
         if metadata.approved_plan_hash is None and metadata.approved_plan_subject is None:
             continue
         comment = view.authored[record.index]

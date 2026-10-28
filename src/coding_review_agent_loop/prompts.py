@@ -4623,7 +4623,12 @@ def build_review_prompt(
     architecture_context: ArchitectureSnapshot | ArchitecturePair | None = None,
     superseded_prepanel_review_context: SupersededPrepanelReview | None = None,
     sweep_context: str = "",
+    evidence_scope: Mapping[str, object] | None = None,
 ) -> str:
+    from .capture_acceptance import evidence_prompt
+    if evidence_scope is not None:
+        sweep_context = ""
+        coder_followup_context += evidence_prompt(evidence_scope, plan=approved_plan_context)
     config = _with_architecture_context(config, architecture_context)
     # The step-back sweep (#1251) rides the same sanitized channel in both the
     # full and the compact branch, and exists only for the bound reviewer.

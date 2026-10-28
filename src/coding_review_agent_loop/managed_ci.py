@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .review_scope import is_complete_code_review
+
 from .managed_ci_result import VerifiedManagedResult
 from .managed_ci_reconciliation import require_verified_result, historical_qualification_fields
 
@@ -2070,7 +2072,7 @@ def find_actor_round_metadata_comment_ids(
         ):
             continue
         if (
-            metadata["role"] == "reviewer"
+            is_complete_code_review(metadata)
             and metadata["state"] == "blocking"
             and metadata["subject"] == predecessor_head
             and metadata["round_number"] == round_number
@@ -2169,6 +2171,7 @@ def _continuity_round_records(
         raw_dispatch_round = payload.get("dispatch_round")
         result[index] = {
             "role": payload["role"],
+            **({"review_scope": payload["review_scope"]} if "review_scope" in payload else {}),
             "state": payload.get("state"),
             "subject": payload["subject"],
             "round_number": payload["round_number"],
@@ -2207,83 +2210,7 @@ def _continuity_round_records(
     return result
 
 
-_MERGE_CONFLICT_OPEN_STATUSES = frozenset({"blocking", "same-pr"})
-_MERGE_CONFLICT_LIVE_LIFECYCLES = frozenset({"repair_required", "awaiting_current_head_review"})
-
-
-def _records_merge_conflict_obligation(payload: Mapping[str, object]) -> bool:
-    """Whether this record carries the tool-owned merge-conflict obligation.
-
-    Only the shape the orchestrator writes for a conflict round counts: a
-    machine-authority merge-conflict obligation that is still open
-    (``blocking``/``same-pr``) and live (``repair_required`` as minted, or
-    ``awaiting_current_head_review`` once advanced for the pushed head).  A
-    resolved, deferred, cleared or qualification-stage item is not evidence of
-    a conflict round (#1057).
-    """
-    for key in ("prior_items", "new_items"):
-        items = payload.get(key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, Mapping):
-                continue
-            # Items are arbitrary JSON from any commenter and are decoded before
-            # author filtering, so raw fields are type-checked before they are
-            # hashed by a membership test (#1370).
-            status = item.get("status")
-            lifecycle = item.get("lifecycle")
-            if (
-                item.get("authority") == MACHINE_AUTHORITY
-                and item.get("obligation_kind") == "merge-conflict"
-                and isinstance(status, str)
-                and status in _MERGE_CONFLICT_OPEN_STATUSES
-                and isinstance(lifecycle, str)
-                and lifecycle in _MERGE_CONFLICT_LIVE_LIFECYCLES
-            ):
-                return True
-    return False
-
-
-def _records_ci_repair_transitions(
-    payload: Mapping[str, object],
-) -> frozenset[tuple[str, str]]:
-    """Return the (failed, candidate) heads bound by tool-owned CI obligations.
-
-    Only the post-push shape counts: a machine-authority CI obligation that the
-    orchestrator advanced to ``awaiting_current_head_review`` for a candidate
-    head distinct from the head that failed.
-    """
-    transitions: set[tuple[str, str]] = set()
-    for key in ("prior_items", "new_items"):
-        items = payload.get(key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, Mapping):
-                continue
-            # Items are arbitrary JSON from any commenter and are decoded before
-            # author filtering, so raw fields are type-checked before they are
-            # hashed by a membership test (#1370).
-            obligation_kind = item.get("obligation_kind")
-            status = item.get("status")
-            failed = item.get("failed_head_sha")
-            candidate = item.get("candidate_head_sha")
-            if (
-                item.get("authority") == MACHINE_AUTHORITY
-                and isinstance(obligation_kind, str)
-                and obligation_kind in CI_MACHINE_OBLIGATION_KINDS
-                and item.get("lifecycle") == "awaiting_current_head_review"
-                and isinstance(status, str)
-                and status in {"blocking", "same-pr"}
-                and isinstance(failed, str)
-                and isinstance(candidate, str)
-                and failed
-                and candidate
-                and failed != candidate
-            ):
-                transitions.add((failed, candidate))
-    return frozenset(transitions)
+from .managed_ci_obligations import _records_merge_conflict_obligation, _records_ci_repair_transitions
 
 
 def _continuity_round_metadata_is_valid(
@@ -2408,7 +2335,7 @@ def _ordinary_continuity_round_metadata_is_valid(
     coder_round = coder_metadata["round_number"]
     reviewers = [
         item for item in selected
-        if item[1]["role"] == "reviewer"
+        if is_complete_code_review(item[1])
         and item[1]["state"] == "blocking"
         and item[1]["subject"] == authorization.predecessor_head
         and item[1]["round_number"] == coder_round - 1
@@ -2947,7 +2874,7 @@ def _rejected_recovery_round_ids(
             continue
         role = metadata["role"]
         phase = metadata.get("phase")
-        if role == "reviewer":
+        if is_complete_code_review(metadata):
             if (
                 metadata["state"] == "blocking"
                 and metadata["subject"] == root_head
@@ -3122,7 +3049,7 @@ def _recovery_continuity_is_valid(
     if any(metadata is None for _cid, metadata in bound):
         return False
     if any(
-        metadata["role"] == "reviewer" and metadata["subject"] == authorization.predecessor_head
+        is_complete_code_review(metadata) and metadata["subject"] == authorization.predecessor_head
         for _cid, metadata in bound
     ):
         return False

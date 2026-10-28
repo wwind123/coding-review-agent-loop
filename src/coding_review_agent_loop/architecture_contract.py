@@ -6,6 +6,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .review_scope import is_complete_code_review
+
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
@@ -163,7 +165,7 @@ def _latest_pr_approval_architecture_identity(
         return None
     for record in reversed(records):
         metadata = record.metadata
-        if metadata.role != "reviewer" or metadata.state != "approved" or _contradictory_evidence_approval(metadata):
+        if not is_complete_code_review(metadata) or metadata.state != "approved" or _contradictory_evidence_approval(metadata):
             continue
         if head_sha is not None and metadata.subject != head_sha:
             continue

@@ -401,17 +401,18 @@ round-state approval readers, qualification and capture dispatch.
 This keeps qualification and dispatch on the same rules without a cyclic
 dependency between their orchestration modules.
 
-A completed converted capture with new tool-verified evidence also establishes
-an ordered semantic-review boundary. Conversion audits, the source freeze,
-dispatch/result binding and the coder's authoritative row evidence reconstruct
-that boundary after restart; neither a coder claim nor a ledger tombstone can
-establish it. Approvals preceding the capture cannot approve its evidence.
-Replacement evidence establishes a later boundary, while identical evidence
-and fresh post-boundary approvals remain reusable. The existing policy-selected
-reviewers receive row claims and tool citations in full and compact contexts,
-including summary-only resumes, and can block semantically inadequate tests.
-Machine supersession alone does not supply semantic approval. Partial captures
-still retain every unresolved row's final barrier.
+A completed converted capture with new tool-verified evidence establishes a
+semantic-review boundary. Same-head complete code approvals survive independently;
+qualification also requires bound published acceptance of the captured claims.
+Eligible captures select the primary or per-row active requesters using the
+[post-capture assignment and scope contract](review-scheduling.md#post-capture-evidence-acceptance).
+Evidence-only records grant capture authority only and are excluded from
+complete-review accounting at every consumer, including code-round completion,
+panel/sweep qualification and step-back/non-convergence streaks. Scoped findings
+remain actionable, but dispositions are restricted to assigned reviewer-owned
+evidence findings. Machine supersession alone supplies no semantic acceptance.
+Replacement evidence reopens acceptance, while identical claims and citations
+retain it. Partial captures retain every unresolved row's final barrier.
 
 `review_rounds._normalize_evidence_only_approval` constructs a public approval
 carrier after the original evidence dispositions have been retained for ledger
