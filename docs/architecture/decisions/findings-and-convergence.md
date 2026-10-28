@@ -23,3 +23,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Optional converted recovery capture requires a coder slot within the restored effective ceiling; at an exhausted ceiling unresolved rows instead reach the normal clean-head evidence freeze, preserving ordinary blocker stops and existing budgets without new state (#1730, 2026-10-27).
 
 - Evidence-stall and evidence-freeze stops publish one bounded best-effort audit diagnostic per stopped invocation for history export; mandatory freeze publication remains authoritative and precedes the audit, whose failure preserves the identical exit-4 exception (#1685, 2026-10-27).
+
+- Accepted citations from the frozen acquisition reserve bounded projection capacity before history; protected overflow stops the handoff explicitly, prior legacy declarations are replaced, and newly verified canonical receipt-only rows may use the existing single per-head progress grant without changing reviewer or CI authority (#1758, 2026-10-28).

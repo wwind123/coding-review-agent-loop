@@ -8,6 +8,7 @@ orchestrator re-exports every name defined here.
 from __future__ import annotations
 
 from .managed_ci_result import VerifiedManagedResult
+from .agent_failure import ValidatedAgentResponse
 
 import hashlib
 import json
@@ -25,7 +26,7 @@ from dataclasses import (
 )
 from pathlib import Path
 from typing import Literal, NoReturn
-from .local_test_evidence import tool_identity_clause, unsuperseded_receipts_sentence
+from .local_test_evidence import tool_identity_clause, unsuperseded_receipts_sentence, redact_test_command
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
 from .reviewer_seats import reviewer_seat_binding
@@ -89,6 +90,7 @@ from .managed_ci import (
 )
 from .protocol import (
     ReviewItemDisposition,
+    DerivedRiskEvidenceResult,
     CITATION_DROPPED_OUTCOME,
     TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE,
     TEST_OBSERVATIONS_NOT_ARRAY_RULES,
@@ -99,6 +101,7 @@ from .protocol import (
     UnresolvedReviewItem,
     CI_MACHINE_OBLIGATION_KINDS,
     EVIDENCE_SOURCE_OPERATOR_SIGNED,
+    EVIDENCE_SOURCE_TOOL_CAPTURED,
     SignedEvidenceReference,
     apply_signed_evidence_references,
     parse_risk_test_matrix_evidence,
@@ -385,6 +388,72 @@ def followup_citation_diagnosis(
             record.rule == TEST_OBSERVATIONS_NOT_ARRAY_AFTER_REPAIR_RULE for record in non_array
         ),
         uncited_receipts=len(frozenset(coder_turn_receipt_ids) - cited),
+    )
+
+
+def render_followup_local_test_evidence(
+    runner: Runner, response: ValidatedAgentResponse,
+    metadata: PostedRoundMetadata | None, *, head: str | None, cwd: Path,
+) -> str | None:
+    """Project accepted citations using the frozen original acquisition."""
+    parsed = response.marker_value
+    return runner.render_local_test_evidence(
+        current_head=head, cwd=cwd,
+        legacy_tests_run=parsed.tests_run if isinstance(parsed, StructuredCoderFollowup) else None,
+        prior_local_test_evidence=metadata.local_test_evidence if metadata else None,
+        acquisition_test_turn_id=response.acquisition_test_turn_id,
+        acquisition_test_observations=response.acquisition_test_observations,
+        accepted_test_citations=parsed.test_observations if isinstance(parsed, StructuredCoderFollowup) else (),
+    )
+
+
+def canonical_receipt_progress(
+    response: ValidatedAgentResponse, derived: DerivedRiskEvidenceResult | None,
+    previous: PostedRoundMetadata | None, plan: ApprovedPlanContext | None,
+    head: str | None, items: Sequence[UnresolvedReviewItem],
+) -> frozenset[str]:
+    """New tool-verified rows for receipt-only blockers, at the same matrix/head.
+
+    Called only with the live post-authentication derivation. Neither the
+    transported projection nor fresh agent declarations grant this allowance.
+    """
+    if (derived is None or previous is None or plan is None or not head
+        or previous.subject != head or derived.bound_head_sha != head
+        or derived.evidence.matrix_identity != plan.risk_test_matrix_identity
+        or previous.risk_test_matrix_evidence is None
+        or not items or any(not item.evidence_row_ids for item in items)):
+        return frozenset()
+    try:
+        prior = parse_risk_test_matrix_evidence(
+            previous.risk_test_matrix_evidence,
+            expected_identity=plan.risk_test_matrix_identity,
+            expected_row_ids=tuple(plan.risk_test_matrix_expected_row_ids or ()),
+        )
+    except AgentLoopError:
+        return frozenset()
+    old_verified = {row.row_id for row in prior.rows if row.status == "verified"}
+    requested = {row_id for item in items for row_id in item.evidence_row_ids}
+    parsed = response.marker_value
+    if not isinstance(parsed, StructuredCoderFollowup):
+        return frozenset()
+    accepted: dict[str, set[tuple[str, str]]] = {}
+    for citation in parsed.test_observations:
+        accepted.setdefault(citation.receipt_id, set()).add(
+            (redact_test_command(citation.command)[0], citation.claim)
+        )
+    live = {
+        row.receipt_id for row in response.acquisition_test_observations
+        if getattr(row, "turn_id", None) == response.acquisition_test_turn_id
+        and getattr(row, "provenance", None) == "parent-observed"
+        and not getattr(row, "restored", True)
+    }
+    return frozenset(
+        citation.receipt_id for row in derived.evidence.rows
+        if row.row_id in requested - old_verified and row.status == "verified"
+        and row.evidence_source == EVIDENCE_SOURCE_TOOL_CAPTURED
+        for citation in row.evidence_citations
+        if citation.receipt_id in live
+        and accepted.get(citation.receipt_id) == {(citation.command, citation.claim)}
     )
 
 

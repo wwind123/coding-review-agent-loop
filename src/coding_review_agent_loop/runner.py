@@ -2212,6 +2212,9 @@ class Runner:
         legacy_tests_run: Sequence[str] | None = None,
         cwd: Path | None = None,
         prior_local_test_evidence: str | None = None,
+        acquisition_test_turn_id: str | None = None,
+        acquisition_test_observations: Sequence[object] = (),
+        accepted_test_citations: Sequence[object] = (),
     ) -> str | None:
         from .local_test_evidence import (
             bounded_evidence_for_round,
@@ -2222,6 +2225,19 @@ class Runner:
 
         self.last_reconciled_local_test_evidence = None
         observations = list(self.local_test_observations())
+        cited = {getattr(item, "receipt_id", None) for item in accepted_test_citations}
+        frozen = [item for item in acquisition_test_observations if (
+            isinstance(item, LocalTestObservation)
+            and item.receipt_id in cited
+            and acquisition_test_turn_id is not None
+            and item.turn_id == acquisition_test_turn_id
+            and item.provenance == "parent-observed"
+            and not item.restored
+        )]
+        # The frozen catalog outlives the runner's mutable rolling buffer and
+        # repair turns. Live rows still win so genuine conflicts are rejected.
+        live_ids = {item.receipt_id for item in observations}
+        observations.extend(item for item in frozen if item.receipt_id not in live_ids)
         if cwd is not None:
             observations = list(
                 mark_out_of_checkout_context(observations, assigned_workdir=cwd)
@@ -2247,7 +2263,13 @@ class Runner:
             cwd=cwd,
         )
         self.last_reconciled_local_test_evidence = evidence
-        return bounded_evidence_for_round(evidence)
+        protected = {
+            item.receipt_id for item in frozen
+            if any(row.receipt_id == item.receipt_id
+                   and row.turn_id == acquisition_test_turn_id
+                   and row.provenance == "parent-observed" for row in evidence.observations)
+        }
+        return bounded_evidence_for_round(evidence, protected_receipt_ids=protected)
 
     def remember_agent_command(
         self,

@@ -1619,6 +1619,12 @@ def reconcile_test_observations(
             )
         else:
             raise AgentLoopError(f"local test observation {index} is not an object")
+    # Display declarations describe this response, never historical executions.
+    # Reusing legacy-N in another turn must not manufacture broker conflicts.
+    rows = [row for row in rows if not (
+        row.provenance == "self-reported"
+        and "legacy tests_run declaration; no parent receipt" in row.caveats
+    )]
     legacy_rows: list[LocalTestObservation] = []
     if legacy_tests_run:
         legacy_rows = list(parse_legacy_tests_run(legacy_tests_run, cwd=cwd or Path.cwd()))
@@ -2105,7 +2111,10 @@ def _with_bounded_classification(
     return detail
 
 
-def bounded_evidence_for_round(evidence: LocalTestEvidence | Mapping[str, object]) -> str:
+def bounded_evidence_for_round(
+    evidence: LocalTestEvidence | Mapping[str, object],
+    *, protected_receipt_ids: Iterable[str] = (),
+) -> str:
     """Encode a bounded canonical metadata field, degrading before transport."""
     source = evidence.to_dict() if isinstance(evidence, LocalTestEvidence) else dict(evidence)
     raw_rows = source.get("observations")
@@ -2117,9 +2126,16 @@ def bounded_evidence_for_round(evidence: LocalTestEvidence | Mapping[str, object
         for row in rows
         if isinstance(row, Mapping) and row.get("outcome") in OUTCOMES
     ]
-    # Retain unresolved failures before any class of pass, then prefer newer
-    # rows within a class. Restore chronological order for rendering.
+    protected = frozenset(protected_receipt_ids)
+    protected_rows = [row for row in all_details if row.get("receipt_id") in protected]
+    if len(protected_rows) > MAX_ROUND_OBSERVATIONS:
+        raise AgentLoopError("Current-acquisition cited receipts exceed round count capacity; evidence handoff stopped")
+    # Reserve cited acquisition receipts, then retain unresolved failures
+    # before other passes. Prefer newer rows within each priority class and
+    # restore chronological order for rendering.
     def retention_priority(row: Mapping[str, object]) -> int:
+        if row.get("receipt_id") in protected:
+            return 6
         if row.get("superseded_by") or is_non_evidence_launch_failure(row):
             return 0
         caveats = row.get("caveats")
@@ -2205,6 +2221,10 @@ def bounded_evidence_for_round(evidence: LocalTestEvidence | Mapping[str, object
             value["capture_incomplete"] = True
         return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
+    # Never silently evict a known acquisition citation. Fail closed before
+    # publishing a handoff whose citations would misleadingly look unknown.
+    if len(encode(protected_rows, truncated=True).encode()) > MAX_ROUND_BYTES and protected_rows:
+        raise AgentLoopError("Current-acquisition cited receipts exceed round byte capacity; evidence handoff stopped")
     encoded = encode(details, truncated=count_truncated)
     if len(encoded.encode()) > MAX_ROUND_BYTES:
         retained = list(enumerate(details))
