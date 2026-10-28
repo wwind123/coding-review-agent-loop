@@ -113,7 +113,8 @@ def test_recovery_recomputes_resumed_work_when_scopes_change(monkeypatch, scoped
     monkeypatch.setattr(acceptance, "capture_pending", lambda *args, **kwargs: True)
     monkeypatch.setattr(acceptance, "full_capture_binding", lambda *args, **kwargs: binding)
     record = SimpleNamespace(index=11 if fresh else 9,
-        metadata=SimpleNamespace(capture_review_binding=binding if bound else None))
+        metadata=SimpleNamespace(role="reviewer", review_scope=None,
+                                 capture_review_binding=binding if bound else None))
     pending, resumed = capture_review_recovery((), head="head", plan=None,
         required_reviewers=("Codex",), primary=None, approvals={},
         scopes={"Codex": {"rows": ["row-a"]}} if scoped else {},

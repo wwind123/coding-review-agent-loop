@@ -7,7 +7,7 @@ orchestrator re-exports every name defined here.
 from __future__ import annotations
 
 from .review_scope import is_complete_code_review
-from .capture_dispatch import narrow_capture_scopes, scoped_review_items, scoped_validator, select_capture_reviewers, capture_review_recovery
+from .capture_dispatch import narrow_capture_scopes, scoped_review_items, scoped_validator, select_capture_reviewers, capture_review_recovery, is_resumable_capture_review
 from .converted_capture import recovery_capture, capture_feedback, recheck_capture, capture_review_context, admitted_capture_history
 from .pr_restart import checkpoint_restart, review_inputs_changed
 from .review_rounds import _normalize_evidence_only_approval
@@ -3838,7 +3838,7 @@ def run_pr_loop(
             resumed_by_name = {
                 name: record
                 for name, record in completed_by_name.items()
-                if is_complete_code_review(record.metadata)
+                if is_resumable_capture_review(record.metadata)
                 and _resumed_pr_reviewer_matches_requirements(
                     record,
                     human_requirements,
@@ -3897,6 +3897,8 @@ def run_pr_loop(
                 # must still reach the diagnostic or the audited supersession
                 # rather than being dropped silently.
                 for resumed_name, resumed_candidate in completed_by_name.items():
+                    if not is_complete_code_review(resumed_candidate.metadata):
+                        continue
                     if _pr_record_is_panel_qualified(
                         resumed_candidate,
                         panel_evidence,
@@ -4234,7 +4236,7 @@ def run_pr_loop(
                 # launch list matches what the per-reviewer loop would decide.
                 # Read at call time, after the board for this round is chosen.
                 reviewer_name = agent_display_name(reviewer)
-                if reviewer_name in capture_scopes:
+                if reviewer_name in capture_scopes and reviewer_name not in resumed_by_name:
                     return "turn"
                 return _classify_pr_reviewer_prelaunch(
                     reviewer_name,
@@ -4915,7 +4917,6 @@ def run_pr_loop(
                 )
                 continue
             skip_reviewers_this_round = skip_reviewers_for_recovery or conflict_pending
-
             pr_fatal_errors: list[tuple[str, AgentLoopError]] = []
             pr_prep_failures: dict[AgentName, AgentLoopError] = {}
             pr_turn_results: dict[AgentName, _ReviewerTurnResult] = {}
@@ -4931,7 +4932,6 @@ def run_pr_loop(
             reviewer_agents_by_name = {
                 agent_display_name(reviewer): reviewer for reviewer in configured_reviewers
             }
-
             def _post_pr_reviewer_comment(
                 reviewer_name: str,
                 parsed: ParsedReview,

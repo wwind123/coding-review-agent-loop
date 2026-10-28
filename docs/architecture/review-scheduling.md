@@ -41,7 +41,11 @@ findings and their permitted dispositions use the capture reconciliation path.
 Assignments bind the publication episode, canonical evidence, resulting head,
 matrix, assigned rows and reviewer contract. The publication validation digest
 includes scope, so private spool output cannot qualify a changed assignment.
-Resume reuses only admitted published matching acceptance. Identical evidence
+Resume replays admitted scoped publication responses through ordinary finding-ID
+assignment and settlement for blocking evidence findings, even when
+private spool state is lost. Reconciled scoped rounds retain their assigned IDs;
+these recovered responses still have no complete-code-review authority. Resume
+reuses only admitted published matching acceptance. Identical evidence
 keeps its binding; replacement claims or citations reopen acceptance. Ordinary
 complete reviews can satisfy both gates when their durable context binding
 proves that their prompt included the current capture. Ambiguous legacy history

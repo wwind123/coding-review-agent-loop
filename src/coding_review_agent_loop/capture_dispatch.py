@@ -1,6 +1,6 @@
 """PR dispatch adapters for the pure capture acceptance contract."""
 from .agents.registry import agent_display_name
-from .capture_acceptance import capture_assignments, accepted_capture_reviewers, assigned_findings
+from .capture_acceptance import capture_assignments, accepted_capture_reviewers, assigned_findings, reviewer_contract
 from .review_scope import is_complete_code_review
 
 
@@ -85,7 +85,7 @@ def select_capture_reviewers(decision, scopes, required_reviewers):
 
 
 def resume_capture_round(records, *, comments, trusted_actor, head):
-    """A scoped publication is a ledger anchor, never completed code work."""
+    """Replay admitted scoped responses through settlement, without code authority."""
     from .round_state import (ResumedReviewRound, _recovery_record_admitted,
                               _max_unresolved_item_number_from_records)
     from .review_scope import scope_present, valid_evidence_scope
@@ -103,23 +103,28 @@ def resume_capture_round(records, *, comments, trusted_actor, head):
                 and all(valid_evidence_scope(s) for s in scope["assignments"].values())):
             return None
     coder = next((r for r in reversed(current) if r.metadata.role == "coder"), None)
-    items = {item.item_id: item for item in latest.metadata.prior_items}
-    from .capture_reconciliation import reconcile_capture_record
-    from .capture_acceptance import full_capture_binding
-    binding = full_capture_binding(records, head=head, matrix_identity=None)
-    for record in current:
-        if record.metadata.round_number != latest.metadata.round_number:
-            continue
-        if _recovery_record_admitted(record, comments, trusted_actor):
-            settled = reconcile_capture_record(tuple(items.values()), record.metadata, binding=binding)
-            items = {item.item_id: item for item in settled}
+    # Keep the pre-review ledger intact until the existing settlement path has
+    # replayed the public responses. Treating round-end findings as prior work
+    # changes scheduling inputs and can redispatch an already published turn.
+    items = latest.metadata.prior_items
+    completed = [record for record in current
+        if record.metadata.round_number == latest.metadata.round_number
+        and record.metadata.role == "reviewer"
+        and valid_evidence_scope(record.metadata.review_scope)
+        and _recovery_record_admitted(record, comments, trusted_actor)]
+    reconciled = latest.metadata.role == "summary" and latest.metadata.phase == "reconciliation"
+    if reconciled:
+        from dataclasses import replace
+        completed = [replace(record, metadata=replace(record.metadata, phase="authoritative",
+            new_items=assigned_findings(latest.metadata.new_items, record.metadata.review_scope,
+                                       record.metadata.agent))) for record in completed]
     return ResumedReviewRound(round_number=latest.metadata.round_number,
-        prior_items=tuple(items.values()), completed_reviews=(),
+        prior_items=tuple(items), completed_reviews=tuple(completed),
         coder_output=(coder.metadata.raw_structured_coder_response or coder.body) if coder else None,
         coder_metadata=coder.metadata if coder else None,
         coder_comment_body=coder.body if coder else None,
         next_unresolved_item_number=_max_unresolved_item_number_from_records(records) + 1,
-        reconciled=False, qualification_checkpoint=None)
+        reconciled=reconciled, qualification_checkpoint=None)
 
 
 def capture_review_recovery(records, *, head, plan, required_reviewers, primary,
@@ -131,5 +136,15 @@ def capture_review_recovery(records, *, head, plan, required_reviewers, primary,
     binding = full_capture_binding(records, head=head,
         matrix_identity=plan.risk_test_matrix_identity if plan else None)
     return pending, {name: record for name, record in resumed.items()
-        if name not in scopes and (not pending or (binding is not None and record.index > boundary
-            and record.metadata.capture_review_binding == binding))}
+        if (name in scopes and record.index > boundary
+            and record.metadata.review_scope == scopes[name]
+            and reviewer_contract(record.metadata) == scopes[name]["contract"])
+        or (name not in scopes and is_complete_code_review(record.metadata)
+            and (not pending or (binding is not None and record.index > boundary
+                and record.metadata.capture_review_binding == binding)))}
+
+
+def is_resumable_capture_review(metadata):
+    from .review_scope import valid_evidence_scope
+    return is_complete_code_review(metadata) or (valid_evidence_scope(metadata.review_scope)
+        and metadata.acquisition_outcome == "success")
