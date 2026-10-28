@@ -7651,3 +7651,135 @@ def test_distinct_commands_do_not_clear_unstable_failure_1753(case):
     result = _reconcile_b([*rows, passing], registry=registry)
     assert result.authoritative_failures == ("unstable-failure",)
     assert _by_receipt(result)["unstable-failure"].attribution.stable is False
+
+
+@pytest.mark.parametrize("count,long_rows", [(40, False), (12, True), (40, True)])
+def test_acquisition_citation_retained_under_count_and_byte_pressure_1758(count, long_rows):
+    from dataclasses import replace
+    registry = EnvironmentIdentityRegistry()
+    passed = _observation(outcome="passed", timestamp="2026-10-01T00:00:00Z",
+                          receipt_id="cited", registry=registry)
+    older = [replace(passed, receipt_id=f"failed-{i}", outcome="failed",
+                     normalized_command="pytest " + "x" * (490 if long_rows else 8),
+                     identifiers=tuple("test_" + str(j) + "x" * 200 for j in range(12)) if long_rows else ())
+             for i in range(count)]
+    evidence = reconcile_test_observations([*older, passed], registry=registry)
+    # The original projection seam loses a captured, reconciled receipt.
+    assert "cited" not in {row.receipt_id for row in decode_bounded_evidence(
+        bounded_evidence_for_round(evidence)).observations}
+    encoded = bounded_evidence_for_round(evidence, protected_receipt_ids={"cited"})
+    projected = decode_bounded_evidence(encoded)
+    assert len(encoded.encode()) <= 16 * 1024
+    assert len(projected.observations) <= 32
+    assert any(row.receipt_id == "cited" and row.turn_id == passed.turn_id
+               for row in projected.observations)
+    assert projected.capture_incomplete
+    assert set(evidence.authoritative_failures) == set(projected.authoritative_failures)
+    assert "truncated" in " ".join(projected.caveats)
+
+
+@pytest.mark.parametrize("long_rows", [False, True])
+def test_protected_capacity_overflow_stops_handoff_explicitly_1758(long_rows):
+    from dataclasses import replace
+    registry = EnvironmentIdentityRegistry()
+    row = _observation(outcome="passed", timestamp="2026-10-01T00:00:00Z",
+                       receipt_id="p", registry=registry)
+    rows = [replace(row, receipt_id=f"p{i}", identifiers=tuple("x" * 240 for _ in range(12))
+                    if long_rows else ()) for i in range(12 if long_rows else 33)]
+    evidence = reconcile_test_observations(rows, registry=registry)
+    with pytest.raises(evidence_module.AgentLoopError, match="capacity; evidence handoff stopped"):
+        bounded_evidence_for_round(evidence, protected_receipt_ids={row.receipt_id for row in rows})
+
+
+def test_prior_legacy_declarations_are_replaced_not_accumulated_1758(tmp_path):
+    from dataclasses import replace
+    runner = Runner()
+    failure = _observation(outcome="failed", timestamp="2026-10-01T00:00:00Z",
+                           receipt_id="real-failure", registry=runner._environment_registry)
+    runner._local_test_observations.append(replace(failure, cwd=str(tmp_path)))
+    prior = runner.render_local_test_evidence(legacy_tests_run=["pytest tests/old.py"], cwd=tmp_path)
+    for _ in range(2):
+        prior = runner.render_local_test_evidence(
+            legacy_tests_run=["pytest tests/new.py"], cwd=tmp_path, prior_local_test_evidence=prior)
+        live = runner.last_reconciled_local_test_evidence
+        legacy = [row for row in live.observations if row.provenance == "self-reported"]
+        assert len(legacy) == 1 and legacy[0].command == ("pytest", "tests/new.py")
+        assert legacy[0].attribution.state == "unknown"
+        assert "legacy tests_run declaration" in " ".join(legacy[0].caveats)
+        assert not any("conflicting receipt" in caveat for caveat in live.caveats)
+        assert "real-failure" in live.authoritative_failures
+    # Clearing current declarations clears the prior display rows, too.
+    runner.render_local_test_evidence(cwd=tmp_path, prior_local_test_evidence=prior)
+    assert all(row.provenance != "self-reported"
+               for row in runner.last_reconciled_local_test_evidence.observations)
+
+
+@pytest.mark.parametrize("kind", ["pytest", "node", "playwright"])
+def test_real_codex_backend_delivers_broker_and_launcher_journal_1758(tmp_path, monkeypatch, kind):
+    """No provider, download, browser or credentials: local fake Codex calls run-tests."""
+    from agent_loop_helpers import make_config
+    from coding_review_agent_loop.agents.codex import CodexBackend
+    from coding_review_agent_loop.containment import default_policy
+    _git_checkout(tmp_path)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    if kind == "pytest":
+        test = tmp_path / "test_sample.py"
+        test.write_text("def test_sample():\n    assert True\n")
+        argv = [sys.executable, "-m", "pytest", "-n", "0", "-p", "no:cacheprovider", "test_sample.py"]
+    elif kind == "node":
+        if shutil.which("node") is None:
+            pytest.skip("node unavailable")
+        (tmp_path / "sample.cjs").write_text("require('node:test')('sample', () => {});\n")
+        argv = [shutil.which("node"), "--test", "sample.cjs"]
+    else:
+        local = tmp_path / "node_modules" / ".bin" / "playwright"
+        local.parent.mkdir(parents=True)
+        local.write_text("#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Version 1.50.0'; fi\nexit 0\n")
+        local.chmod(0o755)
+        argv = ["npx", "playwright", "test", "sample.spec.js"]
+    fake = bindir / "codex"
+    fake.write_text(f"#!{sys.executable}\n" +
+        "import os, sys\nfrom pathlib import Path\nfrom coding_review_agent_loop.cli import main\n" +
+        "assert os.environ.get('AGENT_LOOP_TEST_BROKER_ENDPOINT')\n" +
+        f"code = main({['run-tests', '--timeout-seconds', '30', '--', *argv]!r})\n" +
+        "Path(sys.argv[sys.argv.index('--output-last-message') + 1]).write_text('done')\n" +
+        "raise SystemExit(code)\n")
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    _import_checkout_in_subprocesses(monkeypatch)
+    from dataclasses import replace
+    config = replace(make_config(tmp_path, coder="codex", reviewer="claude"), codex_dir=tmp_path)
+    runner = Runner(containment_policy=default_policy(mode="off", cache_dir=tmp_path / ".runtime"))
+    result = CodexBackend().run(runner, config, "Exercise the local launcher.", role="coder")
+    assert result.returncode == 0
+    (row,) = runner.local_test_observations()
+    assert row.receipt_id and row.turn_id == runner.latest_test_turn_id
+    assert row.outcome == "passed" and row.provenance == "parent-observed"
+    assert row.suite_start == "verified" and row.execution_ref
+
+
+@pytest.mark.parametrize("kind", ["current", "foreign", "restored", "standalone", "unknown"])
+def test_projection_uses_frozen_acquisition_not_latest_repair_turn_1758(tmp_path, kind):
+    from dataclasses import replace
+    from coding_review_agent_loop.protocol import TestObservationCitation
+    runner = Runner()
+    row = _observation(outcome="passed", timestamp="2026-10-01T00:00:00Z",
+                       receipt_id="original", registry=runner._environment_registry)
+    row = replace(row, cwd=str(tmp_path), turn_id="acquisition",
+                  restored=kind == "restored",
+                  provenance="self-reported" if kind == "standalone" else "parent-observed")
+    runner._latest_test_turn_id = "repair"
+    # The rolling live buffer has lost the original; only the frozen catalog remains.
+    citation = TestObservationCitation(row.normalized_command, row.receipt_id, "current-result")
+    encoded = runner.render_local_test_evidence(
+        cwd=tmp_path, acquisition_test_turn_id="foreign" if kind == "foreign" else "acquisition",
+        acquisition_test_observations=() if kind == "unknown" else (row,),
+        accepted_test_citations=(citation,))
+    if kind == "current":
+        restored = decode_bounded_evidence(encoded)
+        assert len(restored.observations) == 1
+        assert restored.observations[0].turn_id == "acquisition"
+        assert restored.observations[0].receipt_id == "original"
+    else:
+        assert encoded is None

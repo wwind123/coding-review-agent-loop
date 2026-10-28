@@ -2247,7 +2247,7 @@ def test_unchanged_head_tracker_grants_once_per_head_1626():
 
 def test_bounded_metadata_eviction_never_grants_a_round_1626(tmp_path, monkeypatch):
     """Matrix row `grant-not-from-bounded-eviction`."""
-    # The byte cap drops every detail row from the bounded projection.
+    # A cited receipt cannot fit: #1758 requires an explicit capacity stop.
     monkeypatch.setattr(_evidence_module_1626, "MAX_ROUND_BYTES", 300)
     outcome, runner, _launches = _run_evidence_loop_1626(
         tmp_path, monkeypatch,
@@ -2257,7 +2257,7 @@ def test_bounded_metadata_eviction_never_grants_a_round_1626(tmp_path, monkeypat
         reviews=_evidence_reviews_1626(1, final=None),
     )
     assert isinstance(outcome, AgentLoopError), outcome
-    assert "unchanged in 2 consecutive follow-up rounds" in str(outcome)
+    assert "cited receipts exceed round byte capacity; evidence handoff stopped" in str(outcome)
     live = runner.last_reconciled_local_test_evidence
     assert next(row for row in live.observations if row.receipt_id == "fail-1").superseded_by is None
     bounded = _evidence_module_1626.decode_bounded_evidence(
@@ -2497,3 +2497,208 @@ def test_unstable_failure_cited_rerun_reaches_review_1753(tmp_path, monkeypatch,
         assert _reviews_run_1626(runner) == 2
         assert failure.superseded_by is None
         assert "fail-1" in live.authoritative_failures
+
+
+@pytest.mark.parametrize("at_threshold", [False, True])
+def test_saturated_no_commit_citations_reach_next_review_1758(tmp_path, monkeypatch, at_threshold):
+    """Real validated acquisition -> projection -> persisted reviewer handoff."""
+    original_init = _EvidenceRunner1626.__init__
+
+    def saturated_init(self, **kwargs):
+        original_init(self, **kwargs)
+        for index in range(40):
+            row = self._receipt(
+                f"older-{index}", "failed" if index % 2 else "incomplete",
+                {"PATH": "/old"}, turn="earlier-turn", minute=0,
+            )
+            self._local_test_observations.append(dataclasses.replace(
+                row, command=("pytest", f"tests/test_old_{index}.py"),
+                normalized_command="pytest " + "x" * 490,
+                provenance="self-reported" if index % 3 == 0 else "parent-observed",
+            ))
+
+    monkeypatch.setattr(_EvidenceRunner1626, "__init__", saturated_init)
+    outputs = [_followup_1626([_citation_1626("pass-now")])]
+    receipts = [[("pass-now", "passed", {"PATH": "/usr/bin"})]]
+    if at_threshold:
+        outputs.insert(0, _followup_1626())
+        receipts.insert(0, ())
+    outcome, runner, _ = _run_evidence_loop_1626(
+        tmp_path, monkeypatch, coder_outputs=outputs, turn_receipts=receipts,
+        reviews=_evidence_reviews_1626(int(at_threshold)),
+    )
+    assert outcome == 0, outcome
+    bodies = [item["body"] for item in runner.pr_payload["comments"] if isinstance(item, dict)]
+    cited = next(body for body in bodies if "`pass-now`" in body)
+    assert "verified against the parent journal" in cited
+    assert "unverified: unknown or cross-turn receipt" not in cited
+    prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[:2] == ["codex", "exec"]]
+    assert "pass-now" in prompts[-1]
+    assert '\"receipt_id\": \"pass-now\"' in prompts[-1]
+    assert "coder-turn-" in prompts[-1]
+    live = runner.last_reconciled_local_test_evidence
+    assert any(row.receipt_id == "pass-now" for row in live.observations)
+
+
+@pytest.mark.parametrize("mode", ["normal", "threshold", "repeat", "non-evidence", "mismatched-citation", "conflicting-citation"])
+def test_saturated_canonical_receipt_only_handoff_1758(tmp_path, monkeypatch, mode):
+    """Authenticated derivation, fixed-cap persistence and next reviewer resolution."""
+    plan = _followup_matrix_context()
+    config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6,
+                         pr_evidence_stall_rounds=0)
+    head = _init_followup_checkout(config.claude_dir)
+    current = dataclasses.replace(_followup_observation(
+        execution_ref="coder-turn:observation-1", receipt_id="pass-canonical", head=head,
+        timestamp="2026-10-01T00:01:00Z"), cwd=str(config.claude_dir))
+    row_id = "followup-derived-evidence"
+    raw = structured_coder_followup(remaining_items=["item-1"], addressed_items=[])
+    base, end = json.JSONDecoder().raw_decode(raw)
+    payload = dict(base, test_observations=[{
+        "command": current.normalized_command, "receipt_id": current.receipt_id,
+        "claim": "current-result",
+    }], risk_test_matrix_claims=[{
+        "row_id": row_id, "execution_refs": [current.execution_ref],
+        "test_identifiers": ["tests/test_orchestrator_pr.py::test_followup_workflow"],
+        "test_locations": ["tests/test_orchestrator_pr.py"],
+        "workflow_path_claim": "PR follow-up at the unchanged authenticated head",
+        "outcome_assertions": ["The captured test passed."],
+        "forbidden_effect_assertions": ["No commit or approval is fabricated."],
+        "test_level": "workflow", "caveats": [],
+    }])
+    if mode == "mismatched-citation":
+        payload["test_observations"][0]["command"] = "pytest tests/another.py"
+    if mode == "conflicting-citation":
+        payload["test_observations"].append({
+            **payload["test_observations"][0], "claim": "base-reproduction",
+        })
+    text = json.dumps(payload) + raw[end:]
+    parsed = validate_structured_coder_followup(
+        text, required_architecture_impact_contract=1,
+        delivered_risk_test_matrix=plan.risk_test_matrix_payload,
+        delivered_risk_test_matrix_identity=plan.risk_test_matrix_identity,
+        required_risk_test_matrix_contract=1, delivered_risk_test_matrix_row_ids=(row_id,),
+        execution_catalog=(current,),
+    )
+    response = ValidatedAgentResponse(text=text, session_id="session", marker_value=parsed,
+                                     acquisition_test_turn_id="coder-turn",
+                                     acquisition_test_observations=(current,))
+    empty = ValidatedAgentResponse(text=raw, session_id="session",
+                                  marker_value=validate_structured_coder_followup(raw),
+                                  acquisition_test_turn_id="empty-turn")
+    first = structured_pr_review(state="blocking", blocking_items=[{
+        "text": "Provide admissible receipts for the canonical row.",
+        "evidence_row_ids": [row_id],
+    }] if mode != "non-evidence" else ["Fix the implementation, not just evidence."])
+    carried = structured_pr_review(state="blocking", prior_item_dispositions=[{
+        "item_id": "item-1", "disposition": "blocking", "note": "Still needs the receipt.",
+    }])
+    approved = structured_pr_review(state="approved", prior_item_dispositions=[{
+        "item_id": "item-1", "disposition": "resolved", "note": "Canonical receipt now admissible.",
+    }])
+    threshold = mode != "normal"
+    runner = FakeRunner(codex_outputs=[first, *([carried] if threshold else []),
+                                      *([carried] if mode == "repeat" else [approved])],
+                        pr_payload={"headRefOid": head}, git_head=head,
+                        advance_pr_head_on_coder_followup=False)
+    # Saturate both count and bytes; failure commands differ from the pass.
+    runner._local_test_observations.extend([
+        dataclasses.replace(current, receipt_id=f"old-{i}", execution_ref=None,
+                            turn_id="earlier-turn", outcome="failed" if i % 2 else "incomplete",
+                            timestamp="2026-10-01T00:00:00Z",
+                            command=("pytest", f"tests/old_{i}.py"),
+                            normalized_command="pytest " + "x" * 490,
+                            provenance="self-reported" if i % 3 == 0 else "parent-observed")
+        for i in range(40)
+    ])
+    calls = []
+    real = validated_agent._run_validated_agent
+
+    def acquire(*args, **kwargs):
+        if kwargs.get("role") != "coder":
+            return real(*args, **kwargs)
+        calls.append(kwargs)
+        runner.simulate_agent_turn(config, config.claude_dir, head=head)
+        if threshold and len(calls) == 1:
+            return empty
+        runner._local_test_observations.append(current)
+        return response
+
+    patch_attr_in(monkeypatch, (validated_agent, pr_loop, issue_loop, issue_implementation,
+                                plan_first_loop, discuss_loop, triage), "_run_validated_agent", acquire)
+    monkeypatch.setattr(response_validation, "stable_tracked_tree_snapshot", lambda _: SimpleNamespace(
+        head=head, tracked_digest="tree-current", complete=True, stable=True, status_clean=True))
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, issue_loop),
+                  "_read_assigned_workdir_head", lambda *_a, **_k: head)
+    if mode in {"repeat", "non-evidence", "mismatched-citation", "conflicting-citation"}:
+        with pytest.raises(AgentLoopError, match="unchanged in .* consecutive"):
+            run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan)
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=plan) == 0
+    assert runner.pr_payload["headRefOid"] == head
+    records = _records_1292(runner)
+    coder = [record for record in records if record.role == "coder"][-1]
+    assert coder.subject == head
+    assert coder.risk_test_matrix_evidence["rows"][0]["status"] == "verified"
+    from coding_review_agent_loop.local_test_evidence import decode_bounded_evidence
+    persisted = decode_bounded_evidence(coder.local_test_evidence)
+    assert len(coder.local_test_evidence.encode()) <= 16 * 1024
+    assert len(persisted.observations) <= 32
+    assert any(row.receipt_id == current.receipt_id and row.turn_id == "coder-turn"
+               for row in persisted.observations)
+    bodies = [item["body"] for item in runner.pr_payload["comments"] if isinstance(item, dict)]
+    if mode in {"mismatched-citation", "conflicting-citation"}:
+        assert _reviews_run_1626(runner) == 2
+        assert any("unverified:" in body for body in bodies)
+        return
+    assert any("verified against the parent journal" in body for body in bodies)
+    if mode != "non-evidence":
+        prompts = [cmd[-1] for cmd, _ in runner.commands if cmd[:2] == ["codex", "exec"]]
+        assert '"status": "verified"' in prompts[-1]
+        assert current.receipt_id in prompts[-1] and "coder-turn" in prompts[-1]
+        assert _reviews_run_1626(runner) == (3 if threshold else 2)
+
+
+@pytest.mark.parametrize("case", ["foreign", "standalone", "restored", "capture-limited",
+                                   "dirty", "stale", "head-mismatch", "unknown", "repair-only"])
+def test_invalid_acquisition_receipts_never_verify_canonical_rows_1758(tmp_path, monkeypatch, case):
+    """Protection must not turn display retention into canonical authority."""
+    plan = _followup_matrix_context()
+    head = "authenticated-head"
+    row = dataclasses.replace(_followup_observation(
+        execution_ref="original:observation-1", receipt_id="invalid", head=head,
+        timestamp="2026-10-01T00:00:00Z"), cwd=str(tmp_path))
+    overrides = {
+        "foreign": {"turn_id": "foreign-turn"},
+        "standalone": {"provenance": "self-reported"},
+        "restored": {"restored": True, "execution_ref": None},
+        "capture-limited": {"caveats": ("capture-limited",), "outcome": "incomplete",
+                            "suite_start": "unknown"},
+        "stale": {"attribution": dataclasses.replace(row.attribution, tracked_digest="old-tree")},
+        "head-mismatch": {},
+    }
+    row = dataclasses.replace(row, **overrides.get(case, {}))
+    raw = structured_coder_followup(remaining_items=["item-1"], addressed_items=[])
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["risk_test_matrix_claims"] = [{
+        "row_id": "followup-derived-evidence", "execution_refs": ["original:observation-1"],
+        "test_identifiers": ["tests/test_orchestrator_pr.py::test_followup_workflow"],
+        "test_locations": ["tests/test_orchestrator_pr.py"], "test_level": "workflow",
+        "workflow_path_claim": "PR follow-up", "outcome_assertions": ["Test passed."],
+        "forbidden_effect_assertions": ["No unsupported evidence is admitted."], "caveats": [],
+    }]
+    parsed = validate_structured_coder_followup(json.dumps(payload) + raw[end:])
+    snapshot = SimpleNamespace(head="another-head" if case == "head-mismatch" else head,
+                               tracked_digest="tree-current", complete=True,
+                               stable=True, status_clean=case != "dirty")
+    monkeypatch.setattr(response_validation, "stable_tracked_tree_snapshot", lambda _: snapshot)
+    catalog = () if case in {"unknown", "repair-only"} else (row,)
+    runner = FakeRunner()
+    runner._latest_test_turn_id = "repair-turn"
+    runner._local_test_observations.append(row)
+    derived, result = response_validation._derive_authenticated_risk_evidence_for_coder(
+        parsed, approved_plan_context=plan, runner=runner, assigned_workdir=tmp_path,
+        head_sha=head, invocation_id="coder-turn", assigned_worktree_head=head,
+        _closed_execution_catalog=catalog, _journal_observations=catalog,
+    )
+    assert result.evidence.rows[0].status != "verified"
+    assert derived.risk_test_matrix_evidence.rows[0].status != "verified"

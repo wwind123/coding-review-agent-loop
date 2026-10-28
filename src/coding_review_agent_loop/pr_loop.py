@@ -464,6 +464,8 @@ from .pr_loop_support import (
     FollowupCitationDiagnosis,
     _UnchangedHeadTracker,
     cited_evidence_progress,
+    render_followup_local_test_evidence,
+    canonical_receipt_progress,
     followup_citation_diagnosis,
     _coder_followup_head_log,
     _coder_followup_review_context,
@@ -9329,6 +9331,7 @@ def run_pr_loop(
             coder_turn_receipt_ids: frozenset[str] = frozenset()
             followup_citations: FollowupCitationDiagnosis | None = None
             evidence_progress_receipts: frozenset[str] = frozenset()
+            _followup_derived_risk_evidence = None
             try:
                 coder_response = _run_validated_agent(
                     runner,
@@ -9489,19 +9492,9 @@ def run_pr_loop(
                         coder_response,
                         marker_value=derived_followup,
                     )
-                local_test_evidence = runner.render_local_test_evidence(
-                    current_head=updated_pr_context.metadata.head_sha,
-                    legacy_tests_run=(
-                        coder_response.marker_value.tests_run
-                        if isinstance(coder_response.marker_value, StructuredCoderFollowup)
-                        else None
-                    ),
-                    cwd=active_workdir(config),
-                    prior_local_test_evidence=(
-                        latest_coder_metadata.local_test_evidence
-                        if latest_coder_metadata is not None
-                        else None
-                    ),
+                local_test_evidence = render_followup_local_test_evidence(
+                    runner, coder_response, latest_coder_metadata,
+                    head=updated_pr_context.metadata.head_sha, cwd=active_workdir(config),
                 )
                 # Decided from the live, unbounded reconciliation and the
                 # surviving citations of the accepted (derived) follow-up;
@@ -9515,6 +9508,10 @@ def run_pr_loop(
                         getattr(runner, "last_reconciled_local_test_evidence", None),
                         coder_turn_receipt_ids,
                     ),
+                )
+                evidence_progress_receipts |= canonical_receipt_progress(
+                    coder_response, _followup_derived_risk_evidence, latest_coder_metadata,
+                    approved_plan_context, updated_pr_context.metadata.head_sha, unresolved_items,
                 )
                 # The coder metadata record posted below is numbered one past the
                 # loop round; the matrix-evidence anchor must use that number.
@@ -9845,9 +9842,9 @@ def run_pr_loop(
                 and evidence_progress_receipts
                 and unchanged_head_tracker.grant_evidence_progress()
             ):
-                # The follow-up superseded an authoritative failure at this
-                # head with a cited receipt from its own turn: reviewers get
-                # one round to see it, once per head (#1626).
+                # A cited acquisition receipt superseded an authoritative
+                # failure or newly verified a canonical receipt-only row:
+                # reviewers get one round to see it, once per head.
                 log(
                     config,
                     f"Round {round_number}: unchanged head but authoritative cited evidence "

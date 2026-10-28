@@ -252,10 +252,19 @@ that passes three checks:
 - it is in the coder acquisition's frozen catalog
   (`acquisition_test_observations`, captured before any repair launch can
   repoint the runner's latest test turn);
-- the live, unbounded reconciliation retained by
+- either the live, unbounded reconciliation retained by
   `Runner.render_local_test_evidence` names it as `superseded_by` on a
-  parent-observed failure (`superseded_by_current_turn`);
+  parent-observed failure (`superseded_by_current_turn`), or authenticated
+  canonical derivation newly verifies a previously unsatisfied row requested
+  by a receipt-only blocker, with the same approved matrix and head as the
+  prior coder record (`canonical_receipt_progress`);
 - a surviving `test_observations` citation of the accepted follow-up cites it.
+
+Canonical row progress requires every remaining blocker to carry evidence-row
+IDs; an untagged implementation blocker cannot earn this new allowance.
+Repeated passes and unchanged canonical statuses earn nothing. Evidence does
+not resolve findings automatically: the next reviewer must disposition them,
+and CI qualification remains independent.
 
 A failed citation repair therefore never earns the grant. A different head
 resets it, and like the count it is in memory only. The live reconciliation's
@@ -263,8 +272,22 @@ prior-round input is the previous round's bounded projection
 (`prior_local_test_evidence`, decoded in `Runner.render_local_test_evidence`),
 so after a resume a parent-observed failure evicted from that projection cannot
 be seen as superseded and cannot earn the grant; this is conservative (#1639).
-The bounded round evidence projection stays display-only; no gate or count
-reads it. When the stop fires
+The bounded round evidence projection supplies citation display and persisted
+reviewer context; admission and progress use the frozen acquisition catalog,
+authenticated canonical derivation and live reconciliation, never projection
+membership. `Runner.render_local_test_evidence` reserves accepted citations
+matching parent-observed, unrestored receipts in the original acquisition
+before older rows under both the 32-row and 16-KiB bounds. Format repair and
+post-authentication correction cannot replace that acquisition identity.
+If the protected set itself exceeds either capacity, projection raises an
+explicit capacity error and stops the handoff rather than publishing known
+receipts as unknown. Unprotected failures retain priority over other rows;
+truncation preserves unresolved failure IDs and capture-incomplete caveats,
+so omitted details never imply supersession. Current legacy `tests_run`
+declarations replace prior display-only declarations instead of accumulating
+or colliding at reused indices. Legacy declarations remain self-reported with
+unknown attribution and cannot earn canonical satisfaction or progress.
+When the stop fires
 after the last follow-up's `test_observations` were dropped as a non-array,
 the message names that, says whether repair was attempted, and gives the
 number of uncited receipts from the frozen catalog.
