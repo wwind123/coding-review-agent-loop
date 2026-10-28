@@ -6,6 +6,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .review_scope import is_complete_code_review
+from .capture_dispatch import narrow_capture_scopes, scoped_review_items, scoped_validator, select_capture_reviewers
 from .converted_capture import recovery_capture, capture_feedback, recheck_capture, capture_review_context, admitted_capture_history
 from .pr_restart import checkpoint_restart, review_inputs_changed
 from .review_rounds import _normalize_evidence_only_approval
@@ -636,61 +638,7 @@ def _enforce_pr_board_floor(
     )
 
 
-def _admitted_plan_comments(
-    runner: Runner | None, config: AgentLoopConfig, issue_context: IssueContext,
-) -> tuple[tuple[object, ...], tuple[str, int] | None]:
-    """Plan history with plan board-change links admitted (#1377)."""
-    from .plan_board_state import admitted_issue_comments
-
-    return admitted_issue_comments(
-        runner, config=config, issue_number=issue_context.number,
-        comments=issue_context.comments,
-    )
-
-
-def _canonical_plan_without_handoff(
-    config: AgentLoopConfig,
-    issue_context: IssueContext,
-    *,
-    source_locator: str,
-    error_message: str,
-    runner: Runner | None = None,
-) -> ApprovedPlanContext | None:
-    """The completely approved canonical plan of an issue with no handoff record.
-
-    Approval is verified against the approving plan board, never the PR
-    invocation's board (#1373), resolving any recorded plan board change
-    lineage (#1377).  ``None`` means the issue has no plan round; incomplete
-    approval, including an open carried obligation, raises ``error_message``.
-    """
-    comments, trusted_actor = _admitted_plan_comments(runner, config, issue_context)
-    plan_config, plan_comments = plan_verification_inputs(
-        config, comments, issue_number=issue_context.number, trusted_actor=trusted_actor,
-    )
-    resumed_plan = _resume_plan_round(plan_comments, configured_reviewers=reviewers(plan_config))
-    if resumed_plan is None:
-        return None
-    plan_text, resumed_plan_round = resumed_plan
-    _require_complete_canonical_plan_approval(
-        plan_comments,
-        config=plan_config,
-        plan_text=plan_text,
-        plan_round=resumed_plan_round,
-        human_requirements=issue_context.human_requirements,
-        error_message=error_message,
-    )
-    # The shared approval classification: requirement binding (issue and
-    # authoritative parent), a reconstructible ledger, inherited
-    # admissibility and signed supersession (#1377).
-    from .plan_verification import require_recoverable_plan_approval
-
-    require_recoverable_plan_approval(
-        runner, config=config, issue_context=issue_context, comments=comments,
-        trusted_actor=trusted_actor, error_message=error_message,
-    )
-    return make_approved_plan_context(
-        plan_text, source_locator=source_locator, expected_hash=approved_plan_hash(plan_text),
-    )
+from .pr_plan_recovery import _admitted_plan_comments, _canonical_plan_without_handoff
 
 
 def _entry_plan_handoff_board(
@@ -2361,7 +2309,16 @@ def run_pr_loop(
         from .reviewer_seats import reviewer_seat_binding
         seat_binding = reviewer_seat_binding(config)
 
+        capture_scopes = {}
+        capture_binding = None
+
         def bound_pr_metadata(**fields: object) -> PostedRoundMetadata:
+            if fields.get("role") == "reviewer" and fields.get("agent") in capture_scopes:
+                fields["review_scope"] = capture_scopes[fields["agent"]]
+            if fields.get("role") == "reviewer" and capture_binding is not None:
+                fields["capture_review_binding"] = capture_binding
+            if fields.get("role") == "summary" and capture_scopes:
+                fields["review_scope"] = {"kind": "capture-reconciliation", "assignments": capture_scopes}
             metadata = PostedRoundMetadata(**fields)
             return (
                 dataclasses_replace(metadata, seat_binding=seat_binding)
@@ -3865,13 +3822,15 @@ def run_pr_loop(
                 matrix_identity=(approved_plan_context.risk_test_matrix_identity
                                  if approved_plan_context is not None else None),
             )
+            from .capture_acceptance import full_capture_binding
+            capture_binding = full_capture_binding(capture_records,
+                head=pr_metadata.head_sha, matrix_identity=(approved_plan_context.risk_test_matrix_identity
+                                                          if approved_plan_context else None))
             if capture_boundary_index >= 0:
                 log(config, f"Round {round_number}: converted capture publication at comment "
                     f"{capture_boundary_index} bounds semantic approval eligibility; "
                     "scope selection alone does not invalidate approval carry")
-            if capture_stale_reviewers(capture_records,
-                                       head=pr_metadata.head_sha, boundary=capture_boundary_index):
-                request_automatic_scheduler_fallback("converted capture evidence requires semantic review")
+            capture_scopes = {}
             completed_by_name = {
                 record.metadata.agent: record
                 for record in (current_resume.completed_reviews if current_resume is not None else ())
@@ -3879,7 +3838,7 @@ def run_pr_loop(
             resumed_by_name = {
                 name: record
                 for name, record in completed_by_name.items()
-                if record.index > capture_boundary_index
+                if is_complete_code_review(record.metadata)
                 and _resumed_pr_reviewer_matches_requirements(
                     record,
                     human_requirements,
@@ -4030,7 +3989,6 @@ def run_pr_loop(
                 _extract_round_metadata_records(pr_comments, flow="pr"),
                 head_sha=pr_metadata.head_sha,
             )
-            conversion_boundary_index = max(conversion_boundary_index, capture_boundary_index)
             if conversion_boundary_index >= 0:
                 unchanged_head_approvals = {
                     name: record
@@ -4047,6 +4005,30 @@ def run_pr_loop(
                     pr_fresh_from_rounds, name, record.metadata.round_number
                 )
             }
+            capture_scopes = narrow_capture_scopes(
+                capture_records, head=pr_metadata.head_sha, plan=approved_plan_context,
+                required_reviewers=scheduler_contract.required_reviewers,
+                primary=scheduler_contract.primary_reviewer if scheduler_capabilities.requires_primary else None,
+                approvals=unchanged_head_approvals, boundary=capture_boundary_index,
+                items=prior_unresolved_items,
+                eligible=(_capture_complete and not scheduler_operator_force_full
+                          and not full_board_pass
+                          and not pending_automatic_fallback_reasons
+                          and (panel_evidence is None or panel_evidence.opened)),
+            )
+            for name in capture_scopes:
+                resumed_by_name.pop(name, None)
+            capture_full_review_pending = False
+            if capture_boundary_index >= 0 and not capture_scopes:
+                # Conservative fallback still needs fresh capture-aware complete
+                # reviews; complete approvals remain independent of this gate.
+                from .capture_acceptance import capture_pending
+                if capture_pending(capture_records, head=pr_metadata.head_sha,
+                    plan=approved_plan_context, required_reviewers=scheduler_contract.required_reviewers,
+                    primary=scheduler_contract.primary_reviewer, approvals=unchanged_head_approvals):
+                    capture_full_review_pending = True
+                    resumed_by_name = {name: record for name, record in resumed_by_name.items()
+                                       if record.index > capture_boundary_index}
             checkpoint_expected_plan_digest = (
                 approved_plan_context.plan_hash
                 if approved_plan_context is not None
@@ -4221,10 +4203,10 @@ def run_pr_loop(
                         )
 
             def _pr_review_validators(reviewer_name: str) -> dict[str, object]:
-                return _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name: _validate_review_response(
+                return _architecture_mode_validators(lambda mode: scoped_validator(lambda text, reviewer_name=reviewer_name: _validate_review_response(
                     text,
                     reviewer=reviewer_name,
-                    unresolved_items=prior_unresolved_items,
+                    unresolved_items=scoped_review_items(prior_unresolved_items, capture_scopes, reviewer_name),
                     optional_item_ids=compact_hidden_future_ids,
                     # Never share the mutable round_new_unresolved_items
                     # list with concurrent workers (#594): it only
@@ -4232,7 +4214,7 @@ def run_pr_loop(
                     # message, so an empty tuple changes no outcome.
                     current_round_items=(), architecture_status_mode=mode,
                     approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
-                ))
+                ), scopes=capture_scopes, reviewer=reviewer_name, items=prior_unresolved_items))
 
             def _pr_publication(reviewer_name: str):
                 return round_publication(
@@ -4242,6 +4224,7 @@ def run_pr_loop(
                     validation_context=publication_context_digest(
                         head=current_pr_subject,
                         surfaced=sorted(str(item) for item in surfaced_reviewer_requirement_ids),
+                        **({"review_scope": capture_scopes[reviewer_name]} if reviewer_name in capture_scopes else {}),
                         **({"capture_boundary": capture_boundary_index} if capture_boundary_index >= 0 else {}),
                         **({"seat_binding": seat_binding} if seat_binding is not None else {}),
                     ),
@@ -4255,6 +4238,8 @@ def run_pr_loop(
                 # launch list matches what the per-reviewer loop would decide.
                 # Read at call time, after the board for this round is chosen.
                 reviewer_name = agent_display_name(reviewer)
+                if reviewer_name in capture_scopes:
+                    return "turn"
                 return _classify_pr_reviewer_prelaunch(
                     reviewer_name,
                     unavailable=reviewer in unavailable_reviewer_failures,
@@ -4262,7 +4247,7 @@ def run_pr_loop(
                     selective_policy=selective_policy,
                     selected_reviewer_names=selected_reviewer_names,
                     prior_approval=unchanged_head_approvals.get(reviewer_name),
-                    full_board_pass=full_board_pass,
+                    full_board_pass=full_board_pass or capture_full_review_pending,
                     round_number=round_number,
                     human_requirements=human_requirements,
                 )
@@ -4719,6 +4704,14 @@ def run_pr_loop(
                             if name not in selected_reviewer_names
                         ),
                     )
+                if capture_scopes:
+                    if scheduler_operator_force_full or not classification.narrow:
+                        capture_scopes = {}
+                    else:
+                        final_sweep = False
+                        selected_reviewer_names = set(capture_scopes)
+                        scheduler_decision = select_capture_reviewers(
+                            scheduler_decision, capture_scopes, scheduler_contract.required_reviewers)
                 log(
                     config,
                     f"Round {round_number}: {scheduler_contract.policy} scheduler phase="
@@ -5374,12 +5367,13 @@ def run_pr_loop(
                                 round_number,
                                 config,
                                 reviewer=reviewer,
+                                evidence_scope=capture_scopes.get(agent_display_name(reviewer)),
                                 pr_metadata=pr_metadata,
                                 pr_checks=shared_reviewer_pr_checks,
                                 memory=memory,
                                 issue_context=issue_context,
                                 human_requirements=human_requirements,
-                                unresolved_items=prior_unresolved_items,
+                                unresolved_items=scoped_review_items(prior_unresolved_items, capture_scopes, agent_display_name(reviewer)),
                                 compact_context=(
                                     use_compact_pr_context
                                     and not reviewer_fresh_contexts[reviewer]
@@ -5627,7 +5621,8 @@ def run_pr_loop(
                     reviewer_new_unresolved_items = list(resumed_record.metadata.new_items)
                     log(config, f"Round {round_number}: resuming {reviewer_name}'s completed review")
                 elif (
-                    not full_board_pass
+                    not full_board_pass and not capture_full_review_pending
+                    and reviewer_name not in capture_scopes
                     and (prior_approval := unchanged_head_approvals.get(reviewer_name)) is not None
                     and prior_approval.metadata.round_number < round_number
                     and (
@@ -5726,14 +5721,7 @@ def run_pr_loop(
                         if use_compact_pr_context
                         else None
                     )
-                    sequential_pr_validators = _architecture_mode_validators(lambda mode: lambda text, reviewer_name=reviewer_name, items=prior_unresolved_items: _validate_review_response(
-                        text,
-                        reviewer=reviewer_name,
-                        unresolved_items=items,
-                        optional_item_ids=compact_hidden_future_ids,
-                        current_round_items=round_new_unresolved_items, architecture_status_mode=mode,
-                        approved_matrix_row_ids=approved_matrix_row_ids(approved_plan_context),
-                    ))
+                    sequential_pr_validators = _pr_review_validators(reviewer_name)
                     review_response, review_failure = _capture_agent_invocation(
                         lambda: _same_round_replay_or_invoke(
                             runner,
@@ -5754,12 +5742,13 @@ def run_pr_loop(
                                 round_number,
                                 config,
                                 reviewer=reviewer,
+                                evidence_scope=capture_scopes.get(agent_display_name(reviewer)),
                                 pr_metadata=pr_metadata,
                                 pr_checks=reviewer_pr_checks,
                                 memory=memory,
                                 issue_context=issue_context,
                                 human_requirements=human_requirements,
-                                unresolved_items=prior_unresolved_items,
+                                unresolved_items=scoped_review_items(prior_unresolved_items, capture_scopes, reviewer_name),
                                 compact_context=reviewer_compact_context,
                                 compact_prior=(
                                     CompactPriorContext(tuple(pr_compact_prior_summaries))

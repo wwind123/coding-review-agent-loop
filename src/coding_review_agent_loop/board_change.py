@@ -41,6 +41,8 @@ fields.  :data:`PR_SURFACE` keeps the PR records byte-identical.
 
 from __future__ import annotations
 
+from .review_scope import is_complete_code_review
+
 import base64
 import contextvars
 import dataclasses
@@ -1078,7 +1080,7 @@ def derive_legacy_root(
     posters = [
         record.metadata.agent
         for record in sorted(records, key=lambda item: item.index)
-        if record.metadata.role == "reviewer" and record.metadata.agent
+        if is_complete_code_review(record.metadata) and record.metadata.agent
     ]
     posters = list(dict.fromkeys(posters))
     if contract is not None:
@@ -1258,7 +1260,7 @@ def _resolve_board_lineage(
         dict.fromkeys(
             record.metadata.agent
             for record in ordered
-            if record.metadata.role == "reviewer" and record.metadata.agent
+            if is_complete_code_review(record.metadata) and record.metadata.agent
         )
     )
 

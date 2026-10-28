@@ -2,7 +2,52 @@
 
 How reviewers are chosen for each PR head and each candidate plan: the shared pre-round snapshot and no-execution policy, selective intermediate and `primary-then-panel` PR review, signed board amendments, staged issue plan review with its exact-plan candidate key and reviewer-only phase-advance round, the transition classifier, the primary-phase stall stop, the staged-plan mode conflict, the plan step-back episode, planning scheduler metadata, frozen policy evaluation and the shared reviewer exhaustiveness rule.
 
-Source paths: `src/coding_review_agent_loop/review_scheduling.py`, `src/coding_review_agent_loop/plan_review_scheduling.py`, `src/coding_review_agent_loop/review_rounds.py`, `src/coding_review_agent_loop/board_amendment.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/review_evaluation.py`, `src/coding_review_agent_loop/prompts.py`, `tests/test_review_scheduling.py`, `tests/test_plan_review_scheduling.py`, `tests/test_review_step_back.py`, `tests/test_review_evaluation.py`, `tests/test_pr_loop_review_scheduling.py`.
+Source paths: `src/coding_review_agent_loop/capture_acceptance.py`, `src/coding_review_agent_loop/capture_dispatch.py`, `src/coding_review_agent_loop/review_scope.py`, `src/coding_review_agent_loop/code_approval.py`, `src/coding_review_agent_loop/review_scheduling.py`, `src/coding_review_agent_loop/plan_review_scheduling.py`, `src/coding_review_agent_loop/review_rounds.py`, `src/coding_review_agent_loop/board_amendment.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/review_evaluation.py`, `src/coding_review_agent_loop/prompts.py`, `tests/test_review_scheduling.py`, `tests/test_plan_review_scheduling.py`, `tests/test_review_step_back.py`, `tests/test_review_evaluation.py`, `tests/test_pr_loop_review_scheduling.py`.
+
+## Post-capture evidence acceptance
+
+After an admitted converted recovery capture, complete code approval and semantic
+capture acceptance are independent gates. `capture_acceptance.py` derives stable
+row assignments from conversion audit ownership and the effective board. Eligible
+same-head captures use the configured primary for `primary-then-panel`; other
+policies choose each row's first active requesting owner in board order, then
+deduplicate the reviewer set. Every required complete code approval must already
+qualify at that head, with the current plan, requirement, architecture,
+acquisition and seat contracts and any panel/sweep obligations satisfied.
+Operator force-full, missing approvals, uncertain ownership, a changed code head
+or unrelated code findings retain ordinary policy review. Existing automatic
+code-review recovery remains in force for code work; capture freshness alone
+does not create another complete-board obligation after that work qualifies.
+
+`capture_dispatch.py` shares scope, prompt and response validation across
+sequential and parallel publication. Full, compact and summary-only contexts
+retain the assigned row requirements, canonical claims, tool citations and
+related findings. Scoped verdicts accept evidence only; they cannot open the
+panel, supply a code sweep, resolve unrelated findings or clear machine evidence.
+Semantic coverage gaps become actionable findings tagged with the assigned rows.
+Reviewer failures retain the existing bounded availability and board-amendment
+handling and never imply acceptance.
+
+`review_scope.is_complete_code_review` is the common authority boundary for
+decoded records and raw recovery mappings: only a reviewer record with absent
+scope carries complete-review authority. Explicit null, malformed and unknown
+scopes remain present through decoding and re-serialization and fail closed.
+Scoped turns are excluded from complete approvals, panel/sweep derivation,
+complete-round reconciliation, step-back/non-convergence history, legacy board
+participation inference, architecture approval and managed-CI recovery authority.
+They still undergo effective-seat and board-integrity validation. Bound scoped
+findings and their permitted dispositions use the capture reconciliation path.
+
+Assignments bind the publication episode, canonical evidence, resulting head,
+matrix, assigned rows and reviewer contract. The publication validation digest
+includes scope, so private spool output cannot qualify a changed assignment.
+Resume reuses only admitted published matching acceptance. Identical evidence
+keeps its binding; replacement claims or citations reopen acceptance. Ordinary
+complete reviews can satisfy both gates when their durable context binding
+proves that their prompt included the current capture. Ambiguous legacy history
+requires fresh ordinary review. Final CI/merge qualification checks the same
+semantic predicate against live inputs. Capture attempt limits and unresolved
+partial-capture barriers remain unchanged; no new CLI option is needed.
 
 ## Reviewer selection and scheduling
 

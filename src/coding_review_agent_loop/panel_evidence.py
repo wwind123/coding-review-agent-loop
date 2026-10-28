@@ -6,6 +6,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .review_scope import is_complete_code_review, scope_present
+
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
@@ -121,6 +123,8 @@ def _derive_pr_panel_evidence(
     opening_source: str | None = None
     for record in sorted(records, key=lambda item: item.index):
         metadata = record.metadata
+        if scope_present(metadata):
+            continue
         valid = metadata.scheduler_metadata_status == "valid"
         if valid and metadata.scheduler_force_full and metadata.scheduler_force_full_source == "operator":
             opening, opening_source = record, "operator"
@@ -155,7 +159,8 @@ def _derive_pr_panel_evidence(
     post_opening_latch = bool(
         opening is not None
         and any(
-            record.index > opening.index
+            not scope_present(record.metadata)
+            and record.index > opening.index
             and record.metadata.scheduler_metadata_status == "valid"
             and record.metadata.scheduler_force_full
             and record.metadata.scheduler_force_full_source != "operator"
@@ -185,6 +190,8 @@ def _pr_record_is_panel_qualified(
     operator-sourced opening (recorded, or being established by this round's
     operator flag) qualifies only records written after it.
     """
+    if not is_complete_code_review(record.metadata):
+        return False
     if evidence.opening_index is not None and record.index > evidence.opening_index:
         return True
     if record.metadata.agent != primary_reviewer:

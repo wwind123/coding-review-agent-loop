@@ -29,6 +29,7 @@ from typing import Literal, NoReturn
 from .local_test_evidence import tool_identity_clause, unsuperseded_receipts_sentence, redact_test_command
 from .agents.base import AgentName
 from .agents.registry import agent_display_name
+from .review_scope import is_complete_code_review
 from .reviewer_seats import reviewer_seat_binding
 from .config import (
     AgentLoopConfig,
@@ -2880,7 +2881,7 @@ def _latest_pr_reviewer_records(
     configured_names = {agent_display_name(reviewer) for reviewer in configured_reviewers}
     latest: dict[str, PostedRoundRecord] = {}
     for record in reversed(records):
-        if record.metadata.role != "reviewer" or record.metadata.agent not in configured_names:
+        if not is_complete_code_review(record.metadata) or record.metadata.agent not in configured_names:
             continue
         latest.setdefault(record.metadata.agent, record)
     return latest
@@ -3738,13 +3739,10 @@ def _fresh_pr_qualification_snapshot(
     ) >= 0:
         raise AgentLoopError("Converted capture history is incomplete; semantic approval cannot be qualified.")
     if boundary >= 0:
-        names = {agent_display_name(agent) for agent in config.reviewer}
-        latest = {}
-        for record in records:
-            if record.metadata.role == "reviewer" and record.metadata.subject == context.metadata.head_sha:
-                latest[record.metadata.agent] = record
-        if not complete or any(name not in latest or latest[name].index <= boundary
-                               or latest[name].metadata.state != "approved" for name in names):
+        from .capture_dispatch import qualification_capture_pending
+        if not complete or qualification_capture_pending(records, config=config,
+            comments=context.comments, head=context.metadata.head_sha,
+            plan=fresh_approved_plan_context, requirements=requirements.effective_requirements):
             context = dataclasses_replace(context, converted_capture_review_pending=True)
     return context, requirement_ids, fresh_approved_plan_context, config
 
@@ -4461,7 +4459,7 @@ def admitted_capture_history(runner, config, *, pr_number, comments):
     )
     records = _extract_round_metadata_records(hydrated, flow="pr")
     return tuple(record for record in records
-                 if record.metadata.role == "reviewer"
+                 if (record.metadata.role == "reviewer" and is_complete_code_review(record.metadata))
                  or _recovery_record_admitted(record, hydrated, actor)), complete
 
 

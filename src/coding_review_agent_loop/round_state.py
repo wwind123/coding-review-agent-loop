@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+from .review_scope import is_complete_code_review, scope_present, encode_review_scope, decode_review_scope
 from .review_approval import _contradictory_evidence_approval
 from .agents.base import AgentName
 from .agents.registry import agent_display_name, agent_signature
@@ -410,6 +411,9 @@ class PostedRoundMetadata:
     # Cumulative signed-evidence references carried on every terminal freeze
     # or release record and on conversion records; malformed entries drop.
     signed_evidence_references: tuple[SignedEvidenceReference, ...] = ()
+    review_scope: object = None
+    review_scope_present: bool = False
+    capture_review_binding: object = None
 
     def __post_init__(self) -> None:
         if self.scheduler_metadata_status not in {"absent", "valid", "invalid"}:
@@ -2455,6 +2459,7 @@ def _encode_round_metadata(metadata: PostedRoundMetadata) -> str:
         payload["signed_evidence_references"] = [
             reference.to_payload() for reference in metadata.signed_evidence_references
         ]
+    payload.update(encode_review_scope(metadata))
     payload.update(_encode_recovery_fields(metadata))
     return encode_mapping(payload)
 
@@ -3073,6 +3078,7 @@ def _decode_round_metadata_mapping(payload: Mapping[str, object]) -> PostedRound
             followup_dispatch_head=_decode_followup_dispatch_head(payload),
             evidence_stall=_decode_evidence_stall(payload),
             **_decode_conversion_fields(payload),
+            **decode_review_scope(payload),
             plan_execution_mode=_decode_execution_mode(payload.get("plan_execution_mode")),
             plan_issue_digest=_decode_plan_issue_digest(payload),
             **_decode_recovery_fields(payload),
@@ -3521,74 +3527,7 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
     return _promote_legacy_machine_items(tuple(records))
 
 
-def _latest_pr_approved_reviews_for_head(
-    comments: Sequence[object],
-    *,
-    head_sha: str | None,
-    configured_reviewers: Sequence[AgentName],
-    approved_plan_context: ApprovedPlanContext | None = None,
-    human_requirements: Sequence[object] = (),
-    reviewer_acquisition_contract: Mapping[str, tuple[object, ...]] | None = None,
-    require_architecture_contract: bool = False,
-) -> dict[str, PostedRoundRecord]:
-    if not head_sha:
-        return {}
-    configured_names = {agent_display_name(agent) for agent in configured_reviewers}
-    from .converted_capture_state import capture_eligible_records
-    latest_by_reviewer: dict[str, PostedRoundRecord] = {}
-    records = _extract_round_metadata_records(comments, flow="pr")
-    for record in reversed(capture_eligible_records(records, head=head_sha, plan=approved_plan_context)):
-        metadata = record.metadata
-        if (
-            metadata.subject != head_sha
-            or metadata.role != "reviewer"
-            or metadata.agent not in configured_names
-            or metadata.agent in latest_by_reviewer
-        ):
-            continue
-        if require_architecture_contract and metadata.architecture_contract_version != 1:
-            continue
-        latest_by_reviewer[metadata.agent] = record
-
-    def acquisition_contract_matches(record: PostedRoundRecord) -> bool:
-        if reviewer_acquisition_contract is None:
-            return True
-        expected = reviewer_acquisition_contract.get(record.metadata.agent)
-        if expected is None or len(expected) < 2:
-            return False
-        if record.metadata.acquisition_outcome != "success":
-            return False
-        return (
-            (record.metadata.configured_model in expected[0]
-             if isinstance(expected[0], tuple) else record.metadata.configured_model == expected[0])
-            and record.metadata.configured_effort == expected[1]
-            and (len(expected) < 3 or record.metadata.provider == expected[2])
-        )
-
-    return {
-        reviewer: record
-        for reviewer, record in latest_by_reviewer.items()
-        if record.metadata.state == "approved"
-        and not _contradictory_evidence_approval(record.metadata)
-        and acquisition_contract_matches(record)
-        and (
-            approved_plan_context is None
-            or (
-                record.metadata.approved_plan_hash == approved_plan_context.plan_hash
-                and record.metadata.approved_plan_subject == approved_plan_context.plan_subject
-            )
-        )
-        and (
-            not human_requirements
-            or (
-                "HUMAN_REQUIREMENTS_RESOLVED" in record.body
-                and {
-                    str(getattr(item, "requirement_id", ""))
-                    for item in human_requirements
-                }.issubset(set(record.metadata.surfaced_reviewer_requirement_ids))
-            )
-        )
-    }
+from .code_approval import _latest_pr_approved_reviews_for_head
 
 
 def _prior_item_ledger_signature(items: Sequence[UnresolvedReviewItem]) -> tuple[tuple[object, ...], ...]:
@@ -3741,7 +3680,7 @@ def inert_post_reconciliation_checkpoint_indexes(
     for record in sorted(records, key=lambda item: item.index):
         metadata = record.metadata
         key = (metadata.round_number, metadata.subject)
-        if metadata.role == "summary" and metadata.phase == "reconciliation":
+        if metadata.role == "summary" and metadata.phase == "reconciliation" and not scope_present(metadata):
             closed.add(key)
         elif metadata.phase in _PR_ROUND_REOPENING_PHASES:
             closed.discard(key)
@@ -3829,7 +3768,7 @@ def startup_force_full_latch(
     """
     operator = automatic = False
     for record in force_full_latch_records(records):
-        if record.metadata.scheduler_force_full:
+        if not scope_present(record.metadata) and record.metadata.scheduler_force_full:
             if record.metadata.scheduler_force_full_source == "operator":
                 operator = True
             elif not requires_primary:
@@ -3846,6 +3785,7 @@ def _pr_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
     """
     return any(
         record.metadata.role == "summary"
+        and not scope_present(record.metadata)
         and record.metadata.phase not in PR_PRE_RECONCILIATION_PHASES
         for record in records
     )
@@ -3916,6 +3856,8 @@ def _append_active_pr_new_items(
 ) -> None:
     seen_item_ids = {item.item_id for item in active_items}
     for record in records:
+        if scope_present(record.metadata):
+            continue
         for item in record.metadata.new_items:
             if item.status not in {"blocking", "same-pr"} or item.item_id in seen_item_ids:
                 continue
@@ -3966,6 +3908,8 @@ def _aggregate_record_dispositions(
 ) -> dict[str, list[ReviewItemDisposition]]:
     dispositions_by_item: dict[str, list[ReviewItemDisposition]] = {}
     for record in records:
+        if scope_present(record.metadata):
+            continue
         for disposition in record.metadata.dispositions:
             dispositions_by_item.setdefault(disposition.item_id, []).append(disposition)
     return dispositions_by_item
@@ -4001,7 +3945,7 @@ def _canonically_resolved_history_item_ids(
                 active[item.item_id] = item
                 resolved.discard(item.item_id)
         dispositions_by_item = _aggregate_record_dispositions(
-            [record for record in group if record.metadata.role == "reviewer"]
+            [record for record in group if is_complete_code_review(record.metadata)]
         )
         candidates = [
             item for item in active.values() if item.item_id in dispositions_by_item
@@ -4071,7 +4015,7 @@ def _replay_history_items(
             for item in record.metadata.prior_items:
                 appear(item)
         dispositions_by_item = _aggregate_record_dispositions(
-            [record for record in group if record.metadata.role == "reviewer"]
+            [record for record in group if is_complete_code_review(record.metadata)]
         )
         candidates = [
             item for item in active.values() if item.item_id in dispositions_by_item
@@ -4507,6 +4451,8 @@ def _coder_handoff_is_live(
         if record.index <= handoff.index:
             continue
         metadata = record.metadata
+        if scope_present(metadata):
+            continue
         if metadata.role in {"coder", "reviewer"} or metadata.phase == HEAD_REVIEW_RECOVERY_PHASE:
             return False
     return True
@@ -4520,6 +4466,8 @@ def _head_review_handoff_is_live(
         if record.index <= handoff.index or record.metadata.subject != handoff.metadata.subject:
             continue
         metadata = record.metadata
+        if scope_present(metadata):
+            continue
         if metadata.role in {"coder", "reviewer"}:
             return False
         if (
@@ -4817,7 +4765,7 @@ def _recover_unrecorded_pr_head_advance(
     reviewer_records_after_coder = tuple(
         record
         for record in current_round_records
-        if record.metadata.role == "reviewer"
+        if is_complete_code_review(record.metadata)
         and (latest_coder_record is None or record.index > latest_coder_record.index)
     )
     new_item_records_after_coder = tuple(
@@ -4827,7 +4775,7 @@ def _recover_unrecorded_pr_head_advance(
         and (latest_coder_record is None or record.index > latest_coder_record.index)
     )
     all_reviewer_records = tuple(
-        record for record in current_round_records if record.metadata.role == "reviewer"
+        record for record in current_round_records if is_complete_code_review(record.metadata)
     )
     all_new_item_records = tuple(
         record
@@ -4935,7 +4883,8 @@ def _latest_prior_pr_subject_is_coherent(
     if selection is None:
         return False
     if any(
-        record.metadata.role in {"coder", "reviewer"}
+        (record.metadata.role == "coder" or is_complete_code_review(record.metadata))
+        and not scope_present(record.metadata)
         for record in selection.current_round_records
     ):
         return True
@@ -5531,6 +5480,10 @@ def _resume_pr_round_from_records(
     # A checkpoint posted into a closed round never anchors the resume, so a
     # later ledger cannot displace the reconciled transcript (#1553).
     records = drop_inert_post_reconciliation_checkpoints(records)
+    from .capture_dispatch import resume_capture_round
+    scoped_resume = resume_capture_round(records, comments=comments, trusted_actor=trusted_actor, head=head_sha)
+    if scoped_resume is not None:
+        return scoped_resume
     current_head_records = [record for record in records if record.metadata.subject == head_sha]
     if current_head_records and current_head_records[-1].metadata.phase in EVIDENCE_TERMINAL_PHASES:
         # The latest current-head record is the single freeze or release
@@ -5650,7 +5603,7 @@ def _resume_pr_round_from_records(
             reconciliation_record = record
     for record in current_round_records:
         metadata = record.metadata
-        if metadata.role != "reviewer" or metadata.agent not in configured_reviewer_names:
+        if not is_complete_code_review(metadata) or metadata.agent not in configured_reviewer_names:
             continue
         if record.index <= reopened_below:
             continue
@@ -6013,7 +5966,7 @@ def _resume_plan_round(
     configured_reviewer_names = {agent_display_name(agent) for agent in configured_reviewers}
     for record in current_round_records:
         metadata = record.metadata
-        if metadata.role != "reviewer" or metadata.agent not in configured_reviewer_names:
+        if not is_complete_code_review(metadata) or metadata.agent not in configured_reviewer_names:
             continue
         reviewer_records[metadata.agent] = record
     settled_new_items: list[UnresolvedReviewItem] = []

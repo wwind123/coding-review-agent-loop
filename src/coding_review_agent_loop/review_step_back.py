@@ -19,6 +19,8 @@ a resumed run agree at exactly K and M.  A malformed entry marks the history
 
 from __future__ import annotations
 
+from .review_scope import is_complete_code_review, scope_present
+
 import dataclasses
 import difflib
 import json
@@ -90,6 +92,7 @@ def effective_new_items(
         meta = candidate.metadata
         if (
             meta.role == "summary"
+            and not scope_present(meta)
             and meta.phase == "reconciliation"
             and meta.flow == metadata.flow
             and meta.round_number == metadata.round_number
@@ -117,6 +120,8 @@ def classify_review(
     record's own; pass :func:`effective_new_items` output for a provisional
     publication record (``None`` means unresolvable).
     """
+    if not is_complete_code_review(metadata):
+        return CLASS_OTHER
     if metadata.state == "approved":
         return CLASS_APPROVED
     if metadata.state != "blocking":
@@ -278,7 +283,7 @@ def _walk_primary_reviews(
     latest_review: dict[int, "PostedRoundRecord"] = {}
     for record in ordered:
         metadata = record.metadata
-        if metadata.role != "reviewer" or metadata.agent != primary:
+        if not is_complete_code_review(metadata) or metadata.agent != primary:
             continue
         if record.index <= boundary_index:
             continue
@@ -516,7 +521,7 @@ def first_plan_review_round(
     rounds = [
         record.metadata.round_number
         for record in records
-        if record.metadata.role == "reviewer" and record.metadata.agent == reviewer
+        if is_complete_code_review(record.metadata) and record.metadata.agent == reviewer
     ]
     return min(rounds) if rounds else None
 
@@ -694,7 +699,7 @@ def reviewer_previous_plan_baseline(
     for record in sorted(records, key=lambda item: item.index):
         metadata = record.metadata
         if (
-            metadata.role == "reviewer"
+            is_complete_code_review(metadata)
             and metadata.agent == reviewer
             and metadata.round_number < before_round
             and (previous is None or metadata.round_number >= previous.metadata.round_number)
@@ -1430,7 +1435,7 @@ def _mandatory_plan_finding_lines(
     latest: dict[int, "PostedRoundRecord"] = {}
     for record in ordered:
         metadata = record.metadata
-        if metadata.role == "reviewer" and metadata.agent == primary:
+        if is_complete_code_review(metadata) and metadata.agent == primary:
             latest[metadata.round_number] = record
     lines: list[str] = []
     for number in sorted(latest):
@@ -2037,7 +2042,7 @@ def pr_reviews_for(
     latest: dict[int, "PostedRoundRecord"] = {}
     for record in ordered:
         metadata = record.metadata
-        if metadata.flow == "pr" and metadata.role == "reviewer" and metadata.agent == reviewer:
+        if metadata.flow == "pr" and is_complete_code_review(metadata) and metadata.agent == reviewer:
             latest[metadata.round_number] = record
     result = []
     for number, record in sorted(latest.items()):
@@ -2535,7 +2540,7 @@ def pr_step_back_approach_alternative(
     if any(
         record.index > latest.index
         and record.metadata.flow == "pr"
-        and record.metadata.role == "reviewer"
+        and is_complete_code_review(record.metadata)
         and record.metadata.subject == head_sha
         for record in ordered
     ):

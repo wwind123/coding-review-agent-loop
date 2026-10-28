@@ -28,6 +28,7 @@ PR_REVIEW_POLICIES = frozenset(
 
 SCHEDULER_PHASES = frozenset(
     {
+        "capture-evidence",
         "full-board",
         "primary",
         "secondary-audit",

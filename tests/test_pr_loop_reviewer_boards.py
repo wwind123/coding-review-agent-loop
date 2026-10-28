@@ -1,5 +1,7 @@
 """PR-loop tests for board_amendment and reviewer_seats: PR reviewer boards (#1542)."""
 
+import coding_review_agent_loop.pr_plan_recovery as pr_plan_recovery
+
 import dataclasses
 import re
 from types import SimpleNamespace
@@ -616,7 +618,7 @@ def _m1133_strict_plan_run(tmp_path, monkeypatch, *, supplied):
     """Fresh managed-CI authorization through run_pr_loop, plan approved by three."""
     plan_board = ("codex", "gemini", "antigravity")
     patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, plan_first_loop, issue_loop,
+        pr_loop_support, pr_loop, pr_plan_recovery, plan_first_loop, issue_loop,
     ), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
 
@@ -625,7 +627,7 @@ def _m1133_strict_plan_run(tmp_path, monkeypatch, *, supplied):
             raise AgentLoopError(error_message)
 
     patch_attr_in(monkeypatch, (
-        panel_evidence, pr_loop_support, pr_loop,
+        panel_evidence, pr_loop_support, pr_loop, pr_plan_recovery,
     ), "_require_complete_canonical_plan_approval", require)
     # The fixture stubs the completion predicate, including the shared
     # classification recovery now applies to real plan history (#1377).
@@ -845,7 +847,7 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
     plan_board = ("codex", "gemini", "antigravity")
     plan_checks = []
     patch_attr_in(monkeypatch, (
-        pr_loop_support, pr_loop, plan_first_loop, issue_loop,
+        pr_loop_support, pr_loop, pr_plan_recovery, plan_first_loop, issue_loop,
     ), "_resume_plan_round", lambda comments, **_kw: ("approved plan", object())
     )
 
@@ -855,7 +857,7 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
             raise AgentLoopError(error_message)
 
     patch_attr_in(monkeypatch, (
-        panel_evidence, pr_loop_support, pr_loop,
+        panel_evidence, pr_loop_support, pr_loop, pr_plan_recovery,
     ), "_require_complete_canonical_plan_approval", require)
     # The fixture stubs the completion predicate, including the shared
     # classification recovery now applies to real plan history (#1377).
