@@ -296,17 +296,82 @@ class TreeAttribution:
         }
 
 
+class _EnvironmentDifference:
+    """Latest names-only snapshot, never part of an evidence projection."""
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._names: tuple[str, ...] = ()
+
+    def replace(self, names: tuple[str, ...]) -> None:
+        with self._lock:
+            self._names = names
+
+    def snapshot(self) -> tuple[str, ...]:
+        with self._lock:
+            return self._names
+
+
+def _environment_difference_names(left: bytes, right: bytes) -> tuple[str, ...]:
+    def entries(raw: bytes) -> dict[str, bytes]:
+        result: dict[str, bytes] = {}
+        offset = 0
+        while offset < len(raw):
+            parts = []
+            for _ in range(2):
+                size = struct.unpack_from(">I", raw, offset)[0]
+                offset += 4
+                if size > len(raw) - offset:
+                    raise ValueError("invalid canonical entry length")
+                parts.append(raw[offset:offset + size])
+                offset += size
+            name = parts[0].decode("utf-8")
+            parts[1].decode("utf-8")
+            if name in result:
+                raise ValueError("duplicate canonical entry")
+            result[name] = parts[1]
+        return result
+
+    before, after = entries(left), entries(right)
+    names = []
+    total = 0
+    for name in sorted(before.keys() | after.keys()):
+        if before.get(name) == after.get(name):
+            continue
+        size = len(name.encode("utf-8"))
+        if len(names) == 64 or total + size > 8192:
+            break
+        names.append(name)
+        total += size
+    return tuple(names)
+
+
 @dataclass(frozen=True)
 class EnvironmentIdentity:
     """An in-memory identity; ``canonical_bytes`` is never serialized."""
 
     process_token: str
     canonical_bytes: bytes = field(repr=False, compare=False)
+    _difference: _EnvironmentDifference = field(
+        default_factory=_EnvironmentDifference, init=False, repr=False, compare=False
+    )
+
+    def _differing_names_snapshot(self) -> tuple[str, ...]:
+        return self._difference.snapshot()
 
     def compare(self, other: "EnvironmentIdentity | None") -> str:
         if other is None or self.process_token.split(":", 1)[0] != other.process_token.split(":", 1)[0]:
             return "unknown"
-        return "equivalent" if self.canonical_bytes == other.canonical_bytes else "different"
+        if self.canonical_bytes == other.canonical_bytes:
+            return "equivalent"
+        try:
+            names = _environment_difference_names(self.canonical_bytes, other.canonical_bytes)
+        except (ValueError, UnicodeError, struct.error):
+            # Diagnostics cannot alter verdicts or destroy an earlier snapshot.
+            pass
+        else:
+            self._difference.replace(names)
+        return "different"
 
 
 class EnvironmentIdentityRegistry:
