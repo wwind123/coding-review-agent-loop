@@ -7456,3 +7456,198 @@ def test_difference_names_broker_projection_and_restart_privacy(tmp_path, capsys
             assert private not in external
     finally:
         server.stop()
+# #1753: unstable failures need a qualifying pass, in-process and after resume.
+def _unstable_pair_1753(registry):
+    failure = _broker_row(
+        outcome="failed", receipt="unstable-failure", timestamp=_T_FAIL,
+        registry=registry, stable=False, state="unknown", head=None, digest=None,
+        caveats=("repository changed while the test command ran",),
+    )
+    passing = _broker_row(
+        outcome="passed", receipt="stable-pass", timestamp=_T_PASS, registry=registry,
+    )
+    return failure, passing
+
+
+def _unstable_cases_1753():
+    return [
+        "qualifying", "old-failure", "absent", "earlier", "equal-time", "failed", "timed_out", "incomplete",
+        "command", "cwd", "subset", "superset", "fixture", "fixture-none",
+        "environment", "identity-missing", "foreign-registry",
+        "snapshot-missing", "snapshot-dirty", "snapshot-incomplete", "snapshot-unstable",
+        "snapshot-head", "snapshot-digest", "head-missing", "pass-unstable",
+        "pass-digest", "pass-untracked", "pass-untracked-state", "pass-self-reported",
+        "pass-telemetry", "pass-outside", "failure-outside", "pass-base", "pass-base-state", "failure-base",
+        "failure-self-reported", "failure-launch", "unknown-stability",
+        "precommit", "pass-old-head", "digest-missing", "digest-mismatch", "environment-caveat",
+    ]
+
+
+@pytest.mark.parametrize("restored,restored_pass", [(False, False), (True, False), (True, True)],
+                         ids=["live", "restart-live-pass", "restart-restored-pass"])
+@pytest.mark.parametrize("case", _unstable_cases_1753())
+def test_unstable_failure_supersession_boundaries_1753(case, restored, restored_pass):
+    registry = EnvironmentIdentityRegistry()
+    failure, passing = _unstable_pair_1753(registry)
+    options = dict(current_head=_HEAD, current_snapshot=_restart_snapshot(), registry=registry)
+    expected = case in {"qualifying", "old-failure"}
+    if case == "old-failure":
+        failure = _dc_replace(failure, attribution=_dc_replace(
+            failure.attribution, head="c" * 40, tracked_digest="d" * 64,
+        ))
+    elif case in {"earlier", "equal-time"}:
+        passing = _dc_replace(passing, timestamp=_T_FAIL if case == "equal-time" else "2026-10-22T00:00:00+00:00")
+    elif case in {"failed", "timed_out", "incomplete"}:
+        passing = _dc_replace(passing, outcome=case)
+    elif case in {"command", "cwd"}:
+        argv = ("python", "-m", "pytest", "tests/test_other.py", "-q") if case == "command" else (
+            "python", "-m", "pytest", str(_ROOT_A / "tests/test_protocol.py"), "-q",
+        )
+        passing = _broker_row(
+            argv, outcome="passed", receipt="stable-pass", timestamp=_T_PASS,
+            registry=registry, cwd=_ROOT_A / "pkg" if case == "cwd" else _ROOT_A,
+        )
+        assert failure.normalized_command != passing.normalized_command
+    elif case in {"subset", "superset"}:
+        passing = _dc_replace(passing, scope=EvidenceScope(case, ("tests/test_other.py",)))
+    elif case in {"fixture", "fixture-none"}:
+        fixture = _FixtureRecord(path="fixtures/service.sh", digest="100755:" + "c" * 40)
+        if case == "fixture":
+            passing = _dc_replace(passing, fixture=fixture)
+        else:
+            failure = _dc_replace(failure, fixture=fixture)
+    elif case == "environment":
+        passing = _dc_replace(passing, environment_identity=registry.capture({"PATH": "/changed"}))
+        # A known divergent verdict is all that survives transport.
+        if restored:
+            passing = _dc_replace(passing, environment_state="different", caveats=(*passing.caveats, ENVIRONMENT_DIFFERS_CAVEAT))
+    elif case == "identity-missing":
+        passing = _dc_replace(passing, environment_identity=None)
+        expected = restored_pass  # The bounded restart policy admits missing recovered identity.
+    elif case == "foreign-registry":
+        passing = _dc_replace(passing, environment_identity=EnvironmentIdentityRegistry().capture({"PATH": "/usr/bin"}))
+        # Restart policy does not assert environment equivalence.
+        expected = restored
+    elif case.startswith("snapshot-"):
+        key = case.removeprefix("snapshot-")
+        options["current_snapshot"] = {
+            "missing": None, "dirty": _restart_snapshot(status_clean=False),
+            "incomplete": _restart_snapshot(complete=False), "unstable": _restart_snapshot(stable=False),
+            "head": _restart_snapshot(head="c" * 40), "digest": _restart_snapshot(digest=None),
+        }[key]
+    elif case == "head-missing":
+        options["current_head"] = None
+    elif case in {"pass-unstable", "pass-digest", "pass-untracked", "pass-untracked-state", "precommit", "pass-old-head"}:
+        updates = {
+            "pass-unstable": dict(stable=False), "pass-digest": dict(tracked_digest="d" * 64),
+            "pass-untracked": dict(untracked_input=True),
+            "pass-untracked-state": dict(state="untracked-input-unverified"),
+            "precommit": dict(head="c" * 40, state="stale"),
+            "pass-old-head": dict(head="c" * 40),
+        }[case]
+        passing = _dc_replace(passing, attribution=_dc_replace(passing.attribution, **updates))
+        expected = not restored and case in {"precommit", "pass-old-head"}
+    elif case in {"pass-self-reported", "pass-telemetry", "failure-self-reported"}:
+        provenance = "telemetry-unverified" if case == "pass-telemetry" else "self-reported"
+        if case.startswith("failure"):
+            failure = _dc_replace(failure, provenance=provenance)
+        else:
+            passing = _dc_replace(passing, provenance=provenance)
+    elif case in {"pass-outside", "failure-outside"}:
+        from coding_review_agent_loop.local_test_evidence import OUT_OF_CHECKOUT_CONTEXT_CAVEAT
+        if case.startswith("failure"):
+            failure = _dc_replace(failure, caveats=(*failure.caveats, OUT_OF_CHECKOUT_CONTEXT_CAVEAT))
+        else:
+            passing = _dc_replace(passing, caveats=(*passing.caveats, OUT_OF_CHECKOUT_CONTEXT_CAVEAT))
+    elif case == "pass-base-state":
+        passing = _dc_replace(passing, attribution=_dc_replace(passing.attribution, state="base-reproduction"))
+    elif case in {"pass-base", "failure-base"}:
+        if case.startswith("failure"):
+            failure = _dc_replace(failure, claim="base-reproduction")
+        else:
+            passing = _dc_replace(passing, claim="base-reproduction")
+    elif case == "failure-launch":
+        failure = _dc_replace(failure, outcome="launch-failed", inner_exec="not-attempted", suite_start="not-started", caveats=(*failure.caveats, PRE_COLLECTION_LAUNCH_FAILURE_PREFIX + "pytest usage"))
+    elif case == "unknown-stability":
+        failure = _dc_replace(failure, attribution=_dc_replace(failure.attribution, stable=None))
+    elif case in {"digest-missing", "digest-mismatch"}:
+        passing = _dc_replace(passing, restart_command_digest=None if case == "digest-missing" else "d" * 32)
+        expected = not restored  # Live matching uses normalized command identity.
+    elif case == "environment-caveat":
+        passing = _dc_replace(passing, caveats=(*passing.caveats, ENVIRONMENT_DIFFERS_CAVEAT))
+        expected = not restored  # Live compares actual identities, never labels.
+    if restored:
+        failure = _restore(_persist([failure], registry=registry))[0]
+    if restored_pass:
+        passing = _restore(_persist([passing], registry=registry))[0]
+    rows = [failure] if case == "absent" else [failure, passing]
+    result = reconcile_test_observations(rows, **options)
+    observed = _by_receipt(result)["unstable-failure"]
+    assert (observed.superseded_by == "stable-pass") is expected
+    assert observed.attribution.stable is failure.attribution.stable
+    assert observed.attribution.head == failure.attribution.head
+    assert observed.attribution.tracked_digest == failure.attribution.tracked_digest
+    assert observed.superseded_by != evidence_module.TREE_CHANGE_SUPERSESSION
+    excluded = case in {"failure-self-reported", "failure-outside", "failure-launch"}
+    assert ("unstable-failure" in result.authoritative_failures) is (not expected and not excluded)
+    if expected:
+        assert len(result.observations) == 2
+
+
+@pytest.mark.parametrize("pass_mode", ["live", "restored", "absent", "forged", "unrefreshed", "different"])
+def test_runner_revalidates_previously_cleared_unstable_pair_1753(tmp_path, monkeypatch, pass_mode):
+    registry = EnvironmentIdentityRegistry()
+    failure, passing = _unstable_pair_1753(registry)
+    prior = _persist([failure, passing], registry=registry, current_head=_HEAD, snapshot=_restart_snapshot())
+    restored = _restore(prior)
+    assert restored[0].superseded_by is None  # Stored links are not authority.
+    runner = Runner()
+    runner._environment_registry = registry
+    _patch_snapshot(monkeypatch, _restart_snapshot(root=str(tmp_path)))
+    if pass_mode == "live":
+        # Keep only the unstable failure in prior evidence; runner captures the rerun.
+        prior = _persist([failure], registry=registry)
+        runner._local_test_observations.append(_dc_replace(passing, cwd=str(tmp_path)))
+    elif pass_mode in {"absent", "forged"}:
+        payload = json.loads(_persist([failure], registry=registry))
+        if pass_mode == "forged":
+            payload["observations"][0]["superseded_by"] = "stable-pass"
+        prior = json.dumps(payload)
+    elif pass_mode in {"unrefreshed", "different"}:
+        payload = json.loads(prior)
+        if pass_mode == "unrefreshed":
+            payload["observations"][1]["attribution"]["stable"] = False
+        else:
+            payload["observations"][1]["environment"] = "different"
+            payload["observations"][1]["caveats"].append(ENVIRONMENT_DIFFERS_CAVEAT)
+        prior = json.dumps(payload)
+    rendered = runner.render_local_test_evidence(
+        current_head=_HEAD, cwd=tmp_path, prior_local_test_evidence=prior,
+    )
+    decoded = decode_bounded_evidence(rendered, restore_classification=True)
+    row = _by_receipt(decoded)["unstable-failure"]
+    expected = pass_mode in {"live", "restored"}
+    assert (row.superseded_by == "stable-pass") is expected
+    assert (decoded.authoritative_failures == ()) is expected
+    assert row.attribution.stable is False
+    assert (_unsuperseded_sentence(rendered) == "") is expected
+    assert row.attribution.head is None and row.attribution.tracked_digest is None
+
+
+@pytest.mark.parametrize("case", sorted(_distinct_pairs()))
+def test_distinct_commands_do_not_clear_unstable_failure_1753(case):
+    fail_argv, fail_cwd, pass_argv, pass_cwd = _distinct_pairs()[case]
+    argv_a, cwd_a = _bind(fail_argv, fail_cwd, _ROOT_A)
+    argv_b, cwd_b = _bind(pass_argv, pass_cwd, _ROOT_B)
+    registry = EnvironmentIdentityRegistry()
+    failure = _broker_row(
+        argv_a, outcome="failed", receipt="unstable-failure", timestamp=_T_FAIL,
+        registry=registry, cwd=cwd_a, stable=False, state="unknown",
+    )
+    passing = _run_b_pass(argv_b, registry=registry, cwd=cwd_b)
+    # Restart matching deliberately distinguishes raw forms that the live
+    # normalizer treats as equivalent (absolute paths, dot components, etc.).
+    rows = _restore(_persist([failure], registry=registry))
+    result = _reconcile_b([*rows, passing], registry=registry)
+    assert result.authoritative_failures == ("unstable-failure",)
+    assert _by_receipt(result)["unstable-failure"].attribution.stable is False

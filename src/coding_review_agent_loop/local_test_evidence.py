@@ -1322,6 +1322,7 @@ class _CrossRestartContext:
     # refresh rewrites a live row's head to the current one.  Eligibility is
     # judged on these, never on a rewritten attribution.
     entry_heads: tuple[str | None, ...] = ()
+    base_reproduction_rows: frozenset[int] = frozenset()
 
 
 def _can_supersede_across_restart(
@@ -1350,7 +1351,20 @@ def _can_supersede_across_restart(
     assert context.current_snapshot is not None
     if passing.environment_identity is None and not passing.restored:
         return False, "later pass has no live or restored identity"
+    unstable_failure = failure.attribution.stable is False
+    if unstable_failure and (
+        passing.timestamp <= failure.timestamp
+        or failure.claim == "base-reproduction"
+        or failure.attribution.state == "base-reproduction"
+        or passing.claim == "base-reproduction"
+        or passing_index in context.base_reproduction_rows
+    ):
+        return False, None
     for row, index in ((failure, failure_index), (passing, passing_index)):
+        # An explicitly unstable failure cannot establish tree authority.
+        # Only its side is waived; the pass must still be freshly confirmed.
+        if row is failure and unstable_failure:
+            continue
         if row.restored and index not in context.refreshed_restored:
             return False, "restored attribution was not confirmed against the current head"
         if not 0 <= index < len(context.entry_heads) or (
@@ -1418,6 +1432,36 @@ def _can_supersede(
         return False, "fixture identity differs; a run with another fixture or none cannot supersede it"
     if failure.scope.normalized() != passing.scope.normalized():
         return False, "scope differs; subset/superset result cannot supersede the failure"
+    if failure.attribution.stable is False:
+        if (
+            failure.provenance != "parent-observed"
+            or passing.timestamp <= failure.timestamp
+            or failure.claim == "base-reproduction"
+            or failure.attribution.state == "base-reproduction"
+            or passing.claim == "base-reproduction"
+            or context is not None and passing_index in context.base_reproduction_rows
+        ):
+            return False, None
+        if context is None or not _snapshot_positively_known(
+            context.current_snapshot, context.current_head
+        ):
+            return False, "current head or tracked tree is not positively known"
+        assert context.current_snapshot is not None
+        attribution = passing.attribution
+        if (
+            attribution.state != "current-head"
+            or attribution.stable is not True
+            or attribution.head != context.current_head
+            or attribution.tracked_digest != context.current_snapshot.tracked_digest
+            or attribution.untracked_input
+        ):
+            return False, "later pass is not stable current-head at the current tracked digest"
+        comparison = compare_environment_identities(
+            passing.environment_identity, failure.environment_identity, registry=registry
+        )
+        return comparison == "equivalent", (
+            None if comparison == "equivalent" else f"environment identity is {comparison}"
+        )
     if failure.attribution.state != passing.attribution.state:
         return False, "tracked-tree attribution differs"
     if failure.attribution.state != "current-head":
@@ -1737,6 +1781,9 @@ def reconcile_test_observations(
         snapshot_head_matches=snapshot_head_matches,
         refreshed_restored=frozenset(refreshed_restored),
         entry_heads=entry_heads,
+        base_reproduction_rows=frozenset(
+            index for index, facts in enumerate(entry_facts) if facts.base_reproduction
+        ),
     )
     for failure_index, failure in enumerate(rows):
         if (
