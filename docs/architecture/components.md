@@ -179,6 +179,26 @@ and patch targets of the facade outside that file and its guard helper. The tabl
 decomposition into independently deployed services. Shared data types live
 alongside their owning modules rather than in one central model package.
 
+### Private environment mismatch snapshot
+
+`EnvironmentIdentity.compare` retains a private, memory-only tuple of the names
+whose canonical entries differ, including additions, removals and original-case
+spelling changes. Only the receiver is updated (registry `left`, helper
+`current`); the argument is never mutated. A synchronized holder, excluded from
+repr and dataclass equality, replaces its snapshot only after a successfully
+decoded `different` comparison. Equivalent, unknown, missing-operand,
+cross-process and diagnostic-decode-failure comparisons leave it untouched.
+Concurrent replacements and snapshot reads serialize; the last replacement wins.
+
+The snapshot keeps the sorted prefix of at most 64 complete names and 8192
+UTF-8 bytes, without values, value digests or partner identities. It describes
+the latest successfully decoded mismatch, not a complete per-partner history.
+Its private in-process accessor is for trusted debugging and tests only. The
+holder lives only as long as the live identity: observation projections, broker
+frames and catalogs, journals, bounded evidence, logs and prompts never carry
+it, and restart reconstruction cannot recover it. Verdicts, exclusions and
+failure supersession authority remain unchanged.
+
 ## Decisions
 
 [Decision log](decisions/components.md)

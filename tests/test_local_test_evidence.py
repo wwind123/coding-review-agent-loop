@@ -7300,3 +7300,159 @@ def test_scratch_display_does_not_grant_evidence_or_hide_failure(tmp_path, monke
     assert not _admissible_evidence_observations([marked], assigned_workdir=checkout, selectable=True)
     evidence = reconcile_test_observations([marked], current_head='head-a', cwd=checkout)
     assert ('audit' in evidence.authoritative_failures) == (outcome == 'failed')
+
+
+@pytest.mark.parametrize("entry", ["direct", "registry", "helper"])
+def test_difference_names_comparison_paths_and_lifecycle(entry):
+    registry = EnvironmentIdentityRegistry()
+    left = registry.capture({"CHANGED": "秘密", "REMOVED": "", "SAME": "stable"})
+    right = registry.capture({"CHANGED": "new-secret", "ADDED": "雪", "SAME": "stable"})
+    # Seed the argument independently to make receiver-only ownership observable.
+    right.compare(registry.capture({"ARGUMENT_SEED": "private"}))
+    argument_snapshot = right._differing_names_snapshot()
+    compare = {
+        "direct": lambda a, b: a.compare(b) if a is not None else "unknown",
+        "registry": registry.compare,
+        "helper": evidence_module.compare_environment_identities,
+    }[entry]
+    assert compare(left, right) == "different"
+    expected = ("ADDED", "CHANGED", "REMOVED")
+    assert left._differing_names_snapshot() == expected
+    assert right._differing_names_snapshot() == argument_snapshot
+    same = registry.capture({"SAME": "stable", "REMOVED": "", "CHANGED": "秘密"})
+    foreign = EnvironmentIdentityRegistry().capture({"OTHER": "x"})
+    malformed = evidence_module.EnvironmentIdentity(left.process_token, b"\x00")
+    for partner, verdict in [(same, "equivalent"), (None, "unknown"),
+                             (foreign, "unknown"), (malformed, "different")]:
+        assert compare(left, partner) == verdict
+        assert left._differing_names_snapshot() == expected
+        if partner is not None:
+            assert partner._differing_names_snapshot() == ()
+    assert compare(None, left) == "unknown"
+    assert left._differing_names_snapshot() == expected
+    fresh = registry.capture({})
+    assert compare(fresh, registry.capture({})) == "equivalent"
+    assert compare(fresh, None) == "unknown"
+    assert compare(None, fresh) == "unknown"
+    assert compare(fresh, foreign) == "unknown"
+    assert fresh._differing_names_snapshot() == ()
+    assert compare(left, registry.capture({"CHANGED": "秘密", "REMOVED": "", "SAME": "new"})) == "different"
+    assert left._differing_names_snapshot() == ("SAME",)
+    # The holder is excluded from the dataclass's existing equality contract.
+    assert left == evidence_module.EnvironmentIdentity(left.process_token, b"unrelated")
+
+
+def test_difference_names_exclusions_and_canonical_semantics():
+    registry = EnvironmentIdentityRegistry()
+    left = registry.capture({"KEEP": "x", **{name: "a" for name in ENVIRONMENT_EXCLUSIONS}})
+    right = registry.capture({"KEEP": "x", **{name: "b" for name in ENVIRONMENT_EXCLUSIONS}})
+    assert registry.compare(left, right) == "equivalent"
+    assert left._differing_names_snapshot() == ()
+    lookalikes = {name + "_SUFFIX": "changed" for name in ENVIRONMENT_EXCLUSIONS}
+    assert left.compare(registry.capture({"KEEP": "x", **lookalikes})) == "different"
+    assert left._differing_names_snapshot() == tuple(sorted(lookalikes))[:64]
+    for insensitive in (False, True):
+        a = evidence_module.EnvironmentIdentity("process:a", canonical_environment_bytes(
+            {"Path": "x", "Z": "same"}, case_insensitive=insensitive))
+        b = evidence_module.EnvironmentIdentity("process:b", canonical_environment_bytes(
+            {"Z": "same", "PATH": "x"}, case_insensitive=insensitive))
+        assert a.compare(b) == "different"
+        assert a._differing_names_snapshot() == ("PATH", "Path")
+    with pytest.raises(Exception, match="case-colliding"):
+        canonical_environment_bytes({"Path": "x", "PATH": "x"}, case_insensitive=True)
+
+
+@pytest.mark.parametrize("names, expected_count", [
+    ([f"NAME_{i:03d}" for i in range(100)], 64),
+    ([f"{i:03d}" + "雪" * 1000 for i in range(5)], 2),
+    (["A" * 8193, "Z"], 0),
+])
+def test_difference_names_bounds_and_concurrent_replacement(names, expected_count):
+    from concurrent.futures import ThreadPoolExecutor
+
+    registry = EnvironmentIdentityRegistry()
+    receiver = registry.capture({})
+    partners = [registry.capture({prefix + name: "secret" for name in names})
+                for prefix in ("", "X")]
+    expected = []
+    for partner in partners:
+        assert receiver.compare(partner) == "different"
+        snapshot = receiver._differing_names_snapshot()
+        assert len(snapshot) == expected_count
+        assert sum(len(name.encode("utf-8")) for name in snapshot) <= 8192
+        expected.append(snapshot)
+    def update(index):
+        assert receiver.compare(partners[index % 2]) == "different"
+        assert receiver._differing_names_snapshot() in expected
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(update, range(100)))
+    # A known last replacement wins after all concurrent writers complete.
+    receiver.compare(partners[0])
+    assert receiver._differing_names_snapshot() == expected[0]
+    assert all(partner._differing_names_snapshot() == () for partner in partners)
+
+
+@pytest.mark.parametrize("use_registry", [False, True])
+@pytest.mark.parametrize("last_partner", ["equivalent", "unknown"])
+def test_difference_names_reconciliation_retains_failure_and_snapshot(use_registry, last_partner):
+    registry = EnvironmentIdentityRegistry()
+    def row(outcome, minute, receipt, value):
+        return _observation(outcome=outcome, timestamp=f"2026-09-10T10:0{minute}:00+00:00",
+                            receipt_id=receipt, registry=registry,
+                            environment={"PRIVATE_MISMATCH_NAME": value})
+    failure = row("failed", 0, "failure-a", "secret-a")
+    other_failure = row("failed", 1, "failure-b", "secret-b")
+    passing = row("passed", 2, "passing", "secret-b")
+    if last_partner == "unknown":
+        other_failure = evidence_module.replace(other_failure, environment_identity=None)
+    selected = registry if use_registry else None
+    for _ in range(2):
+        evidence = reconcile_test_observations([failure, other_failure, passing], registry=selected)
+        assert "failure-a" in evidence.authoritative_failures
+        assert evidence.observations[0].superseded_by is None
+        assert passing.environment_identity._differing_names_snapshot() == ("PRIVATE_MISMATCH_NAME",)
+        assert failure.environment_identity._differing_names_snapshot() == ()
+        if last_partner == "equivalent":
+            assert evidence.observations[1].superseded_by == "passing"
+        text = bounded_evidence_for_round(evidence)
+        assert "PRIVATE_MISMATCH_NAME" not in text
+        assert "secret-a" not in text and "secret-b" not in text
+    # Reusing the passing identity in the annotation loop with an equivalent
+    # or unknown predecessor must also preserve its latest mismatch.
+    reconcile_test_observations([other_failure, passing], registry=selected)
+    assert passing.environment_identity._differing_names_snapshot() == ("PRIVATE_MISMATCH_NAME",)
+
+
+def test_difference_names_broker_projection_and_restart_privacy(tmp_path, capsys, caplog):
+    sentinel = "DISTINCTIVE_PRIVATE_ENV_NAME"
+    secrets = ("distinctive-secret-value-a", "distinctive-secret-value-b")
+    def execute(argv, cwd, timeout, environment, stream):
+        return SimpleNamespace(outcome="passed", returncode=0, elapsed_seconds=0.01, output_tail="")
+    registry = EnvironmentIdentityRegistry()
+    server = BrokerServer(root=tmp_path, turn_id="privacy-turn", execute=execute,
+                          environment_registry=registry).start()
+    try:
+        results = []
+        for value in secrets:
+            results.append(BrokerClient({**server.environment, "AGENT_LOOP_INVOCATION_ID": "privacy-turn", sentinel: value}).run(
+                [sys.executable, "-m", "pytest", "tests/test_example.py"],
+                timeout_seconds=5, cwd=tmp_path))
+        rows = server.snapshot_journal()
+        evidence = reconcile_test_observations(rows, registry=registry)
+        assert rows[1].environment_identity._differing_names_snapshot() == (sentinel,)
+        encoded = _persist(rows, registry=registry)
+        restored = _restore(encoded)
+        assert all(row.environment_identity is None for row in restored)
+        assert all(row.environment_state == "identity-unknown" for row in restored)
+        fresh = EnvironmentIdentityRegistry()
+        assert fresh.capture({sentinel: secrets[0]})._differing_names_snapshot() == ()
+        restored_evidence = reconcile_test_observations(restored, registry=fresh)
+        external = repr((rows, results, server.live_execution_catalog(),
+                         [row.to_dict() for row in rows], evidence.to_dict(),
+                         bounded_evidence_for_round(evidence), encoded, restored_evidence.to_dict()))
+        captured = capsys.readouterr()
+        external += captured.out + captured.err + caplog.text
+        for private in (sentinel, *secrets, *(hashlib.sha256(s.encode()).hexdigest() for s in secrets)):
+            assert private not in external
+    finally:
+        server.stop()
