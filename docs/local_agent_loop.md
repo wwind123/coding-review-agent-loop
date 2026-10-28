@@ -1975,7 +1975,7 @@ remain comparison-bearing. Environment identity bytes are retained only in
 trusted memory within one orchestrator process. A restart therefore renders
 old observations `identity-unknown`; protected cross-process environment
 comparison is intentionally not supported by this same-user implementation.
-A restored failure can still be superseded at an unchanged head and tree
+A restored failure can still be superseded by qualifying current-head receipts
 under the gated rule in
 [Failures restored across a restart](#failures-restored-across-a-restart),
 which never compares environments.
@@ -2009,6 +2009,19 @@ partial output, and unsupported or unverified baseline remain visible. Legacy
 self-reported/capture-limited; direct shell execution cannot claim complete
 capture. Base reproduction requires a clean, stable checkout at the base
 commit and never performs a dangerous checkout mutation or live-service test.
+
+An explicitly unstable (`stable=false`) parent-observed live failure also
+allows a narrow exception (#1753): a later passing receipt must match the
+normalized command, fixture and scope, have equivalent live environment
+identities, and be stably attributable to the authenticated current head and
+tracked digest. A complete, stable, clean current snapshot must positively
+confirm that head and digest, without untracked-input uncertainty on the pass.
+The failure's uncertain head and digest need not match. Its original unstable
+attribution and caveats stay visible, with a link to the passing receipt;
+it is never promoted to stable or classified as historical just for being
+unstable. Without a qualifying pass it remains authoritative. Missing or
+unknown stability does not select this exception; base reproduction,
+out-of-checkout context and non-evidence launch exclusions remain in effect.
 
 #### Pre-collection launch failures
 
@@ -2128,6 +2141,24 @@ persisted state or caveat never satisfies one on its own:
 - The pass does not carry the persisted `effective target environment differs`
   verdict. That caveat is ranked so that the caveat cap and repeated transport
   keep it.
+
+For a restored parent-observed failure whose stability is explicitly false,
+only the failure-side tree attribution, refresh and recorded-head checks above
+are waived (#1753). The pass still needs its recorded entry head to equal the
+current authenticated head, stable current-head attribution at the positively
+known current tracked digest, no untracked input, and either a live identity
+or a restored attribution refreshed in this reconcile. The command digest,
+fixture, scope, chronology and context checks remain mandatory. A pass with a
+known-different environment state or the environment-difference caveat is
+rejected. Restart recovery follows the existing policy for unavailable
+identities; it never claims recovered live environment equivalence.
+
+Stored supersession links are discarded and eligibility is recomputed after
+every decode, including for previously cleared unstable failures. An absent
+or incompatible pass leaves the failure authoritative. An old passing entry
+head, a stripped command digest or an unrefreshed restored pass cannot become
+eligible through persistence or a prior supersession link. Stable-failure
+and historical-tree handling are unchanged.
 
 The superseded failure, never the pass, carries the visible caveat
 `superseded across a restart; environment not compared`. It stays journaled and

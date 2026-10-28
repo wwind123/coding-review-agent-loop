@@ -2420,3 +2420,80 @@ def test_evidence_stall_decision_names_the_tool_mismatch_1632():
         77, "abc123", "f" * 64, {"row-a": "no citation"}, 3
     )
     assert "run-tests-tool" not in plain
+
+
+@pytest.mark.parametrize("resume", ["live", "failure", "cleared-pair"])
+@pytest.mark.parametrize("compatible", [True, False])
+def test_unstable_failure_cited_rerun_reaches_review_1753(tmp_path, monkeypatch, resume, compatible):
+    """Drive the real follow-up and Runner reconciliation at the stop threshold."""
+    evidence = _evidence_module_1626
+    original = _EvidenceRunner1626
+
+    class UnstableRunner(original):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            failure = self._local_test_observations[0]
+            failure = dataclasses.replace(
+                failure, restart_command_digest="a" * 32,
+                attribution=dataclasses.replace(
+                    failure.attribution, stable=False, state="unknown", head=None,
+                    tracked_digest=None,
+                ),
+            )
+            rows = [failure]
+            if resume == "cleared-pair":
+                rows.append(self._receipt(
+                    "old-pass", "passed", {"PATH": "/usr/bin"}, turn="old", minute=1,
+                ))
+                cleared = evidence.reconcile_test_observations(
+                    rows, registry=self.registry, current_head="abc123", current_snapshot=snapshot,
+                )
+                assert cleared.authoritative_failures == ()
+                rows = list(cleared.observations)
+            if resume != "live":
+                # Restore through the bounded transport, which drops supersession links.
+                rows = list(evidence.decode_bounded_evidence(evidence.bounded_evidence_for_round(
+                    evidence.LocalTestEvidence(tuple(rows)),
+                )).observations)
+                assert rows[0].superseded_by is None
+                # The old pass cannot discharge the obligation before this turn.
+                if resume == "cleared-pair":
+                    rows[1] = dataclasses.replace(rows[1], attribution=dataclasses.replace(
+                        rows[1].attribution, stable=False,
+                    ))
+            self._local_test_observations[:] = rows
+
+        def _receipt(self, *args, **kwargs):
+            row = dataclasses.replace(super()._receipt(*args, **kwargs), restart_command_digest="a" * 32)
+            if args[0] == "pass-2" and not compatible and resume != "live":
+                # A previously observed divergence survives resume as a caveat;
+                # historical environment bytes are deliberately unavailable.
+                row = dataclasses.replace(row, caveats=(evidence.ENVIRONMENT_DIFFERS_CAVEAT,))
+            return row
+
+    snapshot = SimpleNamespace(
+        head="abc123", tracked_digest="tree-a", complete=True, stable=True, status_clean=True,
+    )
+    monkeypatch.setattr(evidence, "stable_tracked_tree_snapshot", lambda _cwd: snapshot)
+    monkeypatch.setitem(globals(), "_EvidenceRunner1626", UnstableRunner)
+    outcome, runner, launches = _run_evidence_loop_1626(
+        tmp_path, monkeypatch,
+        coder_outputs=[_followup_1626(), _followup_1626([_citation_1626("pass-2")])],
+        turn_receipts=[(), [("pass-2", "passed", {"PATH": "/usr/bin" if compatible else "/changed"})]],
+        reviews=_evidence_reviews_1626(1, final="approved" if compatible else None),
+    )
+    live = runner.last_reconciled_local_test_evidence
+    failure = next(row for row in live.observations if row.receipt_id == "fail-1")
+    assert failure.attribution.stable is False
+    assert failure.attribution.head is None
+    assert not launches
+    if compatible:
+        assert outcome == 0, outcome
+        assert _reviews_run_1626(runner) == 3
+        assert failure.superseded_by == "pass-2"
+        assert live.authoritative_failures == ()
+    else:
+        assert isinstance(outcome, AgentLoopError), outcome
+        assert _reviews_run_1626(runner) == 2
+        assert failure.superseded_by is None
+        assert "fail-1" in live.authoritative_failures

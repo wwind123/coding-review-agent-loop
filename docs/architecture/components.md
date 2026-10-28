@@ -179,6 +179,32 @@ and patch targets of the facade outside that file and its guard helper. The tabl
 decomposition into independently deployed services. Shared data types live
 alongside their owning modules rather than in one central model package.
 
+## Unstable local test attribution (#1753)
+
+`local_test_evidence.py` retains an explicitly unstable parent-observed failure
+until a later qualifying pass supersedes it. Live reconciliation requires the
+same normalized command, fixture and scope, equivalent live environment
+identities, and stable passing attribution confirmed against a complete,
+stable, clean snapshot at the authenticated current head and tracked digest,
+without untracked-input uncertainty. The failure's unreliable tree is never
+promoted to stable or classified as historical because it is unstable.
+
+After bounded receipt transport, the same exception waives only the restored
+unstable failure's attribution, refresh and recorded-head gates. Restart
+command digests, fixture and scope keys, chronology, provenance and context
+exclusions still apply. The pass must retain its recorded current head and
+stable current tracked digest, have no untracked input, and have a live
+identity or be refreshed in this reconcile. Known-different passing
+environments and their persisted caveat are rejected; unavailable identities
+follow the existing bounded restart policy, without asserting equivalence.
+Persisted supersession links never authorize recovery: every reconcile after
+decode independently checks receipts. Missing or unknown failure stability
+never selects the exception, and without a qualifying pass the failure stays
+authoritative. Both receipts and the original unstable attribution remain
+visible. Stable-failure rules, journal schema, environment privacy and PR
+approval gates are unchanged. See the [CLI guide](../local_agent_loop.md#failures-restored-across-a-restart)
+for the full receipt eligibility contract.
+
 ## Decisions
 
 [Decision log](decisions/components.md)
