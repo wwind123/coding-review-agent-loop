@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 import coding_review_agent_loop.pr_loop as pr_loop_module
+from coding_review_agent_loop.converted_capture_state import capture_review_context
 from coding_review_agent_loop.agents.registry import agent_display_name
 from coding_review_agent_loop.cli import build_parser, run_pr_loop
 from coding_review_agent_loop.comment_rendering import render_risk_test_matrix_section
@@ -2339,6 +2340,18 @@ def test_skipped_capture_revalidates_live_head_at_final_gate(tmp_path, monkeypat
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _cwd in runner.commands)
 
 
+def _assert_capture_context(text, evidence):
+    assert "Converted-row capture evidence:" in text
+    assert "awaiting semantic review" not in text
+    assert "receipt verification does not establish semantic coverage" in text
+    assert "When review is required, judge whether the cited tests exercise the affected rows" in text
+    assert "Approvals predating this publication do not establish acceptance" in text
+    assert "Report coverage gaps as ordinary evidence-tagged findings" in text
+    assert "do not run commands or clear machine obligations" in text
+    assert json.dumps(evidence, sort_keys=True) in text
+    assert evidence["rows"][0]["evidence_citations"]
+
+
 def _prepare_verified_recovery(tmp_path, monkeypatch, *, policy="all-reviewers"):
     context = _plan_context("row-a", "row-b")
     real_qualify = pr_loop_module._fresh_pr_qualification_snapshot
@@ -2367,6 +2380,8 @@ def _prepare_verified_recovery(tmp_path, monkeypatch, *, policy="all-reviewers")
 ])
 def test_verified_capture_restart_requires_then_reuses_semantic_review(tmp_path, monkeypatch, seam, policy):
     runner, config, context = _prepare_verified_recovery(tmp_path, monkeypatch, policy=policy)
+    # Exercise complete bound approvals as well as the default scoped acceptance.
+    config = dataclasses.replace(config, pr_review_force_full=policy == "all-reviewers")
     runner.codex_outputs.append(_review())
     original_post = pr_loop_module.post_pr_comment
     source = _records(runner)[-1].index
@@ -2389,6 +2404,10 @@ def test_verified_capture_restart_requires_then_reuses_semantic_review(tmp_path,
     captures = [r for r in _records(runner) if r.index > source and r.metadata.role == "coder"]
     assert len(captures) == 1
     capture = captures[0]
+    _assert_capture_context(
+        capture_review_context(_records(runner), head="fedcba9", plan=context),
+        capture.metadata.risk_test_matrix_evidence,
+    )
     # Code approvals are independent of capture freshness; the semantic gate
     # below still refuses a capture without published acceptance.
     from coding_review_agent_loop.round_state import _latest_pr_approved_reviews_for_head
@@ -2406,9 +2425,24 @@ def test_verified_capture_restart_requires_then_reuses_semantic_review(tmp_path,
     monkeypatch.setattr(pr_loop_module, "post_pr_comment", original_post)
     runner.simulate_new_process()
     assert run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context) == 0
-    assert len(_reviews_after(runner, capture.index)) == 1
+    [semantic] = _reviews_after(runner, capture.index)
+    assert semantic.metadata.state == "approved"
+    if policy == "selective-intermediate":
+        assert semantic.metadata.review_scope is not None
+    else:
+        assert semantic.metadata.capture_review_binding is not None
     assert _agent_count(runner, "claude") == 2
-    assert "tests/test_row-a.py::test_it" in _prompts(runner, "codex")[-1]
+    _assert_capture_context(_prompts(runner, "codex")[-1], capture.metadata.risk_test_matrix_evidence)
+    _assert_capture_context(
+        capture_review_context(admitted_pr_records(runner, config, pr_number=77),
+                               head="fedcba9", plan=context),
+        capture.metadata.risk_test_matrix_evidence,
+    )
+    fresh, _, _, _ = pr_loop_module._fresh_pr_qualification_snapshot(
+        runner, config=config, pr_number=77, issue_context=None, parent_issue_context=None,
+        approved_plan_context=context,
+    )
+    assert not fresh.converted_capture_review_pending
 
 
 def test_verified_capture_can_be_rejected_for_semantic_coverage(tmp_path, monkeypatch):
@@ -2471,21 +2505,31 @@ def test_capture_boundary_replacement_and_identical_evidence(tmp_path, monkeypat
     capture = next(r for r in reversed(records) if r.metadata.role == "coder")
     boundary = lambda history: evidence_review_boundary(history, head="fedcba9",
                                                         matrix_identity=context.risk_test_matrix_identity)
+    render = lambda history: capture_review_context(history, head="fedcba9", plan=context)
+    assert render([]) == ""
+    assert render([r for r in records if r.index < capture.index]) == ""
+    assert capture_review_context(records, head="another-head", plan=context) == ""
+    assert capture_review_context(records, head="fedcba9", plan=_plan_context("other-row")) == ""
     assert boundary(records) == capture.index
+    _assert_capture_context(render(records), capture.metadata.risk_test_matrix_evidence)
     repeated = dataclasses.replace(capture, index=records[-1].index + 1)
     assert boundary([*records, repeated]) == capture.index
+    assert render([*records, repeated]) == render(records)
     changed = json.loads(json.dumps(capture.metadata.risk_test_matrix_evidence))
     changed["rows"][0]["outcome_assertions"] = ["A replacement semantic coverage claim."]
     replacement = dataclasses.replace(repeated, metadata=dataclasses.replace(
         repeated.metadata, risk_test_matrix_evidence=changed,
     ))
     assert boundary([*records, replacement]) == replacement.index
+    _assert_capture_context(render([*records, replacement]), changed)
+    assert json.dumps(capture.metadata.risk_test_matrix_evidence, sort_keys=True) not in render([*records, replacement])
     # A claim, mismatched matrix, or missing dispatch cannot establish a boundary.
     for invalid in [dataclasses.replace(capture.metadata, followup_dispatch_head=None),
                     dataclasses.replace(capture.metadata, risk_test_matrix_evidence=None),
                     dataclasses.replace(capture.metadata, risk_test_matrix_evidence={**changed, "matrix_identity": "0" * 64})]:
         history = [dataclasses.replace(r, metadata=invalid) if r.index == capture.index else r for r in records]
         assert boundary(history) == -1
+        assert render(history) == ""
 
 
 def test_verified_capture_that_moves_head_gets_exact_head_review(tmp_path, monkeypatch):

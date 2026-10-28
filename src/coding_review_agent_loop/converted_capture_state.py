@@ -133,10 +133,11 @@ def capture_review_context(records, *, head, plan):
         return ""
     publication = next(record for record in records if record.index == boundary)
     return (
-        "\nConverted-row capture awaiting semantic review: the tool verified the "
-        "receipts, but reviewers must judge whether the cited tests exercise the "
-        "affected rows. Earlier approvals do not approve this capture. Report "
-        "coverage gaps as ordinary evidence-tagged findings; do not run commands "
+        "\nConverted-row capture evidence: the tool verified the receipts, but "
+        "receipt verification does not establish semantic coverage. When review "
+        "is required, judge whether the cited tests exercise the affected rows. "
+        "Approvals predating this publication do not establish acceptance of "
+        "this capture. Report coverage gaps as ordinary evidence-tagged findings; do not run commands "
         "or clear machine obligations.\n"
         + json.dumps(publication.metadata.risk_test_matrix_evidence, sort_keys=True)
         + "\n"
