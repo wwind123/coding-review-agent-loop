@@ -2122,3 +2122,31 @@ def test_legacy_contradictory_approval_is_not_carried_or_resumed_and_keeps_evide
     assert resumed.prior_items[0].resolution_owners == ledger[0].resolution_owners
     record = PostedRoundRecord(metadata=metadata, body=body, index=0)
     assert not _resumed_pr_reviewer_matches_requirements(record, ())
+
+
+@pytest.mark.parametrize("qualification", [False, True])
+@pytest.mark.parametrize("round_number", [1, 2])
+def test_open_prelaunch_checkpoint_preserves_later_round_identity(round_number, qualification):
+    history = []
+    if round_number > 1:
+        history = [
+            _reviewer(subject="abc123", new_items=(_item(8),)),
+            _summary("reconciliation", "abc123", 1),
+        ]
+    if qualification:
+        history.append(_summary(
+            "qualification-checkpoint", "abc123", 1,
+            qualification_checkpoint=_legacy_checkpoint(),
+        ))
+    history.append(_checkpoint(round_number=round_number, prior_items=(_item(),)))
+    resumed = _resume(history, "abc123")
+    if round_number == 1 and not qualification:
+        assert resumed is None
+        return
+    assert resumed.round_number == round_number
+    assert resumed.completed_reviews == ()
+    assert resumed.reconciled == (round_number == 1 and qualification)
+    assert resumed.coder_output is None
+    if round_number > 1:
+        assert resumed.prior_items == (_item(),)
+        assert resumed.next_unresolved_item_number == 9

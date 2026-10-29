@@ -219,6 +219,28 @@ ignores every inert record. A conversion repeat or a
 head-review recovery handoff reopens the round, so a checkpoint after one is
 not inert. Nothing is deleted, so such PRs resume into round N+1 as they are.
 
+A live, valid scheduler-prelaunch checkpoint for an open round N > 1 anchors
+resume at N even when no coder or reviewer has published in that round. Its
+ledger and finding-ID high-water mark survive; completed reviews stay empty
+and the round is unreconciled. An older same-head qualification checkpoint
+cannot replace that open round identity. Round-1 checkpoint-only startup keeps
+its existing no-resume result without a qualification checkpoint, and its
+existing qualification recovery when one exists, preserving reviewer-board
+link fallback and named-seat rebinding. Pending board amendments still re-enter
+their effective round. Dedicated recovery and closed-round boundaries retain
+precedence. Qualification lookup helpers live in `qualification_checkpoint.py`
+and remain re-exported from `round_state.py`.
+
+Issue implementation delegates PR review to the same PR loop used by a fresh
+PR invocation. Both use the repository, PR surface, PR number, recorded round
+and current head as the private review spool identity. Restoring N therefore
+reuses withheld responses without searching other heads or rounds. Fatal
+reviewer failure and preflight contract refusal retain the spool; publication
+cleans it only after success. Replay still validates responses and frozen
+publication context, and refuses unsafe fresh turns when same-round peers are
+public. The spool schema, private permissions and migration rules are unchanged;
+recovery still requires the original host-local spool.
+
 Resume reconstructs state from recorded evidence and then checks it against the
 live PR, issue, plan, requirements, and policy. GitHub metadata is durable but
 not a blanket authorization token. A lost local response or uncommitted patch

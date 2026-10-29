@@ -1555,7 +1555,11 @@ class EvidenceReleaseRecord:
         )
 
 
-from .qualification_checkpoint import QualificationCheckpoint
+from .qualification_checkpoint import (
+    QualificationCheckpoint,
+    _latest_qualification_checkpoint,
+    _latest_qualification_checkpoint_record,
+)
 
 
 def _serialize_unresolved_item(item: UnresolvedReviewItem) -> dict[str, object]:
@@ -3810,46 +3814,6 @@ def _active_pr_items(items: Sequence[UnresolvedReviewItem]) -> list[UnresolvedRe
     ]
 
 
-def _latest_qualification_checkpoint(
-    records: Sequence[PostedRoundRecord], *, head_sha: str, min_index: int = -1
-) -> QualificationCheckpoint | None:
-    """Return the newest checkpoint bound to the live head.
-
-    An invalid decoded checkpoint is intentionally returned as a value with
-    ``valid=False``.  Callers can then force full reconstruction instead of
-    treating malformed persistence as an absent, safe-to-merge state.
-    """
-    for record in reversed(records):
-        if record.index <= min_index:
-            break
-        checkpoint = record.metadata.qualification_checkpoint
-        if checkpoint is not None and record.metadata.subject == head_sha:
-            return checkpoint
-    return None
-
-
-def _latest_qualification_checkpoint_record(
-    records: Sequence[PostedRoundRecord], *, head_sha: str, min_index: int = -1
-) -> PostedRoundRecord | None:
-    """Return the metadata record that anchors the latest qualification checkpoint.
-
-    Qualification checkpoints are deliberately posted as summary records before
-    a CI dispatch or coder handoff.  A process interruption can therefore leave
-    a current-head transcript with no coder/reviewer record for the next round.
-    Keeping the record, rather than only its decoded value, lets PR recovery use
-    that summary as a durable round anchor.
-    """
-    for record in reversed(records):
-        if record.index <= min_index:
-            break
-        if (
-            record.metadata.subject == head_sha
-            and record.metadata.qualification_checkpoint is not None
-        ):
-            return record
-    return None
-
-
 def _append_active_pr_new_items(
     active_items: list[UnresolvedReviewItem],
     records: Sequence[PostedRoundRecord],
@@ -5620,12 +5584,19 @@ def _resume_pr_round_from_records(
     if latest_coder_record is None and not reviewer_records and not any(
         _contradictory_evidence_approval(r.metadata) for r in current_round_records
     ):
-        if checkpoint_record is None:
-            return None
-        # A summary-only checkpoint retains its ledger and round budget.
-        anchor_metadata = checkpoint_record.metadata
-        current_round_records = (checkpoint_record,)
-        reconciliation_record = None
+        open_prelaunch = (
+            anchor_metadata.phase == "scheduler-prelaunch"
+            and anchor_metadata.round_number > 1
+            and anchor_metadata.scheduler_metadata_status == "valid"
+        )
+        if not open_prelaunch:
+            if checkpoint_record is None:
+                return None
+            # Preserve first-round startup and qualification recovery. A later
+            # open prelaunch instead retains its own round, ledger and spool.
+            anchor_metadata = checkpoint_record.metadata
+            current_round_records = (checkpoint_record,)
+            reconciliation_record = None
     prior_items = anchor_metadata.prior_items
     round_number = anchor_metadata.round_number
     ledger_may_be_incomplete = (

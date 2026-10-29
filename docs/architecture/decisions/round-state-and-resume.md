@@ -16,3 +16,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Pure issue-reference parsers, regexes and evidence types moved verbatim to `github_issue_references.py` with explicit `github.py` compatibility re-exports. GitHub I/O, authorization, provenance decisions, patched-name callers and all read-only source-scan call sites remain in `github.py`; execution, persistence and trust contracts are unchanged, and its source-size allowlist entry is removed (#1697).
 
 - Managed repair checkpoints retain optional typed failed-run correlation and verified settlement provenance; old shapes use unique authenticated source-round chronology, and restart revalidates live evidence without resetting spent budgets (#1709).
+
+- Live scheduler-prelaunch checkpoints for open PR rounds after round 1 retain their recorded round and ledger on resume, preserving private same-round replay across issue and PR modes without changing first-round startup, recovery precedence or spool safeguards (#1774).

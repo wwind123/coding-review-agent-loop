@@ -1,6 +1,12 @@
 """Durable machine qualification checkpoints."""
 from __future__ import annotations
 from dataclasses import dataclass
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .round_state import PostedRoundRecord
+
 from .protocol import MACHINE_OBLIGATION_KINDS, MACHINE_LIFECYCLE_STATES, EVIDENCE_OBLIGATION_KIND
 from .managed_ci_result import FailedManagedRun, VerifiedManagedResult
 
@@ -183,3 +189,43 @@ class QualificationCheckpoint:
             allowed_rounds=0,
             valid=False,
         )
+
+
+def _latest_qualification_checkpoint(
+    records: Sequence[PostedRoundRecord], *, head_sha: str, min_index: int = -1
+) -> QualificationCheckpoint | None:
+    """Return the newest checkpoint bound to the live head.
+
+    An invalid decoded checkpoint is intentionally returned as a value with
+    ``valid=False``.  Callers can then force full reconstruction instead of
+    treating malformed persistence as an absent, safe-to-merge state.
+    """
+    for record in reversed(records):
+        if record.index <= min_index:
+            break
+        checkpoint = record.metadata.qualification_checkpoint
+        if checkpoint is not None and record.metadata.subject == head_sha:
+            return checkpoint
+    return None
+
+
+def _latest_qualification_checkpoint_record(
+    records: Sequence[PostedRoundRecord], *, head_sha: str, min_index: int = -1
+) -> PostedRoundRecord | None:
+    """Return the metadata record that anchors the latest qualification checkpoint.
+
+    Qualification checkpoints are deliberately posted as summary records before
+    a CI dispatch or coder handoff.  A process interruption can therefore leave
+    a current-head transcript with no coder/reviewer record for the next round.
+    Keeping the record, rather than only its decoded value, lets PR recovery use
+    that summary as a durable round anchor.
+    """
+    for record in reversed(records):
+        if record.index <= min_index:
+            break
+        if (
+            record.metadata.subject == head_sha
+            and record.metadata.qualification_checkpoint is not None
+        ):
+            return record
+    return None
