@@ -19,3 +19,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - PR follow-up report partition and citation workdir refusals use the existing single shared semantic-evidence correction allowance inside validated acquisition (#1738).
 
 - Semantic refusals exposed by the post-repair test-observations fallback use the same shared correction allowance and terminal classification as direct and repaired candidates (#1738).
+
+- Initial and coverage-reask implementation acquisitions share the PR-follow-up typed report/selector correction policy, one allowance per acquisition; initial exhaustion stops before PR authentication, while coverage exhaustion discards the candidate and refreshes the original PR with post-authentication audit and recovery safeguards (#1768).

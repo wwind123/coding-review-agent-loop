@@ -1000,3 +1000,111 @@ def test_workflow_correction_repairs_a_deficient_reask_without_a_second_reask(tm
     # The deficiency that survived the re-ask disappears once correction supplies the level.
     assert f"complete at {h.head}" in comment and "after one coverage re-ask" in comment
     assert "missing-level" not in comment.split("### Risk-matrix coverage map")[1]
+
+
+# #1768: drive report refusals through the real validated acquisition.
+def _report_refusal(text):
+    payload, end = json.JSONDecoder().raw_decode(text)
+    payload["tests_run"] = ["node --test --require /outside/shim.cjs tests/test_a.js"]
+    return json.dumps(payload) + text[end:]
+
+
+@pytest.mark.parametrize("stage", ["initial", "coverage"])
+@pytest.mark.parametrize("surface", ["direct", "normalized", "repair"])
+def test_workflow_report_correction_succeeds(tmp_path, monkeypatch, stage, surface):
+    incomplete, ok = _real_agent_texts()
+    refused = _report_refusal(ok)
+    if surface == "normalized":
+        payload, _end = json.JSONDecoder().raw_decode(refused)
+        refused = json.dumps(payload) + "\n-- Anthropic Claude\n<!-- AGENT_STATE: blocking -->"
+    elif surface == "repair":
+        repaired = refused
+        payload, end = json.JSONDecoder().raw_decode(refused)
+        payload["summary"] = ""
+        refused = json.dumps(payload) + refused[end:]
+        monkeypatch.setattr(validated_agent_module, "attempt_repair", lambda *_a, **_k: repaired)
+    outputs = ([incomplete] if stage == "coverage" else []) + [json.dumps({"result": refused, "session_id": "refused-session"}), ok]
+    h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, claude_outputs=outputs)
+    assert h.run() == 0
+    commands = _claude_commands(h)
+    assert len(commands) == (3 if stage == "coverage" else 2)
+    assert "refused-session" in commands[-1]
+    assert "Previous response not accepted: test evidence" in commands[-1][-1]
+    assert "/outside/shim.cjs" in commands[-1][-1]
+    assert "outside/shim" not in h.coder_comment()
+    assert h.run_pr_calls
+    assert "complete at" in h.coder_comment()
+
+
+@pytest.mark.parametrize("order", ["report-report", "report-selector", "selector-report"])
+@pytest.mark.parametrize("surface", ["direct", "normalized", "repair"])
+def test_workflow_coverage_refusals_share_one_correction(tmp_path, monkeypatch, order, surface):
+    incomplete, ok = _real_agent_texts()
+    report = _report_refusal(ok)
+    selector_payload, end = json.JSONDecoder().raw_decode(ok)
+    selector_payload["risk_test_matrix_claims"][0]["execution_refs"] = ["failed-selector"]
+    selector = json.dumps(selector_payload) + ok[end:]
+    observation = {
+        "execution_ref": "failed-selector", "command": "python -m pytest tests/test_a.py",
+        "outcome": "failed", "provenance": "parent-observed",
+        "wrapper_bootstrap": "verified", "inner_exec": "started", "suite_start": "verified",
+    }
+    monkeypatch.setattr(issue_implementation, "_current_test_turn_observations", lambda _r: (observation,))
+    first, second = [report if part == "report" else selector for part in order.split("-")]
+    if surface == "normalized":
+        payload, _end = json.JSONDecoder().raw_decode(first)
+        first = json.dumps(payload) + "\n-- Anthropic Claude\n<!-- AGENT_STATE: blocking -->"
+    elif surface == "repair":
+        repaired = first
+        payload, end = json.JSONDecoder().raw_decode(first)
+        payload["summary"] = ""
+        first = json.dumps(payload) + first[end:]
+        monkeypatch.setattr(validated_agent_module, "attempt_repair", lambda *_a, **_k: repaired)
+    h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, claude_outputs=[incomplete, first, second])
+    assert h.run() == 0
+    assert len(_claude_commands(h)) == 3
+    assert "coverage re-ask response discarded" in h.coder_comment()
+    assert "incomplete at" in h.coder_comment()
+    assert h.run_pr_calls
+
+
+@pytest.mark.parametrize("changed_pr", [False, True])
+@pytest.mark.parametrize("managed", [False, True])
+def test_workflow_report_correction_refreshes_original_pr(tmp_path, monkeypatch, changed_pr, managed):
+    incomplete, ok = _real_agent_texts()
+    payload, end = json.JSONDecoder().raw_decode(ok)
+    payload["pr_number"] = 99 if changed_pr else 77
+    corrected = json.dumps(payload) + ok[end:]
+    h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, managed_ci=managed,
+                        claude_outputs=[incomplete, _report_refusal(ok), corrected])
+    events = []
+    if managed:
+        nonce = "correction-nonce"
+        intent = ManagedCiCreationIntent(branch="agent-loop/managed-56", trusted_actor="agent-loop",
+                                        protection_mode="voluntary", audit_nonce=nonce)
+        monkeypatch.setattr(issue_implementation, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+        def authenticate(*_a, **kw):
+            head = kw["metadata"].head_sha
+            events.append(("authenticate", head))
+            return replace(_managed_issue_handoff(nonce=nonce), head_sha=head)
+        monkeypatch.setattr(issue_implementation, "authenticate_issue_created_handoff", authenticate)
+        monkeypatch.setattr(issue_implementation, "publish_issue_created_authorization",
+                            lambda *_a, **kw: events.append(("publish", kw["metadata"].head_sha)) or kw["handoff"])
+    next_output = h.runner._next_agent_output
+    def push_during_correction(outputs):
+        if outputs is h.runner.claude_outputs and len(outputs) == 1:
+            h.commit_file("tests/test_corrected.py", push=True)
+        return next_output(outputs)
+    monkeypatch.setattr(h.runner, "_next_agent_output", push_during_correction)
+    assert h.run() == 0
+    assert len(_claude_commands(h)) == 3
+    refreshed = h.runner.pr_payload["headRefOid"]
+    assert refreshed != h.head
+    comment = h.coder_comment()
+    assert ("coverage re-ask response discarded" in comment) is changed_pr
+    assert f"{'incomplete' if changed_pr else 'complete'} at {refreshed}" in comment
+    assert h.run_pr_calls[0]["pr_number"] == 77
+    handoffs = [body for body in h.all_comments() if "AGENT_ISSUE_PR_HANDOFF" in body]
+    assert handoffs and all(refreshed in body and h.head not in body for body in handoffs)
+    if managed:
+        assert events == [("authenticate", h.head), ("authenticate", refreshed), ("publish", refreshed)]

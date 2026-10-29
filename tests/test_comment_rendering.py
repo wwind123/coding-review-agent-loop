@@ -3479,3 +3479,36 @@ def test_issue_handoff_receipt_must_belong_to_current_coder_turn():
     )
 
     assert "unverified: unknown or cross-turn receipt" in rendered
+
+
+@pytest.mark.parametrize("variant,expected", [
+    ("equivalent", "verified against the parent journal"),
+    ("changed-argv", "command disagrees"),
+    ("conflict-argv", "conflicting uses"),
+    ("conflict-claim", "conflicting uses"),
+    ("old", "unknown or cross-turn"),
+    ("missing", "unknown or cross-turn"),
+    ("capture-limited", "capture-limited"),
+])
+def test_wrapped_receipt_correlation(tmp_path, variant, expected):
+    from types import SimpleNamespace
+    from coding_review_agent_loop.comment_rendering import _render_test_observation_citations
+    from coding_review_agent_loop.local_test_evidence import bounded_evidence_for_round
+    inner = "python -m pytest 'tests/test_a.py::test_x[value with spaces]'"
+    wrapper = "agent-loop run-tests --timeout-seconds 180 --memory-dir /private/memory -- "
+    command = wrapper + (inner + " -q" if variant == "changed-argv" else inner)
+    citations = [SimpleNamespace(command=command, receipt_id="r", claim="current-result")]
+    if variant in {"equivalent", "conflict-argv", "conflict-claim"}:
+        citations.append(SimpleNamespace(command=inner + (" -q" if variant == "conflict-argv" else ""), receipt_id="r", claim="base-reproduction" if variant == "conflict-claim" else "current-result"))
+    evidence = bounded_evidence_for_round({"observations": [] if variant == "missing" else [{
+        "command": shlex.split(inner), "outcome": "passed", "provenance": "parent-observed",
+        "receipt_id": "r", "turn_id": "old" if variant == "old" else "turn",
+        "environment": "unknown", "attribution": {"state": "current-head"},
+        "caveats": ["capture-limited"] if variant == "capture-limited" else [],
+    }]})
+    rendered = _render_test_observation_citations(citations, local_test_evidence=evidence, current_test_turn_id="turn")
+    assert expected in rendered
+    assert "/private/memory" not in rendered
+    if variant == "equivalent":
+        assert rendered.count(expected) == 2
+        assert "unverified" not in rendered

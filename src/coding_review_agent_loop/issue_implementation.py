@@ -134,6 +134,7 @@ from .validated_agent import (
 )
 from .response_validation import (
     _validate_issue_implementation_response,
+    _validate_followup_workdir_report,
     _current_test_turn_observations,
     _derive_authenticated_risk_evidence_for_coder,
     assess_risk_coverage_map,
@@ -535,7 +536,7 @@ def _implement_approved_issue_unscoped(
             marker_description="structured issue_implementation result, blocking, or clarification",
             require_architecture_impact_contract=True,
             architecture_document_paths=_architecture_document_paths_hook(runner, invoke_config),
-            **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text: _validate_issue_implementation_response(
+            **_architecture_and_test_observation_mode_validators(lambda mode, observations_mode: lambda text: _validate_followup_workdir_report(_validate_issue_implementation_response(
                 text,
                 human_requirements=implementation_requirements,
                 require_architecture_impact=True,
@@ -560,7 +561,7 @@ def _implement_approved_issue_unscoped(
                     else None
                 ), architecture_status_mode=mode,
                 test_observations_mode=observations_mode,
-            )),
+            ), config=invoke_config)),
             usage_context=usage_context,
             role="coder",
             reask_on_evidence_rejection=True,

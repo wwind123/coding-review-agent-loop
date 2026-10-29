@@ -2267,7 +2267,7 @@ def test_report_side_consumers_pass_the_launcher_opt_in_explicitly():
     for module, function in (
         (workdir_guard, "_validate_managed_command"),
         (comment_rendering, "_render_test_command_for_comment"),
-        (protocol, "_managed_test_wrapper_inner_command"),
+        (runtime, "managed_test_wrapper_inner_command"),
         (local_test_evidence, "_referenced_paths"),
     ):
         source = inspect.getsource(getattr(module, function))
@@ -7959,3 +7959,23 @@ def test_suite_start_reason_helpers_are_closed_set_1661():
     assert runtime.coerce_suite_start_reason("probe-unavailable", "verified") is None
     assert runtime.coerce_suite_start_reason("made-up", "unknown") is None
     assert runtime.coerce_suite_start_reason(None, "unknown") is None
+
+
+@pytest.mark.parametrize("launcher", ["agent-loop", "/opt/bin/agent-loop", "python3 -m coding_review_agent_loop.cli"])
+def test_report_projection_preserves_inner_argv(launcher):
+    inner = "node --test --require 'tests/a shim.cjs' -- tests/a.js"
+    command = f"{launcher} run-tests --timeout-seconds 180 --memory-dir /private/memory -- {inner}"
+    assert runtime.managed_test_wrapper_inner_command(command) == shlex.join(shlex.split(inner))
+    assert runtime.managed_test_wrapper_inner_command("env FEATURE=1 timeout 200 " + command) == shlex.join(shlex.split(inner))
+
+
+@pytest.mark.parametrize("command", [
+    "agent-loop run-tests --unknown 3 -- pytest tests/",
+    "agent-loop run-tests --timeout-seconds 1 --timeout-seconds 2 -- pytest tests/",
+    "agent-loop run-tests pytest tests/", "agent-loop run-tests --",
+    "agent-loop run-tests -- pytest 'unterminated",
+    "../agent-loop run-tests -- pytest tests/",
+    "timeout --unknown agent-loop run-tests -- pytest tests/",
+])
+def test_report_projection_fails_closed(command):
+    assert runtime.managed_test_wrapper_inner_command(command) is None

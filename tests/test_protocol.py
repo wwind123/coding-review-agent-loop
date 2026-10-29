@@ -8186,3 +8186,20 @@ def test_post_auth_suite_start_diagnostic_follows_the_persisted_reason_1661(reas
         "observation_classes": ["pass-unauthoritative"],
         "disqualifiers": ["suite-start-unverified"],
     }
+
+
+@pytest.mark.parametrize("launcher", ["agent-loop", "/opt/bin/agent-loop", "python3 -m coding_review_agent_loop.cli"])
+def test_wrapped_citation_matches_only_exact_inner_journal_argv(launcher):
+    import shlex
+    from coding_review_agent_loop.protocol import TestObservationCitation, _citation_matches_observation
+    inner = "python -m pytest 'tests/test_a.py::test_x[value with spaces]'"
+    command = f"{launcher} run-tests --timeout-seconds 180 --memory-dir /private/memory -- {inner}"
+    observation = {"receipt_id": "r", "command": shlex.split(inner)}
+    assert _citation_matches_observation(TestObservationCitation(command, "r", "current-result"), observation)
+    for citation in [
+        TestObservationCitation(command + " -q", "r", "current-result"),
+        TestObservationCitation(command, "unknown", "current-result"),
+        TestObservationCitation(command, "r", "base-reproduction"),
+        TestObservationCitation(command.replace("--timeout-seconds 180", "--unknown 180"), "r", "current-result"),
+    ]:
+        assert not _citation_matches_observation(citation, observation)

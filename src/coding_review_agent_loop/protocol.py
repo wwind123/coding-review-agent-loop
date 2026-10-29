@@ -67,8 +67,7 @@ from .protocol_markers import sanitize_historical_text
 from .review_scheduling import normalize_fix_scope
 from .test_runtime import (
     CITABLE_TEST_RUNNERS_SUMMARY,
-    TestRuntimeConfigurationError,
-    parse_managed_test_command,
+    managed_test_wrapper_inner_command as _managed_test_wrapper_inner_command,
 )
 
 _logger = logging.getLogger(__name__)
@@ -3598,19 +3597,6 @@ def _citation_matches_observation(
         return True
     wrapped_command = _managed_test_wrapper_inner_command(citation.command)
     return wrapped_command is not None and wrapped_command in commands
-
-
-def _managed_test_wrapper_inner_command(command: str) -> str | None:
-    """Project a managed-wrapper citation to its broker argv."""
-    try:
-        parsed = parse_managed_test_command(  # shape-check: handled
-            shlex.split(command), allow_command_name_launcher=True
-        )
-    except (ValueError, TestRuntimeConfigurationError):
-        return None
-    if parsed is None:
-        return None
-    return shlex.join(parsed.inner_argv)
 
 
 def _observation_semantics(observation: object) -> tuple[dict[str, object], bool]:

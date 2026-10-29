@@ -1360,7 +1360,7 @@ def _validate_followup_workdir_report(
     parsed: object, *, config: AgentLoopConfig,
 ) -> object:
     """Compose structured report guards inside every validated candidate path."""
-    if not isinstance(parsed, StructuredCoderFollowup):
+    if not isinstance(parsed, (StructuredCoderFollowup, StructuredIssueImplementation)):
         return parsed
     try:
         partitioned = _degrade_out_of_checkout_tests(parsed, config=config)
