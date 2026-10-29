@@ -784,3 +784,21 @@ def test_flag_off_registration_never_reconciles_or_records_an_environment(tmp_pa
         assert worktree_pr_env.reconcile_pr_local_environment(on, Runner(), root) is None
         assert cv.environment_record(root) is None
         assert (root / "node_modules").is_symlink()
+
+
+def test_private_writes_do_not_stale_shared_source_health(tmp_path, monkeypatch):
+    from coding_review_agent_loop import worktree_link_integrity as health
+    s = PrEnv(tmp_path, monkeypatch)
+    config = s.config()
+    with workdir_claim_scope(command='task'):
+        s.prepare(config)
+        root = config.claude_dir
+        store = s.store('claude')
+        before = health.health_path(store).read_bytes()
+        def write_private(workdir):
+            (workdir / 'node_modules' / 'private-addition').touch()
+        backend = run_turn(monkeypatch, config, 'claude', 'coder', write_private)
+        assert backend.calls == 1
+        assert health.health_path(store).read_bytes() == before
+        assert health.inspect(store, ('node_modules',))[1] is None
+        assert not (store / 'node_modules' / 'private-addition').exists()

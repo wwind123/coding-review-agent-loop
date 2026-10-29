@@ -158,6 +158,8 @@ def invalidate_store_setup_state(store: Path) -> None:
         path = setup_record_path(store)
         _unlink_private(path)
         _unlink_private(generated_ledger_path(store))
+        from .worktree_link_integrity import health_path
+        _unlink_private(health_path(store))
         _fsync_directory(path.parent)
     except OSError as exc:
         raise AgentLoopError(
@@ -736,19 +738,28 @@ def ensure_store_setup(store: Path, sha: str, *, free: bool, config: Any, runner
     Returns True when the command ran in this lock hold.
     """
     command = getattr(config, "worktree_setup", None)
-    if not command:
-        return False
+    from .worktree_link_integrity import ensure_health, publish, begin_recovery, refusal
     from .run_worktrees import _held_store_message, _require_lock_held, link_source_usable
 
     _require_lock_held(store)
     if getattr(runner, "dry_run", False):
         log(config, f"Would run worktree setup in {store}")
         return False
+    links = tuple(getattr(config, "worktree_links", ()) or ())
+    health_error = ensure_health(
+        store, links, config=config,
+        setup_backed=bool(command or os.path.lexists(setup_record_path(store))
+                          or os.path.lexists(generated_ledger_path(store))),
+    )
+    if not command:
+        if health_error:
+            raise AgentLoopError(health_error)
+        return False
     keys = tuple(getattr(config, "worktree_setup_keys", ()) or ())
     links = tuple(getattr(config, "worktree_links", ()) or ())
     digest, entries = setup_digest(store, sha, command=command, keys=keys, runner=runner)
     unusable = [link for link in links if not link_source_usable(store, link)]
-    if record_matches(read_setup_record(store), store=store, digest=digest, command=command) and not unusable:
+    if record_matches(read_setup_record(store), store=store, digest=digest, command=command) and not unusable and not health_error:
         return False
     if not free:
         raise AgentLoopError(_held_store_message(store, "needs --worktree-setup to run"))
@@ -756,6 +767,9 @@ def ensure_store_setup(store: Path, sha: str, *, free: bool, config: Any, runner
     # Refuse before the record is touched, so a refusal leaves everything as it was.
     removable = _check_store_clean(store, entries, runner=runner, at_sha=False, generated=generated)
     invalidate_setup_record(store)
+    if links:
+        # A failed first setup must never become a manual bootstrap.
+        begin_recovery(store, links, "setup recovery required")
     _remove_generated_keys(store, removable, generated)
     _materialize(store, sha, runner=runner, keys=keys)
     _check_store_clean(store, entries, runner=runner, at_sha=True, generated=generated)
@@ -764,20 +778,33 @@ def ensure_store_setup(store: Path, sha: str, *, free: bool, config: Any, runner
     run_setup_command(store, command, timeout_seconds=timeout)
     for link in links:
         if not link_source_usable(store, link):
-            raise AgentLoopError(
-                f"--worktree-link '{link}': the --worktree-setup command succeeded but did not create "
-                f"{store / link} in the shared clone {store}; no setup record was written."
-            )
+            reason = "the --worktree-setup command succeeded but did not create a usable source"
+            begin_recovery(store, links, reason, link=link)
+            raise AgentLoopError(refusal(store, link, reason))
     # Before the success record, so a crash in between only forces a rerun.
     _write_generated_ledger(store, _generated_after_setup(store, entries))
-    _write_setup_record(store, {
-        "version": SETUP_RECORD_VERSION,
-        "digest": digest,
-        "command_sha256": command_hash(command),
-        "base_sha": sha,
-        "store_identity": _store_identity(store),
-        "completed_at": time.time(),
-    })
+    health_generation = None
+    if links:
+        try:
+            health_generation = publish(store, links, config=config, setup_backed=True)["generation"]
+        except (OSError, ValueError) as exc:
+            link = getattr(exc, "link", links[0])
+            begin_recovery(store, links, str(exc), link=link)
+            raise AgentLoopError(refusal(store, link, str(exc))) from exc
+    try:
+        _write_setup_record(store, {
+            "version": SETUP_RECORD_VERSION,
+            "digest": digest,
+            "command_sha256": command_hash(command),
+            "base_sha": sha,
+            "store_identity": _store_identity(store),
+            "completed_at": time.time(),
+            "health_generation": health_generation,
+        })
+    except BaseException:
+        if links:
+            begin_recovery(store, links, "setup publication failed")
+        raise
     return True
 
 

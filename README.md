@@ -2212,3 +2212,11 @@ For private directories left by completed or interrupted runs, see
 [Removing stopped private directory trees](docs/local_agent_loop.md#removing-stopped-private-directory-trees).
 Release only a trusted tree after all its writers have stopped; deletion is a
 separate operator step.
+
+Shared `--worktree-link` directory sources must be nonempty. Bounded structural
+health checks detect selected deletion at startup and around checked turns;
+damaged or stale sources require a trusted `--worktree-setup CMD` repair (for
+node_modules, `--worktree-setup 'npm ci'` in the named clone). Shared links still
+allow write-through; use `--worktree-setup-pr-local` for writable run isolation.
+See [source integrity and recovery](docs/local_agent_loop.md#shared-source-integrity-and-recovery)
+for migration, persistence and detection limits.

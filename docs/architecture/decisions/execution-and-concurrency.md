@@ -34,3 +34,4 @@ never rewritten or deleted. The detail doc describes the current design.
 - Generic equals-form report and temporary-output values preserve their previous classification across display and strict guards; only recognized execution inputs receive general equals-form path extraction (#1738, #1743).
 
 - Report guards and receipt consumers share strict managed-wrapper interpretation; unknown long options never consume option-shaped next tokens, and canonical redacted inner argv correlate equivalent citations without granting scratch display inputs evidence authority (#1768).
+- Shared link sources use persisted bounded structural witnesses and capped child counts, with clone-local stale health checked at startup and around checked turns; recovery requires trusted operator setup with nonempty output validation, while large sources reduce coverage and shared write-through remains opt-in PR-local isolation's responsibility (#1775).

@@ -728,10 +728,10 @@ def test_worktree_link_missing_source_fails_before_worktree(tmp_path, monkeypatc
     stores = {
         os.path.realpath(default_agent_workdir("OWNER/REPO", agent)) for agent in ("claude", "codex")
     }
-    named = message.split("does not exist in the shared clone ", 1)[1].split(";", 1)[0]
-    assert os.path.realpath(named) in stores
-    assert "pass --worktree-setup CMD to create it" in message
-    assert "or create the path there" in message
+    assert any(store in message for store in stores)
+    assert "--worktree-setup CMD" in message
+    assert "--worktree-setup-pr-local" in message
+    assert "Refusing worktree creation" in message
     assert "succeeded but did not create" not in message
 
 
@@ -750,6 +750,7 @@ def test_worktree_link_not_ignored_as_symlink_warns_without_writing_ignore_state
     for agent in ("claude", "codex"):
         store = env.seed_store(agent, venv=False)
         (store / "node_modules").mkdir()
+        (store / "node_modules" / "ready").touch()
     exclude = default_agent_workdir("OWNER/REPO", "claude") / ".git" / "info" / "exclude"
     before = exclude.read_bytes() if exclude.exists() else None
     messages = _unignored_warnings(monkeypatch)
@@ -1165,3 +1166,60 @@ def test_unpoisoned_checkout_gets_no_pushed_branch_recovery(tmp_path, monkeypatc
         error = CheckoutVerificationError("changed outside agent-loop")
         assert add_pushed_branch_recovery(error, runner=runner, config=config, issue_number=7) is False
         assert str(error) == "changed outside agent-loop"
+
+
+@pytest.mark.parametrize('replace_link', [False, True])
+def test_shared_source_damage_poison_and_zero_backend_launches(tmp_path, monkeypatch, replace_link):
+    from coding_review_agent_loop import checkout_verification as cv, worktree_link_integrity as health
+    from coding_review_agent_loop.agents import registry
+    from coding_review_agent_loop.errors import CheckoutVerificationError
+    env = Env(tmp_path, monkeypatch)
+    env.commit('.gitignore', '/.venv\n')
+    env.seed_stores()
+    config = env.config(extra=('--worktree-link', '.venv'))
+    with workdir_claim_scope(command='task'):
+        claim_agent_workdirs(config)
+        ensure_agent_workdirs(config, Runner())
+        root = config.claude_dir
+        store = default_agent_workdir('OWNER/REPO', 'claude')
+        source = store / '.venv'
+        if replace_link:
+            (root / '.venv').unlink()
+            (root / '.venv').mkdir()
+            # An already poisoned checkout still inspects the original source.
+            cv.poison_checkout(root, 'original link violation')
+        shutil.rmtree((source if replace_link else root / '.venv') / 'bin')
+        cv.record_checkout_baseline(config, Runner(), root, source='coder')
+        assert cv.has_poisoned_entry(root)
+        assert health.inspect(store, ('.venv',))[1]
+        other = default_agent_workdir('OWNER/REPO', 'codex')
+        assert health.inspect(other, ('.venv',))[1] is None
+        launches = []
+        backend = registry.get_backend('claude')
+        monkeypatch.setattr(type(backend), 'run', lambda *a, **k: launches.append(1))
+        for attempt in range(2):
+            with pytest.raises(CheckoutVerificationError) as caught:
+                registry.run_agent_result(Runner(), agent='claude', config=config,
+                                          prompt='x', role='coder', attempt_suffix=str(attempt))
+            message = str(caught.value)
+            assert str(store.absolute()) in message and str(source.absolute()) in message
+            assert '--worktree-setup CMD' in message and '--worktree-setup-pr-local' in message
+        assert launches == []
+
+
+def test_replaced_link_alone_keeps_shared_health_usable(tmp_path, monkeypatch):
+    from coding_review_agent_loop import checkout_verification as cv, worktree_link_integrity as health
+    env = Env(tmp_path, monkeypatch)
+    env.commit('.gitignore', '/.venv\n')
+    env.seed_stores()
+    config = env.config(extra=('--worktree-link', '.venv'))
+    with workdir_claim_scope(command='task'):
+        claim_agent_workdirs(config)
+        ensure_agent_workdirs(config, Runner())
+        root = config.claude_dir
+        (root / '.venv').unlink()
+        (root / '.venv').mkdir()
+        cv.record_checkout_baseline(config, Runner(), root, source='coder')
+        assert cv.has_poisoned_entry(root)
+        store = default_agent_workdir('OWNER/REPO', 'claude')
+        assert health.inspect(store, ('.venv',))[1] is None

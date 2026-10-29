@@ -248,7 +248,9 @@ def build_parser() -> argparse.ArgumentParser:
                 "Opt-in, repeatable. A repository-relative path (for example .venv) that is untracked in "
                 "the shared default clone and is symlinked (never copied) into each per-run worktree. Its "
                 "parent directories must be tracked in the repository. Explicit --<agent>-dir checkouts "
-                "ignore it. The linked state is shared and mutable across concurrent runs."
+                "ignore it. Directory sources must be nonempty; damaged, stale or unknown source health "
+                "requires setup or the run refuses reuse. The linked state is shared and mutable across "
+                "concurrent runs. See docs/local_agent_loop.md, Test dependencies in per-run worktrees."
             ),
         )
         subparser.add_argument(
@@ -260,8 +262,11 @@ def build_parser() -> argparse.ArgumentParser:
                 "sandbox) that prepares untracked test dependencies in each active agent's shared "
                 "default clone before per-run worktrees link them, for example "
                 "'python3 -m venv .venv && .venv/bin/pip install -r requirements.txt'. It runs once per "
-                "clone and reruns only when the command or a --worktree-setup-key entry at the pinned "
-                "base commit changes, or a --worktree-link source is missing. A failure stops the run "
+                "clone and reruns when the command or a --worktree-setup-key entry at the pinned "
+                "base commit changes, or linked-source health is missing, damaged, stale or unknown "
+                "(including legacy setup records without health). Directory sources must be nonempty; "
+                "without setup, unsafe sources refuse reuse. See docs/local_agent_loop.md, "
+                "Test dependencies in per-run worktrees. A failure stops the run "
                 "with the output tail. A --worktree-setup-key file that is absent at the base commit "
                 "but was created by a successful setup (for example package-lock.json from npm "
                 "install) is recorded and does not block later setups while its bytes are unchanged. "

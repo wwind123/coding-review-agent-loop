@@ -147,6 +147,9 @@ class _LinkRegistration:
     env_nonce: str = ""
     key_entries: tuple[tuple[str, str], ...] = ()
     deferred: tuple[str, ...] = ()
+    shared_store: Path | None = None
+    health_links: tuple[str, ...] = ()
+    health_generation: str | None = None
 
 
 # Held only in this process, never as git ignore state: lexical path -> registration.
@@ -187,6 +190,7 @@ def register_worktree_links(
     writable: bool = True,
     base_digest: str | None = None,
     key_entries: tuple[tuple[str, str], ...] = (),
+    shared_store: Path | None = None,
 ) -> None:
     """Record the links created in ``path`` plus the root identity they are bound to."""
     registration = _LinkRegistration(
@@ -199,7 +203,15 @@ def register_worktree_links(
         base_digest=base_digest,
         env_nonce=secrets.token_hex(16),
         key_entries=key_entries,
+        shared_store=shared_store,
+        health_links=tuple(mapping),
     )
+    if shared_store is not None:
+        from .worktree_link_integrity import inspect, refusal
+        data, reason, link = inspect(shared_store, tuple(mapping))
+        if reason:
+            raise CheckoutVerificationError(refusal(shared_store, link, reason, turn=True))
+        registration = replace(registration, health_generation=data["generation"])
     with _LEDGER_LOCK:
         _LINKS[_key(path)] = registration
 
@@ -787,6 +799,7 @@ def record_checkout_baseline(config, runner, path: Path, *, source: str) -> None
     """Refresh the baseline from the live checkout; poison it if that cannot be captured."""
     if getattr(runner, "dry_run", False):
         return
+    _check_shared_health(config, path, post_turn=True)
     with _LEDGER_LOCK:
         # Poison is sticky: a refresh never turns an untrusted checkout back
         # into a trusted one (only a fresh startup establishment may).
@@ -819,6 +832,7 @@ def verify_checkout(
     config, runner, *, path: Path, agent: str, purpose: str
 ) -> CheckoutFingerprint:
     """Refuse (CheckoutVerificationError) unless the checkout matches its baseline."""
+    _check_shared_health(config, path)
     _refuse_untrusted_root(path, agent=agent, purpose=purpose)
     try:
         recover_gemini_injection(config, runner, path)
@@ -945,3 +959,43 @@ def _adopt_gate_artifacts(config, runner, path: Path, before: CheckoutFingerprin
         )
     with _LEDGER_LOCK:
         _LEDGER[_key(path)] = _Expected(after)
+
+
+def _check_shared_health(config, path: Path, *, post_turn: bool = False) -> None:
+    """Inspect original sources independently of link capture and reconciliation.
+
+    Re-read current health under the lock instead of publishing old snapshots
+    over a newer setup generation. Private paths have left ``links``.
+    """
+    registration = link_registration(path)
+    if registration is None or registration.shared_store is None or not registration.links:
+        return
+    from .run_worktrees import store_lock
+    from .worktree_link_integrity import inspect, mark_stale, refusal
+    store = registration.shared_store
+    selected = {os.fsdecode(link) for link in registration.links}
+    message = None
+    try:
+        with store_lock(store):
+            _data, reason, link = inspect(store, registration.health_links, selected=selected)
+            if reason:
+                message = refusal(store, link, reason, turn=True)
+                try:
+                    mark_stale(store, registration.health_links, reason, link=link)
+                except (AgentLoopError, OSError, ValueError, KeyError, TypeError) as exc:
+                    message += f" Source-health stale publication failed: {exc}."
+    except (AgentLoopError, OSError) as exc:
+        message = refusal(store, next(iter(selected)), f"unknown source health: {exc}", turn=True)
+    if message:
+        broken = [os.fsdecode(name) for name, target in registration.links.items()
+                  if not link_intact(path, name, target)]
+        if broken:
+            message += " " + "; ".join(
+                f"worktree link {name} was removed, retargeted or reached through a symlink"
+                for name in broken
+            ) + "."
+        if not has_poisoned_entry(path):
+            poison_checkout(path, message)
+        log(config, message)
+        if not post_turn:
+            raise CheckoutVerificationError(message)
