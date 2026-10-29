@@ -1188,7 +1188,7 @@ def test_shared_source_damage_poison_and_zero_backend_launches(tmp_path, monkeyp
             (root / '.venv').mkdir()
             # An already poisoned checkout still inspects the original source.
             cv.poison_checkout(root, 'original link violation')
-        shutil.rmtree(source / 'bin')
+        shutil.rmtree((source if replace_link else root / '.venv') / 'bin')
         cv.record_checkout_baseline(config, Runner(), root, source='coder')
         assert cv.has_poisoned_entry(root)
         assert health.inspect(store, ('.venv',))[1]
