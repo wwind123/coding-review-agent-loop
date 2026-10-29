@@ -1571,7 +1571,7 @@ def test_health_without_matching_setup_success_refuses_after_restart(tmp_path, m
 
 
 @pytest.mark.parametrize('with_setup', [False, True])
-@pytest.mark.parametrize('failure', ['empty', 'root-open', 'root-count', 'nested-count', 'root-close'])
+@pytest.mark.parametrize('failure', ['missing', 'dangling', 'empty', 'root-open', 'root-count', 'nested-count', 'root-close'])
 @pytest.mark.parametrize('links', [('node_modules',), ('.venv', 'node_modules')])
 def test_initial_capture_failure_keeps_source_attribution(tmp_path, monkeypatch, with_setup, failure, links):
     from contextlib import contextmanager
@@ -1579,8 +1579,11 @@ def test_initial_capture_failure_keeps_source_attribution(tmp_path, monkeypatch,
     env = seeded(tmp_path, monkeypatch, gitignore='/.venv\n/node_modules\n')
     store = env.seed_store('claude', venv='.venv' in links)
     source = store / 'node_modules'
-    source.mkdir()
-    if failure != 'empty':
+    if failure == 'dangling':
+        source.symlink_to(tmp_path / 'absent-packages')
+    elif failure != 'missing':
+        source.mkdir()
+    if failure not in ('missing', 'dangling', 'empty'):
         (source / 'package').mkdir()
         (source / 'package' / 'ready').touch()
     original_root = health._root
@@ -1610,8 +1613,9 @@ def test_initial_capture_failure_keeps_source_attribution(tmp_path, monkeypatch,
         run_worktrees.prepare_store(store, config=config, runner=Runner())
     message = str(caught.value)
     assert f"--worktree-link 'node_modules' source {str(source.absolute())!r}" in message
+    expected_reason = ('succeeded but did not create' if with_setup else 'No such file') if failure in ('missing', 'dangling') else ('empty' if failure == 'empty' else f'{failure} failure')
     for expected in (str(store.absolute()), '--worktree-setup CMD', "--worktree-setup 'npm ci'",
-                     '--worktree-setup-pr-local', 'empty' if failure == 'empty' else f'{failure} failure'):
+                     '--worktree-setup-pr-local', expected_reason):
         assert expected in message
     assert not config.claude_dir.exists()
     assert worktree_setup.read_setup_record(store) is None
@@ -1624,6 +1628,16 @@ def test_initial_capture_failure_keeps_source_attribution(tmp_path, monkeypatch,
         with run_worktrees.store_lock(store):
             health.begin_recovery(store, links, 'retry required')
         assert health.inspect(store, links)[2] == 'node_modules'
+        from coding_review_agent_loop import checkout_verification as cv
+        cv.reset_checkout_baselines()
+        without_setup = dataclasses.replace(config, worktree_setup=None)
+        with pytest.raises(AgentLoopError) as restarted:
+            run_worktrees.prepare_store(store, config=without_setup, runner=Runner())
+        assert f"--worktree-link 'node_modules' source {str(source.absolute())!r}" in str(restarted.value)
+        assert "--worktree-setup 'npm ci'" in str(restarted.value)
+        assert health.inspect(store, links)[2] == 'node_modules'
+        assert worktree_setup.read_setup_record(store) is None
+        assert not config.claude_dir.exists()
 
 
 @pytest.mark.parametrize('subcommand', ['issue', 'pr', 'task'])

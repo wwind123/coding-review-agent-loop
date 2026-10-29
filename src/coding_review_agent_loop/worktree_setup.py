@@ -738,7 +738,7 @@ def ensure_store_setup(store: Path, sha: str, *, free: bool, config: Any, runner
     Returns True when the command ran in this lock hold.
     """
     command = getattr(config, "worktree_setup", None)
-    from .worktree_link_integrity import ensure_health, publish, begin_recovery
+    from .worktree_link_integrity import ensure_health, publish, begin_recovery, refusal
     from .run_worktrees import _held_store_message, _require_lock_held, link_source_usable
 
     _require_lock_held(store)
@@ -778,10 +778,9 @@ def ensure_store_setup(store: Path, sha: str, *, free: bool, config: Any, runner
     run_setup_command(store, command, timeout_seconds=timeout)
     for link in links:
         if not link_source_usable(store, link):
-            raise AgentLoopError(
-                f"--worktree-link '{link}': the --worktree-setup command succeeded but did not create "
-                f"{store / link} in the shared clone {store}; no setup record was written."
-            )
+            reason = "the --worktree-setup command succeeded but did not create a usable source"
+            begin_recovery(store, links, reason, link=link)
+            raise AgentLoopError(refusal(store, link, reason))
     # Before the success record, so a crash in between only forces a rerun.
     _write_generated_ledger(store, _generated_after_setup(store, entries))
     health_generation = None
@@ -791,7 +790,6 @@ def ensure_store_setup(store: Path, sha: str, *, free: bool, config: Any, runner
         except (OSError, ValueError) as exc:
             link = getattr(exc, "link", links[0])
             begin_recovery(store, links, str(exc), link=link)
-            from .worktree_link_integrity import refusal
             raise AgentLoopError(refusal(store, link, str(exc))) from exc
     try:
         _write_setup_record(store, {

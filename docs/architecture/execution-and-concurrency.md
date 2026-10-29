@@ -71,7 +71,8 @@ state force operator setup even if the setup digest matches. Without setup,
 agent-loop refuses before creating a worktree or launching an agent, naming the
 absolute clone/source, relative link and reason. Initial capture failures preserve
 the failing source through root and optional-probe checks; failed setup output
-validation retains that source in the pending recovery record and repair message.
+validation, including missing or dangling outputs, retains that source in the
+pending recovery record and repair message across restart.
 Rerun once with a trusted
 `--worktree-setup CMD` that reinstalls or validates from the named clone root;
 for node_modules use `--worktree-setup 'npm ci'`. After manual repair use a real
@@ -149,7 +150,8 @@ ends no background child survives the store-lock release and the group ID
 cannot have been reused when it is signalled; on a host without `os.waitid`
 setup is refused before anything launches. A failure or timeout raises
 with the output tail, leaving no record; a success that still leaves a link
-source missing raises "succeeded but did not create" without a record. Dry-run
+source missing or dangling raises the common source-specific repair diagnostic,
+retaining the failing link in pending recovery without a setup-success record. Dry-run
 only logs. After linking, a read-only `git check-ignore --no-index` probe in the
 new worktree warns when a link is not ignored as a symlink (never failing,
 never writing ignore state), and with neither setup nor link flags a one-line
