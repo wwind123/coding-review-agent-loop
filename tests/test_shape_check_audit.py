@@ -833,11 +833,21 @@ def test_approved_followups_rewrapped_fix_scope_propagates(protocol_inventory):
         assert protocol_inventory.annotation(site.line) == "fatal:no-conservative-reading"
 
 
-def test_managed_test_command_call_is_handled(protocol_inventory):
-    assert IMPORTED_RAISERS["parse_managed_test_command"] == frozenset({"TestRuntimeConfigurationError"})
-    [site] = protocol_inventory.handled("_managed_test_wrapper_inner_command")
+@pytest.mark.parametrize("boundary", ["protocol-import", "runtime-parser"])
+def test_managed_test_command_call_is_handled(protocol_inventory, boundary):
+    if boundary == "protocol-import":
+        assert "_managed_test_wrapper_inner_command" in IMPORTED_NON_RAISERS
+        assert "parse_managed_test_command" not in IMPORTED_RAISERS
+        assert protocol_inventory.imported_functions["_managed_test_wrapper_inner_command"] == (
+            "test_runtime", "managed_test_wrapper_inner_command"
+        )
+        assert "_managed_test_wrapper_inner_command" not in SHAPE_CHECK_AUDIT
+        return
+    inventory = collect_module("test_runtime", PackageIndex().source("test_runtime"))
+    [site] = inventory.handled("managed_test_wrapper_inner_command")
     assert site.targets == ("parse_managed_test_command",)
-    assert "_managed_test_wrapper_inner_command" not in SHAPE_CHECK_AUDIT
+    assert {class_label(key) for key in site.classes} == {"TestRuntimeConfigurationError"}
+    assert not inventory.propagating("managed_test_wrapper_inner_command")
 
 
 def test_post_init_value_errors_are_not_sites(protocol_inventory):
