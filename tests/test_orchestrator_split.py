@@ -73,13 +73,15 @@ def test_registered_modules_respect_layering():
 
 
 def test_every_new_package_module_is_registered():
-    # These Git boundary helpers are package modules, not orchestrator moves.
-    independent_git_modules = {
+    # Git boundary and shared-source health helpers are independent package
+    # modules, not orchestrator moves subject to the extraction order.
+    independent_infrastructure_modules = {
         "secure_git", "git_transport", "git_windows_launcher", "inspect_git_subprocess",
         "transport_check",
+        "worktree_link_integrity",
     }
     problems = guard.unregistered_modules(
-        guard.package_module_names(), (*BASELINE["modules"], *independent_git_modules),
+        guard.package_module_names(), (*BASELINE["modules"], *independent_infrastructure_modules),
         guard.registered_module_names()
     )
     assert problems == []
