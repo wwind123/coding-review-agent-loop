@@ -789,9 +789,10 @@ def ensure_store_setup(store: Path, sha: str, *, free: bool, config: Any, runner
         try:
             health_generation = publish(store, links, config=config, setup_backed=True)["generation"]
         except (OSError, ValueError) as exc:
-            begin_recovery(store, links, "health publication failed")
+            link = getattr(exc, "link", links[0])
+            begin_recovery(store, links, str(exc), link=link)
             from .worktree_link_integrity import refusal
-            raise AgentLoopError(refusal(store, links[0], str(exc))) from exc
+            raise AgentLoopError(refusal(store, link, str(exc))) from exc
     try:
         _write_setup_record(store, {
             "version": SETUP_RECORD_VERSION,

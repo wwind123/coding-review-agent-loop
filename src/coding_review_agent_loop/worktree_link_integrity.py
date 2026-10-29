@@ -123,6 +123,23 @@ def _witness(root_fd: int, path: str) -> int:
         return stat.S_IFMT(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)
 
 
+class SourceHealthError(OSError):
+    """A capture failure attributed to its configured source."""
+
+    def __init__(self, link: str, cause: Exception):
+        super().__init__(str(cause))
+        self.link = link
+
+
+@contextlib.contextmanager
+def _capture_root(store: Path, link: str):
+    try:
+        with _root(store, link) as root:
+            yield root
+    except (OSError, ValueError) as exc:
+        raise SourceHealthError(link, exc) from exc
+
+
 def capture(store: Path, links: tuple[str, ...]) -> dict:
     """Select immutable probes breadth first, with roots reserved before optional work."""
     from .worktree_setup import _store_identity
@@ -133,7 +150,7 @@ def capture(store: Path, links: tuple[str, ...]) -> dict:
     queue = deque()
     counts = witnesses = 0
     for link in links:
-        with _root(store, link) as (fd, binding):
+        with _capture_root(store, link) as (fd, binding):
             source = {"binding": binding, "counts": [], "witnesses": []}
             data["sources"][link] = source
             if stat.S_ISDIR(os.fstat(fd).st_mode):
@@ -150,7 +167,7 @@ def capture(store: Path, links: tuple[str, ...]) -> dict:
     while queue:
         link, parent, entries = queue.popleft()
         source = data["sources"][link]
-        with _root(store, link) as (fd, binding):
+        with _capture_root(store, link) as (fd, binding):
             if binding != source["binding"]:
                 raise OSError("source changed during baseline selection")
             for name, kind in entries:
@@ -322,7 +339,7 @@ def begin_recovery(store: Path, links: tuple[str, ...], reason: str, *, link: st
                 "generation": secrets.token_hex(16), "sources": {}, "limited": False,
                 "state": "pending", "setup_backed": True}
     data["stale"] = reason[:2048]
-    data["stale_link"] = link if link in links else links[0]
+    data["stale_link"] = link if link in links else data.get("stale_link") or links[0]
     if _size(data) > HEALTH_RECORD_MAX_BYTES:
         raise AgentLoopError("stale source-health record exceeds byte budget")
     _write_private_json(path, data)
@@ -354,6 +371,7 @@ def ensure_health(
                 "damage is unknowable; use trusted reinstall if completeness is uncertain.")
             return None
         except (OSError, ValueError) as exc:
+            link = getattr(exc, "link", link)
             reason = str(exc)
     if reason and data is not None:
         mark_stale(store, links, reason, link=link)

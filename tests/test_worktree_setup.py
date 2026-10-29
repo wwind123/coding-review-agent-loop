@@ -1464,13 +1464,14 @@ def test_tracked_tree_probe_failure_names_the_checkout(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('with_setup', [False, True])
-def test_empty_source_rebuild_or_actionable_refusal(tmp_path, monkeypatch, with_setup):
+@pytest.mark.parametrize('links', [('node_modules',), ('.venv', 'node_modules')])
+def test_empty_source_rebuild_or_actionable_refusal(tmp_path, monkeypatch, with_setup, links):
     from coding_review_agent_loop import worktree_link_integrity as health
-    env = seeded(tmp_path, monkeypatch, gitignore='/node_modules\n')
-    store = env.seed_store('claude', venv=False)
+    env = seeded(tmp_path, monkeypatch, gitignore='/.venv\n/node_modules\n')
+    store = env.seed_store('claude', venv='.venv' in links)
     (store / 'node_modules').mkdir()
     command = setup_command(tmp_path / 'counter', 'mkdir -p node_modules && touch node_modules/package')
-    config = setup_config(env, command, links=('node_modules',))
+    config = setup_config(env, command, links=links)
     if not with_setup:
         config = dataclasses.replace(config, worktree_setup=None)
         with pytest.raises(AgentLoopError) as caught:
@@ -1483,7 +1484,7 @@ def test_empty_source_rebuild_or_actionable_refusal(tmp_path, monkeypatch, with_
         assert not config.claude_dir.exists()
     else:
         run_worktrees.prepare_store(store, config=config, runner=Runner())
-        assert health.inspect(store, ('node_modules',))[1] is None
+        assert health.inspect(store, links)[1] is None
         assert worktree_setup.read_setup_record(store)
 
 
@@ -1567,3 +1568,72 @@ def test_health_without_matching_setup_success_refuses_after_restart(tmp_path, m
         run_worktrees.prepare_store(store, config=without_setup, runner=Runner())
     run_worktrees.prepare_store(store, config=config, runner=Runner())
     assert health.inspect(store, ('.venv',))[1] is None
+
+
+@pytest.mark.parametrize('with_setup', [False, True])
+@pytest.mark.parametrize('failure', ['empty', 'root-open', 'root-count', 'nested-count', 'root-close'])
+@pytest.mark.parametrize('links', [('node_modules',), ('.venv', 'node_modules')])
+def test_initial_capture_failure_keeps_source_attribution(tmp_path, monkeypatch, with_setup, failure, links):
+    from contextlib import contextmanager
+    from coding_review_agent_loop import worktree_link_integrity as health
+    env = seeded(tmp_path, monkeypatch, gitignore='/.venv\n/node_modules\n')
+    store = env.seed_store('claude', venv='.venv' in links)
+    source = store / 'node_modules'
+    source.mkdir()
+    if failure != 'empty':
+        (source / 'package').mkdir()
+        (source / 'package' / 'ready').touch()
+    original_root = health._root
+    if failure in ('root-open', 'root-close'):
+        @contextmanager
+        def fail_root(root_store, link):
+            if link == 'node_modules' and failure == 'root-open':
+                raise OSError('root-open failure')
+            with original_root(root_store, link) as root:
+                yield root
+            if link == 'node_modules' and failure == 'root-close':
+                raise OSError('root-close failure')
+        monkeypatch.setattr(health, '_root', fail_root)
+    elif failure in ('root-count', 'nested-count'):
+        original_entries = health._entries
+        def fail_entries(fd, path, **kwargs):
+            # Identify the source by its anchored descriptor, including optional probes.
+            if (os.fstat(fd).st_ino == source.stat().st_ino and
+                    path == ('' if failure == 'root-count' else 'package')):
+                raise OSError(f'{failure} failure')
+            return original_entries(fd, path, **kwargs)
+        monkeypatch.setattr(health, '_entries', fail_entries)
+    config = setup_config(env, 'true', links=links)
+    if not with_setup:
+        config = dataclasses.replace(config, worktree_setup=None)
+    with pytest.raises(AgentLoopError) as caught:
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    message = str(caught.value)
+    assert f"--worktree-link 'node_modules' source {str(source.absolute())!r}" in message
+    for expected in (str(store.absolute()), '--worktree-setup CMD', "--worktree-setup 'npm ci'",
+                     '--worktree-setup-pr-local', 'empty' if failure == 'empty' else f'{failure} failure'):
+        assert expected in message
+    assert not config.claude_dir.exists()
+    assert worktree_setup.read_setup_record(store) is None
+    if with_setup:
+        data, reason, link = health.inspect(store, links)
+        assert data['state'] == 'pending'
+        assert data['stale_link'] == link == 'node_modules'
+        assert reason in message
+        # A subsequent recovery attempt must not replace the known failing source.
+        with run_worktrees.store_lock(store):
+            health.begin_recovery(store, links, 'retry required')
+        assert health.inspect(store, links)[2] == 'node_modules'
+
+
+@pytest.mark.parametrize('subcommand', ['issue', 'pr', 'task'])
+def test_cli_help_describes_link_health_recovery(subcommand, capsys):
+    with pytest.raises(SystemExit) as caught:
+        build_parser().parse_args([subcommand, '--help'])
+    assert caught.value.code == 0
+    text = ' '.join(capsys.readouterr().out.split())
+    assert 'reruns only' not in text
+    assert 'Directory sources must be nonempty' in text
+    assert 'damaged, stale or unknown source health' in text
+    assert 'legacy setup records without health' in text
+    assert 'Test dependencies in per-run worktrees' in text

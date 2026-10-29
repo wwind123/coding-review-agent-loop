@@ -69,7 +69,10 @@ nonempty manually managed sources bootstrap with a warning: historical partial
 damage cannot be proven absent. Empty sources, damaged health and durable stale
 state force operator setup even if the setup digest matches. Without setup,
 agent-loop refuses before creating a worktree or launching an agent, naming the
-absolute clone/source, relative link and reason. Rerun once with a trusted
+absolute clone/source, relative link and reason. Initial capture failures preserve
+the failing source through root and optional-probe checks; failed setup output
+validation retains that source in the pending recovery record and repair message.
+Rerun once with a trusted
 `--worktree-setup CMD` that reinstalls or validates from the named clone root;
 for node_modules use `--worktree-setup 'npm ci'`. After manual repair use a real
 validating command that exits nonzero for incomplete dependencies. Do not use a
