@@ -242,7 +242,8 @@ stops the repair chain on that candidate with no fallback model and takes the
 same route (one opted-in re-ask, otherwise a `semantic-evidence-rejection`
 stop), whatever the repair transport outcome (#999).
 
-PR follow-ups also opt into the same single semantic-evidence re-ask (#1738).
+PR follow-ups and both initial and coverage-reask implementation acquisitions
+opt into the same single semantic-evidence re-ask (#1738, #1768).
 Structured report partition and strict citation workdir guards run inside the
 validated acquisition, including normalized and repaired candidates. Only their
 typed report refusals join the re-askable reasons; operational and authorization
@@ -255,7 +256,16 @@ fallback takes that same route; dropping a malformed field cannot swallow a
 refusal or reset the allowance. Correction resumes the acquisition session when available and uses
 its own closed catalog. Only a fully validated replacement may publish progress
 or settle findings; terminal rejection and pushed-head recovery remain intact.
-Initial implementation handoffs gain no new retry policy.
+Exhausted initial implementation correction is a pre-authentication acquisition
+failure: no PR number is accepted or authenticated, no authorization audit or
+handoff is published, and no coverage continuation or confirmed-PR diagnostic
+is emitted. A remote unconfirmed PR may exist; operators must inspect it before
+rerunning instead of automatically creating a replacement. Exhausted coverage
+correction retains the invocation-failure discard and initial-result fallback.
+The original PR is re-authenticated after accepted or discarded coverage re-asks,
+so evidence binds to the refreshed head. Post-authentication validators remain
+as defence in depth with existing managed-CI audit and confirmed-PR diagnostics.
+Checkout and authorization failures never receive semantic correction.
 
 One launch state is not an authority decision at parse time (#1659): a passing,
 parent-observed selector whose only launch defect is `suite_start=unknown`

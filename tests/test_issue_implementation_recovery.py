@@ -355,6 +355,8 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
 def test_approved_plan_invalid_post_pr_observation_keeps_authorization_resumable(
     tmp_path, monkeypatch,
 ):
+    # Exercise the post-authentication defence independently of acquisition.
+    monkeypatch.setattr(issue_implementation, "_validate_followup_workdir_report", lambda parsed, **_k: parsed)
     runner = _IssueRecoveryWorkflowRunner(
         labeled=True,
         codex_outputs=[
@@ -1382,3 +1384,28 @@ def test_issue_scratch_input_report_stays_in_checkout(tmp_path, monkeypatch):
     assert run_issue_loop(runner, issue_number=56, config=config) == 0
     assert any(audit in comment for comment in runner.comments)
     assert not any('Out-of-checkout context runs' in comment for comment in runner.comments)
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_initial_report_correction_exhaustion_precedes_authentication(tmp_path, monkeypatch, managed):
+    from coverage_reask_helpers import CoverageHarness, response_text
+    from test_issue_implementation_coverage_reask import _report_refusal, _claude_commands
+    refused = _report_refusal(response_text())
+    h = CoverageHarness(tmp_path, monkeypatch, real_agent=True, applicable=False,
+                        managed_ci=managed, claude_outputs=[refused, refused])
+    if managed:
+        intent = ManagedCiCreationIntent(branch="agent-loop/managed-56", trusted_actor="agent-loop",
+                                        protection_mode="voluntary", audit_nonce="nonce")
+        monkeypatch.setattr(issue_implementation, "preflight_managed_ci_creation", lambda *_a, **_k: intent)
+    authenticated = []
+    monkeypatch.setattr(issue_implementation, "authenticate_issue_created_handoff", lambda *_a, **_k: authenticated.append(1))
+    with pytest.raises(AgentLoopError) as error:
+        h.run()
+    assert "semantic-evidence-rejection" in str(error.value)
+    assert "confirmed open" not in str(error.value)
+    assert "agent-loop pr 77" not in str(error.value)
+    assert len(_claude_commands(h)) == 2
+    assert not authenticated
+    assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _cwd in h.runner.commands)
+    assert not h.all_comments()
+    assert not h.run_pr_calls

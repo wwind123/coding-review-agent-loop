@@ -75,9 +75,8 @@ IMPORTED_RAISERS: dict[str, frozenset[str]] = {
     # (protocol_markers.py): the marker-neutralization defence.
     "sanitize_historical_text": frozenset({"AgentLoopError"}),
     "normalize_fix_scope": frozenset({"AgentLoopError"}),
-    "parse_managed_test_command": frozenset({"TestRuntimeConfigurationError"}),
 }
-IMPORTED_NON_RAISERS: frozenset[str] = frozenset()
+IMPORTED_NON_RAISERS: frozenset[str] = frozenset({"_managed_test_wrapper_inner_command"})
 
 
 SHAPE_CHECK_AUDIT: dict[str, ShapeCheckClassification] = {

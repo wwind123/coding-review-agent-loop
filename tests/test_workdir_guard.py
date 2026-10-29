@@ -1767,3 +1767,40 @@ def test_scratch_input_does_not_hide_outside_cwd_or_program(tmp_path, monkeypatc
             [f'{root}/scratch/run-audit.py tests/test_api.py --input {report}'],
             assigned_workdir=tmp_path / 'checkout',
         )
+
+
+@pytest.mark.parametrize("wrapper", ["{}", "agent-loop run-tests --timeout-seconds 180 --memory-dir /private/memory -- {}"])
+@pytest.mark.parametrize("booleans", ["--test", "--unknown-boolean --another-boolean --test"])
+def test_node_scratch_require_is_display_only(tmp_path, monkeypatch, wrapper, booleans):
+    root = tmp_path / "coding-review-agent-loop"
+    monkeypatch.setattr(workdir_guard, "scratch_root", lambda: root)
+    command = wrapper.format(f"node {booleans} --require {root}/scratch/issue-1868-local-assets.cjs tests/test_history_delete_frontend.js")
+    checkout = tmp_path / "checkout"
+    partition = workdir_guard.partition_reported_tests_by_workdir([command], assigned_workdir=checkout)
+    assert partition.in_checkout == (command,) and not partition.out_of_checkout
+    assert not workdir_guard.command_is_admissible_evidence(command, assigned_workdir=checkout)
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir([command], assigned_workdir=checkout)
+
+
+@pytest.mark.parametrize("operand", [
+    "--require /outside/shim.cjs", "/outside/test.js", "-- /outside/test.js",
+    "--config /outside/config.json",
+])
+@pytest.mark.parametrize("wrapper", ["{}", "agent-loop run-tests -- {}"])
+def test_unknown_boolean_keeps_outside_inputs_guarded(tmp_path, wrapper, operand):
+    command = wrapper.format(f"node --unknown --test {operand} tests/test_a.js")
+    with pytest.raises(AgentLoopError):
+        workdir_guard.partition_reported_tests_by_workdir([command], assigned_workdir=tmp_path / "checkout")
+
+
+@pytest.mark.parametrize("wrapper", ["{}", "agent-loop run-tests -- {}"])
+def test_unknown_boolean_outside_cwd_is_never_checkout_evidence(tmp_path, wrapper):
+    command = wrapper.format("node --unknown --test --cwd /outside tests/test_a.js")
+    checkout = tmp_path / "checkout"
+    partition = workdir_guard.partition_reported_tests_by_workdir([command], assigned_workdir=checkout)
+    assert not partition.in_checkout
+    assert partition.out_of_checkout == (command,)
+    assert not workdir_guard.command_is_admissible_evidence(command, assigned_workdir=checkout)
+    with pytest.raises(AgentLoopError):
+        validate_test_commands_within_workdir([command], assigned_workdir=checkout)

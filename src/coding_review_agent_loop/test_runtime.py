@@ -700,6 +700,17 @@ def parse_managed_test_command(
     )
 
 
+def managed_test_wrapper_inner_command(command: str) -> str | None:
+    """Project an exact report-side wrapper to broker argv, or fail closed."""
+    try:
+        parsed = parse_managed_test_command(
+            shlex.split(command), allow_command_name_launcher=True
+        )
+    except (ValueError, TestRuntimeConfigurationError):
+        return None
+    return shlex.join(parsed.inner_argv) if parsed is not None else None
+
+
 def _pinned_launcher_prefix() -> tuple[str, ...] | None:
     """The import-pinned running-install launcher prefix (#1632), or None."""
     from .agent_executable import agent_loop_launcher

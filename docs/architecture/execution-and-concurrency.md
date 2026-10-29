@@ -571,6 +571,19 @@ Generic equals-form values such as `--junitxml=/tmp/report.xml` and
 does not turn them into execution inputs. Known config and ignore option values
 remain guarded in both separate and equals forms.
 
+Report guards, protocol receipt matching and receipt rendering share the strict
+`test_runtime.py` managed wrapper grammar (#1768). Rendering projects original
+citation text before redaction and compares canonical redacted inner argv, also
+using that key for conflict detection. Equivalent wrapped and bare citations
+match broker journal argv without revealing wrapper memory locations; distinct
+inner argv or claims still conflict. No journal migration or path equivalence
+is introduced. Prefix execution inputs and sibling shell clauses remain guarded;
+malformed wrappers fail closed. Unknown long options without `=` never consume
+an option-shaped next token: `node --test --require <scratch-shim> tests/test.js`
+therefore retains its confined scratch value for display. The inner `--` still
+ends option scanning, and positional, config, cwd, program, traversal and symlink
+guards remain intact. Display acceptance grants no strict citation eligibility.
+
 ## Other Entry Paths
 
 - `discuss` coordinates non-implementation debate, with optional research,

@@ -87,6 +87,7 @@ from .test_runtime import (
     DEFAULT_TEST_TIMEOUT_SECONDS,
     TestRuntimeConfigurationError,
     managed_wrapper_traversal,
+    managed_test_wrapper_inner_command,
     parse_managed_test_invocation,
     resolve_timeout_seconds,
 )
@@ -237,12 +238,14 @@ def _render_test_observation_citations(
     citation_uses: dict[str, set[tuple[str, str]]] = {}
     for citation in citations:
         receipt_id = sanitize_historical_text(str(getattr(citation, "receipt_id", "")))
-        command = sanitize_historical_text(str(getattr(citation, "command", "")))
+        original = str(getattr(citation, "command", ""))
+        command = sanitize_historical_text(managed_test_wrapper_inner_command(original) or original)
         claim = sanitize_historical_text(str(getattr(citation, "claim", "")))
         safe_command, _identifiers, _caveats = redact_test_command(command)
         citation_uses.setdefault(receipt_id, set()).add((safe_command, claim))
     for citation in citations:
-        command = sanitize_historical_text(str(getattr(citation, "command", "")))
+        original = str(getattr(citation, "command", ""))
+        command = sanitize_historical_text(managed_test_wrapper_inner_command(original) or original)
         receipt_id = sanitize_historical_text(str(getattr(citation, "receipt_id", "")))
         claim = sanitize_historical_text(str(getattr(citation, "claim", "")))
         safe_command, _identifiers, _caveats = redact_test_command(command)

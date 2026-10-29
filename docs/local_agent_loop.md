@@ -7027,8 +7027,23 @@ repository, issue, base, label event, or exact-head fields never authorize
 managed CI. A rejected post-PR test report therefore stays rejected without a
 handoff or approval, while the same authorized head remains resumable.
 
-If structured response validation fails before a PR number is accepted, no
-creation authorization is synthesized from the rejected response. Recovery
+Initial and coverage-reask implementation reports receive one shared semantic
+correction allowance for report-workdir and selector refusals, including
+normalized or repaired candidates. Correction resumes the rejected session when
+available and must use correction-turn observations. A second refusal exhausts
+acquisition; it does not start another coverage re-ask.
+
+If initial correction is exhausted, structured validation fails before a PR
+number is accepted or authenticated. No creation authorization, handoff, coverage
+continuation or confirmed-PR recovery diagnostic is synthesized from rejected
+output. A remote unconfirmed PR may already exist: inspect the issue's open PRs
+and the reserved branch before rerunning, and use the same PR recovery path
+rather than creating a replacement. Exhausted coverage correction instead
+discards that response, falls back to the initial result and re-authenticates
+the original PR, including any head pushed during the failed acquisition.
+Post-authentication failures retain their authorization audit and confirmed-PR
+recovery guidance. Checkout and authorization errors gain no semantic retry.
+Recovery
 depends on the live protection assessment. For a voluntary or plan-limited
 base, a later issue-mode recovery uses the explicit fresh grant:
 

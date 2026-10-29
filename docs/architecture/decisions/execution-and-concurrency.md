@@ -32,3 +32,5 @@ never rewritten or deleted. The detail doc describes the current design.
 
 - Structured reports allow confined scratch option-value occurrences for display only; strict receipt evidence and failure authority remain unchanged (#1738).
 - Generic equals-form report and temporary-output values preserve their previous classification across display and strict guards; only recognized execution inputs receive general equals-form path extraction (#1738, #1743).
+
+- Report guards and receipt consumers share strict managed-wrapper interpretation; unknown long options never consume option-shaped next tokens, and canonical redacted inner argv correlate equivalent citations without granting scratch display inputs evidence authority (#1768).

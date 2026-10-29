@@ -17,7 +17,7 @@ from .test_runtime import (
     ManagedWrapperTraversal,
     TestRuntimeConfigurationError,
     managed_wrapper_traversal,
-    parse_managed_test_invocation,
+    parse_managed_test_command,
 )
 
 
@@ -875,8 +875,9 @@ def _scratch_option_values(tokens: Sequence[str], head: int | None) -> dict[int,
                 value_index = index if equals else index + 1
                 if not equals and value_index < len(tokens):
                     value = tokens[value_index]
-                    if value == "--":
-                        break
+                    if value.startswith("-"):
+                        index += 1
+                        continue
                 path = Path(value).expanduser()
                 if (
                     value and path.is_absolute() and ".." not in path.parts
@@ -1617,8 +1618,8 @@ def _validate_managed_command(
         prefix_len = _wrapper_traversal(tokens, managed=True).effective_head_index
         if prefix_len is None:
             return False
-        managed = parse_managed_test_invocation(
-            tokens[prefix_len:], allow_command_name_launcher=True
+        managed = parse_managed_test_command(
+            tokens, allow_command_name_launcher=True
         )
     except (ValueError, TestRuntimeConfigurationError):
         managed = None
