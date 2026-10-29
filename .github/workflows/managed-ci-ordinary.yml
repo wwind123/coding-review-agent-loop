@@ -27,6 +27,11 @@ on:
         type: number
         required: false
         default: 1
+      shard_timeout_minutes:
+        description: Maximum minutes for each test shard, including setup
+        type: number
+        required: false
+        default: 30
       durations_file:
         description: Optional caller-owned shard duration file (equal weights when absent)
         type: string
@@ -61,6 +66,7 @@ jobs:
     needs: plan
     name: Python ${{ inputs.python_version }} full suite (shard ${{ matrix.shard }}/${{ inputs.shards }})
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.shard_timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:

@@ -6887,6 +6887,36 @@ jobs:
       test_command: python -m pytest -n auto
 ```
 
+Both pinned reusable workflows, `managed-ci-ordinary.yml` and `managed-ci.yml`,
+expose optional numeric `shard_timeout_minutes`, default **30**. This is the
+runner job's `timeout-minutes` for every test shard, including the default
+single-shard suite. Repository `ci.yml` callers omit the input and use that
+default. External consumers must update the pinned callee revision to a commit
+containing this input before using it. For a legitimate single-shard suite
+that needs a longer budget, add the following to **both** caller routes' `with`
+blocks (ordinary `ci` and `managed`), coordinating their pinned revisions:
+
+```yaml
+      shards: 1
+      shard_timeout_minutes: 60
+```
+
+The selected shard job budget is independent of the local CI watch. The
+30-minute default exceeds `--ci-timeout-seconds 1200` (20 minutes); local watch
+expiry does not cancel hosted CI. For the default job budget, for example,
+select `--ci-timeout-seconds 2400`, allowing additional time for validation,
+queueing, setup, aggregation and publication. This is an example, not a guarantee
+under arbitrary queue delays. Larger consumer budgets need a correspondingly
+longer watch plus that overhead. CLI defaults remain unchanged.
+
+A failed per-test timeout or a shard job timeout reaches the always-evaluated
+aggregate, whose literal all-shards-success gate fails before the coverage
+verifier. For an authorized managed dispatch, the existing publisher then
+posts failure for the validated exact head. Whole-run cancellation, runner loss
+and status API failure can prevent publication; use the existing managed-CI
+recovery guidance for those cases. Local workflow harnesses check the wiring
+and simulated outcomes, not GitHub-hosted timeout enforcement.
+
 An integration-base PR is deliberately not suppressed (the expression only
 suppresses when the base is the default branch), so its ordinary CI stays
 informational and is never the trusted gate.
@@ -9804,6 +9834,19 @@ failure leaves no record; under `--quiet` the summary is the only record.
 Movement of the checkout after capture is not detected.
 
 ## Runtime-aware local test timeouts
+
+Repository pytest runs default to 600 seconds per test with
+`timeout_method = signal`, covering fixture setup, call and teardown together.
+On Linux this raises a normal named failure in serial pytest and xdist workers,
+so the log identifies the hung test. The 600-second limit gives conservative
+headroom over legitimate slow tests (committed timings approached 181 seconds).
+A short `--timeout` override can diagnose a hang without waiting ten minutes.
+Signal requires SIGALRM and the main thread; pytest-timeout falls back to the
+thread method outside the main thread. On platforms without SIGALRM, explicitly
+select `--timeout-method=thread`: it dumps stacks and aborts the process rather
+than producing a normal failure, and xdist may restart the worker. Do not disable
+timeout protection to hide hangs. This per-test policy is distinct from the
+whole-command watchdog and the hosted shard job budget described above.
 
 The run-level command ceiling is configured with
 `--coder-test-command-timeout-seconds SECONDS` and defaults to 1,800 seconds.

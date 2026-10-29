@@ -2168,6 +2168,12 @@ python -m pip install -e '.[dev]'
 python -m pytest
 ```
 
+Repository tests have a 600-second per-test signal timeout, including fixture
+setup and teardown. Both reusable CI workflows default to a 30-minute shard
+job ceiling and accept the optional numeric `shard_timeout_minutes` input.
+See the [CI budget and consumer guidance](docs/local_agent_loop.md#managed-exact-head-ci)
+for longer consumer budgets and the independent local CI watch.
+
 Use focused tests while changing one subsystem, for example:
 
 ```bash
