@@ -1719,3 +1719,21 @@ def test_docs_describe_worktree_setup_generated_keys_and_timeout():
         if getattr(action, "choices", None) and "issue" in action.choices
     )
     assert "--worktree-setup-timeout" in issue_help
+
+
+def test_ci_timeout_policy_and_consumer_budget_guidance():
+    text = LOCAL_AGENT_LOOP_DOC.read_text()
+    start = text.index("Both pinned reusable workflows,")
+    section = text[start:text.index("An integration-base PR", start)]
+    for phrase in (
+        "`managed-ci-ordinary.yml` and `managed-ci.yml`",
+        "optional numeric `shard_timeout_minutes`, default **30**",
+        "single-shard suite", "update the pinned callee revision",
+        "**both** caller routes", "shard_timeout_minutes: 60",
+        "--ci-timeout-seconds 1200", "--ci-timeout-seconds 2400",
+        "expiry does not cancel hosted CI", "validation,", "queueing, setup, aggregation and publication",
+        "Larger consumer budgets", "Whole-run cancellation, runner loss",
+    ):
+        assert phrase in section
+    for phrase in ("600 seconds", "timeout_method = signal", "setup, call and teardown", "--timeout-method=thread"):
+        assert phrase in text

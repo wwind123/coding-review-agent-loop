@@ -2421,3 +2421,21 @@ def test_dispatch_validator_rejects_the_rerun_attempt_against_a_published_failur
     assert published_failure["terminal_attempts"] == []
     with pytest.raises(ValueError):
         _dispatch_validate(record=published_failure, current_run_attempt="2")
+
+
+@pytest.mark.parametrize("test_result", ["failure", "cancelled", "timed_out", "success"])
+def test_single_workflow_timeout_status_is_bound_to_validated_head(monkeypatch, test_result):
+    # timed_out is a conclusion/payload seam only, never needs.<job>.result.
+    requests, code, _out, _sleeps = _v2_publish_result(monkeypatch, TEST_RESULT=test_result)
+    assert code == 0 and len(requests) == 1
+    assert requests[0].full_url == STATUS_URL
+    payload = json.loads(requests[0].data)
+    expected = "success" if test_result == "success" else "failure"
+    assert payload["state"] == expected
+    assert payload["description"] == "nonce=" + "n" * 32 + ";run_id=200;attempt=1;result=" + expected
+    assert payload["target_url"] == "https://github.com/OWNER/REPO/actions/runs/200"
+
+    requests, code, _out, _sleeps = _v2_publish_result(
+        monkeypatch, TEST_RESULT=test_result, VALIDATION_RESULT="failure",
+    )
+    assert (requests, code) == ([], 0)

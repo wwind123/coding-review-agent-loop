@@ -184,6 +184,15 @@ The whole boundary is a reusable `workflow_call` workflow
 exactly the permissions the callee jobs need; the dispatch must execute from the
 live default branch, whose head the intent's `workflow_revision` is bound to.
 The ordinary `Python 3.12 full suite` check is sharded the same way.
+Both reusable workflows expose an optional numeric `shard_timeout_minutes`
+input controlling the runner job ceiling for every shard, including single-shard
+callers. A shard timeout flows through the existing always-evaluated aggregate
+and its literal success gate; an authorized managed run then publishes failure
+for the validated target. Authorization and exactly-once coverage remain
+prerequisites for success. The hosted job ceiling is independent of the local CI
+watch, whose expiry does not cancel hosted execution. Whole-run cancellation,
+runner loss and status API outages can still prevent terminal publication.
+See the CLI guide for defaults, consumer pin updates and budget sizing.
 Split layout: an adopter whose tests need services or a routed matrix
 composes `managed-ci-validate.yml` (read-only; its validator step is byte-identical
 to the single-job workflow), caller-owned read-only test jobs, and

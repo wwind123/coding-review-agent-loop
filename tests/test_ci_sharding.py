@@ -905,3 +905,49 @@ def test_callee_files_depend_only_on_the_standard_library_and_pytest():
             elif isinstance(node, ast.ImportFrom):
                 imported.add((node.module or "").split(".")[0])
         assert imported <= set(sys.stdlib_module_names) | {"__future__"} | allowed, (name, imported)
+
+
+@pytest.mark.parametrize("workflow,job", [(ORDINARY_WORKFLOW, "test-shard"), (MANAGED_WORKFLOW, "exact-head-shard")], ids=["ordinary", "managed"])
+@pytest.mark.parametrize("shards", [None, 3], ids=["default-single", "multi"])
+@pytest.mark.parametrize("budget", [None, 60], ids=["default-budget", "consumer-budget"])
+def test_reusable_shard_budget_routing(workflow, job, shards, budget):
+    document = yaml.safe_load(workflow.read_text())
+    # PyYAML follows YAML 1.1, which treats the unquoted on key as True.
+    inputs = document.get("on", document.get(True))["workflow_call"]["inputs"]
+    declaration = inputs["shard_timeout_minutes"]
+    assert declaration["type"] == "number"
+    assert declaration["required"] is False
+    assert type(declaration["default"]) is int and declaration["default"] == 30
+    assert inputs["shards"]["default"] == 1
+    runner = _jobs(workflow)[job]
+    assert runner["timeout-minutes"] == "${{ inputs.shard_timeout_minutes }}"
+    assert runner["strategy"]["fail-fast"] is False
+    selected_shards = int(inputs["shards"]["default"]) if shards is None else shards
+    selected_budget = int(declaration["default"]) if budget is None else budget
+    # Bounded expression resolution, shared by every matrix leg, including 1.
+    for _ in range(selected_shards):
+        assert int(_expand(runner["timeout-minutes"], {"inputs.shard_timeout_minutes": selected_budget})) == (30 if budget is None else 60)
+
+
+def test_repository_callers_use_reusable_budget_defaults():
+    jobs = _jobs(ROOT / ".github" / "workflows" / "ci.yml")
+    for caller, workflow in [("ci", ORDINARY_WORKFLOW), ("managed", MANAGED_WORKFLOW)]:
+        job = jobs[caller]
+        assert job["uses"] == f"./.github/workflows/{workflow.name}"
+        assert "shard_timeout_minutes" not in job["with"]
+        assert "timeout-minutes" not in job
+        assert job["with"]["shards"] == 3
+
+
+def test_actual_publisher_scheduling_and_validated_bindings():
+    job = _job_block("managed", "publish-exact-head")
+    assert job["needs"] == ["validate-managed", "exact-head"]
+    condition = _if_expression(job)
+    validation_condition = _if_expression(_job_block("managed", "validate-managed"))
+    assert condition == "always() && " + validation_condition
+    assert job["permissions"] == {"statuses": "write"}
+    env = job["steps"][0]["env"]
+    assert env["TEST_RESULT"] == "${{ needs.exact-head.result }}"
+    assert env["VALIDATION_RESULT"] == "${{ needs.validate-managed.result }}"
+    assert env["TARGET_SHA"] == "${{ needs.validate-managed.outputs.target_sha }}"
+    assert env["NONCE"] == "${{ needs.validate-managed.outputs.managed_nonce }}"

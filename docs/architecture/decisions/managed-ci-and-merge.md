@@ -23,3 +23,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Recovery rendering and workflow-mirrored intent validation are pure sibling modules; `managed_ci.py` retains I/O, freshness and authorization gates and re-exports every moved binding (#1692).
 
 - Same-head managed repair recovery observes an authenticated later successful attempt of the recorded run through a separate immutable result, preserving fresh-generation dispatch authority and carrying original result identity into automatic proof and manual publication (#1709).
+
+- Reusable ordinary and managed shard jobs share an optional consumer-selected job budget; named pytest timeouts and the outer shard ceiling address different hangs while preserving aggregate and authorization gates, and local CI watching remains independent (#1769).
