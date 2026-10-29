@@ -1850,6 +1850,11 @@ def _ensure_run_worktree(
     run_worktrees.prune_dead_worktrees(store, runs_root, path, config=config, runner=runner)
     with run_worktrees.store_lock(store):
         if config.worktree_links:
+            from .worktree_link_integrity import ensure_health
+            error = ensure_health(store, tuple(config.worktree_links), config=config,
+                                  setup_backed=bool(config.worktree_setup), bootstrap=False)
+            if error:
+                raise AgentLoopError(error)
             run_worktrees.check_link_sources(store, config.worktree_links)
         if not os.path.lexists(path):
             run_worktrees.add_run_worktree(store, path, sha, config=config, runner=runner)
@@ -1874,10 +1879,10 @@ def _ensure_run_worktree(
             digest, entries = _environment_digest(store, sha, config=config, runner=runner)
             register_worktree_links(
                 path, mapping, pr_local=True, writable=worktree_writable(config, agent),
-                base_digest=digest, key_entries=entries,
+                base_digest=digest, key_entries=entries, shared_store=store,
             )
         else:
-            register_worktree_links(path, mapping)
+            register_worktree_links(path, mapping, shared_store=store)
         run_worktrees.warn_unignored_links(path, store, config.worktree_links, config=config, runner=runner)
     _sync_base_branch(path, label=label, default_owned=True, config=config, runner=runner)
 

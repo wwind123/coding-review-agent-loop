@@ -37,6 +37,57 @@ any worktree. The outermost `workdir_claim_scope` runs registered finalizers
 failure. At startup a run prunes worktrees whose owner record matches and whose
 claim lock is free; unrecognized entries are logged and left untouched.
 
+**Shared link source health (`worktree_link_integrity.py`, #1775).**
+
+Shared link sources now require nonempty directory outputs. Agent-loop records
+bounded structural health in private `link-health.json` beside `setup.json`,
+binding the store identity, configured links, source identities, generation,
+selected probes and stale reason. Publication is atomic, mode 0600 and fsynced.
+Startup and the second store-lock hold before worktree creation check health;
+every checked backend attempt checks still-shared sources before launch. The
+post-turn check inspects the original sources even after link replacement,
+reconciliation failure or sticky checkout poison. Under the store lock it
+revalidates current health, preserving healthy newer setup generations, and
+marks damage stale without deleting the generated-key ledger. No lock spans
+an agent turn. A poisoned run remains poisoned after source repair.
+
+Checks read no dependency-file contents: at most 64 selected directory counts,
+128 children per count (8192 entries total), 128 saved path/type witnesses and
+probe depth 4 (counted children can reach depth 5). The scan payload is at most
+32 KiB and complete record at most 64 KiB. Roots reserve counts first; optional
+probes use breadth-first selection. Large healthy trees reduce coverage and
+log limitations instead of being refused. Baselines are never resampled on
+reuse. Additions and content/mtime changes do not rebase counts. Counts capped
+at 128 detect decreases only below their recorded value. Unselected/deeper
+deletion, same-count substitution, overwritten bytes and damage behind interior
+symlinks exceed the guarantee. Interior symlinks and substituted probe ancestors
+are not traversed. Unsafe, unreadable, unstable or malformed required health
+refuses reuse; more than 64 directory roots is a configuration error.
+
+Legacy setup-backed stores rebuild once to establish health. Inspectable,
+nonempty manually managed sources bootstrap with a warning: historical partial
+damage cannot be proven absent. Empty sources, damaged health and durable stale
+state force operator setup even if the setup digest matches. Without setup,
+agent-loop refuses before creating a worktree or launching an agent, naming the
+absolute clone/source, relative link and reason. Rerun once with a trusted
+`--worktree-setup CMD` that reinstalls or validates from the named clone root;
+for node_modules use `--worktree-setup 'npm ci'`. After manual repair use a real
+validating command that exits nonzero for incomplete dependencies. Do not use a
+no-op command or delete health records. Only successful setup with validated
+nonempty outputs clears stale state; setup success is published last and must
+match the health generation before setup-backed sources can be reused. Pending
+recovery records retain store/configuration identity but cannot authorize reuse. Failed or
+interrupted recovery retains health history and generated-key protections.
+
+Shared symlinks still permit write-through. Same-user chmod/symlinks cannot
+provide per-turn isolation, and permissive backend launches have no common
+read-only mount boundary. Agent-loop does not recursively chmod dependencies or
+install mount infrastructure. Use `--worktree-setup-pr-local` for opt-in writable
+per-run dependencies. Already-running consumers can observe damage before the
+next check. Bounded post-turn lock waits and intentionally empty shared caches
+remain future work. Explicit directories and dry-run retain their behavior;
+private paths are excluded from shared-source attribution.
+
 **Operator worktree setup (`worktree_setup.py`).** `--worktree-setup CMD`
 is an operator CLI flag, never read from repository configuration. Inside
 `prepare_store`'s single store-lock hold, after `_fetch_and_pin` returns the
@@ -51,8 +102,8 @@ bytes. The success record is `<lock root>/workdir-stores/<store-key>/setup.json`
 zero exit) and holds the digest, command hash, base SHA and the store root's
 dev/ino as a secondary check. Setup is required when the record is missing,
 unreadable or different, or when any `--worktree-link` source fails the shared
-`link_source_usable` predicate (`os.path.exists`, so a dangling source symlink
-counts as missing); `_prepare_store_locked` deletes the record and the generated-key ledger before it
+`link_source_usable` predicate (a dangling source symlink counts as missing),
+or persisted source health requires recovery; `_prepare_store_locked` deletes the record and the generated-key ledger before it
 removes a stale store or clones a missing one. With `--worktree-setup`, a store whose
 index or HEAD commit still holds tracked paths (only an unborn HEAD with an
 empty index counts as artifact-only, and an inspection failure counts as

@@ -39,7 +39,7 @@ from test_run_worktrees import STORE_HOLDER, Env, RecordingRunner, child_env, gi
 # --- helpers ---------------------------------------------------------------
 
 
-def setup_command(counter: Path, tail: str = "mkdir -p .venv") -> str:
+def setup_command(counter: Path, tail: str = "mkdir -p .venv && touch .venv/ready") -> str:
     # Keep a tail's background operator from also backgrounding the counter
     # write: process-group cleanup may kill that job before it records the run.
     return f'echo "$PWD" >> {shlex.quote(str(counter))} && {{ {tail}\n}}'
@@ -152,7 +152,7 @@ def test_key_or_command_change_reruns_setup_from_pinned_blobs(tmp_path, monkeypa
     assert git(store, "rev-parse", "HEAD") == second
     assert (store / "requirements.txt").read_text() == "pytest==2\n"
 
-    changed = dataclasses.replace(config, worktree_setup=setup_command(counter, "mkdir -p .venv && true"))
+    changed = dataclasses.replace(config, worktree_setup=setup_command(counter, "mkdir -p .venv && touch .venv/ready && true"))
     run_worktrees.prepare_store(store, config=changed, runner=Runner())
     assert runs_in(counter, store) == 3
     assert worktree_setup.read_setup_record(store)["command_sha256"] == worktree_setup.command_hash(
@@ -418,10 +418,10 @@ def test_tracked_modification_stops_required_setup_before_invalidation(tmp_path,
 def test_concurrent_runs_on_one_store_set_up_once(tmp_path, monkeypatch):
     env = seeded(tmp_path, monkeypatch)
     counter = tmp_path / "counter"
-    config = setup_config(env, setup_command(counter, "sleep 1 && mkdir -p .venv"))
+    config = setup_config(env, setup_command(counter, "sleep 1 && mkdir -p .venv && touch .venv/ready"))
     store = claude_store()
     run_worktrees.prepare_store(  # clone once so both threads contend only on setup
-        store, config=dataclasses.replace(config, worktree_setup=None), runner=Runner()
+        store, config=dataclasses.replace(config, worktree_setup=None, worktree_links=()), runner=Runner()
     )
     errors: list[BaseException] = []
     barrier = threading.Barrier(2)
@@ -553,7 +553,7 @@ def test_missing_store_clone_deletes_leftover_record(tmp_path, monkeypatch):
 def test_unusable_link_source_forces_setup_despite_matching_record(tmp_path, monkeypatch, damage):
     env = seeded(tmp_path, monkeypatch)
     counter = tmp_path / "counter"
-    recreate = '{ if [ -L .venv ]; then mkdir -p "$(readlink .venv)"; else mkdir -p .venv; fi; }'
+    recreate = '{ if [ -L .venv ]; then mkdir -p "$(readlink .venv)" && touch .venv/ready; else mkdir -p .venv && touch .venv/ready; fi; }'
     config = setup_config(env, setup_command(counter, recreate))
     with workdir_claim_scope(command="task"):
         prepare_full(config)
@@ -945,7 +945,7 @@ HINT = "may have been created by the --worktree-setup command itself"
 def lock_command(counter: Path, content: str = "gen-1", tail: str = "") -> str:
     """Write the untracked lockfile (only while the repository tracks none), like npm install."""
     write = f"if ! git ls-files --error-unmatch {LOCK} >/dev/null 2>&1; then printf {content} > {LOCK}; fi"
-    return setup_command(counter, f"{write}; mkdir -p .venv{tail}")
+    return setup_command(counter, f"{write}; mkdir -p .venv && touch .venv/ready{tail}")
 
 
 def lock_config(env: Env, command: str):
@@ -1050,11 +1050,11 @@ def test_operator_placed_absent_key_still_stops_with_hint(tmp_path, monkeypatch,
     config = lock_config(env, setup_command(counter))  # never writes the lockfile
     store = claude_store()
     if before_first:
-        run_worktrees.prepare_store(store, config=dataclasses.replace(config, worktree_setup=None), runner=Runner())
+        run_worktrees.prepare_store(store, config=dataclasses.replace(config, worktree_setup=None, worktree_links=()), runner=Runner())
     else:
         run_worktrees.prepare_store(store, config=config, runner=Runner())
         assert ledger(store) == {}
-        config = dataclasses.replace(config, worktree_setup=setup_command(counter, "mkdir -p .venv && true"))
+        config = dataclasses.replace(config, worktree_setup=setup_command(counter, "mkdir -p .venv && touch .venv/ready && true"))
     runs = runs_in(counter, store)
     (store / LOCK).write_text("planted")
     with pytest.raises(AgentLoopError, match="absent at the base commit") as caught:
@@ -1228,7 +1228,7 @@ def test_record_without_a_ledger_still_matches(tmp_path, monkeypatch):
     run_worktrees.prepare_store(store, config=config, runner=Runner())
     worktree_setup.generated_ledger_path(store).unlink()
     record = worktree_setup.read_setup_record(store)
-    assert set(record) == {"version", "digest", "command_sha256", "base_sha", "store_identity", "completed_at"}
+    assert set(record) == {"version", "digest", "command_sha256", "base_sha", "store_identity", "completed_at", "health_generation"}
     run_worktrees.prepare_store(store, config=config, runner=Runner())
     assert runs_in(counter, store) == 1
 
@@ -1408,7 +1408,7 @@ def test_shared_clone_setup_timeout_names_the_flag(tmp_path, monkeypatch):
     env = seeded(tmp_path, monkeypatch)
     counter = tmp_path / "counter"
     config = dataclasses.replace(
-        setup_config(env, setup_command(counter, "mkdir -p .venv; sleep 30 & sleep 30")),
+        setup_config(env, setup_command(counter, "mkdir -p .venv && touch .venv/ready; sleep 30 & sleep 30")),
         worktree_setup_timeout_seconds=1, coder_test_command_timeout_seconds=600,
     )
     store = claude_store()
@@ -1461,3 +1461,109 @@ def test_tracked_tree_probe_failure_names_the_checkout(tmp_path, monkeypatch):
     message = str(run.value)
     assert message.startswith(f"Could not verify the tracked tree of the run worktree {run_path} ")
     assert "shared clone" not in message
+
+
+@pytest.mark.parametrize('with_setup', [False, True])
+def test_empty_source_rebuild_or_actionable_refusal(tmp_path, monkeypatch, with_setup):
+    from coding_review_agent_loop import worktree_link_integrity as health
+    env = seeded(tmp_path, monkeypatch, gitignore='/node_modules\n')
+    store = env.seed_store('claude', venv=False)
+    (store / 'node_modules').mkdir()
+    command = setup_command(tmp_path / 'counter', 'mkdir -p node_modules && touch node_modules/package')
+    config = setup_config(env, command, links=('node_modules',))
+    if not with_setup:
+        config = dataclasses.replace(config, worktree_setup=None)
+        with pytest.raises(AgentLoopError) as caught:
+            run_worktrees.prepare_store(store, config=config, runner=Runner())
+        message = str(caught.value)
+        for expected in (str(store.absolute()), str((store / 'node_modules').absolute()),
+                         'node_modules', 'empty', '--worktree-setup CMD', "--worktree-setup 'npm ci'",
+                         '--worktree-setup-pr-local', 'exits nonzero'):
+            assert expected in message
+        assert not config.claude_dir.exists()
+    else:
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+        assert health.inspect(store, ('node_modules',))[1] is None
+        assert worktree_setup.read_setup_record(store)
+
+
+@pytest.mark.parametrize('failure', ['exit', 'empty', 'interrupt', 'publication'])
+def test_stale_recovery_failure_retains_history_and_ledger(tmp_path, monkeypatch, failure):
+    from coding_review_agent_loop import worktree_link_integrity as health
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / 'counter'
+    config = setup_config(env, setup_command(counter))
+    store = claude_store()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    ledger = worktree_setup.generated_ledger_path(store).read_bytes()
+    with run_worktrees.store_lock(store):
+        health.mark_stale(store, ('.venv',), 'turn damage')
+    if failure == 'exit':
+        monkeypatch.setattr(worktree_setup, 'run_setup_command', lambda *a, **k: (_ for _ in ()).throw(AgentLoopError('setup exited 1')))
+    elif failure == 'interrupt':
+        monkeypatch.setattr(worktree_setup, 'run_setup_command', lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+    elif failure == 'empty':
+        def empty(*a, **k):
+            shutil.rmtree(store / '.venv')
+            (store / '.venv').mkdir()
+        monkeypatch.setattr(worktree_setup, 'run_setup_command', empty)
+    else:
+        monkeypatch.setattr(health, 'publish', lambda *a, **k: (_ for _ in ()).throw(OSError('publication failed')))
+    with pytest.raises((AgentLoopError, KeyboardInterrupt)):
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert worktree_setup.read_setup_record(store) is None
+    assert worktree_setup.generated_ledger_path(store).read_bytes() == ledger
+    assert health.inspect(store, ('.venv',))[1]
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'dirty', 'held', 'success-record'])
+def test_stale_recovery_guards_and_success_publication(tmp_path, monkeypatch, failure):
+    from contextlib import contextmanager
+    from coding_review_agent_loop import worktree_link_integrity as health
+    env = seeded(tmp_path, monkeypatch)
+    counter = tmp_path / 'counter'
+    config = setup_config(env, setup_command(counter))
+    store = claude_store()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    ledger = worktree_setup.generated_ledger_path(store).read_bytes()
+    with run_worktrees.store_lock(store):
+        health.mark_stale(store, ('.venv',), 'damaged by another run')
+    if failure == 'timeout':
+        config = dataclasses.replace(config, worktree_setup=setup_command(counter, 'sleep 30'),
+                                     worktree_setup_timeout_seconds=1)
+    elif failure == 'dirty':
+        (store / 'a.txt').write_text('operator changes')
+    elif failure == 'held':
+        @contextmanager
+        def held(_store):
+            yield False
+        monkeypatch.setattr(run_worktrees, 'probe_free_claim', held)
+    else:
+        def refuse(*a, **k):
+            raise OSError('success record publication failed')
+        monkeypatch.setattr(worktree_setup, '_write_setup_record', refuse)
+    with pytest.raises((AgentLoopError, OSError)):
+        run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert worktree_setup.read_setup_record(store) is None
+    assert worktree_setup.generated_ledger_path(store).read_bytes() == ledger
+    assert health.inspect(store, ('.venv',))[1]
+    if failure in ('dirty', 'held'):
+        assert runs_in(counter, store) == 1
+
+
+def test_health_without_matching_setup_success_refuses_after_restart(tmp_path, monkeypatch):
+    from coding_review_agent_loop import checkout_verification as cv, worktree_link_integrity as health
+    env = seeded(tmp_path, monkeypatch)
+    config = setup_config(env, setup_command(tmp_path / 'counter'))
+    store = claude_store()
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    data = worktree_setup._read_private_json(health.health_path(store))
+    assert data['setup_backed']
+    assert worktree_setup.read_setup_record(store)['health_generation'] == data['generation']
+    worktree_setup.setup_record_path(store).unlink()  # crash between the two publications
+    cv.reset_checkout_baselines()
+    without_setup = dataclasses.replace(config, worktree_setup=None)
+    with pytest.raises(AgentLoopError, match='setup success is missing'):
+        run_worktrees.prepare_store(store, config=without_setup, runner=Runner())
+    run_worktrees.prepare_store(store, config=config, runner=Runner())
+    assert health.inspect(store, ('.venv',))[1] is None

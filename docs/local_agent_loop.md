@@ -1388,8 +1388,8 @@ agent-loop issue 123 --repo OWNER/REPO \
   run with a message naming the flag. Managed-CI recovery commands keep it.
 - It runs again only when the command string or a key entry at the newly
   pinned base commit changes, when a `--worktree-link` source is missing or
-  is a dangling symlink, or when agent-loop (re-)creates the clone. Without
-  keys it runs once per clone lifetime. Setup is rechecked at every base pin,
+  is a dangling symlink, when source health is damaged/stale/unknown, or when agent-loop (re-)creates the clone. Without
+  keys it runs once per clone lifetime unless source health requires recovery. Setup is rechecked at every base pin,
   including the base sync just before implementation; PR-head checkouts keep
   the base environment.
 - The store lives under `/tmp` and is wiped on reboot; the next run simply
@@ -1455,6 +1455,57 @@ agent-loop issue 123 --repo OWNER/REPO \
   prints `agent-loop managed-pr --head <branch> --expected-closing-issue N` as
   the resume and the manual `git -C <store> worktree remove --force <run-worktree>`
   cleanup; agent-loop never removes that worktree itself.
+
+#### Shared source integrity and recovery
+
+Shared link sources now require nonempty directory outputs. Agent-loop records
+bounded structural health in private `link-health.json` beside `setup.json`,
+binding the store identity, configured links, source identities, generation,
+selected probes and stale reason. Publication is atomic, mode 0600 and fsynced.
+Startup and the second store-lock hold before worktree creation check health;
+every checked backend attempt checks still-shared sources before launch. The
+post-turn check inspects the original sources even after link replacement,
+reconciliation failure or sticky checkout poison. Under the store lock it
+revalidates current health, preserving healthy newer setup generations, and
+marks damage stale without deleting the generated-key ledger. No lock spans
+an agent turn. A poisoned run remains poisoned after source repair.
+
+Checks read no dependency-file contents: at most 64 selected directory counts,
+128 children per count (8192 entries total), 128 saved path/type witnesses and
+probe depth 4 (counted children can reach depth 5). The scan payload is at most
+32 KiB and complete record at most 64 KiB. Roots reserve counts first; optional
+probes use breadth-first selection. Large healthy trees reduce coverage and
+log limitations instead of being refused. Baselines are never resampled on
+reuse. Additions and content/mtime changes do not rebase counts. Counts capped
+at 128 detect decreases only below their recorded value. Unselected/deeper
+deletion, same-count substitution, overwritten bytes and damage behind interior
+symlinks exceed the guarantee. Interior symlinks and substituted probe ancestors
+are not traversed. Unsafe, unreadable, unstable or malformed required health
+refuses reuse; more than 64 directory roots is a configuration error.
+
+Legacy setup-backed stores rebuild once to establish health. Inspectable,
+nonempty manually managed sources bootstrap with a warning: historical partial
+damage cannot be proven absent. Empty sources, damaged health and durable stale
+state force operator setup even if the setup digest matches. Without setup,
+agent-loop refuses before creating a worktree or launching an agent, naming the
+absolute clone/source, relative link and reason. Rerun once with a trusted
+`--worktree-setup CMD` that reinstalls or validates from the named clone root;
+for node_modules use `--worktree-setup 'npm ci'`. After manual repair use a real
+validating command that exits nonzero for incomplete dependencies. Do not use a
+no-op command or delete health records. Only successful setup with validated
+nonempty outputs clears stale state; setup success is published last and must
+match the health generation before setup-backed sources can be reused. Pending
+recovery records retain store/configuration identity but cannot authorize reuse. Failed or
+interrupted recovery retains health history and generated-key protections.
+
+Shared symlinks still permit write-through. Same-user chmod/symlinks cannot
+provide per-turn isolation, and permissive backend launches have no common
+read-only mount boundary. Agent-loop does not recursively chmod dependencies or
+install mount infrastructure. Use `--worktree-setup-pr-local` for opt-in writable
+per-run dependencies. Already-running consumers can observe damage before the
+next check. Bounded post-turn lock waits and intentionally empty shared caches
+remain future work. Explicit directories and dry-run retain their behavior;
+private paths are excluded from shared-source attribution.
 
 #### Dependency changes inside a PR
 
