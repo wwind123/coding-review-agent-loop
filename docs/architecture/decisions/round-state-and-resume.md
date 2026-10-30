@@ -22,3 +22,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-10-30: PR acknowledgement aliases recover only from earliest trusted durable lineage and exact historical shapes, with per-record disposition normalization and cleared-target replay; original numbering and idempotent restart remain intact (#1791).
 
 - 2026-10-30: Coder-dispatch records are lineage-neutral until actor admission; acknowledgement recovery uses the next ordinary carrier and accepts validated ordinary reconciliation copies. Exhausted acknowledgement repair has an explicit open-round boundary preserving ledger and numbering on same-head restart (#1791).
+
+- 2026-10-30: All recovery transport phases are lineage-neutral for legacy acknowledgement origin selection; ordinary coder evidence fields do not veto producer eligibility, while conversion origins remain excluded. The acknowledgement failure boundary also hands off active state after an unrecorded push and reopens scheduler checkpoint admission after reconciliation (#1791).

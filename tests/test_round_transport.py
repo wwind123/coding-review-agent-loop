@@ -3162,10 +3162,30 @@ def test_ack_disposition_coalescing_preserves_distinct_reviewer_evidence():
     ]
 
 
-@pytest.mark.parametrize("phase", ["coder-followup-rejected", "head-review-recovery", "evidence-conversion"])
-def test_ack_authentication_specific_origin_cannot_grant_legacy_authority(phase):
+@pytest.mark.parametrize("phase", ["coder-dispatch", "coder-followup-rejected", "head-review-recovery"])
+@pytest.mark.parametrize("role,agent,expected", [("coder", "Claude", ACK_ID), ("reviewer", "Codex", "item-13")])
+@pytest.mark.parametrize("matrix", [False, True])
+@pytest.mark.parametrize("persisted", [False, True])
+def test_ack_transport_neutrality_and_coder_evidence_origin(phase, role, agent, expected, matrix, persisted):
+    from acknowledgement_helpers import ack_matrix_metadata
+    from coding_review_agent_loop.round_state import record_carries_evidence_authority
+    item = promoted_ack() if persisted else legacy_ack()
     records = _ack_records(
-        durable_record((legacy_ack(),), phase=phase),
+        durable_record((item,), role="summary", agent="Orchestrator", phase="coder-dispatch"),
+        durable_record((item,), role="summary", agent="Orchestrator", phase=phase),
+        durable_record((item,), role=role, agent=agent, **(ack_matrix_metadata() if matrix else {})),
+        durable_record((item,), round_number=3),
+    )
+    assert record_carries_evidence_authority(records[2].metadata) == matrix
+    assert all(record.metadata.prior_items[0].item_id == expected for record in records)
+    if expected == "item-13":
+        assert all(record.metadata.prior_items[0].obligation_kind == "unknown" for record in records)
+    assert _max_unresolved_item_number_from_records(records) == 13
+
+
+def test_ack_conversion_origin_cannot_grant_legacy_authority():
+    records = _ack_records(
+        durable_record((legacy_ack(),), phase="evidence-conversion"),
         durable_record((legacy_ack(),), round_number=3),
     )
     assert all(record.metadata.prior_items[0].item_id == "item-13" for record in records)
@@ -3218,8 +3238,9 @@ def test_ack_rejects_malformed_ordinary_reconciliation_fields(overrides):
     assert all(r.metadata.prior_items[0].item_id == "item-13" for r in records)
 
 
-def test_ack_dispatch_alone_cannot_establish_origin():
+@pytest.mark.parametrize("phase", ["coder-dispatch", "coder-followup-rejected", "head-review-recovery"])
+def test_ack_transport_alone_cannot_establish_origin(phase):
     records = _ack_records(durable_record((legacy_ack(),), role="summary", agent="Orchestrator",
-                                          phase="coder-dispatch"))
+                                          phase=phase))
     assert records[0].metadata.prior_items[0].item_id == "item-13"
     assert records[0].metadata.prior_items[0].obligation_kind == "unknown"

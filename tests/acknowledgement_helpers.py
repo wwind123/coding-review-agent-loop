@@ -107,3 +107,35 @@ def ack_resume_history(*, promoted=False, coder_ack=False, conflict=False, unrel
     return [dispatch, original, coder, review]
 
 
+
+
+def ack_matrix_metadata():
+    """Coder evidence fields as persisted by a matrix-governed follow-up."""
+    return {
+        "risk_test_matrix_evidence": {"matrix_identity": "a" * 64, "rows": []},
+        "risk_test_matrix_capture_classification": {
+            "version": 1, "matrix_identity": "a" * 64, "head": "abc123",
+            "rows": {"ack": {"class": "not-capture-limited", "observation_classes": [],
+                             "disqualifiers": ["verified"]}},
+        },
+    }
+
+
+def ack_origin_history(history, carrier):
+    """Add the transport/evidence variants preceding the first coder carrier."""
+    from coding_review_agent_loop.round_state import _decode_round_metadata, _strip_round_metadata, ROUND_RESUME_MARKER_RE
+    def decode(body):
+        return _decode_round_metadata(ROUND_RESUME_MARKER_RE.search(body).group("payload"))
+    dispatch, *ordinary = history
+    if carrier == "matrix":
+        ordinary = [
+            _attach_round_metadata(_strip_round_metadata(body), replace(
+                decode(body), **ack_matrix_metadata(),
+            )) if decode(body).role == "coder" else body
+            for body in ordinary
+        ]
+    elif carrier != "plain":
+        metadata = decode(dispatch)
+        transport = _attach_round_metadata("Historical transport.", replace(metadata, phase=carrier))
+        return [dispatch, transport, dispatch, *ordinary]
+    return [dispatch, *ordinary]

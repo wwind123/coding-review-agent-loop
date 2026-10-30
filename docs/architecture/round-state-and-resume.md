@@ -23,13 +23,17 @@ changing the trust or persistence contracts.
 `legacy_machine_items.py` owns legacy machine promotion and planning demotion,
 re-exported by `round_state.py`. Before PR promotion, it indexes the earliest
 durable appearance of each numbered acknowledgement candidate across both
-`prior_items` and `new_items` in history order. Coder-dispatch carriers are
-lineage-neutral at this stage because their actor admission happens later;
-the next ordinary carrier establishes origin. A dispatch alone cannot grant
+`prior_items` and `new_items` in history order. Recovery transport carriers
+(dispatch, rejected follow-up, and head-review recovery) are lineage-neutral
+at this stage because their actor admission happens later; the next ordinary
+carrier establishes origin. Transport alone cannot grant
 authority, and a following reviewer origin still rejects recovery.
 Only an eligible coder
 checkpoint or Orchestrator summary with a consistent source round can establish
-lineage. Later trusted carries cannot authorize a reviewer origin; later
+lineage. Coder evidence fields, including matrix capture classifications, do
+not change producer eligibility; evidence-conversion handoffs cannot establish
+an origin. Evidence authority still requires its separate actor admission.
+Later trusted carries cannot authorize a reviewer origin; later
 reviewer copies with the legacy untrusted-lineage diagnostic do not revoke an
 already trusted origin.
 
@@ -63,7 +67,10 @@ An exhausted acknowledgement repair publishes an explicit
 `acknowledgement-repair-failed` boundary. Same-head resume preserves its round,
 full carried ledger and the history-wide item-number high-water mark, including
 round 1. Earlier reviews saw a different ledger and are rerun; the boundary is
-not reconciliation or approval.
+not reconciliation or approval. It reopens scheduler checkpoint admission after
+a prior reconciliation. A subsequent unrecorded push carries its active ledger,
+round and history-wide numbering into a fresh review on the new head without
+requiring the operator recovery override.
 
 ## Closed planning rounds
 

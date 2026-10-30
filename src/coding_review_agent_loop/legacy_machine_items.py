@@ -405,7 +405,7 @@ def recover_pr_acknowledgement_aliases(records: Sequence[PostedRoundRecord]) -> 
     """
     # Authentication-specific carriers are admitted later by their owning
     # reader. They cannot establish stage-1 legacy producer authority here.
-    from .round_state import RECOVERY_RECORD_PHASES, record_carries_evidence_authority
+    from .round_state import RECOVERY_RECORD_PHASES, EVIDENCE_CONVERSION_PHASE
 
     origins = {}
     copies = {}
@@ -413,10 +413,10 @@ def recover_pr_acknowledgement_aliases(records: Sequence[PostedRoundRecord]) -> 
         if record.metadata.flow != "pr":
             continue
         for item in (*record.metadata.prior_items, *record.metadata.new_items):
-            # Dispatch is authenticated only by the later recovery reader.
-            # It is lineage-neutral here: the next ordinary carrier establishes
-            # origin, including a reviewer carrier which must remain rejected.
-            if record.metadata.phase != "coder-dispatch":
+            # Recovery transport is authenticated by its owning reader later.
+            # No transport phase establishes origin; the next ordinary carrier
+            # does, including a reviewer carrier which must remain rejected.
+            if record.metadata.phase not in RECOVERY_RECORD_PHASES:
                 origins.setdefault(item.item_id, (record, item))
             copies.setdefault(item.item_id, []).append(item)
     aliases = set()
@@ -425,7 +425,7 @@ def recover_pr_acknowledgement_aliases(records: Sequence[PostedRoundRecord]) -> 
         if not (
             metadata.role in {"coder", "summary"}
             and metadata.phase not in RECOVERY_RECORD_PHASES
-            and not record_carries_evidence_authority(metadata)
+            and metadata.phase != EVIDENCE_CONVERSION_PHASE
             and (metadata.role == "coder" or metadata.agent == "Orchestrator")
             and metadata.round_number >= origin.source_round
             and _ack_candidate_shape(origin)

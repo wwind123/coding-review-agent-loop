@@ -1447,8 +1447,10 @@ def _capture_ack_blockers(monkeypatch):
 
 @pytest.mark.parametrize("promoted", [False, True])
 @pytest.mark.parametrize("complete_board", [False, True])
-def test_ack_legacy_resume_board_clearance_without_coder_ack(tmp_path, monkeypatch, promoted, complete_board):
-    history = ack_resume_history(promoted=promoted)
+@pytest.mark.parametrize("carrier", ["plain", "matrix", "coder-followup-rejected", "head-review-recovery"])
+def test_ack_legacy_resume_board_clearance_without_coder_ack(tmp_path, monkeypatch, promoted, complete_board, carrier):
+    from acknowledgement_helpers import ack_origin_history
+    history = ack_origin_history(ack_resume_history(promoted=promoted), carrier)
     partial_resume = _resume_pr_round(
         [IssueComment(author="bot", created_at=None, body=b) for b in history],
         head_sha="abc123", configured_reviewers=("codex", "gemini"),
@@ -1529,7 +1531,9 @@ def test_ack_conflicting_alias_resume_retains_machine_gate_and_notes(tmp_path, m
 
 
 @pytest.mark.parametrize("round_number", [1, 5])
-def test_ack_failure_boundary_excludes_same_ledger_earlier_reviews(round_number):
+@pytest.mark.parametrize("head", ["abc123", "new-head"])
+@pytest.mark.parametrize("prelaunch", [False, True])
+def test_ack_failure_boundary_excludes_same_ledger_earlier_reviews(round_number, head, prelaunch):
     prior = (dedicated_ack(), unrelated_item())
     history = [
         durable_record(prior, round_number=round_number),
@@ -1538,10 +1542,26 @@ def test_ack_failure_boundary_excludes_same_ledger_earlier_reviews(round_number)
         durable_record(prior, round_number=round_number, role="summary", agent="Orchestrator",
                        phase="acknowledgement-repair-failed"),
     ]
-    resumed = _resume_pr_round(
-        [IssueComment(author="bot", created_at=None, body=b) for b in history],
-        head_sha="abc123", configured_reviewers=("codex",),
+    from coding_review_agent_loop.round_state import (
+        drop_inert_post_reconciliation_checkpoints, _extract_round_metadata_records,
+        _latest_prior_pr_subject_is_coherent,
     )
+    # Reconciliation precedes the gate; the failure reopens this same round.
+    history.insert(-1, durable_record(prior, round_number=round_number,
+                   role="summary", agent="Orchestrator", phase="reconciliation"))
+    # An older numbered finding must still reserve its number on either head.
+    history.insert(0, durable_record((dataclasses.replace(unrelated_item(), item_id="item-99"),),
+                                    round_number=round_number))
+    if prelaunch:
+        history.append(durable_record(prior, round_number=round_number, role="summary",
+                                      agent="Orchestrator", phase="scheduler-prelaunch"))
+    comments = [IssueComment(author="bot", created_at=None, body=b) for b in history]
+    records = _extract_round_metadata_records(comments, flow="pr")
+    assert drop_inert_post_reconciliation_checkpoints(records) == records
+    assert _latest_prior_pr_subject_is_coherent(records, head_sha="new-head")
+    resumed = _resume_pr_round(comments, head_sha=head, configured_reviewers=("codex",))
+    assert resumed.next_unresolved_item_number == 100
+    assert resumed.unrecorded_head_advance == (head != "abc123")
     assert resumed.round_number == round_number
     assert resumed.prior_items == prior
     assert resumed.coder_output is None

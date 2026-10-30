@@ -3378,9 +3378,7 @@ def _select_current_round_records(
             for record in reversed(subject_records)
             if (
                 record.metadata.phase == HEAD_REVIEW_RECOVERY_PHASE
-                or (record.metadata.phase == "acknowledgement-repair-failed"
-                    and record.metadata.role == "summary"
-                    and record.metadata.agent == "Orchestrator")
+                or _is_acknowledgement_failure_boundary(record.metadata)
             )
             and record.metadata.round_number == anchor_metadata.round_number
         ),
@@ -3427,10 +3425,17 @@ PR_PRE_RECONCILIATION_PHASES = frozenset(
 )
 
 
+def _is_acknowledgement_failure_boundary(metadata: PostedRoundMetadata) -> bool:
+    return (metadata.flow == "pr" and metadata.phase == "acknowledgement-repair-failed"
+            and metadata.role == "summary" and metadata.agent == "Orchestrator")
+
+
 # Records that reopen a reconciled PR round at the same head and round number:
-# the conversion repeat (#1325) and a head-review recovery handoff.  A
+# conversion, head-review recovery, and acknowledgement repair failure. A
 # scheduler checkpoint after one of them belongs to the reopened round.
-_PR_ROUND_REOPENING_PHASES = frozenset({EVIDENCE_CONVERSION_PHASE, HEAD_REVIEW_RECOVERY_PHASE})
+_PR_ROUND_REOPENING_PHASES = frozenset({
+    EVIDENCE_CONVERSION_PHASE, HEAD_REVIEW_RECOVERY_PHASE, "acknowledgement-repair-failed",
+})
 
 
 def inert_post_reconciliation_checkpoint_indexes(
@@ -4554,6 +4559,16 @@ def _recover_unrecorded_pr_head_advance(
         coder_output = None
         compact_prior_summaries = ()
     else:
+        boundary = next((record for record in reversed(current_round_records)
+                         if _is_acknowledgement_failure_boundary(record.metadata)), None)
+        if boundary is not None:
+            return ResumedReviewRound(
+                round_number=boundary.metadata.round_number,
+                prior_items=tuple(_active_pr_items(boundary.metadata.prior_items)),
+                coder_output=None, completed_reviews=(),
+                next_unresolved_item_number=_max_unresolved_item_number_from_records(walk_view) + 1,
+                ledger_may_be_incomplete=False, unrecorded_head_advance=True,
+            )
         return _legacy_checkpoint_head_review(
             selection.anchor_record,
             records,
@@ -4616,7 +4631,8 @@ def _latest_prior_pr_subject_is_coherent(
     if selection is None:
         return False
     if any(
-        (record.metadata.role == "coder" or is_complete_code_review(record.metadata))
+        (record.metadata.role == "coder" or is_complete_code_review(record.metadata)
+         or _is_acknowledgement_failure_boundary(record.metadata))
         and not scope_present(record.metadata)
         for record in selection.current_round_records
     ):
@@ -5358,10 +5374,9 @@ def _resume_pr_round_from_records(
             and anchor_metadata.round_number > 1
             and anchor_metadata.scheduler_metadata_status == "valid"
         )
-        open_ack_failure = (
-            anchor_metadata.role == "summary"
-            and anchor_metadata.agent == "Orchestrator"
-            and anchor_metadata.phase == "acknowledgement-repair-failed"
+        open_ack_failure = any(
+            _is_acknowledgement_failure_boundary(record.metadata)
+            for record in current_round_records
         )
         if not (open_prelaunch or open_ack_failure):
             if checkpoint_record is None:
