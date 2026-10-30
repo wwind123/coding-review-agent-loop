@@ -1427,3 +1427,143 @@ def test_959_followup_without_evidence_posts_no_section_then_full_on_evidence(tm
     assert second.risk_test_matrix_evidence_full_round == second.round_number
     assert "<summary>Full matrix evidence (1 row)</summary>" in second_body
     assert "unchanged since round" not in second_body
+
+
+from acknowledgement_helpers import (
+    ACK_ID, UNTRUSTED_NOTE, dedicated_ack, durable_record, legacy_ack,
+    promoted_ack, pr_payload as ack_pr_payload, unrelated_item, ack_resume_history,
+)
+
+
+def _capture_ack_blockers(monkeypatch):
+    captured = []
+    real = pr_loop._raise_if_maintained_disputed_items
+    def capture(items, **kwargs):
+        captured.append(tuple(items))
+        return real(items, **kwargs)
+    monkeypatch.setattr(pr_loop, "_raise_if_maintained_disputed_items", capture)
+    return captured
+
+
+@pytest.mark.parametrize("promoted", [False, True])
+@pytest.mark.parametrize("complete_board", [False, True])
+@pytest.mark.parametrize("carrier", ["plain", "matrix", "coder-followup-rejected", "head-review-recovery"])
+def test_ack_legacy_resume_board_clearance_without_coder_ack(tmp_path, monkeypatch, promoted, complete_board, carrier):
+    from acknowledgement_helpers import ack_origin_history
+    history = ack_origin_history(ack_resume_history(promoted=promoted), carrier)
+    partial_resume = _resume_pr_round(
+        [IssueComment(author="bot", created_at=None, body=b) for b in history],
+        head_sha="abc123", configured_reviewers=("codex", "gemini"),
+    )
+    assert partial_resume.completed_reviews, partial_resume
+    snapshots = _capture_ack_blockers(monkeypatch)
+    runner = FakeRunner(
+        gemini_outputs=[structured_pr_review(
+            reviewer="Google Gemini", human_requirements_resolved=complete_board,
+            prior_item_dispositions=[
+                {"item_id": ACK_ID, "disposition": "resolved", "note": "Ordinary disposition is insufficient."},
+                {"item_id": "item-2", "disposition": "resolved", "note": "Keep unrelated machine gate."},
+            ],
+        )],
+        pr_payload=ack_pr_payload(history), advance_pr_head_on_coder_followup=False,
+    )
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2)
+    with pytest.raises(AgentLoopError, match="blocking issues after round 2"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert snapshots
+    assert {i.item_id for i in snapshots[-1]} == ({"item-2"} if complete_board else {ACK_ID, "item-2"})
+    assert not any(cmd[0] in {"claude", "pytest"} for cmd, _ in runner.commands)
+    comments = [IssueComment(author="bot", created_at=None, body=b) for b in history]
+    resumed = _resume_pr_round(comments, head_sha="abc123", configured_reviewers=("codex", "gemini"))
+    assert resumed.next_unresolved_item_number == 14
+    assert [d.item_id for d in resumed.completed_reviews[0].metadata.dispositions] == [ACK_ID, "item-2"]
+    # Persist the settled ledger just as a later coder checkpoint does, then
+    # restart twice. No original comment needs editing or deletion.
+    checkpoint = durable_record(snapshots[-1], round_number=3)
+    for _ in range(2):
+        restart = _resume_pr_round(
+            [*comments, IssueComment(author="bot", created_at=None, body=checkpoint)],
+            head_sha="abc123", configured_reviewers=("codex", "gemini"),
+        )
+        assert {i.item_id for i in restart.prior_items} == {i.item_id for i in snapshots[-1]}
+        assert restart.next_unresolved_item_number == 14
+
+
+@pytest.mark.parametrize("promoted", [False, True])
+def test_ack_resume_coder_clearance_consumes_alias_replay(tmp_path, monkeypatch, promoted):
+    snapshots = _capture_ack_blockers(monkeypatch)
+    runner = FakeRunner(
+        pr_payload=ack_pr_payload(ack_resume_history(promoted=promoted, coder_ack=True, conflict=True)),
+        gemini_outputs=[structured_pr_review(
+            reviewer="Google Gemini", human_requirements_resolved=True,
+            prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved", "note": "Keep unrelated machine gate."}],
+        )],
+    )
+    with pytest.raises(AgentLoopError, match="blocking issues after round 2"):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2))
+    assert {i.item_id for i in snapshots[-1]} == {"item-2"}
+
+
+def test_ack_resume_preserves_unrelated_unknown_disposition_error(tmp_path):
+    runner = FakeRunner(pr_payload=ack_pr_payload(ack_resume_history(coder_ack=True, bad_id=True)))
+    with pytest.raises(AgentLoopError, match="unknown item `item-999`"):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2))
+
+
+def test_ack_conflicting_alias_resume_retains_machine_gate_and_notes(tmp_path, monkeypatch):
+    snapshots = _capture_ack_blockers(monkeypatch)
+    runner = FakeRunner(
+        pr_payload=ack_pr_payload(ack_resume_history(promoted=True, conflict=True)),
+        gemini_outputs=[structured_pr_review(
+            reviewer="Google Gemini", human_requirements_resolved=True,
+            prior_item_dispositions=[
+                {"item_id": ACK_ID, "disposition": "resolved", "note": "Acknowledged."},
+                {"item_id": "item-2", "disposition": "resolved", "note": "Ordinary disposition."},
+            ],
+        )],
+    )
+    with pytest.raises(AgentLoopError, match="blocking issues after round 2"):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2))
+    ack = next(item for item in snapshots[-1] if item.item_id == ACK_ID)
+    assert ack.lifecycle == "repair_required"
+    assert any("Alias reviewed." in note and "Keep ack gate." in note for note in ack.notes)
+    assert {i.item_id for i in snapshots[-1]} == {ACK_ID, "item-2"}
+
+
+@pytest.mark.parametrize("round_number", [1, 5])
+@pytest.mark.parametrize("head", ["abc123", "new-head"])
+@pytest.mark.parametrize("prelaunch", [False, True])
+def test_ack_failure_boundary_excludes_same_ledger_earlier_reviews(round_number, head, prelaunch):
+    prior = (dedicated_ack(), unrelated_item())
+    history = [
+        durable_record(prior, round_number=round_number),
+        durable_record(prior, round_number=round_number, role="reviewer", agent="Codex",
+                       state="approved", body=structured_pr_review()),
+        durable_record(prior, round_number=round_number, role="summary", agent="Orchestrator",
+                       phase="acknowledgement-repair-failed"),
+    ]
+    from coding_review_agent_loop.round_state import (
+        drop_inert_post_reconciliation_checkpoints, _extract_round_metadata_records,
+        _latest_prior_pr_subject_is_coherent,
+    )
+    # Reconciliation precedes the gate; the failure reopens this same round.
+    history.insert(-1, durable_record(prior, round_number=round_number,
+                   role="summary", agent="Orchestrator", phase="reconciliation"))
+    # An older numbered finding must still reserve its number on either head.
+    history.insert(0, durable_record((dataclasses.replace(unrelated_item(), item_id="item-99"),),
+                                    round_number=round_number))
+    if prelaunch:
+        history.append(durable_record(prior, round_number=round_number, role="summary",
+                                      agent="Orchestrator", phase="scheduler-prelaunch"))
+    comments = [IssueComment(author="bot", created_at=None, body=b) for b in history]
+    records = _extract_round_metadata_records(comments, flow="pr")
+    assert drop_inert_post_reconciliation_checkpoints(records) == records
+    assert _latest_prior_pr_subject_is_coherent(records, head_sha="new-head")
+    resumed = _resume_pr_round(comments, head_sha=head, configured_reviewers=("codex",))
+    assert resumed.next_unresolved_item_number == 100
+    assert resumed.unrecorded_head_advance == (head != "abc123")
+    assert resumed.round_number == round_number
+    assert resumed.prior_items == prior
+    assert resumed.coder_output is None
+    assert resumed.completed_reviews == ()
+    assert not resumed.reconciled

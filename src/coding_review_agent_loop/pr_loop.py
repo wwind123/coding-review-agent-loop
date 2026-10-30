@@ -318,6 +318,7 @@ from .round_visibility import (
     latest_round_checkpoint_index,
     visible_peer_names,
 )
+from .legacy_machine_items import consumed_acknowledgement_disposition
 from .unresolved_items import (
     ClearedItemProgress,
     HUMAN_REQUIREMENTS_ACK_ITEM_ID,
@@ -480,6 +481,7 @@ from .pr_loop_support import (
     _partition_unresolved_items,
     _log_coder_followup_dispatch,
     _machine_obligation_checkpoint,
+    _record_failed_acknowledgement,
     _qualification_digest,
     _qualification_checkpoint_review_identity_matches,
     _managed_checkpoint_needs_fresh_attempt,
@@ -5934,6 +5936,8 @@ def run_pr_loop(
                         head_sha=summary_head,
                     )
                 for disposition in evidence_dispositions:
+                    if consumed_acknowledgement_disposition(disposition, resumed_record, prior_unresolved_items):
+                        continue
                     _record_prior_item_disposition(
                         prior_dispositions,
                         disposition,
@@ -6752,21 +6756,12 @@ def run_pr_loop(
                                 "approved without acknowledging signed human requirements; "
                                 "re-injecting as blocking item",
                             )
-                            unresolved_items.append(
-                                _next_unresolved_item(
-                                    item_number=next_unresolved_item_number,
-                                    reviewer="Orchestrator",
-                                    source_round=round_number,
-                                    text=(
-                                        f"Reviewer(s) {', '.join(still_missing)} approved without "
-                                        "acknowledging the signed human requirements. Coder must address the "
-                                        "human requirements and ensure the reviewer explicitly resolves them "
-                                        "before approval."
-                                    ),
-                                    status="blocking",
-                                )
+                            unresolved_items = _record_failed_acknowledgement(
+                                runner, config=config, pr_number=pr_number,
+                                items=unresolved_items, source_round=round_number,
+                                missing_reviewers=still_missing, subject=current_pr_subject,
+                                bound_metadata=bound_pr_metadata, post_comment=post_pr_comment,
                             )
-                            next_unresolved_item_number += 1
                             must_fix_items = [
                                 item for item in unresolved_items if item.status in {"blocking", "same-pr"}
                             ]

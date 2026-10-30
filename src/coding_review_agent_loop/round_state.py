@@ -832,6 +832,7 @@ class PostedRoundRecord:
     index: int
     metadata: PostedRoundMetadata
     body: str
+    original_item_number_high_water: int = 0
 
 
 @dataclass(frozen=True)
@@ -3242,247 +3243,21 @@ def _strip_round_metadata(body: str) -> str:
     return cleaned.strip()
 
 
-_LEGACY_MACHINE_REVIEWERS = {
-    "GitHub managed exact-head CI": "managed-exact-head-ci",
-    "GitHub PR checks": "github-pr-checks",
-    "Alembic migration validation": "alembic-migration",
-}
-
-
-_LEGACY_UNTRUSTED_LINEAGE_NOTE = "Synthetic machine record lacked trusted orchestrator lineage."
-_LEGACY_UNBOUND_HEAD_NOTE = "Known machine item could not be bound to a failed head."
-
-
-def _legacy_machine_kind(item: UnresolvedReviewItem) -> str | None:
-    if item.item_id == "item-merge-conflict":
-        return "merge-conflict"
-    if item.item_id == "item-human-requirements-acknowledgement":
-        return "human-requirements-acknowledgement"
-    return _LEGACY_MACHINE_REVIEWERS.get(item.reviewer) or (
-        "unknown" if item.reviewer == "Orchestrator" else None
-    )
-
-
-def _legacy_machine_promotion(
-    item: UnresolvedReviewItem,
-    *,
-    record: PostedRoundRecord,
-    first_record: PostedRoundRecord | None,
-) -> UnresolvedReviewItem:
-    """Promote only orchestrator-lineage synthetic items from old ledgers.
-
-    A display name in reviewer prose is not authority.  The first durable
-    ``new_items`` record (or a coder checkpoint carrying a legacy machine item)
-    must be an orchestrator-produced record before a known kind is promoted.
-    Ambiguous synthetic records become explicit unknown blockers.
-    """
-    if item.is_machine_obligation:
-        return item
-    kind = _legacy_machine_kind(item)
-    if kind is None:
-        return item
-    lineage = first_record or record
-    trusted = (
-        lineage.metadata.role in {"summary", "coder"}
-        and (
-            lineage.metadata.agent == "Orchestrator"
-            or lineage.metadata.role == "coder"
-        )
-        and item.status in {"blocking", "same-pr"}
-        and lineage.metadata.round_number >= item.source_round
-    )
-    if not trusted:
-        return replace(
-            item,
-            authority=UNKNOWN_MACHINE_AUTHORITY,
-            obligation_kind="unknown",
-            lifecycle="repair_required",
-            failed_head_sha=None,
-            candidate_head_sha=None,
-            obligation_identity=f"unknown:{item.item_id}",
-            notes=(*item.notes, _LEGACY_UNTRUSTED_LINEAGE_NOTE),
-            resolution_owners=(),
-            owner_states=(),
-        )
-    failed_head: str | None = None
-    if lineage.metadata.role == "summary" and lineage.metadata.agent == "Orchestrator":
-        # An orchestrator summary's subject is the authoritative PR head for
-        # the recorded machine event.
-        failed_head = lineage.metadata.subject
-    elif lineage.metadata.role == "coder":
-        # A legacy CI failure was often first carried by the coder checkpoint,
-        # after the coder had already pushed a repair head. The scheduler
-        # previous/current pair is the producer-owned provenance that lets us
-        # recover the failed head; visible CI prose is not authority.
-        previous_head = lineage.metadata.scheduler_previous_sha
-        current_head = lineage.metadata.scheduler_current_sha
-        if (
-            previous_head
-            and current_head
-            and lineage.metadata.subject == current_head
-            and previous_head != current_head
-        ):
-            failed_head = previous_head
-    if not failed_head or failed_head == "unknown":
-        return replace(
-            item,
-            authority=UNKNOWN_MACHINE_AUTHORITY,
-            obligation_kind="unknown",
-            lifecycle="repair_required",
-            obligation_identity=f"unknown:{item.item_id}",
-            notes=(*item.notes, _LEGACY_UNBOUND_HEAD_NOTE),
-            resolution_owners=(),
-            owner_states=(),
-        )
-    return replace(
-        item,
-        authority=MACHINE_AUTHORITY,
-        obligation_kind=kind,
-        lifecycle="repair_required",
-        failed_head_sha=failed_head,
-        candidate_head_sha=None,
-        obligation_identity=f"{kind}:{item.item_id}",
-        resolution_owners=(),
-        owner_states=(),
-    )
-
-
-def _promote_legacy_machine_items(records: Sequence[PostedRoundRecord]) -> tuple[PostedRoundRecord, ...]:
-    first_new_item_record: dict[str, PostedRoundRecord] = {}
-    for record in records:
-        for item in record.metadata.new_items:
-            first_new_item_record.setdefault(item.item_id, record)
-    promoted: list[PostedRoundRecord] = []
-    for record in records:
-        metadata = record.metadata
-        prior = tuple(
-            _legacy_machine_promotion(
-                item,
-                record=record,
-                first_record=first_new_item_record.get(item.item_id),
-            )
-            for item in metadata.prior_items
-        )
-        new_items = tuple(
-            _legacy_machine_promotion(
-                item,
-                record=record,
-                first_record=first_new_item_record.get(item.item_id, record),
-            )
-            for item in metadata.new_items
-        )
-        if prior != metadata.prior_items or new_items != metadata.new_items:
-            metadata = replace(metadata, prior_items=prior, new_items=new_items)
-        promoted.append(replace(record, metadata=metadata))
-    return tuple(promoted)
-
-
-PLAN_DEMOTED_MACHINE_ITEM_NOTE = (
-    "Planning has no machine-obligation clearance path; this orchestrator-authored "
-    "plan item was restored to an ordinary reviewer-dispositionable finding (#1005)."
+from .legacy_machine_items import (
+    PLAN_DEMOTED_MACHINE_ITEM_NOTE,
+    _LEGACY_MACHINE_REVIEWERS,
+    _LEGACY_UNTRUSTED_LINEAGE_NOTE,
+    _LEGACY_UNBOUND_HEAD_NOTE,
+    _REVIEWER_DISPOSITION_NOTE_RE,
+    _legacy_machine_kind,
+    _legacy_machine_promotion,
+    _promote_legacy_machine_items,
+    _has_legacy_promotion_note_tail,
+    _is_legacy_promoted_plan_item,
+    _demote_plan_machine_item,
+    _demote_plan_machine_items,
+    recover_pr_acknowledgement_aliases,
 )
-
-
-_REVIEWER_DISPOSITION_NOTE_RE = re.compile(r"[A-Za-z][A-Za-z0-9 ._-]*: \S")
-
-
-def _has_legacy_promotion_note_tail(notes: Sequence[str]) -> bool:
-    """True when the promotion's diagnostic note is followed only by reviewer notes.
-
-    ``_apply_unresolved_item_dispositions`` appends ``"<reviewer>: <note>"``
-    evidence to a machine record each round it is dispositioned, so a promoted
-    item carried through approval rounds holds those notes after the diagnostic.
-    """
-    diagnostics = {_LEGACY_UNTRUSTED_LINEAGE_NOTE, _LEGACY_UNBOUND_HEAD_NOTE}
-    positions = [index for index, note in enumerate(notes) if note in diagnostics]
-    if len(positions) != 1:
-        return False
-    return all(
-        _REVIEWER_DISPOSITION_NOTE_RE.match(note) for note in notes[positions[0] + 1:]
-    )
-
-
-def _is_legacy_promoted_plan_item(item: UnresolvedReviewItem) -> bool:
-    """Recognize exactly what ``_legacy_machine_promotion`` made of a plan item."""
-    return (
-        item.is_machine_obligation
-        and item.reviewer == "Orchestrator"
-        and item.item_id not in {"item-merge-conflict", "item-human-requirements-acknowledgement"}
-        and item.authority in {MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY}
-        and item.obligation_kind == "unknown"
-        and item.obligation_identity == f"unknown:{item.item_id}"
-        and item.lifecycle == "repair_required"
-        and item.candidate_head_sha is None
-        # Only the authority/head combinations the promotion can emit: machine
-        # authority bound to a failed head, or unknown authority with no head
-        # plus the diagnostic note the promotion appended for that outcome.
-        and (
-            (item.authority == MACHINE_AUTHORITY and bool(item.failed_head_sha))
-            or (
-                item.authority == UNKNOWN_MACHINE_AUTHORITY
-                and not item.failed_head_sha
-                and _has_legacy_promotion_note_tail(item.notes)
-            )
-        )
-        # The legacy promotion always clears ownership; a machine record that
-        # still names owners is not identifiable as that promotion.
-        and not item.resolution_owners
-        and not item.owner_states
-        and item.status in {"blocking", "same-pr"}
-        and not any(note.startswith("Invalid persisted machine") for note in item.notes)
-    )
-
-
-def _demote_plan_machine_item(item: UnresolvedReviewItem) -> UnresolvedReviewItem:
-    """Return a plan-flow machine record to the ordinary finding representation.
-
-    The planning loop never mints machine obligations and has no path that
-    clears one: reviewer dispositions are evidence only for machine records,
-    and the human-requirements/merge-conflict/CI clearance paths are PR-only.
-    A machine-authority item in a plan ledger (historically the legacy
-    promotion of the orchestrator's human-requirements re-injection item)
-    would therefore stay blocking forever and force a revision after every
-    unanimous approval (#1005).  Restoring the legacy representation lets the
-    reviewers disposition it like every other plan finding; the
-    human-requirements gate still re-checks acknowledgements each round and
-    re-injects a fresh item if they remain missing.
-
-    Only the exact legacy-promotion shape is restored.  A malformed or
-    otherwise unrecognized machine record (for example the ``unknown`` blocker
-    the decoder mints for an invalid persisted field) stays a machine
-    obligation, so the planning loop stops on it with a diagnostic instead of
-    letting a reviewer approval clear corrupted state.
-    """
-    if not _is_legacy_promoted_plan_item(item):
-        return item
-    notes = item.notes
-    if PLAN_DEMOTED_MACHINE_ITEM_NOTE not in notes:
-        notes = (*notes, PLAN_DEMOTED_MACHINE_ITEM_NOTE)
-    return replace(
-        item,
-        authority=None,
-        obligation_kind=None,
-        lifecycle=None,
-        failed_head_sha=None,
-        candidate_head_sha=None,
-        obligation_identity=None,
-        notes=notes,
-        resolution_owners=(),
-        owner_states=(),
-    )
-
-
-def _demote_plan_machine_items(records: Sequence[PostedRoundRecord]) -> tuple[PostedRoundRecord, ...]:
-    demoted: list[PostedRoundRecord] = []
-    for record in records:
-        metadata = record.metadata
-        prior = tuple(_demote_plan_machine_item(item) for item in metadata.prior_items)
-        new_items = tuple(_demote_plan_machine_item(item) for item in metadata.new_items)
-        if prior != metadata.prior_items or new_items != metadata.new_items:
-            metadata = replace(metadata, prior_items=prior, new_items=new_items)
-            record = replace(record, metadata=metadata)
-        demoted.append(record)
-    return tuple(demoted)
 
 
 def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) -> tuple[PostedRoundRecord, ...]:
@@ -3528,7 +3303,7 @@ def _extract_round_metadata_records(comments: Sequence[object], *, flow: str) ->
         # Legacy machine promotion exists for PR ledgers, whose machine gates
         # have clearance paths.  A plan ledger has none (#1005).
         return _demote_plan_machine_items(tuple(records))
-    return _promote_legacy_machine_items(tuple(records))
+    return _promote_legacy_machine_items(recover_pr_acknowledgement_aliases(records))
 
 
 from .code_approval import _latest_pr_approved_reviews_for_head
@@ -3601,7 +3376,10 @@ def _select_current_round_records(
         (
             record
             for record in reversed(subject_records)
-            if record.metadata.phase == HEAD_REVIEW_RECOVERY_PHASE
+            if (
+                record.metadata.phase == HEAD_REVIEW_RECOVERY_PHASE
+                or _is_acknowledgement_failure_boundary(record.metadata)
+            )
             and record.metadata.round_number == anchor_metadata.round_number
         ),
         None,
@@ -3639,6 +3417,7 @@ from .plan_round_closure import (  # re-export planning history helpers
 PR_PRE_RECONCILIATION_PHASES = frozenset(
     {
         "scheduler-prelaunch",
+        "acknowledgement-repair-failed",
         CODER_DISPATCH_PHASE,
         CODER_FOLLOWUP_REJECTED_PHASE,
         HEAD_REVIEW_RECOVERY_PHASE,
@@ -3646,10 +3425,17 @@ PR_PRE_RECONCILIATION_PHASES = frozenset(
 )
 
 
+def _is_acknowledgement_failure_boundary(metadata: PostedRoundMetadata) -> bool:
+    return (metadata.flow == "pr" and metadata.phase == "acknowledgement-repair-failed"
+            and metadata.role == "summary" and metadata.agent == "Orchestrator")
+
+
 # Records that reopen a reconciled PR round at the same head and round number:
-# the conversion repeat (#1325) and a head-review recovery handoff.  A
+# conversion, head-review recovery, and acknowledgement repair failure. A
 # scheduler checkpoint after one of them belongs to the reopened round.
-_PR_ROUND_REOPENING_PHASES = frozenset({EVIDENCE_CONVERSION_PHASE, HEAD_REVIEW_RECOVERY_PHASE})
+_PR_ROUND_REOPENING_PHASES = frozenset({
+    EVIDENCE_CONVERSION_PHASE, HEAD_REVIEW_RECOVERY_PHASE, "acknowledgement-repair-failed",
+})
 
 
 def inert_post_reconciliation_checkpoint_indexes(
@@ -3785,6 +3571,7 @@ def _pr_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
 def _max_unresolved_item_number_from_records(records: Sequence[PostedRoundRecord]) -> int:
     max_number = 0
     for record in records:
+        max_number = max(max_number, record.original_item_number_high_water)
         for item in (*record.metadata.prior_items, *record.metadata.new_items):
             match = re.fullmatch(r"item-(\d+)", item.item_id)
             if match:
@@ -4772,6 +4559,16 @@ def _recover_unrecorded_pr_head_advance(
         coder_output = None
         compact_prior_summaries = ()
     else:
+        boundary = next((record for record in reversed(current_round_records)
+                         if _is_acknowledgement_failure_boundary(record.metadata)), None)
+        if boundary is not None:
+            return ResumedReviewRound(
+                round_number=boundary.metadata.round_number,
+                prior_items=tuple(_active_pr_items(boundary.metadata.prior_items)),
+                coder_output=None, completed_reviews=(),
+                next_unresolved_item_number=_max_unresolved_item_number_from_records(walk_view) + 1,
+                ledger_may_be_incomplete=False, unrecorded_head_advance=True,
+            )
         return _legacy_checkpoint_head_review(
             selection.anchor_record,
             records,
@@ -4834,7 +4631,8 @@ def _latest_prior_pr_subject_is_coherent(
     if selection is None:
         return False
     if any(
-        (record.metadata.role == "coder" or is_complete_code_review(record.metadata))
+        (record.metadata.role == "coder" or is_complete_code_review(record.metadata)
+         or _is_acknowledgement_failure_boundary(record.metadata))
         and not scope_present(record.metadata)
         for record in selection.current_round_records
     ):
@@ -5576,7 +5374,11 @@ def _resume_pr_round_from_records(
             and anchor_metadata.round_number > 1
             and anchor_metadata.scheduler_metadata_status == "valid"
         )
-        if not open_prelaunch:
+        open_ack_failure = any(
+            _is_acknowledgement_failure_boundary(record.metadata)
+            for record in current_round_records
+        )
+        if not (open_prelaunch or open_ack_failure):
             if checkpoint_record is None:
                 return None
             # Preserve first-round startup and qualification recovery. A later

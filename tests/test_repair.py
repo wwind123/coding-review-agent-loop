@@ -3022,6 +3022,7 @@ def test_pr_loop_repair_blocking_records_same_pr_followups(tmp_path):
         summary="Fix the error message formatting.",
         reviewer="OpenAI Codex",
         human_requirements_resolved=False,
+        same_pr_followups=["Fix the error message formatting."],
     )
     repaired_blocking = structured_pr_review(
         state="blocking",

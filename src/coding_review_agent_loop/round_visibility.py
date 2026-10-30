@@ -10,18 +10,33 @@ A trusted record that reopens the round at the same head (an admitted
 evidence conversion, #1664) may be passed as ``reopening_boundary_index``:
 publications at or before it belong to the earlier pass, which the reopened
 pass legitimately reads, so they are not same-round peers.  The index is
-always an index into the same ``records`` history that is passed in.
+always an index into the same ``records`` history that is passed in. Failed
+acknowledgement repairs automatically bound visibility using resume's predicate.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-from .round_state import PostedRoundRecord
+from .round_state import PostedRoundRecord, _is_acknowledgement_failure_boundary
 
 # Scheduler phases whose launch is gated on the primary's approved review.
 GATED_LAUNCH_PHASES = frozenset({"secondary-audit", "final-secondary-sweep"})
 PRIMARY_APPROVAL_OPENING = "primary-approval"
+
+
+def acknowledgement_failure_boundary_index(
+    records: Sequence[PostedRoundRecord], *, flow: str, round_number: int, subject: str
+) -> int | None:
+    """The latest failed-repair boundary in this exact history, as used by resume."""
+    return max(
+        (record.index for record in records
+         if record.metadata.flow == flow
+         and record.metadata.round_number == round_number
+         and record.metadata.subject == subject
+         and _is_acknowledgement_failure_boundary(record.metadata)),
+        default=None,
+    )
 
 
 def same_round_public_publications(
@@ -38,7 +53,8 @@ def same_round_public_publications(
     Reads the complete extracted history: no ledger-signature filter, no
     last-record-per-reviewer dedupe, no ``scheduler_phase`` filter, and no
     reconciliation boundary.  A ``reopening_boundary_index`` raises the lower
-    bound; the coder and reopening boundaries combine by max.
+    bound; coder, failed acknowledgement repair and reopening boundaries combine
+    by max. Failed-repair boundaries use the same predicate as resume.
     """
     coder_boundary = max(
         (
@@ -50,8 +66,12 @@ def same_round_public_publications(
         ),
         default=-1,
     )
+    failure_boundary = acknowledgement_failure_boundary_index(
+        records, flow=flow, round_number=round_number, subject=subject,
+    )
     lower_bound = max(
         coder_boundary,
+        failure_boundary if failure_boundary is not None else -1,
         reopening_boundary_index if reopening_boundary_index is not None else -1,
     )
     return [

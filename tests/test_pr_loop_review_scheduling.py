@@ -1619,7 +1619,7 @@ def test_staged_unacknowledged_human_requirement_remains_blocking_after_panel_se
         pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("merged with an unacknowledged requirement")
     )
 
-    with pytest.raises(AgentLoopError, match=r"blocking issues after round 2.*Orchestrator \(item-1\)"):
+    with pytest.raises(AgentLoopError, match=r"blocking issues after round 2.*item-human-requirements-acknowledgement"):
         run_pr_loop(runner, pr_number=77, config=config)
 
     assert _agent_sequence(runner)[:3] == ["codex", "gemini", "agy"]
