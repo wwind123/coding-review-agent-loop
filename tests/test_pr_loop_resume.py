@@ -1574,7 +1574,7 @@ def test_resume_desync_stops_before_entry_writes(tmp_path, fresh):
     from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
     runner = FakeRunner()
     runner.branch_tip = 'b' * 40
-    config = make_config(tmp_path, managed_ci=fresh)
+    config = make_config(tmp_path, managed_ci=fresh, managed_ci_fresh_authorization=fresh, managed_ci_issue_number=56 if fresh else None)
     with pytest.raises(PrHeadObservationError, match='desync'):
         run_pr_loop(runner, pr_number=77, config=config)
     assert not runner.comments

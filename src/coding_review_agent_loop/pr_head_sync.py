@@ -44,7 +44,7 @@ def _read(runner: Runner, config: AgentLoopConfig, endpoint: str, cwd: Path) -> 
         if result.returncode:
             raise PrHeadObservationError(f"PR-head verification failed reading {endpoint}.")
         return _object(json.loads(result.stdout))
-    except (AgentLoopError, ValueError) as exc:
+    except (AgentLoopError, OSError, ValueError) as exc:
         raise PrHeadObservationError(f"PR-head verification failed reading {endpoint}: {exc}") from exc
 
 
@@ -144,7 +144,7 @@ def observe_pr_head(
             raise PrHeadObservationError(desync_message(
                 config, **details, origin=origin, issue_number=issue_number, managed_hint=managed_hint,
             ), desync=details)
-        runner.run(["sleep", "2"], cwd=resolved_cwd)
+        _wait_for_next_sample(runner, resolved_cwd)
         context = _context(runner, config=config, pr_number=pr_number, cwd=resolved_cwd)
     raise AssertionError("unreachable")
 
@@ -164,7 +164,7 @@ def _context(
 ) -> PullRequestReviewContext:
     try:
         return read_pr_context(runner, config=config, pr_number=pr_number, cwd=cwd)
-    except AgentLoopError as exc:
+    except (AgentLoopError, OSError) as exc:
         raise PrHeadObservationError(f"PR-head context verification failed: {exc}") from exc
 
 
@@ -182,3 +182,12 @@ def explain_pr_head_recovery(
     except Exception:  # Diagnostics must preserve the primary stop and its cleanup.
         return
     error.args = (message,)
+
+
+def _wait_for_next_sample(runner: Runner, cwd: Path) -> None:
+    try:
+        result = runner.run(["sleep", "2"], cwd=cwd)
+    except (AgentLoopError, OSError) as exc:
+        raise PrHeadObservationError(f"PR-head convergence wait verification failed: {exc}") from exc
+    if result.returncode:
+        raise PrHeadObservationError("PR-head convergence wait verification failed.")

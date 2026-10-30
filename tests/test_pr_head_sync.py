@@ -240,3 +240,31 @@ def test_recovery_enrichment_preserves_verification_errors_and_primary_stop(tmp_
     monkeypatch.setattr(sync, 'desync_message', lambda *a, **k: (_ for _ in ()).throw(ValueError('renderer unavailable')))
     sync.explain_pr_head_recovery(desync, config, origin='issue-created', issue_number=56)
     assert str(desync) == 'original stop'
+
+
+@pytest.mark.parametrize('failure', ['os-error', 'command-error', 'nonzero'])
+def test_failed_convergence_wait_is_an_observation_stop(tmp_path, failure):
+    runner = runner_at(tip=B)
+    original = runner.run
+    def run(args, **kwargs):
+        if args == ['sleep', '2']:
+            if failure == 'os-error': raise OSError('sleep unavailable')
+            if failure == 'command-error': raise sync.AgentLoopError('wait failed')
+            return dataclasses.replace(original(args, **kwargs), returncode=1)
+        return original(args, **kwargs)
+    runner.run = run
+    with pytest.raises(sync.PrHeadObservationError, match='convergence wait verification failed'):
+        observe(runner, tmp_path)
+
+
+@pytest.mark.parametrize('boundary', ['context', 'branch'])
+def test_read_launch_failure_is_an_observation_stop(tmp_path, boundary):
+    runner = runner_at()
+    original = runner.run
+    def run(args, **kwargs):
+        if (boundary == 'context' and args[:3] == ['gh', 'pr', 'view']) or (boundary == 'branch' and '/git/ref/' in ' '.join(args)):
+            raise OSError('read unavailable')
+        return original(args, **kwargs)
+    runner.run = run
+    with pytest.raises(sync.PrHeadObservationError, match='verification failed'):
+        observe(runner, tmp_path)

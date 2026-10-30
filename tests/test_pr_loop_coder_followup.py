@@ -2767,3 +2767,33 @@ def test_recovery_dispatch_desync_bypasses_guarded_rejection_audit(tmp_path, mon
     dispatches = _records_1292(runner, 'coder-dispatch')
     assert dispatches[-1].dispatch_attempt == 2
     assert not _records_1292(runner, 'coder')
+
+
+def test_prefetched_round_observation_stops_before_next_reviewer(tmp_path, monkeypatch):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state='blocking', blocking_items=['Fix it.']),
+                       structured_pr_review(state='approved')],
+        claude_outputs=[structured_coder_followup(addressed_items=['item-1'])],
+        advance_pr_head_on_coder_followup=False)
+    original_run = runner.run
+    def run(args, **kwargs):
+        result = original_run(args, **kwargs)
+        # The external branch advance occurs after acceptance of the first
+        # unchanged turn, so only the next selected snapshot can detect it.
+        if args[:3] == ['gh', 'pr', 'comment'] and _m1034_coder_comments(runner):
+            runner.branch_tip = 'b' * 40
+        return result
+    runner.run = run
+    selected = []
+    original_observe = pr_loop.observe_pr_head
+    def observe(*args, **kwargs):
+        selected.append(kwargs['context'])
+        return original_observe(*args, **kwargs)
+    monkeypatch.setattr(pr_loop, 'observe_pr_head', observe)
+    with pytest.raises(PrHeadObservationError, match='desync'):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+    assert len(selected) == 1
+    assert len(_m1034_coder_comments(runner)) == 1
+    assert len(runner.codex_outputs) == 1
+    assert len([cmd for cmd, _ in runner.commands if cmd == ['sleep', '2']]) == 2
