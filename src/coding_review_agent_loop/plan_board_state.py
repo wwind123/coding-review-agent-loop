@@ -38,6 +38,7 @@ from .board_change import (
 from .errors import AgentLoopError
 from .pr_board_state import _rebind_signed_segment, check_lineage_floor
 from .round_state import _extract_round_metadata_records
+from .plan_round_closure import plan_amendment_activation_round
 
 # Placeholder actor used only to validate an unposted candidate when the issue
 # has no link records yet, so no authenticated actor is needed.
@@ -249,11 +250,16 @@ def resolve_plan_board_state(
         )
     elif lineage.pending_amendments and not lineage.pending_links and resume_round is not None:
         from .panel_evidence import _board_amendment_template
+        from .plan_issue_scope import resolve_plan_scope
 
         start_round = resume_round(effective_config, lineage)
+        scope_start = resolve_plan_scope(comments, trusted_actor)
+        activation_records = tuple(
+            record for record in records if record.metadata.round_number >= scope_start
+        )
         require_amendment_activation(
             lineage,  # type: ignore[arg-type]
-            start_round_number=start_round,
+            start_round_number=plan_amendment_activation_round(activation_records, lineage, start_round),
             template=lambda amendment, round_number: _board_amendment_template(
                 flow="plan",
                 issue_number=issue_number,

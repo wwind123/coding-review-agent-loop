@@ -733,7 +733,7 @@ def test_plan_review_force_full_recovers_the_premature_secondary_review(tmp_path
     assert run_issue_loop(
         runner,
         issue_number=56,
-        config=_staged_plan_config(tmp_path, plan_review_force_full=True, max_rounds=1),
+        config=_staged_plan_config(tmp_path, plan_review_force_full=True, max_rounds=2),
         plan_first=True,
     ) == 0
 
@@ -742,6 +742,7 @@ def test_plan_review_force_full_recovers_the_premature_secondary_review(tmp_path
     ]
     # The last checkpoint is this run's decision; the first is seeded history.
     decision = prelaunch[-1]
+    assert decision.round_number == 2
     assert decision.scheduler_phase == "full-board"
     assert set(decision.scheduler_selected_reviewers) == {"Codex", "Gemini"}
     assert decision.scheduler_force_full is True
@@ -759,6 +760,7 @@ def test_plan_review_force_full_recovers_the_premature_secondary_review(tmp_path
         if record.role == "reviewer" and not record.new_items
     ]
     assert {record.agent for record in fresh_reviews} == {"Codex", "Gemini"}
+    assert {record.round_number for record in fresh_reviews} == {2}
     # The superseded review reaches its own author as explicitly
     # non-authoritative context, and no other reviewer.
     gemini_prompt = [
@@ -1932,3 +1934,553 @@ def test_resumed_round_renders_and_records_the_same_baseline_form(tmp_path):
     )
     resumed_lines = _m1516_baseline_lines(rerun_messages)
     assert resumed_lines == [live_lines[1]]
+
+
+def _closed_rereview_history(tmp_path, *, opened=True, secondary_state="approved"):
+    """Generation-1 closed history with a contradictory last scheduling key."""
+    comments, canonical = _staged_plan_history(
+        tmp_path, reviewer_records=[("Codex", "approved", ()), ("Gemini", secondary_state, ())],
+        reconciliation_record=True,
+    )
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    records = _extract_round_metadata_records(
+        [SimpleNamespace(body=c["body"]) for c in comments], flow="plan"
+    )
+    checkpoint = records[1].metadata
+    key = {**checkpoint.plan_candidate_key, "surfaced_requirement_id_digest": "old-requirements"}
+    comments[3]["body"] = _attach_round_metadata(
+        "Old secondary review", replace(records[3].metadata, plan_candidate_key=key)
+    )
+    primary = replace(records[2].metadata, plan_candidate_key=key)
+    comments[2]["body"] = _attach_round_metadata("Old primary approval", primary)
+    if opened:
+        opening = replace(
+            checkpoint, plan_candidate_key=key, scheduler_phase="secondary-audit",
+            scheduler_approved_reviewers=("Codex",),
+            scheduler_selected_reviewers=("Gemini",),
+            scheduler_paused_reviewers=(("Codex", "carried approval"),),
+        )
+        comments.insert(3, {"author": {"login": "bot"}, "createdAt": "2026-01-01T00:00:02Z",
+                            "body": _attach_round_metadata("Qualified opening", opening)})
+    # A used contradictory checkpoint precedes the secondary, so it remains
+    # historical scheduling evidence rather than an idle post-settlement stray.
+    contradictory = replace(checkpoint, plan_candidate_key={**key, "aggregate_plan_identity": "old"})
+    comments.insert(-2, {"author": {"login": "bot"}, "createdAt": "2026-01-01T00:00:03Z",
+                         "body": _attach_round_metadata("Contradictory key", contradictory)})
+    return comments, canonical, checkpoint
+
+
+@pytest.mark.parametrize("stray_source", [None, "automatic", "operator"])
+@pytest.mark.parametrize("ledger_differs", [False, True])
+def test_closed_key_rereview_rolls_over_before_publication(tmp_path, stray_source, ledger_differs):
+    comments, canonical, checkpoint = _closed_rereview_history(tmp_path)
+    if stray_source:
+        item = UnresolvedReviewItem(item_id="item-17", reviewer="Codex", source_round=1,
+                                    text="Not the settled ledger", status="blocking")
+        comments.append({"author": {"login": "bot"}, "createdAt": "2026-01-01T00:02:00Z",
+                         "body": _attach_round_metadata("Idle checkpoint", replace(
+                             checkpoint, scheduler_force_full=True,
+                             scheduler_force_full_source=stray_source,
+                             prior_items=(item,) if ledger_differs else (),
+                         ))})
+    runner = _FakeRunner(issue_comments=comments,
+                         codex_outputs=[structured_plan_review(state="approved")],
+                         gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")])
+    before = len(_plan_round_records(runner))
+    assert run_issue_loop(runner, issue_number=56,
+                          config=_staged_plan_config(tmp_path, max_rounds=2), plan_first=True) == 0
+    fresh = _plan_round_records(runner)[before:]
+    assert {record.round_number for record in fresh} == {2}
+    assert {record.agent for record in fresh if record.role == "reviewer"} == {"Codex", "Gemini"}
+    decision = next(record for record in fresh if record.phase == "scheduler-prelaunch")
+    assert decision.scheduler_force_full and decision.scheduler_force_full_source == "automatic"
+    assert decision.scheduler_selected_reviewers == ("Codex", "Gemini")
+    assert not any(record.role == "coder" for record in fresh)
+    assert all(record.subject == _plan_subject(canonical) for record in fresh)
+    assert not any(record.prior_items for record in fresh)
+    assert not any(command[0] == "claude" for command, _ in runner.commands)
+
+
+@pytest.mark.parametrize("blocking", [False, True])
+@pytest.mark.parametrize("idle_operator", [None, "plain", "first-amendment-use"])
+def test_unopened_closed_key_rereview_stays_primary_only_without_latch(tmp_path, blocking, idle_operator):
+    comments, canonical, checkpoint = _closed_rereview_history(
+        tmp_path, opened=False, secondary_state="blocking" if blocking else "approved"
+    )
+    runner = _FakeRunner(issue_comments=comments,
+                         codex_outputs=[structured_plan_review(state="approved")],
+                         gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")])
+    digest = None
+    if idle_operator == "first-amendment-use":
+        from coding_review_agent_loop.board_amendment import collect_reviewer_board_amendments
+        from issue_loop_test_helpers import _m943_post_amendment
+        contract = panel_evidence.make_plan_contract(
+            ("Codex", "Gemini", "Antigravity"), "primary-then-panel", "Codex"
+        )
+        for comment in runner.issue_comments:
+            match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", comment["body"])
+            metadata = _decode_round_metadata(match.group(1))
+            if metadata.scheduler_contract is not None:
+                comment["body"] = _attach_round_metadata("Historical scheduling", replace(
+                    metadata, scheduler_contract=contract.as_dict(),
+                    scheduler_paused_reviewers=metadata.scheduler_paused_reviewers + (("Antigravity", "paused"),),
+                ))
+        _m943_post_amendment(runner, effective_from_round=1)
+        digest = collect_reviewer_board_amendments(
+            [SimpleNamespace(body=c["body"], author_login=c["author"]["login"])
+             for c in runner.issue_comments], flow="plan", issue_number=56,
+        )[0].digest
+    if idle_operator:
+        runner.issue_comments.append({"author": {"login": "bot"}, "createdAt": "2026-06-01T00:02:00Z",
+                         "body": _attach_round_metadata("Idle operator checkpoint", replace(
+                             checkpoint, scheduler_force_full=True, scheduler_force_full_source="operator",
+                             reviewer_board_amendment_digest=digest))})
+    before = len(_plan_round_records(runner))
+    config = _staged_plan_config(tmp_path, max_rounds=3)
+    if blocking:
+        with pytest.raises(plan_first_loop_module.PlanPrePanelSafetyError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    else:
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    fresh = _plan_round_records(runner)[before:]
+    checkpoint = next(record for record in fresh if record.phase == "scheduler-prelaunch")
+    assert checkpoint.round_number == 2
+    assert checkpoint.reviewer_board_amendment_digest == digest
+    assert checkpoint.scheduler_selected_reviewers == ("Codex",)
+    assert not checkpoint.scheduler_force_full
+    assert checkpoint.scheduler_force_full_source is None
+    assert all(record.round_number > 1 for record in fresh)
+    assert all(record.subject == _plan_subject(canonical) for record in fresh)
+    assert not any(record.role == "coder" for record in fresh)
+    assert not any(record.agent == "Gemini" for record in fresh if record.round_number == 2)
+    if not blocking:
+        assert any(record.agent == "Gemini" and record.round_number == 3 for record in fresh)
+
+
+def test_closed_operator_rollover_respects_round_bound(tmp_path):
+    finding = UnresolvedReviewItem(item_id="item-1", reviewer="Gemini", source_round=1,
+                                   text="Superseded", status="blocking")
+    comments, _ = _staged_plan_history(tmp_path, reconciliation_record=True,
+                                      reviewer_records=[("Gemini", "blocking", (finding,))])
+    runner = _FakeRunner(issue_comments=comments)
+    before = len(runner.issue_comments)
+    with pytest.raises(AgentLoopError, match="beyond --max-rounds"):
+        run_issue_loop(runner, issue_number=56, config=_staged_plan_config(
+            tmp_path, max_rounds=1, plan_review_force_full=True), plan_first=True)
+    fresh = runner.issue_comments[before:]
+    assert not any("Plan review scheduling audit." in comment["body"] for comment in fresh)
+    assert not any(command[0] in {"claude", "codex", "gemini"} for command, _ in runner.commands)
+
+
+@pytest.mark.parametrize("boundary", ["plan-phase-advance", "scheduler-prelaunch"])
+@pytest.mark.parametrize("amended", [False, True])
+@pytest.mark.parametrize("idle_checkpoint", [False, True])
+def test_closed_rereview_restart_uses_next_round_and_activation_boundary(tmp_path, boundary, amended, idle_checkpoint):
+    from coding_review_agent_loop.plan_board_state import plan_resume_round
+    from coding_review_agent_loop.github import get_issue_context
+    from issue_loop_test_helpers import _m943_post_amendment
+
+    comments, canonical, historical_checkpoint = _closed_rereview_history(tmp_path)
+    if idle_checkpoint:
+        comments.append({"author": {"login": "bot"}, "createdAt": "2026-01-01T00:02:00Z",
+                         "body": _attach_round_metadata("Idle historical checkpoint", historical_checkpoint)})
+    runner = _FakeRunner(issue_comments=comments,
+                         codex_outputs=[structured_plan_review(state="approved")],
+                         gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")])
+    config = _staged_plan_config(tmp_path, max_rounds=2)
+    if amended:
+        contract = panel_evidence.make_plan_contract(
+            ("Codex", "Gemini", "Antigravity"), "primary-then-panel", "Codex"
+        )
+        for comment in runner.issue_comments:
+            match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", comment["body"])
+            metadata = _decode_round_metadata(match.group(1))
+            if metadata.scheduler_contract is not None:
+                comment["body"] = _attach_round_metadata("Historical scheduling", replace(
+                    metadata, scheduler_contract=contract.as_dict(),
+                    scheduler_paused_reviewers=metadata.scheduler_paused_reviewers + (("Antigravity", "paused"),),
+                ))
+        _m943_post_amendment(runner, effective_from_round=1)
+
+    real_post = plan_first_loop_module.post_issue_comment
+
+    def interrupt(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", kwargs["body"])
+        if match:
+            metadata = _decode_round_metadata(match.group(1))
+            if metadata.phase == boundary and metadata.round_number == 2:
+                raise KeyboardInterrupt
+        return result
+
+    with patch.object(plan_first_loop_module, "post_issue_comment", side_effect=interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    records = _plan_round_records(runner)
+    advance = next(record for record in records if record.phase == "plan-phase-advance")
+    assert advance.round_number == 2
+    assert advance.scheduler_contract is None
+    assert advance.reviewer_board_amendment_digest is None
+    context = get_issue_context(runner, config=config, issue_number=56)
+    assert plan_resume_round(context.comments, config) == 2
+    before = len(records)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    fresh = _plan_round_records(runner)[before:]
+    assert {record.round_number for record in fresh} == {2}
+    assert all(record.subject == _plan_subject(canonical) for record in fresh)
+    assert not any(record.role == "coder" for record in fresh)
+    assert not any(command[0] == "claude" for command, _ in runner.commands)
+    checkpoint = next(record for record in _plan_round_records(runner)
+                      if record.round_number == 2 and record.phase == "scheduler-prelaunch")
+    assert checkpoint.scheduler_force_full
+    assert checkpoint.scheduler_force_full_source == "automatic"
+    assert bool(checkpoint.reviewer_board_amendment_digest) == amended
+    if amended:
+        assert checkpoint.scheduler_contract["required_reviewers"] == ["Codex", "Gemini"]
+
+
+@pytest.mark.parametrize("operator", [False, True])
+@pytest.mark.parametrize("blocking", [False, True])
+def test_closed_history_preserves_reviewer_backed_post_reconciliation_opening(tmp_path, operator, blocking):
+    comments, canonical, _ = _closed_rereview_history(tmp_path)
+    # Move the used opening and its secondary after reconciliation, as older
+    # tool versions sometimes did; reconciliation still owns the settled ledger.
+    opening = comments.pop(3)
+    secondary = comments.pop(-2)
+    match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", opening["body"])
+    metadata = _decode_round_metadata(match.group(1))
+    if operator:
+        metadata = replace(metadata, scheduler_force_full=True, scheduler_force_full_source="operator")
+    opening["body"] = _attach_round_metadata("Used historical opening", metadata)
+    match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", secondary["body"])
+    review = _decode_round_metadata(match.group(1))
+    finding = UnresolvedReviewItem(item_id="item-9", reviewer="Gemini", source_round=1,
+                                   text="Qualified finding", status="blocking")
+    secondary["body"] = _attach_round_metadata("Qualified secondary", replace(
+        review, state="blocking" if blocking else "approved", new_items=(finding,) if blocking else (),
+    ))
+    comments.extend([opening, secondary])
+    resolved = [{"item_id": "item-9", "disposition": "resolved"}] if blocking else []
+    runner = _FakeRunner(issue_comments=comments,
+                         codex_outputs=[structured_plan_review(state="approved", prior_plan_item_dispositions=resolved)],
+                         gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini",
+                                                               prior_plan_item_dispositions=resolved)])
+    before = len(_plan_round_records(runner))
+    assert run_issue_loop(runner, issue_number=56, config=_staged_plan_config(tmp_path, max_rounds=2),
+                          plan_first=True) == 0
+    fresh = _plan_round_records(runner)[before:]
+    assert {record.round_number for record in fresh} == {2}
+    advance = next(record for record in fresh if record.phase == "plan-phase-advance")
+    assert [item.item_id for item in advance.prior_items] == (["item-9"] if blocking else [])
+    assert not any(record.role == "coder" for record in fresh)
+    assert all(record.subject == _plan_subject(canonical) for record in fresh)
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_legacy_closed_plan_with_stale_bindings_rolls_over(tmp_path, staged):
+    comments, canonical, _ = _closed_rereview_history(tmp_path, opened=False)
+    rewritten = []
+    for comment in comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", comment["body"])
+        metadata = _decode_round_metadata(match.group(1))
+        if not staged and metadata.phase == "scheduler-prelaunch":
+            continue
+        if metadata.phase == "reconciliation":
+            comment["body"] = _attach_round_metadata("Legacy authoritative summary", replace(metadata, phase="authoritative"))
+        rewritten.append(comment)
+    runner = _FakeRunner(issue_comments=rewritten,
+                         codex_outputs=[structured_plan_review(state="approved")],
+                         gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")])
+    config = (_staged_plan_config(tmp_path, max_rounds=3) if staged else
+              make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2))
+    before = len(_plan_round_records(runner))
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    fresh = _plan_round_records(runner)[before:]
+    assert all(record.round_number > 1 for record in fresh)
+    assert all(record.subject == _plan_subject(canonical) for record in fresh)
+    assert not any(record.role == "coder" for record in fresh)
+
+
+def test_completed_plan_shortcut_ignores_force_flag(tmp_path):
+    runner = _FakeRunner(claude_outputs=[structured_v1_plan_state()],
+                         codex_outputs=[structured_plan_review(state="approved")],
+                         gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")])
+    config = _staged_plan_config(tmp_path, max_rounds=2)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    calls = [command for command, _ in runner.commands if command[0] in {"claude", "codex", "gemini"}]
+    assert run_issue_loop(runner, issue_number=56, config=replace(config, plan_review_force_full=True),
+                          plan_first=True) == 0
+    assert calls == [command for command, _ in runner.commands if command[0] in {"claude", "codex", "gemini"}]
+
+
+def _pending_amendment_rereview(tmp_path):
+    from issue_loop_test_helpers import _m943_post_amendment
+
+    comments, canonical, _ = _closed_rereview_history(tmp_path)
+    runner = _FakeRunner(issue_comments=comments,
+                         codex_outputs=[structured_plan_review(state="approved")],
+                         gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")])
+    contract = panel_evidence.make_plan_contract(
+        ("Codex", "Gemini", "Antigravity"), "primary-then-panel", "Codex"
+    )
+    for comment in runner.issue_comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", comment["body"])
+        metadata = _decode_round_metadata(match.group(1))
+        if metadata.scheduler_contract is not None:
+            comment["body"] = _attach_round_metadata("Historical scheduling", replace(
+                metadata, scheduler_contract=contract.as_dict(),
+                scheduler_paused_reviewers=metadata.scheduler_paused_reviewers + (("Antigravity", "paused"),),
+            ))
+    _m943_post_amendment(runner, effective_from_round=1)
+    return runner, canonical, _staged_plan_config(tmp_path, max_rounds=2)
+
+
+def test_closed_amendment_rollover_schedules_same_run_without_clearing_contradiction(tmp_path):
+    runner, canonical, config = _pending_amendment_rereview(tmp_path)
+    before = len(_plan_round_records(runner))
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    records = _plan_round_records(runner)[before:]
+    advance, checkpoint = records[:2]
+    assert advance.phase == "plan-phase-advance" and advance.round_number == 2
+    assert advance.scheduler_contract is None and advance.reviewer_board_amendment_digest is None
+    assert checkpoint.phase == "scheduler-prelaunch" and checkpoint.round_number == 2
+    assert checkpoint.scheduler_selected_reviewers == ("Codex", "Gemini")
+    assert checkpoint.scheduler_force_full_source == "automatic"
+    assert checkpoint.reviewer_board_amendment_digest
+    assert all(record.subject == _plan_subject(canonical) for record in records)
+    assert not any(record.role == "coder" for record in records)
+
+
+@pytest.mark.parametrize("defect", ["absent", "wrong-subject", "wrong-phase", "skipped", "intervening-review", "intervening-scheduler"])
+def test_invalid_amendment_rollover_boundary_refused_in_preflight_and_startup(tmp_path, defect):
+    from coding_review_agent_loop.github import get_issue_context
+    from coding_review_agent_loop.plan_board_state import (
+        resolve_plan_board_state, plan_drift_error, plan_resume_round,
+    )
+
+    runner, canonical, config = _pending_amendment_rereview(tmp_path)
+    for comment in list(runner.issue_comments):
+        match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", comment["body"])
+        if not match:
+            continue
+        metadata = _decode_round_metadata(match.group(1))
+        if metadata.phase == "reconciliation":
+            if defect == "absent":
+                runner.issue_comments.remove(comment)
+            elif defect == "wrong-subject":
+                comment["body"] = _attach_round_metadata("Wrong predecessor", replace(metadata, subject="other"))
+            elif defect == "wrong-phase":
+                comment["body"] = _attach_round_metadata("Not settled", replace(metadata, phase="plan-phase-advance"))
+    advance = PostedRoundMetadata(
+        flow="plan", role="summary", agent="Orchestrator", subject=_plan_subject(canonical),
+        round_number=3 if defect == "skipped" else 2, phase="plan-phase-advance",
+    )
+    if defect.startswith("intervening"):
+        runner.issue_comments.append({"author": {"login": "bot"}, "createdAt": "2026-01-01T00:03:00Z",
+                                      "body": _attach_round_metadata("Intervening work", replace(
+                                          advance, role="reviewer" if defect.endswith("review") else "summary",
+                                          agent="Codex", state="approved",
+                                          phase="publication" if defect.endswith("review") else "scheduler-prelaunch"))})
+    runner.issue_comments.append({"author": {"login": "bot"}, "createdAt": "2026-01-01T00:04:00Z",
+                                  "body": _attach_round_metadata("Reviewer-only advance", advance)})
+    context = get_issue_context(runner, config=config, issue_number=56)
+    before = len(runner.issue_comments)
+    with pytest.raises(AgentLoopError, match="Replace the record with one effective from round"):
+        resolve_plan_board_state(
+            runner, config=config, issue_number=56, comments=context.comments,
+            admitted=(context.comments, None), drift_error=plan_drift_error(56),
+            resume_round=lambda effective, _lineage: plan_resume_round(context.comments, effective),
+        )
+    with pytest.raises(AgentLoopError, match="Replace the record with one effective from round"):
+        plan_first_loop_module._run_plan_first_loop(
+            runner, issue_number=56, config=config, memory=None, issue_context=context,
+            usage_context=validated_agent_module._new_usage_context(config),
+        )
+    assert len(runner.issue_comments) == before
+    assert not any(command[0] in {"claude", "codex", "gemini"} for command, _ in runner.commands)
+
+
+@pytest.mark.parametrize("gate", ["growth", "narrow-staged"])
+def test_resumed_primary_approval_skips_panel_for_required_revision(tmp_path, gate):
+    from issue_loop_test_helpers import _m1268_staged_raw
+
+    initial = _FakeRunner(
+        claude_outputs=[_m1268_staged_raw() if gate == "narrow-staged" else structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=1, plan_execution_mode="decompose-only")
+    with pytest.raises(AgentLoopError, match="phase advance was still pending"):
+        run_issue_loop(initial, issue_number=56, config=config, plan_first=True)
+    resumed = _FakeRunner(issue_comments=list(initial.issue_comments))
+    before = len(_plan_round_records(resumed))
+    config = replace(config, max_rounds=3, plan_execution_mode="plan-only",
+                     plan_narrow_staged=gate == "narrow-staged",
+                     **({"plan_growth_max_chars": 1000} if gate == "growth" else {}))
+    prompts = []
+
+    def revision_boundary(*args, **kwargs):
+        assert kwargs["agent"] == config.coder
+        prompts.append(kwargs["prompt"])
+        raise KeyboardInterrupt
+
+    with patch.object(plan_first_loop_module, "_run_validated_agent", side_effect=revision_boundary):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
+    assert len(prompts) == 1
+    assert ("Orchestrator plan-growth notice" if gate == "growth" else "Operator directive (orchestrator") in prompts[0]
+    fresh = _plan_round_records(resumed)[before:]
+    assert not any(record.role == "reviewer" or record.phase == "scheduler-prelaunch" for record in fresh)
+    assert not any(record.phase == "plan-phase-advance" for record in fresh)
+
+
+@pytest.mark.parametrize("source", [None, "automatic", "operator"])
+@pytest.mark.parametrize("ledger_differs", [False, True])
+@pytest.mark.parametrize("restart", [None, "plan-phase-advance", "scheduler-prelaunch"])
+def test_idle_only_contradiction_requires_fresh_closed_round_review(
+    tmp_path, source, ledger_differs, restart
+):
+    """Idle identity evidence invalidates exact approvals without gaining authority."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=3)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    records = _plan_round_records(runner)
+    checkpoint = next(r for r in reversed(records) if r.phase == "scheduler-prelaunch")
+    canonical = next(r.canonical_plan for r in records if r.role == "coder")
+    closed_round = checkpoint.round_number
+    assert closed_round == 2
+    # Serial staged approvals need not publish a reconciliation themselves.
+    runner.issue_comments.append({"author": {"login": "bot"},
+        "createdAt": f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z",
+        "body": _attach_round_metadata("Settled planning round", PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", round_number=closed_round,
+            subject=_plan_subject(canonical), phase="reconciliation"))})
+    item = UnresolvedReviewItem(item_id="item-17", reviewer="Codex", source_round=closed_round,
+                                text="Idle ledger has no authority", status="blocking")
+    idle = replace(
+        checkpoint,
+        plan_candidate_key={**checkpoint.plan_candidate_key, "aggregate_plan_identity": "old"},
+        scheduler_force_full=source is not None, scheduler_force_full_source=source,
+        prior_items=(item,) if ledger_differs else (),
+    )
+    for metadata in (idle, replace(idle, plan_candidate_key=checkpoint.plan_candidate_key)):
+        # Even a later idle matching key must not erase the negative evidence.
+        runner.issue_comments.append({"author": {"login": "bot"},
+            "createdAt": f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z",
+            "body": _attach_round_metadata("Idle historical checkpoint", metadata)})
+    before = len(_plan_round_records(runner))
+    calls_before = len(runner.commands)
+    runner.codex_outputs.append(structured_plan_review(state="approved"))
+    runner.gemini_outputs.append(structured_plan_review(state="approved", reviewer="Google Gemini"))
+    real_post = plan_first_loop_module.post_issue_comment
+
+    def interrupt(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", kwargs["body"])
+        if match:
+            metadata = _decode_round_metadata(match.group(1))
+            if metadata.round_number == closed_round + 1 and metadata.phase == restart:
+                raise KeyboardInterrupt
+        return result
+
+    if restart:
+        with patch.object(plan_first_loop_module, "post_issue_comment", side_effect=interrupt):
+            with pytest.raises(KeyboardInterrupt):
+                run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    fresh = _plan_round_records(runner)[before:]
+    assert {r.round_number for r in fresh} == {closed_round + 1}
+    assert {r.agent for r in fresh if r.role == "reviewer"} == {"Codex", "Gemini"}
+    decision = next(r for r in fresh if r.phase == "scheduler-prelaunch")
+    assert decision.scheduler_selected_reviewers == ("Codex", "Gemini")
+    assert decision.scheduler_force_full_source == "automatic"
+    assert not any(r.prior_items or r.role == "coder" for r in fresh)
+    assert all(r.subject == _plan_subject(canonical) for r in fresh)
+    assert sorted(command[0] for command, _ in runner.commands[calls_before:]
+                  if command[0] in {"claude", "codex", "gemini"}) == ["codex", "gemini"]
+    # The real current-key N+1 prelaunch clears degradation and permits completion.
+    calls_after = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert not any(command[0] in {"claude", "codex", "gemini"}
+                   for command, _ in runner.commands[calls_after:])
+
+
+@pytest.mark.parametrize("opened,boundary", [
+    (False, "scheduler-prelaunch"), (False, "first-review"),
+    (True, "scheduler-prelaunch"), (True, "first-review"), (True, "all-reviews"),
+])
+def test_recovery_prelaunch_retires_only_older_round_approvals(tmp_path, opened, boundary):
+    """Recovery retires invalid old approvals but keeps fresh same-round reuse."""
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    if opened:
+        comments, canonical, checkpoint = _closed_rereview_history(tmp_path)
+    else:
+        comments, canonical = _staged_plan_history(
+            tmp_path, reviewer_records=[("Codex", "approved", ())], reconciliation_record=True
+        )
+        records = plan_first_loop_module._extract_round_metadata_records(
+            [SimpleNamespace(body=c["body"]) for c in comments], flow="plan"
+        )
+        checkpoint = records[1].metadata
+        comments[2]["body"] = _attach_round_metadata("Exact primary approval", replace(
+            records[2].metadata, plan_candidate_key=checkpoint.plan_candidate_key))
+        comments.append({"author": {"login": "bot"}, "createdAt": "2026-01-01T00:02:00Z",
+            "body": _attach_round_metadata("Idle contradictory checkpoint", replace(
+                checkpoint, plan_candidate_key={**checkpoint.plan_candidate_key,
+                                                "aggregate_plan_identity": "old"}))})
+    runner = _FakeRunner(issue_comments=comments,
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")])
+    config = _staged_plan_config(tmp_path, max_rounds=3, review_parallel=True)
+    before = len(_plan_round_records(runner))
+    real_post = plan_first_loop_module.post_issue_comment
+    published = 0
+
+    def interrupt(*args, **kwargs):
+        nonlocal published
+        result = real_post(*args, **kwargs)
+        match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", kwargs["body"])
+        if match:
+            metadata = _decode_round_metadata(match.group(1))
+            if metadata.round_number == 2:
+                published += metadata.role == "reviewer"
+                if (metadata.phase == boundary
+                    or (boundary == "first-review" and published == 1)
+                    or (boundary == "all-reviews" and published == 2)):
+                    raise KeyboardInterrupt
+        return result
+
+    with patch.object(plan_first_loop_module, "post_issue_comment", side_effect=interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    fresh = _plan_round_records(runner)[before:]
+    decisions = [r for r in fresh if r.phase == "scheduler-prelaunch"]
+    assert decisions[0].scheduler_force_full is opened
+    assert decisions[0].scheduler_selected_reviewers == (("Codex", "Gemini") if opened else ("Codex",))
+    reviews = [r for r in fresh if r.role == "reviewer"]
+    assert sorted((r.agent, r.round_number) for r in reviews) == [
+        ("Codex", 2), ("Gemini", 3 if not opened and boundary == "scheduler-prelaunch" else 2)
+    ]
+    if not opened:
+        assert reviews[0].agent == "Codex"
+    assert all(r.round_number > 1 and r.subject == _plan_subject(canonical) for r in fresh)
+    assert not any(r.role == "coder" for r in fresh)
+    assert sorted(command[0] for command, _ in runner.commands
+                  if command[0] in {"claude", "codex", "gemini"}) == ["codex", "gemini"]
+    comments = [SimpleNamespace(body=c["body"]) for c in runner.issue_comments]
+    plan_text, plan_round = pr_loop_support._resume_plan_round(
+        comments, configured_reviewers=panel_evidence.reviewers(config))
+    panel_evidence._require_complete_canonical_plan_approval(
+        comments, config=config, plan_text=plan_text, plan_round=plan_round,
+        human_requirements=(), error_message="recovery approvals were lost")
+    classification = classify_plan_approval(comments, config=config, issue_number=56)
+    assert classification.approved, classification
+    calls_before = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert not any(command[0] in {"claude", "codex", "gemini"}
+                   for command, _ in runner.commands[calls_before:])

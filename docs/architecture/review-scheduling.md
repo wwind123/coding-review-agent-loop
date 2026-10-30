@@ -58,6 +58,46 @@ Strict pre-panel primary ordering still applies. Final CI/merge qualification
 checks the same semantic predicate against live inputs. Capture attempt limits and unresolved
 partial-capture barriers remain unchanged; no new CLI option is needed.
 
+## Planning rollover and activation
+
+A reconciled planning round accepts no fresh reviewer turns. Necessary fresh
+reviews move to N+1 after qualified settlement, before publication or spool
+preflight. Contradictory candidate history after a qualified panel opening keeps
+the conservative full-board fallback. Unopened automatic fallback selects only
+the primary and records no automatic force-full latch. Approval-only secondary
+history permits ordinary later panel progression; premature blocking secondary
+history retains the existing safety stop after a current-key checkpoint clears
+degradation. A current operator override authorizes the full board in N+1;
+an idle historical operator checkpoint supplies no opening or operator latch,
+even when it is the first carrier of an amendment digest. The raw carrier
+remains available to amendment-use and lineage validation.
+
+History projection discards only idle post-reconciliation scheduling decisions.
+Idle checkpoints retain negative candidate-key and invalid-metadata evidence
+until a legitimate scheduler recovery checkpoint supersedes it. A later idle
+matching checkpoint cannot restore intact history or completed approvals.
+A legitimate force-full or contradictory-key recovery prelaunch retires its
+selected reviewers' approvals from earlier rounds, including across restart.
+This also covers primary-only unopened recovery without a force-full latch.
+Completed same-round reviews survive repeated prelaunches, matching live reuse
+and frozen publication replay.
+Checkpoints followed by same-subject, same-round reviewers retain qualified
+primary-approved secondary-audit or operator openings, including blocking
+findings. Reconciliation remains the settled ledger anchor. Automatic latches
+after a qualified opening remain effective across restart.
+
+Pending amendment activation is validated at entry N. A staged reviewer-only
+rollover writes a contract-neutral, digest-free phase advance, leaving the
+contradictory scheduling key intact. Read-only board preflight and loop startup
+share a history-derived activation boundary: checkpoint-only N+1 may validate
+activation at N only through the immediately preceding reconciled same-subject,
+same-scope round and a neutral reviewer-only transition after the amendment,
+without intervening scheduling or reviewer work. Execution reporting still
+names N+1. The first N+1 prelaunch binds the effective contract and amendment
+digest and marks use through existing lineage validation. Restart after that
+checkpoint enters N+1 normally. Arbitrary earlier activation rounds and invalid
+predecessors remain refused; PR activation is unchanged.
+
 ## Reviewer selection and scheduling
 
 All selected reviewers receive the same pre-round snapshot. Parallel execution

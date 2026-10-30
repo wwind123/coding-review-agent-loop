@@ -160,7 +160,8 @@ def _assert_managed_ci_plan_recovery_fails_closed(config, comments):
         )
 
 
-def test_managed_ci_plan_approval_rejects_post_approval_contradictory_key(tmp_path):
+@pytest.mark.parametrize("history", ["open", "closed", "closed-matching-idle"])
+def test_managed_ci_plan_approval_rejects_post_approval_contradictory_key(tmp_path, history):
     """A later checkpoint contradicting the current key voids carried approvals."""
     config, comments = _completed_staged_plan_comments(tmp_path)
     latest_checkpoint = None
@@ -177,16 +178,29 @@ def test_managed_ci_plan_approval_rejects_post_approval_contradictory_key(tmp_pa
     )
     contradictory = replace(stored_key, aggregate_plan_identity="f" * 64)
     assert contradictory.subject == stored_key.subject
+    if history != "open":
+        comments.append(SimpleNamespace(body=_attach_round_metadata(
+            "Settled planning round", PostedRoundMetadata(
+                flow="plan", role="summary", agent="Orchestrator",
+                round_number=latest_checkpoint.round_number, subject=stored_key.subject,
+                phase="reconciliation",
+            )
+        )))
     comments = [
         *comments,
         SimpleNamespace(
             body=_attach_round_metadata(
                 "Plan review scheduling audit.\n\n-- Orchestrator",
-                replace(latest_checkpoint, plan_candidate_key=contradictory.as_dict()),
+                replace(latest_checkpoint, phase="scheduler-prelaunch",
+                        plan_candidate_key=contradictory.as_dict()),
             )
         ),
     ]
 
+    if history == "closed-matching-idle":
+        comments.append(SimpleNamespace(body=_attach_round_metadata(
+            "Idle matching checkpoint", replace(latest_checkpoint, phase="scheduler-prelaunch")
+        )))
     _assert_managed_ci_plan_recovery_fails_closed(config, comments)
 
 

@@ -25,6 +25,7 @@ from .round_state import (
     PRE_RECONCILIATION_PLAN_SUMMARY_PHASES,
     PostedRoundRecord,
     _extract_round_metadata_records,
+    _plan_round_is_reconciled,
 )
 from .round_visibility import (
     PRIMARY_APPROVAL_OPENING,
@@ -130,7 +131,10 @@ def _reconciling_summaries(
         and record.metadata.role == "summary"
         and record.metadata.round_number == round_number
         and record.metadata.subject == subject
-        and record.metadata.phase not in PRE_RECONCILIATION_PLAN_SUMMARY_PHASES
+        and (
+            _plan_round_is_reconciled((record,)) if flow == "plan"
+            else record.metadata.phase not in PRE_RECONCILIATION_PLAN_SUMMARY_PHASES
+        )
     ]
 
 
@@ -412,6 +416,16 @@ def _compute(
     context: RecoveryVisibilityContext | None = None,
     boundary: int | None = None,
 ) -> PartialRoundRecovery:
+    if flow == "plan" and _reconciling_summaries(
+        _extract_round_metadata_records(comments, flow=flow),
+        flow=flow, round_number=round_number, subject=subject,
+    ):
+        return PartialRoundRecovery(
+            verified=False,
+            reason=(f"Planning round {round_number} is reconciled and closed; "
+                    f"resume necessary fresh reviews in round {round_number + 1}. "
+                    "Do not delete historical reviews or attachments."),
+        )
     gate_indices, opening_targets = _frame(
         comments, flow=flow, round_number=round_number, subject=subject, context=context,
         boundary=boundary,

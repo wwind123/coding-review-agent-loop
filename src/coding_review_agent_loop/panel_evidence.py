@@ -635,6 +635,9 @@ def _derive_plan_panel_evidence(
     key K that lists the primary as approved and is preceded by the primary's
     own approved plan review of K.
     """
+    from .plan_round_closure import project_plan_history
+
+    records = project_plan_history(records)
     secondaries = set(required_reviewers) - {primary_reviewer}
     primary_approved_keys: set[tuple[object, ...]] = set()
     artifacts: list[str] = []
@@ -745,9 +748,32 @@ def _carried_plan_approvals(
         return ()
     required = set(required_reviewers)
     surfaced = {str(item) for item in surfaced_requirement_ids}
-    carried: dict[str, bool] = {}
-    for record in sorted(records, key=lambda item: item.index):
+    from .plan_round_closure import project_plan_history
+
+    carried: dict[str, tuple[bool, int]] = {}
+    for record in sorted(project_plan_history(records), key=lambda item: item.index):
         metadata = record.metadata
+        previous_key = _plan_key_from_payload(metadata.scheduler_plan_previous_key)
+        checkpoint_key = _plan_key_from_payload(metadata.plan_candidate_key)
+        contradictory_prelaunch = bool(
+            previous_key is not None
+            and checkpoint_key is not None
+            and previous_key.subject == checkpoint_key.subject
+            and not previous_key.matches(checkpoint_key)
+        )
+        if (
+            metadata.role == "summary"
+            and metadata.phase == "scheduler-prelaunch"
+            and metadata.scheduler_metadata_status == "valid"
+            and (metadata.scheduler_force_full or contradictory_prelaunch)
+        ):
+            # Recovery must not resurrect older approvals after its current-key
+            # checkpoint clears degradation, including primary-only recovery.
+            # Repeated prelaunches reuse completed same-round reviews live;
+            # preserve those reviews during durable approval replay as well.
+            for name in metadata.scheduler_selected_reviewers:
+                if name in carried and carried[name][1] < metadata.round_number:
+                    carried.pop(name)
         if metadata.role != "reviewer" or metadata.agent not in required:
             continue
         if predates_restoration(
@@ -780,8 +806,8 @@ def _carried_plan_approvals(
             and parent_bound
         )
         # A later record for the same reviewer supersedes an earlier one.
-        carried[metadata.agent] = bool(qualifies)
-    return tuple(sorted(name for name, ok in carried.items() if ok))
+        carried[metadata.agent] = (bool(qualifies), metadata.round_number)
+    return tuple(sorted(name for name, (ok, _) in carried.items() if ok))
 
 
 @dataclass(frozen=True)
@@ -804,6 +830,10 @@ def _classify_staged_plan_history(
     caller's record extraction).  Shared by the live planning scheduler and
     managed-CI plan recovery so both read the same history as authoritative.
     """
+    from .plan_round_closure import project_plan_history
+
+    raw_records = plan_records
+    plan_records = project_plan_history(raw_records)
     latest_scheduler_record = next(
         (
             record
@@ -834,10 +864,25 @@ def _classify_staged_plan_history(
     recovery_boundary_index = (
         latest_scheduler_record.index if latest_scheduler_record is not None else -1
     )
+    # Idle closed-round checkpoints have no scheduling authority, but their
+    # negative identity evidence survives until a legitimate recovery boundary.
+    # In particular, another idle matching checkpoint cannot clear a mismatch.
+    authoritative_indices = {record.index for record in plan_records}
+    for record in raw_records:
+        if record.index in authoritative_indices or record.index <= recovery_boundary_index:
+            continue
+        record_key = _plan_key_from_payload(record.metadata.plan_candidate_key)
+        if (
+            record_key is not None
+            and record_key.subject == current_key.subject
+            and not record_key.matches(current_key)
+        ):
+            key_contradiction = True
+            previous_key = record_key
     if any(
         record.index > recovery_boundary_index
         and record.metadata.scheduler_metadata_status == "invalid"
-        for record in plan_records
+        for record in raw_records
     ):
         history_class = classify_plan_history("invalid")
     elif has_planning_history and latest_scheduler_record is None:
