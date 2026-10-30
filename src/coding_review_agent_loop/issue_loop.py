@@ -6,7 +6,7 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
-from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError
+from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError, explain_pr_head_recovery
 
 import datetime
 import sys
@@ -1141,7 +1141,9 @@ def run_issue_loop(
                 legacy_tests_run=implementation_result.tests_run,
                 cwd=active_workdir(config),
             )
-        except PrHeadObservationError:
+        except PrHeadObservationError as exc:
+            if managed_pr_authenticated and managed_ci_handoff is not None:
+                explain_pr_head_recovery(exc, config, origin="issue-created", issue_number=getattr(managed_ci_handoff, "issue_number", None))
             raise
         except AgentLoopError:
             if managed_pr_authenticated and managed_ci_creation_intent is not None:

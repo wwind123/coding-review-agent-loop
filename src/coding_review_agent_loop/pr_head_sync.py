@@ -21,6 +21,10 @@ if TYPE_CHECKING:
 class PrHeadObservationError(AgentLoopError):
     """GitHub cannot supply a safe, coherent PR-head observation."""
 
+    def __init__(self, message: str, *, desync: dict | None = None) -> None:
+        super().__init__(message)
+        self.desync = dict(desync) if desync is not None else None
+
 
 def _sha(value: object) -> str:
     if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
@@ -136,10 +140,10 @@ def observe_pr_head(
             managed_hint = isinstance(labels, list) and any(
                 isinstance(label, dict) and label.get("name") == "agent-loop-managed" for label in labels
             )
+            details = dict(number=pr_number, repository=repository, ref=ref, head=head, tip=tip)
             raise PrHeadObservationError(desync_message(
-                config, number=pr_number, repository=repository, ref=ref, head=head, tip=tip,
-                origin=origin, issue_number=issue_number, managed_hint=managed_hint,
-            ))
+                config, **details, origin=origin, issue_number=issue_number, managed_hint=managed_hint,
+            ), desync=details)
         runner.run(["sleep", "2"], cwd=resolved_cwd)
         context = _context(runner, config=config, pr_number=pr_number, cwd=resolved_cwd)
     raise AssertionError("unreachable")
@@ -162,3 +166,19 @@ def _context(
         return read_pr_context(runner, config=config, pr_number=pr_number, cwd=cwd)
     except AgentLoopError as exc:
         raise PrHeadObservationError(f"PR-head context verification failed: {exc}") from exc
+
+
+def explain_pr_head_recovery(
+    error: BaseException | None, config: AgentLoopConfig, *,
+    origin: str | None, issue_number: int | None,
+) -> None:
+    """Enrich a stop from already authenticated scope without masking cleanup."""
+    if not isinstance(error, PrHeadObservationError) or error.desync is None:
+        return
+    if origin not in {"issue-created", "source-managed", "adopted"}:
+        return
+    try:
+        message = desync_message(config, **error.desync, origin=origin, issue_number=issue_number)
+    except Exception:  # Diagnostics must preserve the primary stop and its cleanup.
+        return
+    error.args = (message,)

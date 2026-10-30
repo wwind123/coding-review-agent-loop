@@ -216,3 +216,27 @@ def test_unauthed_labeled_origin_gets_conditional_recovery_without_command(tmp_p
         observe(runner, tmp_path)
     assert 'If this is an issue-created' in str(error.value)
     assert '--managed-ci-fresh' not in str(error.value)
+
+
+def test_late_authenticated_scope_enriches_an_observation_stop(tmp_path):
+    runner = runner_at(tip=B)
+    with pytest.raises(sync.PrHeadObservationError) as error:
+        observe(runner, tmp_path)
+    config = make_config(tmp_path)
+    sync.explain_pr_head_recovery(error.value, config, origin='issue-created', issue_number=56)
+    assert '--managed-ci-fresh' in str(error.value)
+    assert '--managed-ci-issue 56' in str(error.value)
+    assert A in str(error.value) and B in str(error.value)
+    sync.explain_pr_head_recovery(error.value, config, origin='source-managed', issue_number=56)
+    assert '--managed-ci-fresh' not in str(error.value)
+
+
+def test_recovery_enrichment_preserves_verification_errors_and_primary_stop(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    error = sync.PrHeadObservationError('verification failed')
+    sync.explain_pr_head_recovery(error, config, origin='issue-created', issue_number=56)
+    assert str(error) == 'verification failed'
+    desync = sync.PrHeadObservationError('original stop', desync={})
+    monkeypatch.setattr(sync, 'desync_message', lambda *a, **k: (_ for _ in ()).throw(ValueError('renderer unavailable')))
+    sync.explain_pr_head_recovery(desync, config, origin='issue-created', issue_number=56)
+    assert str(desync) == 'original stop'

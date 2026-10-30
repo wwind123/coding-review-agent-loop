@@ -454,7 +454,9 @@ and exhausted projection disagreement raise observation verification errors.
 
 Persistent descendant lag raises a distinct observation stop before unchanged
 accounting, accepted or rejected coder publication, continuity evidence or
-qualification reuse. Normal interruption cleanup still runs. The branch tip
+qualification reuse. Stops can enrich their operator recovery text from already authenticated origin
+and issue scope without granting authority or publishing records. Normal
+interruption cleanup still runs. The branch tip
 never replaces the PR-record head as authority for review, CI or merge. Reads
 cannot be atomic with later pushes; existing exact-head gates remain necessary.
 
