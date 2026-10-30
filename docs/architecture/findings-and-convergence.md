@@ -40,7 +40,9 @@ compliance is enforced by the prompt, not by a deterministic classifier.
 
 PR reviewer acknowledgement repair exhaustion upserts the dedicated
 human-requirements acknowledgement machine obligation and immediately persists
-its ledger in an Orchestrator summary. Repeated failures replace that obligation
+its ledger in an Orchestrator summary with an explicit failure-boundary phase.
+Same-head restart retains the round and full ledger and reruns reviewers against
+that ledger rather than treating the summary as reconciliation. Repeated failures replace that obligation
 without consuming an ordinary item number. Existing valid coder acknowledgement
 can clear it after follow-up or at resumed round start. Complete required-board
 acknowledgement also clears it; partial acknowledgement and ordinary reviewer

@@ -269,24 +269,56 @@ _ACK_TEXT_RE = re.compile(
 )
 
 
+def _ack_disposition_fields(item: UnresolvedReviewItem) -> bool:
+    """Validate evidence retained by ordinary reconciliation and promotion."""
+    for pairs in (item.owner_evidence, item.owner_dispositions):
+        if len(dict(pairs)) != len(pairs):
+            return False
+        if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9 ._-]*", owner) for owner, _ in pairs):
+            return False
+    return (
+        all(value in {"blocking", "same-pr", "resolved", "future"}
+            for _, value in item.owner_dispositions)
+        and all(value and f"{owner}: {value}" in item.notes
+                for owner, value in item.owner_evidence)
+    )
+
+
+def _ack_ordinary_ownership(item: UnresolvedReviewItem) -> bool:
+    owners = item.resolution_owners
+    states = dict(item.owner_states)
+    dispositions = dict(item.owner_dispositions)
+    return (
+        len(set(owners)) == len(owners)
+        and all(re.fullmatch(r"[A-Za-z][A-Za-z0-9 ._-]*", owner) for owner in owners)
+        and (not owners or "Orchestrator" in owners)
+        and len(states) == len(item.owner_states)
+        and (not states or set(states) == set(owners))
+        and set(dispositions).issubset(owners)
+        and set(dict(item.owner_evidence)).issubset(owners)
+        and all(state == ("cleared" if dispositions.get(owner) in {"resolved", "future"} else "pending")
+                for owner, state in item.owner_states)
+        and all(owner == "Orchestrator" or owner in dispositions for owner in owners)
+    )
+
+
 def _ack_candidate_shape(item: UnresolvedReviewItem) -> bool:
     if not (
         re.fullmatch(r"item-[1-9][0-9]*", item.item_id)
         and item.reviewer == "Orchestrator"
-        and item.status == "blocking"
+        and item.status in {"blocking", "same-pr"}
         and item.source_round > 0
         and item.source_status in {None, "blocking"}
         and _ACK_TEXT_RE.fullmatch(item.text)
         and not item.fix_scope
-        and not item.owner_evidence and not item.owner_dispositions
+        and _ack_disposition_fields(item)
         and not item.sub_items and not item.evidence_row_ids
         and not item.converted_row_id and not item.provenance and not item.repeat_of
     ):
         return False
     if not item.is_machine_obligation:
         return (
-            item.resolution_owners in {(), ("Orchestrator",)}
-            and item.owner_states in {(), (("Orchestrator", "pending"),)}
+            _ack_ordinary_ownership(item)
             and all(_REVIEWER_DISPOSITION_NOTE_RE.match(note) for note in item.notes)
         )
     # Reuse the exact persisted promotion-shape guard. Despite its historical
@@ -381,7 +413,11 @@ def recover_pr_acknowledgement_aliases(records: Sequence[PostedRoundRecord]) -> 
         if record.metadata.flow != "pr":
             continue
         for item in (*record.metadata.prior_items, *record.metadata.new_items):
-            origins.setdefault(item.item_id, (record, item))
+            # Dispatch is authenticated only by the later recovery reader.
+            # It is lineage-neutral here: the next ordinary carrier establishes
+            # origin, including a reviewer carrier which must remain rejected.
+            if record.metadata.phase != "coder-dispatch":
+                origins.setdefault(item.item_id, (record, item))
             copies.setdefault(item.item_id, []).append(item)
     aliases = set()
     for item_id, (record, origin) in origins.items():

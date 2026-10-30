@@ -3376,7 +3376,12 @@ def _select_current_round_records(
         (
             record
             for record in reversed(subject_records)
-            if record.metadata.phase == HEAD_REVIEW_RECOVERY_PHASE
+            if (
+                record.metadata.phase == HEAD_REVIEW_RECOVERY_PHASE
+                or (record.metadata.phase == "acknowledgement-repair-failed"
+                    and record.metadata.role == "summary"
+                    and record.metadata.agent == "Orchestrator")
+            )
             and record.metadata.round_number == anchor_metadata.round_number
         ),
         None,
@@ -3414,6 +3419,7 @@ from .plan_round_closure import (  # re-export planning history helpers
 PR_PRE_RECONCILIATION_PHASES = frozenset(
     {
         "scheduler-prelaunch",
+        "acknowledgement-repair-failed",
         CODER_DISPATCH_PHASE,
         CODER_FOLLOWUP_REJECTED_PHASE,
         HEAD_REVIEW_RECOVERY_PHASE,
@@ -5352,7 +5358,12 @@ def _resume_pr_round_from_records(
             and anchor_metadata.round_number > 1
             and anchor_metadata.scheduler_metadata_status == "valid"
         )
-        if not open_prelaunch:
+        open_ack_failure = (
+            anchor_metadata.role == "summary"
+            and anchor_metadata.agent == "Orchestrator"
+            and anchor_metadata.phase == "acknowledgement-repair-failed"
+        )
+        if not (open_prelaunch or open_ack_failure):
             if checkpoint_record is None:
                 return None
             # Preserve first-round startup and qualification recovery. A later

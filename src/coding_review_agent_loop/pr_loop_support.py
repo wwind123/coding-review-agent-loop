@@ -5537,6 +5537,7 @@ def _record_failed_acknowledgement(
             bound_metadata(
                 flow="pr", role="summary", agent="Orchestrator",
                 round_number=source_round, subject=subject, prior_items=tuple(items),
+                phase="acknowledgement-repair-failed",
             ),
         ),
     )

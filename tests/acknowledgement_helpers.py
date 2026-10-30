@@ -63,7 +63,8 @@ def pr_payload(history=()):
         "comments": [
             {"author": {"login": "maintainer"}, "createdAt": "2026-05-18T10:00:00Z",
              "body": "Please preserve the URL.\n\n-- Human Reviewer"},
-            *[{"author": {"login": "bot"}, "createdAt": f"2026-05-20T00:{i:02}:00Z", "body": body}
+            *[{"author": {"login": "coding-review-agent-loop"}, "_rest_author_id": 424242,
+               "createdAt": f"2026-05-20T00:{i:02}:00Z", "body": body}
               for i, body in enumerate(history)],
         ],
     }
@@ -97,6 +98,12 @@ def ack_resume_history(*, promoted=False, coder_ack=False, conflict=False, unrel
         surfaced_reviewer_requirement_ids=(requirement_id,),
         body=structured_pr_review(state="blocking" if conflict else "approved", human_requirements_resolved=True),
     )
-    return [original, coder, review]
+    from coding_review_agent_loop.round_state import RecoveryRoundBudget
+    dispatch = durable_record(
+        (alias, *other), role="summary", agent="Orchestrator", phase="coder-dispatch",
+        dispatch_round=1, dispatch_head="abc123", dispatch_attempt=1, recovery_dispatch=False,
+        recovery_round_budget=RecoveryRoundBudget(2, False, False),
+    )
+    return [dispatch, original, coder, review]
 
 

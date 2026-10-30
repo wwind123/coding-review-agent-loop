@@ -990,3 +990,30 @@ def test_ack_resume_coder_clearance_then_fresh_missing_reviewer_reraises(tmp_pat
     ) if "repair remains blocked" in r.body]
     assert len(failures) == 1
     assert [i.item_id for i in failures[0].metadata.prior_items] == [ACK_ID]
+
+
+@pytest.mark.parametrize("round_number", [1, 5])
+def test_ack_failure_boundary_resumes_round_ledger_and_numbering(tmp_path, monkeypatch, round_number):
+    from dataclasses import replace
+    from coding_review_agent_loop.round_state import _resume_pr_round
+    _exhaust_ack_repair(monkeypatch)
+    future = UnresolvedReviewItem(item_id="item-7", reviewer="Codex", source_round=1,
+                                  text="Preserve deferred work.", status="future")
+    high_item = replace(future, item_id="item-41")
+    prior = (future,)
+    history = [durable_record((high_item,), round_number=1),
+               durable_record(prior, round_number=round_number)]
+    runner = FakeRunner(pr_payload=ack_pr_payload(history), codex_outputs=[structured_pr_review(
+        prior_item_dispositions=[{"item_id": "item-7", "disposition": "future", "note": "Keep deferred."}],
+    )])
+    with pytest.raises(AgentLoopError, match=f"blocking issues after round {round_number}"):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=round_number))
+    comments = [IssueComment(author="bot", created_at=None, body=c["body"])
+                for c in runner.pr_payload["comments"]]
+    for _ in range(2):
+        resumed = _resume_pr_round(comments, head_sha="abc123", configured_reviewers=("codex",))
+        assert resumed.round_number == round_number
+        assert {i.item_id for i in resumed.prior_items} == {ACK_ID, "item-7"}
+        assert resumed.next_unresolved_item_number == 42
+        assert not resumed.reconciled
+        assert not resumed.completed_reviews

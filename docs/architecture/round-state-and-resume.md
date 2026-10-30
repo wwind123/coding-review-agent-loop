@@ -23,7 +23,11 @@ changing the trust or persistence contracts.
 `legacy_machine_items.py` owns legacy machine promotion and planning demotion,
 re-exported by `round_state.py`. Before PR promotion, it indexes the earliest
 durable appearance of each numbered acknowledgement candidate across both
-`prior_items` and `new_items` in admitted history order. Only an eligible coder
+`prior_items` and `new_items` in history order. Coder-dispatch carriers are
+lineage-neutral at this stage because their actor admission happens later;
+the next ordinary carrier establishes origin. A dispatch alone cannot grant
+authority, and a following reviewer origin still rejects recovery.
+Only an eligible coder
 checkpoint or Orchestrator summary with a consistent source round can establish
 lineage. Later trusted carries cannot authorize a reviewer origin; later
 reviewer copies with the legacy untrusted-lineage diagnostic do not revoke an
@@ -32,7 +36,11 @@ already trusted origin.
 Recovery requires the complete historical PR acknowledgement template and
 consistent identity across copies. It accepts ordinary findings and precise
 persisted unknown promotion shapes, including their valid authority/head,
-lifecycle, empty ownership and diagnostic/reviewer-note combinations. Invalid
+lifecycle, empty ownership and diagnostic/reviewer-note combinations. Ordinary
+blocking and same-PR copies may retain valid reconciliation owners, pending or
+cleared owner states, dispositions and matching reviewer evidence. Promotion
+may retain that evidence after clearing ownership; malformed fields still veto
+recovery. Invalid
 persisted fields, near matches, conflicting identities and unrelated unknowns
 remain blockers. The unknown-obligation repair guard is unchanged.
 
@@ -50,6 +58,12 @@ historical records in memory without adding old items into newer ledgers, so
 later cleared checkpoints remain cleared on repeated restart. Existing comments
 are never edited or deleted. Planning retains its separate ordinary-finding
 and legacy-demotion behavior and receives no PR alias/disposition migration.
+
+An exhausted acknowledgement repair publishes an explicit
+`acknowledgement-repair-failed` boundary. Same-head resume preserves its round,
+full carried ledger and the history-wide item-number high-water mark, including
+round 1. Earlier reviews saw a different ledger and are rerun; the boundary is
+not reconciliation or approval.
 
 ## Closed planning rounds
 
