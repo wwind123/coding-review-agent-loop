@@ -18,3 +18,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Managed repair checkpoints retain optional typed failed-run correlation and verified settlement provenance; old shapes use unique authenticated source-round chronology, and restart revalidates live evidence without resetting spent budgets (#1709).
 
 - Live scheduler-prelaunch checkpoints for open PR rounds after round 1 retain their recorded round and ledger on resume, preserving private same-round replay across issue and PR modes without changing first-round startup, recovery precedence or spool safeguards (#1774).
+
+- 2026-10-30: PR acknowledgement aliases recover only from earliest trusted durable lineage and exact historical shapes, with per-record disposition normalization and cleared-target replay; original numbering and idempotent restart remain intact (#1791).

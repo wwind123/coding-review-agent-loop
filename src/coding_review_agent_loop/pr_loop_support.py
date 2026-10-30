@@ -5511,3 +5511,33 @@ def _stop_for_human_decision(
             "the stop stands.",
         )
     raise exc
+
+
+def _record_failed_acknowledgement(
+    runner, *, config, pr_number, items, source_round, missing_reviewers,
+    subject, bound_metadata, post_comment,
+):
+    """Upsert and durably publish exhausted PR acknowledgement repair."""
+    from .unresolved_items import _upsert_human_requirements_ack_item
+    from .round_state import _attach_round_metadata
+
+    items = _upsert_human_requirements_ack_item(
+        items, source_round=source_round,
+        text=(
+            f"Reviewer(s) {', '.join(missing_reviewers)} approved without "
+            "acknowledging the signed human requirements. Coder must address the "
+            "human requirements and ensure the reviewer explicitly resolves them "
+            "before approval."
+        ),
+    )
+    post_comment(
+        runner, config=config, pr_number=pr_number,
+        body=_attach_round_metadata(
+            "Reviewer acknowledgement repair remains blocked.",
+            bound_metadata(
+                flow="pr", role="summary", agent="Orchestrator",
+                round_number=source_round, subject=subject, prior_items=tuple(items),
+            ),
+        ),
+    )
+    return items

@@ -921,3 +921,72 @@ def test_pr_loop_resume_with_trust_set_excludes_historically_acknowledged_requir
     for prompt in (*coder_prompts, *review_prompts):
         assert f"Requirement {excluded.requirement_id}:" not in prompt
     assert "No signed human requirements were surfaced" in coder_prompts[-1]
+
+
+from acknowledgement_helpers import ACK_ID, dedicated_ack, durable_record, pr_payload as ack_pr_payload
+from coding_review_agent_loop.round_state import _extract_round_metadata_records
+from coding_review_agent_loop.repair import RepairAttemptResult
+from coding_review_agent_loop.github import _parse_pr_human_requirements
+
+
+def _exhaust_ack_repair(monkeypatch):
+    calls = []
+    def exhausted(raw, **kwargs):
+        assert kwargs["repair_kwargs"]["expected_kind"] == "pr_review"
+        calls.append(raw)
+        attempts = [RepairAttemptResult(
+            backend="codex", model=model, prompt="Repair acknowledgement.", output="invalid",
+            returncode=0, outcome="invalid_output", diagnostic="Missing acknowledgement.",
+            log_path=None, fallback_planned=index == 0,
+        ) for index, model in enumerate(("gpt-6-luna", "gpt-6.1-sol"))]
+        return None, None, attempts
+    monkeypatch.setattr(pr_loop, "_run_structured_repair", exhausted)
+    return calls
+
+
+def test_ack_exhausted_repair_upserts_dedicated_durable_item_and_coder_clears(tmp_path, monkeypatch):
+    calls = _exhaust_ack_repair(monkeypatch)
+    requirement_id = _parse_pr_human_requirements(ack_pr_payload())[0].requirement_id
+    runner = FakeRunner(
+        pr_payload=ack_pr_payload(),
+        codex_outputs=[structured_pr_review(), structured_pr_review(), structured_pr_review(human_requirements_resolved=True)],
+        claude_outputs=[structured_coder_followup(human_requirement_ids=[requirement_id])] * 2,
+    )
+    clears = []
+    real = pr_loop._reconcile_human_requirements_ack_item
+    def reconcile(items, **kwargs):
+        result = real(items, **kwargs)
+        if any(i.item_id == ACK_ID for i in items) and not any(i.item_id == ACK_ID for i in result):
+            clears.append(kwargs["source_round"])
+        return result
+    monkeypatch.setattr(pr_loop, "_reconcile_human_requirements_ack_item", reconcile)
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, max_rounds=3)) == 0
+    assert len(calls) == 2
+    assert clears
+    from types import SimpleNamespace
+    records = _extract_round_metadata_records([SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr")
+    failures = [r for r in records if "repair remains blocked" in r.body]
+    assert [r.metadata.round_number for r in failures] == [1, 2]
+    for record in failures:
+        assert [i.item_id for i in record.metadata.prior_items] == [ACK_ID]
+        assert record.metadata.prior_items[0].source_round == record.metadata.round_number
+    from coding_review_agent_loop.round_state import _max_unresolved_item_number_from_records
+    assert _max_unresolved_item_number_from_records(records) == 0
+
+
+def test_ack_resume_coder_clearance_then_fresh_missing_reviewer_reraises(tmp_path, monkeypatch):
+    from acknowledgement_helpers import ack_resume_history
+    calls = _exhaust_ack_repair(monkeypatch)
+    runner = FakeRunner(
+        pr_payload=ack_pr_payload(ack_resume_history(promoted=True, coder_ack=True, unrelated=False)),
+        gemini_outputs=[structured_pr_review(reviewer="Google Gemini")],
+    )
+    with pytest.raises(AgentLoopError, match="blocking issues after round 2"):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=2))
+    assert len(calls) == 1
+    from types import SimpleNamespace
+    failures = [r for r in _extract_round_metadata_records(
+        [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr"
+    ) if "repair remains blocked" in r.body]
+    assert len(failures) == 1
+    assert [i.item_id for i in failures[0].metadata.prior_items] == [ACK_ID]

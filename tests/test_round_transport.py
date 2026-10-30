@@ -3006,3 +3006,171 @@ def test_resume_reparse_of_a_posted_prose_payload_keeps_todays_records_1626(kind
         assert carrier.kind == kind
         # The reconstruction re-parse uses the default degrade mode.
         assert _parse_1626(kind, resumed.coder_output).test_observation_degradations == records
+
+
+# #1791: trust comes from the earliest durable appearance, including prior_items.
+from dataclasses import replace
+from acknowledgement_helpers import (
+    ACK_ID, ACK_TEXT, UNBOUND_NOTE, UNTRUSTED_NOTE, dedicated_ack, durable_record,
+    legacy_ack, promoted_ack, unrelated_item,
+)
+from coding_review_agent_loop.round_state import _max_unresolved_item_number_from_records
+
+
+def _ack_records(*bodies):
+    return _extract_round_metadata_records([SimpleNamespace(body=body) for body in bodies], flow="pr")
+
+
+@pytest.mark.parametrize("persisted", [False, True])
+def test_ack_recovers_earliest_coder_prior_carrier_and_coalesces(persisted):
+    original = promoted_ack() if persisted else legacy_ack()
+    later = promoted_ack(notes=(UNTRUSTED_NOTE, "Codex: Still checking."))
+    bodies = [
+        durable_record((original, unrelated_item())),
+        durable_record((later, dedicated_ack(), unrelated_item()), role="reviewer", agent="Codex"),
+        durable_record((later, dedicated_ack(), unrelated_item()), round_number=3),
+    ]
+    records = _ack_records(*bodies)
+    assert records[0].metadata.new_items == ()
+    for record in records:
+        items = record.metadata.prior_items
+        assert [item.item_id for item in items] == [ACK_ID, "item-2"]
+        assert items[0].obligation_kind == "human-requirements-acknowledgement"
+        assert items[0].failed_head_sha is None
+        assert items[0].obligation_identity == "human-requirements-acknowledgement"
+    assert _max_unresolved_item_number_from_records(records) == 13
+    # A second restart from the unchanged comments is deterministic.
+    assert records == _ack_records(*bodies)
+    cleared = durable_record((unrelated_item(),), round_number=4)
+    assert [i.item_id for i in _ack_records(*bodies, cleared)[-1].metadata.prior_items] == ["item-2"]
+
+
+@pytest.mark.parametrize("collection", ["prior", "new"])
+@pytest.mark.parametrize("later_role,later_agent", [("coder", "Claude"), ("summary", "Orchestrator")])
+def test_ack_rejects_reviewer_origin_despite_later_trusted_carries(collection, later_role, later_agent):
+    item = legacy_ack()
+    first = durable_record(
+        (item,) if collection == "prior" else (),
+        new_items=(item,) if collection == "new" else (), role="reviewer", agent="Codex",
+    )
+    records = _ack_records(first, durable_record((item,), role=later_role, agent=later_agent))
+    for record in records:
+        for entry in (*record.metadata.prior_items, *record.metadata.new_items):
+            assert entry.item_id == "item-13"
+            assert entry.obligation_kind == "unknown"
+            assert entry.lifecycle == "repair_required"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"text": ACK_TEXT + " extra"}, {"text": ACK_TEXT.replace("before approval.", "before plan approval.")},
+    {"text": ACK_TEXT.replace("Codex, Gemini", "")}, {"text": "prefix " + ACK_TEXT},
+    {"obligation_identity": "unknown:item-99"}, {"candidate_head_sha": "candidate"},
+    {"failed_head_sha": "head"}, {"notes": ()}, {"notes": (UNBOUND_NOTE, "arbitrary suffix")},
+    {"notes": (UNBOUND_NOTE, UNTRUSTED_NOTE)}, {"resolution_owners": ("Orchestrator",)},
+    {"owner_states": (("Orchestrator", "pending"),)}, {"lifecycle": "qualifying"},
+    {"obligation_identity": "invalid-machine-record", "notes": ("Invalid persisted machine field: authority",)},
+])
+def test_ack_rejects_near_matches_and_malformed_promotions(overrides):
+    item = replace(promoted_ack(), **overrides)
+    record = _ack_records(durable_record((item,)))[0]
+    assert record.metadata.prior_items[0].item_id == "item-13"
+    assert record.metadata.prior_items[0].is_machine_obligation
+
+
+@pytest.mark.parametrize("overrides", [
+    {"text": ACK_TEXT.replace("Codex, Gemini", "Claude")}, {"source_round": 2},
+    {"reviewer": "Codex"}, {"obligation_identity": "unknown:item-99"},
+])
+def test_ack_conflicting_copy_cannot_acquire_authority(overrides):
+    records = _ack_records(
+        durable_record((legacy_ack(),)),
+        durable_record((replace(promoted_ack(), **overrides),), round_number=3),
+    )
+    assert all(record.metadata.prior_items[0].item_id == "item-13" for record in records)
+
+
+@pytest.mark.parametrize("authority,head,notes", [
+    (MACHINE_AUTHORITY, "failed", ()),
+    (UNKNOWN_MACHINE_AUTHORITY, None, (UNBOUND_NOTE, "Codex: Acknowledged.")),
+    (UNKNOWN_MACHINE_AUTHORITY, None, (UNTRUSTED_NOTE, "Codex: Acknowledged.")),
+])
+def test_ack_accepts_only_legitimate_legacy_authority_head_combinations(authority, head, notes):
+    item = promoted_ack(authority=authority, failed_head_sha=head, notes=notes)
+    records = _ack_records(durable_record((item,)))
+    assert records[0].metadata.prior_items[0].item_id == ACK_ID
+
+
+def test_ack_alias_dispositions_coalesce_only_for_record_prior_ledger():
+    dispositions = (
+        ReviewItemDisposition(reviewer="Codex", item_id="item-13", disposition="resolved", note="Alias note."),
+        ReviewItemDisposition(reviewer="Codex", item_id=ACK_ID, disposition="blocking", note="Dedicated note."),
+        ReviewItemDisposition(reviewer="Codex", item_id="item-2", disposition="resolved"),
+        ReviewItemDisposition(reviewer="Codex", item_id="item-999", disposition="resolved"),
+    )
+    records = _ack_records(
+        durable_record((legacy_ack(), unrelated_item())),
+        durable_record((promoted_ack(), dedicated_ack(), unrelated_item()), role="reviewer", agent="Codex",
+                       dispositions=dispositions),
+        durable_record((), role="reviewer", agent="Gemini", dispositions=dispositions[:1]),
+    )
+    normalized = records[1].metadata.dispositions
+    assert [d.item_id for d in normalized] == [ACK_ID, "item-2", "item-999"]
+    assert normalized[0].disposition == "blocking"
+    assert normalized[0].note == "Alias note.\nDedicated note."
+    assert records[2].metadata.dispositions[0].item_id == "item-13"
+    retained, _ = _apply_unresolved_item_dispositions(
+        records[1].metadata.prior_items, {ACK_ID: [replace(normalized[0], disposition="resolved")]},
+        same_status="same-pr",
+    )
+    assert ACK_ID in [i.item_id for i in retained]
+
+
+@pytest.mark.parametrize("role,agent,source_round", [
+    ("summary", "Codex", 1), ("coder", "Claude", 3), ("reviewer", "Orchestrator", 1),
+])
+def test_ack_rejects_ineligible_earliest_producer(role, agent, source_round):
+    item = legacy_ack(source_round=source_round)
+    records = _ack_records(durable_record((item,), role=role, agent=agent))
+    assert records[0].metadata.prior_items[0].obligation_kind == "unknown"
+    assert records[0].metadata.prior_items[0].item_id == "item-13"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"authority": MACHINE_AUTHORITY, "failed_head_sha": "unknown", "notes": ()},
+    {"authority": MACHINE_AUTHORITY, "failed_head_sha": "failed", "notes": (UNBOUND_NOTE,)},
+])
+def test_ack_rejects_impossible_promoted_head_diagnostic_pairs(overrides):
+    records = _ack_records(durable_record((promoted_ack(**overrides),)))
+    assert records[0].metadata.prior_items[0].item_id == "item-13"
+
+
+def test_ack_disposition_coalescing_preserves_distinct_reviewer_evidence():
+    dispositions = tuple(
+        ReviewItemDisposition(reviewer=reviewer, item_id=item_id, disposition=state, note=reviewer)
+        for reviewer, item_id, state in (
+            ("Codex", "item-13", "resolved"), ("Gemini", ACK_ID, "blocking"),
+            ("Codex", ACK_ID, "blocking"),
+        )
+    )
+    records = _ack_records(durable_record((legacy_ack(),), dispositions=dispositions))
+    assert [(d.reviewer, d.item_id, d.disposition) for d in records[0].metadata.dispositions] == [
+        ("Codex", ACK_ID, "blocking"), ("Gemini", ACK_ID, "blocking"),
+    ]
+
+
+@pytest.mark.parametrize("phase", ["coder-dispatch", "coder-followup-rejected", "head-review-recovery", "evidence-conversion"])
+def test_ack_authentication_specific_origin_cannot_grant_legacy_authority(phase):
+    records = _ack_records(
+        durable_record((legacy_ack(),), phase=phase),
+        durable_record((legacy_ack(),), round_number=3),
+    )
+    assert all(record.metadata.prior_items[0].item_id == "item-13" for record in records)
+
+
+def test_ack_rejects_invalid_persisted_field_at_decoder_boundary():
+    payload = _anchor_payload(durable_record((promoted_ack(),)))
+    payload["prior_items"][0]["authority"] = 42
+    record = _ack_records(_comment(payload))[0]
+    item = record.metadata.prior_items[0]
+    assert item.item_id == "item-13"
+    assert item.obligation_identity == "invalid-machine-record"
