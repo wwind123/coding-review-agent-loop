@@ -2406,3 +2406,81 @@ def test_idle_only_contradiction_requires_fresh_closed_round_review(
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     assert not any(command[0] in {"claude", "codex", "gemini"}
                    for command, _ in runner.commands[calls_after:])
+
+
+@pytest.mark.parametrize("opened,boundary", [
+    (False, "scheduler-prelaunch"), (False, "first-review"),
+    (True, "scheduler-prelaunch"), (True, "first-review"), (True, "all-reviews"),
+])
+def test_recovery_prelaunch_retires_only_older_round_approvals(tmp_path, opened, boundary):
+    """Recovery retires invalid old approvals but keeps fresh same-round reuse."""
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+
+    if opened:
+        comments, canonical, checkpoint = _closed_rereview_history(tmp_path)
+    else:
+        comments, canonical = _staged_plan_history(
+            tmp_path, reviewer_records=[("Codex", "approved", ())], reconciliation_record=True
+        )
+        records = plan_first_loop_module._extract_round_metadata_records(
+            [SimpleNamespace(body=c["body"]) for c in comments], flow="plan"
+        )
+        checkpoint = records[1].metadata
+        comments[2]["body"] = _attach_round_metadata("Exact primary approval", replace(
+            records[2].metadata, plan_candidate_key=checkpoint.plan_candidate_key))
+        comments.append({"author": {"login": "bot"}, "createdAt": "2026-01-01T00:02:00Z",
+            "body": _attach_round_metadata("Idle contradictory checkpoint", replace(
+                checkpoint, plan_candidate_key={**checkpoint.plan_candidate_key,
+                                                "aggregate_plan_identity": "old"}))})
+    runner = _FakeRunner(issue_comments=comments,
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")])
+    config = _staged_plan_config(tmp_path, max_rounds=3, review_parallel=True)
+    before = len(_plan_round_records(runner))
+    real_post = plan_first_loop_module.post_issue_comment
+    published = 0
+
+    def interrupt(*args, **kwargs):
+        nonlocal published
+        result = real_post(*args, **kwargs)
+        match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", kwargs["body"])
+        if match:
+            metadata = _decode_round_metadata(match.group(1))
+            if metadata.round_number == 2:
+                published += metadata.role == "reviewer"
+                if (metadata.phase == boundary
+                    or (boundary == "first-review" and published == 1)
+                    or (boundary == "all-reviews" and published == 2)):
+                    raise KeyboardInterrupt
+        return result
+
+    with patch.object(plan_first_loop_module, "post_issue_comment", side_effect=interrupt):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    fresh = _plan_round_records(runner)[before:]
+    decisions = [r for r in fresh if r.phase == "scheduler-prelaunch"]
+    assert decisions[0].scheduler_force_full is opened
+    assert decisions[0].scheduler_selected_reviewers == (("Codex", "Gemini") if opened else ("Codex",))
+    reviews = [r for r in fresh if r.role == "reviewer"]
+    assert sorted((r.agent, r.round_number) for r in reviews) == [
+        ("Codex", 2), ("Gemini", 3 if not opened and boundary == "scheduler-prelaunch" else 2)
+    ]
+    if not opened:
+        assert reviews[0].agent == "Codex"
+    assert all(r.round_number > 1 and r.subject == _plan_subject(canonical) for r in fresh)
+    assert not any(r.role == "coder" for r in fresh)
+    assert sorted(command[0] for command, _ in runner.commands
+                  if command[0] in {"claude", "codex", "gemini"}) == ["codex", "gemini"]
+    comments = [SimpleNamespace(body=c["body"]) for c in runner.issue_comments]
+    plan_text, plan_round = pr_loop_support._resume_plan_round(
+        comments, configured_reviewers=panel_evidence.reviewers(config))
+    panel_evidence._require_complete_canonical_plan_approval(
+        comments, config=config, plan_text=plan_text, plan_round=plan_round,
+        human_requirements=(), error_message="recovery approvals were lost")
+    classification = classify_plan_approval(comments, config=config, issue_number=56)
+    assert classification.approved, classification
+    calls_before = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert not any(command[0] in {"claude", "codex", "gemini"}
+                   for command, _ in runner.commands[calls_before:])

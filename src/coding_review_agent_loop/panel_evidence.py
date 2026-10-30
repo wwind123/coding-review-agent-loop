@@ -750,20 +750,30 @@ def _carried_plan_approvals(
     surfaced = {str(item) for item in surfaced_requirement_ids}
     from .plan_round_closure import project_plan_history
 
-    carried: dict[str, bool] = {}
+    carried: dict[str, tuple[bool, int]] = {}
     for record in sorted(project_plan_history(records), key=lambda item: item.index):
         metadata = record.metadata
+        previous_key = _plan_key_from_payload(metadata.scheduler_plan_previous_key)
+        checkpoint_key = _plan_key_from_payload(metadata.plan_candidate_key)
+        contradictory_prelaunch = bool(
+            previous_key is not None
+            and checkpoint_key is not None
+            and previous_key.subject == checkpoint_key.subject
+            and not previous_key.matches(checkpoint_key)
+        )
         if (
             metadata.role == "summary"
             and metadata.phase == "scheduler-prelaunch"
             and metadata.scheduler_metadata_status == "valid"
-            and metadata.scheduler_force_full
+            and (metadata.scheduler_force_full or contradictory_prelaunch)
         ):
-            # A durable forced review must finish its selected fresh turns.
-            # Otherwise its current-key prelaunch could clear degradation and
-            # immediately resurrect the approvals that caused the rollover.
+            # Recovery must not resurrect older approvals after its current-key
+            # checkpoint clears degradation, including primary-only recovery.
+            # Repeated prelaunches reuse completed same-round reviews live;
+            # preserve those reviews during durable approval replay as well.
             for name in metadata.scheduler_selected_reviewers:
-                carried.pop(name, None)
+                if name in carried and carried[name][1] < metadata.round_number:
+                    carried.pop(name)
         if metadata.role != "reviewer" or metadata.agent not in required:
             continue
         if predates_restoration(
@@ -796,8 +806,8 @@ def _carried_plan_approvals(
             and parent_bound
         )
         # A later record for the same reviewer supersedes an earlier one.
-        carried[metadata.agent] = bool(qualifies)
-    return tuple(sorted(name for name, ok in carried.items() if ok))
+        carried[metadata.agent] = (bool(qualifies), metadata.round_number)
+    return tuple(sorted(name for name, (ok, _) in carried.items() if ok))
 
 
 @dataclass(frozen=True)
