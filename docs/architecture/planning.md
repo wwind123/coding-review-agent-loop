@@ -2,7 +2,7 @@
 
 The main lifecycle diagram and the plan-first path up to the implementation PR: the canonical approved plan and its handoff binding, the generation-1 risk-based mode and transition matrix and its inheritance by child plans, implementation evidence claims and their selector, row-ID and launcher rules, deterministic planning-validation recovery, and the generation-1 execution strategy with staged child phases.
 
-Source paths: `src/coding_review_agent_loop/plan_first_loop.py`, `src/coding_review_agent_loop/issue_implementation.py`, `src/coding_review_agent_loop/child_plan_binding.py`, `src/coding_review_agent_loop/execution_policy.py`, `src/coding_review_agent_loop/plan_assembly.py`, `src/coding_review_agent_loop/risk_coverage_map.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/decomposition.py`, `src/coding_review_agent_loop/child_topology.py`, `src/coding_review_agent_loop/phase_progress.py`, `tests/test_plan_first_loop_review.py`, `tests/test_plan_first_loop_staged.py`, `tests/test_plan_first_loop_step_back.py`, `tests/test_plan_first_loop_execution_strategy.py`, `tests/test_issue_implementation_handoff.py`, `tests/test_issue_implementation_recovery.py`, `tests/test_issue_loop_resume.py`, `tests/test_plan_assembly.py`.
+Source paths: `src/coding_review_agent_loop/execution_retirement.py`, `tests/test_execution_decision_retirement.py`, `src/coding_review_agent_loop/plan_first_loop.py`, `src/coding_review_agent_loop/issue_implementation.py`, `src/coding_review_agent_loop/child_plan_binding.py`, `src/coding_review_agent_loop/execution_policy.py`, `src/coding_review_agent_loop/plan_assembly.py`, `src/coding_review_agent_loop/risk_coverage_map.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/decomposition.py`, `src/coding_review_agent_loop/child_topology.py`, `src/coding_review_agent_loop/phase_progress.py`, `tests/test_plan_first_loop_review.py`, `tests/test_plan_first_loop_staged.py`, `tests/test_plan_first_loop_step_back.py`, `tests/test_plan_first_loop_execution_strategy.py`, `tests/test_issue_implementation_handoff.py`, `tests/test_issue_implementation_recovery.py`, `tests/test_issue_loop_resume.py`, `tests/test_plan_assembly.py`.
 
 ## Main Lifecycle
 
@@ -399,6 +399,14 @@ The existing decision records retired hashes and explains terminal supersession.
 
 `issue_loop.py` defers only an authenticated terminal canonical handoff in
 plan-first mode; approval must still prove retirement under a different plan.
+Hash-less split materializations after a retiring decision belong to its current
+one-shot plan only when the recovered approved plan permits every split key and
+the materialization subject matches. Verified retired split keys suppress prior
+discuss proposals, preserving completed work without recreating children. Legacy
+plans without an execution recommendation repeat strict canonical handoff
+resolution before execution writes; entry deferral alone provides no dispatch
+authority.
+
 Same-plan and direct-mode terminal recovery refuse. Restart rebuilds a read-only,
 invocation-scoped execution history view before PR recovery and fresh preflights.
 Current-plan records positively attribute children and PRs first, including the

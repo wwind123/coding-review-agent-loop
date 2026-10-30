@@ -24,6 +24,8 @@ class ExecutionHistory:
     pr_numbers: frozenset[int]
     removed_records: tuple[tuple[tuple, int, int], ...]
 
+    retired_split_keys: frozenset[str] = frozenset()
+
     def view(self, context):
         if context.number != self.parent_issue:
             return context
@@ -115,8 +117,9 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
     """Partition attributed current work before checking historical completion.
 
     Hash retirement applies to records before the retiring decision, so an
-    A/B/A recurrence never suppresses the latest A. Hash-less records need a
-    retirement boundary AND verified terminal references.
+    A/B/A recurrence never suppresses the latest A. Hash-less history needs a
+    retirement boundary and verified terminal references; current split work
+    needs explicit approved-plan ownership.
     """
     from .execution_policy import _strict_gh_listing, _REALIZATION_LISTING_LIMIT
     from .child_topology import parent_child_search_queries
@@ -144,6 +147,37 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
     boundary = max((i for i, dec in decisions if dec.retires_plan_hashes), default=(-1, -1))
     if newly_retired:
         boundary = (len(comments), 0)
+    # Keep retired split identities when their historical records are hidden.
+    retired_split_keys = set()
+    split_records = []
+    for index, comment in enumerate(comments):
+        for marker in s.DISCUSS_SPLIT_MARKER_RE.finditer(comment.body or ""):
+            metadata = s._decode_split_metadata(marker["payload"])
+            if metadata.parent_issue == issue_number:
+                position = (index, marker.start())
+                split_records.append((position, metadata))
+                if position < boundary:
+                    retired_split_keys.update(c.key for c in metadata.children)
+    current_split_keys = frozenset()
+    active = [dec for dec in d.live_execution_decisions(comments, parent_issue=issue_number)
+              if dec.plan_hash == plan_hash and dec.strategy == "one-shot"]
+    if active and any(position >= boundary for position, _ in split_records):
+        from .round_state import recover_approved_plan_context
+        from .execution_policy import _approved_one_shot_split_keys
+        context = recover_approved_plan_context(
+            comments, expected_hash=plan_hash, expected_subject=active[-1].plan_subject,
+        )
+        if not context.is_available or not context.canonical_text:
+            raise AgentLoopError("Cannot verify current split ownership: approved plan is unavailable.")
+        key_config = replace(config, execution_history=ExecutionHistory(
+            issue_number, frozenset(retired), frozenset(), frozenset(), (),
+            frozenset(retired_split_keys),
+        ))
+        current_split_keys = _approved_one_shot_split_keys(
+            context.canonical_text,
+            issue_context=IssueContext(issue_number, config.repo, None, None, None, tuple(comments)),
+            config=key_config,
+        )
     current_children, current_prs, old_children, old_prs = set(), set(), set(), set()
     historical = []
     # Current hash-bearing records establish ownership before hash-less
@@ -154,6 +188,12 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
         ):
             current_children.update(children)
             current_prs.update(prs)
+    for position, metadata in split_records:
+        if (position >= boundary and active
+                and metadata.subject == active[-1].plan_subject
+                and metadata.children
+                and all(c.key in current_split_keys for c in metadata.children)):
+            current_children.update(_reference(c.number, c.url, config.repo) for c in metadata.children)
     for index, raw, record_hash, children, prs in records:
         old = record_hash in newly_retired or any(
             index < i and record_hash in dec.retires_plan_hashes for i, dec in decisions
@@ -167,7 +207,9 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
             current_children.update(children)
             current_prs.update(prs)
         else:
-            raise AgentLoopError("Cannot verify historical topology ownership for the approved plan.")
+            raise AgentLoopError("Cannot verify historical topology ownership for the approved plan: "
+                                 + ", ".join([f"child issue #{n}" for n in sorted(children)]
+                                             + [f"PR #{n}" for n in sorted(prs)] or ["unmapped record"]) + ".")
     if old_children & current_children or old_prs & current_prs:
         raise AgentLoopError("Ambiguous ownership: historical and current execution records claim the same work.")
 
@@ -314,7 +356,17 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
         blockers.append(f"branch `{branch_name}` could not be checked; verify access and retry")
     if blockers:
         raise AgentLoopError("Conflicting execution decision exists under plan hash " + (", ".join(newly_retired) or plan_hash) + "; live or unverifiable work: " + "; ".join(blockers) + ". Resume live work or verify uncertain evidence before re-approval.")
+    for number in old_children:
+        item = child_items[number]
+        markers = list(s.SPLIT_CHILD_MARKER_RE.finditer(item.get("body", "")))
+        for marker in markers:
+            if int(marker["parent"]) == issue_number:
+                retired_split_keys.add(marker["key"])
+        # Match the same marker-less legacy title fallback as split discovery.
+        prefix = f"[#{issue_number} stage] "
+        if not item.get("body") and item.get("title", "").startswith(prefix):
+            retired_split_keys.add(s.split_stage_proposal_from_text(item["title"][len(prefix):]).key)
     return ExecutionHistory(issue_number, frozenset(retired), frozenset(old_children), frozenset(old_prs), tuple(
         ((comments[i[0]].comment_id, comments[i[0]].created_at, comments[i[0]].body), i[1], i[1] + len(raw))
         for i, raw in historical
-    ))
+    ), frozenset(retired_split_keys))

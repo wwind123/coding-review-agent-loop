@@ -23,3 +23,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Initial and coverage-reask implementation acquisitions share the PR-follow-up typed report/selector correction policy, one allowance per acquisition; initial exhaustion stops before PR authentication, while coverage exhaustion discards the candidate and refreshes the original PR with post-authentication audit and recovery safeguards (#1768).
 
 - Re-approved plans may retire terminal execution history using complete inventories and resolved references; plan-first terminal handoffs defer to post-approval checks, and restart partitions current work before verified history without deleting durable records or branches (#1792, 2026-10-30).
+
+- Terminal-retirement recovery attributes post-decision split records through approved split keys and subject, retains retired split keys when filtering prior discuss proposals, and restores the pre-write canonical barrier for legacy plans without recommendations (#1792).

@@ -4697,6 +4697,17 @@ def _run_plan_first_loop_body(
                 log(config, str(nested))
                 print(json.dumps(nested.as_dict(), sort_keys=True))
                 return 2
+            # Entry deferral grants no execution authority to legacy plans.
+            # Reapply the canonical barrier before any execution writes.
+            if recommendation is None and mode != "plan-only":
+                resolve_canonical_pr_for_issue(
+                    runner, config=config, issue_number=issue_number,
+                    issue_context=issue_context,
+                    expected_fallback_scope=IssuePrProvenanceScope(
+                        repository=config.repo, issue_number=issue_number,
+                        flow="approved", approved_plan_hash=plan_hash,
+                    ),
+                )
             # Retirement verifies terminal history before any execution writes.
             retired_decision_hashes: frozenset[str] = frozenset()
             retiring_decision_hashes: tuple[str, ...] = ()

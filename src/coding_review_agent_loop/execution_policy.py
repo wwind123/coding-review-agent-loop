@@ -299,8 +299,15 @@ def _prior_discuss_split_proposals(
     if not final_summaries:
         return []
     latest = final_summaries[-1]
+    history = getattr(config, "execution_history", None)
+    retired_keys = getattr(history, "retired_split_keys", frozenset())
+
+    def remaining(proposals):
+        return [proposal for proposal in proposals
+                if split_stage_proposal_from_text(proposal).key not in retired_keys]
+
     if latest.metadata.split_proposals:
-        return list(latest.metadata.split_proposals)
+        return remaining(latest.metadata.split_proposals)
     configured_reviewers = reviewers(config)
     reviewer_workdirs = {
         agent_display_name(agent): agent_workdir(config, agent) for agent in configured_reviewers
@@ -311,7 +318,7 @@ def _prior_discuss_split_proposals(
         configured_reviewers=configured_reviewers,
         reviewer_workdirs=reviewer_workdirs,
     )
-    return list(recovered[0]) if recovered else []
+    return remaining(recovered[0]) if recovered else []
 
 
 def _plan_text_suggests_narrowing(plan_text: str) -> bool:

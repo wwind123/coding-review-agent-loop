@@ -453,3 +453,119 @@ def test_restart_recovers_provenanced_pr_created_before_replacement_handoff(tmp_
     assert run(runner, tmp_path) == 0
     assert _m1087_posted_decisions(runner) == []
     assert not runner.claude_outputs
+
+
+def discuss_split(proposal):
+    from coding_review_agent_loop.discuss_loop import _attach_round_metadata
+    from coding_review_agent_loop.round_state import PostedRoundMetadata
+    return comment(_attach_round_metadata("Split consensus.", PostedRoundMetadata(
+        flow="discuss", role="summary", agent="Orchestrator", round_number=1,
+        subject="discuss-subject", is_final=True, split_proposals=(proposal,),
+    )))
+
+
+@pytest.mark.parametrize("source", ["deferred", "discuss"])
+@pytest.mark.parametrize("handoff", [False, True])
+def test_restart_attributes_post_retirement_split_children(tmp_path, source, handoff):
+    raw = structured_v1_plan_state()
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["deferred_stages"] = [{"title": "New follow-up", "summary": "Explicit remaining work."}]
+    raw = json.dumps(payload) + raw[end:]
+    comments = [_m1087_stale_decision_comment(), comment(old_record("split"))]
+    if source == "discuss":
+        comments.append(discuss_split("New follow-up"))
+    runner = RetirementRunner(children=[child()], issue_comments=comments,
+        claude_outputs=[raw, "Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"])
+    assert run(runner, tmp_path, materialize_split_issues=True) == 0
+    if source == "discuss":
+        assert len(runner.issues) == 1
+        created = runner.issues[0]
+    else:
+        # A manually filed explicitly approved deferred stage uses the same
+        # hash-less materialization contract as discuss/child split stages.
+        current = _m1087_posted_decisions(runner)[0]
+        proposal = s.split_stage_proposal_from_text("New follow-up")
+        metadata = s.SplitMaterializationMetadata(56, current.plan_subject, (
+            s.MaterializedSplitChild(proposal.title, proposal.key,
+                "https://github.com/OWNER/REPO/issues/99", 99, "adopted"),))
+        runner.issue_comments.append(comment(s.format_split_materialization_summary(
+            parent_issue=56, metadata=metadata), 58))
+        runner.issue_comments[-1]["createdAt"] = "2026-05-24T00:00:00Z"
+        created = {"body": f"<!-- AGENT_SPLIT_CHILD: parent=56 key={proposal.key} -->",
+                   "title": "[#56 stage] New follow-up"}
+    runner.children.append(dict(child(99, "OPEN", created["body"]), title=created["title"]))
+    if not handoff:
+        runner.issue_comments = [c for c in runner.issue_comments if not (
+            "AGENT_PLAN_ONE_SHOT_IMPL" in c["body"] or "AGENT_ISSUE_PR_HANDOFF" in c["body"])]
+        runner.claude_outputs = ["Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"]
+    runner.codex_outputs = ["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"]
+    runner.comments.clear()
+    runner.issues.clear()
+    assert run(runner, tmp_path, materialize_split_issues=True) == 0
+    assert runner.issues == []
+    assert _m1087_posted_decisions(runner) == []
+    if handoff:
+        assert not runner.claude_outputs
+
+
+@pytest.mark.parametrize("mode", ["decompose-only", "implement-by-phase", "implement-one-shot"])
+@pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
+def test_legacy_plan_terminal_deferral_never_authorizes_writes(tmp_path, mode, state):
+    from agent_loop_helpers import structured_plan_state
+    runner = RetirementRunner(issue_comments=[_m1087_stale_decision_comment(), comment(old_record("canonical"))],
+        pr_payloads_by_number={82: dict(pr(state=state), url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])},
+        claude_outputs=[structured_plan_state(child_stages=[{"title": "New work", "summary": "Do work."}]),
+                        "Implementation must not run."])
+    with pytest.raises(AgentLoopError, match="not OPEN"):
+        run(runner, tmp_path, plan_execution_mode=mode, materialize_split_issues=True,
+            execution_strategy_contract_required=False)
+    no_dispatch(runner)
+    assert not any("AGENT_DISCUSS_SPLIT" in body or "AGENT_SPLIT_UNFILED_WARNING" in body
+                   for body in runner.comments)
+
+
+@pytest.mark.parametrize("materialize", [False, True])
+@pytest.mark.parametrize("origin", ["summary", "child-marker", "title"])
+def test_retired_discuss_split_proposals_are_not_recreated(tmp_path, materialize, origin):
+    proposal = s.split_stage_proposal_from_text("Old follow-up")
+    metadata = s.SplitMaterializationMetadata(56, "old", (s.MaterializedSplitChild(
+        proposal.title, proposal.key, "https://github.com/OWNER/REPO/issues/90", 90, "created"),))
+    comments = [_m1087_stale_decision_comment(), discuss_split("Old follow-up")]
+    if origin == "summary":
+        comments.append(comment(s.format_split_materialization_summary(parent_issue=56, metadata=metadata)))
+    body = "" if origin == "title" else f"<!-- AGENT_SPLIT_CHILD: parent=56 key={proposal.key} -->"
+    runner = RetirementRunner(children=[dict(child(body=body), title="[#56 stage] Old follow-up")],
+        issue_comments=comments)
+    assert run(runner, tmp_path, materialize_split_issues=materialize) == 0
+    assert runner.issues == []
+    assert _m1087_implementation_dispatched(runner)
+    assert not any("AGENT_DISCUSS_SPLIT" in body or "AGENT_SPLIT_UNFILED_WARNING" in body
+                   for body in runner.comments)
+
+
+@pytest.mark.parametrize("mismatch", ["key", "subject", "mixed"])
+def test_post_retirement_split_requires_complete_approved_ownership(tmp_path, mismatch):
+    raw = structured_v1_plan_state()
+    payload, end = json.JSONDecoder().raw_decode(raw)
+    payload["deferred_stages"] = [{"title": "Approved follow-up", "summary": "Remaining work."}]
+    runner = RetirementRunner(claude_outputs=[json.dumps(payload) + raw[end:],
+        "Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"])
+    assert run(runner, tmp_path) == 0
+    decision = _m1087_posted_decisions(runner)[0]
+    key = s.split_stage_proposal_from_text("Approved follow-up").key
+    children = [s.MaterializedSplitChild("Follow-up", "b" * 64 if mismatch == "key" else key,
+        "https://github.com/OWNER/REPO/issues/99", 99, "created")]
+    if mismatch == "mixed":
+        children.append(s.MaterializedSplitChild("Unapproved", "b" * 64,
+            "https://github.com/OWNER/REPO/issues/100", 100, "created"))
+    metadata = s.SplitMaterializationMetadata(56,
+        "unrelated" if mismatch == "subject" else decision.plan_subject, tuple(children))
+    record = comment(s.format_split_materialization_summary(parent_issue=56, metadata=metadata))
+    record["createdAt"] = "2026-05-24T00:00:00Z"
+    runner.issue_comments.append(record)
+    runner.comments.clear()
+    with pytest.raises(AgentLoopError, match="ownership.*child issue #99"):
+        run(runner, tmp_path)
+    assert runner.comments == []
+    assert runner.issues == []
+    assert not runner.claude_outputs
