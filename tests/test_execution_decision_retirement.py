@@ -216,7 +216,15 @@ def test_strategy_transitions_route_past_terminal_history(tmp_path, old_strategy
             stage["non_goals"] = ["No unrelated work."]
             stage["compatibility_constraints"] = ["Preserve public interfaces."]
         raw = json.dumps(payload) + raw[end:]
-    runner = RetirementRunner(children=[child()], prs=[pr()], issue_comments=[_m1087_stale_decision_comment(), comment(record)],
+    earlier = _m1087_stale_decision_comment()
+    if old_strategy == "staged":
+        marker = d.EXECUTION_DECISION_MARKER_RE.search(earlier["body"])
+        decision = d._decode_execution_decision(marker["payload"])
+        earlier["body"] = d.format_execution_decision(replace(
+            decision, strategy="staged", requested_policy="implement-by-phase",
+            current_action="implement-by-phase", stage_ids=("old-stage",),
+        ))
+    runner = RetirementRunner(children=[child()], prs=[pr()], issue_comments=[earlier, comment(record)],
         claude_outputs=[raw, "Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"])
     if new_strategy == "staged":
         runner.pr_payload["body"] = "Fixes #99"
