@@ -1563,7 +1563,6 @@ def test_run_pr_loop_labels_reviewer_and_acknowledgement_rounds_as_reviewer_feed
             ),
             structured_pr_review(
                 state="approved", summary="Acknowledged.", human_requirements_resolved=True,
-                prior_item_dispositions=[{"item_id": "item-2", "disposition": "resolved"}],
             ),
         ],
         claude_outputs=[ack_markdown, ack_markdown],
@@ -1586,9 +1585,11 @@ def test_run_pr_loop_labels_reviewer_and_acknowledgement_rounds_as_reviewer_feed
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert [round_number for round_number, _items in dispatched] == [1, 2]
-    for _round_number, items in dispatched:
-        assert items and not any(item.is_machine_obligation for item in items)
-    assert [item.item_id for item in dispatched[1][1]] == ["item-2"]
+    assert [item.item_id for item in dispatched[0][1]] == ["item-1"]
+    assert not dispatched[0][1][0].is_machine_obligation
+    # Dedicated acknowledgement obligations are excluded from coder findings;
+    # the coder acknowledges the surfaced requirement through its response.
+    assert dispatched[1][1] == ()
     err = capsys.readouterr().err
     assert "re-injecting as blocking item" in err
     assert _round_label_lines(err) == [

@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
-from typing import TYPE_CHECKING, Sequence
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 from .protocol import MACHINE_AUTHORITY, UNKNOWN_MACHINE_AUTHORITY, UnresolvedReviewItem
 

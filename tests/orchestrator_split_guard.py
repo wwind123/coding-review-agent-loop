@@ -69,6 +69,7 @@ EXTRACTED_MODULES: tuple[str, ...] = (
     'capture_acceptance',
     'capture_reconciliation',
     'capture_dispatch',
+    'legacy_machine_items',
     'pr_loop_support',
     'converted_capture',
     'pr_restart',
