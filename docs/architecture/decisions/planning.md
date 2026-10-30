@@ -31,3 +31,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Terminal retirement verifies historical child implementation PRs through complete PR inventories and authenticated child handoffs, including closed children whose PRs remain open (#1792).
 
 - Historical child retirement authenticates every handoff lineage, preserving same-PR contract supersession while checking earlier PRs for reopened or unreadable work on each restart (#1792).
+
+- Retirement assessment owns its strict listing reader and receives approved split ownership as a caller-supplied policy function, preserving the acyclic module layering enforced by the extraction registry (#1792).

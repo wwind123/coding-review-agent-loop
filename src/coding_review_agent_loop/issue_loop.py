@@ -524,10 +524,12 @@ def run_issue_loop(
         if plan_first and recovered_plan_hash is not None:
             from .decomposition import live_execution_decisions
             from .execution_retirement import assess_execution_history
+            from .execution_policy import _approved_one_shot_split_keys
             if any(decision.plan_hash == recovered_plan_hash and decision.retires_plan_hashes
                    for decision in live_execution_decisions(issue_context.comments, parent_issue=issue_number)):
                 history = assess_execution_history(
                     runner, config=config, issue_number=issue_number,
+                    approved_split_keys=_approved_one_shot_split_keys,
                     comments=issue_context.comments, plan_hash=recovered_plan_hash, newly_retired=(),
                 )
                 if history is not None:

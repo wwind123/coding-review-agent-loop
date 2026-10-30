@@ -14,6 +14,39 @@ from . import decomposition as d
 from . import split_materialization as s
 from .errors import AgentLoopError
 from .workdirs import active_workdir
+from .runner import Runner
+from .config import AgentLoopConfig
+from collections.abc import Sequence
+
+
+_REALIZATION_LISTING_LIMIT = 100000
+
+
+def _strict_gh_listing(
+    runner: Runner,
+    *,
+    config: AgentLoopConfig,
+    args: Sequence[str],
+) -> list[dict] | None:
+    """A complete ``gh ... list --json`` result, or ``None`` when unreadable.
+
+    A failed command, output that is not a JSON list of objects, or a result
+    that fills the limit (possibly truncated) is ``None``.
+    """
+    result = runner.run(
+        [config.gh_cmd, *args], cwd=active_workdir(config), check=False
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        items = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
+        return None
+    if len(items) >= _REALIZATION_LISTING_LIMIT:
+        return None
+    return items
 
 
 @dataclass(frozen=True)
@@ -146,7 +179,7 @@ def _records(comments, parent, repo):
     return result
 
 
-def assess_execution_history(runner, *, config, issue_number, comments, plan_hash, newly_retired):
+def assess_execution_history(runner, *, config, issue_number, comments, plan_hash, newly_retired, approved_split_keys):
     """Partition attributed current work before checking historical completion.
 
     Hash retirement applies to records before the retiring decision, so an
@@ -154,7 +187,6 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
     retirement boundary and verified terminal references; current split work
     needs explicit approved-plan ownership.
     """
-    from .execution_policy import _strict_gh_listing, _REALIZATION_LISTING_LIMIT
     from .child_topology import parent_child_search_queries
     from .github import parse_strong_issue_reference_evidence, read_rest_issue_comments
     from .issue_pr_handoff import authenticate_canonical_issue_pr
@@ -196,7 +228,6 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
               if dec.plan_hash == plan_hash and dec.strategy == "one-shot"]
     if active and any(position >= boundary for position, _ in split_records):
         from .round_state import recover_approved_plan_context
-        from .execution_policy import _approved_one_shot_split_keys
         context = recover_approved_plan_context(
             comments, expected_hash=plan_hash, expected_subject=active[-1].plan_subject,
         )
@@ -206,7 +237,7 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
             issue_number, frozenset(retired), frozenset(), frozenset(), (),
             frozenset(retired_split_keys),
         ))
-        current_split_keys = _approved_one_shot_split_keys(
+        current_split_keys = approved_split_keys(
             context.canonical_text,
             issue_context=IssueContext(issue_number, config.repo, None, None, None, tuple(comments)),
             config=key_config,

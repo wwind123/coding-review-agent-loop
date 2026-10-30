@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.parse
+from .execution_retirement import _strict_gh_listing, _REALIZATION_LISTING_LIMIT
 from collections.abc import Sequence
 from dataclasses import dataclass
 from .agents.registry import agent_display_name, get_backend
@@ -1494,36 +1495,6 @@ def _persist_execution_decision_if_needed(
         post_execution_decision(runner, config=config, decision=decision)
 
 
-_REALIZATION_LISTING_LIMIT = 100000
-
-
-def _strict_gh_listing(
-    runner: Runner,
-    *,
-    config: AgentLoopConfig,
-    args: Sequence[str],
-) -> list[dict] | None:
-    """A complete ``gh ... list --json`` result, or ``None`` when unreadable.
-
-    A failed command, output that is not a JSON list of objects, or a result
-    that fills the limit (possibly truncated) is ``None``.
-    """
-    result = runner.run(
-        [config.gh_cmd, *args], cwd=active_workdir(config), check=False
-    )
-    if result.returncode != 0:
-        return None
-    try:
-        items = json.loads(result.stdout)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(items, list) or not all(isinstance(item, dict) for item in items):
-        return None
-    if len(items) >= _REALIZATION_LISTING_LIMIT:
-        return None
-    return items
-
-
 def _execution_decision_realization_evidence(
     runner: Runner,
     *,
@@ -1540,6 +1511,7 @@ def _execution_decision_realization_evidence(
         ))
         assess_execution_history(
             runner, config=config, issue_number=issue_number, comments=comments,
+            approved_split_keys=_approved_one_shot_split_keys,
             plan_hash="", newly_retired=hashes or ("diagnostic",),
         )
     except AgentLoopError as exc:
@@ -1571,6 +1543,7 @@ def _retirable_execution_decision_hashes(
         ).comments
     history = assess_execution_history(
         runner, config=config, issue_number=issue_number, comments=comments,
+        approved_split_keys=_approved_one_shot_split_keys,
         plan_hash=plan_hash, newly_retired=stale,
     )
     if stale:

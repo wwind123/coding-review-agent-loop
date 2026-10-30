@@ -388,9 +388,11 @@ bounded to one `agent-pr` child per run while the parent remains open.
 Repair may preserve a complete v1 source, but cannot synthesize missing
 recommendation data.
 
-Execution re-approval uses `execution_retirement.py` to assess complete child and
-all-state PR inventories plus every referenced handoff, decomposition, checkpoint
-and split record. A stale decision may be retired only when its work is absent
+Execution re-approval uses `execution_retirement.py` and its strict inventory
+reader to assess complete child and all-state PR listings plus every referenced
+handoff, decomposition, checkpoint and split record. Callers supply the approved
+split ownership derivation from execution policy, keeping retirement assessment
+independent of that higher policy layer. A stale decision may be retired only when its work is absent
 or positively terminal (CLOSED children; CLOSED or MERGED PRs), with confirmed
 absence of the encoded reserved-branch endpoint. Unknown, truncated or unreadable
 state fails closed. A leftover branch requires manual deletion after verifying
