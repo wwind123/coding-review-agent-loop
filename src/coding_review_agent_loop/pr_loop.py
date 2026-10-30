@@ -131,6 +131,7 @@ from .github import (
     PullRequestReviewContext,
     get_issue_context,
     get_pr_mergeability,
+    get_pr_review_context,
     parse_linked_issue_numbers,
     get_pr_checks,
     post_pr_comment,
@@ -3497,11 +3498,7 @@ def run_pr_loop(
                     # Refresh conversion visibility (#1664); transport failures
                     # retain our record, but observation stops must propagate.
                     try:
-                        refreshed_pr_context = get_observed_pr_review_context(
-                            runner, config=config, pr_number=pr_number
-                        )
-                    except PrHeadObservationError:
-                        raise
+                        refreshed_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
                     except AgentLoopError as exc:
                         log(
                             config,
@@ -3509,6 +3506,9 @@ def run_pr_loop(
                             f"operator conversion failed ({exc}); keeping the earlier snapshot",
                         )
                     else:
+                        refreshed_pr_context = observe_pr_head(
+                            runner, config=config, pr_number=pr_number, context=refreshed_pr_context
+                        )
                         if refreshed_pr_context.metadata.head_sha == pr_metadata.head_sha:
                             pr_context = refreshed_pr_context
                             initial_pr_context = refreshed_pr_context
@@ -5133,13 +5133,13 @@ def run_pr_loop(
                 # stop or undecodable history forbids reviewer launches.
                 pr_fresh_records: tuple[PostedRoundRecord, ...] | None = None
                 try:
-                    pr_fresh_comments = get_observed_pr_review_context(
-                        runner, config=config, pr_number=pr_number
-                    ).comments
-                except PrHeadObservationError:
-                    raise
+                    pr_fresh_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
                 except AgentLoopError:
                     pr_fresh_comments = None
+                else:
+                    pr_fresh_comments = observe_pr_head(
+                        runner, config=config, pr_number=pr_number, context=pr_fresh_context
+                    ).comments
                 try:
                     if pr_fresh_comments is not None:
                         pr_fresh_records = _extract_round_metadata_records(

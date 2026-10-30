@@ -7,7 +7,7 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
-from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError
+from .pr_head_sync import get_observed_pr_review_context, observe_pr_head
 
 from .managed_ci_result import VerifiedManagedResult
 from .agent_failure import ValidatedAgentResponse
@@ -4038,12 +4038,13 @@ def _pr_step_back_decision(
     ):
         return PrStepBackDecision()
     try:
-        fresh = _extract_round_metadata_records(
-            get_observed_pr_review_context(runner, config=config, pr_number=pr_number).comments,
-            flow="pr",
-        )
-    except PrHeadObservationError:
-        raise
+        fresh_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    except AgentLoopError as exc:
+        log(config, f"PR step-back suppressed: fresh round history is unavailable ({exc})")
+        return PrStepBackDecision()
+    fresh_context = observe_pr_head(runner, config=config, pr_number=pr_number, context=fresh_context)
+    try:
+        fresh = _extract_round_metadata_records(fresh_context.comments, flow="pr")
     except AgentLoopError as exc:
         log(config, f"PR step-back suppressed: fresh round history is unavailable ({exc})")
         return PrStepBackDecision()
@@ -4591,28 +4592,35 @@ def _reconcile_converted_evidence(
         return list(ledger)
     assert approved_plan_context is not None
     if records is None:
+        if comments is None:
+            try:
+                fresh_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+            except AgentLoopError:
+                visible_comments = None
+            else:
+                visible_comments = observe_pr_head(
+                    runner, config=config, pr_number=pr_number, context=fresh_context
+                ).comments
+        else:
+            visible_comments = comments
         try:
-            raw_records = _extract_round_metadata_records(
-                comments if comments is not None else get_observed_pr_review_context(
-                    runner, config=config, pr_number=pr_number
-                ).comments,
-                flow="pr",
-            )
-        except PrHeadObservationError:
-            raise
+            raw_records = _extract_round_metadata_records(visible_comments or (), flow="pr")
         except AgentLoopError:
             raw_records = ()
         if not any(_is_row_converted_obligation(item) for item in ledger) and not any(
             record.metadata.phase == EVIDENCE_CONVERSION_PHASE for record in raw_records
         ):
             return list(ledger)
-        try:
-            records, history_complete = admitted_pr_records_status(
-                runner, config, pr_number=pr_number, comments=comments
-            )
-        except AgentLoopError as exc:
-            log(config, f"Converted-evidence reconciliation used no history ({exc})")
+        if visible_comments is None:
             records, history_complete = (), False
+        else:
+            try:
+                records, history_complete = admitted_pr_records_status(
+                    runner, config, pr_number=pr_number, comments=visible_comments
+                )
+            except AgentLoopError as exc:
+                log(config, f"Converted-evidence reconciliation used no history ({exc})")
+                records, history_complete = (), False
     references, audits = evidence_authority_from_records(records)
     if not history_complete:
         log(

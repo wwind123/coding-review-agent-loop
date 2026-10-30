@@ -1709,18 +1709,21 @@ def test_an_operator_conversion_beside_a_public_same_round_review_runs_the_board
     context = _plan_context("row-a", "row-b")
     runner, config = _stalled_carried_panel(tmp_path, monkeypatch, context)
     if fresh_read == "failing":
-        real_read = pr_loop_module.get_observed_pr_review_context
+        real_read = runner.run
         failed = []
+        monkeypatch.setattr("coding_review_agent_loop.github_retry._sleep", lambda _: None)
 
-        def read(*args, **kwargs):
+        def read(args, **kwargs):
+            result = real_read(args, **kwargs)
             records = _records(runner)
             conversions = [r for r in records if r.metadata.phase == "evidence-conversion"]
-            if conversions and not _reviews_after(runner, conversions[-1].index):
+            if (args[:3] == ["gh", "pr", "view"] and "comments" in args[-1]
+                    and conversions and not _reviews_after(runner, conversions[-1].index)):
                 failed.append(len(runner.pr_payload["comments"]))
-                raise AgentLoopError("GitHub read failed")
-            return real_read(*args, **kwargs)
+                return dataclasses.replace(result, returncode=1, stdout="", stderr="HTTP 503 Service Unavailable")
+            return result
 
-        monkeypatch.setattr(pr_loop_module, "get_observed_pr_review_context", read)
+        monkeypatch.setattr(runner, "run", read)
     with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
     conversion = _conversion(runner)
@@ -1729,7 +1732,7 @@ def test_an_operator_conversion_beside_a_public_same_round_review_runs_the_board
     _assert_fresh_repeat(runner, conversion)
     if fresh_read == "failing":
         # Both the post-conversion refresh and the post-checkpoint visibility read failed.
-        assert len(failed) >= 2
+        assert len(failed) >= 6
 
 
 def test_a_restart_after_an_unfinished_operator_conversion_restores_the_full_board_repeat(
@@ -2543,3 +2546,92 @@ def test_verified_capture_that_moves_head_gets_exact_head_review(tmp_path, monke
     [fresh] = _reviews_after(runner, capture.index)
     assert fresh.metadata.subject == capture.metadata.subject
     assert fresh.metadata.state == "approved"
+
+
+@pytest.mark.parametrize("site", ["conversion", "checkpoint", "step-back", "reconciliation"])
+@pytest.mark.parametrize("failure", ["transport", "closed", "desync", "verification"])
+def test_optional_visibility_refresh_separates_read_fallback_from_observation(
+    tmp_path, monkeypatch, site, failure
+):
+    """All optional refreshes fall back only when acquisition fails, never observation."""
+    import coding_review_agent_loop.pr_loop_support as support
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+
+    context = _plan_context("row-a", "row-b")
+    if site in {"conversion", "checkpoint"}:
+        runner, config = _stalled_carried_panel(tmp_path, monkeypatch, context)
+        invoke = lambda: run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
+    else:
+        runner, config = FakeRunner(), make_config(tmp_path)
+        if site == "step-back":
+            monkeypatch.setattr(support, "_pr_step_back_records_may_matter", lambda *a, **k: True)
+            invoke = lambda: support._pr_step_back_decision(
+                runner, config, pr_number=77, round_number=3, snapshot_comments=(),
+                tracked=("Codex",), head_sha=START_HEAD,
+            )
+        else:
+            ledger, _, _ = _upsert_converted_evidence_obligation(
+                [], item_number=2, row_id="row-a", matrix_identity=context.risk_test_matrix_identity,
+                head_sha=START_HEAD, owners=("Codex",), source_round=2, explanation="",
+            )
+            invoke = lambda: support._reconcile_converted_evidence(
+                runner, config, pr_number=77, ledger=ledger, head_sha=START_HEAD,
+                approved_plan_context=context,
+            )
+    logs = []
+    monkeypatch.setattr(pr_loop_module, "log", lambda config, message: logs.append(message))
+    monkeypatch.setattr(support, "log", lambda config, message: logs.append(message))
+    monkeypatch.setattr("coding_review_agent_loop.github_retry._sleep", lambda _: None)
+    original = runner.run
+    failed_reads = []
+    triggered = []
+
+    def run(args, **kwargs):
+        result = original(args, **kwargs)
+        if args[:3] != ["gh", "pr", "view"] or "comments" not in args[-1]:
+            return result
+        if not triggered:
+            if site in {"conversion", "checkpoint"}:
+                records = _records(runner)
+                conversions = [r for r in records if r.metadata.phase == "evidence-conversion"]
+                if not conversions or _reviews_after(runner, conversions[-1].index):
+                    return result
+                if site == "checkpoint" and not any(
+                    r.metadata.phase == "scheduler-prelaunch" and r.index > conversions[-1].index
+                    for r in records
+                ):
+                    return result
+            triggered.append(len(runner.commands))
+            if failure == "closed":
+                runner.pr_payload["state"] = "CLOSED"
+            elif failure == "desync":
+                runner.branch_tip = "b" * 40
+            elif failure == "verification":
+                runner.branch_tip = "invalid"
+        if failure == "transport" and len(failed_reads) < 3:
+            failed_reads.append(args)
+            return dataclasses.replace(result, returncode=1, stdout="", stderr="HTTP 503 Service Unavailable")
+        return result
+
+    monkeypatch.setattr(runner, "run", run)
+    if failure == "transport":
+        if site in {"conversion", "checkpoint"}:
+            with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
+                invoke()
+            _assert_fresh_repeat(runner, _conversion(runner))
+        elif site == "step-back":
+            assert invoke() == support.PrStepBackDecision()
+        else:
+            assert invoke() == ledger
+        assert len(failed_reads) == 3
+    else:
+        error_type = AgentLoopError if failure == "closed" else PrHeadObservationError
+        message = {"closed": "provide an open PR", "desync": "GitHub PR-head desync", "verification": "full hexadecimal"}[failure]
+        with pytest.raises(error_type, match=message):
+            invoke()
+        assert not any("comment refresh after" in message or "fresh round history is unavailable" in message
+                       or "Converted-evidence reconciliation used no history" in message for message in logs)
+        if site in {"conversion", "checkpoint"}:
+            assert not _reviews_after(runner, _conversion(runner).index)
+        assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands[triggered[0]:])
+    assert triggered

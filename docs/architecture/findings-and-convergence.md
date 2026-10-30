@@ -441,7 +441,11 @@ head moves.
 `pr_head_sync.py` rejects closed or merged PRs with the existing not-open
 error before reading a branch tip or diagnosing lag. Comment-only completion
 deduplication after merge uses the plain context reader, so automatic branch
-deletion cannot interrupt merge completion bookkeeping.
+deletion cannot interrupt merge completion bookkeeping. Optional conversion,
+scheduler-checkpoint, step-back and converted-evidence visibility refreshes keep
+their existing fallback when the plain context read fails. When that read
+succeeds, head observation runs outside the fallback handler: closed-PR stops,
+desync and verification failures propagate before the refreshed history is used.
 
 `pr_head_sync.py` observes the PR projection, REST PR head and independent tip
 of the exact head repository/ref before lifecycle publications, entry activation

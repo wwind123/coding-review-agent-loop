@@ -2,6 +2,7 @@
 
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -1049,16 +1050,19 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
     runner.codex_outputs.append(structured_pr_review(human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
     runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini", human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
     if not fresh_read:
-        real_context = pr_loop.get_observed_pr_review_context
+        real_context = runner.run
+        monkeypatch.setattr("coding_review_agent_loop.github_retry._sleep", lambda _: None)
         failed_reads = []
-        def unavailable_after_checkpoint(*args, **kwargs):
-            if not failed_reads and sum(r.metadata.phase == "scheduler-prelaunch" for r in records()) > sum(
+        def unavailable_after_checkpoint(args, **kwargs):
+            result = real_context(args, **kwargs)
+            if (args[:3] == ["gh", "pr", "view"] and "comments" in args[-1]
+                    and len(failed_reads) < 3 and sum(r.metadata.phase == "scheduler-prelaunch" for r in records()) > sum(
                 r.metadata.phase == "scheduler-prelaunch" for r in before
-            ):
+            )):
                 failed_reads.append(True)
-                raise AgentLoopError("Transient fresh visibility read failure.")
-            return real_context(*args, **kwargs)
-        monkeypatch.setattr(pr_loop, "get_observed_pr_review_context", unavailable_after_checkpoint)
+                return replace(result, returncode=1, stdout="", stderr="HTTP 503 Service Unavailable")
+            return result
+        monkeypatch.setattr(runner, "run", unavailable_after_checkpoint)
     snapshots = []
     real_clear = pr_loop._clear_human_requirements_ack_item
     def capture(items):
@@ -1077,7 +1081,7 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
     from coding_review_agent_loop.round_state import _max_unresolved_item_number_from_records
     assert _max_unresolved_item_number_from_records(after) == 0
     if not fresh_read:
-        assert failed_reads
+        assert len(failed_reads) == 3
     assert all(r.metadata.round_number == 1 for r in after)
     assert not any(cmd[:3] == ["gh", "api", "--method"] and "DELETE" in cmd
                    for cmd, _ in runner.commands)
