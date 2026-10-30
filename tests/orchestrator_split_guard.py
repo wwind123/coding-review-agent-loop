@@ -54,6 +54,7 @@ EXTRACTED_MODULES: tuple[str, ...] = (
     'reviewer_seats',
     'validated_agent',
     'response_validation',
+    'plan_round_closure',
     'panel_evidence',
     'review_rounds',
     'discuss_loop',
