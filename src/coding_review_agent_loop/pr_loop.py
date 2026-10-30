@@ -6,7 +6,7 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
-from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError, observe_pr_head, explain_pr_head_recovery
+from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError, observe_pr_head, explain_pr_head_recovery, diagnostic_origin
 
 from .review_scope import is_complete_code_review
 from .capture_dispatch import narrow_capture_scopes, scoped_review_items, scoped_validator, select_capture_reviewers, capture_review_recovery, is_resumable_capture_review
@@ -9438,7 +9438,7 @@ def run_pr_loop(
                     source_round=round_number,
                 )
                 updated_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number,
-                    origin=managed_ci.origin if managed_ci else "ordinary",
+                    origin=diagnostic_origin(managed_ci),
                     issue_number=managed_ci_handoff.issue_number if managed_ci_handoff else None)
                 unresolved_items = _advance_machine_obligations_for_head(
                     unresolved_items,
@@ -9904,7 +9904,7 @@ def run_pr_loop(
     finally:
         cleanup_failure: AgentLoopError | None = None
         active_exception = sys.exc_info()[1]
-        explain_pr_head_recovery(active_exception, config, origin=getattr(managed_ci, "origin", None), issue_number=getattr(managed_ci_handoff, "issue_number", None))
+        explain_pr_head_recovery(active_exception, config, origin=diagnostic_origin(managed_ci), issue_number=getattr(managed_ci_handoff, "issue_number", None))
         preserve_issue_created_suppression = _preserve_issue_created_managed_suppression(
             managed_ci,
             active_exception=active_exception,

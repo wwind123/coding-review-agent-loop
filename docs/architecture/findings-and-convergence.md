@@ -464,7 +464,10 @@ and exhausted projection disagreement raise observation verification errors.
 Persistent descendant lag raises a distinct observation stop before unchanged
 accounting, accepted or rejected coder publication, continuity evidence or
 qualification reuse. Stops can enrich their operator recovery text from already authenticated origin
-and issue scope without granting authority or publishing records. Normal
+and issue scope without granting authority or publishing records. Diagnostic origin
+uses explicit contract origin first, then authenticated adoption when the origin
+is absent; adopted PRs receive existing managed recovery advice rather than
+conditional issue-created fresh-authorization advice. Normal
 interruption cleanup still runs. The branch tip
 never replaces the PR-record head as authority for review, CI or merge. Reads
 cannot be atomic with later pushes; existing exact-head gates remain necessary.

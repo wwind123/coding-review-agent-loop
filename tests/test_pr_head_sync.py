@@ -268,3 +268,18 @@ def test_read_launch_failure_is_an_observation_stop(tmp_path, boundary):
     runner.run = run
     with pytest.raises(sync.PrHeadObservationError, match='verification failed'):
         observe(runner, tmp_path)
+
+
+@pytest.mark.parametrize('origin,adopted,expected', [
+    ('issue-created', False, 'issue-created'),
+    ('source-managed', False, 'source-managed'),
+    ('issue-created', True, 'issue-created'),
+    ('source-managed', True, 'source-managed'),
+    (None, True, 'adopted'),
+    (None, False, None),
+])
+def test_diagnostic_origin_uses_authenticated_contract(origin, adopted, expected):
+    from coding_review_agent_loop.managed_ci import ManagedCiContract
+    contract = ManagedCiContract(origin=origin, adopted_existing_pr=adopted)
+    assert sync.diagnostic_origin(contract) == expected
+    assert sync.diagnostic_origin(None) == 'ordinary'

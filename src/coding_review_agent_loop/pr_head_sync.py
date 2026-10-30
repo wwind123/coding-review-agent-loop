@@ -16,6 +16,7 @@ from .workdirs import active_workdir
 if TYPE_CHECKING:
     from .config import AgentLoopConfig
     from .runner import Runner
+    from .managed_ci import ManagedCiContract
 
 
 class PrHeadObservationError(AgentLoopError):
@@ -46,6 +47,13 @@ def _read(runner: Runner, config: AgentLoopConfig, endpoint: str, cwd: Path) -> 
         return _object(json.loads(result.stdout))
     except (AgentLoopError, OSError, ValueError) as exc:
         raise PrHeadObservationError(f"PR-head verification failed reading {endpoint}: {exc}") from exc
+
+
+def diagnostic_origin(contract: ManagedCiContract | None) -> str | None:
+    """Resolve authenticated provenance for diagnostics without changing authority."""
+    if contract is None:
+        return "ordinary"
+    return contract.origin or ("adopted" if contract.adopted_existing_pr else None)
 
 
 def desync_message(

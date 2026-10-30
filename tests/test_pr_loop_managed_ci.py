@@ -1251,7 +1251,8 @@ def _m1047_contract(origin):
     return ManagedCiContract(
         protocol_version=2,
         issue_created_pr=origin == "issue-created",
-        origin=origin,
+        origin=None if origin == "adopted" else origin,
+        adopted_existing_pr=origin == "adopted",
         active_label_event_id=101,
         invocation_applied_label=True,
         trusted_actor_login="agent-loop",
@@ -1730,7 +1731,6 @@ def test_observation_stop_keeps_existing_origin_cleanup(tmp_path, monkeypatch, o
         claude_outputs=[structured_coder_followup(addressed_items=['item-1'])],
         advance_pr_head_on_coder_followup=False)
     contract = _m1047_contract(origin)
-    contract.adopted_existing_pr = origin == 'adopted'
     monkeypatch.setattr(pr_loop, 'revalidate_adopted_managed_ci', lambda *a, **k: True)
     _m1047_reach_publication(monkeypatch, runner, contract)
     original = runner._maybe_advance_pr_head_for_coder_followup
@@ -1739,7 +1739,25 @@ def test_observation_stop_keeps_existing_origin_cleanup(tmp_path, monkeypatch, o
         if '"kind": "coder_followup"' in '\n'.join(cmd): runner.branch_tip = 'b' * 40
     runner._maybe_advance_pr_head_for_coder_followup = push
     release_calls = _m1047_release_spy(monkeypatch)
-    with pytest.raises(PrHeadObservationError, match='desync'):
+    initial_messages = []
+    real_explain = pr_loop.explain_pr_head_recovery
+    def explain(error, config, **kwargs):
+        initial_messages.append(str(error))
+        assert kwargs['origin'] == origin
+        real_explain(error, config, **kwargs)
+    monkeypatch.setattr(pr_loop, 'explain_pr_head_recovery', explain)
+    with pytest.raises(PrHeadObservationError, match='desync') as error:
         run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, managed_ci=True))
     assert bool(release_calls) is (origin == 'adopted')
     assert runner.has_managed_label() is (origin != 'adopted')
+    if origin == 'adopted':
+        assert contract.origin is None and contract.adopted_existing_pr
+    for message in [*initial_messages, str(error.value)]:
+        if origin in {'adopted', 'source-managed'}:
+            assert 'Existing origin-specific managed-CI recovery and cleanup still apply' in message
+            assert 'If this is an issue-created managed PR' not in message
+            assert 'Authenticate the owning issue' not in message
+            assert '--managed-ci-fresh' not in message
+        else:
+            assert 'Manual rewind invalidates managed continuity' in message
+    assert len(initial_messages) == 1
