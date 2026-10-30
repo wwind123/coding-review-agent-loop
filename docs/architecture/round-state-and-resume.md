@@ -28,6 +28,9 @@ subject and round follows it. Idle checkpoints cannot replace the ledger,
 open a panel, or supply approvals; reviewer-backed checkpoints retain their
 historical opening authority under the existing candidate and approval checks.
 Raw history remains available for board lineage and amendment-use validation.
+Even an idle checkpoint carrying the first use of an amendment digest cannot
+restore an operator force-full latch or scheduler savings; digest admission
+and scheduling authority are separate.
 An open next-round phase advance or prelaunch remains a resume anchor.
 
 When a closed round needs fresh reviews, planning settles qualified findings

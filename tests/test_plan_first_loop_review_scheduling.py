@@ -2002,18 +2002,39 @@ def test_closed_key_rereview_rolls_over_before_publication(tmp_path, stray_sourc
 
 
 @pytest.mark.parametrize("blocking", [False, True])
-@pytest.mark.parametrize("idle_operator", [False, True])
+@pytest.mark.parametrize("idle_operator", [None, "plain", "first-amendment-use"])
 def test_unopened_closed_key_rereview_stays_primary_only_without_latch(tmp_path, blocking, idle_operator):
     comments, canonical, checkpoint = _closed_rereview_history(
         tmp_path, opened=False, secondary_state="blocking" if blocking else "approved"
     )
-    if idle_operator:
-        comments.append({"author": {"login": "bot"}, "createdAt": "2026-01-01T00:02:00Z",
-                         "body": _attach_round_metadata("Idle operator checkpoint", replace(
-                             checkpoint, scheduler_force_full=True, scheduler_force_full_source="operator"))})
     runner = _FakeRunner(issue_comments=comments,
                          codex_outputs=[structured_plan_review(state="approved")],
                          gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")])
+    digest = None
+    if idle_operator == "first-amendment-use":
+        from coding_review_agent_loop.board_amendment import collect_reviewer_board_amendments
+        from issue_loop_test_helpers import _m943_post_amendment
+        contract = panel_evidence.make_plan_contract(
+            ("Codex", "Gemini", "Antigravity"), "primary-then-panel", "Codex"
+        )
+        for comment in runner.issue_comments:
+            match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", comment["body"])
+            metadata = _decode_round_metadata(match.group(1))
+            if metadata.scheduler_contract is not None:
+                comment["body"] = _attach_round_metadata("Historical scheduling", replace(
+                    metadata, scheduler_contract=contract.as_dict(),
+                    scheduler_paused_reviewers=metadata.scheduler_paused_reviewers + (("Antigravity", "paused"),),
+                ))
+        _m943_post_amendment(runner, effective_from_round=1)
+        digest = collect_reviewer_board_amendments(
+            [SimpleNamespace(body=c["body"], author_login=c["author"]["login"])
+             for c in runner.issue_comments], flow="plan", issue_number=56,
+        )[0].digest
+    if idle_operator:
+        runner.issue_comments.append({"author": {"login": "bot"}, "createdAt": "2026-06-01T00:02:00Z",
+                         "body": _attach_round_metadata("Idle operator checkpoint", replace(
+                             checkpoint, scheduler_force_full=True, scheduler_force_full_source="operator",
+                             reviewer_board_amendment_digest=digest))})
     before = len(_plan_round_records(runner))
     config = _staged_plan_config(tmp_path, max_rounds=3)
     if blocking:
@@ -2024,6 +2045,7 @@ def test_unopened_closed_key_rereview_stays_primary_only_without_latch(tmp_path,
     fresh = _plan_round_records(runner)[before:]
     checkpoint = next(record for record in fresh if record.phase == "scheduler-prelaunch")
     assert checkpoint.round_number == 2
+    assert checkpoint.reviewer_board_amendment_digest == digest
     assert checkpoint.scheduler_selected_reviewers == ("Codex",)
     assert not checkpoint.scheduler_force_full
     assert checkpoint.scheduler_force_full_source is None
@@ -2276,3 +2298,36 @@ def test_invalid_amendment_rollover_boundary_refused_in_preflight_and_startup(tm
         )
     assert len(runner.issue_comments) == before
     assert not any(command[0] in {"claude", "codex", "gemini"} for command, _ in runner.commands)
+
+
+@pytest.mark.parametrize("gate", ["growth", "narrow-staged"])
+def test_resumed_primary_approval_skips_panel_for_required_revision(tmp_path, gate):
+    from issue_loop_test_helpers import _m1268_staged_raw
+
+    initial = _FakeRunner(
+        claude_outputs=[_m1268_staged_raw() if gate == "narrow-staged" else structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=1, plan_execution_mode="decompose-only")
+    with pytest.raises(AgentLoopError, match="phase advance was still pending"):
+        run_issue_loop(initial, issue_number=56, config=config, plan_first=True)
+    resumed = _FakeRunner(issue_comments=list(initial.issue_comments))
+    before = len(_plan_round_records(resumed))
+    config = replace(config, max_rounds=3, plan_execution_mode="plan-only",
+                     plan_narrow_staged=gate == "narrow-staged",
+                     **({"plan_growth_max_chars": 1000} if gate == "growth" else {}))
+    prompts = []
+
+    def revision_boundary(*args, **kwargs):
+        assert kwargs["agent"] == config.coder
+        prompts.append(kwargs["prompt"])
+        raise KeyboardInterrupt
+
+    with patch.object(plan_first_loop_module, "_run_validated_agent", side_effect=revision_boundary):
+        with pytest.raises(KeyboardInterrupt):
+            run_issue_loop(resumed, issue_number=56, config=config, plan_first=True)
+    assert len(prompts) == 1
+    assert ("Orchestrator plan-growth notice" if gate == "growth" else "Operator directive (orchestrator") in prompts[0]
+    fresh = _plan_round_records(resumed)[before:]
+    assert not any(record.role == "reviewer" or record.phase == "scheduler-prelaunch" for record in fresh)
+    assert not any(record.phase == "plan-phase-advance" for record in fresh)

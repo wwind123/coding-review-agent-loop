@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from .plan_round_closure import (
     project_plan_history, plan_amendment_activation_round, attach_plan_rollover_metadata,
-    plan_force_full_latch_records,
 )
 
 import hashlib
@@ -1783,7 +1782,7 @@ def _run_plan_first_loop_body(
                 "changed board is resolved, floor-checked and applied; no further agent was "
                 "invoked and nothing was approved."
             )
-    for record in plan_force_full_latch_records(plan_drift_records):
+    for record in project_plan_history(plan_drift_records):
         metadata = record.metadata
         if not staged_planning or plan_approved_shortcut:
             continue
@@ -2534,6 +2533,7 @@ def _run_plan_first_loop_body(
             else None
         )
         plan_scheduler_decision = None
+        plan_history_class = None  # Growth/narrowing may skip classification this round.
         stall_deferred_for_step_back = False
         step_back_candidate_review = False
         step_back_review_anchor: PlanStepBackAnchor | None = None

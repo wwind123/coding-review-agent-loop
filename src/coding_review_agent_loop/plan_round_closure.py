@@ -119,18 +119,3 @@ def attach_plan_rollover_metadata(body, metadata, *, staged: bool):
         return _attach_round_metadata(body, metadata)
     finally:
         reset_plan_board_stamp(token)
-
-
-def plan_force_full_latch_records(records):
-    """Keep first amendment uses for latch reconstruction, independently of decisions."""
-    projected = {record.index for record in project_plan_history(records)}
-    seen = set()
-    retained = []
-    for record in sorted(records, key=lambda record: record.index):
-        digest = record.metadata.reviewer_board_amendment_digest
-        activation = digest is not None and digest not in seen
-        if digest is not None:
-            seen.add(digest)
-        if record.index in projected or activation:
-            retained.append(record)
-    return tuple(retained)

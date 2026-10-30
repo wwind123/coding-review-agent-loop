@@ -68,7 +68,9 @@ the primary and records no automatic force-full latch. Approval-only secondary
 history permits ordinary later panel progression; premature blocking secondary
 history retains the existing safety stop after a current-key checkpoint clears
 degradation. A current operator override authorizes the full board in N+1;
-an idle historical operator checkpoint supplies no opening.
+an idle historical operator checkpoint supplies no opening or operator latch,
+even when it is the first carrier of an amendment digest. The raw carrier
+remains available to amendment-use and lineage validation.
 
 History projection discards only idle post-reconciliation scheduling decisions.
 Checkpoints followed by same-subject, same-round reviewers retain qualified
