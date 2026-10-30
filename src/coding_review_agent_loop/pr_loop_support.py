@@ -60,6 +60,7 @@ from .github import (
     board_protection_is_reliable,
     protection_awaits_readiness,
     get_pr_head_sha,
+    get_pr_review_context,
     get_issue_context,
     get_pr_mergeability,
     parse_linked_issue_numbers,
@@ -3220,9 +3221,7 @@ def _post_reduced_board_completion_note(
 ) -> None:
     """Post one plain completion note per amendment digest (no round metadata)."""
     try:
-        comments = get_observed_pr_review_context(runner, config=config, pr_number=pr_number).comments
-    except PrHeadObservationError:
-        raise
+        comments = get_pr_review_context(runner, config=config, pr_number=pr_number).comments
     except AgentLoopError:
         comments = ()
     if any(

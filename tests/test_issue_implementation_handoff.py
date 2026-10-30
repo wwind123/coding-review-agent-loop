@@ -826,21 +826,49 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
 
 
 @pytest.mark.parametrize('one_shot', [False, True])
-@pytest.mark.parametrize('invalid', [False, True])
-def test_approved_resume_observation_precedes_contract_and_handoffs(tmp_path, monkeypatch, one_shot, invalid):
+@pytest.mark.parametrize('outcome', ['desync', 'invalid', 'converged'])
+def test_approved_resume_observation_precedes_contract_and_handoffs(tmp_path, monkeypatch, one_shot, outcome):
     from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
     runner = FakeRunner(pr_payload={'body': 'Fixes #56'})
     runner.branch_tip = 'b' * 40
-    if invalid: runner.pr_payload['headRefOid'] = 'invalid'
+    if outcome == 'invalid': runner.pr_payload['headRefOid'] = 'invalid'
+    original = runner.run
+
+    def run(args, **kwargs):
+        if args == ['sleep', '2'] and outcome == 'converged':
+            runner.pr_payload.update(headRefOid='b' * 40, url='https://example.test/latest', title='Latest context')
+        return original(args, **kwargs)
+
+    runner.run = run
+    delegated = []
+    monkeypatch.setattr(issue_implementation, 'run_pr_loop', lambda *a, **k: delegated.append(k) or 0)
     monkeypatch.setattr(issue_implementation, 'resolve_canonical_pr_for_issue', lambda *a, **k: SimpleNamespace(
         source='legacy-closing-reference', pr_number=77, metadata=None, evidence_summary='authenticated fixture'))
     config = make_config(tmp_path)
     issue = IssueContext(number=56, repo='OWNER/REPO', title='Issue', body='Issue', url='https://github.com/OWNER/REPO/issues/56', comments=())
-    with pytest.raises(PrHeadObservationError):
-        issue_implementation._implement_approved_issue(runner, issue_number=56, approved_plan='Approved plan.',
+    def invoke():
+        return issue_implementation._implement_approved_issue(runner, issue_number=56, approved_plan='Approved plan.',
             config=config, memory=None, issue_context=issue, coder_session_id=None,
             usage_context=validated_agent_module._new_usage_context(config),
             one_shot_parent_issue=56 if one_shot else None)
-    assert not runner.pr_payload.get('comments')
-    assert not any('handoff' in body.lower() for body in runner.comments)
+
+    if outcome == 'converged':
+        assert invoke() == 0
+        assert delegated
+        handoffs = [body for body in runner.comments if 'AGENT_ISSUE_PR_HANDOFF' in body or 'AGENT_PLAN_ONE_SHOT_IMPL' in body]
+        assert len(handoffs) == (2 if one_shot else 1)
+        for body in handoffs:
+            if 'AGENT_PLAN_ONE_SHOT_IMPL' in body:
+                from coding_review_agent_loop.decomposition import _decode_one_shot_impl_handoff_metadata
+                encoded = body.split('AGENT_PLAN_ONE_SHOT_IMPL: ', 1)[1].split(' -->', 1)[0]
+                assert _decode_one_shot_impl_handoff_metadata(encoded).pr_head_sha == 'b' * 40
+            else:
+                assert 'b' * 40 in body and 'https://example.test/latest' in body
+                assert '6367c48dd193d56ea7b0baad25b19455e529f5ee' not in body
+    else:
+        with pytest.raises(PrHeadObservationError):
+            invoke()
+        assert not delegated
+        assert not runner.pr_payload.get('comments')
+        assert not any('handoff' in body.lower() for body in runner.comments)
     assert not any(cmd[:1] in (['claude'], ['codex']) for cmd, _ in runner.commands)

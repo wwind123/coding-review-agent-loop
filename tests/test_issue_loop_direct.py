@@ -241,3 +241,37 @@ def test_new_issue_pr_observation_precedes_head_bound_publication(tmp_path, inva
         run_issue_loop(runner, issue_number=56, config=make_config(tmp_path))
     assert not runner.pr_payload.get('comments')
     assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
+
+
+def test_new_issue_pr_transient_convergence_binds_latest_context(tmp_path, monkeypatch):
+    import coding_review_agent_loop.issue_loop as issue_loop
+    runner = FakeRunner(claude_outputs=['Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->'])
+    before = runner.pr_payload['headRefOid']
+    runner.branch_tip = 'b' * 40
+    original = runner.run
+
+    def run(args, **kwargs):
+        if args == ['sleep', '2']:
+            runner.pr_payload.update(headRefOid='b' * 40, url='https://example.test/latest', title='Latest context')
+        return original(args, **kwargs)
+
+    runner.run = run
+    metadata = []
+    attach = issue_loop._attach_round_metadata
+
+    def capture(body, record):
+        metadata.append(record)
+        return attach(body, record)
+
+    monkeypatch.setattr(issue_loop, '_attach_round_metadata', capture)
+    delegated = []
+    monkeypatch.setattr(issue_loop, 'run_pr_loop', lambda *a, **k: delegated.append(k) or 0)
+    assert run_issue_loop(runner, issue_number=56, config=make_config(tmp_path)) == 0
+    assert delegated
+    handoffs = [body for body in runner.comments if 'AGENT_ISSUE_PR_HANDOFF' in body]
+    assert len(handoffs) == 1
+    assert 'b' * 40 in handoffs[0] and 'https://example.test/latest' in handoffs[0]
+    assert before not in handoffs[0]
+    coder = [body for body in runner.comments if body.startswith('## Issue implementation')]
+    assert len(coder) == 1
+    assert metadata and all(record.subject == 'b' * 40 for record in metadata)

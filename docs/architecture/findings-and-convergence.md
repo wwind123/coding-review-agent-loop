@@ -438,6 +438,11 @@ head moves.
 
 ## GitHub PR-head observation
 
+`pr_head_sync.py` rejects closed or merged PRs with the existing not-open
+error before reading a branch tip or diagnosing lag. Comment-only completion
+deduplication after merge uses the plain context reader, so automatic branch
+deletion cannot interrupt merge completion bookkeeping.
+
 `pr_head_sync.py` observes the PR projection, REST PR head and independent tip
 of the exact head repository/ref before lifecycle publications, entry activation
 and fresh grants, selected review rounds and post-coder progress accounting.

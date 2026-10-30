@@ -252,3 +252,18 @@ def test_task_loop_writes_one_run_window_on_normal_exit(tmp_path):
     assert [r["record"] for r in records] == ["run-start", "run-end"]
     assert records[0]["run_id"] == records[1]["run_id"]
     assert runner.telemetry_attribution is None
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_task_head_observation_precedes_publication(tmp_path, monkeypatch, invalid):
+    import coding_review_agent_loop.issue_loop as issue_loop
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    runner = FakeRunner(claude_outputs=["Implemented.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->"])
+    runner.branch_tip = "b" * 40
+    if invalid:
+        runner.pr_payload["headRefOid"] = "invalid"
+    delegated = []
+    monkeypatch.setattr(issue_loop, "run_pr_loop", lambda *a, **k: delegated.append(k) or 0)
+    with pytest.raises(PrHeadObservationError):
+        run_task_loop(runner, task_text="Add an endpoint.", config=make_config(tmp_path))
+    assert not delegated and not runner.comments and not runner.pr_payload.get("comments")

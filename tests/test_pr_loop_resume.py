@@ -1596,3 +1596,24 @@ def test_entry_transient_lag_uses_latest_complete_context(tmp_path):
     assert 'Coherent title' in prompt
     assert 'b' * 40 in prompt
     assert len([cmd for cmd, _ in runner.commands if cmd == ['sleep', '2']]) == 1
+
+
+@pytest.mark.parametrize("state,deleted", [("CLOSED", False), ("MERGED", True)])
+def test_non_open_entry_stops_before_branch_observation(tmp_path, state, deleted):
+    runner = FakeRunner(pr_payload={"state": state})
+    runner.branch_tip = "b" * 40
+    original = runner.run
+
+    def run(args, **kwargs):
+        result = original(args, **kwargs)
+        if deleted and len(args) > 2 and "/git/ref/heads/" in args[2]:
+            return dataclasses.replace(result, returncode=1, stderr="HTTP 404")
+        return result
+
+    runner.run = run
+    with pytest.raises(AgentLoopError, match=f"PR #77 is {state}; provide an open PR number") as error:
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+    assert "force-push" not in str(error.value)
+    assert not runner.comments
+    assert not any("/git/ref/heads/" in " ".join(cmd) for cmd, _ in runner.commands)
+    assert not any(cmd[:1] in (["claude"], ["codex"]) for cmd, _ in runner.commands)

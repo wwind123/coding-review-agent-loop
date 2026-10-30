@@ -97,8 +97,13 @@ def observe_pr_head(
         metadata = context.metadata
         if (metadata.repo, metadata.head_branch, metadata.base_branch) != selected_identity:
             raise PrHeadObservationError("PR-head verification failed: PR repository/ref/base identity changed.")
-        head = _sha(metadata.head_sha)
         pull = _read(runner, config, f"repos/{config.repo}/pulls/{pr_number}", resolved_cwd)
+        state = pull.get("state")
+        if state == "closed":
+            raise AgentLoopError(f"PR #{pr_number} is {'MERGED' if pull.get('merged') else 'CLOSED'}; provide an open PR number.")
+        if state != "open":
+            raise PrHeadObservationError("PR-head verification failed: missing or invalid PR state.")
+        head = _sha(metadata.head_sha)
         rest_head, base = _object(pull.get("head")), _object(pull.get("base"))
         repository = _object(rest_head.get("repo")).get("full_name")
         ref = rest_head.get("ref")

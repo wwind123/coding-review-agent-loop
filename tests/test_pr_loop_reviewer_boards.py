@@ -59,7 +59,8 @@ from coding_review_agent_loop.board_amendment import (  # noqa: E402
 
 
 @pytest.mark.parametrize("linked_issue", [False, True], ids=["standalone", "issue-mode"])
-def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkeypatch, linked_issue):
+@pytest.mark.parametrize("delete_branch", [False, True])
+def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkeypatch, linked_issue, delete_branch, capsys):
     """Row pr-qualification, standalone (issue_context=None) and with a linked issue."""
     payload = (
         {
@@ -82,10 +83,27 @@ def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkey
     assert '"issue": null' in template
 
     _m943_append(runner, template)
-    monkeypatch.setattr(
-        pr_loop_support, "merge_pr", lambda *args, **kwargs: None
-    )
+    merged = False
+    original_run = runner.run
+
+    def run(args, **kwargs):
+        result = original_run(args, **kwargs)
+        if merged and delete_branch and len(args) > 2 and '/git/ref/heads/' in args[2]:
+            return dataclasses.replace(result, returncode=1, stderr="HTTP 404: deleted branch")
+        return result
+
+    def merge(*args, **kwargs):
+        nonlocal merged
+        merged = True
+
+    runner.run = run
+    monkeypatch.setattr(pr_loop_support, "merge_pr", merge)
+    completions = []
+    monkeypatch.setattr(pr_loop, "_record_staged_parent_completion_after_merge", lambda *a, **k: completions.append(1))
     assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
+    assert merged and completions
+    assert "merged" in capsys.readouterr().out.lower()
+    merged = False  # Remaining assertions inspect the pre-merge qualification contract.
 
     # The qualification gate re-reads the fresh PR comments, including the
     # pre-amendment three-reviewer records, and accepts the amended board.

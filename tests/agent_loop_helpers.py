@@ -1416,7 +1416,9 @@ class FakeRunner(Runner):
             endpoint = cmd[2]
             if re.fullmatch(r"repos/[^/]+/[^/]+/pulls/\d+", endpoint):
                 payload = self.pr_payload
-                data = {"head": {"repo": {"full_name": self.head_repository},
+                data = {"state": "open" if payload.get("state") == "OPEN" else "closed",
+                        "merged": payload.get("state") == "MERGED",
+                        "head": {"repo": {"full_name": self.head_repository},
                                   "ref": payload.get("headRefName"), "sha": payload.get("headRefOid")},
                         "base": {"ref": payload.get("baseRefName"), "repo": {"full_name": "OWNER/REPO"}}}
                 return CommandResult(cmd, cwd_path, json_dumps(data), "", 0)
