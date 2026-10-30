@@ -27,3 +27,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Terminal-retirement recovery attributes post-decision split records through approved split keys and subject, retains retired split keys when filtering prior discuss proposals, and restores the pre-write canonical barrier for legacy plans without recommendations (#1792).
 
 - Plan-only approval after an authenticated terminal canonical handoff skips split materialization and unfiled-scope warnings; entry deferral does not grant split-writing authority (#1792).
+
+- Terminal retirement verifies historical child implementation PRs through complete PR inventories and authenticated child handoffs, including closed children whose PRs remain open (#1792).

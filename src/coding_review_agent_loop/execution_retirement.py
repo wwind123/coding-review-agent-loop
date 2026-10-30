@@ -123,7 +123,7 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
     """
     from .execution_policy import _strict_gh_listing, _REALIZATION_LISTING_LIMIT
     from .child_topology import parent_child_search_queries
-    from .github import parse_strong_issue_reference_evidence
+    from .github import parse_strong_issue_reference_evidence, read_rest_issue_comments
     from .issue_pr_handoff import authenticate_canonical_issue_pr
     from .github import IssueContext
 
@@ -240,10 +240,11 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
                 raise AgentLoopError("Cannot verify child listing association fields.")
             accept(item, child_items, "child issue")
     branch_name = f"agent-loop/managed-{issue_number}"
-    for item in inventory([
+    all_prs = inventory([
         "pr", "list", "--repo", config.repo, "--state", "all", "--json",
         "number,body,headRefName,state", "--limit", str(_REALIZATION_LISTING_LIMIT),
-    ], "pull requests"):
+    ], "pull requests")
+    for item in all_prs:
         if not isinstance(item.get("body"), str) or not isinstance(item.get("headRefName"), str):
             raise AgentLoopError("Cannot verify PR listing association fields.")
         _number(item.get("number"), "PR listing")
@@ -309,6 +310,33 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
                         if (payload.get("identity") == identity and payload.get("plan_hash") == plan_hash
                                 and payload.get("parent_issue") == issue_number):
                             current_children.add(number)
+    # A closed child does not prove its implementation PR is terminal. Apply
+    # this to every historical child source, including inventory-only children.
+    for number in sorted(child_items.keys() - current_children):
+        child_comments = read_rest_issue_comments(
+            runner, config=config, issue_number=number,
+            purpose="historical child implementation cannot be retired safely",
+            reject_empty_output=True,
+        )
+        canonical = authenticate_canonical_issue_pr(
+            runner, config=config, issue_number=number,
+            issue_context=IssueContext(number, config.repo, None, None, None, child_comments),
+        )
+        linked_prs = set()
+        for item in all_prs:
+            if item["headRefName"] == f"agent-loop/managed-{number}" or parse_strong_issue_reference_evidence(
+                item["body"], repo=config.repo, issue_number=number
+            ) or (canonical is not None and item["number"] == canonical.pr_number):
+                accept(item, pr_items, "PR")
+                linked_prs.add(item["number"])
+        if canonical is not None:
+            accept(dict(pr_items.get(canonical.pr_number, {}),
+                        number=canonical.pr_number, state=canonical.state), pr_items, "PR")
+            linked_prs.add(canonical.pr_number)
+        if linked_prs & current_prs:
+            raise AgentLoopError("Ambiguous ownership: historical child implementation is claimed by current execution.")
+        old_prs.update(linked_prs)
+    if not newly_retired:
         # PRs created before their handoff require the existing exact approved
         # provenance contract; an unrelated or unreadable OPEN PR still blocks.
         from .github import validate_pull_request_provenance

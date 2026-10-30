@@ -47,6 +47,8 @@ class RetirementRunner(_M1087Runner):
             "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"])
         kwargs.setdefault("issue_urls", ["https://github.com/OWNER/REPO/issues/99", "https://github.com/OWNER/REPO/issues/100"])
         super().__init__(search_issues_payload=self.children, **kwargs)
+        for number in {c["number"] for c in self.children} | self.issue_payloads_by_number.keys():
+            self.issue_comments_by_number.setdefault(number, [])
 
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         cmd = [str(a) for a in args]
@@ -198,6 +200,63 @@ def test_comment_references_are_resolved_when_search_misses(tmp_path, kind, stat
         with pytest.raises(AgentLoopError):
             run(runner, tmp_path)
         no_dispatch(runner)
+
+
+@pytest.mark.parametrize("origin", ["phase", "split", "summary", "stage", "inventory"])
+@pytest.mark.parametrize("association", ["closing-reference", "managed-branch", "canonical-listed", "canonical-only"])
+@pytest.mark.parametrize("state", ["OPEN", "CLOSED", "MERGED", "unreadable"])
+def test_historical_child_implementation_pr_is_assessed(tmp_path, origin, association, state):
+    records = [_m1087_stale_decision_comment()]
+    if origin in {"phase", "split"}:
+        records.append(comment(old_record(origin)))
+    elif origin == "summary":
+        records.append(comment(d.format_decomposition_parent_summary(
+            parent_issue=56, mode="implement-by-phase", plan_hash=_M1087_STALE_HASH,
+            created=(d.CreatedPhaseIssue(d.RecordedPhase("Old", "agent-pr"),
+                "https://github.com/OWNER/REPO/issues/90", 90),))))
+    elif origin == "stage":
+        records.append(comment(s.format_split_stage_handoff_comment(
+            parent_issue=56, plan_hash=_M1087_STALE_HASH,
+            child=s.MaterializedSplitChild("Old", "a" * 64,
+                "https://github.com/OWNER/REPO/issues/90", 90, "created"))))
+    implementation = dict(pr(83, state), body="Fixes #90" if association == "closing-reference" else "",
+        headRefName="agent-loop/managed-90" if association == "managed-branch" else "other-branch",
+        url="https://github.com/OWNER/REPO/pull/83", headRefOid="abc123", comments=[])
+    handoff = format_issue_pr_handoff_comment(issue_number=90, pr_number=83,
+        pr_url=implementation["url"], pr_head_sha="abc123", flow="issue-implementation", plan_hash=None)
+    runner = RetirementRunner(children=[child()], issue_comments=records,
+        prs=[implementation] if association != "canonical-only" else [],
+        issue_comments_by_number={90: [comment(handoff)] if association.startswith("canonical-") else []},
+        pr_payloads_by_number={83: implementation} if state != "unreadable" else {},
+        malformed_pr_view_numbers=[83] if state == "unreadable" else [])
+    if state in {"CLOSED", "MERGED"}:
+        assert run(runner, tmp_path) == 0
+        assert _m1087_implementation_dispatched(runner)
+        assert _m1087_posted_decisions(runner)[0].retires_plan_hashes == (_M1087_STALE_HASH,)
+    else:
+        with pytest.raises(AgentLoopError) as error:
+            run(runner, tmp_path)
+        assert "#83" in str(error.value)
+        assert "#90 is OPEN" not in str(error.value)
+        no_dispatch(runner)
+        assert not any("AGENT_ISSUE_PR_HANDOFF" in b for b in runner.comments)
+
+
+@pytest.mark.parametrize("fault", ["failure", "invalid-json", "empty", "malformed-handoff"])
+def test_historical_child_unreadable_handoff_blocks(tmp_path, fault):
+    class UnreadableChildRunner(RetirementRunner):
+        def run(self, args, *, cwd, **kwargs):
+            cmd = [str(a) for a in args]
+            if cmd[:2] == ["gh", "api"] and cmd[2].startswith("repos/OWNER/REPO/issues/90/comments?") and fault != "malformed-handoff":
+                cmd, cwd_path = self._record_command(cmd, cwd)
+                return CommandResult(cmd, cwd_path, "not json" if fault == "invalid-json" else "",
+                    "permission denied" if fault == "failure" else "", 1 if fault == "failure" else 0)
+            return super().run(args, cwd=cwd, **kwargs)
+    runner = UnreadableChildRunner(children=[child()],
+        issue_comments_by_number={90: [comment("<!-- AGENT_ISSUE_PR_HANDOFF: invalid -->")]})
+    with pytest.raises(AgentLoopError):
+        run(runner, tmp_path)
+    no_dispatch(runner)
 
 
 @pytest.mark.parametrize("old_strategy", ["one-shot", "staged"])

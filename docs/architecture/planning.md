@@ -395,6 +395,11 @@ or positively terminal (CLOSED children; CLOSED or MERGED PRs), with confirmed
 absence of the encoded reserved-branch endpoint. Unknown, truncated or unreadable
 state fails closed. A leftover branch requires manual deletion after verifying
 finished work; retirement never mutates old work or changes stage-completion rules.
+Historical children from every record and inventory source also require terminal
+implementation PRs: the assessment correlates child closing references and managed
+branches, reads complete child comment histories, and authenticates canonical child
+handoffs even when their PRs are absent from listings. Unreadable child histories
+or PR references block retirement.
 The existing decision records retired hashes and explains terminal supersession.
 
 `issue_loop.py` defers only an authenticated terminal canonical handoff in
