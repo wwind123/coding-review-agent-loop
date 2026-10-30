@@ -270,6 +270,41 @@ def test_terminal_canonical_entry_defers_only_for_proven_new_plan(tmp_path, stat
 
 
 @pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
+@pytest.mark.parametrize("materialize", [False, True])
+@pytest.mark.parametrize("source", ["legacy-stage", "legacy-discuss", "fresh-discuss"])
+def test_plan_only_terminal_deferral_never_writes_split_scope(
+    tmp_path, capsys, state, materialize, source
+):
+    from agent_loop_helpers import structured_plan_state
+
+    comments = [_m1087_stale_decision_comment(), comment(old_record("canonical"))]
+    if source.endswith("discuss"):
+        comments.append(discuss_split("New follow-up"))
+    plan = (
+        structured_v1_plan_state() if source == "fresh-discuss" else
+        structured_plan_state(child_stages=[{"title": "New follow-up", "summary": "Do work."}]
+                              if source == "legacy-stage" else None)
+    )
+    runner = RetirementRunner(
+        # Entry deferral must not grant writes even when old work is still live.
+        children=[child(90, "OPEN")], branch_exists=True,
+        issue_comments=comments,
+        pr_payloads_by_number={82: dict(pr(state=state),
+            url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])},
+        claude_outputs=[plan, "Implementation must not run."],
+    )
+    assert run(runner, tmp_path, plan_execution_mode="plan-only",
+               materialize_split_issues=materialize,
+               execution_strategy_contract_required=source == "fresh-discuss") == 0
+    assert "plan approved by" in capsys.readouterr().out
+    no_dispatch(runner)
+    assert len(runner.claude_outputs) == 1
+    assert not any("AGENT_DISCUSS_SPLIT" in body or "AGENT_SPLIT_UNFILED_WARNING" in body
+                   for body in runner.comments)
+    assert not any(cmd[:2] == ["git", "push"] for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
 def test_terminal_canonical_direct_mode_still_refuses(tmp_path, state):
     body = format_issue_pr_handoff_comment(issue_number=56, pr_number=82,
         pr_url="https://github.com/OWNER/REPO/pull/82", pr_head_sha="abc123",

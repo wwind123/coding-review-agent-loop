@@ -111,6 +111,7 @@ from .github import (
 )
 from .publication_resume import context_digest as publication_context_digest
 from .issue_pr_handoff import (
+    authenticate_canonical_issue_pr,
     post_issue_pr_handoff_comment,
     require_pr_metadata_for_handoff,
     resolve_canonical_pr_for_issue,
@@ -4826,7 +4827,16 @@ def _run_plan_first_loop_body(
                 allow_issue_filing=mode in {"implement-one-shot", "implement-by-phase"},
                 usage_context=usage_context,
             )
-            split_scope_materialized = _handle_plan_first_split_scope(
+            # Terminal entry deferral permits planning, not split writes. Keep
+            # ordinary plan-only split behavior only without that handoff.
+            terminal_plan_only = False
+            if mode == "plan-only" and not config.dry_run:
+                canonical = authenticate_canonical_issue_pr(
+                    runner, config=config, issue_number=issue_number,
+                    issue_context=issue_context,
+                )
+                terminal_plan_only = canonical is not None and canonical.state in {"CLOSED", "MERGED"}
+            split_scope_materialized = False if terminal_plan_only else _handle_plan_first_split_scope(
                 runner,
                 issue_number=issue_number,
                 config=config,

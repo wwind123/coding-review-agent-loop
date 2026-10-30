@@ -405,7 +405,9 @@ the materialization subject matches. Verified retired split keys suppress prior
 discuss proposals, preserving completed work without recreating children. Legacy
 plans without an execution recommendation repeat strict canonical handoff
 resolution before execution writes; entry deferral alone provides no dispatch
-authority.
+authority. Plan-only runs with an authenticated terminal canonical handoff return
+the approved plan without materializing split proposals or posting unfiled-scope
+warnings, whether or not split materialization was requested.
 
 Same-plan and direct-mode terminal recovery refuse. Restart rebuilds a read-only,
 invocation-scoped execution history view before PR recovery and fresh preflights.
