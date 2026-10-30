@@ -463,7 +463,7 @@ def test_claude_review_loop_runs_tests_and_merge_only_after_approval(tmp_path):
 
     commands = [cmd for cmd, _cwd in runner.commands]
     assert ["pytest", "tests/test_agent_loop.py"] in commands
-    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"] in commands
+    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "6367c48dd193d56ea7b0baad25b19455e529f5ee"] in commands
 
 def test_claude_review_loop_does_not_run_codex_after_final_blocking_round(tmp_path):
     runner = FakeRunner(
@@ -751,11 +751,11 @@ def _ack_pr_run(tmp_path, monkeypatch, *, repaired_status=None):
     metadata = PullRequestMetadata(
         number=77, repo="OWNER/REPO", title="Acknowledgement repair",
         head_branch="feature/review-context", base_branch="main",
-        head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url="https://github.com/OWNER/REPO/pull/77",
     )
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *args, **kwargs: PullRequestReviewContext(
             metadata=metadata, comments=(), human_requirements=(requirement,)
         ),
@@ -853,10 +853,10 @@ def _ack_pr_resume_run(tmp_path, monkeypatch, *, acknowledged, parallel):
         url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
         body="Keep the current audit trail.",
     )
-    real_context = pr_loop_support.get_pr_review_context
+    real_context = pr_loop_support.get_observed_pr_review_context
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *args, **kwargs: dataclasses.replace(
             real_context(*args, **kwargs), human_requirements=(requirement,)
         ),
@@ -1041,7 +1041,7 @@ def test_owning_pr_loop_writes_run_end_on_exception(tmp_path, monkeypatch):
     def boom(*_a, **_k):
         raise AgentLoopError("pr stop")
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_pr_review_context", boom)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_observed_pr_review_context", boom)
     with pytest.raises(AgentLoopError, match="pr stop"):
         pr_loop.run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
     records = list(load_records(telemetry_log_path()))

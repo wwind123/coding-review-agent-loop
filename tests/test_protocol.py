@@ -6621,7 +6621,7 @@ def test_evidence_obligation_lifecycle_is_validated():
         obligation_identity="human-exact-head-evidence:abc",
     )
     UnresolvedReviewItem(**base, lifecycle="evidence_deferred")
-    UnresolvedReviewItem(**base, lifecycle="evidence_frozen", candidate_head_sha="abc123")
+    UnresolvedReviewItem(**base, lifecycle="evidence_frozen", candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     with pytest.raises(ValueError, match="frozen head"):
         UnresolvedReviewItem(**base, lifecycle="evidence_frozen")
     with pytest.raises(ValueError, match="evidence lifecycle"):
@@ -6630,7 +6630,7 @@ def test_evidence_obligation_lifecycle_is_validated():
         UnresolvedReviewItem(
             item_id="item-2", reviewer="GitHub PR checks", source_round=1, text="x",
             status="blocking", authority="machine", obligation_kind="github-pr-checks",
-            lifecycle="evidence_deferred", failed_head_sha="abc123",
+            lifecycle="evidence_deferred", failed_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         )
 
 

@@ -624,7 +624,7 @@ def test_evidence_approval_normalizer_preserves_real_blockers_and_requests(mixed
     from coding_review_agent_loop.protocol import ParsedReview, ApprovedFollowups
     from coding_review_agent_loop.unresolved_items import _upsert_evidence_obligation
     items, _ = _upsert_evidence_obligation([], item_number=1, reviewer="Codex", text="Attach the live run.",
-                                          source_round=1, current_head_sha="abc123")
+                                          source_round=1, current_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     finding = ApprovedFollowup(reviewer="Codex", text="Fix an actual defect.")
     disposition = ReviewItemDisposition(item_id="item-2" if mixed == "unknown-disposition" else "item-1",
                                         reviewer="Codex", disposition="blocking", note="Still needed.")

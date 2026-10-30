@@ -1,3 +1,4 @@
+import hashlib
 """PR-loop tests for review_step_back and finding_history: PR convergence (#1542)."""
 
 import json
@@ -693,7 +694,7 @@ def test_ci_repair_dispatch_shows_the_earlier_ci_failure_by_check_name(
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
         if kwargs.get("role") == "coder":
-            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+            runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
     patch_attr_in(monkeypatch, (
@@ -703,9 +704,9 @@ def test_ci_repair_dispatch_shows_the_earlier_ci_failure_by_check_name(
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
-        if head == "repaired-2":
+        if head == "b922ce25aedcf47d31bdeb16ec4eeb5a7a5099ae":
             return _watch_check_board("passing")
-        name = "unit-a" if head != "repaired-1" else "lint-b"
+        name = "unit-a" if head != "aa09285eba47312c8c4f6a8190cab30ea08e880d" else "lint-b"
         failed = PullRequestCheck(
             name=name, kind="check_run", status="failure", url=f"https://example.test/{name}"
         )
@@ -729,7 +730,7 @@ def test_ci_repair_dispatch_shows_the_earlier_ci_failure_by_check_name(
     history = second.split("Earlier-round history for this run", 1)[1].split("\n\n", 1)[0]
     assert history.count("CI github-pr-checks on") == 1
     # The head-A failure is superseded by the live failure on head B (round 2).
-    assert "CI github-pr-checks on abc123 (superseded by the failure on repaired-1)" in history
+    assert "CI github-pr-checks on 6367c48dd193 (superseded by the failure on aa09285eba47)" in history
     assert "Failing checks: unit-a" in history
     assert "lint-b" not in history
     assert "Failing checks: unit-a" in history
@@ -777,7 +778,7 @@ def test_deferred_finding_stays_deferred_across_ci_repair_dispatches_and_on_repl
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
         if kwargs.get("role") == "coder":
-            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+            runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
     patch_attr_in(monkeypatch, (
@@ -787,9 +788,9 @@ def test_deferred_finding_stays_deferred_across_ci_repair_dispatches_and_on_repl
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
-        if head == "repaired-3":
+        if head == "53b2c9f83ff0003fb3c252c123ca0d6426fdd340":
             return _watch_check_board("passing")
-        if head == "abc123":
+        if head == "6367c48dd193d56ea7b0baad25b19455e529f5ee":
             return _watch_check_board("passing")
         failed = PullRequestCheck(
             name=f"check-{head}", kind="check_run", status="failure",
@@ -871,7 +872,7 @@ def test_deferred_finding_survives_a_real_resume_and_reintroduction_flips_it_ope
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
         if kwargs.get("role") == "coder":
-            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+            runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
     patch_attr_in(monkeypatch, (
@@ -881,7 +882,7 @@ def test_deferred_finding_survives_a_real_resume_and_reintroduction_flips_it_ope
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
-        if head in {"repaired-3", "abc123"}:
+        if head in {"53b2c9f83ff0003fb3c252c123ca0d6426fdd340", "6367c48dd193d56ea7b0baad25b19455e529f5ee"}:
             return _watch_check_board("passing")
         failed = PullRequestCheck(
             name=f"check-{head}", kind="check_run", status="failure",
@@ -987,7 +988,7 @@ def test_future_finding_cleared_in_full_context_mode_is_resolved_live_and_on_res
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
         if kwargs.get("role") == "coder":
-            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+            runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
     patch_attr_in(monkeypatch, (
@@ -997,7 +998,7 @@ def test_future_finding_cleared_in_full_context_mode_is_resolved_live_and_on_res
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
-        if head in {"repaired-3", "abc123"}:
+        if head in {"53b2c9f83ff0003fb3c252c123ca0d6426fdd340", "6367c48dd193d56ea7b0baad25b19455e529f5ee"}:
             return _watch_check_board("passing")
         failed = PullRequestCheck(
             name=f"check-{head}", kind="check_run", status="failure",
@@ -1079,7 +1080,7 @@ def test_future_finding_reintroduced_as_blocking_in_full_context_mode_is_open_li
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
         if kwargs.get("role") == "coder":
-            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+            runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
     patch_attr_in(monkeypatch, (
@@ -1089,7 +1090,7 @@ def test_future_finding_reintroduced_as_blocking_in_full_context_mode_is_open_li
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
-        if head in {"repaired-3", "abc123"}:
+        if head in {"53b2c9f83ff0003fb3c252c123ca0d6426fdd340", "6367c48dd193d56ea7b0baad25b19455e529f5ee"}:
             return _watch_check_board("passing")
         failed = PullRequestCheck(
             name=f"check-{head}", kind="check_run", status="failure",
@@ -1146,7 +1147,7 @@ def test_future_finding_cleared_in_the_first_resumed_round_is_resolved_not_defer
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
         if kwargs.get("role") == "coder":
-            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+            runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
     patch_attr_in(monkeypatch, (
@@ -1156,7 +1157,7 @@ def test_future_finding_cleared_in_the_first_resumed_round_is_resolved_not_defer
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
-        if head in {"repaired-3", "abc123"}:
+        if head in {"53b2c9f83ff0003fb3c252c123ca0d6426fdd340", "6367c48dd193d56ea7b0baad25b19455e529f5ee"}:
             return _watch_check_board("passing")
         failed = PullRequestCheck(
             name=f"check-{head}", kind="check_run", status="failure",
@@ -1239,7 +1240,7 @@ def test_future_finding_cleared_by_subitem_completion_is_resolved_live_and_after
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
         if kwargs.get("role") == "coder":
-            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+            runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
     patch_attr_in(monkeypatch, (
@@ -1249,7 +1250,7 @@ def test_future_finding_cleared_by_subitem_completion_is_resolved_live_and_after
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
-        if head != "repaired-1":
+        if head != "aa09285eba47312c8c4f6a8190cab30ea08e880d":
             return _watch_check_board("passing")
         failed = PullRequestCheck(
             name=f"check-{head}", kind="check_run", status="failure",
@@ -1364,7 +1365,7 @@ def test_compact_resume_cannot_reintroduce_a_deferred_finding_under_its_old_id(
     def run(*args, **kwargs):
         response = original(*args, **kwargs)
         if kwargs.get("role") == "coder":
-            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+            runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
     patch_attr_in(monkeypatch, (
@@ -1374,7 +1375,7 @@ def test_compact_resume_cannot_reintroduce_a_deferred_finding_under_its_old_id(
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
-        if head != "repaired-1":
+        if head != "aa09285eba47312c8c4f6a8190cab30ea08e880d":
             return _watch_check_board("passing")
         failed = PullRequestCheck(
             name=f"check-{head}", kind="check_run", status="failure",
@@ -1438,7 +1439,7 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
 ):
     """`ci-repair-dispatch` (ordinary CI) across four coder dispatches.
 
-    Head A (abc123) fails unit-a in round 1; head B (repaired-1) fails lint-b in
+    Head A (6367c48dd193d56ea7b0baad25b19455e529f5ee) fails unit-a in round 1; head B (aa09285eba47312c8c4f6a8190cab30ea08e880d) fails lint-b in
     round 2 and, because the second coder turn pushes nothing, again in round 3
     (a repeated snapshot of the same failure); round 4 sees pending checks on a
     new head.  B must stay one instance first observed in round 2, rendered as an
@@ -1465,7 +1466,7 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
         ],
         claude_outputs=[structured_coder_followup(remaining_items=["item-1", "item-2"])] * 4,
     )
-    heads = iter(["repaired-1", "repaired-1", "repaired-3", "repaired-4"])
+    heads = iter(["aa09285eba47312c8c4f6a8190cab30ea08e880d", "aa09285eba47312c8c4f6a8190cab30ea08e880d", "53b2c9f83ff0003fb3c252c123ca0d6426fdd340", "359a6e8e0d5ad21614437ac98e7c42291449dce5"])
     original = validated_agent._run_validated_agent
 
     def run(*args, **kwargs):
@@ -1481,8 +1482,8 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
 
     def boards(*_a, **_k):
         head = runner.pr_payload["headRefOid"]
-        failing = {"abc123": "unit-a", "repaired-1": "lint-b"}.get(head)
-        if head == "repaired-3":
+        failing = {"6367c48dd193d56ea7b0baad25b19455e529f5ee": "unit-a", "aa09285eba47312c8c4f6a8190cab30ea08e880d": "lint-b"}.get(head)
+        if head == "53b2c9f83ff0003fb3c252c123ca0d6426fdd340":
             return _watch_check_board(
                 "pending",
                 pending=(PullRequestCheck(name="lint-b", kind="check_run", status="pending"),),
@@ -1520,10 +1521,10 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
             block.split(":", 1)[0]: block for block in re.split(r"\n(?=Round \d+:)", text)
         }
 
-    superseded = "item-2: CI github-pr-checks on abc123 (superseded by the failure on repaired-1)"
-    b_open = "item-2: CI github-pr-checks on repaired-1 (open)"
+    superseded = "item-2: CI github-pr-checks on 6367c48dd193 (superseded by the failure on aa09285eba47)"
+    b_open = "item-2: CI github-pr-checks on aa09285eba47 (open)"
     # Dispatch 2: B is the current round's failure, so only A is history.
-    assert superseded in history(prompts[1]) and "repaired-1 (open)" not in history(prompts[1])
+    assert superseded in history(prompts[1]) and "aa09285eba47 (open)" not in history(prompts[1])
     for prompt in prompts[2:]:
         text = history(prompt)
         by_round = rounds(text)
@@ -1532,7 +1533,7 @@ def test_ci_history_repeated_snapshot_and_older_open_failure_at_later_dispatches
         assert b_open in by_round["Round 2"] and "lint-b (failure)" in by_round["Round 2"]
         assert text.count("CI github-pr-checks on") == 2
         assert "CI github-pr-checks" not in by_round.get("Round 3", "")
-        assert "repaired-3" not in text
+        assert "53b2c9f83ff0" not in text
         assert "GitHub PR checks are failing" not in text
 
 
@@ -1842,7 +1843,7 @@ def _approach_alternative_coders():
     ] + [
         structured_coder_followup(
             addressed_items=["item-3"],
-            summary="Approach alternative: drop the predecessor-head disqualifier.",
+            summary="Approach alternative: drop the aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c disqualifier.",
         )
     ]
 
@@ -1857,7 +1858,7 @@ def test_an_approach_alternative_step_back_stops_live_for_a_human_decision(tmp_p
         run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
     message = str(excinfo.value)
     assert "the coder proposes replacing the approved approach" in message
-    assert "drop the predecessor-head disqualifier." in message
+    assert "drop the aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c disqualifier." in message
     assert "rerun with the scope change approved" in message
     assert "accept a stated limitation" in message and "--pr-step-back-rounds 0" in message
     assert len(_sb_coder_prompts(runner)) == 3  # no further coder turn
@@ -1880,7 +1881,7 @@ def test_a_resumed_run_stops_before_reviewing_the_approach_alternative_head(tmp_
     runner.codex_outputs.append(_sb_review(resolved=["item-3"]))
     with pytest.raises(HumanDecisionRequiredError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=_sb_config(tmp_path))
-    assert "drop the predecessor-head disqualifier." in str(excinfo.value)
+    assert "drop the aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c disqualifier." in str(excinfo.value)
     assert len(_sb_coder_prompts(runner)) == 3
     assert len(_sb_codex_prompts(runner)) == reviews_before  # no review of that head
     # Continuing to generalize disables the stop and reviews the head.

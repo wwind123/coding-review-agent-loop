@@ -558,7 +558,7 @@ def test_oversized_plan_followup_issue_body_is_shortened():
 
     body = _plan_followup_issue_body(
         issue_number=841,
-        plan_hash="abc123",
+        plan_hash="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         plan_subject="Stage the transport rewrite",
         followup=followup,
     )
@@ -624,7 +624,7 @@ def test_oversized_plan_followup_update_notes_alone_are_shortened():
 
     body = _plan_followup_issue_body(
         issue_number=841,
-        plan_hash="abc123",
+        plan_hash="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         plan_subject="Stage the transport rewrite",
         followup=followup,
     )
@@ -986,7 +986,7 @@ def test_followup_identity_record_leads_pr_and_plan_bodies_and_survives_bounding
         source_context=_source(parent=1),
     )
     plan_body = _plan_followup_issue_body(
-        issue_number=841, plan_hash="abc123", plan_subject="subject", followup=_plan_group(huge),
+        issue_number=841, plan_hash="6367c48dd193d56ea7b0baad25b19455e529f5ee", plan_subject="subject", followup=_plan_group(huge),
         source_context=_source(parent=1),
     )
     for body in (pr_body, plan_body):

@@ -5575,7 +5575,7 @@ def _long_in_cap_selector(root):
 
 
 def _secret_option(root):
-    return ("python", "-m", "pytest", "--token=abc123", "tests/test_protocol.py"), root
+    return ("python", "-m", "pytest", "--token=6367c48dd193d56ea7b0baad25b19455e529f5ee", "tests/test_protocol.py"), root
 
 
 def _long_non_repo_argument(root):
@@ -5868,7 +5868,7 @@ def test_attribution_refresh_applies_only_to_matching_restored_rows(tmp_path):
 
     rows = [
         restored("matching"),
-        restored("other-head", head="9" * 40),
+        restored("5e6741348108b11e3f3ef936c335b1967d17ac6c", head="9" * 40),
         restored("other-tree", digest="c" * 64),
         restored("unstable", stable=False),
     ]
@@ -5890,7 +5890,7 @@ def test_attribution_refresh_applies_only_to_matching_restored_rows(tmp_path):
     )
     states = {row.receipt_id: row.attribution.state for row in evidence.observations}
     assert states["matching"] == "current-head"
-    assert states["other-head"] == "stale"
+    assert states["5e6741348108b11e3f3ef936c335b1967d17ac6c"] == "stale"
     assert states["other-tree"] == "stale"
     assert states["unstable"] == "stale"
     assert states["unmarked"] == "stale"

@@ -1093,7 +1093,7 @@ def _correction_fixture(monkeypatch, tmp_path, *, reauthenticated_head):
         turn_id="turn-current",
         normalized_command="python3 -m pytest tests/test_row_a.py -q",
         attribution=_Attribution(
-            state="current-head", head="head-same", tracked_digest="tree-same", stable=True,
+            state="current-head", head="062ef49c654695584ac672bf097707bfa3c1732d", tracked_digest="tree-same", stable=True,
         ),
         environment_state="not-compared",
         wrapper_bootstrap="verified",
@@ -1137,7 +1137,7 @@ def _correction_fixture(monkeypatch, tmp_path, *, reauthenticated_head):
     monkeypatch.setattr(
         _response_validation, "stable_tracked_tree_snapshot",
         lambda _workdir: _NS(
-            head="head-same", tracked_digest="tree-same",
+            head="062ef49c654695584ac672bf097707bfa3c1732d", tracked_digest="tree-same",
             complete=True, stable=True, status_clean=True,
         ),
     )
@@ -1166,7 +1166,7 @@ def _correction_fixture(monkeypatch, tmp_path, *, reauthenticated_head):
             approved_plan_context=context,
             runner=Runner(),
             assigned_workdir=tmp_path,
-            head_sha="head-same",
+            head_sha="062ef49c654695584ac672bf097707bfa3c1732d",
             config=_NS(coder="codex", coder_test_command_timeout_seconds=1),
             session_id="coder-session",
             reauthenticate_head=lambda: reauthenticated_head,
@@ -1181,11 +1181,11 @@ def test_same_head_correction_at_unchanged_head_verifies(monkeypatch, tmp_path):
     The reauthenticated head equals ``head_sha``, which is also the
     predecessor head: the corrected receipt is verified with citations.
     """
-    run, heads = _correction_fixture(monkeypatch, tmp_path, reauthenticated_head="head-same")
+    run, heads = _correction_fixture(monkeypatch, tmp_path, reauthenticated_head="062ef49c654695584ac672bf097707bfa3c1732d")
 
     _parsed, result = run()
 
-    assert heads == ["head-same", "head-same"]
+    assert heads == ["062ef49c654695584ac672bf097707bfa3c1732d", "062ef49c654695584ac672bf097707bfa3c1732d"]
     row = result.evidence.rows[0]
     assert row.status == "verified"
     assert row.evidence_citations
@@ -1198,7 +1198,7 @@ def test_remote_head_race_correction_stays_unverified(monkeypatch, tmp_path):
 
     _parsed, result = run()
 
-    assert heads == ["head-same", "head-raced"]
+    assert heads == ["062ef49c654695584ac672bf097707bfa3c1732d", "head-raced"]
     row = result.evidence.rows[0]
     assert row.status != "verified"
     assert row.evidence_citations == ()

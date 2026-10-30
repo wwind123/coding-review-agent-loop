@@ -58,7 +58,7 @@ def test_pr_loop_reinjects_blocking_item_when_human_requirement_marker_missing(t
             "title": "Improve review prompt context",
             "headRefName": "feature/review-context",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [
                 {
                     "author": {"login": "maintainer"},
@@ -97,7 +97,7 @@ def test_pr_loop_recovers_when_second_reviewer_includes_human_requirement_marker
         "title": "Improve review prompt context",
         "headRefName": "feature/review-context",
         "baseRefName": "main",
-        "headRefOid": "abc123",
+        "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "comments": [
             {
                 "author": {"login": "maintainer"},
@@ -143,7 +143,7 @@ def test_pr_loop_allows_approval_with_human_requirement_resolution_marker(tmp_pa
             "title": "Improve review prompt context",
             "headRefName": "feature/review-context",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [
                 {
                     "author": {"login": "maintainer"},
@@ -405,7 +405,7 @@ def test_pr_loop_revalidates_latest_coder_output_against_refreshed_human_require
             "title": "Improve review prompt context",
             "headRefName": "feature/review-context",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [
                 {
                     "author": {"login": "maintainer"},
@@ -425,7 +425,7 @@ def test_pr_loop_revalidates_latest_coder_output_against_refreshed_human_require
         title="Improve review prompt context",
         head_branch="feature/review-context",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/77",
     )
     contexts = iter(
@@ -453,7 +453,7 @@ def test_pr_loop_revalidates_latest_coder_output_against_refreshed_human_require
 
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *args, **kwargs: next(contexts),
     )
 
@@ -615,7 +615,7 @@ def test_pr_loop_rereviews_unchanged_head_when_human_requirement_changes(
         title="Improve review prompt context",
         head_branch="feature/review-context",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/77",
     )
     prior_codex_review = _attach_round_metadata(
@@ -630,7 +630,7 @@ def test_pr_loop_rereviews_unchanged_head_when_human_requirement_changes(
             role="reviewer",
             agent="OpenAI Codex",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             state="approved",
             surfaced_reviewer_requirement_ids=("Requirement 1",),
         ),
@@ -662,7 +662,7 @@ def test_pr_loop_rereviews_unchanged_head_when_human_requirement_changes(
 
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         next_context,
     )
     config = make_config(
@@ -879,7 +879,7 @@ def test_pr_loop_resume_with_trust_set_excludes_historically_acknowledged_requir
             "title": "Widen timeout",
             "headRefName": "feature/timeout",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [
                 {
                     "author": {"login": "agent-bot"},
@@ -1011,7 +1011,7 @@ def test_ack_failure_boundary_resumes_round_ledger_and_numbering(tmp_path, monke
     comments = [IssueComment(author="bot", created_at=None, body=c["body"])
                 for c in runner.pr_payload["comments"]]
     for _ in range(2):
-        resumed = _resume_pr_round(comments, head_sha="abc123", configured_reviewers=("codex",))
+        resumed = _resume_pr_round(comments, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", configured_reviewers=("codex",))
         assert resumed.round_number == round_number
         assert {i.item_id for i in resumed.prior_items} == {ACK_ID, "item-7"}
         assert resumed.next_unresolved_item_number == 42
@@ -1049,7 +1049,7 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
     runner.codex_outputs.append(structured_pr_review(human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
     runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini", human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
     if not fresh_read:
-        real_context = pr_loop.get_pr_review_context
+        real_context = pr_loop.get_observed_pr_review_context
         failed_reads = []
         def unavailable_after_checkpoint(*args, **kwargs):
             if not failed_reads and sum(r.metadata.phase == "scheduler-prelaunch" for r in records()) > sum(
@@ -1058,7 +1058,7 @@ def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypa
                 failed_reads.append(True)
                 raise AgentLoopError("Transient fresh visibility read failure.")
             return real_context(*args, **kwargs)
-        monkeypatch.setattr(pr_loop, "get_pr_review_context", unavailable_after_checkpoint)
+        monkeypatch.setattr(pr_loop, "get_observed_pr_review_context", unavailable_after_checkpoint)
     snapshots = []
     real_clear = pr_loop._clear_human_requirements_ack_item
     def capture(items):

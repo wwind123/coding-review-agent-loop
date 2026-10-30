@@ -2,7 +2,7 @@
 
 How findings are carried and closed, and how the PR loop stops when it does not converge: stable finding IDs and dispositions, reviewer scope discipline and future follow-ups, human-only exact-head evidence and risk-matrix row conversion, conjunctive sub-items, progress publication, the PR step-back, sweep and sibling escalation, the non-convergence stop, the evidence-only stall stop and evidence conversion.
 
-Source paths: `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
+Source paths: `src/coding_review_agent_loop/pr_head_sync.py`, `src/coding_review_agent_loop/converted_capture.py`, `src/coding_review_agent_loop/pr_restart.py`, `src/coding_review_agent_loop/unresolved_items.py`, `src/coding_review_agent_loop/review_step_back.py`, `src/coding_review_agent_loop/evidence_stall.py`, `src/coding_review_agent_loop/evidence_conversion.py`, `src/coding_review_agent_loop/pr_loop.py`, `src/coding_review_agent_loop/pr_loop_support.py`, `src/coding_review_agent_loop/scope_declarations.py`, `src/coding_review_agent_loop/protocol.py`, `tests/test_review_step_back.py`, `tests/test_evidence_stall.py`, `tests/test_evidence_conversion.py`, `tests/test_pr_loop_review_ledger.py`, `tests/test_pr_loop_convergence.py`, `tests/test_pr_loop_followups.py`, `tests/test_pr_loop_evidence_freeze.py`.
 
 ## Findings, evidence and convergence
 
@@ -435,6 +435,28 @@ publication modes use this carrier; generic model approval completeness stays
 strict. `pr_restart.py` checkpoints qualification restarts with their actual
 head and architecture causes, advancing head-bound obligations only when the
 head moves.
+
+## GitHub PR-head observation
+
+`pr_head_sync.py` observes the PR projection, REST PR head and independent tip
+of the exact head repository/ref before lifecycle publications, entry activation
+and fresh grants, selected review rounds and post-coder progress accounting.
+Issue-to-PR entry includes direct and approved-plan implementation, legacy
+resume and plan-first legacy-closing-reference resume before extracting handoff
+metadata. Callers consume the returned complete context, including its URL.
+
+At most three samples, two seconds apart, permit transient convergence. Full
+commit SHAs and repository/ref/base identity are mandatory. Equality avoids an
+ancestry call; differing immutable commits use the head repository's comparison.
+Only an ahead result with matching base and merge base proves descendant lag.
+Behind/diverged tips retain existing handling. Missing data, uncertain ancestry
+and exhausted projection disagreement raise observation verification errors.
+
+Persistent descendant lag raises a distinct observation stop before unchanged
+accounting, accepted or rejected coder publication, continuity evidence or
+qualification reuse. Normal interruption cleanup still runs. The branch tip
+never replaces the PR-record head as authority for review, CI or merge. Reads
+cannot be atomic with later pushes; existing exact-head gates remain necessary.
 
 ## Decisions
 

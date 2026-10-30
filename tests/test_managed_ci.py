@@ -184,10 +184,10 @@ class ManagedRunner(FakeRunner):
             payload = {
                 "head": {
                     "repo": {"full_name": "OWNER/REPO"},
-                    "sha": "abc123",
+                    "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                     "ref": "feature",
                 },
-                "base": {"ref": self.base_ref},
+                "base": {"ref": self.base_ref, "repo": {"full_name": "OWNER/REPO"}},
                 "labels": [],
             }
             return CommandResult(cmd, cwd_path, json.dumps(payload), "", 0)
@@ -236,10 +236,10 @@ class V2ManagedRunner(ManagedRunner):
         self.rest_pr = {
             "head": {
                 "repo": {"full_name": "OWNER/REPO"},
-                "sha": "abc123",
+                "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "ref": "agent-loop/managed-643",
             },
-            "base": {"ref": "main"},
+            "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}},
             "user": {"login": actor_login, "id": actor_id},
             "labels": [{"name": MANAGED_LABEL}],
             "draft": True,
@@ -595,7 +595,7 @@ def metadata(*, base_branch="main"):
         title="Managed CI",
         head_branch="feature",
         base_branch=base_branch,
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/7",
         body=f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=nonce-643",
     )
@@ -682,7 +682,7 @@ class RacedAuthorizationCommentRunner(AuthorizationCommentRunner):
         if endpoint == "repos/OWNER/REPO/pulls/7":
             self.pull_reads += 1
             if self.pull_reads == 2:
-                self.rest_pr["head"]["sha"] = "raced-head"
+                self.rest_pr["head"]["sha"] = "a607eb2974b572fbd8ce0410e987804f1e0775a6"
         return super()._run_locked(args, cwd=cwd, check=check, input_text=input_text)
 
 
@@ -786,7 +786,7 @@ def _workflow_runner_for_issue_authorization(
             "body": body,
             "headRefName": "agent-loop/managed-643",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [],
             "reviews": [],
         },
@@ -806,7 +806,7 @@ def test_run_pr_loop_ordinary_resume_uses_real_durable_recovery_and_activation(
 ):
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci",
         nonce="opening-nonce", label_event_id=101,
     )
@@ -904,11 +904,11 @@ def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_gr
         metadata=replace(metadata(), body=runner.rest_pr["body"]),
     )
     runner.intent_comments.extend([
-        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-        _round_comment(89, role="coder", subject="next-head", round_number=2),
+        _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
     ])
-    runner.rest_pr["head"]["sha"] = "next-head"
-    runner.pr_payload["headRefOid"] = "next-head"
+    runner.rest_pr["head"]["sha"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
+    runner.pr_payload["headRefOid"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
     continuity = publish_issue_created_continuity_authorization(
         runner,
         config=make_config(
@@ -916,8 +916,8 @@ def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_gr
             managed_ci_trusted_actor="agent-loop", allow_unprotected_managed_ci=True,
         ),
         handoff=root,
-        predecessor_head="abc123",
-        new_head="next-head",
+        predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+        new_head="e9bff449de155dd0be5fd76276214538b0dfd315",
         round_comment_ids=(88, 89),
     )
     config = make_config(
@@ -956,7 +956,7 @@ def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_gr
     reviewer_command = next(
         command for command, _cwd in runner.commands if command[:2] == ["codex", "exec"]
     )
-    assert "next-head" in " ".join(reviewer_command)
+    assert "e9bff449de155dd0be5fd76276214538b0dfd315" in " ".join(reviewer_command)
     assert any(
         "Reviewed the continuity-authorized exact head." in comment
         for comment in runner.comments
@@ -970,7 +970,7 @@ def test_run_pr_loop_fresh_retry_reuses_continuity_terminal_without_competing_gr
     assert runner.dispatch_count == 0
 
 
-def _authorization_handoff(*, head="abc123"):
+def _authorization_handoff(*, head="6367c48dd193d56ea7b0baad25b19455e529f5ee"):
     return managed_ci.AuthenticatedIssueCreatedHandoff(
         pr_number=7,
         issue_number=643,
@@ -1006,7 +1006,7 @@ def test_issue_authorization_round_trip_is_comment_only_and_idempotent(tmp_path)
         issue_number=643,
         pr_number=7,
         base_ref="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         actor_login="agent-loop",
         actor_id=1,
         protection="voluntary",
@@ -1088,16 +1088,16 @@ def test_issue_authorization_continuity_accepts_one_gap_free_head_chain(tmp_path
         runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
     )
     runner.intent_comments.extend([
-        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-        _round_comment(89, role="coder", subject="next-head", round_number=2),
+        _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
     ])
-    runner.rest_pr["head"]["sha"] = "next-head"
+    runner.rest_pr["head"]["sha"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
     continued = publish_issue_created_continuity_authorization(
         runner,
         config=config,
         handoff=initial,
-        predecessor_head="abc123",
-        new_head="next-head",
+        predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+        new_head="e9bff449de155dd0be5fd76276214538b0dfd315",
         round_comment_ids=(88, 89),
     )
     audit = _find_resume_audit(
@@ -1108,18 +1108,18 @@ def test_issue_authorization_continuity_accepts_one_gap_free_head_chain(tmp_path
         actor_id=1,
         base_ref="main",
         issue_number=643,
-        live_head="next-head",
+        live_head="e9bff449de155dd0be5fd76276214538b0dfd315",
     )
     assert continued.authorization_kind == "continuity"
     assert audit is not None
     assert audit[0] == continued.authorization_comment_id
-    assert audit[1]["head"] == "next-head"
+    assert audit[1]["head"] == "e9bff449de155dd0be5fd76276214538b0dfd315"
 
 
 def test_continuity_publication_rechecks_live_tuple_before_writing(tmp_path):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci",
         nonce="nonce-643", label_event_id=101,
     )
@@ -1128,11 +1128,11 @@ def test_continuity_publication_rechecks_live_tuple_before_writing(tmp_path):
         intent_comments=[
             {"id": 41, "user": {"login": "agent-loop", "id": 1},
              "body": str(format_issue_created_authorization_comment(root))},
-            _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-            _round_comment(89, role="coder", subject="next-head", round_number=2),
+            _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+            _round_comment(89, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
         ],
     )
-    runner.rest_pr["head"]["sha"] = "next-head"
+    runner.rest_pr["head"]["sha"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
@@ -1142,8 +1142,8 @@ def test_continuity_publication_rechecks_live_tuple_before_writing(tmp_path):
             runner,
             config=config,
             handoff=_authorization_handoff(),
-            predecessor_head="abc123",
-            new_head="next-head",
+            predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+            new_head="e9bff449de155dd0be5fd76276214538b0dfd315",
             round_comment_ids=(88, 89),
         )
 
@@ -1157,7 +1157,7 @@ def test_continuity_publication_rechecks_live_tuple_before_writing(tmp_path):
 def test_continuity_publication_rechecks_authorization_set_before_writing(tmp_path):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci",
         nonce="nonce-643", label_event_id=101,
     )
@@ -1166,11 +1166,11 @@ def test_continuity_publication_rechecks_authorization_set_before_writing(tmp_pa
         intent_comments=[
             {"id": 41, "user": {"login": "agent-loop", "id": 1},
              "body": str(format_issue_created_authorization_comment(root))},
-            _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-            _round_comment(89, role="coder", subject="next-head", round_number=2),
+            _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+            _round_comment(89, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
         ],
     )
-    runner.rest_pr["head"]["sha"] = "next-head"
+    runner.rest_pr["head"]["sha"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
@@ -1180,8 +1180,8 @@ def test_continuity_publication_rechecks_authorization_set_before_writing(tmp_pa
             runner,
             config=config,
             handoff=_authorization_handoff(),
-            predecessor_head="abc123",
-            new_head="next-head",
+            predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+            new_head="e9bff449de155dd0be5fd76276214538b0dfd315",
             round_comment_ids=(88, 89),
         )
 
@@ -1195,7 +1195,7 @@ def test_continuity_publication_rechecks_authorization_set_before_writing(tmp_pa
 def test_continuity_publication_rejects_distinct_predecessor_authorizations(tmp_path):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci",
         nonce="root", label_event_id=101,
     )
@@ -1207,11 +1207,11 @@ def test_continuity_publication_rejects_distinct_predecessor_authorizations(tmp_
              "body": str(format_issue_created_authorization_comment(root))},
             {"id": 42, "user": {"login": "agent-loop", "id": 1},
              "body": str(format_issue_created_authorization_comment(competing))},
-            _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-            _round_comment(89, role="coder", subject="next-head", round_number=2),
+            _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+            _round_comment(89, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
         ],
     )
-    runner.rest_pr["head"]["sha"] = "next-head"
+    runner.rest_pr["head"]["sha"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
@@ -1221,8 +1221,8 @@ def test_continuity_publication_rejects_distinct_predecessor_authorizations(tmp_
             runner,
             config=config,
             handoff=_authorization_handoff(),
-            predecessor_head="abc123",
-            new_head="next-head",
+            predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+            new_head="e9bff449de155dd0be5fd76276214538b0dfd315",
             round_comment_ids=(88, 89),
         )
 
@@ -1243,17 +1243,17 @@ def test_continuity_publication_rejects_different_head_fork(tmp_path):
         runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
     )
     runner.intent_comments.extend([
-        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
         _round_comment(89, role="coder", subject="head-a", round_number=2),
     ])
     runner.rest_pr["head"]["sha"] = "head-a"
     publish_issue_created_continuity_authorization(
-        runner, config=config, handoff=initial, predecessor_head="abc123",
+        runner, config=config, handoff=initial, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         new_head="head-a", round_comment_ids=(88, 89),
     )
 
     runner.intent_comments.extend([
-        _round_comment(90, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(90, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
         _round_comment(91, role="coder", subject="head-b", round_number=2),
     ])
     runner.rest_pr["head"]["sha"] = "head-b"
@@ -1266,7 +1266,7 @@ def test_continuity_publication_rejects_different_head_fork(tmp_path):
     }
     with pytest.raises(AgentLoopError, match="forked predecessor"):
         publish_issue_created_continuity_authorization(
-            runner, config=config, handoff=initial, predecessor_head="abc123",
+            runner, config=config, handoff=initial, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             new_head="head-b", round_comment_ids=(90, 91),
         )
 
@@ -1281,7 +1281,7 @@ def test_continuity_publication_rejects_different_head_fork(tmp_path):
 def test_continuity_fork_through_duplicate_predecessor_aliases_fails_closed(tmp_path):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
@@ -1289,7 +1289,7 @@ def test_continuity_fork_through_duplicate_predecessor_aliases_fails_closed(tmp_
         kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
         base_ref="main", head_sha="head-a", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="first",
-        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=41,
+        label_event_id=101, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", predecessor_comment_id=41,
         round_comment_ids=(88, 89),
     )
     second = replace(
@@ -1301,11 +1301,11 @@ def test_continuity_fork_through_duplicate_predecessor_aliases_fails_closed(tmp_
          "body": str(format_issue_created_authorization_comment(root))},
         {"id": 42, "user": {"login": "agent-loop", "id": 1},
          "body": str(format_issue_created_authorization_comment(root))},
-        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
         _round_comment(89, role="coder", subject="head-a", round_number=2),
         {"id": 100, "user": {"login": "agent-loop", "id": 1},
          "body": str(format_issue_created_authorization_comment(first))},
-        _round_comment(90, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(90, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
         _round_comment(91, role="coder", subject="head-b", round_number=2),
         {"id": 101, "user": {"login": "agent-loop", "id": 1},
          "body": str(format_issue_created_authorization_comment(second))},
@@ -1322,7 +1322,7 @@ def test_continuity_fork_through_duplicate_predecessor_aliases_fails_closed(tmp_
     with pytest.raises(AgentLoopError, match="forked predecessor"):
         publish_issue_created_continuity_authorization(
             runner, config=config, handoff=_authorization_handoff(),
-            predecessor_head="abc123", new_head="head-b", round_comment_ids=(90, 91),
+            predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="head-b", round_comment_ids=(90, 91),
         )
 
     assert not any(
@@ -1346,11 +1346,11 @@ def test_continuity_publication_rejects_missing_correlated_round_metadata(tmp_pa
     initial = publish_issue_created_authorization(
         runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
     )
-    runner.rest_pr["head"]["sha"] = "next-head"
+    runner.rest_pr["head"]["sha"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
     with pytest.raises(AgentLoopError, match="correlated round metadata"):
         publish_issue_created_continuity_authorization(
-            runner, config=config, handoff=initial, predecessor_head="abc123",
-            new_head="next-head", round_comment_ids=(initial.authorization_comment_id,),
+            runner, config=config, handoff=initial, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+            new_head="e9bff449de155dd0be5fd76276214538b0dfd315", round_comment_ids=(initial.authorization_comment_id,),
         )
 
 
@@ -1390,7 +1390,7 @@ def test_conflict_resolution_round_grants_continuity_without_a_reviewer_pair(tmp
 
     selected = managed_ci.find_actor_round_metadata_comment_ids(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        predecessor_head="abc123", new_head="merged-head", round_number=12,
+        predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head", round_number=12,
         after_comment_id=50,
     )
 
@@ -1407,7 +1407,7 @@ def test_head_advance_without_review_or_conflict_obligation_still_fails(tmp_path
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
         managed_ci.find_actor_round_metadata_comment_ids(
             runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-            predecessor_head="abc123", new_head="merged-head", round_number=12,
+            predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head", round_number=12,
             after_comment_id=50,
         )
 
@@ -1425,7 +1425,7 @@ def _publish_conflict_round_continuity(runner, *, config):
         runner,
         config=config,
         handoff=initial,
-        predecessor_head="abc123",
+        predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         new_head="merged-head",
         round_comment_ids=(61,),
     )
@@ -1494,7 +1494,7 @@ def test_continuity_publication_rejects_a_lone_coder_record_without_the_obligati
             runner,
             config=config,
             handoff=initial,
-            predecessor_head="abc123",
+            predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             new_head="merged-head",
             round_comment_ids=(61,),
         )
@@ -1537,7 +1537,7 @@ def _conflict_continuity(comment_id=61):
         kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
         base_ref="main", head_sha="merged-head", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
-        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=50,
+        label_event_id=101, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", predecessor_comment_id=50,
         round_comment_ids=(comment_id,),
     )
 
@@ -1654,7 +1654,7 @@ def test_m1057_stale_or_non_machine_conflict_item_denies_continuity(tmp_path, ca
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
         managed_ci.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-            actor_id=1, predecessor_head="abc123", new_head="merged-head", round_number=12,
+            actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head", round_number=12,
             after_comment_id=50,
         )
     assert managed_ci._continuity_round_metadata_is_valid(
@@ -1683,7 +1683,7 @@ def test_m1057_resume_rejects_a_conflict_grant_whose_obligation_went_stale(tmp_p
     assert audit is None
 
 
-@pytest.mark.parametrize("confirmed_head", ["abc123", None])
+@pytest.mark.parametrize("confirmed_head", ["6367c48dd193d56ea7b0baad25b19455e529f5ee", None])
 def test_m1057_orchestrator_minted_conflict_shapes_still_grant_continuity(
     tmp_path, confirmed_head
 ):
@@ -1709,7 +1709,7 @@ def test_m1057_orchestrator_minted_conflict_shapes_still_grant_continuity(
     runner.intent_comments.append(comment)
     selected = managed_ci.find_actor_round_metadata_comment_ids(
         runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-        actor_id=1, predecessor_head="abc123", new_head="merged-head", round_number=12,
+        actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head", round_number=12,
         after_comment_id=50,
     )
     assert selected == (61,)
@@ -1721,7 +1721,7 @@ def test_m1057_orchestrator_minted_conflict_shapes_still_grant_continuity(
 # --- #1024: an exact-head CI repair round authorizes continuity on its own ---
 
 
-def _advanced_ci_obligation(*, failed="abc123", candidate="ci-fix-head", round_number=12):
+def _advanced_ci_obligation(*, failed="6367c48dd193d56ea7b0baad25b19455e529f5ee", candidate="ci-fix-head", round_number=12):
     """The CI obligation exactly as the orchestrator serializes it after a push."""
     from coding_review_agent_loop.unresolved_items import (
         MANAGED_CI_OBLIGATION_KIND,
@@ -1765,7 +1765,7 @@ def _ci_repair_continuity(comment_id=61, *, predecessor_comment_id=50):
         kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
         base_ref="main", head_sha="ci-fix-head", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
-        label_event_id=101, predecessor_head="abc123",
+        label_event_id=101, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         predecessor_comment_id=predecessor_comment_id, round_comment_ids=(comment_id,),
     )
 
@@ -1776,7 +1776,7 @@ def test_ci_repair_round_grants_continuity_without_a_reviewer_pair(tmp_path):
 
     selected = managed_ci.find_actor_round_metadata_comment_ids(
         runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-        actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+        actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
         after_comment_id=50,
     )
 
@@ -1798,7 +1798,7 @@ def test_ci_repair_round_continuity_grant_reauthenticates_on_resume(tmp_path):
     runner.intent_comments.append(_ci_repair_round_comment(61))
     runner.rest_pr["head"]["sha"] = "ci-fix-head"
     continued = publish_issue_created_continuity_authorization(
-        runner, config=config, handoff=initial, predecessor_head="abc123",
+        runner, config=config, handoff=initial, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         new_head="ci-fix-head", round_comment_ids=(61,),
     )
 
@@ -1816,7 +1816,7 @@ def test_ci_repair_round_continuity_grant_reauthenticates_on_resume(tmp_path):
 def _mismatched_ci_items():
     advanced = _advanced_ci_obligation()
     return {
-        "failed-head-mismatch": _advanced_ci_obligation(failed="other-head"),
+        "0109780857a5f763d3dacdb5f43c546d6776b3ba-mismatch": _advanced_ci_obligation(failed="5e6741348108b11e3f3ef936c335b1967d17ac6c"),
         "candidate-head-mismatch": replace(advanced, candidate_head_sha="another-head"),
         "repair-required": replace(advanced, lifecycle="repair_required"),
         "cleared": replace(advanced, lifecycle="cleared"),
@@ -1838,7 +1838,7 @@ def test_ci_repair_continuity_refuses_an_unbound_ci_obligation(tmp_path, case):
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
         managed_ci.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
     assert managed_ci._continuity_round_metadata_is_valid(
@@ -1854,7 +1854,7 @@ def test_ci_repair_continuity_refuses_two_coder_records(tmp_path):
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
         managed_ci.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
     two = replace(_ci_repair_continuity(), round_comment_ids=(61, 62))
@@ -1869,7 +1869,7 @@ def test_ci_repair_continuity_refuses_a_foreign_actor(tmp_path):
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
         managed_ci.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
     assert managed_ci._continuity_round_metadata_is_valid(
@@ -1885,7 +1885,7 @@ def test_ci_repair_continuity_refuses_a_record_older_than_the_predecessor(tmp_pa
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
         managed_ci.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
     assert managed_ci._continuity_round_metadata_is_valid(
@@ -1931,7 +1931,7 @@ def test_ci_repair_continuity_publication_writes_nothing_for_an_invalid_record(t
 
     with pytest.raises(AgentLoopError, match="authenticated, correlated round metadata"):
         publish_issue_created_continuity_authorization(
-            runner, config=config, handoff=initial, predecessor_head="abc123",
+            runner, config=config, handoff=initial, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             new_head="ci-fix-head",
             round_comment_ids=tuple(comment["id"] for comment in comments),
         )
@@ -1992,7 +1992,7 @@ def test_m1370_wrongly_typed_ci_obligation_fields_never_crash_continuity(
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
         managed_ci.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
     assert managed_ci._continuity_round_metadata_is_valid(
@@ -2021,7 +2021,7 @@ def test_m1370_publication_writes_nothing_for_wrongly_typed_ci_fields(
 
     with pytest.raises(AgentLoopError, match="authenticated, correlated round metadata"):
         publish_issue_created_continuity_authorization(
-            runner, config=config, handoff=initial, predecessor_head="abc123",
+            runner, config=config, handoff=initial, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             new_head="ci-fix-head", round_comment_ids=(61,),
         )
 
@@ -2040,7 +2040,7 @@ def test_m1370_hostile_foreign_ci_record_does_not_block_a_valid_repair_round(
 
     selected = managed_ci.find_actor_round_metadata_comment_ids(
         runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-        actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+        actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
         after_comment_id=50,
     )
 
@@ -2084,7 +2084,7 @@ def test_issue_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
     )
     runner = _OrchestratorRoundCommentRunner(issue_events=[label_event()])
     runner.pr_payload.update({
-        "headRefName": "agent-loop/managed-643", "headRefOid": "abc123",
+        "headRefName": "agent-loop/managed-643", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "baseRefName": "main", "body": runner.rest_pr["body"],
     })
     root = publish_issue_created_authorization(
@@ -2108,14 +2108,14 @@ def test_issue_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
     )
     outcomes = iter([
         managed_ci.ManagedCiOutcome(
-            status="failed", head_sha="abc123",
+            status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             checks=PullRequestChecks(
                 state="failing", required_checks=("final-ci/exact-head",),
                 passing=(), pending=(), failing=(failed_check,), missing_required=(),
                 branch_protection_status="configured", check_query_status="ok",
             ),
         ),
-        managed_ci.ManagedCiOutcome(status="passed", head_sha="abc123-coder-1"),
+        managed_ci.ManagedCiOutcome(status="passed", head_sha="525753a4b04bd57d874211ba1fade250c3ff6d82"),
     ])
     qualified_heads = []
     merges = []
@@ -2154,7 +2154,7 @@ def test_issue_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
     records = _authorization_records(runner)
     assert [record.kind for _comment_id, record in records] == ["creation", "continuity"]
     grant_id, grant = records[1]
-    assert (grant.predecessor_head, grant.head_sha) == ("abc123", "abc123-coder-1")
+    assert (grant.predecessor_head, grant.head_sha) == ("6367c48dd193d56ea7b0baad25b19455e529f5ee", "525753a4b04bd57d874211ba1fade250c3ff6d82")
     assert grant.predecessor_comment_id == root.authorization_comment_id
     assert len(grant.round_comment_ids) == 1
     coder_comment = next(
@@ -2163,18 +2163,18 @@ def test_issue_ci_failure_after_full_approval_repairs_and_merges_in_one_run(
     )
     decoded = managed_ci._continuity_round_records([coder_comment])[0]
     assert decoded["role"] == "coder"
-    assert decoded["ci_repair_transitions"] == frozenset({("abc123", "abc123-coder-1")})
+    assert decoded["ci_repair_transitions"] == frozenset({("6367c48dd193d56ea7b0baad25b19455e529f5ee", "525753a4b04bd57d874211ba1fade250c3ff6d82")})
     assert handoffs[0][1].authorization_comment_id == grant_id
     # Resume reauthenticates the same chain.
     audit = _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="abc123-coder-1",
+        base_ref="main", issue_number=643, live_head="525753a4b04bd57d874211ba1fade250c3ff6d82",
     )
     assert audit is not None and audit[0] == grant_id
     # Re-review, qualification and merge all target the repaired head only.
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
-    assert qualified_heads == ["abc123", "abc123-coder-1"]
-    assert merges == [{"expected_head_sha": "abc123-coder-1"}]
+    assert qualified_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee", "525753a4b04bd57d874211ba1fade250c3ff6d82"]
+    assert merges == [{"expected_head_sha": "525753a4b04bd57d874211ba1fade250c3ff6d82"}]
     err = capsys.readouterr().err
     assert "Round 1: Claude repairing failed CI" in err
     assert "addressing reviewer feedback" not in err
@@ -2199,7 +2199,7 @@ def test_managed_a_to_b_failure_shows_superseded_a_and_open_b_in_the_second_repa
     )
     runner = _OrchestratorRoundCommentRunner(issue_events=[label_event()])
     runner.pr_payload.update({
-        "headRefName": "agent-loop/managed-643", "headRefOid": "abc123",
+        "headRefName": "agent-loop/managed-643", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "baseRefName": "main", "body": runner.rest_pr["body"],
     })
     root = publish_issue_created_authorization(
@@ -2234,7 +2234,7 @@ def test_managed_a_to_b_failure_shows_superseded_a_and_open_b_in_the_second_repa
     )
     outcomes = iter([
         managed_ci.ManagedCiOutcome(
-            status="failed", head_sha="abc123",
+            status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             checks=PullRequestChecks(
                 state="failing", required_checks=("final-ci/exact-head",),
                 passing=(), pending=(), failing=(failed_check,), missing_required=(),
@@ -2242,14 +2242,14 @@ def test_managed_a_to_b_failure_shows_superseded_a_and_open_b_in_the_second_repa
             ),
         ),
         managed_ci.ManagedCiOutcome(
-            status="failed", head_sha="abc123-coder-1",
+            status="failed", head_sha="525753a4b04bd57d874211ba1fade250c3ff6d82",
             checks=PullRequestChecks(
                 state="failing", required_checks=("final-ci/exact-head",),
                 passing=(), pending=(), failing=(failed_check_b,), missing_required=(),
                 branch_protection_status="configured", check_query_status="ok",
             ),
         ),
-        managed_ci.ManagedCiOutcome(status="passed", head_sha="abc123-coder-1-coder-2"),
+        managed_ci.ManagedCiOutcome(status="passed", head_sha="e0ce9a0e6346d339a1d547903f1600244fe31b35"),
     ])
     qualified_heads = []
     merges = []
@@ -2292,7 +2292,7 @@ def test_managed_a_to_b_failure_shows_superseded_a_and_open_b_in_the_second_repa
     # itself is first observed this round, so it is only in the review payload.
     assert history.count("CI managed-exact-head-ci on") == 1
     assert (
-        "CI managed-exact-head-ci on abc123 (superseded by the failure on abc123-coder)"
+        "CI managed-exact-head-ci on 6367c48dd193 (superseded by the failure on 525753a4b04b)"
         in history
     )
     assert "Failing checks: final-ci/exact-head (failure)" in history
@@ -2300,9 +2300,9 @@ def test_managed_a_to_b_failure_shows_superseded_a_and_open_b_in_the_second_repa
     assert "Required checks" in history and "Reviewed head" not in history
     assert "fix by Claude: Fixed managed CI." in history
     assert "final-ci/lint-b" in prompts[1]
-    assert qualified_heads[:2] == ["abc123", "abc123-coder-1"]
-    assert qualified_heads[-1] == "abc123-coder-1-coder-2"
-    assert merges == [{"expected_head_sha": "abc123-coder-1-coder-2"}]
+    assert qualified_heads[:2] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee", "525753a4b04bd57d874211ba1fade250c3ff6d82"]
+    assert qualified_heads[-1] == "e0ce9a0e6346d339a1d547903f1600244fe31b35"
+    assert merges == [{"expected_head_sha": "e0ce9a0e6346d339a1d547903f1600244fe31b35"}]
 
 
 
@@ -2311,7 +2311,7 @@ def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualif
 ):
     """#1273 `ci-repair-dispatch` (managed): B stays open history until qualification.
 
-    A fails on abc123, B on abc123-coder-1; after B's repair a reviewer blocks a
+    A fails on 6367c48dd193d56ea7b0baad25b19455e529f5ee, B on 525753a4b04bd57d874211ba1fade250c3ff6d82; after B's repair a reviewer blocks a
     new finding before re-qualification, so the third coder dispatch shows B as
     an older OPEN entry (first observed in round 2) and A superseded.  Only the
     next approval's exact-head qualification clears B, then the PR merges.
@@ -2323,7 +2323,7 @@ def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualif
     )
     runner = _OrchestratorRoundCommentRunner(issue_events=[label_event()])
     runner.pr_payload.update({
-        "headRefName": "agent-loop/managed-643", "headRefOid": "abc123",
+        "headRefName": "agent-loop/managed-643", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "baseRefName": "main", "body": runner.rest_pr["body"],
     })
     root = publish_issue_created_authorization(
@@ -2370,7 +2370,7 @@ def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualif
     )
     outcomes = iter([
         managed_ci.ManagedCiOutcome(
-            status="failed", head_sha="abc123",
+            status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             checks=PullRequestChecks(
                 state="failing", required_checks=("final-ci/exact-head",),
                 passing=(), pending=(), failing=(failed_check,), missing_required=(),
@@ -2378,7 +2378,7 @@ def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualif
             ),
         ),
         managed_ci.ManagedCiOutcome(
-            status="failed", head_sha="abc123-coder-1",
+            status="failed", head_sha="525753a4b04bd57d874211ba1fade250c3ff6d82",
             checks=PullRequestChecks(
                 state="failing", required_checks=("final-ci/exact-head",),
                 passing=(), pending=(), failing=(failed_check_b,), missing_required=(),
@@ -2386,7 +2386,7 @@ def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualif
             ),
         ),
         managed_ci.ManagedCiOutcome(
-            status="passed", head_sha="abc123-coder-1-coder-2-coder-3"
+            status="passed", head_sha="fa0338def2a61b1065c3d0a5057896a71aa9aaa2"
         ),
     ])
     qualified_heads = []
@@ -2430,35 +2430,35 @@ def test_managed_failure_b_is_older_open_history_at_a_later_dispatch_then_qualif
     round_two = rest.split("Round 3:", 1)[0]
     assert history.count("CI managed-exact-head-ci on") == 2
     assert (
-        "CI managed-exact-head-ci on abc123 (superseded by the failure on abc123-coder)"
+        "CI managed-exact-head-ci on 6367c48dd193 (superseded by the failure on 525753a4b04b)"
         in round_one
     )
     assert "final-ci/exact-head (failure)" in round_one and "lint-b" not in round_one
     # B: first observed in round 2, still the live failure, so an older OPEN entry
     # even though the reviewer voted it resolved in round 3.
-    assert "CI managed-exact-head-ci on abc123-coder (open)" in round_two
+    assert "CI managed-exact-head-ci on 525753a4b04b (open)" in round_two
     assert "final-ci/lint-b (failure)" in round_two
     # The round-3 reviewer finding is current-round: payload only.
     assert "src/app.py:7" not in history and "src/app.py:7" in prompts[2]
     # Approval-gated qualification: no qualification of the blocked head; only the
     # next approval qualifies (and clears B on) the final head, which merges.
-    assert qualified_heads == ["abc123", "abc123-coder-1", "abc123-coder-1-coder-2-coder-3"]
-    assert merges == [{"expected_head_sha": "abc123-coder-1-coder-2-coder-3"}]
+    assert qualified_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee", "525753a4b04bd57d874211ba1fade250c3ff6d82", "fa0338def2a61b1065c3d0a5057896a71aa9aaa2"]
+    assert merges == [{"expected_head_sha": "fa0338def2a61b1065c3d0a5057896a71aa9aaa2"}]
 
 def test_round_metadata_selection_requires_current_ordered_transition(tmp_path):
     runner = AuthorizationCommentRunner(issue_events=[label_event()])
     runner.intent_comments.extend([
-        _round_comment(18, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-        _round_comment(19, role="coder", subject="next-head", round_number=2),
-        _round_comment(51, role="coder", subject="next-head", round_number=2),
-        _round_comment(52, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(18, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+        _round_comment(19, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
+        _round_comment(51, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
+        _round_comment(52, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
     ])
     config = make_config(tmp_path)
 
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
         managed_ci.find_actor_round_metadata_comment_ids(
             runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-            predecessor_head="abc123", new_head="next-head", round_number=1,
+            predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=1,
             after_comment_id=50,
         )
 
@@ -2466,20 +2466,20 @@ def test_round_metadata_selection_requires_current_ordered_transition(tmp_path):
 def test_continuity_resume_rejects_round_metadata_older_than_predecessor(tmp_path):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
     continuity = ManagedCiIssueAuthorization(
         kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="next-head", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="e9bff449de155dd0be5fd76276214538b0dfd315", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
-        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=50,
+        label_event_id=101, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", predecessor_comment_id=50,
         round_comment_ids=(48, 49),
     )
     comments = [
-        _round_comment(48, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-        _round_comment(49, role="coder", subject="next-head", round_number=2),
+        _round_comment(48, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+        _round_comment(49, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
         {"id": 50, "user": {"login": "agent-loop", "id": 1},
          "body": str(format_issue_created_authorization_comment(root))},
         {"id": 51, "user": {"login": "agent-loop", "id": 1},
@@ -2490,7 +2490,7 @@ def test_continuity_resume_rejects_round_metadata_older_than_predecessor(tmp_pat
 
     assert _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="next-head",
+        base_ref="main", issue_number=643, live_head="e9bff449de155dd0be5fd76276214538b0dfd315",
     ) is None
 
 
@@ -2498,21 +2498,21 @@ def test_continuity_resume_rejects_round_metadata_older_than_predecessor(tmp_pat
 def test_continuity_resume_rejects_uncorrelated_round_metadata(tmp_path, mutation):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
     continuation = ManagedCiIssueAuthorization(
         kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="next-head", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="e9bff449de155dd0be5fd76276214538b0dfd315", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
-        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=41,
+        label_event_id=101, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", predecessor_comment_id=41,
         round_comment_ids=(42, 43),
     )
     reviewer = _round_comment(
-        42, role="reviewer", subject="abc123", round_number=1, state="blocking"
+        42, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"
     )
-    coder = _round_comment(43, role="coder", subject="next-head", round_number=2)
+    coder = _round_comment(43, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2)
     if mutation == "unrelated":
         reviewer = _round_comment(
             42, role="reviewer", subject="different-head", round_number=1,
@@ -2522,7 +2522,7 @@ def test_continuity_resume_rejects_uncorrelated_round_metadata(tmp_path, mutatio
         reviewer["body"] = "<!-- AGENT_ROUND_RESUME: !!! -->"
     else:
         reviewer = _round_comment(
-            42, role="reviewer", subject="abc123", round_number=7, state="blocking"
+            42, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=7, state="blocking"
         )
     comments = [
         {"id": 41, "user": {"login": "agent-loop", "id": 1},
@@ -2537,32 +2537,32 @@ def test_continuity_resume_rejects_uncorrelated_round_metadata(tmp_path, mutatio
 
     assert _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="next-head",
+        base_ref="main", issue_number=643, live_head="e9bff449de155dd0be5fd76276214538b0dfd315",
     ) is None
 
 
 def test_continuity_resume_rejects_two_valid_metadata_forks(tmp_path):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
     first = ManagedCiIssueAuthorization(
         kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="next-head", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="e9bff449de155dd0be5fd76276214538b0dfd315", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="first",
-        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=41,
+        label_event_id=101, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", predecessor_comment_id=41,
         round_comment_ids=(42, 43),
     )
     second = replace(first, nonce="second", round_comment_ids=(44, 45))
     comments = [
         {"id": 41, "user": {"login": "agent-loop", "id": 1},
          "body": str(format_issue_created_authorization_comment(root))},
-        _round_comment(42, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-        _round_comment(43, role="coder", subject="next-head", round_number=2),
-        _round_comment(44, role="reviewer", subject="abc123", round_number=3, state="blocking"),
-        _round_comment(45, role="coder", subject="next-head", round_number=4),
+        _round_comment(42, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+        _round_comment(43, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
+        _round_comment(44, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=3, state="blocking"),
+        _round_comment(45, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=4),
         {"id": 46, "user": {"login": "agent-loop", "id": 1},
          "body": str(format_issue_created_authorization_comment(first))},
         {"id": 47, "user": {"login": "agent-loop", "id": 1},
@@ -2573,7 +2573,7 @@ def test_continuity_resume_rejects_two_valid_metadata_forks(tmp_path):
 
     assert _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="next-head",
+        base_ref="main", issue_number=643, live_head="e9bff449de155dd0be5fd76276214538b0dfd315",
     ) is None
 
 
@@ -2581,7 +2581,7 @@ def test_continuity_resume_rejects_two_valid_metadata_forks(tmp_path):
 def test_continuity_resume_rejects_different_head_fork(tmp_path, live_head):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
@@ -2589,7 +2589,7 @@ def test_continuity_resume_rejects_different_head_fork(tmp_path, live_head):
         kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
         base_ref="main", head_sha="head-a", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="first",
-        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=41,
+        label_event_id=101, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", predecessor_comment_id=41,
         round_comment_ids=(42, 43),
     )
     second = replace(
@@ -2598,9 +2598,9 @@ def test_continuity_resume_rejects_different_head_fork(tmp_path, live_head):
     comments = [
         {"id": 41, "user": {"login": "agent-loop", "id": 1},
          "body": str(format_issue_created_authorization_comment(root))},
-        _round_comment(42, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(42, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
         _round_comment(43, role="coder", subject="head-a", round_number=2),
-        _round_comment(44, role="reviewer", subject="abc123", round_number=1, state="blocking"),
+        _round_comment(44, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
         _round_comment(45, role="coder", subject="head-b", round_number=2),
         {"id": 46, "user": {"login": "agent-loop", "id": 1},
          "body": str(format_issue_created_authorization_comment(first))},
@@ -2741,8 +2741,8 @@ def test_fresh_authorization_supersedes_prior_grant_for_verified_descendant(tmp_
     runner.issue_events.append(label_event(202))
     runner.compare_payload = {
         "status": "ahead",
-        "base_commit": {"sha": "abc123"},
-        "merge_base_commit": {"sha": "abc123"},
+        "base_commit": {"sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
+        "merge_base_commit": {"sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     }
     advanced = authorize_fresh_issue_created_resume(
         runner, config=config, pr_number=7, issue_number=643,
@@ -2757,7 +2757,7 @@ def test_fresh_authorization_supersedes_prior_grant_for_verified_descendant(tmp_
     assert advanced.authorization_comment_id != first.authorization_comment_id
     parsed = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
     assert parsed is not None
-    assert parsed.predecessor_head == "abc123"
+    assert parsed.predecessor_head == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     assert parsed.predecessor_comment_id == first.authorization_comment_id
     assert parsed.label_event_id == 202
 
@@ -2794,8 +2794,8 @@ def _rebound_plan_fresh_setup(tmp_path):
     runner.rest_pr["head"]["sha"] = "descendant"
     runner.compare_payload = {
         "status": "ahead",
-        "base_commit": {"sha": "abc123"},
-        "merge_base_commit": {"sha": "abc123"},
+        "base_commit": {"sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
+        "merge_base_commit": {"sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     }
     live = replace(
         metadata(), head_branch="agent-loop/managed-643", head_sha="descendant"
@@ -2889,16 +2889,16 @@ def test_fresh_authorization_after_same_head_rebind_uses_the_retired_grant(tmp_p
     )
 
     assert rebound.authorization_kind == "fresh"
-    assert rebound.head_sha == "abc123"
+    assert rebound.head_sha == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     parsed = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
     assert parsed is not None
     assert parsed.approved_plan_hash == "b" * 64
-    assert parsed.predecessor_head == "abc123"
+    assert parsed.predecessor_head == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     assert parsed.predecessor_comment_id == first.authorization_comment_id
 
     audit_kwargs = dict(
         config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="abc123",
+        base_ref="main", issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         expected_protection="voluntary", require_actor_owned_label_event=True,
     )
     # Activation resolves the rebound grant; the retired grant is history.
@@ -2945,10 +2945,10 @@ def _same_head_rebound(tmp_path):
 
 def _advance_head(runner):
     runner.intent_comments.extend([
-        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-        _round_comment(89, role="coder", subject="next-head", round_number=2),
+        _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
     ])
-    runner.rest_pr["head"]["sha"] = "next-head"
+    runner.rest_pr["head"]["sha"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
 
 
 def _inject_authorization(runner, comment_id, record):
@@ -2962,7 +2962,7 @@ def _inject_authorization(runner, comment_id, record):
 def _retired_plan_record(**overrides):
     record = ManagedCiIssueAuthorization(
         kind="fresh", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci",
         nonce="retired-fresh", label_event_id=101, approved_plan_hash="a" * 64,
     )
@@ -2974,8 +2974,8 @@ def test_continuity_after_same_head_rebind_chains_to_the_rebound_grant(tmp_path)
     _advance_head(runner)
 
     continued = publish_issue_created_continuity_authorization(
-        runner, config=config, handoff=rebound, predecessor_head="abc123",
-        new_head="next-head", round_comment_ids=(88, 89),
+        runner, config=config, handoff=rebound, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+        new_head="e9bff449de155dd0be5fd76276214538b0dfd315", round_comment_ids=(88, 89),
     )
 
     assert continued.authorization_kind == "continuity"
@@ -2986,7 +2986,7 @@ def test_continuity_after_same_head_rebind_chains_to_the_rebound_grant(tmp_path)
     assert parsed.predecessor_comment_id == rebound.authorization_comment_id
     audit = _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="next-head",
+        base_ref="main", issue_number=643, live_head="e9bff449de155dd0be5fd76276214538b0dfd315",
         expected_handoff=continued, expected_protection="voluntary",
         require_actor_owned_label_event=True,
     )
@@ -3003,7 +3003,7 @@ def test_continuity_after_same_head_rebind_without_retirement_refuses(tmp_path):
         publish_issue_created_continuity_authorization(
             runner, config=config,
             handoff=replace(rebound, retired_plan_hashes=frozenset()),
-            predecessor_head="abc123", new_head="next-head", round_comment_ids=(88, 89),
+            predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="e9bff449de155dd0be5fd76276214538b0dfd315", round_comment_ids=(88, 89),
         )
     assert len(runner.intent_comments) == posted
 
@@ -3016,8 +3016,8 @@ def test_continuity_refuses_retired_plan_record_with_inconsistent_fields(tmp_pat
 
     with pytest.raises(AgentLoopError, match="conflicting prior authorizations"):
         publish_issue_created_continuity_authorization(
-            runner, config=config, handoff=rebound, predecessor_head="abc123",
-            new_head="next-head", round_comment_ids=(88, 89),
+            runner, config=config, handoff=rebound, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+            new_head="e9bff449de155dd0be5fd76276214538b0dfd315", round_comment_ids=(88, 89),
         )
     assert len(runner.intent_comments) == posted
 
@@ -3030,7 +3030,7 @@ def test_resume_audit_retires_only_the_plan_hash(tmp_path, overrides):
     runner, config, _first, rebound = _same_head_rebound(tmp_path)
     audit_kwargs = dict(
         config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="abc123",
+        base_ref="main", issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         expected_handoff=rebound, expected_protection="voluntary",
         require_actor_owned_label_event=True,
     )
@@ -3067,7 +3067,7 @@ def test_fresh_authorization_same_head_plan_change_without_retirement_refuses(tm
 def test_fresh_authorization_rejects_actor_owned_record_with_unknown_label_event(tmp_path):
     forged = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=999,
     )
@@ -3107,22 +3107,22 @@ def test_recovery_accepts_continuity_terminal_for_opening_body_head(tmp_path):
         runner, config=config, handoff=_authorization_handoff(), metadata=metadata()
     )
     runner.intent_comments.extend([
-        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-        _round_comment(89, role="coder", subject="next-head", round_number=2),
+        _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
     ])
-    runner.rest_pr["head"]["sha"] = "next-head"
+    runner.rest_pr["head"]["sha"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
     continued = publish_issue_created_continuity_authorization(
         runner,
         config=config,
         handoff=initial,
-        predecessor_head="abc123",
-        new_head="next-head",
+        predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+        new_head="e9bff449de155dd0be5fd76276214538b0dfd315",
         round_comment_ids=(88, 89),
     )
     recovered_metadata = replace(
         metadata(),
         head_branch="agent-loop/managed-643",
-        head_sha="next-head",
+        head_sha="e9bff449de155dd0be5fd76276214538b0dfd315",
     )
 
     recovered = recover_issue_created_handoff(
@@ -3143,7 +3143,7 @@ def test_recovery_accepts_continuity_terminal_for_opening_body_head(tmp_path):
         actor_id=1,
         base_ref="main",
         issue_number=643,
-        live_head="next-head",
+        live_head="e9bff449de155dd0be5fd76276214538b0dfd315",
         expected_handoff=recovered,
         expected_protection="voluntary",
         require_actor_owned_label_event=True,
@@ -3298,7 +3298,7 @@ def test_public_pr_missing_authorization_reaches_parser_valid_fresh_remedy(tmp_p
             "draft": True,
             "head": {
                 "repo": {"full_name": "OWNER/REPO"},
-                "sha": "abc123",
+                "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "ref": "agent-loop/managed-643",
             },
             "user": {"login": "agent-loop", "id": 1},
@@ -3365,7 +3365,7 @@ def test_fresh_authorization_supersedes_grant_on_unrelated_replacement_head(tmp_
     runner.rest_pr["head"]["sha"] = "replacement"
     runner.compare_payload = {
         "status": "diverged",
-        "base_commit": {"sha": "abc123"},
+        "base_commit": {"sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
         "merge_base_commit": {"sha": "other"},
     }
 
@@ -3432,7 +3432,7 @@ def test_fresh_authorization_rejects_same_number_foreign_repository_association(
 def test_creation_plus_fresh_at_same_head_selects_fresh_grant(tmp_path):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
@@ -3445,7 +3445,7 @@ def test_creation_plus_fresh_at_same_head_selects_fresh_grant(tmp_path):
     config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
     audit = _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="abc123",
+        base_ref="main", issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     assert audit is not None
     assert audit[0] == 42
@@ -3455,29 +3455,29 @@ def test_creation_plus_fresh_at_same_head_selects_fresh_grant(tmp_path):
 def test_continuity_duplicate_root_comment_ids_remain_resumable(tmp_path):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
     continuity = ManagedCiIssueAuthorization(
         kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="next-head", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="e9bff449de155dd0be5fd76276214538b0dfd315", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
-        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=40,
+        label_event_id=101, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", predecessor_comment_id=40,
         round_comment_ids=(88, 89),
     )
     comments = [
         {"id": 40, "user": {"login": "agent-loop", "id": 1}, "body": str(format_issue_created_authorization_comment(root))},
         {"id": 41, "user": {"login": "agent-loop", "id": 1}, "body": str(format_issue_created_authorization_comment(root))},
-        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-        _round_comment(89, role="coder", subject="next-head", round_number=2),
+        _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
         {"id": 90, "user": {"login": "agent-loop", "id": 1}, "body": str(format_issue_created_authorization_comment(continuity))},
     ]
-    runner = V2ManagedRunner(intent_comments=comments, rest_pr={"head": {"sha": "next-head"}})
+    runner = V2ManagedRunner(intent_comments=comments, rest_pr={"head": {"sha": "e9bff449de155dd0be5fd76276214538b0dfd315"}})
     config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
     audit = _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="next-head",
+        base_ref="main", issue_number=643, live_head="e9bff449de155dd0be5fd76276214538b0dfd315",
     )
     assert audit is not None and audit[0] == 90
 
@@ -3486,7 +3486,7 @@ def test_continuity_duplicate_root_comment_ids_remain_resumable(tmp_path):
 def test_resume_rejects_untrusted_or_mismatched_authorization(tmp_path, mutation):
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
@@ -3508,7 +3508,7 @@ def test_resume_rejects_untrusted_or_mismatched_authorization(tmp_path, mutation
     config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop")
     assert _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="abc123",
+        base_ref="main", issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     ) is None
 
 
@@ -3523,7 +3523,7 @@ def test_resume_rejects_every_mismatched_authorization_binding(tmp_path, mutatio
     )
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="nonce-643",
         label_event_id=101, approved_plan_hash="plan-hash",
     )
@@ -3549,7 +3549,7 @@ def test_resume_rejects_every_mismatched_authorization_binding(tmp_path, mutatio
 
     assert _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="abc123",
+        base_ref="main", issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         expected_handoff=handoff, expected_protection="voluntary",
     ) is None
 
@@ -3565,7 +3565,7 @@ def test_activation_rejects_mismatched_authorization_without_label_or_dispatch(t
     )
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="nonce-643",
         label_event_id=101, approved_plan_hash="plan-hash",
     )
@@ -3625,7 +3625,7 @@ def test_activation_rejects_mismatched_authorization_without_label_or_dispatch(t
 def test_resume_rejects_unsolicited_live_head(tmp_path):
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
@@ -3643,7 +3643,7 @@ def test_resume_rejects_unsolicited_live_head(tmp_path):
 def test_public_resume_requires_authorized_label_event_for_versioned_record(tmp_path):
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
@@ -3657,14 +3657,14 @@ def test_public_resume_requires_authorized_label_event_for_versioned_record(tmp_
     assert _find_resume_audit(
         without_event, config=config, pr_number=7,
         actor_login="agent-loop", actor_id=1, base_ref="main",
-        issue_number=643, live_head="abc123", require_actor_owned_label_event=True,
+        issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", require_actor_owned_label_event=True,
     ) is None
 
     with_event = V2ManagedRunner(intent_comments=comments, issue_events=[label_event()])
     assert _find_resume_audit(
         with_event, config=config, pr_number=7,
         actor_login="agent-loop", actor_id=1, base_ref="main",
-        issue_number=643, live_head="abc123", require_actor_owned_label_event=True,
+        issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", require_actor_owned_label_event=True,
     ) is not None
 
 
@@ -3717,7 +3717,7 @@ def test_unlabeled_activation_rejects_wrong_terminal_comment_without_label_or_di
             "body": str(format_issue_created_authorization_comment(
                 ManagedCiIssueAuthorization(
                     kind="creation", repository="OWNER/REPO", issue_number=643,
-                    pr_number=7, base_ref="main", head_sha="abc123",
+                    pr_number=7, base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
                     actor_login="agent-loop", actor_id=1,
                     protection="voluntary", waiver="allow-unprotected-managed-ci",
                     nonce="nonce-643", label_event_id=101,
@@ -3773,7 +3773,7 @@ def test_activation_rejects_forged_authorization_surface_without_label_or_dispat
 ):
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
@@ -3837,7 +3837,7 @@ def test_activation_rejects_forged_authorization_surface_without_label_or_dispat
 def test_activation_rejects_unsolicited_head_before_labeling(tmp_path):
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
@@ -3847,7 +3847,7 @@ def test_activation_rejects_unsolicited_head_before_labeling(tmp_path):
             "state": "open", "draft": True, "labels": [],
             "head": {
                 "repo": {"full_name": "OWNER/REPO"},
-                "sha": "unsolicited-head",
+                "sha": "9ae4c088a99d5c31a82889618d7b5f285c2dc8c5",
                 "ref": "agent-loop/managed-643",
             },
         },
@@ -3871,7 +3871,7 @@ def test_activation_rejects_unsolicited_head_before_labeling(tmp_path):
         ),
     )
     handoff = replace(
-        _authorization_handoff(head="unsolicited-head"),
+        _authorization_handoff(head="9ae4c088a99d5c31a82889618d7b5f285c2dc8c5"),
         lifecycle="draft-unlabeled-reentry",
         opening_override_nonce="nonce-643",
     )
@@ -3884,7 +3884,7 @@ def test_activation_rejects_unsolicited_head_before_labeling(tmp_path):
             metadata=replace(
                 metadata(),
                 head_branch="agent-loop/managed-643",
-                head_sha="unsolicited-head",
+                head_sha="9ae4c088a99d5c31a82889618d7b5f285c2dc8c5",
             ),
             managed_resume=AuthenticatedManagedResume(
                 origin="issue-created",
@@ -3906,7 +3906,7 @@ def test_activation_rejects_unsolicited_head_before_labeling(tmp_path):
 def test_activation_race_releases_label_without_dispatch_or_new_authorization(tmp_path):
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="nonce-643",
         label_event_id=101,
     )
@@ -3981,7 +3981,7 @@ def test_fresh_remedy_is_not_advertised_without_the_explicit_waiver(tmp_path):
             config=config,
             pr_number=7,
             base_ref="main",
-            expected_head_sha="abc123",
+            expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             active_event=(101, "agent-loop", 1),
             reason="authorization provenance is unavailable",
             recovery_capable=True,
@@ -4015,7 +4015,7 @@ def test_ordinary_release_renders_recovered_issue_scope_as_parser_valid_fresh_co
             config=config,
             pr_number=7,
             base_ref="main",
-            expected_head_sha="abc123",
+            expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             active_event=(101, "agent-loop", 1),
             reason="no fully bound actor-owned issue-created authorization reaches the live head",
             recovery_capable=True,
@@ -4137,7 +4137,7 @@ def test_source_managed_release_never_advertises_issue_created_fresh_authorizati
     with pytest.raises(AgentLoopError) as exc_info:
         managed_ci._release_for_ordinary_recovery(
             runner, config=config, pr_number=7, base_ref="main",
-            expected_head_sha="abc123", active_event=(101, "agent-loop", 1),
+            expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", active_event=(101, "agent-loop", 1),
             reason="the active managed-label event is temporarily unreadable",
             recovery_capable=True,
         )
@@ -4197,7 +4197,7 @@ def test_source_managed_activation_release_never_advertises_fresh_grant(tmp_path
 def test_pr_body_authorization_copy_cannot_supply_resume_provenance(tmp_path):
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
@@ -4209,22 +4209,22 @@ def test_pr_body_authorization_copy_cannot_supply_resume_provenance(tmp_path):
 
     assert _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="abc123",
+        base_ref="main", issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     ) is None
 
 
 def test_issue_authorization_forked_head_chain_fails_closed(tmp_path):
     root = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="root",
         label_event_id=101,
     )
     first = ManagedCiIssueAuthorization(
         kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="next-head", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="e9bff449de155dd0be5fd76276214538b0dfd315", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="first",
-        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=41,
+        label_event_id=101, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", predecessor_comment_id=41,
         round_comment_ids=(88,),
     )
     fork = replace(first, nonce="fork", round_comment_ids=(89,))
@@ -4233,14 +4233,14 @@ def test_issue_authorization_forked_head_chain_fails_closed(tmp_path):
         {"id": 42, "user": {"login": "agent-loop", "id": 1}, "body": str(format_issue_created_authorization_comment(first))},
         {"id": 43, "user": {"login": "agent-loop", "id": 1}, "body": str(format_issue_created_authorization_comment(fork))},
     ]
-    runner = V2ManagedRunner(intent_comments=comments, rest_pr={"head": {"sha": "next-head"}})
+    runner = V2ManagedRunner(intent_comments=comments, rest_pr={"head": {"sha": "e9bff449de155dd0be5fd76276214538b0dfd315"}})
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
     )
     assert _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="next-head",
+        base_ref="main", issue_number=643, live_head="e9bff449de155dd0be5fd76276214538b0dfd315",
     ) is None
 
 
@@ -4503,7 +4503,7 @@ def test_issue_created_handoff_authenticates_override_before_any_remote_write(tm
         title="Managed CI",
         head_branch="agent-loop/managed-643",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/7",
         body=body,
     )
@@ -4529,7 +4529,7 @@ def test_issue_created_handoff_authenticates_override_before_any_remote_write(tm
         metadata=metadata,
     )
 
-    assert handoff.head_sha == "abc123"
+    assert handoff.head_sha == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     assert handoff.override_nonce == "fresh"
     assert not any("--method" in command for command, _ in runner.commands)
 
@@ -4546,7 +4546,7 @@ def test_direct_resume_reconstructs_issue_override_as_provenance_before_writes(t
         title="Managed CI",
         head_branch="agent-loop/managed-643",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/7",
         body=body,
     )
@@ -4578,7 +4578,7 @@ def test_issue_and_pr_resume_authenticate_nonce_bearing_advanced_head(
     tmp_path, managed_ci_pr_mode, issue_number
 ):
     body = f"Fixes #643\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce=after-coder-round"
-    advanced_sha = "coder-round-head"
+    advanced_sha = "c594585c3e95545540916267d7b1411c5a8606ed"
     runner = V2ManagedRunner(
         rest_pr={
             "state": "open",
@@ -4623,7 +4623,7 @@ def _ready_issue_metadata(body="Fixes #643", base_branch="main"):
         title="Managed CI",
         head_branch="agent-loop/managed-643",
         base_branch=base_branch,
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/7",
         body=body,
     )
@@ -4704,7 +4704,7 @@ def test_explicit_managed_issue_resume_reclaims_draft_unlabeled_state(tmp_path):
             "body": body,
             "head": {
                 "repo": {"full_name": "OWNER/REPO"},
-                "sha": "coder-round-head",
+                "sha": "c594585c3e95545540916267d7b1411c5a8606ed",
                 "ref": "agent-loop/managed-643",
             },
         },
@@ -4715,7 +4715,7 @@ def test_explicit_managed_issue_resume_reclaims_draft_unlabeled_state(tmp_path):
             "body": str(format_issue_created_authorization_comment(
                 ManagedCiIssueAuthorization(
                     kind="creation", repository="OWNER/REPO", issue_number=643,
-                    pr_number=7, base_ref="main", head_sha="coder-round-head",
+                    pr_number=7, base_ref="main", head_sha="c594585c3e95545540916267d7b1411c5a8606ed",
                     actor_login="agent-loop", actor_id=1, protection="voluntary",
                     waiver="allow-unprotected-managed-ci", nonce="old",
                     label_event_id=101,
@@ -4723,7 +4723,7 @@ def test_explicit_managed_issue_resume_reclaims_draft_unlabeled_state(tmp_path):
             )),
         }],
     )
-    metadata = replace(_ready_issue_metadata(body=body), head_sha="coder-round-head")
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="c594585c3e95545540916267d7b1411c5a8606ed")
 
     handoff = recover_issue_created_handoff(
         runner,
@@ -4764,7 +4764,7 @@ def test_strict_draft_unlabeled_reentry_uses_historical_label_event(tmp_path):
             "state": "open", "draft": True, "labels": [],
             "head": {
                 "repo": {"full_name": "OWNER/REPO"},
-                "sha": "coder-round-head",
+                "sha": "c594585c3e95545540916267d7b1411c5a8606ed",
                 "ref": "agent-loop/managed-643",
             },
         },
@@ -4783,12 +4783,12 @@ def test_strict_draft_unlabeled_reentry_uses_historical_label_event(tmp_path):
 
     contract = activate_managed_ci(
         runner, config=config, pr_number=7, metadata=replace(
-            _ready_issue_metadata(), head_sha="coder-round-head"
+            _ready_issue_metadata(), head_sha="c594585c3e95545540916267d7b1411c5a8606ed"
         ),
         managed_resume=AuthenticatedManagedResume(
             origin="issue-created", lifecycle="draft-unlabeled-reentry",
             issue_created_handoff=replace(
-                _authorization_handoff(head="coder-round-head"),
+                _authorization_handoff(head="c594585c3e95545540916267d7b1411c5a8606ed"),
                 protection_mode="strict",
             ),
         ),
@@ -4824,7 +4824,7 @@ def test_strict_draft_unlabeled_reentry_requires_actor_owned_label_history(
             "state": "open", "draft": True, "labels": [],
             "head": {
                 "repo": {"full_name": "OWNER/REPO"},
-                "sha": "coder-round-head",
+                "sha": "c594585c3e95545540916267d7b1411c5a8606ed",
                 "ref": "agent-loop/managed-643",
             },
         },
@@ -4847,12 +4847,12 @@ def test_strict_draft_unlabeled_reentry_requires_actor_owned_label_history(
     ):
         activate_managed_ci(
             runner, config=config, pr_number=7, metadata=replace(
-                _ready_issue_metadata(), head_sha="coder-round-head"
+                _ready_issue_metadata(), head_sha="c594585c3e95545540916267d7b1411c5a8606ed"
             ),
             managed_resume=AuthenticatedManagedResume(
                 origin="issue-created", lifecycle="draft-unlabeled-reentry",
                 issue_created_handoff=replace(
-                    _authorization_handoff(head="coder-round-head"),
+                    _authorization_handoff(head="c594585c3e95545540916267d7b1411c5a8606ed"),
                     protection_mode="strict",
                 ),
             ),
@@ -4878,7 +4878,7 @@ def test_draft_unlabeled_stale_authorization_does_not_apply_label(tmp_path):
             "state": "open", "draft": True, "labels": [],
             "head": {
                 "repo": {"full_name": "OWNER/REPO"},
-                "sha": "new-head",
+                "sha": "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6",
                 "ref": "agent-loop/managed-643",
             },
         },
@@ -4901,11 +4901,11 @@ def test_draft_unlabeled_stale_authorization_does_not_apply_label(tmp_path):
     with pytest.raises(AgentLoopError, match="no fully bound actor-owned issue-created authorization"):
         activate_managed_ci(
             runner, config=config, pr_number=7, metadata=replace(
-                _ready_issue_metadata(), head_sha="new-head"
+                _ready_issue_metadata(), head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"
             ),
             managed_resume=AuthenticatedManagedResume(
                 origin="issue-created", lifecycle="draft-unlabeled-reentry",
-                issue_created_handoff=_authorization_handoff(head="new-head"),
+                issue_created_handoff=_authorization_handoff(head="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"),
             ),
         )
 
@@ -5094,7 +5094,7 @@ def test_issue_authorization_parser_enforces_kind_specific_schema(tmp_path, kind
         issue_number=643,
         pr_number=7,
         base_ref="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         actor_login="agent-loop",
         actor_id=1,
         protection="voluntary",
@@ -5131,7 +5131,7 @@ def test_issue_authorization_parser_rejects_noncanonical_fresh_schema(changes):
         issue_number=643,
         pr_number=7,
         base_ref="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         actor_login="agent-loop",
         actor_id=1,
         protection="voluntary",
@@ -5155,7 +5155,7 @@ def test_activation_rejects_malformed_fresh_authorization_before_label_or_dispat
         issue_number=643,
         pr_number=7,
         base_ref="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         actor_login="agent-loop",
         actor_id=1,
         protection="voluntary",
@@ -5205,7 +5205,7 @@ def test_activation_rejects_malformed_fresh_authorization_before_label_or_dispat
         actor_id=1,
         base_ref="main",
         issue_number=643,
-        live_head="abc123",
+        live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         require_actor_owned_label_event=True,
     ) is None
 
@@ -5363,7 +5363,7 @@ def test_issue_created_tuple_actor_refusal_includes_trusted_actor_remediation(tm
         invocation_argv=("agent-loop", "issue", "643", "--repo", "OWNER/REPO"),
     )
     runner = V2ManagedRunner(rest_pr={"state": "open", "body": body})
-    metadata = replace(_ready_issue_metadata(body=body), head_sha="abc123")
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     intent = managed_ci.ManagedCiCreationIntent(
         branch="agent-loop/managed-643",
         trusted_actor="agent-loop",
@@ -5394,7 +5394,7 @@ def test_issue_created_tuple_actor_refusal_replaces_existing_trusted_actor(tmp_p
         ),
     )
     runner = V2ManagedRunner(rest_pr={"state": "open", "body": body})
-    metadata = replace(_ready_issue_metadata(body=body), head_sha="abc123")
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     intent = managed_ci.ManagedCiCreationIntent(
         branch="agent-loop/managed-643",
         trusted_actor="agent-loop",
@@ -5439,7 +5439,7 @@ def test_issue_created_tuple_mismatch_includes_shell_quoted_resume_command(tmp_p
             "ref": "agent-loop/managed-643",
         }},
     )
-    metadata = replace(_ready_issue_metadata(body=body), head_sha="abc123")
+    metadata = replace(_ready_issue_metadata(body=body), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     intent = managed_ci.ManagedCiCreationIntent(
         branch="agent-loop/managed-643",
         trusted_actor="agent-loop",
@@ -5514,7 +5514,7 @@ def test_pr_mode_resumes_only_from_durable_issue_authorization_and_mints_fresh_a
             "body": str(format_issue_created_authorization_comment(
                 ManagedCiIssueAuthorization(
                     kind="creation", repository="OWNER/REPO", issue_number=643,
-                    pr_number=7, base_ref="main", head_sha="abc123",
+                    pr_number=7, base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
                     actor_login="agent-loop", actor_id=1, protection="voluntary",
                     waiver="allow-unprotected-managed-ci", nonce="nonce-643",
                     label_event_id=101,
@@ -5713,7 +5713,7 @@ def test_intent_history_malformed_page_fails_closed_instead_of_minting_nonce(tmp
     # is never minted while one is present (#1043).
     with pytest.raises(managed_ci.ManagedCiIntentLedgerError, match="malformed comment author"):
         _ensure_v2_intent(
-            runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract,
+            runner, config=config, pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", contract=contract,
         )
     assert not any("issues/7/comments" in " ".join(cmd) and "POST" in cmd for cmd, _ in runner.commands)
 
@@ -5722,7 +5722,7 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
     config = make_config(tmp_path, auto_merge=True)
     runner = V2ManagedRunner(issue_events=[])
     capability = OrdinaryRecoveryCapability(
-        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
     )
     monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
@@ -5736,12 +5736,12 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
                 required=("test",),
             ),
             mergeability=None,
-            head_sha="abc123",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
     )
     merged: list[tuple[int, str | None]] = []
@@ -5756,7 +5756,7 @@ def test_ordinary_fallback_readies_draft_then_merges_same_exact_head(tmp_path, m
     )
 
     assert any(command[:3] == ["gh", "pr", "ready"] for command, _ in runner.commands)
-    assert merged == [(7, "abc123")]
+    assert merged == [(7, "6367c48dd193d56ea7b0baad25b19455e529f5ee")]
 
 
 @pytest.mark.parametrize(
@@ -5779,7 +5779,7 @@ def test_ordinary_fallback_unreadable_protection_requires_clean_after_ready(
     )
     runner = V2ManagedRunner(issue_events=[])
     capability = OrdinaryRecoveryCapability(
-        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
     )
     monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
@@ -5793,13 +5793,13 @@ def test_ordinary_fallback_unreadable_protection_requires_clean_after_ready(
                 required=(),
                 protection="forbidden",
             ),
-            mergeability=PullRequestMergeability("mergeable", "MERGEABLE", "DRAFT", "abc123", "main"),
-            head_sha="abc123",
+            mergeability=PullRequestMergeability("mergeable", "MERGEABLE", "DRAFT", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "main"),
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
     )
     events: list[str] = []
@@ -5808,7 +5808,7 @@ def test_ordinary_fallback_unreadable_protection_requires_clean_after_ready(
     def fake_mergeability(*args, **kwargs):
         assert any(command[:3] == ["gh", "pr", "ready"] for command, _ in runner.commands)
         events.append("probe")
-        return PullRequestMergeability("mergeable", "MERGEABLE", states.pop(0), "abc123", "main")
+        return PullRequestMergeability("mergeable", "MERGEABLE", states.pop(0), "6367c48dd193d56ea7b0baad25b19455e529f5ee", "main")
 
     patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "get_pr_mergeability", fake_mergeability)
     merged: list[tuple[int, str | None]] = []
@@ -5820,7 +5820,7 @@ def test_ordinary_fallback_unreadable_protection_requires_clean_after_ready(
 
     if expect_merge:
         _finalize_ordinary_recovery_merge(runner, config=config, pr_number=7, capability=capability)
-        assert merged == [(7, "abc123")]
+        assert merged == [(7, "6367c48dd193d56ea7b0baad25b19455e529f5ee")]
     else:
         with pytest.raises(AgentLoopError, match="merge state is not CLEAN after readiness"):
             _finalize_ordinary_recovery_merge(runner, config=config, pr_number=7, capability=capability)
@@ -5840,11 +5840,11 @@ def test_fake_runner_models_gh_parser_failure_when_check_is_true(tmp_path):
 def test_ordinary_recovery_rejects_green_checks_without_post_release_run(monkeypatch, tmp_path):
     config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
     capability = OrdinaryRecoveryCapability(
-        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100, prior_run_ids=frozenset({2}),
     )
     passing = checks(passing=(PullRequestCheck("test", "check_run", "success"),), required=("test",))
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     monkeypatch.setattr(managed_ci, "get_pr_mergeability", lambda *args, **kwargs: type("M", (), {"state": "mergeable"})())
     monkeypatch.setattr(managed_ci, "_workflow_runs_payload", lambda *args, **kwargs: [{"id": 2, "status": "completed", "conclusion": "success"}])
     monkeypatch.setattr(managed_ci, "get_pr_checks", lambda *args, **kwargs: passing)
@@ -5858,14 +5858,14 @@ def test_ordinary_recovery_rejects_green_checks_without_post_release_run(monkeyp
     ("merge_state", "head", "expected"),
     [
         # DRAFT defers the CLEAN check to the finalizer after readiness.
-        ("DRAFT", "abc123", "passed"),
+        ("DRAFT", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "passed"),
         # The single poll is also the last one (1s budget, 120s startup
         # window): a green board that cannot qualify reports the unreadable
         # protection instead of a generic timeout (late-green deadline).
         ("DRAFT", "other", "protection_unreadable"),
-        ("BLOCKED", "abc123", "protection_unreadable"),
+        ("BLOCKED", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "protection_unreadable"),
         ("CLEAN", "other", "protection_unreadable"),
-        ("CLEAN", "abc123", "passed"),
+        ("CLEAN", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "passed"),
     ],
 )
 def test_ordinary_recovery_forbidden_branch_protection_requires_clean_merge_state(
@@ -5873,7 +5873,7 @@ def test_ordinary_recovery_forbidden_branch_protection_requires_clean_merge_stat
 ):
     config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
     capability = OrdinaryRecoveryCapability(
-        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100, prior_run_ids=frozenset(),
     )
     passing = checks(
@@ -5882,7 +5882,7 @@ def test_ordinary_recovery_forbidden_branch_protection_requires_clean_merge_stat
         protection="forbidden",
     )
     mergeability = PullRequestMergeability("mergeable", "MERGEABLE", merge_state, head, "main")
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     monkeypatch.setattr(
         managed_ci,
         "get_pr_mergeability",
@@ -5906,9 +5906,9 @@ def test_ordinary_recovery_forbidden_branch_protection_requires_clean_merge_stat
 @pytest.mark.parametrize(
     "mergeability",
     [
-        PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "abc123", "main"),
+        PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "main"),
         PullRequestMergeability("unknown", None, None, None, None),
-        PullRequestMergeability("mergeable", "MERGEABLE", "BLOCKED", "abc123", "main"),
+        PullRequestMergeability("mergeable", "MERGEABLE", "BLOCKED", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "main"),
     ],
 )
 def test_ordinary_recovery_unqualifiable_merge_state_stops_within_startup_window(
@@ -5921,7 +5921,7 @@ def test_ordinary_recovery_unqualifiable_merge_state_stops_within_startup_window
         ci_startup_timeout_seconds=60,
     )
     capability = OrdinaryRecoveryCapability(
-        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100, prior_run_ids=frozenset(),
     )
     passing = checks(
@@ -5929,7 +5929,7 @@ def test_ordinary_recovery_unqualifiable_merge_state_stops_within_startup_window
         required=("test",),
         protection="forbidden",
     )
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     monkeypatch.setattr(managed_ci, "get_pr_mergeability", lambda *args, **kwargs: mergeability)
     monkeypatch.setattr(
         managed_ci,
@@ -5962,7 +5962,7 @@ def test_ordinary_recovery_late_green_board_at_deadline_reports_unreadable_prote
         ci_startup_timeout_seconds=300,
     )
     capability = OrdinaryRecoveryCapability(
-        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100, prior_run_ids=frozenset(),
     )
     success = PullRequestCheck("test", "check_run", "success")
@@ -5976,8 +5976,8 @@ def test_ordinary_recovery_late_green_board_at_deadline_reports_unreadable_prote
         [{"id": 3, "status": "in_progress"}],
         [{"id": 3, "status": "completed", "conclusion": "success"}],
     ]
-    blocked = PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "abc123", "main")
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    blocked = PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "main")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     monkeypatch.setattr(managed_ci, "get_pr_mergeability", lambda *args, **kwargs: blocked)
     monkeypatch.setattr(managed_ci, "_workflow_runs_payload", lambda *args, **kwargs: runs.pop(0))
     monkeypatch.setattr(managed_ci, "get_pr_checks", lambda *args, **kwargs: boards.pop(0))
@@ -5995,7 +5995,7 @@ def test_ordinary_fallback_protection_unreadable_stops_with_guidance(tmp_path, m
     config = make_config(tmp_path, auto_merge=True)
     runner = V2ManagedRunner(issue_events=[])
     capability = OrdinaryRecoveryCapability(
-        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=None, released_at=100, prior_run_ids=frozenset({2}),
     )
     monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
@@ -6008,13 +6008,13 @@ def test_ordinary_fallback_protection_unreadable_stops_with_guidance(tmp_path, m
                 passing=(PullRequestCheck("test", "check_run", "success"),),
                 protection="forbidden",
             ),
-            mergeability=PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "abc123", "main"),
-            head_sha="abc123",
+            mergeability=PullRequestMergeability("unknown", "UNKNOWN", "UNKNOWN", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "main"),
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=metadata()),
     )
     monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: pytest.fail("must not merge"))
@@ -6031,11 +6031,11 @@ def test_ordinary_fallback_protection_unreadable_stops_with_guidance(tmp_path, m
 def test_ordinary_recovery_accepts_current_head_run_without_local_clock_filter(monkeypatch, tmp_path):
     config = make_config(tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1)
     capability = OrdinaryRecoveryCapability(
-        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=2_000, prior_run_ids=frozenset(),
     )
     passing = checks(passing=(PullRequestCheck("test", "check_run", "success"),), required=("test",))
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "abc123")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     monkeypatch.setattr(managed_ci, "get_pr_mergeability", lambda *args, **kwargs: type("M", (), {"state": "mergeable"})())
     monkeypatch.setattr(
         managed_ci,
@@ -6056,12 +6056,12 @@ def test_ordinary_recovery_accepts_current_head_run_without_local_clock_filter(m
 
 def test_refresh_ordinary_recovery_rebinds_changed_head_and_resets_run_baseline(tmp_path):
     capability = OrdinaryRecoveryCapability(
-        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=7, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100, prior_run_ids=frozenset({2}),
     )
     runner = V2ManagedRunner(
         rest_pr={
-            "head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "new-head", "ref": "feature"},
+            "head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6", "ref": "feature"},
             "labels": [],
         },
         issue_events=[label_event(), label_event(event="unlabeled")],
@@ -6072,7 +6072,7 @@ def test_refresh_ordinary_recovery_rebinds_changed_head_and_resets_run_baseline(
     )
 
     assert refreshed is not None
-    assert refreshed.expected_head_sha == "new-head"
+    assert refreshed.expected_head_sha == "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"
     assert refreshed.prior_run_ids == frozenset()
 
 
@@ -6084,7 +6084,7 @@ def v2_contract(**overrides):
         "trusted_actor_id": 1,
         "workflow_revision": "base-sha",
         "nonce": "nonce-1",
-        "expected_head_sha": "abc123",
+        "expected_head_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
     }
     fields.update(overrides)
     return ManagedCiContract(**fields)
@@ -6118,12 +6118,12 @@ def test_publish_manual_v2_qualification_retains_label_readies_and_audits_sha(tm
         runner,
         config=config,
         pr_number=7,
-        expected_head_sha="abc123",
+        expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         contract=contract,
         reviewers=("Codex", "Claude"),
     )
 
-    assert qualified == "abc123"
+    assert qualified == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     commands = [command for command, _cwd in runner.commands]
     # Retaining the label means no `unlabeled` event re-runs ordinary CI.
     assert _managed_label_deletes(runner) == []
@@ -6152,7 +6152,7 @@ def test_publish_manual_v2_qualification_retains_label_readies_and_audits_sha(tm
     )
     audit_commands = [command for command in commands if QUALIFICATION_MARKER in " ".join(command)]
     assert len(audit_commands) == 1
-    assert "qualified_head=abc123" in " ".join(" ".join(command) for command in audit_commands)
+    assert "qualified_head=6367c48dd193d56ea7b0baad25b19455e529f5ee" in " ".join(" ".join(command) for command in audit_commands)
     assert not any(command[:3] == ["gh", "pr", "merge"] for command in commands)
 
 
@@ -6171,7 +6171,7 @@ def test_publish_manual_v2_qualification_publishes_unprotected_residual_risk(tmp
         runner,
         config=config,
         pr_number=7,
-        expected_head_sha="abc123",
+        expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         contract=contract,
         reviewers=("Codex",),
     )
@@ -6188,14 +6188,14 @@ def test_publish_manual_v2_qualification_rejects_head_change_before_release(tmp_
         issue_created_pr=True, active_label_event_id=101, invocation_applied_label=True,
         protection_mode="strict",
     )
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
 
     with pytest.raises(AgentLoopError, match="head changed before"):
         publish_manual_v2_qualification(
             runner,
             config=config,
             pr_number=7,
-            expected_head_sha="abc123",
+            expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             contract=contract,
             reviewers=("Codex",),
         )
@@ -6214,7 +6214,7 @@ def test_publish_manual_v2_qualification_rejects_head_change_after_audit(tmp_pat
         issue_created_pr=True, active_label_event_id=101, invocation_applied_label=True,
         protection_mode="strict",
     )
-    heads = iter(("abc123", "new-head"))
+    heads = iter(("6367c48dd193d56ea7b0baad25b19455e529f5ee", "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"))
     monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: next(heads))
 
     with pytest.raises(AgentLoopError, match="after qualification publication"):
@@ -6222,7 +6222,7 @@ def test_publish_manual_v2_qualification_rejects_head_change_after_audit(tmp_pat
             runner,
             config=config,
             pr_number=7,
-            expected_head_sha="abc123",
+            expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             contract=contract,
             reviewers=("Codex",),
         )
@@ -6319,7 +6319,7 @@ def _publish(runner, tmp_path, **contract_overrides):
     fields.update(contract_overrides)
     contract = v2_contract(**fields)
     return publish_manual_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123",
+        runner, config=config, pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         contract=contract, reviewers=("Codex",),
     ), contract
 
@@ -6370,7 +6370,7 @@ def test_publish_manual_adopted_ready_pr_retains_label_without_readying(tmp_path
 
     qualified, _contract = _publish(runner, tmp_path, issue_created_pr=False, adopted_existing_pr=True)
 
-    assert qualified == "abc123"
+    assert qualified == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     assert _managed_label_deletes(runner) == []
     assert runner.event_reads == 2
     assert not any(command[:3] == ["gh", "pr", "ready"] for command, _cwd in runner.commands)
@@ -6449,7 +6449,7 @@ def test_publish_manual_record_failure_releases_owned_label(tmp_path, monkeypatc
 
 
 def test_publish_manual_cleanup_confirmed_absent_label_makes_no_write(tmp_path, monkeypatch):
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
     runner = PublicationRunner(rest_pr={"labels": [{"name": "bug"}]})
 
     with pytest.raises(AgentLoopError, match="head changed before"):
@@ -6484,7 +6484,7 @@ def test_publish_manual_cleanup_confirmed_absent_label_makes_no_write(tmp_path, 
 def test_publish_manual_cleanup_unreadable_pr_attempts_delete(
     tmp_path, monkeypatch, pr_read, delete_outcome, expect_fragment,
 ):
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
     runner = PublicationRunner(pr_overrides={0: pr_read}, delete_outcome=delete_outcome)
 
     with pytest.raises(AgentLoopError, match="head changed before") as raised:
@@ -6495,7 +6495,7 @@ def test_publish_manual_cleanup_unreadable_pr_attempts_delete(
 
 
 def test_publish_manual_cleanup_never_masks_the_publication_error(tmp_path, monkeypatch):
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
     # Invalid events JSON is unreadable provenance (fail-open DELETE), and the
     # DELETE itself raises: the helper swallows both.
     runner = PublicationRunner(event_overrides={0: "not json"}, delete_outcome="raise")
@@ -6523,7 +6523,7 @@ def test_publish_manual_cleanup_attaches_note_to_non_agent_loop_error(tmp_path, 
 
 
 def test_publish_manual_non_404_delete_failure_reports_manual_removal(tmp_path, monkeypatch):
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
     runner = PublicationRunner(delete_outcome=("gh: Server Error (HTTP 500)", 1))
 
     with pytest.raises(AgentLoopError, match="remove it manually"):
@@ -6578,7 +6578,10 @@ class EntryNormalizationRunner(FakeRunner):
 
 
 def _live_pr(*, state="open", draft=False, labels=(MANAGED_LABEL,)):
-    return {"state": state, "draft": draft, "labels": [{"name": name} for name in labels]}
+    return {"state": state, "draft": draft, "labels": [{"name": name} for name in labels],
+            "head": {"repo": {"full_name": "OWNER/REPO"}, "ref": "feature/review-context",
+                     "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
+            "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}}}
 
 
 def test_release_retained_managed_label_releases_open_ready_labeled_pr(tmp_path):
@@ -6721,7 +6724,7 @@ def test_release_retained_managed_label_strict_404_counts_as_absent(tmp_path):
     ids=["incidental-404-text", "conflicting-statuses", "unstructured-404"],
 )
 def test_publish_manual_cleanup_ambiguous_404_reports_manual_removal(tmp_path, monkeypatch, stderr):
-    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "new-head")
+    monkeypatch.setattr(managed_ci, "get_pr_head_sha", lambda *args, **kwargs: "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
     runner = PublicationRunner(delete_outcome=(stderr, 1))
     # The scripted DELETE clears labels for any "404" text; an ambiguous
     # diagnostic must still be reported as a failed removal.
@@ -6846,7 +6849,7 @@ def checks(
 def test_activate_managed_ci_only_for_complete_supported_contract(tmp_path):
     config = make_config(tmp_path, auto_merge=True)
     runner = ManagedRunner(
-        pr_payload={"headRefOid": "abc123"},
+        pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
         pr_status_payload={
             "statuses": [{"context": FINAL_CONTEXT, "state": "pending"}]
         },
@@ -6884,7 +6887,7 @@ def test_activate_managed_ci_accepts_resolved_non_main_base(tmp_path):
     config = make_config(tmp_path, auto_merge=True, base="release")
     runner = ManagedRunner(
         base_ref="release",
-        pr_payload={"headRefOid": "abc123"},
+        pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
         pr_status_payload={"statuses": [{"context": FINAL_CONTEXT, "state": "pending"}]},
     )
 
@@ -6905,7 +6908,7 @@ def test_activate_managed_ci_removes_label_when_handoff_times_out(tmp_path):
     )
     runner = ManagedRunner(
         handoff_completes=False,
-        pr_payload={"headRefOid": "abc123"},
+        pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     )
 
     with pytest.raises(AgentLoopError, match="handoff.*did not complete"):
@@ -6949,7 +6952,7 @@ def test_dispatch_and_wait_bind_final_qualification_to_exact_head(tmp_path):
     config = make_config(tmp_path, auto_merge=True, ci_poll_interval_seconds=1)
     final = {"context": FINAL_CONTEXT, "state": "success", "target_url": None}
     runner = ManagedRunner(
-        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
         pr_status_payload={"statuses": [final]},
         pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
     )
@@ -6958,7 +6961,7 @@ def test_dispatch_and_wait_bind_final_qualification_to_exact_head(tmp_path):
         runner,
         config=config,
         pr_number=7,
-        expected_head_sha="abc123",
+        expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         head_ref="feature",
         contract=ManagedCiContract(),
     )
@@ -6972,21 +6975,21 @@ def test_dispatch_and_wait_bind_final_qualification_to_exact_head(tmp_path):
         if "repos/OWNER/REPO/actions/workflows/ci.yml/dispatches" in cmd
     )
     assert "ref=feature" in dispatch
-    assert "inputs[expected_head_sha]=abc123" in dispatch
+    assert "inputs[expected_head_sha]=6367c48dd193d56ea7b0baad25b19455e529f5ee" in dispatch
 
 
 def test_publish_round_readiness_posts_success_status(tmp_path):
     config = make_config(tmp_path, auto_merge=True)
     runner = FakeRunner()
 
-    assert publish_round_readiness(runner, config=config, head_sha="abc123") is True
+    assert publish_round_readiness(runner, config=config, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee") is True
 
     assert runner.commands[-1][0] == [
         "gh",
         "api",
         "--method",
         "POST",
-        "repos/OWNER/REPO/statuses/abc123",
+        "repos/OWNER/REPO/statuses/6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "-f",
         "state=success",
         "-f",
@@ -7006,7 +7009,7 @@ def test_wait_for_final_qualification_returns_infrastructure_stall(tmp_path):
     )
     runner = ManagedRunner(
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         },
@@ -7049,7 +7052,7 @@ def test_wait_for_final_qualification_treats_all_terminal_failures_as_failed(
     )
     runner = ManagedRunner(
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         },
@@ -7081,7 +7084,7 @@ def test_v2_qualification_ignores_same_context_status_from_another_run(tmp_path)
     )
     runner = ManagedRunner(
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         },
@@ -7105,7 +7108,7 @@ def test_v2_qualification_ignores_same_context_status_from_another_run(tmp_path)
         nonce="nonce-1",
         attached_run_id=100,
         run_attempt=1,
-        expected_head_sha="abc123",
+        expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
 
     outcome = wait_for_final_qualification(
@@ -7121,7 +7124,7 @@ def test_v2_qualification_accepts_only_attached_run_status(tmp_path):
     )
     runner = ManagedRunner(
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         },
@@ -7145,7 +7148,7 @@ def test_v2_qualification_accepts_only_attached_run_status(tmp_path):
         nonce="nonce-1",
         attached_run_id=100,
         run_attempt=1,
-        expected_head_sha="abc123",
+        expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
 
     outcome = wait_for_final_qualification(
@@ -7172,7 +7175,7 @@ def test_v2_correlated_status_uses_history_and_ignores_later_unrelated_status(tm
     })
     contract = v2_contract(attached_run_id=100, run_attempt=1)
 
-    result = _v2_correlated_status(runner, config=config, expected_head="abc123", contract=contract)
+    result = _v2_correlated_status(runner, config=config, expected_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", contract=contract)
 
     assert result is not None
     assert result.status == "success"
@@ -7189,7 +7192,7 @@ def test_v2_correlated_status_omits_unknown_attempt_token(tmp_path):
         "creator": {"login": "github-actions[bot]", "id": 41898282},
     }]})
     result = _v2_correlated_status(
-        runner, config=config, expected_head="abc123",
+        runner, config=config, expected_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         contract=v2_contract(attached_run_id=100, run_attempt=None),
     )
     assert result is None
@@ -7201,13 +7204,13 @@ def test_v2_completed_run_without_attempt_waits_without_terminal_publication(tmp
     )
     runner = V2ManagedRunner(
         workflow_runs=[v2_run(attempt=None, status="completed", conclusion="cancelled")],
-        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
         pr_status_payload={"statuses": []},
         pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
     )
     contract = v2_contract(
         attached_run_id=100, run_attempt=None, intent_comment_id=17,
-        pr_number=7, expected_head_sha="abc123",
+        pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
 
     outcome = wait_for_final_qualification(
@@ -7231,13 +7234,13 @@ def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_
     )
     runner = V2ManagedRunner(
         workflow_runs=[v2_run(status="completed", conclusion="cancelled")],
-        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
         pr_status_payload={"statuses": []},
         pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
     )
     contract = v2_contract(
         attached_run_id=100, run_attempt=1, intent_comment_id=17,
-        pr_number=7, expected_head_sha="abc123",
+        pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     monkeypatch.setattr(
         managed_ci, "_v2_correlated_status", lambda *args, **kwargs: None
@@ -7259,7 +7262,7 @@ def test_v2_completed_run_without_publisher_status_stops_and_records_ledger(tmp_
         if "/issues/comments/17" in " ".join(command)
     )
     assert not any(
-        "/statuses/abc123" in " ".join(command) and "POST" in command
+        "/statuses/6367c48dd193d56ea7b0baad25b19455e529f5ee" in " ".join(command) and "POST" in command
         for command, _cwd in runner.commands
     )
 
@@ -7291,13 +7294,13 @@ def test_v2_cancelled_run_during_candidate_jobs_stops_without_publishing_status(
     runner = V2ManagedRunner(
         workflow_runs=[v2_run(status="completed", conclusion="cancelled")],
         jobs=[{"name": "candidate", "conclusion": "cancelled"}],
-        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
         pr_status_payload={"statuses": []},
         pr_branch_protection_payload={"contexts": [FINAL_CONTEXT], "checks": []},
     )
     contract = v2_contract(
         attached_run_id=100, run_attempt=1, intent_comment_id=17,
-        pr_number=7, expected_head_sha="abc123",
+        pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     monkeypatch.setattr(managed_ci, "_v2_correlated_status", lambda *args, **kwargs: None)
 
@@ -7466,7 +7469,7 @@ def test_v2_completed_run_failure_race_accepts_late_correlated_status(tmp_path, 
     runner = V2ManagedRunner(
         workflow_runs=[v2_run(status="completed", conclusion="failure")],
         jobs=[{"name": "unit", "conclusion": "failure"}],
-        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
     )
     contract = v2_contract(attached_run_id=100, run_attempt=1)
     failure = PullRequestCheck(
@@ -7492,7 +7495,7 @@ def test_v2_qualification_rejects_numeric_prefix_tokens_and_run_url(tmp_path):
     runner = V2ManagedRunner(
         workflow_runs=[v2_run(run_id=100, attempt=1)],
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         },
@@ -7528,7 +7531,7 @@ def test_v2_qualification_refreshes_rerun_attempt_before_correlating_status(tmp_
     runner = V2ManagedRunner(
         workflow_runs=[v2_run(run_id=100, attempt=2)],
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         },
@@ -7558,10 +7561,10 @@ def test_v2_qualification_refreshes_rerun_attempt_before_correlating_status(tmp_
 @pytest.mark.parametrize(
     ("rest_pr", "config_overrides"),
     [
-        ({"head": {"repo": {"full_name": "FORK/REPO"}, "sha": "abc123", "ref": "agent-loop/managed-643"}}, {}),
+        ({"head": {"repo": {"full_name": "FORK/REPO"}, "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "ref": "agent-loop/managed-643"}}, {}),
         ({"draft": False}, {}),
         ({"labels": []}, {}),
-        ({"head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "new-head", "ref": "agent-loop/managed-643"}}, {}),
+        ({"head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6", "ref": "agent-loop/managed-643"}}, {}),
         ({"user": {"login": "other", "id": 1}}, {}),
         ({}, {"managed_ci_trusted_actor": "other"}),
     ],
@@ -7572,14 +7575,14 @@ def test_v2_activation_rejects_untrusted_or_incomplete_opening_tuple(
     settings = {"auto_merge": True, "managed_ci_trusted_actor": "agent-loop"}
     settings.update(config_overrides)
     config = make_config(tmp_path, **settings)
-    runner = V2ManagedRunner(rest_pr=rest_pr, pr_payload={"headRefOid": "abc123"})
+    runner = V2ManagedRunner(rest_pr=rest_pr, pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
 
     assert activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata()) is None
 
 
 def test_v2_activation_and_preflight_require_authenticated_actor(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(pr_payload={"headRefOid": "abc123"})
+    runner = V2ManagedRunner(pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
 
     intent = preflight_managed_ci_creation(runner, config=config, issue_number=643)
     contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
@@ -7603,7 +7606,7 @@ def test_v2_activation_derives_visible_intent_capability_from_base_workflow(
     tmp_path, workflow, capable
 ):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(workflow=workflow, pr_payload={"headRefOid": "abc123"})
+    runner = V2ManagedRunner(workflow=workflow, pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
 
     contract = activate_managed_ci(runner, config=config, pr_number=7, metadata=metadata())
 
@@ -7614,7 +7617,7 @@ def test_v2_activation_derives_visible_intent_capability_from_base_workflow(
 def _visible_intent_pr(expected_head):
     return {
         "state": "open", "draft": True, "number": 7,
-        "base": {"ref": "main"}, "head": {
+        "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}}, "head": {
             "sha": expected_head, "ref": "agent-loop/managed-7",
             "repo": {"full_name": "OWNER/REPO"},
         }, "user": {"login": "agent-loop", "id": 7},
@@ -7685,7 +7688,7 @@ def test_v2_visible_intent_body_round_trips_through_intent_rediscovery(tmp_path)
 
 def test_v2_preflight_accepts_exactly_one_reserved_direct_branch(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(pr_payload={"headRefOid": "abc123"})
+    runner = V2ManagedRunner(pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
 
     intent = preflight_managed_ci_creation(
         runner,
@@ -7713,7 +7716,7 @@ def test_v2_preflight_accepts_reserved_direct_branch_in_manual_mode(tmp_path):
         make_config(tmp_path, auto_merge=False, managed_ci_trusted_actor="agent-loop"),
         managed_ci=True,
     )
-    runner = V2ManagedRunner(pr_payload={"headRefOid": "abc123"})
+    runner = V2ManagedRunner(pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
 
     intent = preflight_managed_ci_creation(
         runner,
@@ -7762,7 +7765,7 @@ def test_existing_pr_adoption_rejects_null_head_repository_name(tmp_path):
         rest_pr={
             "draft": False,
             "state": "open",
-            "head": {"repo": {"full_name": None}, "sha": "abc123", "ref": "feature"},
+            "head": {"repo": {"full_name": None}, "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "ref": "feature"},
             "labels": [],
         },
         pr_branch_protection_payload={"contexts": [FINAL_CONTEXT]},
@@ -7782,7 +7785,7 @@ def test_existing_pr_adoption_reuses_trusted_label_and_revalidates(tmp_path):
             "draft": False,
             "state": "open",
             "user": {"login": "someone", "id": 55},
-            "head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "abc123", "ref": "feature"},
+            "head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "ref": "feature"},
             "labels": [{"name": MANAGED_LABEL}],
         },
         issue_events=[label_event()],
@@ -7928,7 +7931,7 @@ def test_explicit_activation_release_is_terminal_and_unqualified(tmp_path):
             config=config,
             pr_number=7,
             base_ref="main",
-            expected_head_sha="abc123",
+            expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             active_event=None,
             reason="timeline unavailable",
             recovery_capable=True,
@@ -7983,7 +7986,7 @@ def test_v2_fresh_generation_resets_attachment_terminal_history_and_early_fields
     )
 
     _ensure_v2_intent(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", contract=contract
     )
 
     prepared = runner.intent_snapshots[-1]
@@ -8067,7 +8070,7 @@ def test_v2_emitted_lifecycle_records_are_accepted_by_pinned_consumers(tmp_path)
 
     pr = {
         "state": "open", "draft": True, "number": 7,
-        "base": {"ref": "main"}, "head": {
+        "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}}, "head": {
             "sha": expected_head, "ref": "agent-loop/managed-7",
             "repo": {"full_name": "OWNER/REPO"},
         }, "user": {"login": "agent-loop", "id": 7},
@@ -8120,7 +8123,7 @@ def test_v2_current_pinned_consumer_scopes_lifecycle_validation_to_requested_non
         return {"user": {"login": "agent-loop"}, "body": f"<!-- AGENT_MANAGED_CI_INTENT_V2 {json.dumps(record, separators=(',', ':'))} -->"}
     pr = {
         "state": "open", "draft": True, "number": 7,
-        "base": {"ref": "main"}, "head": {
+        "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}}, "head": {
             "sha": expected_head, "ref": "agent-loop/managed-7",
             "repo": {"full_name": "OWNER/REPO"},
         }, "user": {"login": "agent-loop"},
@@ -8197,7 +8200,7 @@ def test_v2_dispatch_ledger_failure_uses_authenticated_ordinary_recovery_capabil
     monkeypatch.setattr(managed_ci, "_ensure_v2_intent", fail_intent)
 
     _dispatch_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", contract=contract
     )
 
     assert contract.activation_path == "ordinary_fallback"
@@ -8235,14 +8238,14 @@ def test_v2_dispatch_discovers_run_with_display_title_and_qualified_path(tmp_pat
 
 def test_v2_dispatch_rejects_a_stale_approved_head(tmp_path):
     config = make_config(tmp_path, auto_merge=True, managed_ci_trusted_actor="agent-loop")
-    runner = V2ManagedRunner(pr_payload={"headRefOid": "new-head"})
+    runner = V2ManagedRunner(pr_payload={"headRefOid": "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"})
 
     with pytest.raises(AgentLoopError, match="head moved from approved SHA"):
         dispatch_final_qualification(
             runner,
             config=config,
             pr_number=7,
-            expected_head_sha="abc123",
+            expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             head_ref="agent-loop/managed-643",
             contract=v2_contract(),
         )
@@ -8256,7 +8259,7 @@ def test_v2_qualification_reports_failed_jobs_from_the_attached_run(tmp_path):
         workflow_runs=[v2_run()],
         jobs=[{"name": "unit", "conclusion": "failure", "html_url": "https://example.test/job/1"}],
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
         },
@@ -8300,7 +8303,7 @@ def test_v2_failed_jobs_and_ready_merge_recovery(tmp_path):
         runner,
         config=config,
         pr_number=7,
-        expected_head_sha="abc123",
+        expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         contract=v2_contract(),
     )
 
@@ -8361,16 +8364,16 @@ def test_merge_pr_uses_expected_head_guard(tmp_path):
     config = make_config(tmp_path, auto_merge=True)
     runner = FakeRunner()
 
-    merge_pr(runner, config, 7, expected_head_sha="abc123")
+    merge_pr(runner, config, 7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
     command = runner.commands[-1][0]
-    assert command[-2:] == ["--match-head-commit", "abc123"]
+    assert command[-2:] == ["--match-head-commit", "6367c48dd193d56ea7b0baad25b19455e529f5ee"]
 
 
 # --- Issue #878: visible labels on tool-owned managed-CI records ------------
 
 
-def _authorization_record(kind, *, head="abc123"):
+def _authorization_record(kind, *, head="6367c48dd193d56ea7b0baad25b19455e529f5ee"):
     extra = (
         {
             "predecessor_head": "old-head",
@@ -8414,7 +8417,7 @@ def test_authorization_bodies_are_labeled_per_kind_without_touching_the_marker()
         assert tail == marker
         assert label.startswith("Agent-loop managed-CI ")
         assert "issue #643" in label and "pull request #7" in label
-        assert "abc123"[:7] in label
+        assert "6367c48dd193d56ea7b0baad25b19455e529f5ee"[:7] in label
         assert parse_issue_created_authorization_comment(body) == record
         # Deterministic: a retry renders a byte-identical body.
         assert str(format_issue_created_authorization_comment(record)) == body
@@ -8515,7 +8518,7 @@ def test_intent_body_stays_marker_only_for_the_base_workflow_validator(tmp_path)
     contract = v2_contract()
 
     _ensure_v2_intent(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", contract=contract
     )
 
     stored = next(
@@ -8612,7 +8615,7 @@ def test_altered_intent_body_fails_the_create_read_back(tmp_path):
 
     with pytest.raises(AgentLoopError, match="returned a different body"):
         _ensure_v2_intent(
-            runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+            runner, config=config, pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", contract=contract
         )
     assert contract.intent_comment_id is None
     assert contract.intent_state is None
@@ -8623,7 +8626,7 @@ def test_altered_intent_body_fails_the_patch_read_back_without_advancing_state(t
     runner = AlteredLabelIntentRunner(alter_patch=True)
     contract = v2_contract()
     _ensure_v2_intent(
-        runner, config=config, pr_number=7, expected_head_sha="abc123", contract=contract
+        runner, config=config, pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", contract=contract
     )
     assert contract.intent_state == "prepared"
 
@@ -8712,18 +8715,18 @@ def test_qualified_head_comment_is_labeled_and_verified(tmp_path):
     )
 
     qualified = publish_manual_v2_qualification(
-        runner, config=config, pr_number=7, expected_head_sha="abc123",
+        runner, config=config, pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         contract=contract, reviewers=("Codex",),
     )
 
-    assert qualified == "abc123"
+    assert qualified == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     audit = runner.audit_comments[contract.audit_comment_id]["body"]
     label, separator, tail = audit.partition("\n\n")
     assert separator == "\n\n"
     assert label.startswith("Agent-loop managed-CI qualified-head record")
     # The canonical marker span itself is unchanged; it has no parser consumer.
     assert tail.startswith(f"<!-- {QUALIFICATION_MARKER} repo=OWNER/REPO pr=7 ")
-    assert "qualified_head=abc123" in tail
+    assert "qualified_head=6367c48dd193d56ea7b0baad25b19455e529f5ee" in tail
 
 
 class AlteredQualificationLabelRunner(ManualQualificationRunner, AlteredAuditLabelRunner):
@@ -8745,7 +8748,7 @@ def test_unverified_qualification_audit_raises_and_adopts_no_head(tmp_path):
 
     with pytest.raises(AgentLoopError, match="returned a different body"):
         publish_manual_v2_qualification(
-            runner, config=config, pr_number=7, expected_head_sha="abc123",
+            runner, config=config, pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             contract=contract, reviewers=("Codex",),
         )
 
@@ -8765,7 +8768,7 @@ def _resume_activation_runner(runner_class):
             "body": str(format_issue_created_authorization_comment(
                 ManagedCiIssueAuthorization(
                     kind="creation", repository="OWNER/REPO", issue_number=643,
-                    pr_number=7, base_ref="main", head_sha="abc123",
+                    pr_number=7, base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
                     actor_login="agent-loop", actor_id=1, protection="voluntary",
                     waiver="allow-unprotected-managed-ci", nonce="nonce-643",
                     label_event_id=101,
@@ -8907,7 +8910,7 @@ def _spilled_conflict_continuity():
         kind="continuity", repository="OWNER/REPO", issue_number=643, pr_number=7,
         base_ref="main", head_sha="merged-head", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="next",
-        label_event_id=101, predecessor_head="abc123", predecessor_comment_id=50,
+        label_event_id=101, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", predecessor_comment_id=50,
         round_comment_ids=(anchor_id,),
     )
     return comments, anchor_id, authorization
@@ -8926,7 +8929,7 @@ def test_m953_spilled_conflict_obligation_grants_continuity(tmp_path):
     runner.intent_comments.extend(comments)
     selected = managed_ci.find_actor_round_metadata_comment_ids(
         runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-        actor_id=1, predecessor_head="abc123", new_head="merged-head", round_number=12,
+        actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head", round_number=12,
         after_comment_id=50,
     )
     assert selected == (anchor_id,)
@@ -8957,7 +8960,7 @@ def test_m953_legacy_reader_declines_spilled_conflict_continuity(tmp_path, monke
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
         managed_ci.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-            actor_id=1, predecessor_head="abc123", new_head="merged-head",
+            actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="merged-head",
             round_number=12, after_comment_id=50,
         )
 
@@ -8999,7 +9002,7 @@ def test_m1024_spilled_ci_obligation_grants_continuity(tmp_path):
 
     records = managed_ci._continuity_round_records(comments)
     assert records[len(comments) - 1]["ci_repair_transitions"] == frozenset(
-        {("abc123", "ci-fix-head")}
+        {("6367c48dd193d56ea7b0baad25b19455e529f5ee", "ci-fix-head")}
     )
     assert managed_ci._continuity_round_metadata_is_valid(
         comments, authorization=authorization
@@ -9009,7 +9012,7 @@ def test_m1024_spilled_ci_obligation_grants_continuity(tmp_path):
     runner.intent_comments.extend(comments)
     selected = managed_ci.find_actor_round_metadata_comment_ids(
         runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-        actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+        actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
         after_comment_id=50,
     )
     assert selected == (anchor_id,)
@@ -9039,7 +9042,7 @@ def test_m1024_legacy_reader_declines_spilled_ci_repair_continuity(tmp_path, mon
     with pytest.raises(AgentLoopError, match="correlated blocking-review and coder"):
         managed_ci.find_actor_round_metadata_comment_ids(
             runner, config=make_config(tmp_path), pr_number=7, actor_login="agent-loop",
-            actor_id=1, predecessor_head="abc123", new_head="ci-fix-head", round_number=12,
+            actor_id=1, predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="ci-fix-head", round_number=12,
             after_comment_id=50,
         )
 
@@ -9308,7 +9311,7 @@ def _override_metadata(body):
         title="Managed CI",
         head_branch="agent-loop/managed-643",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/7",
         body=body,
     )
@@ -9838,7 +9841,7 @@ def test_voluntary_and_plan_limited_still_require_the_explicit_waiver(tmp_path):
 def _unreadable_record(**overrides):
     values = dict(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="unreadable", waiver="allow-unreadable-protection",
         nonce="opening-nonce", label_event_id=101,
     )
@@ -9892,7 +9895,7 @@ def test_unreadable_creation_authorization_round_trips_through_resume_audit(tmp_
     def audit(config, expected_protection):
         return _find_resume_audit(
             runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-            base_ref="main", issue_number=643, live_head="abc123",
+            base_ref="main", issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             expected_handoff=handoff, expected_protection=expected_protection,
             require_actor_owned_label_event=True,
         )
@@ -9982,7 +9985,7 @@ def test_resume_activation_refuses_unreadable_without_its_waiver(tmp_path):
     with pytest.raises(AgentLoopError, match=_BOTH_WAIVERS):
         activate_managed_ci(
             runner, config=config, pr_number=7,
-            metadata=replace(_ready_issue_metadata(), head_sha="abc123"),
+            metadata=replace(_ready_issue_metadata(), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
             managed_resume=AuthenticatedManagedResume(
                 origin="issue-created", lifecycle="draft-unlabeled-reentry",
                 issue_created_handoff=replace(
@@ -10024,7 +10027,7 @@ def test_activation_fresh_advice_follows_the_state_specific_waiver(
             config=config,
             pr_number=7,
             base_ref="main",
-            expected_head_sha="abc123",
+            expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             active_event=(101, "agent-loop", 1),
             reason="no fully bound actor-owned issue-created authorization reaches the live head",
             recovery_capable=True,
@@ -10182,7 +10185,7 @@ def _recovery_runner(records, *, scripted=None, lifecycle="draft-labeled", **kwa
             "body": _RECOVERY_BODY,
             "headRefName": "agent-loop/managed-643",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [],
             "reviews": [],
         },
@@ -10934,7 +10937,7 @@ def _page_for_router(runner):
 
 def _router_pr():
     return {
-        "state": "open", "draft": True, "number": 7, "base": {"ref": "main"},
+        "state": "open", "draft": True, "number": 7, "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}},
         "head": {"sha": V2_HEAD, "ref": "agent-loop/managed-7", "repo": {"full_name": "OWNER/REPO"}},
         "user": {"login": "agent-loop", "id": 1}, "labels": [{"name": MANAGED_LABEL}],
     }
@@ -11258,7 +11261,7 @@ def _qualified_ready_labeled_runner(origin="issue-created", **kwargs):
             "body": body,
             "headRefName": "agent-loop/managed-643",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [],
             "reviews": [],
         },
@@ -11433,11 +11436,11 @@ def test_refused_round_readiness_is_logged_and_does_not_abort(tmp_path, capsys, 
     config = replace(make_config(tmp_path, auto_merge=True), quiet=False)
     runner = _RefusingStatusRunner(stderr)
 
-    assert publish_round_readiness(runner, config=config, head_sha="abc123") is False
+    assert publish_round_readiness(runner, config=config, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee") is False
 
-    assert runner.commands[-1][4] == "repos/OWNER/REPO/statuses/abc123"
+    assert runner.commands[-1][4] == "repos/OWNER/REPO/statuses/6367c48dd193d56ea7b0baad25b19455e529f5ee"
     err = capsys.readouterr().err
-    assert f"could not publish the non-required `{READINESS_CONTEXT}` status for abc123" in err
+    assert f"could not publish the non-required `{READINESS_CONTEXT}` status for 6367c48dd193d56ea7b0baad25b19455e529f5ee" in err
     assert ("not permitted through this proxy" in err) if stderr else ("exit 1" in err)
 
 
@@ -11489,7 +11492,7 @@ def test_m1065_fresh_authorization_supersedes_stale_conflicting_records(tmp_path
 
     assert handoff.authorization_kind == "fresh"
     assert handoff.protection_mode == "voluntary"
-    assert handoff.head_sha == "abc123"
+    assert handoff.head_sha == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
     assert record is not None
     assert record.superseded_comment_ids == (41, 42)
@@ -11506,7 +11509,7 @@ def test_m1065_fresh_authorization_supersedes_stale_conflicting_records(tmp_path
     # The resume audit and the plan binding both see one live-head terminal.
     audit = _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="abc123",
+        base_ref="main", issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         expected_handoff=handoff, expected_protection="voluntary",
         require_actor_owned_label_event=True,
     )
@@ -11514,7 +11517,7 @@ def test_m1065_fresh_authorization_supersedes_stale_conflicting_records(tmp_path
     assert audit[0] == handoff.authorization_comment_id
     managed_ci.verify_managed_pr_plan_binding(
         runner, config=config, pr_number=7, issue_number=643,
-        live_head="abc123", approved_plan_hash=_PLAN_1065,
+        live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", approved_plan_hash=_PLAN_1065,
     )
 
 
@@ -11536,7 +11539,7 @@ def test_m1065_fresh_authorization_still_refuses_non_protection_conflicts(tmp_pa
 def test_m1065_recovery_after_supersession_uses_the_superseding_grant(tmp_path):
     superseding = ManagedCiIssueAuthorization(
         kind="fresh", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci", nonce="fresh",
         label_event_id=101, approved_plan_hash=_PLAN_1065, superseded_comment_ids=(41, 42),
     )
@@ -11630,7 +11633,7 @@ def test_m1065_fresh_authorization_supersedes_same_protection_unbound_records(tm
 
     audit = _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="abc123",
+        base_ref="main", issue_number=643, live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         expected_handoff=handoff, expected_protection="voluntary",
         require_actor_owned_label_event=True,
     )
@@ -11638,7 +11641,7 @@ def test_m1065_fresh_authorization_supersedes_same_protection_unbound_records(tm
     assert audit[0] == handoff.authorization_comment_id
     managed_ci.verify_managed_pr_plan_binding(
         runner, config=config, pr_number=7, issue_number=643,
-        live_head="abc123", approved_plan_hash=_PLAN_1065,
+        live_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", approved_plan_hash=_PLAN_1065,
     )
 
 
@@ -11655,11 +11658,11 @@ def _continuity_1069_runner(extra_records):
     ]
     comments.extend(_stale_record_comments(extra_records, first_id=42))
     comments.extend([
-        _round_comment(88, role="reviewer", subject="abc123", round_number=1, state="blocking"),
-        _round_comment(89, role="coder", subject="next-head", round_number=2),
+        _round_comment(88, role="reviewer", subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=1, state="blocking"),
+        _round_comment(89, role="coder", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
     ])
     runner = AuthorizationCommentRunner(issue_events=[label_event()], intent_comments=comments)
-    runner.rest_pr["head"]["sha"] = "next-head"
+    runner.rest_pr["head"]["sha"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
     return runner
 
 
@@ -11681,11 +11684,11 @@ def test_m1069_resume_across_head_advance_supersedes_stranded_record(tmp_path, m
     # An interrupted earlier attempt left a compatible grant at a head that the
     # live history no longer contains.
     stray = _unreadable_record(
-        kind="fresh", head_sha="stray-head", nonce="stray",
+        kind="fresh", head_sha="a356ad9112655d0c4fddfcff82ce6761b6a86267", nonce="stray",
         protection="voluntary", waiver="allow-unprotected-managed-ci",
     )
     runner = _continuity_1069_runner([stray])
-    _ancestors_1069(monkeypatch, {"abc123", "next-head"})
+    _ancestors_1069(monkeypatch, {"6367c48dd193d56ea7b0baad25b19455e529f5ee", "e9bff449de155dd0be5fd76276214538b0dfd315"})
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
@@ -11693,7 +11696,7 @@ def test_m1069_resume_across_head_advance_supersedes_stranded_record(tmp_path, m
     handoff = replace(_authorization_handoff(), authorization_comment_id=41)
 
     first = _continue_1069(
-        runner, config, handoff, predecessor="abc123", new_head="next-head", rounds=(88, 89),
+        runner, config, handoff, predecessor="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="e9bff449de155dd0be5fd76276214538b0dfd315", rounds=(88, 89),
     )
     first_record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
     assert first_record is not None
@@ -11706,12 +11709,12 @@ def test_m1069_resume_across_head_advance_supersedes_stranded_record(tmp_path, m
     # A second resume after another head advance extends the live chain and
     # has nothing left to retire; it does not append a competing record.
     runner.intent_comments.extend([
-        _round_comment(200, role="reviewer", subject="next-head", round_number=2, state="blocking"),
+        _round_comment(200, role="reviewer", subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2, state="blocking"),
         _round_comment(201, role="coder", subject="third-head", round_number=3),
     ])
     runner.rest_pr["head"]["sha"] = "third-head"
     second = _continue_1069(
-        runner, config, first, predecessor="next-head", new_head="third-head", rounds=(200, 201),
+        runner, config, first, predecessor="e9bff449de155dd0be5fd76276214538b0dfd315", new_head="third-head", rounds=(200, 201),
     )
     second_record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
     assert second_record is not None
@@ -11736,7 +11739,7 @@ def test_m1069_continuity_supersedes_only_compatible_unbound_records(tmp_path, m
     voluntary = dict(protection="voluntary", waiver="allow-unprotected-managed-ci")
     extra = [
         # 42: compatible, cannot chain to the new head -> retired.
-        _unreadable_record(kind="fresh", head_sha="stray-head", nonce="a", **voluntary),
+        _unreadable_record(kind="fresh", head_sha="a356ad9112655d0c4fddfcff82ce6761b6a86267", nonce="a", **voluntary),
         # 43: recorded a different protection -> kept; recovery adjudicates it.
         _unreadable_record(kind="fresh", head_sha="old-unreadable", nonce="b"),
         # 44: foreign managed-label provenance -> not merely stranded; kept.
@@ -11752,7 +11755,7 @@ def test_m1069_continuity_supersedes_only_compatible_unbound_records(tmp_path, m
         _unreadable_record(kind="fresh", head_sha="ancestor-head", nonce="e", **voluntary),
     ]
     runner = _continuity_1069_runner(extra)
-    _ancestors_1069(monkeypatch, {"abc123", "ancestor-head"})
+    _ancestors_1069(monkeypatch, {"6367c48dd193d56ea7b0baad25b19455e529f5ee", "ancestor-head"})
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
@@ -11760,7 +11763,7 @@ def test_m1069_continuity_supersedes_only_compatible_unbound_records(tmp_path, m
     handoff = replace(_authorization_handoff(), authorization_comment_id=41)
 
     _continue_1069(
-        runner, config, handoff, predecessor="abc123", new_head="next-head", rounds=(88, 89),
+        runner, config, handoff, predecessor="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="e9bff449de155dd0be5fd76276214538b0dfd315", rounds=(88, 89),
     )
 
     record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
@@ -11772,15 +11775,15 @@ def _discarded_child_1069(head):
     return _unreadable_record(
         kind="continuity", head_sha=head, nonce="child",
         protection="voluntary", waiver="allow-unprotected-managed-ci",
-        predecessor_head="abc123", predecessor_comment_id=41, round_comment_ids=(88, 89),
+        predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", predecessor_comment_id=41, round_comment_ids=(88, 89),
     )
 
 
 def test_m1069_discarded_continuity_child_is_retired_not_a_fork(tmp_path, monkeypatch):
-    # An interrupted attempt authorized abc123 -> discarded-head; the branch
-    # then returned to abc123 and the next coder turn produced next-head.
+    # An interrupted attempt authorized 6367c48dd193d56ea7b0baad25b19455e529f5ee -> discarded-head; the branch
+    # then returned to 6367c48dd193d56ea7b0baad25b19455e529f5ee and the next coder turn produced e9bff449de155dd0be5fd76276214538b0dfd315.
     runner = _continuity_1069_runner([_discarded_child_1069("discarded-head")])
-    _ancestors_1069(monkeypatch, {"abc123"})
+    _ancestors_1069(monkeypatch, {"6367c48dd193d56ea7b0baad25b19455e529f5ee"})
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
@@ -11788,7 +11791,7 @@ def test_m1069_discarded_continuity_child_is_retired_not_a_fork(tmp_path, monkey
 
     continued = _continue_1069(
         runner, config, replace(_authorization_handoff(), authorization_comment_id=41),
-        predecessor="abc123", new_head="next-head", rounds=(88, 89),
+        predecessor="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="e9bff449de155dd0be5fd76276214538b0dfd315", rounds=(88, 89),
     )
 
     record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
@@ -11797,7 +11800,7 @@ def test_m1069_discarded_continuity_child_is_retired_not_a_fork(tmp_path, monkey
     assert record.superseded_comment_ids == (42,)
     audit = _find_resume_audit(
         runner, config=config, pr_number=7, actor_login="agent-loop", actor_id=1,
-        base_ref="main", issue_number=643, live_head="next-head",
+        base_ref="main", issue_number=643, live_head="e9bff449de155dd0be5fd76276214538b0dfd315",
     )
     assert audit is not None
     assert audit[0] == continued.authorization_comment_id
@@ -11805,7 +11808,7 @@ def test_m1069_discarded_continuity_child_is_retired_not_a_fork(tmp_path, monkey
 
 def test_m1069_child_that_reaches_the_new_head_still_refuses_as_fork(tmp_path, monkeypatch):
     runner = _continuity_1069_runner([_discarded_child_1069("middle-head")])
-    _ancestors_1069(monkeypatch, {"abc123", "middle-head"})
+    _ancestors_1069(monkeypatch, {"6367c48dd193d56ea7b0baad25b19455e529f5ee", "middle-head"})
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_trusted_actor="agent-loop",
         allow_unprotected_managed_ci=True,
@@ -11815,7 +11818,7 @@ def test_m1069_child_that_reaches_the_new_head_still_refuses_as_fork(tmp_path, m
     with pytest.raises(AgentLoopError, match="forked predecessor"):
         _continue_1069(
             runner, config, replace(_authorization_handoff(), authorization_comment_id=41),
-            predecessor="abc123", new_head="next-head", rounds=(88, 89),
+            predecessor="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="e9bff449de155dd0be5fd76276214538b0dfd315", rounds=(88, 89),
         )
     assert len(runner.intent_comments) == posted
 
@@ -11823,7 +11826,7 @@ def test_m1069_child_that_reaches_the_new_head_still_refuses_as_fork(tmp_path, m
 def test_m1069_ordinary_recovery_admits_same_protection_stranded_record(tmp_path):
     # The ordinary resume must get past recovery for a continuity round to
     # retire the stranded record at all.
-    stray = _unreadable_record(kind="fresh", head_sha="stray-head", nonce="stray")
+    stray = _unreadable_record(kind="fresh", head_sha="a356ad9112655d0c4fddfcff82ce6761b6a86267", nonce="stray")
     runner = _recovery_runner([_unreadable_record(), stray])
 
     handoff = _recover(runner, _cloud_config(tmp_path, managed_ci_pr_mode=True))
@@ -11837,7 +11840,7 @@ def test_m1069_protection_disagreement_is_left_to_recovery_refusal(tmp_path):
     # A record whose protection differs is not ordinary-path history: recovery
     # refuses before any continuity round, and fresh adjudicates the state.
     stray = _unreadable_record(
-        kind="fresh", head_sha="stray-head", nonce="stray",
+        kind="fresh", head_sha="a356ad9112655d0c4fddfcff82ce6761b6a86267", nonce="stray",
         protection="voluntary", waiver="allow-unprotected-managed-ci",
     )
     runner = _recovery_runner([_unreadable_record(), stray])
@@ -11849,7 +11852,7 @@ def test_m1069_protection_disagreement_is_left_to_recovery_refusal(tmp_path):
 
 def test_m1069_failed_comparison_keeps_the_record(tmp_path, monkeypatch):
     stray = _unreadable_record(
-        kind="fresh", head_sha="stray-head", nonce="stray",
+        kind="fresh", head_sha="a356ad9112655d0c4fddfcff82ce6761b6a86267", nonce="stray",
         protection="voluntary", waiver="allow-unprotected-managed-ci",
     )
     runner = _continuity_1069_runner([stray])
@@ -11865,7 +11868,7 @@ def test_m1069_failed_comparison_keeps_the_record(tmp_path, monkeypatch):
 
     _continue_1069(
         runner, config, replace(_authorization_handoff(), authorization_comment_id=41),
-        predecessor="abc123", new_head="next-head", rounds=(88, 89),
+        predecessor="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="e9bff449de155dd0be5fd76276214538b0dfd315", rounds=(88, 89),
     )
 
     record = parse_issue_created_authorization_comment(runner.intent_comments[-1]["body"])
@@ -11876,7 +11879,7 @@ def test_m1069_failed_comparison_keeps_the_record(tmp_path, monkeypatch):
 def test_m1069_continuity_supersession_is_honored_and_round_trips():
     base = _unreadable_record()
     continuity = replace(
-        base, kind="continuity", head_sha="next", nonce="c", predecessor_head="abc123",
+        base, kind="continuity", head_sha="next", nonce="c", predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         predecessor_comment_id=40, round_comment_ids=(88, 89), superseded_comment_ids=(41,),
     )
     assert parse_issue_created_authorization_comment(
@@ -12191,7 +12194,7 @@ def test_m1067_failed_readiness_command_prints_full_tuple_manual_undo(tmp_path):
     assert "`gh pr ready 7 --repo OWNER/REPO`" in text
     assert "no qualification is implied" in text
     for expected in (
-        "head_repo=OWNER/REPO", "head_ref=agent-loop/managed-643", "head_sha=abc123",
+        "head_repo=OWNER/REPO", "head_ref=agent-loop/managed-643", "head_sha=6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "base_ref=main", "author_login=agent-loop", "author_id=1", "state=open",
     ):
         assert expected in text
@@ -12546,7 +12549,7 @@ def test_m1067_malformed_snapshot_never_renders_as_unlabeled_or_ready():
     partial = managed_ci._PrStateSnapshot.from_payload({
         "labels": [{"name": MANAGED_LABEL}, 7], "draft": True, "state": "open",
         "head": {"repo": {"full_name": "OWNER/REPO"}, "ref": "r", "sha": "s"},
-        "base": {"ref": "main"}, "user": {"login": "agent-loop", "id": 1},
+        "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}}, "user": {"login": "agent-loop", "id": 1},
     })
     assert partial.render() == "draft, with unreadable labels"
 
@@ -12594,8 +12597,8 @@ _M1067_MALFORMED = {"labels": [3], "draft": "x"}
     "identity",
     [
         {"user": {"login": "someone", "id": 55}},
-        {"head": {"repo": None, "sha": "abc123", "ref": "agent-loop/managed-643"}},
-        {"head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "abc123", "ref": "feature"}},
+        {"head": {"repo": None, "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "ref": "agent-loop/managed-643"}},
+        {"head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "ref": "feature"}},
         {"user": {"login": "agent-loop", "id": True}},
     ],
 )
@@ -12659,7 +12662,7 @@ def test_m1067_strict_int_and_tuple_mismatch_reject_booleans():
     assert managed_ci._strict_int(7) == 7
     payload = {
         "head": {"repo": {"full_name": "OWNER/REPO"}, "ref": "r", "sha": "s"},
-        "base": {"ref": "main"}, "user": {"login": "agent-loop", "id": 1},
+        "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}}, "user": {"login": "agent-loop", "id": 1},
         "state": "open", "draft": True, "labels": [],
     }
     entry = managed_ci._PrStateSnapshot.from_payload(payload)
@@ -12710,7 +12713,7 @@ def test_m1067_missing_authorization_preflight_release_reports_once(tmp_path):
     )
     runner = _m1067_draft_labeled_runner(
         rest_pr={"head": {
-            "repo": {"full_name": "OWNER/REPO"}, "sha": "new-head", "ref": "agent-loop/managed-643",
+            "repo": {"full_name": "OWNER/REPO"}, "sha": "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6", "ref": "agent-loop/managed-643",
         }},
         pr_branch_protection_payload=None,
         issue_events=[label_event()],
@@ -12725,10 +12728,10 @@ def test_m1067_missing_authorization_preflight_release_reports_once(tmp_path):
     with pytest.raises(AgentLoopError, match="no fully bound actor-owned") as raised:
         activate_managed_ci(
             runner, config=config, pr_number=7,
-            metadata=replace(_ready_issue_metadata(), head_sha="new-head"),
+            metadata=replace(_ready_issue_metadata(), head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"),
             managed_resume=AuthenticatedManagedResume(
                 origin="issue-created", lifecycle="draft-labeled",
-                issue_created_handoff=_authorization_handoff(head="new-head"),
+                issue_created_handoff=_authorization_handoff(head="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"),
             ),
         )
 
@@ -12807,7 +12810,7 @@ def test_m1067_dispatch_time_release_reports_measured_state_only(tmp_path, capsy
     if managed:
         with pytest.raises(AgentLoopError) as raised:
             _release_for_ordinary_recovery(
-                runner, config=config, pr_number=7, base_ref="main", expected_head_sha="abc123",
+                runner, config=config, pr_number=7, base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 active_event=(101, "agent-loop", 1), reason="fresh intent ledger could not be reconciled",
                 recovery_capable=True,
             )
@@ -12817,7 +12820,7 @@ def test_m1067_dispatch_time_release_reports_measured_state_only(tmp_path, capsy
         assert "Before this run" not in text
     else:
         recovery = _release_for_ordinary_recovery(
-            runner, config=config, pr_number=7, base_ref="main", expected_head_sha="abc123",
+            runner, config=config, pr_number=7, base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             active_event=(101, "agent-loop", 1), reason="fresh intent ledger could not be reconciled",
             recovery_capable=True,
         )
@@ -12844,7 +12847,7 @@ def test_m1067_dispatch_time_recovery_incapable_release_logs_measured_state(tmp_
     )
 
     recovery = _release_for_ordinary_recovery(
-        runner, config=config, pr_number=7, base_ref="main", expected_head_sha="abc123",
+        runner, config=config, pr_number=7, base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         active_event=(101, "agent-loop", 1), reason="ledger", recovery_capable=False,
     )
 
@@ -12866,7 +12869,7 @@ def test_m1067_dispatch_time_unconfirmed_delete_measures_label(tmp_path, applies
 
     with pytest.raises(AgentLoopError) as raised:
         _release_for_ordinary_recovery(
-            runner, config=config, pr_number=7, base_ref="main", expected_head_sha="abc123",
+            runner, config=config, pr_number=7, base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             active_event=(101, "agent-loop", 1), reason="ledger", recovery_capable=True,
         )
 
@@ -12982,7 +12985,7 @@ def _m1067_strict_draft_unlabeled_runner(**kwargs):
         rest_pr={
             "state": "open", "draft": True, "labels": [],
             "head": {
-                "repo": {"full_name": "OWNER/REPO"}, "sha": "coder-round-head",
+                "repo": {"full_name": "OWNER/REPO"}, "sha": "c594585c3e95545540916267d7b1411c5a8606ed",
                 "ref": "agent-loop/managed-643",
             },
         },
@@ -12995,11 +12998,11 @@ def _m1067_strict_draft_unlabeled_runner(**kwargs):
 def _m1067_strict_reentry(runner, tmp_path):
     return activate_managed_ci(
         runner, config=_m1067_config(tmp_path), pr_number=7,
-        metadata=replace(_ready_issue_metadata(), head_sha="coder-round-head"),
+        metadata=replace(_ready_issue_metadata(), head_sha="c594585c3e95545540916267d7b1411c5a8606ed"),
         managed_resume=AuthenticatedManagedResume(
             origin="issue-created", lifecycle="draft-unlabeled-reentry",
             issue_created_handoff=replace(
-                _authorization_handoff(head="coder-round-head"), protection_mode="strict",
+                _authorization_handoff(head="c594585c3e95545540916267d7b1411c5a8606ed"), protection_mode="strict",
             ),
         ),
     )
@@ -13340,7 +13343,7 @@ def test_waiter_returns_timeout_not_passed_for_final_success_with_nonfinal_failu
         tmp_path, auto_merge=True, ci_timeout_seconds=1, ci_poll_interval_seconds=1
     )
     runner = ManagedRunner(
-        pr_payload={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
+        pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN"},
         pr_status_payload={"statuses": [{"context": FINAL_CONTEXT, "state": "success", "target_url": None}]},
         pr_check_runs_payload={
             "total_count": 1,
@@ -13352,7 +13355,7 @@ def test_waiter_returns_timeout_not_passed_for_final_success_with_nonfinal_failu
     outcome = wait_for_final_qualification(runner, config=config, pr_number=7, metadata=metadata())
 
     assert outcome.status == "timeout"
-    assert outcome.head_sha == "abc123"
+    assert outcome.head_sha == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     assert [check.name for check in outcome.checks.failing] == ["lint"]
 
 
@@ -13370,7 +13373,7 @@ def test_draft_labeled_state_left_by_supersession_stop_is_accepted_by_real_resum
     source_runner = _recovery_runner([_unreadable_record()])
     resume = authenticate_source_managed_resume(
         source_runner, config=_cloud_config(tmp_path), pr_number=7,
-        source_branch="feature", source_sha="abc123",
+        source_branch="feature", source_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         managed_branch="agent-loop/managed-643", override_nonce="opening-nonce",
     )
     assert resume.lifecycle == "draft-labeled"
@@ -13429,7 +13432,7 @@ def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligatio
     monkeypatch.setattr(
         pr_loop, "wait_for_final_qualification",
         lambda *a, **k: ManagedCiOutcome(
-            status="passed", checks=board(state["protection"]), head_sha="abc123"
+            status="passed", checks=board(state["protection"]), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"
         ),
     )
     patch_attr_in(monkeypatch, (
@@ -13437,7 +13440,7 @@ def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligatio
     ), "_mergeability_for_unreadable_protection",
         lambda *a, **k: PullRequestMergeability(
             state="mergeable", mergeable_raw="MERGEABLE", merge_state_raw="DRAFT",
-            head_sha="abc123", base_branch="main",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", base_branch="main",
         ),
     )
     finalized = []
@@ -13447,7 +13450,7 @@ def test_1117_draft_stop_then_real_resume_entry_paths_finalize_carried_obligatio
     ), "_merge_with_exact_head_proof", lambda *a, **k: finalized.append("merge"))
     monkeypatch.setattr(
         pr_loop, "publish_manual_v2_qualification",
-        lambda *a, **k: finalized.append("publish") or "abc123",
+        lambda *a, **k: finalized.append("publish") or "6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     real_activate = pr_loop.activate_managed_ci
     lifecycles = []
@@ -13518,7 +13521,7 @@ class _CheckoutSetupReached(Exception):
 def test_run_pr_loop_resume_with_missing_default_checkout_clones_it(tmp_path, monkeypatch):
     record = ManagedCiIssueAuthorization(
         kind="creation", repository="OWNER/REPO", issue_number=643, pr_number=7,
-        base_ref="main", head_sha="abc123", actor_login="agent-loop", actor_id=1,
+        base_ref="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", actor_login="agent-loop", actor_id=1,
         protection="voluntary", waiver="allow-unprotected-managed-ci",
         nonce="opening-nonce", label_event_id=101,
     )
@@ -14453,7 +14456,7 @@ from coding_review_agent_loop.round_state import (  # noqa: E402
     RecoveryRoundBudget as _Budget1367,
 )
 
-_H0_1367, _H1_1367, _H2_1367 = "abc123", "stranded-head", "recovered-head"
+_H0_1367, _H1_1367, _H2_1367 = "6367c48dd193d56ea7b0baad25b19455e529f5ee", "stranded-head", "recovered-head"
 _ORIGIN_1367 = "origin-head"
 _PLAN_1367 = "plan-1367"
 _CORRELATED_1367 = "correlated blocking-review and coder round metadata"
@@ -14736,7 +14739,7 @@ def _mutate_1367(chain, case):
     elif case == "review-wrong-round":
         chain["review"] = meta(50, _review_meta_1367(round_number=2))
     elif case == "review-wrong-head":
-        chain["review"] = meta(50, _review_meta_1367(subject="other-head"))
+        chain["review"] = meta(50, _review_meta_1367(subject="5e6741348108b11e3f3ef936c335b1967d17ac6c"))
     elif case == "review-approved":
         chain["review"] = meta(50, _review_meta_1367(state="approved"))
     elif case == "reviewers-disagree":
@@ -14747,14 +14750,14 @@ def _mutate_1367(chain, case):
         chain["rejected"] = meta(52, _rejected_meta_1367(round_number=2))
     elif case == "rejected-wrong-dispatch-head":
         chain["rejected"] = meta(52, _rejected_meta_1367(
-            dispatch_head="other-head", rejected_coder_followup_from_head="other-head",
+            dispatch_head="5e6741348108b11e3f3ef936c335b1967d17ac6c", rejected_coder_followup_from_head="5e6741348108b11e3f3ef936c335b1967d17ac6c",
         ))
     elif case == "rejected-from-head-mismatch":
         chain["rejected"] = meta(52, _rejected_meta_1367(
-            rejected_coder_followup_from_head="other-head",
+            rejected_coder_followup_from_head="5e6741348108b11e3f3ef936c335b1967d17ac6c",
         ))
     elif case == "rejected-wrong-observed-head":
-        chain["rejected"] = meta(52, _rejected_meta_1367(subject="other-head"))
+        chain["rejected"] = meta(52, _rejected_meta_1367(subject="5e6741348108b11e3f3ef936c335b1967d17ac6c"))
     elif case == "rejected-missing-reason":
         chain["rejected"] = meta(52, _rejected_meta_1367(rejected_coder_followup_reason=None))
     elif case == "rejected-wrong-attempt":
@@ -14776,7 +14779,7 @@ def _mutate_1367(chain, case):
     elif case == "dispatch-wrong-recovery-flag":
         chain["dispatch"] = meta(61, _dispatch_meta_1367(recovery_dispatch=False))
     elif case == "dispatch-wrong-head":
-        chain["dispatch"] = meta(61, _dispatch_meta_1367(head="other-head"))
+        chain["dispatch"] = meta(61, _dispatch_meta_1367(head="5e6741348108b11e3f3ef936c335b1967d17ac6c"))
     elif case == "dispatch-wrong-round":
         chain["dispatch"] = meta(61, _dispatch_meta_1367(dispatch_round=2))
     elif case == "dispatch-wrong-round-number":
@@ -14813,13 +14816,13 @@ def _mutate_1367(chain, case):
     elif case == "two-coders":
         chain["second-coder"] = meta(63, _coder_meta_1367())
     elif case == "coder-wrong-head":
-        chain["coder"] = meta(62, _coder_meta_1367(subject="other-head"))
+        chain["coder"] = meta(62, _coder_meta_1367(subject="5e6741348108b11e3f3ef936c335b1967d17ac6c"))
     elif case == "fresh-without-link":
         chain["fresh"] = _auth_comment_1367(60, _fresh_record_1367(
             predecessor_head=None, predecessor_comment_id=None,
         ))
     elif case == "fresh-wrong-head":
-        chain["fresh"] = _auth_comment_1367(60, _fresh_record_1367(head_sha="other-head"))
+        chain["fresh"] = _auth_comment_1367(60, _fresh_record_1367(head_sha="5e6741348108b11e3f3ef936c335b1967d17ac6c"))
     elif case == "fresh-label-outside-history":
         chain["fresh"] = _auth_comment_1367(60, _fresh_record_1367(label_event_id=999))
     elif case == "fresh-wrong-plan":
@@ -14830,7 +14833,7 @@ def _mutate_1367(chain, case):
     elif case == "root-foreign":
         chain["root"] = _auth_comment_1367(41, _auth_record_1367(), login="mallory", user_id=9)
     elif case == "root-wrong-head":
-        chain["root"] = _auth_comment_1367(41, _auth_record_1367(head_sha="other-head"))
+        chain["root"] = _auth_comment_1367(41, _auth_record_1367(head_sha="5e6741348108b11e3f3ef936c335b1967d17ac6c"))
     elif case == "root-out-of-scope":
         chain["root"] = _auth_comment_1367(41, _auth_record_1367(issue_number=999))
     elif case == "root-different-protection":
@@ -14921,7 +14924,7 @@ def test_m1367_continuity_root_with_broken_ancestry_fails_closed(tmp_path, ances
     if ancestry == "origin-missing":
         del chain["origin"]
     elif ancestry == "origin-wrong-head":
-        chain["origin"] = _auth_comment_1367(30, _auth_record_1367(head_sha="other-head"))
+        chain["origin"] = _auth_comment_1367(30, _auth_record_1367(head_sha="5e6741348108b11e3f3ef936c335b1967d17ac6c"))
     elif ancestry == "origin-coder-missing":
         del chain["origin-coder"]
     elif ancestry == "origin-retired-plan":
@@ -15265,7 +15268,7 @@ def test_m1367_identical_stranded_and_original_heads_never_open_recovery():
     ) is None
     assert managed_ci._rejected_recovery_round_ids(
         comments, by_index, root_head=_H0_1367, fresh_head=_H1_1367,
-        predecessor_head="other-head", new_head=_H2_1367, **common,
+        predecessor_head="5e6741348108b11e3f3ef936c335b1967d17ac6c", new_head=_H2_1367, **common,
     ) is None
 
 
@@ -15413,7 +15416,7 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
         issue_events=[label_event()], authenticated_actor=("agent-loop", 1),
     )
     runner.pr_payload.update({
-        "headRefName": "agent-loop/managed-643", "headRefOid": "abc123",
+        "headRefName": "agent-loop/managed-643", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "baseRefName": "main", "body": runner.rest_pr["body"],
     })
     root = publish_issue_created_authorization(
@@ -15444,14 +15447,14 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
     assert not runner.claude_outputs
     assert not events  # Rejected reports cannot qualify or merge.
     stranded = runner.pr_payload["headRefOid"]
-    assert stranded != "abc123"
+    assert stranded != "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     runner.rest_pr["head"]["sha"] = stranded
 
     # The operator `--managed-ci-fresh` grant at the stranded head links to A0.
     runner.compare_payload = {
         "status": "ahead",
-        "base_commit": {"sha": "abc123"},
-        "merge_base_commit": {"sha": "abc123"},
+        "base_commit": {"sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
+        "merge_base_commit": {"sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     }
     fresh = authorize_fresh_issue_created_resume(
         runner, config=config, pr_number=7, issue_number=643,
@@ -15504,7 +15507,7 @@ def test_m1367_run_pr_loop_recovers_continuity_after_rejected_followup_and_fresh
             )
 
     recovered = runner.pr_payload["headRefOid"]
-    assert recovered not in {"abc123", stranded}
+    assert recovered not in {"6367c48dd193d56ea7b0baad25b19455e529f5ee", stranded}
     dispatches = [
         decoded["recovery"] for comment in runner.intent_comments
         if (decoded := managed_ci._continuity_round_records([comment]).get(0)) is not None
@@ -15629,7 +15632,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
         issue_events=[label_event()], authenticated_actor=("agent-loop", 1),
     )
     runner.pr_payload.update({
-        "headRefName": "agent-loop/managed-643", "headRefOid": "abc123",
+        "headRefName": "agent-loop/managed-643", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "baseRefName": "main", "body": runner.rest_pr["body"],
     })
     root = publish_issue_created_authorization(
@@ -15662,8 +15665,8 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
     stranded = runner.pr_payload["headRefOid"]
     runner.rest_pr["head"]["sha"] = stranded
     runner.compare_payload = {
-        "status": "ahead", "base_commit": {"sha": "abc123"},
-        "merge_base_commit": {"sha": "abc123"},
+        "status": "ahead", "base_commit": {"sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
+        "merge_base_commit": {"sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     }
     fresh = authorize_fresh_issue_created_resume(
         runner, config=config_a, pr_number=7, issue_number=643,
@@ -15771,7 +15774,7 @@ def test_m1376_run_pr_loop_recovery_under_a_then_board_change_to_b_and_head_tran
              if c["body"].startswith("Reviewer board change recorded.")]
     assert len(links) == 1
     final = runner.pr_payload["headRefOid"]
-    assert final not in {"abc123", stranded, recovered}
+    assert final not in {"6367c48dd193d56ea7b0baad25b19455e529f5ee", stranded, recovered}
     continuity = [(cid, r) for cid, r in _authorization_records(runner) if r.kind == "continuity"]
     assert [(r.predecessor_head, r.head_sha) for _cid, r in continuity] == [
         (stranded, recovered), (recovered, final),
@@ -15983,7 +15986,7 @@ def test_wait_for_final_qualification_ignores_the_pre_rerun_attempt(tmp_path, mo
 def _managed_loop(tmp_path, monkeypatch, outcomes, *, rerun_result=None, auto_merge=False):
     runner = FakeRunner(
         codex_outputs=[structured_pr_review(state="approved", summary="Approved.")],
-        pr_payload={"headRefOid": "abc123"},
+        pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
         pr_check_runs_payload={"check_runs": [{"name": "tests", "status": "in_progress"}]},
         pr_status_payload={"state": "pending", "statuses": []},
         pr_branch_protection_payload={"contexts": ["tests"]},
@@ -16014,7 +16017,7 @@ def _managed_loop(tmp_path, monkeypatch, outcomes, *, rerun_result=None, auto_me
         )
 
     monkeypatch.setattr(pr_loop_module, "rerun_managed_attempt", rerun)
-    monkeypatch.setattr(pr_loop, "publish_manual_v2_qualification", lambda *a, **k: "abc123")
+    monkeypatch.setattr(pr_loop, "publish_manual_v2_qualification", lambda *a, **k: "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     merges = []
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop,
@@ -16043,7 +16046,7 @@ def _managed_board(*, failing=(), pending=(), missing=(), query="ok", complete=T
 
 def _terminal(**overrides):
     fields = {
-        "status": "terminal_without_status", "head_sha": "abc123", "run_id": 100, "run_attempt": 1,
+        "status": "terminal_without_status", "head_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "run_id": 100, "run_attempt": 1,
         "workflow_status": "completed", "workflow_conclusion": "failure", "jobs": PLUMBING_JOBS,
         "attempts_used": 3, "checks": _managed_board(),
     }
@@ -16056,7 +16059,7 @@ def test_managed_without_auto_merge_reruns_plumbing_only_once_and_reports_final_
 ):
     runner, config, waits, reruns, merges = _managed_loop(
         tmp_path, monkeypatch,
-        [_terminal(), ManagedCiOutcome(status="passed", head_sha="abc123", attempts_used=2)],
+        [_terminal(), ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", attempts_used=2)],
     )
 
     assert pr_loop.run_pr_loop(runner, pr_number=77, config=config) == 0
@@ -16113,7 +16116,7 @@ def test_managed_published_plumbing_failure_stops_without_rerun_or_dispatch_clai
     tmp_path, monkeypatch, auto_merge
 ):
     failed = ManagedCiOutcome(
-        status="failed", head_sha="abc123", run_id=100, run_attempt=1, jobs=PLUMBING_JOBS,
+        status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", run_id=100, run_attempt=1, jobs=PLUMBING_JOBS,
         failure_details=("Publish final exact-head status: failure",), attempts_used=1,
         checks=_managed_board(), final_status="failure",
     )
@@ -16136,7 +16139,7 @@ def test_managed_published_plumbing_failure_stops_without_rerun_or_dispatch_clai
 def test_managed_test_failure_keeps_the_managed_coder_obligation(tmp_path, monkeypatch):
     jobs = (("Test validated exact head", "failure", ""), ("Publish final exact-head status", "success", ""))
     failed = ManagedCiOutcome(
-        status="failed", head_sha="abc123", run_id=100, run_attempt=1, jobs=jobs,
+        status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", run_id=100, run_attempt=1, jobs=jobs,
         failure_details=("Test validated exact head: failure",), attempts_used=1,
     )
     runner, config, _waits, reruns, _merges = _managed_loop(tmp_path, monkeypatch, [failed])
@@ -16223,7 +16226,7 @@ _JOB_TEST_FAILURE = (
         # A failing test from another workflow on the counted board.
         [_terminal(checks=_BOARD_TEST_FAILURE)],
         [ManagedCiOutcome(
-            status="failed", head_sha="abc123", run_id=100, run_attempt=1, jobs=PLUMBING_JOBS,
+            status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", run_id=100, run_attempt=1, jobs=PLUMBING_JOBS,
             checks=_BOARD_TEST_FAILURE, final_status="failure", attempts_used=1,
         )],
         # The run failed a test job without publishing a status.
@@ -16250,7 +16253,7 @@ def test_managed_test_failure_takes_precedence_and_resumes_the_coder(tmp_path, m
     ("outcome", "expected"),
     [
         (ManagedCiOutcome(
-            status="infrastructure_stall", head_sha="abc123", checks=_managed_board(),
+            status="infrastructure_stall", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", checks=_managed_board(),
             final_status="pending", attempts_used=1,
             stall=CiInfrastructureStall(checks=(StalledCheck(
                 name="tests", kind="check_run", reason="queued_too_long",
@@ -16258,7 +16261,7 @@ def test_managed_test_failure_takes_precedence_and_resumes_the_coder(tmp_path, m
             ),)),
         ), f"{FINAL_CONTEXT}: pending"),
         (ManagedCiOutcome(
-            status="timeout", head_sha="abc123", checks=_managed_board(), final_status="absent",
+            status="timeout", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", checks=_managed_board(), final_status="absent",
             attempts_used=1,
         ), f"{FINAL_CONTEXT}: absent"),
     ],
@@ -16285,7 +16288,7 @@ def test_managed_skipped_board_test_is_never_plumbing_only(tmp_path, monkeypatch
     outcome = (
         _terminal(checks=board) if status == "terminal_without_status"
         else ManagedCiOutcome(
-            status="failed", head_sha="abc123", run_id=100, run_attempt=1, jobs=PLUMBING_JOBS,
+            status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", run_id=100, run_attempt=1, jobs=PLUMBING_JOBS,
             checks=board, final_status="failure", attempts_used=1,
             failure_details=("Publish final exact-head status: failure",),
         )
@@ -16424,7 +16427,7 @@ def test_managed_rerun_rechecks_the_deadline_after_its_verification_reads(tmp_pa
 def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
     """#1177: the transcript a resumable managed qualification stop leaves behind.
 
-    Codex approved ``abc123``, the loop persisted a ``qualifying`` managed
+    Codex approved ``6367c48dd193d56ea7b0baad25b19455e529f5ee``, the loop persisted a ``qualifying`` managed
     checkpoint naming the prior attempt 555/1, and that attempt's
     prior-generation intent comment is on the PR.  The rerun activates for
     real, so its contract carries a fresh generation and no attempt.
@@ -16447,7 +16450,7 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
         text="Managed CI failed on the previous head.", status="blocking",
         source_status="blocking", authority="machine",
         obligation_kind="managed-exact-head-ci", lifecycle="qualifying",
-        failed_head_sha="old-head", candidate_head_sha="abc123",
+        failed_head_sha="old-head", candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         obligation_identity="managed-exact-head-ci:item-1",
     )
     approvers = ("Codex",) if drift != "approval-set" else ("Codex", "Claude")
@@ -16456,7 +16459,7 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
         obligation_identity=item.obligation_identity,
         lifecycle="qualifying",
         failed_head_sha="old-head",
-        candidate_head_sha="abc123",
+        candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         base_branch="main",
         requirements_digest=pr_loop_support._qualification_digest(tuple()),
         acquisition_digest=pr_loop_support._qualification_digest(
@@ -16475,7 +16478,7 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
     approval = _attach_round_metadata(
         "Approved the repaired head.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         PostedRoundMetadata(
-            flow="pr", role="reviewer", agent="Codex", round_number=1, subject="abc123",
+            flow="pr", role="reviewer", agent="Codex", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(dataclasses.replace(item, lifecycle="awaiting_current_head_review"),),
             state="approved", architecture_contract_version=1,
         ),
@@ -16483,7 +16486,7 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
     summary = _attach_round_metadata(
         "PR #7 qualification checkpoint: attached attempt 555/1.",
         PostedRoundMetadata(
-            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="abc123",
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(item,), state="blocking", phase="qualification-checkpoint",
             qualification_checkpoint=checkpoint, architecture_contract_version=1,
         ),
@@ -16494,7 +16497,7 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
             workflow_revision="workflow-sha", intent_generation="prior-gen",
             nonce="prior-nonce", created_at=1, attached_run_id=555, run_attempt=1,
         ),
-        pr_number=7, expected_head_sha="abc123", state="attached",
+        pr_number=7, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", state="attached",
     ))
     runner = _qualified_ready_labeled_runner(
         codex_outputs=[structured_pr_review(state="approved", summary="Re-reviewed.")],
@@ -16533,7 +16536,7 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
         contract = kwargs["contract"]
         events.append(("wait", contract.attached_run_id, contract.run_attempt))
         return managed_ci.ManagedCiOutcome(
-            status="passed", head_sha="abc123",
+            status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             checks=PullRequestChecks(
                 state="passing", required_checks=(FINAL_CONTEXT,),
                 passing=(PullRequestCheck(FINAL_CONTEXT, "check_run", "success"),),
@@ -16550,7 +16553,7 @@ def _fresh_process_qualifying_resume(tmp_path, monkeypatch, *, drift=None):
     ), "_mergeability_for_unreadable_protection",
         lambda *a, **k: PullRequestMergeability(
             state="mergeable", mergeable_raw="MERGEABLE", merge_state_raw="CLEAN",
-            head_sha="abc123", base_branch="main",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", base_branch="main",
         ),
     )
     monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *a, **k: events.append("prepare"))
@@ -16588,9 +16591,9 @@ def test_fresh_process_resume_of_qualifying_checkpoint_dispatches_fresh_attempt_
     assert "force_full=True" not in err
     # Exactly one fresh dispatch under the new generation; 555 is never attached.
     dispatches = [event for event in events if event[0] == "dispatch"]
-    assert dispatches == [("dispatch", "abc123", contract.intent_generation, None, None)]
+    assert dispatches == [("dispatch", "6367c48dd193d56ea7b0baad25b19455e529f5ee", contract.intent_generation, None, None)]
     assert ("wait", 777, 1) in events and ("wait", 555, 1) not in events
-    assert events[-1] == ("merge", "abc123")
+    assert events[-1] == ("merge", "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     # The prior intent record is left as history; only the new attempt is checkpointed.
     assert _attempt_checkpoint_lines(runner)[-1] == "PR #7 qualification checkpoint: attached attempt 777/1."
     assert sum("attached attempt 555/1" in line for line in _attempt_checkpoint_lines(runner)) == 1
@@ -16631,7 +16634,7 @@ def _approach_alternative_coder_comment(comment_id, *, subject, round_number):
         "schema_version": 1,
         "kind": "coder_followup",
         "state": "blocking",
-        "summary": "Approach alternative: drop the predecessor-head disqualifier.",
+        "summary": "Approach alternative: drop the aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c disqualifier.",
     })
     return {
         "id": comment_id,
@@ -16646,7 +16649,7 @@ def _approach_alternative_coder_comment(comment_id, *, subject, round_number):
                     "phase": "pr",
                     "reviewer": "Codex",
                     "trigger_round": 1,
-                    "trigger_head": "abc123",
+                    "trigger_head": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                     "anchor": {"path": "src/spool.py", "start": 124, "end": 140},
                 },),
             ),
@@ -16696,11 +16699,11 @@ def test_managed_resume_after_approach_alternative_uses_real_continuity_authoriz
                 "reviewer round",
                 PostedRoundMetadata(
                     flow="pr", role="reviewer", agent="Codex",
-                    round_number=1, subject="abc123", state="blocking",
+                    round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", state="blocking",
                 ),
             ),
         },
-        _approach_alternative_coder_comment(89, subject="next-head", round_number=2),
+        _approach_alternative_coder_comment(89, subject="e9bff449de155dd0be5fd76276214538b0dfd315", round_number=2),
     ])
     # The same round records as the PR conversation view shows them.
     runner.pr_payload["comments"] = [
@@ -16711,11 +16714,11 @@ def test_managed_resume_after_approach_alternative_uses_real_continuity_authoriz
         }
         for index, comment in enumerate(runner.intent_comments[-2:])
     ]
-    runner.rest_pr["head"]["sha"] = "next-head"
-    runner.pr_payload["headRefOid"] = "next-head"
+    runner.rest_pr["head"]["sha"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
+    runner.pr_payload["headRefOid"] = "e9bff449de155dd0be5fd76276214538b0dfd315"
     publish_issue_created_continuity_authorization(
         runner, config=publish_config, handoff=root,
-        predecessor_head="abc123", new_head="next-head", round_comment_ids=(88, 89),
+        predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_head="e9bff449de155dd0be5fd76276214538b0dfd315", round_comment_ids=(88, 89),
     )
     config = make_config(
         tmp_path, managed_ci=True, managed_ci_pr_mode=True,
@@ -16741,7 +16744,7 @@ def test_managed_resume_after_approach_alternative_uses_real_continuity_authoriz
     resumed = captured["managed_resume"]
     assert resumed is not None and resumed.issue_created_handoff is not None
     assert resumed.issue_created_handoff.authorization_kind == "continuity"
-    assert resumed.issue_created_handoff.head_sha == "next-head"
+    assert resumed.issue_created_handoff.head_sha == "e9bff449de155dd0be5fd76276214538b0dfd315"
     # No competing grant, label write or CI dispatch: not ordinary recovery.
     kinds = [
         record.kind
@@ -16758,9 +16761,9 @@ def test_managed_resume_after_approach_alternative_uses_real_continuity_authoriz
     if step_back_rounds:
         message = str(excinfo.value)
         assert "the coder proposes replacing the approved approach" in message
-        assert "drop the predecessor-head disqualifier." in message
+        assert "drop the aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c disqualifier." in message
         assert reviewer_commands == []
         assert not any("Review verdict" in comment for comment in runner.comments)
     else:
         assert len(reviewer_commands) == 1
-        assert "next-head" in " ".join(reviewer_commands[0])
+        assert "e9bff449de155dd0be5fd76276214538b0dfd315" in " ".join(reviewer_commands[0])

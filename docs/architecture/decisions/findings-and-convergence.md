@@ -29,3 +29,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-10-30: Exhausted PR reviewer acknowledgement repair durably upserts the dedicated obligation; valid coder clearance and complete-board clearance remain separate from the fresh reviewer acknowledgement gate (#1791).
 
 - 2026-10-30: Failed PR acknowledgement repair summaries explicitly mark an open-round ledger boundary, preserving blocking obligations across same-head restart without counting the summary as reconciliation (#1791).
+
+- 2026-10-30: PR-record/branch observation uses three bounded samples before head-bound lifecycle publication and unchanged accounting; persistent strict descendant lag stops without granting branch-tip authority. Operator rewind/re-push recovery stays manual, and existing origin-specific cleanup and exact-head CI/merge gates remain in force (#1801).

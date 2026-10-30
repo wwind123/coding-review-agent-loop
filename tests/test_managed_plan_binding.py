@@ -216,7 +216,7 @@ def test_ci_repair_continuity_chain_binds_the_plan(tmp_path):
         # The referenced record no longer carries the CI obligation at all.
         _round_comment(89, role="coder", subject="head-1", round_number=2),
     ],
-    ids=["foreign-actor", "failed-head-changed", "candidate-head-changed", "obligation-gone"],
+    ids=["foreign-actor", "0109780857a5f763d3dacdb5f43c546d6776b3ba-changed", "candidate-head-changed", "obligation-gone"],
 )
 def test_ci_repair_chain_rejects_a_changed_referenced_record(tmp_path, coder):
     with pytest.raises(AgentLoopError, match="no authenticated chain reaches the live head"):
@@ -260,7 +260,7 @@ def _snapshot(
         architecture_identity_changed=False,
     )
     calls = []
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "get_pr_review_context", lambda *a, **k: pr_context)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "get_observed_pr_review_context", lambda *a, **k: pr_context)
     patch_attr_in(monkeypatch, (discuss_loop, execution_policy, child_plan_binding, pr_loop_support, pr_loop, plan_first_loop, issue_loop), "get_issue_context", lambda *a, **k: issue)
     patch_attr_in(monkeypatch, (architecture_contract, pr_loop_support), "_revalidate_pr_architecture_identity", lambda *a, **k: (None, False)
     )

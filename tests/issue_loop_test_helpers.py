@@ -250,7 +250,7 @@ def _provenance_pages(message: str):
         "data": {
             "repository": {
                 "pullRequest": {
-                    "headRefOid": "abc123",
+                    "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                     "commits": {
                         "totalCount": 1,
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
@@ -274,7 +274,7 @@ def _managed_issue_handoff(*, nonce: str) -> AuthenticatedIssueCreatedHandoff:
         issue_number=56,
         repository="OWNER/REPO",
         base_ref="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop",
         trusted_actor_id=1,
@@ -496,7 +496,7 @@ class _IssueRecoveryWorkflowRunner(FakeRunner):
             "body": body,
             "headRefName": "agent-loop/managed-56",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [],
             "reviews": [],
         }
@@ -509,10 +509,10 @@ class _IssueRecoveryWorkflowRunner(FakeRunner):
             "body": body,
             "head": {
                 "repo": {"full_name": "OWNER/REPO"},
-                "sha": "abc123",
+                "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "ref": "agent-loop/managed-56",
             },
-            "base": {"ref": "main"},
+            "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}},
             "user": {"login": "agent-loop", "id": 1},
         }
         self.authorization_comments = list(authorization_comments or [])

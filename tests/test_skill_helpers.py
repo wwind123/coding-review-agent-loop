@@ -782,7 +782,7 @@ class TestStateManager:
     def test_write_and_read_session(self) -> None:
         repo = "test/skill-repo"
         issue = 9999
-        fields = {"last_completed_step": "post_review", "session_id": "abc123"}
+        fields = {"last_completed_step": "post_review", "session_id": "6367c48dd193d56ea7b0baad25b19455e529f5ee"}
         _run(
             "helpers.state_manager",
             "write-session",
@@ -796,7 +796,7 @@ class TestStateManager:
         result = _run("helpers.state_manager", "read-session", "--issue", str(issue), "--repo", repo)
         data = json.loads(result.stdout)
         assert data["last_completed_step"] == "post_review"
-        assert data["session_id"] == "abc123"
+        assert data["session_id"] == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
 
     def test_write_and_clear_pending_comment(self) -> None:
         repo = "test/skill-repo"
@@ -1036,7 +1036,7 @@ class TestStateManager:
                 "--output", str(output_file),
                 "--flow", "pr", "--role", "coder", "--agent", "Codex",
                 "--round-number", "2", "--state", "blocking",
-                "--subject", "abc123",
+                "--subject", "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "--compact-prior-summaries-file", str(compact_file),
             )
 
@@ -1406,7 +1406,7 @@ def _make_repair_dir(
         "issue": issue,
         "repo": "OWNER/REPO",
         "new_round_number": round_num,
-        "round_subject": "abc123",
+        "round_subject": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "item_id_offset": 0,
         "validate_kind": "plan_review",
         "dry_run": dry_run,
@@ -2160,7 +2160,7 @@ class TestRunExternalRetries:
 class TestRunExternalPRWorkdirSync:
     """run_external syncs workdir to the PR head (not base) when --flow pr --pr N is given."""
 
-    def _invoke_pr(self, monkeypatch, tmp_path, *, pr=42, head_sha="abc123", repo="owner/repo"):
+    def _invoke_pr(self, monkeypatch, tmp_path, *, pr=42, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", repo="owner/repo"):
         """Call run_external.main() in PR flow with mocked checkout functions and a trivial backend."""
         import helpers.run_external as rex
         import coding_review_agent_loop.config as cfg_mod
@@ -2338,7 +2338,7 @@ class TestPromptCheckoutPath:
                 "attribution": {"state": "current-head", "head": "old-head"},
             }]
         })
-        issue = {**self._ISSUE, "headRefOid": "new-head"}
+        issue = {**self._ISSUE, "headRefOid": "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"}
         prompt = build_review_prompt_for_skill(
             issue, "diff", [], 2, "codex", repo="owner/repo", pr_number=7,
             local_test_evidence=evidence,
@@ -3587,9 +3587,9 @@ class TestApprovedFollowups:
         # this pr/head/mode short-circuits before any network post.
         import types as _t
         from helpers.skill_runner import _publish_pr_followups
-        marker = "<!-- AGENT_APPROVED_FOLLOWUPS: pr=7 head=abc123 mode=summarize -->"
+        marker = "<!-- AGENT_APPROVED_FOLLOWUPS: pr=7 head=6367c48dd193d56ea7b0baad25b19455e529f5ee mode=summarize -->"
         pr_comments = [_t.SimpleNamespace(body=f"prior summary\n{marker}")]
-        r = _publish_pr_followups("o/r", 7, "abc123", "summarize", [self._future_item()], pr_comments, dry_run=False)
+        r = _publish_pr_followups("o/r", 7, "6367c48dd193d56ea7b0baad25b19455e529f5ee", "summarize", [self._future_item()], pr_comments, dry_run=False)
         assert r == {"mode": "summarize", "published": False, "count": 1}
 
     def test_pr_prompt_mode_changes_instruction(self) -> None:
@@ -3799,7 +3799,7 @@ class TestAgentMemory:
     def _ctx(self):
         from coding_review_agent_loop.memory import AgentMemoryContext
         return AgentMemoryContext(
-            memory_dir=Path("/tmp/mem"), current_commit="abc123",
+            memory_dir=Path("/tmp/mem"), current_commit="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             last_analyzed_commit=None, changed_files=(),
             repo_summary="REPO SUMMARY TEXT", architecture_map=None,
             test_profile=None, toolchain=None,
@@ -4007,7 +4007,7 @@ class TestReverseRolesHelpers:
             "helpers.state_manager", "attach-metadata",
             "--body-file", body, "--output", out,
             "--flow", "plan", "--role", "coder", "--agent", "Codex",
-            "--round-number", "2", "--state", "approved", "--subject", "abc123",
+            "--round-number", "2", "--state", "approved", "--subject", "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "--raw-structured-coder-response-file", raw,
             "--approved-plan-hash", "0123456789abcdef",
             "--approved-plan-subject", "f" * 64,
@@ -4629,7 +4629,7 @@ class TestHostReviewer:
         manifest = {
             "role": "reviewer", "agent": "claude", "agent_cap": "Claude", "flow": "plan",
             "issue": 9996, "repo": "OWNER/REPO", "new_round_number": 1,
-            "round_subject": "abc123", "item_id_offset": 0,
+            "round_subject": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "item_id_offset": 0,
             "validate_kind": "plan_review", "dry_run": True,
         }
         (request_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -5259,7 +5259,7 @@ def _pr_fix_resume(*, state: str = "blocking", reviewer_names: list[str] | None 
     return {
         "round_number": 1,
         "completed_round_number": 1,
-        "current_plan_subject": "head-old",
+        "current_plan_subject": "4230a696dc78b001733ea26b27813c5e3461c3b0",
         "prior_items": [],
         "compact_prior_summaries": ["old summary"],
         "completed_reviewer_names": names,
@@ -5322,12 +5322,12 @@ class TestRunPrFix:
     def test_settled_gate_requires_current_subject_complete_blocking_review(self) -> None:
         from helpers.skill_runner import _pr_fix_gate
 
-        assert _pr_fix_gate(_pr_fix_resume(), ["codex"], "head-old") == (True, "")
-        allowed, reason = _pr_fix_gate(_pr_fix_resume(state="approved"), ["codex"], "head-old")
+        assert _pr_fix_gate(_pr_fix_resume(), ["codex"], "4230a696dc78b001733ea26b27813c5e3461c3b0") == (True, "")
+        allowed, reason = _pr_fix_gate(_pr_fix_resume(state="approved"), ["codex"], "4230a696dc78b001733ea26b27813c5e3461c3b0")
         assert not allowed and "no blocking" in reason
-        allowed, reason = _pr_fix_gate(_pr_fix_resume(reviewer_names=[]), ["codex"], "head-old")
+        allowed, reason = _pr_fix_gate(_pr_fix_resume(reviewer_names=[]), ["codex"], "4230a696dc78b001733ea26b27813c5e3461c3b0")
         assert not allowed and "reviewer set" in reason
-        allowed, reason = _pr_fix_gate(_pr_fix_resume(), ["codex"], "head-new")
+        allowed, reason = _pr_fix_gate(_pr_fix_resume(), ["codex"], "4c9e5811ced020e934e48e468090e0502cf6bca0")
         assert not allowed and "run-pr-round" in reason
 
     def test_empty_reviewer_data_noops_even_with_carried_prior_items(self) -> None:
@@ -5336,7 +5336,7 @@ class TestRunPrFix:
         resume = _pr_fix_resume(reviewer_names=["Codex"])
         resume["completed_reviewer_data"] = []
         resume["prior_items"] = [_pr_fix_item()]
-        allowed, reason = _pr_fix_gate(resume, ["codex"], "head-old")
+        allowed, reason = _pr_fix_gate(resume, ["codex"], "4230a696dc78b001733ea26b27813c5e3461c3b0")
         assert not allowed
         assert "reviewer data is unavailable" in reason
 
@@ -5344,7 +5344,7 @@ class TestRunPrFix:
         import helpers.skill_runner as sr
 
         monkeypatch.setattr(sr, "_fetch_pr_json", lambda repo, pr: {
-            "number": pr, "state": "CLOSED", "headRefOid": "head-old",
+            "number": pr, "state": "CLOSED", "headRefOid": "4230a696dc78b001733ea26b27813c5e3461c3b0",
         })
         monkeypatch.setattr(sr, "_build_resume", lambda *a, **k: pytest.fail("resume should not run"))
         monkeypatch.setattr(sr, "_position_pr_fix_workdir", lambda *a, **k: pytest.fail("workdir should not mutate"))
@@ -5372,14 +5372,14 @@ class TestRunPrFix:
             {
                 "number": 7,
                 "state": "OPEN",
-                "headRefOid": "head-old",
+                "headRefOid": "4230a696dc78b001733ea26b27813c5e3461c3b0",
                 "headRefName": "feature/pr",
                 "body": "Fixes #338",
             },
             {
                 "number": 7,
                 "state": "OPEN",
-                "headRefOid": "head-new",
+                "headRefOid": "4c9e5811ced020e934e48e468090e0502cf6bca0",
                 "headRefName": "feature/pr",
                 "body": "Fixes #338",
             },
@@ -5418,7 +5418,7 @@ class TestRunPrFix:
         seen = {"count": 0}
         def fake_git_head(workdir: str) -> str:
             seen["count"] += 1
-            return "head-old" if seen["count"] == 1 else "head-new"
+            return "4230a696dc78b001733ea26b27813c5e3461c3b0" if seen["count"] == 1 else "4c9e5811ced020e934e48e468090e0502cf6bca0"
         monkeypatch.setattr(sr, "_git_head", fake_git_head)
 
         requirement = _human_req()
@@ -5438,7 +5438,7 @@ class TestRunPrFix:
                 title="PR",
                 head_branch="feature/pr",
                 base_branch="main",
-                head_sha="head-old",
+                head_sha="4230a696dc78b001733ea26b27813c5e3461c3b0",
                 url=None,
             ),
             comments=(),
@@ -5466,8 +5466,8 @@ class TestRunPrFix:
         sr.cmd_run_pr_fix(args)
         output = json.loads(capsys.readouterr().out)
         assert output["state"] == "blocking"
-        assert output["previous_head_sha"] == "head-old"
-        assert output["head_sha"] == "head-new"
+        assert output["previous_head_sha"] == "4230a696dc78b001733ea26b27813c5e3461c3b0"
+        assert output["head_sha"] == "4c9e5811ced020e934e48e468090e0502cf6bca0"
         assert output["addressed_item_count"] == 1
         assert any(call[:2] == ("helpers.gh_ops", "post-issue-comment") for call in helper_calls)
         external_call = next(call for call in helper_calls if call[:1] == ("helpers.run_external",))
@@ -5487,14 +5487,14 @@ class TestRunPrFix:
             {
                 "number": 7,
                 "state": "OPEN",
-                "headRefOid": "head-old",
+                "headRefOid": "4230a696dc78b001733ea26b27813c5e3461c3b0",
                 "headRefName": "feature/pr",
                 "body": "",
             },
             {
                 "number": 7,
                 "state": "OPEN",
-                "headRefOid": "head-old",
+                "headRefOid": "4230a696dc78b001733ea26b27813c5e3461c3b0",
                 "headRefName": "feature/pr",
                 "body": "",
             },
@@ -5519,7 +5519,7 @@ class TestRunPrFix:
         monkeypatch.setattr(sr, "_reconcile_pending_comment", lambda *a, **k: None)
         monkeypatch.setattr(sr, "_position_pr_fix_workdir", lambda **kwargs: None)
         monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
-        monkeypatch.setattr(sr, "_git_head", lambda workdir: "head-old")
+        monkeypatch.setattr(sr, "_git_head", lambda workdir: "4230a696dc78b001733ea26b27813c5e3461c3b0")
 
         import coding_review_agent_loop.github as gh
         monkeypatch.setattr(
@@ -5532,7 +5532,7 @@ class TestRunPrFix:
                     title="PR",
                     head_branch="feature/pr",
                     base_branch="main",
-                    head_sha="head-old",
+                    head_sha="4230a696dc78b001733ea26b27813c5e3461c3b0",
                     url=None,
                 ),
                 comments=(),
@@ -5572,7 +5572,7 @@ class TestRunPrFix:
         monkeypatch.setattr(sr, "_fetch_pr_json", lambda repo, pr: {
             "number": pr,
             "state": "OPEN",
-            "headRefOid": "head-old",
+            "headRefOid": "4230a696dc78b001733ea26b27813c5e3461c3b0",
             "headRefName": "feature/pr",
             "body": "",
         })
@@ -5580,7 +5580,7 @@ class TestRunPrFix:
         monkeypatch.setattr(sr, "_reconcile_pending_comment", lambda *a, **k: None)
         monkeypatch.setattr(sr, "_position_pr_fix_workdir", lambda **kwargs: None)
         monkeypatch.setattr(sr, "_run_helper", fake_run_helper)
-        monkeypatch.setattr(sr, "_git_head", lambda workdir: "head-old")
+        monkeypatch.setattr(sr, "_git_head", lambda workdir: "4230a696dc78b001733ea26b27813c5e3461c3b0")
         monkeypatch.setattr(sr, "attempt_repair", lambda *a, **k: None)
 
         import coding_review_agent_loop.github as gh
@@ -5594,7 +5594,7 @@ class TestRunPrFix:
                     title="PR",
                     head_branch="feature/pr",
                     base_branch="main",
-                    head_sha="head-old",
+                    head_sha="4230a696dc78b001733ea26b27813c5e3461c3b0",
                     url=None,
                 ),
                 comments=(),
@@ -5682,7 +5682,7 @@ class TestRunImplement:
                 "number": 5,
                 "state": "OPEN",
                 "body": "Fixes #77",
-                "headRefOid": "head-after",
+                "headRefOid": "7ab89c7ef70e88833283299abfaf53385f304db5",
             },
             git_head="head-before",
         )
@@ -5725,7 +5725,7 @@ class TestRunImplement:
 
         # Use a stateful head probe: first invocation advances the assigned
         # checkout; a reuse invocation must return before probing it again.
-        heads = iter(("head-before", "head-after"))
+        heads = iter(("head-before", "7ab89c7ef70e88833283299abfaf53385f304db5"))
         monkeypatch.setattr(sr, "_git_head", lambda _workdir: next(heads))
         monkeypatch.setattr(
             "coding_review_agent_loop.github.get_issue_context",
@@ -5771,7 +5771,7 @@ class TestRunImplement:
 
         sr.cmd_run_implement(args)
         second_output = self._last_json(capsys.readouterr().out)
-        assert second_output == {"pr": 5, "head_sha": "head-after", "issue": 77, "reused": True}
+        assert second_output == {"pr": 5, "head_sha": "7ab89c7ef70e88833283299abfaf53385f304db5", "issue": 77, "reused": True}
         assert len([call for call in helper_calls if call[0] == "helpers.run_external"]) == len(helper_external_calls) == 1
         assert len([
             call for call in helper_calls
@@ -6532,7 +6532,7 @@ class TestRunImplementByPhase:
                 parent_ctx,
                 types.SimpleNamespace(repo="test/skill-repo"),
                 object(),
-                "abc123",
+                "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "Approved parent plan",
                 str(tmp_path),
             )
@@ -6579,7 +6579,7 @@ class TestRunImplementByPhase:
         marker = decomp.format_phase_implementation_handoff_comment(
             parent_issue=77,
             mode="implement-by-phase",
-            plan_hash="abc123",
+            plan_hash="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             phase_index=1,
             created=created,
         )
@@ -6596,7 +6596,7 @@ class TestRunImplementByPhase:
                 parent_ctx,
                 types.SimpleNamespace(repo="test/skill-repo"),
                 object(),
-                "abc123",
+                "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "Approved parent plan",
                 str(tmp_path),
             )
@@ -6629,7 +6629,7 @@ class TestRunImplementByPhase:
         )
         override_body = decomp.format_child_disposition_override_comment(
             parent_issue=77,
-            plan_hash="abc123",
+            plan_hash="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             stage_id="stage-one",
             disposition="requires-child-planning",
             rationale="Require a reviewed child plan.",
@@ -6653,7 +6653,7 @@ class TestRunImplementByPhase:
             "_run_decomposition_for_skill",
             lambda **_kwargs: (
                 self._fresh_decomposition_result(), (created,), parent_ctx,
-                types.SimpleNamespace(repo="test/skill-repo"), object(), "abc123",
+                types.SimpleNamespace(repo="test/skill-repo"), object(), "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "Approved parent plan", str(tmp_path),
             ),
         )
@@ -6706,7 +6706,7 @@ class TestRunImplementByPhase:
             lambda **_kwargs: (
                 self._fresh_decomposition_result(), (created,),
                 types.SimpleNamespace(comments=(), human_requirements=()),
-                types.SimpleNamespace(repo="test/skill-repo"), object(), "abc123",
+                types.SimpleNamespace(repo="test/skill-repo"), object(), "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "Approved parent plan", str(tmp_path),
             ),
         )
@@ -6745,7 +6745,7 @@ class TestRunImplementByPhase:
         marker = decomp.format_phase_implementation_handoff_comment(
             parent_issue=77,
             mode="implement-by-phase",
-            plan_hash="abc123",
+            plan_hash="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             phase_index=1,
             created=created,
             strategy="staged",
@@ -6769,7 +6769,7 @@ class TestRunImplementByPhase:
             "_run_decomposition_for_skill",
             lambda **_kwargs: (
                 self._fresh_decomposition_result(reused=True), (created,), parent_ctx,
-                types.SimpleNamespace(repo="test/skill-repo"), object(), "abc123",
+                types.SimpleNamespace(repo="test/skill-repo"), object(), "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "Approved parent plan", str(tmp_path),
             ),
         )
@@ -6813,7 +6813,7 @@ class TestRunImplementByPhase:
                 parent_ctx,
                 types.SimpleNamespace(repo="test/skill-repo"),
                 object(),
-                "abc123",
+                "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "Approved parent plan",
                 str(tmp_path),
             )
@@ -6851,7 +6851,7 @@ class TestRunImplementByPhase:
                 parent_ctx,
                 types.SimpleNamespace(repo="test/skill-repo"),
                 object(),
-                "abc123",
+                "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "Approved parent plan",
                 str(tmp_path),
             )

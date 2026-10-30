@@ -125,7 +125,7 @@ def _append_stray_checkpoint(runner, **changes):
         runner,
         _attach_round_metadata(
             "PR review scheduling audit: selected Codex; paused Gemini, Antigravity; "
-            "reason: remediation; phase: remediation; head: abc123.",
+            "reason: remediation; phase: remediation; head: 6367c48dd193d56ea7b0baad25b19455e529f5ee.",
             stray,
         ),
     )
@@ -422,7 +422,7 @@ def test_1553_parallel_reconciliation_only_items_survive_rollover(tmp_path):
 def test_1553_rollover_keeps_inert_ledger_records(tmp_path):
     """Row rollover-preserves-inert-records: converted finding and cleared tombstone."""
     _ledger, obligation, _ = _upsert_converted_evidence_obligation(
-        [], item_number=2, row_id="row-a", matrix_identity="ab" * 32, head_sha="abc123",
+        [], item_number=2, row_id="row-a", matrix_identity="ab" * 32, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         owners=("Codex", "Gemini"), source_round=1, explanation="canonical-status:missing",
     )
     tombstone = dataclasses.replace(obligation, lifecycle="cleared")
@@ -441,7 +441,7 @@ def test_1553_rollover_keeps_inert_ledger_records(tmp_path):
         return _attach_round_metadata(
             body,
             PostedRoundMetadata(
-                flow="pr", role=role, agent=agent, round_number=1, subject="abc123",
+                flow="pr", role=role, agent=agent, round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 prior_items=inert, **extra,
             ),
         )
@@ -578,7 +578,7 @@ def test_1553_existing_post_reconciliation_activation_is_lineage_only(tmp_path, 
         )
         encoded = PostedRoundMetadata(
             flow="pr", role="summary", agent="Orchestrator", round_number=2,
-            subject="abc123", prior_items=(ack,),
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", prior_items=(ack,),
         )
         from coding_review_agent_loop.round_transport import ROUND_RESUME_MARKER_RE, decode_mapping
 
@@ -652,7 +652,7 @@ def test_1553_rollover_at_the_round_limit_stops_with_the_round_limit_diagnostic(
     assert not isinstance(excinfo.value, review_rounds.PartialReviewRoundError)
     assert "Delete these" not in str(excinfo.value)
     expected = pr_loop._round_limit_diagnostic(
-        pr_number=77, round_number=2, items=[], current_head_sha="abc123",
+        pr_number=77, round_number=2, items=[], current_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     assert str(excinfo.value).startswith(expected.split("\n")[0][:40])
     assert _records_after(runner, reconciliation) == []
@@ -683,7 +683,7 @@ def test_1553_settlement_helper_matches_round_end_semantics():
     assert [item.item_id for item in settled] == ["item-2", "item-3"]
     assert future == []
     metadata = PostedRoundMetadata(
-        flow="pr", role="summary", agent="Orchestrator", round_number=2, subject="abc123",
+        flow="pr", role="summary", agent="Orchestrator", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         prior_items=(blocking, converted), dispositions=(resolved,), phase="reconciliation",
     )
     assert pr_loop._reconciliation_dispositions_by_item(metadata) == {

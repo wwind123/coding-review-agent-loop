@@ -26,7 +26,7 @@ def test_conservative_capture_reaches_qualification(tmp_path, monkeypatch, paral
     with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
     config = dataclasses.replace(config, review_parallel=parallel)
-    _push_external_head(runner, "fedcba9")
+    _push_external_head(runner, "6946a6f1ac1c65132a6a53600572ceb4af0ee23b")
     runner.advance_pr_head_on_coder_followup = False
     runner.claude_outputs.append(_coder())
     for name, outputs in [("OpenAI Codex", runner.codex_outputs),
@@ -90,10 +90,10 @@ def test_conservative_capture_reaches_qualification(tmp_path, monkeypatch, paral
         assert "tests/test_row-a.py::test_it" in _prompts(runner, command)[-1]
         assert "EVIDENCE-ONLY REVIEW" not in _prompts(runner, command)[-1]
     if fallback == "conflicting-owners":
-        assert capture_assignments(records, head="fedcba9", matrix_identity=context.risk_test_matrix_identity,
+        assert capture_assignments(records, head="6946a6f1ac1c65132a6a53600572ceb4af0ee23b", matrix_identity=context.risk_test_matrix_identity,
             required_reviewers=("Codex", "Gemini", "Antigravity"), primary="Codex",
             approvals={r.metadata.agent: r for r in reviews}) is None
-        assert full_capture_binding(records, head="fedcba9", matrix_identity=context.risk_test_matrix_identity)
+        assert full_capture_binding(records, head="6946a6f1ac1c65132a6a53600572ceb4af0ee23b", matrix_identity=context.risk_test_matrix_identity)
     runner.simulate_new_process()
     fresh, _, _, _ = loop._fresh_pr_qualification_snapshot(runner, config=config, pr_number=77,
         issue_context=loop.get_issue_context(runner, config=config, issue_number=56),

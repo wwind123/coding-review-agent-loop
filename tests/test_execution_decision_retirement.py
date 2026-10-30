@@ -53,7 +53,7 @@ class RetirementRunner(_M1087Runner):
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
         cmd = [str(a) for a in args]
         source = None
-        if cmd[:2] == ["gh", "api"] and cmd[2].startswith("repos/OWNER/REPO/pulls/") and cmd[2].split("/")[-1].isdigit():
+        if cmd[:2] == ["gh", "api"] and cmd[2].startswith("repos/OWNER/REPO/pulls/") and cmd[2].split("/")[-1].isdigit() and cmd[2].split("/")[-1] != "77":
             cmd, cwd_path = self._record_command(cmd, cwd)
             return CommandResult(cmd, cwd_path, json.dumps({"merged": True, "merged_at": "2026-05-21T00:00:00Z",
                 "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}}}), "", 0)
@@ -170,10 +170,10 @@ def test_uncertain_inventory_refuses_before_execution(tmp_path, source, fault):
 def old_record(kind):
     if kind == "pr":
         return d.format_one_shot_impl_handoff_comment(parent_issue=56, mode="implement-one-shot",
-            plan_hash=_M1087_STALE_HASH, plan_subject="old", pr_number=82, pr_head_sha="abc123")
+            plan_hash=_M1087_STALE_HASH, plan_subject="old", pr_number=82, pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     if kind == "canonical":
         return format_issue_pr_handoff_comment(issue_number=56, pr_number=82,
-            pr_url="https://github.com/OWNER/REPO/pull/82", pr_head_sha="abc123",
+            pr_url="https://github.com/OWNER/REPO/pull/82", pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             flow="approved-plan-implementation", plan_hash=_M1087_STALE_HASH)
     if kind == "split":
         metadata = s.SplitMaterializationMetadata(56, "old", (s.MaterializedSplitChild("Old", "a" * 64,
@@ -191,7 +191,7 @@ def old_record(kind):
 def test_comment_references_are_resolved_when_search_misses(tmp_path, kind, state):
     runner = RetirementRunner(issue_comments=[_m1087_stale_decision_comment(), comment(old_record(kind))],
         issue_payloads_by_number={90: child(state=state)} if state != "unreadable" else {},
-        pr_payloads_by_number={82: dict(pr(state=state), url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])} if state != "unreadable" else {},
+        pr_payloads_by_number={82: dict(pr(state=state), url="https://github.com/OWNER/REPO/pull/82", headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])} if state != "unreadable" else {},
         malformed_pr_view_numbers=[82] if state == "unreadable" else [])
     if state == "CLOSED":
         assert run(runner, tmp_path) == 0
@@ -228,14 +228,14 @@ def test_historical_child_implementation_pr_is_assessed(tmp_path, origin, associ
     initial_state = "MERGED" if lifecycle == "restart" else state
     implementation = dict(pr(83, initial_state), body="Fixes #90" if association == "closing-reference" else "",
         headRefName="agent-loop/managed-90" if association == "managed-branch" else "other-branch",
-        url="https://github.com/OWNER/REPO/pull/83", headRefOid="abc123", comments=[])
+        url="https://github.com/OWNER/REPO/pull/83", headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])
     handoff = format_issue_pr_handoff_comment(issue_number=90, pr_number=83,
-        pr_url=implementation["url"], pr_head_sha="abc123", flow="issue-implementation", plan_hash=None)
+        pr_url=implementation["url"], pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="issue-implementation", plan_hash=None)
     child_comments = [comment(handoff)] if association.startswith(("canonical-", "earlier-")) else []
     latest = dict(implementation, number=84, state="MERGED", url="https://github.com/OWNER/REPO/pull/84")
     if association.startswith("earlier-"):
         later_handoff = format_issue_pr_handoff_comment(issue_number=90, pr_number=84,
-            pr_url=latest["url"], pr_head_sha="abc123", flow="issue-implementation", plan_hash=None)
+            pr_url=latest["url"], pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="issue-implementation", plan_hash=None)
         if association == "earlier-same-comment":
             child_comments[0]["body"] += "\n" + later_handoff
         else:
@@ -350,7 +350,7 @@ def test_nonmutating_modes_do_not_retire_or_dispatch(tmp_path, mode, dry):
 @pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
 def test_terminal_canonical_entry_defers_only_for_proven_new_plan(tmp_path, state):
     runner = RetirementRunner(issue_comments=[_m1087_stale_decision_comment(), comment(old_record("canonical"))],
-        pr_payloads_by_number={82: dict(pr(state=state), url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])})
+        pr_payloads_by_number={82: dict(pr(state=state), url="https://github.com/OWNER/REPO/pull/82", headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])})
     assert run(runner, tmp_path) == 0
     assert _m1087_implementation_dispatched(runner)
     assert _m1087_posted_decisions(runner)[0].retires_plan_hashes == (_M1087_STALE_HASH,)
@@ -378,7 +378,7 @@ def test_plan_only_terminal_deferral_never_writes_split_scope(
         children=[child(90, "OPEN")], branch_exists=True,
         issue_comments=comments,
         pr_payloads_by_number={82: dict(pr(state=state),
-            url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])},
+            url="https://github.com/OWNER/REPO/pull/82", headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])},
         claude_outputs=[plan, "Implementation must not run."],
     )
     assert run(runner, tmp_path, plan_execution_mode="plan-only",
@@ -395,10 +395,10 @@ def test_plan_only_terminal_deferral_never_writes_split_scope(
 @pytest.mark.parametrize("state", ["CLOSED", "MERGED"])
 def test_terminal_canonical_direct_mode_still_refuses(tmp_path, state):
     body = format_issue_pr_handoff_comment(issue_number=56, pr_number=82,
-        pr_url="https://github.com/OWNER/REPO/pull/82", pr_head_sha="abc123",
+        pr_url="https://github.com/OWNER/REPO/pull/82", pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="issue-implementation", plan_hash=None)
     runner = RetirementRunner(issue_comments=[comment(body)],
-        pr_payloads_by_number={82: dict(pr(state=state), url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])})
+        pr_payloads_by_number={82: dict(pr(state=state), url="https://github.com/OWNER/REPO/pull/82", headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])})
     with pytest.raises(AgentLoopError, match="not OPEN"):
         run_issue_loop(runner, issue_number=56, config=make_config(tmp_path))
     no_dispatch(runner)
@@ -407,7 +407,7 @@ def test_terminal_canonical_direct_mode_still_refuses(tmp_path, state):
 
 def test_terminal_canonical_without_retirement_authority_still_refuses(tmp_path):
     runner = RetirementRunner(issue_comments=[comment(old_record("canonical"))],
-        pr_payloads_by_number={82: dict(pr(state="MERGED"), url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])})
+        pr_payloads_by_number={82: dict(pr(state="MERGED"), url="https://github.com/OWNER/REPO/pull/82", headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])})
     with pytest.raises(AgentLoopError, match="not OPEN"):
         run(runner, tmp_path)
     no_dispatch(runner)
@@ -428,7 +428,7 @@ def test_same_plan_terminal_canonical_does_not_dispatch_again(tmp_path, state):
 
 def test_restart_between_decision_and_replacement_handoff(tmp_path):
     runner = RetirementRunner(children=[child()], issue_comments=[_m1087_stale_decision_comment(), comment(old_record("split")), comment(old_record("canonical"), 2)],
-        pr_payloads_by_number={82: dict(pr(), url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])})
+        pr_payloads_by_number={82: dict(pr(), url="https://github.com/OWNER/REPO/pull/82", headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])})
     assert run(runner, tmp_path) == 0
     # Simulate death immediately after decision publication: planning and the
     # decision are durable, but all implementation handoffs have not happened.
@@ -529,11 +529,11 @@ def test_restart_hash_recurrence_uses_record_order_even_in_one_comment(tmp_path)
     current = _m1087_posted_decisions(runner)[0]
     old_a = _m1087_stale_decision_comment(current.plan_hash)["body"]
     old_pr = d.format_one_shot_impl_handoff_comment(parent_issue=56, mode="implement-one-shot",
-        plan_hash=current.plan_hash, plan_subject=current.plan_subject, pr_number=82, pr_head_sha="abc123")
+        plan_hash=current.plan_hash, plan_subject=current.plan_subject, pr_number=82, pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     middle_b = _m1087_stale_decision_comment(retires=[current.plan_hash])["body"]
     runner.issue_comments[0] = comment("\n".join([old_a, old_pr, middle_b]), 0)
     runner.pr_payloads_by_number[82] = dict(pr(state="CLOSED"),
-        url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])
+        url="https://github.com/OWNER/REPO/pull/82", headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])
     runner.prs = [pr(77, "OPEN")]
     runner.branch_exists = True
     assert run(runner, tmp_path) == 0
@@ -560,7 +560,7 @@ def test_hashless_split_marker_requires_a_resolved_terminal_child(tmp_path, stat
 
 def test_restart_recovers_provenanced_pr_created_before_replacement_handoff(tmp_path):
     runner = RetirementRunner(issue_comments=[_m1087_stale_decision_comment(), comment(old_record("canonical"))],
-        pr_payloads_by_number={82: dict(pr(), url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])})
+        pr_payloads_by_number={82: dict(pr(), url="https://github.com/OWNER/REPO/pull/82", headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])})
     assert run(runner, tmp_path) == 0
     runner.issue_comments = [c for c in runner.issue_comments if not (
         "AGENT_PLAN_ONE_SHOT_IMPL" in c["body"] or ("AGENT_ISSUE_PR_HANDOFF" in c["body"] and "PR #77" in c["body"]))]
@@ -636,7 +636,7 @@ def test_restart_attributes_post_retirement_split_children(tmp_path, source, han
 def test_legacy_plan_terminal_deferral_never_authorizes_writes(tmp_path, mode, state):
     from agent_loop_helpers import structured_plan_state
     runner = RetirementRunner(issue_comments=[_m1087_stale_decision_comment(), comment(old_record("canonical"))],
-        pr_payloads_by_number={82: dict(pr(state=state), url="https://github.com/OWNER/REPO/pull/82", headRefOid="abc123", comments=[])},
+        pr_payloads_by_number={82: dict(pr(state=state), url="https://github.com/OWNER/REPO/pull/82", headRefOid="6367c48dd193d56ea7b0baad25b19455e529f5ee", comments=[])},
         claude_outputs=[structured_plan_state(child_stages=[{"title": "New work", "summary": "Do work."}]),
                         "Implementation must not run."])
     with pytest.raises(AgentLoopError, match="not OPEN"):

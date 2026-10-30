@@ -7,6 +7,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError
+
 from .managed_ci_result import VerifiedManagedResult
 from .agent_failure import ValidatedAgentResponse
 
@@ -61,7 +63,6 @@ from .github import (
     get_issue_context,
     get_pr_mergeability,
     parse_linked_issue_numbers,
-    get_pr_review_context,
     merge_pr,
     merge_pr_comment_transport_identity,
     post_pr_comment,
@@ -288,7 +289,7 @@ def _merge_with_exact_head_proof(
             raise AgentLoopError(str(exc)) from exc
     live_head = get_pr_head_sha(runner, config, pr_number)
     if live_head != proof.head_sha:
-        live_head = get_pr_review_context(
+        live_head = get_observed_pr_review_context(
             runner, config=config, pr_number=pr_number
         ).metadata.head_sha
     if live_head != proof.head_sha:
@@ -723,7 +724,7 @@ def _finalize_ordinary_recovery_merge(
     capability = refreshed
     outcome = wait_for_ordinary_recovery(
         runner, config=config, capability=capability,
-        metadata=get_pr_review_context(runner, config=config, pr_number=pr_number).metadata,
+        metadata=get_observed_pr_review_context(runner, config=config, pr_number=pr_number).metadata,
     )
     if outcome.status != "passed":
         if outcome.status == "not_started":
@@ -1445,7 +1446,7 @@ def _sub_item_progress_already_posted(
         actor_login, actor_id = resolve_authenticated_github_actor(runner, config=config)
     except AgentLoopError:
         return False
-    comments = get_pr_review_context(runner, config=config, pr_number=pr_number).comments
+    comments = get_observed_pr_review_context(runner, config=config, pr_number=pr_number).comments
     for comment in comments:
         body = getattr(comment, "body", None)
         if not isinstance(body, str):
@@ -2166,7 +2167,7 @@ def _evidence_freeze_gate(
     run stops at the human decision boundary.  With nothing pending the
     caller proceeds to finalization.
     """
-    fresh = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    fresh = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
     if not head_sha or fresh.metadata.head_sha != head_sha:
         return _EvidenceGateOutcome("head_changed", fresh)
     live_ids = tuple(collect_requirement_ids(fresh))
@@ -2755,7 +2756,7 @@ def _record_coder_followup_rejection(
     writes nothing.  Never raises: the caller re-raises the original error.
     """
     try:
-        observed_head = get_pr_head_sha(runner, config, pr_number)
+        observed_head = get_observed_pr_review_context(runner, config=config, pr_number=pr_number).metadata.head_sha
         observed_head = (observed_head or "").strip()
         if not observed_head or (observed_head == pre_turn_head and not recovery_dispatch):
             return
@@ -3219,7 +3220,9 @@ def _post_reduced_board_completion_note(
 ) -> None:
     """Post one plain completion note per amendment digest (no round metadata)."""
     try:
-        comments = get_pr_review_context(runner, config=config, pr_number=pr_number).comments
+        comments = get_observed_pr_review_context(runner, config=config, pr_number=pr_number).comments
+    except PrHeadObservationError:
+        raise
     except AgentLoopError:
         comments = ()
     if any(
@@ -3453,7 +3456,7 @@ def _fresh_pr_qualification_snapshot(
         if approved_plan_context is not None
         else None
     )
-    context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+    context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
     approved_identity = _latest_pr_approval_architecture_identity(
         context.comments, head_sha=context.metadata.head_sha
     )
@@ -4037,9 +4040,11 @@ def _pr_step_back_decision(
         return PrStepBackDecision()
     try:
         fresh = _extract_round_metadata_records(
-            get_pr_review_context(runner, config=config, pr_number=pr_number).comments,
+            get_observed_pr_review_context(runner, config=config, pr_number=pr_number).comments,
             flow="pr",
         )
+    except PrHeadObservationError:
+        raise
     except AgentLoopError as exc:
         log(config, f"PR step-back suppressed: fresh round history is unavailable ({exc})")
         return PrStepBackDecision()
@@ -4395,7 +4400,7 @@ def _authenticated_pr_comments_status(
     barrier rather than treat the missing authority as absent (#1325).
     """
     if comments is None:
-        comments = get_pr_review_context(runner, config=config, pr_number=pr_number).comments
+        comments = get_observed_pr_review_context(runner, config=config, pr_number=pr_number).comments
     comments = tuple(comments)
     try:
         records = _extract_round_metadata_records(comments, flow="pr")
@@ -4589,11 +4594,13 @@ def _reconcile_converted_evidence(
     if records is None:
         try:
             raw_records = _extract_round_metadata_records(
-                comments if comments is not None else get_pr_review_context(
+                comments if comments is not None else get_observed_pr_review_context(
                     runner, config=config, pr_number=pr_number
                 ).comments,
                 flow="pr",
             )
+        except PrHeadObservationError:
+            raise
         except AgentLoopError:
             raw_records = ()
         if not any(_is_row_converted_obligation(item) for item in ledger) and not any(

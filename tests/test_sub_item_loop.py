@@ -285,9 +285,9 @@ def test_repair_path_keeps_sub_items(tmp_path, monkeypatch):
     )
     metadata = PullRequestMetadata(
         number=77, repo="OWNER/REPO", title="t", head_branch="feature/x",
-        base_branch="main", head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+        base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url="https://github.com/OWNER/REPO/pull/77",
     )
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "get_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop), "get_observed_pr_review_context",
         lambda *_a, **_k: PullRequestReviewContext(
             metadata=dataclasses.replace(metadata, head_sha=runner.pr_payload["headRefOid"]),
             comments=(), human_requirements=(requirement,),

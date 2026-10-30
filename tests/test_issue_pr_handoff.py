@@ -723,7 +723,7 @@ def test_unversioned_keyless_plan_is_never_recovered_even_without_requirements(t
     runner = FakeRunner(
         issue_comments=_plain_plan_comments(plan, (("Codex", "approved"),), versioned=False),
         pr_payload={
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
@@ -774,7 +774,7 @@ def test_rootless_plan_change_digest_never_verifies_on_legacy_paths(tmp_path, mo
     else:
         handoff = pr_loop_support_module.AuthenticatedIssueCreatedHandoff(
             pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-            head_sha="abc123", branch="agent-loop/managed-56",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56",
             trusted_actor_login="agent-loop", trusted_actor_id=1,
             protection_mode="voluntary", override_nonce="opening-nonce",
         )
@@ -786,7 +786,7 @@ def test_rootless_plan_change_digest_never_verifies_on_legacy_paths(tmp_path, mo
     runner = FakeRunner(
         issue_comments=forged,
         pr_payload={
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
@@ -836,7 +836,7 @@ def _managed_plan_issue_runner(plan, approvals):
     return FakeRunner(
         issue_comments=_plain_plan_comments(plan, approvals),
         pr_payload={
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
@@ -875,7 +875,7 @@ def test_managed_ci_recovery_verifies_plan_board_not_pr_board(tmp_path, monkeypa
     # Ordinary resume without an issue-side handoff.
     handoff = pr_loop_support_module.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="abc123", branch="agent-loop/managed-56",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="voluntary", override_nonce="opening-nonce",
     )
@@ -903,7 +903,7 @@ def _metadata(**overrides) -> IssuePrHandoffMetadata:
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="issue-implementation",
         plan_hash=None,
     )
@@ -914,7 +914,7 @@ def _metadata(**overrides) -> IssuePrHandoffMetadata:
 def _commit_page(
     messages,
     *,
-    head="abc123",
+    head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     total=None,
     has_next=False,
     cursor=None,
@@ -971,7 +971,7 @@ def test_round_trips_complete_expected_closing_set_and_supersession_lineage():
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="issue-implementation",
         plan_hash=None,
         expected_closing_issue_ids=(56, 57),
@@ -1011,7 +1011,7 @@ def test_find_latest_issue_pr_handoff_ignores_records_for_other_issues():
         issue_number=99,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="issue-implementation",
         plan_hash=None,
     )
@@ -1177,7 +1177,7 @@ def test_require_pr_metadata_for_handoff_raises_on_missing_url():
         title="Title",
         head_branch="feature",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url=None,
     )
     with pytest.raises(AgentLoopError, match="PR URL is unavailable"):
@@ -1205,12 +1205,12 @@ def test_require_pr_metadata_for_handoff_returns_tuple_when_present():
         title="Title",
         head_branch="feature",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/77",
     )
     assert require_pr_metadata_for_handoff(metadata) == (
         "https://github.com/OWNER/REPO/pull/77",
-        "abc123",
+        "6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
 
 
@@ -1379,7 +1379,7 @@ def test_single_candidate_recovery_distinguishes_commit_query_unavailability(tmp
 @pytest.mark.parametrize(
     "changed_page",
     [
-        _commit_page(["second"], head="def456", total=2, oid_start=2),
+        _commit_page(["second"], head="0b3d8b29493059afd7f9912106279c4643ac4939", total=2, oid_start=2),
         _commit_page(["second"], total=3, oid_start=2),
     ],
     ids=["head", "total"],
@@ -1396,7 +1396,7 @@ def test_commit_connection_rejects_history_change_during_pagination(tmp_path, ch
 @pytest.mark.parametrize(
     "final_page",
     [
-        _commit_page(["first"], head="def456"),
+        _commit_page(["first"], head="0b3d8b29493059afd7f9912106279c4643ac4939"),
         _commit_page(["first"], total=2),
     ],
     ids=["head", "total"],
@@ -1488,7 +1488,7 @@ _M936_URL = "https://github.com/OWNER/REPO/pull/77"
 
 def _m936_handoff(plan_hash, *, ids=(56,), supersedes=None):
     return _comment(format_issue_pr_handoff_comment(
-        issue_number=56, pr_number=77, pr_url=_M936_URL, pr_head_sha="abc123",
+        issue_number=56, pr_number=77, pr_url=_M936_URL, pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation", plan_hash=plan_hash,
         expected_closing_issue_ids=ids, supersedes_hash=supersedes,
     ))
@@ -2131,7 +2131,7 @@ def _strict_managed_pr_run(tmp_path, monkeypatch, issue_comments, *, entry, pr_o
 
     handoff = AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="abc123", branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
         trusted_actor_id=1, protection_mode="strict", override_nonce=None,
     )
     monkeypatch.setattr(pr_loop_module, "recover_issue_created_handoff", lambda *a, **k: handoff)
@@ -2142,7 +2142,7 @@ def _strict_managed_pr_run(tmp_path, monkeypatch, issue_comments, *, entry, pr_o
     monkeypatch.setattr(pr_loop_module, "dispatch_final_qualification", lambda *a, **k: None)
     monkeypatch.setattr(
         pr_loop_module, "wait_for_final_qualification",
-        lambda *a, **k: ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *a, **k: ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     monkeypatch.setattr(pr_loop_module, "prepare_v2_merge", lambda *a, **k: None)
     merges = []
@@ -2207,7 +2207,7 @@ def test_staged_plan_by_board_a_qualifies_strict_pr_reviewed_by_board_b(
     reviews = [comment for comment in runner.comments if "**Review verdict:**" in comment]
     assert len(reviews) == 2
     # Strict qualification re-verified the board A plan and merged the exact head once.
-    assert [merge["proof"].head_sha for merge in merges] == ["abc123"]
+    assert [merge["proof"].head_sha for merge in merges] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
 
 
 @pytest.mark.parametrize("entry", ["ordinary", "fresh"])
@@ -2562,7 +2562,7 @@ def test_recovery_refuses_approvals_superseded_by_a_model_round_trip(tmp_path, m
     )
     runner = FakeRunner(
         issue_comments=history,
-        pr_payload={"headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+        pr_payload={"headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                     "baseRefName": "main", "body": "Fixes #56"},
     )
     with pytest.raises(AgentLoopError, match="complete canonical|lineage is inconsistent"):
@@ -2682,7 +2682,7 @@ def test_board_changed_plan_verifies_against_b_and_qualifies_a_pr_board_c(
     # Board C reviewed the exact head; planning was never reopened.
     agents = [command[0] for command, _cwd in runner.commands if command[0] in _AGENT_COMMANDS]
     assert sorted(agents) == ["agy", "claude"]
-    assert [merge["proof"].head_sha for merge in merges] == ["abc123"]
+    assert [merge["proof"].head_sha for merge in merges] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
     # The PR handoff audit record compares board C against the approving board B.
     (audit,) = _audits(runner)
     assert "- Added reviewer(s): Claude" in audit

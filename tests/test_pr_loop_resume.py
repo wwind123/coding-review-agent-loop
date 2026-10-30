@@ -86,7 +86,7 @@ def test_resume_pr_round_reparses_orchestrator_rendered_blocking_issues_comment(
             role="reviewer",
             agent="Codex",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
             dispositions=(),
             new_items=(),
@@ -100,7 +100,7 @@ def test_resume_pr_round_reparses_orchestrator_rendered_blocking_issues_comment(
             role="coder",
             agent="Claude",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
         ),
     )
@@ -110,7 +110,7 @@ def test_resume_pr_round_reparses_orchestrator_rendered_blocking_issues_comment(
             IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=coder_comment),
             IssueComment(author="bot", created_at="2026-05-25T00:01:00Z", body=review_comment),
         ],
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         configured_reviewers=("codex",),
     )
 
@@ -158,7 +158,7 @@ def test_resume_pr_round_prefers_structured_coder_followup_metadata():
             role="coder",
             agent="Claude",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
             raw_structured_coder_response=raw_structured_followup,
         ),
@@ -166,7 +166,7 @@ def test_resume_pr_round_prefers_structured_coder_followup_metadata():
 
     resumed = _resume_pr_round(
         [IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=coder_comment)],
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         configured_reviewers=("codex",),
     )
 
@@ -189,7 +189,7 @@ def test_resume_pr_round_recovers_summary_only_qualification_checkpoint():
         authority="machine",
         obligation_kind="managed-exact-head-ci",
         lifecycle="repair_required",
-        failed_head_sha="failed-head",
+        failed_head_sha="0109780857a5f763d3dacdb5f43c546d6776b3ba",
         candidate_head_sha=None,
         obligation_identity="managed-exact-head-ci:item-30",
     )
@@ -197,7 +197,7 @@ def test_resume_pr_round_recovers_summary_only_qualification_checkpoint():
         obligation_kind="managed-exact-head-ci",
         obligation_identity=item.obligation_identity,
         lifecycle="repair_required",
-        failed_head_sha="failed-head",
+        failed_head_sha="0109780857a5f763d3dacdb5f43c546d6776b3ba",
         candidate_head_sha=None,
         base_branch="main",
         watch_failure_extension_used=True,
@@ -210,7 +210,7 @@ def test_resume_pr_round_recovers_summary_only_qualification_checkpoint():
             role="summary",
             agent="Orchestrator",
             round_number=2,
-            subject="failed-head",
+            subject="0109780857a5f763d3dacdb5f43c546d6776b3ba",
             prior_items=(item,),
             state="blocking",
             phase="qualification-checkpoint",
@@ -220,7 +220,7 @@ def test_resume_pr_round_recovers_summary_only_qualification_checkpoint():
 
     resumed = _resume_pr_round(
         [IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=summary_comment)],
-        head_sha="failed-head",
+        head_sha="0109780857a5f763d3dacdb5f43c546d6776b3ba",
         configured_reviewers=("codex",),
     )
 
@@ -258,7 +258,7 @@ def test_pr_loop_resume_after_interrupted_coder_keeps_failed_head_and_budget(
     config = make_config(tmp_path, auto_merge=False, watch_pending_ci=False, max_rounds=3)
 
     def checks(*args, **kwargs):
-        if kwargs["metadata"].head_sha == "abc123":
+        if kwargs["metadata"].head_sha == "6367c48dd193d56ea7b0baad25b19455e529f5ee":
             return _watch_check_board("failing", failing=(failed,))
         return _watch_check_board("passing")
 
@@ -317,7 +317,7 @@ def test_resume_pr_round_marks_empty_ledger_incomplete_after_same_subject_prior_
             role="reviewer",
             agent="Codex",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(),
             new_items=(prior_new_item,),
             state="blocking",
@@ -330,7 +330,7 @@ def test_resume_pr_round_marks_empty_ledger_incomplete_after_same_subject_prior_
             role="coder",
             agent="Claude",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(),
         ),
     )
@@ -340,7 +340,7 @@ def test_resume_pr_round_marks_empty_ledger_incomplete_after_same_subject_prior_
             IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=prior_review_comment),
             IssueComment(author="bot", created_at="2026-05-25T00:01:00Z", body=current_coder_comment),
         ],
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         configured_reviewers=("codex",),
     )
 
@@ -352,7 +352,7 @@ def test_resume_pr_round_does_not_mark_ledger_incomplete_for_cross_subject_prior
         item_id="item-1",
         reviewer="OpenAI Codex",
         source_round=1,
-        text="Prior other-head item.",
+        text="Prior 5e6741348108b11e3f3ef936c335b1967d17ac6c item.",
         status="blocking",
     )
     prior_review_comment = _attach_round_metadata(
@@ -375,7 +375,7 @@ def test_resume_pr_round_does_not_mark_ledger_incomplete_for_cross_subject_prior
             role="coder",
             agent="Claude",
             round_number=1,
-            subject="new-sha",
+            subject="fd2d39cf710f84ca537091424fc212fa5211885b",
             prior_items=(),
         ),
     )
@@ -385,7 +385,7 @@ def test_resume_pr_round_does_not_mark_ledger_incomplete_for_cross_subject_prior
             IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=prior_review_comment),
             IssueComment(author="bot", created_at="2026-05-25T00:01:00Z", body=current_coder_comment),
         ],
-        head_sha="new-sha",
+        head_sha="fd2d39cf710f84ca537091424fc212fa5211885b",
         configured_reviewers=("codex",),
     )
 
@@ -430,7 +430,7 @@ def test_resume_pr_round_recovers_unrecorded_head_advance_reviewer_new_item():
             IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=coder_comment),
             IssueComment(author="bot", created_at="2026-05-25T00:01:00Z", body=review_comment),
         ],
-        head_sha="new-sha",
+        head_sha="fd2d39cf710f84ca537091424fc212fa5211885b",
         configured_reviewers=("gemini",),
     )
 
@@ -489,7 +489,7 @@ def test_resume_pr_round_recovers_parallel_reconciliation_new_items_after_head_a
             IssueComment(author="bot", created_at="2026-05-25T00:01:00Z", body=publication_comment),
             IssueComment(author="bot", created_at="2026-05-25T00:02:00Z", body=reconciliation_comment),
         ],
-        head_sha="new-sha",
+        head_sha="fd2d39cf710f84ca537091424fc212fa5211885b",
         configured_reviewers=("codex",),
     )
 
@@ -528,7 +528,7 @@ def test_resume_pr_round_recovers_coder_only_unrecorded_head_advance():
 
     resumed = _resume_pr_round(
         [IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=coder_comment)],
-        head_sha="new-sha",
+        head_sha="fd2d39cf710f84ca537091424fc212fa5211885b",
         configured_reviewers=("codex",),
     )
 
@@ -613,7 +613,7 @@ def test_resume_pr_round_recovers_reviewer_only_with_aggregated_dispositions():
             IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=codex_comment),
             IssueComment(author="bot", created_at="2026-05-25T00:01:00Z", body=gemini_comment),
         ],
-        head_sha="new-sha",
+        head_sha="fd2d39cf710f84ca537091424fc212fa5211885b",
         configured_reviewers=("codex", "gemini"),
     )
 
@@ -648,7 +648,7 @@ def test_resume_pr_round_ignores_unrecorded_head_advance_with_no_active_items():
     assert (
         _resume_pr_round(
             [IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=review_comment)],
-            head_sha="new-sha",
+            head_sha="fd2d39cf710f84ca537091424fc212fa5211885b",
             configured_reviewers=("codex",),
         )
         is None
@@ -670,12 +670,12 @@ def test_resume_pr_round_fails_early_for_incoherent_unrecorded_head_advance():
         AgentLoopError,
         match=(
             "PR head advanced without a recorded coder follow-up.*"
-            "Current head: new-sha.*Latest recorded metadata subject: old-sha"
+            "Current head: fd2d39cf710f84ca537091424fc212fa5211885b.*Latest recorded metadata subject: old-sha"
         ),
     ):
         _resume_pr_round(
             [IssueComment(author="bot", created_at="2026-05-25T00:00:00Z", body=bad_comment)],
-            head_sha="new-sha",
+            head_sha="fd2d39cf710f84ca537091424fc212fa5211885b",
             configured_reviewers=("codex",),
         )
 
@@ -703,7 +703,7 @@ def test_resume_pr_round_prefers_latest_metadata_ledger_for_same_head_replay():
             role="coder",
             agent="Claude",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(stale_item,),
         ),
     )
@@ -716,7 +716,7 @@ def test_resume_pr_round_prefers_latest_metadata_ledger_for_same_head_replay():
             role="reviewer",
             agent="Codex",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(stale_item,),
             dispositions=(
                 parse_unresolved_item_dispositions(
@@ -734,7 +734,7 @@ def test_resume_pr_round_prefers_latest_metadata_ledger_for_same_head_replay():
             role="coder",
             agent="Claude",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(active_item,),
         ),
     )
@@ -747,7 +747,7 @@ def test_resume_pr_round_prefers_latest_metadata_ledger_for_same_head_replay():
             role="reviewer",
             agent="Gemini",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(active_item,),
             dispositions=(
                 parse_unresolved_item_dispositions(
@@ -786,7 +786,7 @@ def test_resume_pr_round_prefers_latest_metadata_ledger_for_same_head_replay():
             IssueComment(author="bot", created_at="2026-05-25T00:03:00Z", body=active_coder_comment),
             IssueComment(author="bot", created_at="2026-05-25T00:04:00Z", body=active_reviewer_comment),
         ],
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         configured_reviewers=("codex", "gemini"),
     )
 
@@ -819,7 +819,7 @@ def test_pr_loop_resume_hybrid_history_prefers_metadata_ledger_over_legacy_markd
             role="coder",
             agent="Claude",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
         ),
     )
@@ -832,7 +832,7 @@ def test_pr_loop_resume_hybrid_history_prefers_metadata_ledger_over_legacy_markd
             role="reviewer",
             agent="Codex",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
             dispositions=(
                 parse_unresolved_item_dispositions(
@@ -887,13 +887,13 @@ def test_pr_resume_preserves_persisted_failure_in_next_coder_metadata(tmp_path):
         "receipt_id": "persisted-failure",
         "turn_id": "old-turn",
         "environment": "equivalent",
-        "attribution": {"state": "current-head", "head": "abc123", "stable": True, "tracked_digest": "tree-a"},
+        "attribution": {"state": "current-head", "head": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "stable": True, "tracked_digest": "tree-a"},
     }]})
     coder_comment = _attach_round_metadata(
         structured_coder_followup(remaining_items=["item-1"]),
         PostedRoundMetadata(
             flow="pr", role="coder", agent="Claude", round_number=1,
-            subject="abc123", prior_items=(item,), local_test_evidence=prior_evidence,
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", prior_items=(item,), local_test_evidence=prior_evidence,
             raw_structured_coder_response=structured_coder_followup(remaining_items=["item-1"]),
         ),
     )
@@ -905,7 +905,7 @@ def test_pr_resume_preserves_persisted_failure_in_next_coder_metadata(tmp_path):
         ),
         PostedRoundMetadata(
             flow="pr", role="reviewer", agent="Codex", round_number=1,
-            subject="abc123", prior_items=(item,), state="blocking",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", prior_items=(item,), state="blocking",
             dispositions=(ReviewItemDisposition("item-1", "OpenAI Codex", "blocking", "Fix it."),),
         ),
     )
@@ -989,7 +989,7 @@ def test_pr_loop_routes_unrecorded_head_advance_through_coder_before_reviewers(t
             )
         ],
         pr_payload={
-            "headRefOid": "new-sha",
+            "headRefOid": "fd2d39cf710f84ca537091424fc212fa5211885b",
             "comments": [
                 {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:00:00Z", "body": old_coder_comment},
                 {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:01:00Z", "body": old_review_comment},
@@ -1015,7 +1015,7 @@ def test_pr_loop_routes_unrecorded_head_advance_through_coder_before_reviewers(t
     match = re.search(r"<!--\s*AGENT_LOOP_META:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->", posted_coder_comment)
     assert match is not None
     metadata = _decode_round_metadata(match.group("payload"))
-    assert metadata.subject == "new-sha"
+    assert metadata.subject == "fd2d39cf710f84ca537091424fc212fa5211885b"
     assert metadata.round_number == 2
     assert [item.item_id for item in metadata.prior_items] == ["item-2"]
 
@@ -1057,7 +1057,7 @@ def test_pr_loop_unrecorded_head_advance_prevents_empty_ledger_unknown_item_abor
             )
         ],
         pr_payload={
-            "headRefOid": "new-sha",
+            "headRefOid": "fd2d39cf710f84ca537091424fc212fa5211885b",
             "comments": [
                 {"author": {"login": "bot"}, "createdAt": "2026-05-20T09:01:00Z", "body": old_review_comment},
             ],
@@ -1276,7 +1276,7 @@ def _seeded_resume_runner_959(plan_context, *, anchor_mutation=None, full_round=
             role="coder",
             agent="Claude",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
             raw_structured_coder_response=raw_coder,
             risk_test_matrix_evidence=evidence,
@@ -1300,7 +1300,7 @@ def _seeded_resume_runner_959(plan_context, *, anchor_mutation=None, full_round=
             role="reviewer",
             agent="Codex",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
             dispositions=(
                 ReviewItemDisposition("item-1", "OpenAI Codex", "blocking", "Still open."),
@@ -1315,7 +1315,7 @@ def _seeded_resume_runner_959(plan_context, *, anchor_mutation=None, full_round=
         # Resume re-reviews first, so every review carries the item-1 disposition.
         codex_outputs=_blocking_reviews_959(2)[1:],
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [
                 {"author": {"login": "bot"}, "createdAt": "2026-06-01T00:00:00Z", "body": coder_comment},
                 {"author": {"login": "bot"}, "createdAt": "2026-06-01T00:01:00Z", "body": review_comment},
@@ -1453,7 +1453,7 @@ def test_ack_legacy_resume_board_clearance_without_coder_ack(tmp_path, monkeypat
     history = ack_origin_history(ack_resume_history(promoted=promoted), carrier)
     partial_resume = _resume_pr_round(
         [IssueComment(author="bot", created_at=None, body=b) for b in history],
-        head_sha="abc123", configured_reviewers=("codex", "gemini"),
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", configured_reviewers=("codex", "gemini"),
     )
     assert partial_resume.completed_reviews, partial_resume
     snapshots = _capture_ack_blockers(monkeypatch)
@@ -1474,7 +1474,7 @@ def test_ack_legacy_resume_board_clearance_without_coder_ack(tmp_path, monkeypat
     assert {i.item_id for i in snapshots[-1]} == ({"item-2"} if complete_board else {ACK_ID, "item-2"})
     assert not any(cmd[0] in {"claude", "pytest"} for cmd, _ in runner.commands)
     comments = [IssueComment(author="bot", created_at=None, body=b) for b in history]
-    resumed = _resume_pr_round(comments, head_sha="abc123", configured_reviewers=("codex", "gemini"))
+    resumed = _resume_pr_round(comments, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", configured_reviewers=("codex", "gemini"))
     assert resumed.next_unresolved_item_number == 14
     assert [d.item_id for d in resumed.completed_reviews[0].metadata.dispositions] == [ACK_ID, "item-2"]
     # Persist the settled ledger just as a later coder checkpoint does, then
@@ -1483,7 +1483,7 @@ def test_ack_legacy_resume_board_clearance_without_coder_ack(tmp_path, monkeypat
     for _ in range(2):
         restart = _resume_pr_round(
             [*comments, IssueComment(author="bot", created_at=None, body=checkpoint)],
-            head_sha="abc123", configured_reviewers=("codex", "gemini"),
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", configured_reviewers=("codex", "gemini"),
         )
         assert {i.item_id for i in restart.prior_items} == {i.item_id for i in snapshots[-1]}
         assert restart.next_unresolved_item_number == 14
@@ -1531,7 +1531,7 @@ def test_ack_conflicting_alias_resume_retains_machine_gate_and_notes(tmp_path, m
 
 
 @pytest.mark.parametrize("round_number", [1, 5])
-@pytest.mark.parametrize("head", ["abc123", "new-head"])
+@pytest.mark.parametrize("head", ["6367c48dd193d56ea7b0baad25b19455e529f5ee", "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"])
 @pytest.mark.parametrize("prelaunch", [False, True])
 def test_ack_failure_boundary_excludes_same_ledger_earlier_reviews(round_number, head, prelaunch):
     prior = (dedicated_ack(), unrelated_item())
@@ -1558,12 +1558,41 @@ def test_ack_failure_boundary_excludes_same_ledger_earlier_reviews(round_number,
     comments = [IssueComment(author="bot", created_at=None, body=b) for b in history]
     records = _extract_round_metadata_records(comments, flow="pr")
     assert drop_inert_post_reconciliation_checkpoints(records) == records
-    assert _latest_prior_pr_subject_is_coherent(records, head_sha="new-head")
+    assert _latest_prior_pr_subject_is_coherent(records, head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
     resumed = _resume_pr_round(comments, head_sha=head, configured_reviewers=("codex",))
     assert resumed.next_unresolved_item_number == 100
-    assert resumed.unrecorded_head_advance == (head != "abc123")
+    assert resumed.unrecorded_head_advance == (head != "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert resumed.round_number == round_number
     assert resumed.prior_items == prior
     assert resumed.coder_output is None
     assert resumed.completed_reviews == ()
     assert not resumed.reconciled
+
+
+@pytest.mark.parametrize('fresh', [False, True])
+def test_resume_desync_stops_before_entry_writes(tmp_path, fresh):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    runner = FakeRunner()
+    runner.branch_tip = 'b' * 40
+    config = make_config(tmp_path, managed_ci=fresh)
+    with pytest.raises(PrHeadObservationError, match='desync'):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not runner.comments
+    assert not any(cmd[:2] in (['claude', '--print'], ['codex', 'exec']) for cmd, _ in runner.commands)
+    assert not any('--method' in cmd and 'POST' in cmd for cmd, _ in runner.commands)
+
+
+def test_entry_transient_lag_uses_latest_complete_context(tmp_path):
+    runner = FakeRunner(codex_outputs=[structured_pr_review(state='approved')])
+    runner.branch_tip = 'b' * 40
+    original = runner.run
+    def run(args, **kwargs):
+        if args == ['sleep', '2']:
+            runner.pr_payload.update(headRefOid='b' * 40, title='Coherent title')
+        return original(args, **kwargs)
+    runner.run = run
+    assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path)) == 0
+    prompt = next(cmd[-1] for cmd, _ in runner.commands if cmd[:2] == ['codex', 'exec'])
+    assert 'Coherent title' in prompt
+    assert 'b' * 40 in prompt
+    assert len([cmd for cmd, _ in runner.commands if cmd == ['sleep', '2']]) == 1

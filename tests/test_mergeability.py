@@ -255,22 +255,22 @@ def test_reconcile_adds_blocking_item_when_conflicted():
         state="conflicted",
         mergeable_raw="CONFLICTING",
         merge_state_raw="DIRTY",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         base_branch="main",
     )
 
     items = _reconcile_merge_conflict_item(
-        [], mergeability=mergeability, source_round=1, current_head_sha="abc123"
+        [], mergeability=mergeability, source_round=1, current_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
 
     assert len(items) == 1
     assert items[0].item_id == MERGE_CONFLICT_ITEM_ID
     assert items[0].status == "blocking"
     assert "main" in items[0].text
-    assert "abc123" in items[0].text
+    assert "6367c48dd193d56ea7b0baad25b19455e529f5ee" in items[0].text
     # The confirmed head is recorded so a later transient `unknown` probe on
     # the same head can be told apart from a genuinely resolved conflict.
-    assert any("abc123" in note for note in items[0].notes)
+    assert any("6367c48dd193d56ea7b0baad25b19455e529f5ee" in note for note in items[0].notes)
 
 
 def test_reconcile_clears_item_when_mergeable():
@@ -327,7 +327,7 @@ def test_reconcile_preserves_confirmed_conflict_when_unknown_on_same_head():
             text="PR branch has a merge conflict with `main`.",
             status="blocking",
             source_status="blocking",
-            notes=("confirmed-head:abc123",),
+            notes=("confirmed-head:6367c48dd193d56ea7b0baad25b19455e529f5ee",),
         )
     ]
     mergeability = PullRequestMergeability(
@@ -335,7 +335,7 @@ def test_reconcile_preserves_confirmed_conflict_when_unknown_on_same_head():
     )
 
     items = _reconcile_merge_conflict_item(
-        prior, mergeability=mergeability, source_round=2, current_head_sha="abc123"
+        prior, mergeability=mergeability, source_round=2, current_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
 
     assert len(items) == 1
@@ -356,7 +356,7 @@ def test_reconcile_clears_item_when_unknown_after_head_advanced():
             text="PR branch has a merge conflict with `main`.",
             status="blocking",
             source_status="blocking",
-            notes=("confirmed-head:abc123",),
+            notes=("confirmed-head:6367c48dd193d56ea7b0baad25b19455e529f5ee",),
         )
     ]
     mergeability = PullRequestMergeability(
@@ -364,7 +364,7 @@ def test_reconcile_clears_item_when_unknown_after_head_advanced():
     )
 
     items = _reconcile_merge_conflict_item(
-        prior, mergeability=mergeability, source_round=2, current_head_sha="def456"
+        prior, mergeability=mergeability, source_round=2, current_head_sha="0b3d8b29493059afd7f9912106279c4643ac4939"
     )
 
     assert items == []

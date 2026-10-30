@@ -6,6 +6,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError, observe_pr_head
+
 from .review_scope import is_complete_code_review
 from .capture_dispatch import narrow_capture_scopes, scoped_review_items, scoped_validator, select_capture_reviewers, capture_review_recovery, is_resumable_capture_review
 from .converted_capture import recovery_capture, capture_feedback, recheck_capture, capture_review_context, admitted_capture_history
@@ -131,7 +133,6 @@ from .github import (
     get_pr_mergeability,
     parse_linked_issue_numbers,
     get_pr_checks,
-    get_pr_review_context,
     post_pr_comment,
     post_trusted_pr_comment,
     read_rest_issue_comments,
@@ -834,7 +835,7 @@ def run_pr_loop(
     )
     try:
         bootstrap_cwd = github_bootstrap_cwd(config)
-        initial_pr_context = get_pr_review_context(
+        initial_pr_context = get_observed_pr_review_context(
             runner,
             config=config,
             pr_number=pr_number,
@@ -920,7 +921,7 @@ def run_pr_loop(
         if release_retained_managed_label(
             runner, config=config, pr_number=pr_number, cwd=bootstrap_cwd,
         ):
-            initial_pr_context = get_pr_review_context(
+            initial_pr_context = get_observed_pr_review_context(
                 runner,
                 config=config,
                 pr_number=pr_number,
@@ -3148,7 +3149,7 @@ def run_pr_loop(
             nonlocal initial_pr_context, prefetched_pr_context, resumed_round
             nonlocal pending_conversion_pass, issue_context_refreshed
             nonlocal parent_issue_context_refreshed
-            context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+            context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
             pending_conversion_pass = True
             discard_pre_conversion_spool(current_round, context.metadata.head_sha)
             resumed_round = None
@@ -3223,10 +3224,10 @@ def run_pr_loop(
             if round_number == start_round_number:
                 pr_context = initial_pr_context
             elif prefetched_pr_context is not None:
-                pr_context = prefetched_pr_context
+                pr_context = observe_pr_head(runner, config=config, pr_number=pr_number, context=prefetched_pr_context)
                 prefetched_pr_context = None
             else:
-                pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+                pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
             initial_pr_context = pr_context
             pr_metadata = pr_context.metadata
             historical_inputs_stale = False
@@ -3493,15 +3494,14 @@ def run_pr_loop(
                     if current_resume is not None:
                         current_resume = dataclasses_replace(current_resume, completed_reviews=())
                     discard_pre_conversion_spool(round_number, pr_metadata.head_sha)
-                    # The round's base snapshot must hold the conversion record,
-                    # as the auto path's staging re-read already does, so its
-                    # visibility boundary resolves (#1664).  A failed refresh
-                    # keeps the old snapshot; the fallback then carries this
-                    # process's own record.
+                    # Refresh conversion visibility (#1664); transport failures
+                    # retain our record, but observation stops must propagate.
                     try:
-                        refreshed_pr_context = get_pr_review_context(
+                        refreshed_pr_context = get_observed_pr_review_context(
                             runner, config=config, pr_number=pr_number
                         )
+                    except PrHeadObservationError:
+                        raise
                     except AgentLoopError as exc:
                         log(
                             config,
@@ -5129,15 +5129,15 @@ def run_pr_loop(
                 # (#1156).  Visibility is read from the complete history with
                 # this invocation's own checkpoint included, so opening
                 # evidence is never stale.
-                # A failed transport read falls back to the pre-post history plus
-                # the posted checkpoint; history that was read but cannot be
-                # decoded makes visibility unknowable, so stop before any
-                # reviewer launches (as the round-start decode failure does).
+                # Transport failure retains the posted checkpoint; an observation
+                # stop or undecodable history forbids reviewer launches.
                 pr_fresh_records: tuple[PostedRoundRecord, ...] | None = None
                 try:
-                    pr_fresh_comments = get_pr_review_context(
+                    pr_fresh_comments = get_observed_pr_review_context(
                         runner, config=config, pr_number=pr_number
                     ).comments
+                except PrHeadObservationError:
+                    raise
                 except AgentLoopError:
                     pr_fresh_comments = None
                 try:
@@ -6458,7 +6458,7 @@ def run_pr_loop(
                             shared_outage_backends=frozenset(outage_backends),
                             seat_binding_config=config,
                             fetch_start_round=lambda: _pr_amendment_start_round(
-                                get_pr_review_context(runner, config=config, pr_number=pr_number),
+                                get_observed_pr_review_context(runner, config=config, pr_number=pr_number),
                                 configured_reviewers,
                                 scheduler_capabilities,
                                 runner=runner, config=config,
@@ -7651,7 +7651,7 @@ def run_pr_loop(
                             watch_head_extension_used = True
                         resumed_round = None
                         current_resume = None
-                        prefetched_pr_context = get_pr_review_context(
+                        prefetched_pr_context = get_observed_pr_review_context(
                             runner, config=config, pr_number=pr_number
                         )
                         unresolved_items = _advance_machine_obligations_for_head(
@@ -8249,7 +8249,7 @@ def run_pr_loop(
                                     )
                                     resumed_round = None
                                     current_resume = None
-                                    prefetched_pr_context = get_pr_review_context(
+                                    prefetched_pr_context = get_observed_pr_review_context(
                                         runner, config=config, pr_number=pr_number
                                     )
                                     unresolved_items = _advance_machine_obligations_for_head(
@@ -8484,7 +8484,7 @@ def run_pr_loop(
                                     watch_head_extension_used = True
                                 resumed_round = None
                                 current_resume = None
-                                prefetched_pr_context = get_pr_review_context(
+                                prefetched_pr_context = get_observed_pr_review_context(
                                     runner, config=config, pr_number=pr_number
                                 )
                                 unresolved_items = _advance_machine_obligations_for_head(
@@ -9437,7 +9437,9 @@ def run_pr_loop(
                     human_requirements=human_requirements,
                     source_round=round_number,
                 )
-                updated_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+                updated_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number,
+                    origin=managed_ci.origin if managed_ci else "ordinary",
+                    issue_number=managed_ci_handoff.issue_number if managed_ci_handoff else None)
                 unresolved_items = _advance_machine_obligations_for_head(
                     unresolved_items,
                     current_head_sha=updated_pr_context.metadata.head_sha,
@@ -9467,7 +9469,7 @@ def run_pr_loop(
                             _closed_execution_catalog=coder_response.acquisition_test_observations,
                             _journal_observations=coder_response.acquisition_test_observations,
                             assigned_worktree_head=assigned_worktree_head_after_followup,
-                            reauthenticate_head=lambda: get_pr_review_context(
+                            reauthenticate_head=lambda: get_observed_pr_review_context(
                                 runner, config=config, pr_number=pr_number
                             ).metadata.head_sha,
                         )
@@ -9700,6 +9702,8 @@ def run_pr_loop(
                         config, result=coder_response.marker_value
                     ),
                 )
+            except PrHeadObservationError:
+                raise
             except AgentLoopError as coder_followup_error:
                 if coder_ci_guarded:
                     # A rejected guarded turn (a failed format repair, or a
@@ -9884,7 +9888,7 @@ def run_pr_loop(
             # The result snapshot predates the coder publication. Capture
             # eligibility must see that publication on the very next pass.
             prefetched_pr_context = (
-                get_pr_review_context(runner, config=config, pr_number=pr_number)
+                get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
                 if any(item.converted_row_id for item in latest_coder_metadata.prior_items)
                 else updated_pr_context
             )

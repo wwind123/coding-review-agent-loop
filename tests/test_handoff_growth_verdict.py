@@ -47,7 +47,7 @@ def _verdict(status="compliant", *, gate="enforce", crossed=()):
 
 def _handoff(plan_hash, verdict=None, *, flow="approved-plan-implementation"):
     return format_issue_pr_handoff_comment(
-        issue_number=56, pr_number=77, pr_url=PR_URL, pr_head_sha="abc123",
+        issue_number=56, pr_number=77, pr_url=PR_URL, pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow=flow, plan_hash=plan_hash, plan_growth_verdict=verdict,
     )
 
@@ -277,7 +277,7 @@ def _managed_config(tmp_path, **overrides):
     )
 
 
-_MANAGED_PR = {"headRefName": "agent-loop/managed-56", "headRefOid": "abc123", "baseRefName": "main"}
+_MANAGED_PR = {"headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "baseRefName": "main"}
 
 
 def _no_retired_plans(monkeypatch):
@@ -314,7 +314,7 @@ def test_managed_ordinary_resume_applies_the_recorded_verdict(
     runner = _runner(verdict, **_MANAGED_PR)
     handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="abc123", branch="agent-loop/managed-56",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="voluntary", override_nonce="opening-nonce",
     )

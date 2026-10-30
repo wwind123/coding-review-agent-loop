@@ -382,7 +382,7 @@ def test_managed_implementation_rejected_during_correction_still_publishes_dispa
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     bypass = {
         "id": 9001, "name": "CI", "display_title": "CI", "event": "workflow_dispatch",
-        "head_sha": "correction-head", "head_branch": "agent-loop/managed-56", "created_at": now,
+        "head_sha": "ac6d2e52d9d919e0a3a8517c2805378d6c1e15f2", "head_branch": "agent-loop/managed-56", "created_at": now,
         "html_url": "https://github.com/OWNER/REPO/actions/runs/9001",
         "repository": {"full_name": "OWNER/REPO"},
     }
@@ -403,7 +403,7 @@ def test_managed_implementation_rejected_during_correction_still_publishes_dispa
         if "Coder-turn CI dispatch audit" in item.get("body", "")
     ]
     assert len(notes) == 1
-    assert "run 9001 on `correction-head`" in notes[0]
+    assert "run 9001 on `ac6d2e52d9d919e0a3a8517c2805378d6c1e15f2`" in notes[0]
     assert "non-authoritative diagnostic, not qualification" in notes[0]
     assert "coder response for this turn was rejected" in notes[0]
     assert h.run_pr_calls == []  # no review, qualification or dispatch follows

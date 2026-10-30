@@ -140,7 +140,7 @@ def test_pr_loop_requires_all_reviewers_to_approve(tmp_path):
     ]
     assert len(metadata_fetches) == 1
     assert ["pytest", "tests/test_agent_loop.py"] in commands
-    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"] in commands
+    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "6367c48dd193d56ea7b0baad25b19455e529f5ee"] in commands
 
 
 def test_pr_loop_skips_prior_approval_when_pr_head_is_unchanged(tmp_path):
@@ -876,7 +876,7 @@ def test_pr_loop_resumes_with_only_missing_reviewer_for_current_head(tmp_path):
             role="coder",
             agent="Claude",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
         ),
     )
@@ -889,7 +889,7 @@ def test_pr_loop_resumes_with_only_missing_reviewer_for_current_head(tmp_path):
             role="reviewer",
             agent="Codex",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
             dispositions=(
                 parse_unresolved_item_dispositions(
@@ -939,7 +939,7 @@ def test_pr_loop_resume_raises_agent_loop_error_for_missing_reconstructed_prior_
             role="coder",
             agent="Claude",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
         ),
     )
@@ -957,7 +957,7 @@ def test_pr_loop_resume_raises_agent_loop_error_for_missing_reconstructed_prior_
             role="reviewer",
             agent="Codex",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
             dispositions=(invalid_disposition,),
             state="approved",

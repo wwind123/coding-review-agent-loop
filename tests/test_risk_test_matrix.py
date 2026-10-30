@@ -99,7 +99,7 @@ def _derived_observation(
         turn_id=turn_id,
         attribution={
             "state": "current-head",
-            "head": "head-current",
+            "head": "e3511bc949d4c1aa1f2550273a19bcc680402f62",
             "tracked_digest": "tree-current",
             "stable": True,
             "untracked_input": False,
@@ -135,9 +135,9 @@ def test_derived_matrix_evidence_is_complete_and_selector_citations_are_tool_own
         claims=claims,
         observations=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -175,9 +175,9 @@ def test_one_shared_selector_verifies_every_row_it_covers() -> None:
         claims=claims,
         observations=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -214,9 +214,9 @@ def test_builder_reports_dropped_unapproved_row_claims() -> None:
         claims=claims,
         observations=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -292,9 +292,9 @@ def test_stage_owning_no_rows_drops_sibling_claim_and_names_owners() -> None:
         claims=parsed.risk_test_matrix_claims,
         observations=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
         execution_owner=scoped.risk_test_matrix_execution_owner,
@@ -369,9 +369,9 @@ def test_builder_downgrades_incomplete_semantic_facts(field) -> None:
         claims=claim,
         observations=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -390,9 +390,9 @@ def _derive_for_claims(matrix, claims):
         claims=claims,
         observations=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -473,9 +473,9 @@ def test_derived_matrix_evidence_preserves_unsuperseded_failure_caveat() -> None
         claims=claim,
         observations=(passing, failed),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -527,7 +527,7 @@ def test_orchestrator_derivation_ignores_prior_turn_failure(monkeypatch, tmp_pat
         response_validation,
         "stable_tracked_tree_snapshot",
         lambda _cwd: SimpleNamespace(
-            head="head-current", tracked_digest="tree-current", complete=True,
+            head="e3511bc949d4c1aa1f2550273a19bcc680402f62", tracked_digest="tree-current", complete=True,
             stable=True, status_clean=True,
         ),
     )
@@ -545,7 +545,7 @@ def test_orchestrator_derivation_ignores_prior_turn_failure(monkeypatch, tmp_pat
         approved_plan_context=plan_context,
         runner=runner,
         assigned_workdir=tmp_path,
-        head_sha="head-current",
+        head_sha="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         invocation_id="turn-current",
         _closed_execution_catalog=(current_pass,),
     )
@@ -608,7 +608,7 @@ def test_orchestrator_derivation_excludes_out_of_checkout_broker_runs(
         response_validation,
         "stable_tracked_tree_snapshot",
         lambda _cwd: SimpleNamespace(
-            head="head-current", tracked_digest="tree-current", complete=True,
+            head="e3511bc949d4c1aa1f2550273a19bcc680402f62", tracked_digest="tree-current", complete=True,
             stable=True, status_clean=True,
         ),
     )
@@ -625,7 +625,7 @@ def test_orchestrator_derivation_excludes_out_of_checkout_broker_runs(
         approved_plan_context=plan_context,
         runner=runner,
         assigned_workdir=tmp_path,
-        head_sha="head-current",
+        head_sha="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         invocation_id="turn-current",
         _closed_execution_catalog=catalog,
     )
@@ -702,7 +702,7 @@ def test_orchestrator_derivation_keeps_unvalidatable_failures_in_journal(
         response_validation,
         "stable_tracked_tree_snapshot",
         lambda _cwd: SimpleNamespace(
-            head="head-current", tracked_digest="tree-current", complete=True,
+            head="e3511bc949d4c1aa1f2550273a19bcc680402f62", tracked_digest="tree-current", complete=True,
             stable=True, status_clean=True,
         ),
     )
@@ -719,7 +719,7 @@ def test_orchestrator_derivation_keeps_unvalidatable_failures_in_journal(
         approved_plan_context=plan_context,
         runner=runner,
         assigned_workdir=tmp_path,
-        head_sha="head-current",
+        head_sha="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         invocation_id="turn-current",
         _closed_execution_catalog=catalog,
     )
@@ -752,7 +752,7 @@ def test_derived_matrix_evidence_rejects_a_matching_tree_from_the_wrong_checkout
         claims=claim,
         observations=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
         authenticated_checkout_head="head-other",
         authenticated_tree_clean=True,
@@ -785,7 +785,7 @@ def test_derived_matrix_evidence_requires_explicit_post_authentication_proof() -
         claims=claim,
         observations=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -835,7 +835,7 @@ def test_unchanged_head_receipt_with_clean_checkout_is_verified() -> None:
         execution_ref="invocation:observation-1", receipt_id="receipt-1"
     )
 
-    result = _derive_at_head(observation, current_head="head-current")
+    result = _derive_at_head(observation, current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62")
 
     row = result.evidence.rows[0]
     assert row.status == "verified"
@@ -849,12 +849,12 @@ def test_unchanged_head_keeps_the_clean_tree_and_digest_proofs() -> None:
         execution_ref="invocation:observation-1", receipt_id="receipt-1"
     )
 
-    dirty = _derive_at_head(observation, current_head="head-current", tree_clean=False)
+    dirty = _derive_at_head(observation, current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62", tree_clean=False)
     assert dirty.evidence.rows[0].status == "stale/unverified"
     assert dirty.evidence.rows[0].evidence_citations == ()
     assert any(d.code == "checkout-tree-unavailable" for d in dirty.diagnostics)
 
-    other_tree = _derive_at_head(observation, current_head="head-current", tree="tree-edited")
+    other_tree = _derive_at_head(observation, current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62", tree="tree-edited")
     assert other_tree.evidence.rows[0].status != "verified"
     assert any(d.code == "tree-mismatch" for d in other_tree.diagnostics)
 
@@ -866,7 +866,7 @@ def test_unpushed_local_commit_is_rejected_as_checkout_head_mismatch() -> None:
     )
 
     result = _derive_at_head(
-        observation, current_head="head-current", checkout_head="head-local-unpushed"
+        observation, current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62", checkout_head="head-local-unpushed"
     )
 
     row = result.evidence.rows[0]
@@ -885,17 +885,17 @@ def test_moved_head_verifies_new_head_evidence_and_rejects_old_head_evidence() -
     new_receipt = _derived_observation(
         execution_ref="invocation:observation-1", receipt_id="receipt-new"
     )
-    new_receipt.attribution = {**new_receipt.attribution, "head": "head-new"}
+    new_receipt.attribution = {**new_receipt.attribution, "head": "4c9e5811ced020e934e48e468090e0502cf6bca0"}
     old_receipt = _derived_observation(
         execution_ref="invocation:observation-2", receipt_id="receipt-old"
     )
-    old_receipt.attribution = {**old_receipt.attribution, "head": "head-old"}
+    old_receipt.attribution = {**old_receipt.attribution, "head": "4230a696dc78b001733ea26b27813c5e3461c3b0"}
 
-    verified = _derive_at_head(new_receipt, current_head="head-new")
+    verified = _derive_at_head(new_receipt, current_head="4c9e5811ced020e934e48e468090e0502cf6bca0")
     assert verified.evidence.rows[0].status == "verified"
     assert not any(d.code == "checkout-head-mismatch" for d in verified.diagnostics)
 
-    rejected = _derive_at_head(old_receipt, current_head="head-new")
+    rejected = _derive_at_head(old_receipt, current_head="4c9e5811ced020e934e48e468090e0502cf6bca0")
     assert rejected.evidence.rows[0].status != "verified"
     assert rejected.evidence.rows[0].evidence_citations == ()
     assert any(d.code == "head-mismatch" for d in rejected.diagnostics)
@@ -907,9 +907,9 @@ def test_moved_head_with_checkout_left_at_old_head_is_checkout_head_mismatch() -
     old_receipt = _derived_observation(
         execution_ref="invocation:observation-1", receipt_id="receipt-old"
     )
-    old_receipt.attribution = {**old_receipt.attribution, "head": "head-old"}
+    old_receipt.attribution = {**old_receipt.attribution, "head": "4230a696dc78b001733ea26b27813c5e3461c3b0"}
 
-    result = _derive_at_head(old_receipt, current_head="head-new", checkout_head="head-old")
+    result = _derive_at_head(old_receipt, current_head="4c9e5811ced020e934e48e468090e0502cf6bca0", checkout_head="4230a696dc78b001733ea26b27813c5e3461c3b0")
 
     assert result.evidence.rows[0].status != "verified"
     assert any(d.code == "checkout-head-mismatch" for d in result.diagnostics)
@@ -921,7 +921,7 @@ def test_missing_current_head_is_still_rejected() -> None:
         execution_ref="invocation:observation-1", receipt_id="receipt-1"
     )
 
-    result = _derive_at_head(observation, current_head=None, checkout_head="head-current")
+    result = _derive_at_head(observation, current_head=None, checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62")
 
     assert result.evidence.rows[0].status != "verified"
     assert any(d.code == "checkout-head-mismatch" for d in result.diagnostics)
@@ -963,9 +963,9 @@ def test_derived_matrix_evidence_cannot_resolve_a_cross_turn_selector_from_the_j
         observations=(old_observation,),
         execution_catalog=(),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -1002,9 +1002,9 @@ def test_derived_matrix_evidence_turns_dropped_selectors_into_unknown_ref_diagno
         observations=(observation,),
         execution_catalog=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -1048,7 +1048,7 @@ def test_post_authentication_head_race_downgrades_correction_output(monkeypatch,
         normalized_command="python3 -m pytest tests/test_protocol.py -q",
         attribution=TreeAttribution(
             state="current-head",
-            head="head-current",
+            head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
             tracked_digest="tree-current",
             stable=True,
         ),
@@ -1121,10 +1121,10 @@ def test_post_authentication_head_race_downgrades_correction_output(monkeypatch,
         approved_plan_context=context,
         runner=FakeRunner(),
         assigned_workdir=tmp_path,
-        head_sha="head-current",
+        head_sha="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         config=SimpleNamespace(coder="codex", coder_test_command_timeout_seconds=1),
         session_id="coder-session",
-        reauthenticate_head=lambda: "head-new",
+        reauthenticate_head=lambda: "4c9e5811ced020e934e48e468090e0502cf6bca0",
     )
 
     assert result is not None
@@ -2341,9 +2341,9 @@ def test_truncated_semantic_claim_parses_but_never_derives_as_verified() -> None
         claims=parsed.risk_test_matrix_claims,
         observations=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -2378,9 +2378,9 @@ def test_untruncated_semantic_claim_still_verifies() -> None:
         claims=claims,
         observations=(observation,),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -2425,9 +2425,9 @@ def _parse_and_derive_926(claims, *, row_ids, matrix=None):
         claims=parsed.risk_test_matrix_claims,
         observations=tuple(catalog),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -2762,9 +2762,9 @@ def test_correction_keeps_distinct_drops_at_the_same_index_926() -> None:
         claims=claims,
         observations=tuple(catalog),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -2941,9 +2941,9 @@ def _derive_927(parsed):
         observations=_CATALOG_927,
         execution_catalog=_CATALOG_927,
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(_matrix_927()),
     )
@@ -3475,9 +3475,9 @@ def _derive_with(observations):
         claims=claim,
         observations=observations,
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     )
@@ -3528,9 +3528,9 @@ def _derive_1300(parsed, observations):
         observations=observations,
         execution_catalog=observations,
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(_matrix_927()),
     )
@@ -3751,9 +3751,9 @@ def _tool_evidence(matrix):
             _derived_observation(execution_ref="invocation:o-2", receipt_id="r-2"),
         ),
         invocation_id="turn-current",
-        current_head="head-current",
+        current_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         current_tree_digest="tree-current",
-        authenticated_checkout_head="head-current",
+        authenticated_checkout_head="e3511bc949d4c1aa1f2550273a19bcc680402f62",
         authenticated_tree_clean=True,
         expected_identity=risk_test_matrix_identity(matrix),
     ).evidence

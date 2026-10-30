@@ -81,7 +81,7 @@ def _integration_pr(**extra):
 
 
 def test_issue_and_branch_creation_preflight_reads_main_only(tmp_path):
-    runner = IntegrationRunner(rest_pr=_integration_pr(), pr_payload={"headRefOid": "abc123"})
+    runner = IntegrationRunner(rest_pr=_integration_pr(), pr_payload={"headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
     for kwargs in ({"issue_number": 643}, {"branch": "agent-loop/managed-direct-1-tok"}):
         intent = preflight_managed_ci_creation(runner, config=_config(tmp_path), **kwargs)
         assert intent is not None
@@ -134,7 +134,7 @@ def test_existing_pr_adoption_and_resume_read_main_only(tmp_path, fresh_resume):
         rest_pr={
             "draft": False, "state": "open", "base": {"ref": INTEGRATION},
             "user": {"login": "someone", "id": 55},
-            "head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "abc123", "ref": "feature"},
+            "head": {"repo": {"full_name": "OWNER/REPO"}, "sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "ref": "feature"},
             "labels": [{"name": "agent-loop-managed"}] if fresh_resume else [],
         },
         issue_events=[label_event()] if fresh_resume else [],

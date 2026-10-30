@@ -192,13 +192,13 @@ def _checkpoint(**overrides):
         role="summary",
         agent="Orchestrator",
         round_number=2,
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         phase="scheduler-prelaunch",
         scheduler_contract=make_contract(
             ("Codex", "Claude"), "selective-intermediate", None
         ).as_dict(),
         scheduler_previous_sha=None,
-        scheduler_current_sha="abc123",
+        scheduler_current_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         scheduler_obligation_digest="0" * 16,
         scheduler_selected_reviewers=("Codex", "Claude"),
         scheduler_reasons=("full board",),
@@ -413,7 +413,7 @@ from coding_review_agent_loop.unresolved_items import (  # noqa: E402
     freeze_evidence_obligations,
 )
 
-_FROZEN_HEAD = "abc123"
+_FROZEN_HEAD = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
 
 
 def _evidence_ledger(*, frozen=True):
@@ -540,7 +540,7 @@ def test_external_push_after_freeze_releases_evidence_and_marks_broken_head():
     """Row external-push-breaks-freeze (recovery unit)."""
     ledger = _evidence_ledger()
     resumed = _resume_pr_round(
-        _comments(_freeze_metadata(ledger)), head_sha="def456", configured_reviewers=("codex",)
+        _comments(_freeze_metadata(ledger)), head_sha="0b3d8b29493059afd7f9912106279c4643ac4939", configured_reviewers=("codex",)
     )
     assert resumed is not None
     assert resumed.unrecorded_head_advance is True
@@ -1331,15 +1331,15 @@ def test_board_identity_fields_are_flow_scoped_and_paired(flow, fields):
     )
 
     payload = {"flow": flow, "role": "reviewer", "agent": "Codex", "round_number": 1,
-               "subject": "abc123", **fields}
+               "subject": "6367c48dd193d56ea7b0baad25b19455e529f5ee", **fields}
     with pytest.raises(AgentLoopError, match="Invalid AGENT_LOOP_META payload"):
         _decode_round_metadata_mapping(payload)
     with pytest.raises(ValueError):
         PostedRoundMetadata(flow=flow, role="reviewer", agent="Codex", round_number=1,
-                            subject="abc123", **fields)
+                            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", **fields)
     # A well-formed plan record round-trips its plan board fields through the encoder.
     good = PostedRoundMetadata(
-        flow="plan", role="reviewer", agent="Codex", round_number=1, subject="abc123",
+        flow="plan", role="reviewer", agent="Codex", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         plan_board_root=_PLAN_ROOT, plan_board_identity=_PLAN_ROOT,
     )
     (record,) = _extract_round_metadata_records(
@@ -2130,16 +2130,16 @@ def test_open_prelaunch_checkpoint_preserves_later_round_identity(round_number, 
     history = []
     if round_number > 1:
         history = [
-            _reviewer(subject="abc123", new_items=(_item(8),)),
-            _summary("reconciliation", "abc123", 1),
+            _reviewer(subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", new_items=(_item(8),)),
+            _summary("reconciliation", "6367c48dd193d56ea7b0baad25b19455e529f5ee", 1),
         ]
     if qualification:
         history.append(_summary(
-            "qualification-checkpoint", "abc123", 1,
+            "qualification-checkpoint", "6367c48dd193d56ea7b0baad25b19455e529f5ee", 1,
             qualification_checkpoint=_legacy_checkpoint(),
         ))
     history.append(_checkpoint(round_number=round_number, prior_items=(_item(),)))
-    resumed = _resume(history, "abc123")
+    resumed = _resume(history, "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     if round_number == 1 and not qualification:
         assert resumed is None
         return

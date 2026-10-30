@@ -6,6 +6,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError
+
 import datetime
 import sys
 from dataclasses import replace as dataclasses_replace
@@ -36,7 +38,6 @@ from .github import (
     publish_rejected_coder_turn_dispatch_audit,
     deduplicate_human_requirements,
     get_issue_context,
-    get_pr_review_context,
     post_pr_comment,
     post_trusted_pr_contract_record,
     post_trusted_pr_comment,
@@ -730,7 +731,7 @@ def run_issue_loop(
             # explicit managed recovery. The PR loop authenticates the
             # authorization record independently of this legacy association.
             if resolved_pr.source == "legacy-closing-reference":
-                pr_context = get_pr_review_context(runner, config=config, pr_number=resolved_pr.pr_number)
+                pr_context = get_observed_pr_review_context(runner, config=config, pr_number=resolved_pr.pr_number)
                 validate_pr_expected_closing_issues(
                     runner,
                     config=config,
@@ -1015,7 +1016,7 @@ def run_issue_loop(
         )
         log(config, f"{agent_display_name(config.coder)} reported PR #{pr_number}; validating it is open")
         validate_open_pr(runner, config=config, pr_number=pr_number)
-        initial_pr_context = get_pr_review_context(runner, config=config, pr_number=pr_number)
+        initial_pr_context = get_observed_pr_review_context(runner, config=config, pr_number=pr_number)
         # Once the managed draft is authenticated, a rejection of this turn
         # (for example a failed report validation or a checkout failure during
         # semantic correction) still publishes the dispatch audit (#1366).
@@ -1131,7 +1132,7 @@ def run_issue_loop(
                 invocation_id=coder_response.acquisition_test_turn_id,
                 _closed_execution_catalog=coder_response.acquisition_test_observations,
                 _journal_observations=coder_response.acquisition_test_observations,
-                reauthenticate_head=lambda: get_pr_review_context(
+                reauthenticate_head=lambda: get_observed_pr_review_context(
                     runner, config=config, pr_number=pr_number
                 ).metadata.head_sha,
             )
@@ -1140,6 +1141,8 @@ def run_issue_loop(
                 legacy_tests_run=implementation_result.tests_run,
                 cwd=active_workdir(config),
             )
+        except PrHeadObservationError:
+            raise
         except AgentLoopError:
             if managed_pr_authenticated and managed_ci_creation_intent is not None:
                 publish_rejected_coder_turn_dispatch_audit(
@@ -1351,7 +1354,7 @@ def run_task_loop(
                 )
                 log(config, f"{coder_name} reported PR #{pr_number}; validating it is open")
                 validate_open_pr(runner, config=config, pr_number=pr_number)
-                initial_pr_metadata = get_pr_review_context(runner, config=config, pr_number=pr_number).metadata
+                initial_pr_metadata = get_observed_pr_review_context(runner, config=config, pr_number=pr_number).metadata
                 post_pr_comment(
                     runner,
                     config=config,

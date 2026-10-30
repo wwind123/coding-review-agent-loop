@@ -4674,7 +4674,7 @@ def _remediation_gate_state(tmp_path, monkeypatch):
     runner = _panel_pr_runner()
     config = _panel_pr_config(tmp_path, max_rounds=8)
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    runner.pr_payload["headRefOid"] = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     with patch_object_in((pr_loop_support, pr_loop, issue_loop), "post_pr_comment",
         side_effect=_interrupt_on_phase(pr_loop_support.post_pr_comment, "reconciliation"),
     ):
@@ -4687,7 +4687,7 @@ def _remediation_phases(runner):
     """Scheduler phases posted for the new head, asserting they all sit in one round."""
     records = [
         r for r in _records(runner, flow="pr", surface="pr")
-        if r.subject == "def456" and r.phase == "scheduler-prelaunch"
+        if r.subject == "0b3d8b29493059afd7f9912106279c4643ac4939" and r.phase == "scheduler-prelaunch"
     ]
     assert len({r.round_number for r in records}) <= 1, "the run advanced to another round"
     return [r.scheduler_phase for r in records]
@@ -4708,12 +4708,12 @@ def test_pr_remediation_gate_resumed_into_a_same_round_final_sweep_launches_the_
     assert sorted(runner.reviewer_launches[launches_before:]) == ["agy", "gemini"]
     primary = [
         r for r in _records(runner, flow="pr", surface="pr")
-        if r.subject == "def456" and r.role == "reviewer" and r.agent == "Codex"
+        if r.subject == "0b3d8b29493059afd7f9912106279c4643ac4939" and r.role == "reviewer" and r.agent == "Codex"
     ]
     assert len(primary) == 1
     assert {r.round_number for r in primary} == {
         r.round_number for r in _records(runner, flow="pr", surface="pr")
-        if r.subject == "def456" and r.scheduler_phase == "final-secondary-sweep"
+        if r.subject == "0b3d8b29493059afd7f9912106279c4643ac4939" and r.scheduler_phase == "final-secondary-sweep"
     }
 
 
@@ -4744,7 +4744,7 @@ def test_pr_remediation_gate_is_never_listed_but_the_sweep_peers_are(tmp_path, m
     # actually published for the new head rather than assuming one.
     published = {
         r.agent for r in _records(runner, flow="pr", surface="pr")
-        if r.subject == "def456" and r.role == "reviewer" and r.scheduler_phase == "final-secondary-sweep"
+        if r.subject == "0b3d8b29493059afd7f9912106279c4643ac4939" and r.role == "reviewer" and r.scheduler_phase == "final-secondary-sweep"
     }
     assert len(published) == 1 and published <= {"Gemini", "Antigravity"}
     assert ("reviewer", next(iter(published)), "final-secondary-sweep") in listed

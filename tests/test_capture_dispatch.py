@@ -25,12 +25,12 @@ def test_capture_dispatch_preserves_code_approval(tmp_path, monkeypatch, policy,
     assert "EVIDENCE-ONLY REVIEW" in _prompts(runner, "codex")[-1]
     assert '"expected_outcome": "outcome row-a"' in _prompts(runner, "codex")[-1]
     comments = authenticated_pr_comments(runner, config, pr_number=77)[0]
-    approvals = _latest_pr_approved_reviews_for_head(comments, head_sha="fedcba9",
+    approvals = _latest_pr_approved_reviews_for_head(comments, head_sha="6946a6f1ac1c65132a6a53600572ceb4af0ee23b",
         configured_reviewers=config.reviewer, approved_plan_context=context)
     assert approvals["Codex"].index < capture.index
     admitted, complete = admitted_capture_history(runner, config, pr_number=77, comments=comments)
     assert complete
-    assert not capture_pending(admitted, head="fedcba9", plan=context,
+    assert not capture_pending(admitted, head="6946a6f1ac1c65132a6a53600572ceb4af0ee23b", plan=context,
                                required_reviewers=("Codex",), approvals=approvals)
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
 
@@ -59,7 +59,7 @@ def test_multiple_requesters_receive_only_their_rows(tmp_path, monkeypatch, para
     _install_derivation(monkeypatch, context, [limited])
     with pytest.raises(HumanDecisionRequiredError, match="frozen at head"):
         run_pr_loop(runner, pr_number=77, config=config, approved_plan_context=context)
-    _push_external_head(runner, "fedcba9")
+    _push_external_head(runner, "6946a6f1ac1c65132a6a53600572ceb4af0ee23b")
     runner.advance_pr_head_on_coder_followup = False
     runner.claude_outputs.append(_coder())
     runner.codex_outputs.extend([review("OpenAI Codex", kept=["item-3", "item-4"], state="blocking"),
@@ -78,10 +78,10 @@ def test_multiple_requesters_receive_only_their_rows(tmp_path, monkeypatch, para
     # lineage; a removed requester cannot receive work or be substituted.
     from coding_review_agent_loop.capture_acceptance import capture_assignments
     approvals = {r.metadata.agent: r for r in records if r.metadata.role == "reviewer"
-                 and r.metadata.subject == "fedcba9" and r.index < capture.index}
-    assert capture_assignments(records, head="fedcba9", matrix_identity=context.risk_test_matrix_identity,
+                 and r.metadata.subject == "6946a6f1ac1c65132a6a53600572ceb4af0ee23b" and r.index < capture.index}
+    assert capture_assignments(records, head="6946a6f1ac1c65132a6a53600572ceb4af0ee23b", matrix_identity=context.risk_test_matrix_identity,
         required_reviewers=("Gemini",), approvals=approvals) is None
-    restored = capture_assignments(records, head="fedcba9", matrix_identity=context.risk_test_matrix_identity,
+    restored = capture_assignments(records, head="6946a6f1ac1c65132a6a53600572ceb4af0ee23b", matrix_identity=context.risk_test_matrix_identity,
         required_reviewers=("Codex", "Gemini"), approvals=approvals)
     assert {name: scope["rows"] for name, scope in restored.items()} == {"Codex": ["row-a"], "Gemini": ["row-b"]}
 
@@ -99,10 +99,10 @@ def test_unavailable_scoped_reviewer_keeps_acceptance_pending(tmp_path, monkeypa
     capture = next(r for r in reversed(records) if r.metadata.role == "coder")
     assert not _reviews_after(runner, capture.index)
     comments = authenticated_pr_comments(runner, config, pr_number=77)[0]
-    approvals = _latest_pr_approved_reviews_for_head(comments, head_sha="fedcba9",
+    approvals = _latest_pr_approved_reviews_for_head(comments, head_sha="6946a6f1ac1c65132a6a53600572ceb4af0ee23b",
         configured_reviewers=config.reviewer, approved_plan_context=context)
     admitted, _ = admitted_capture_history(runner, config, pr_number=77, comments=comments)
-    assert capture_pending(admitted, head="fedcba9", plan=context,
+    assert capture_pending(admitted, head="6946a6f1ac1c65132a6a53600572ceb4af0ee23b", plan=context,
                            required_reviewers=("Codex",), approvals=approvals)
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
 
@@ -146,7 +146,7 @@ def test_live_qualification_rejects_malformed_scoped_publication(tmp_path, monke
         issue_context=None, parent_issue_context=None, approved_plan_context=context)
     assert fresh.converted_capture_review_pending
     comments = authenticated_pr_comments(runner, config, pr_number=77)[0]
-    approvals = _latest_pr_approved_reviews_for_head(comments, head_sha="fedcba9",
+    approvals = _latest_pr_approved_reviews_for_head(comments, head_sha="6946a6f1ac1c65132a6a53600572ceb4af0ee23b",
         configured_reviewers=config.reviewer, approved_plan_context=context)
     assert approvals["Codex"].index < capture.index
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
@@ -234,7 +234,7 @@ def test_capture_dispatch_uses_admitted_amendment_lineage(tmp_path, monkeypatch,
             removed_reviewers=removed, restored_reviewers=added, effective_from_round=amendment_round,
             rationale="Backend recovered" if added else "Backend unavailable")
     _m943_append(runner, amendment(("Codex", "Gemini"), ("Gemini",)))
-    _push_external_head(runner, "fedcba9")
+    _push_external_head(runner, "6946a6f1ac1c65132a6a53600572ceb4af0ee23b")
     runner.advance_pr_head_on_coder_followup = False
     runner.claude_outputs.append(_coder())
     runner.codex_outputs.extend([_review(kept=["item-3", "item-4"], state="blocking"), _review()])
@@ -247,7 +247,7 @@ def test_capture_dispatch_uses_admitted_amendment_lineage(tmp_path, monkeypatch,
         def interrupt_capture(*args, **kwargs):
             result = original_post(*args, **kwargs)
             latest = _records(runner)[-1]
-            if latest.metadata.role == "coder" and latest.metadata.subject == "fedcba9":
+            if latest.metadata.role == "coder" and latest.metadata.subject == "6946a6f1ac1c65132a6a53600572ceb4af0ee23b":
                 raise KeyboardInterrupt()
             return result
         monkeypatch.setattr(loop, "post_pr_comment", interrupt_capture)

@@ -212,7 +212,7 @@ def test_base_reproduction_citation_authority_is_unchanged(monkeypatch):
     registry = EnvironmentIdentityRegistry()
     rows = [
         # Base head differs from the current head.
-        _journal_row(registry, receipt="base-other-head", outcome="passed", digest="tree-a",
+        _journal_row(registry, receipt="base-5e6741348108b11e3f3ef936c335b1967d17ac6c", outcome="passed", digest="tree-a",
                      head="head-a", minute=0, state="base-reproduction"),
         # Tracked digest equals the current digest.
         _journal_row(registry, receipt="base-current-digest", outcome="passed", digest="tree-b",
@@ -374,11 +374,11 @@ def test_validation_seam_journal_gate_ignores_only_historical_failures(
         assert row.status == "verified"
 
 
-@pytest.mark.parametrize("selected", ["base-other-head", "base-current-digest"])
+@pytest.mark.parametrize("selected", ["base-5e6741348108b11e3f3ef936c335b1967d17ac6c", "base-current-digest"])
 def test_validation_seam_base_reproduction_status_is_unchanged(monkeypatch, tmp_path, selected):
     registry = EnvironmentIdentityRegistry()
     journal = [
-        _seam_row(registry, tmp_path, receipt="base-other-head", outcome="passed",
+        _seam_row(registry, tmp_path, receipt="base-5e6741348108b11e3f3ef936c335b1967d17ac6c", outcome="passed",
                   digest="tree-a", head="head-a", minute=0, state="base-reproduction"),
         _seam_row(registry, tmp_path, receipt="base-current-digest", outcome="passed",
                   digest="tree-b", head="head-b", minute=1, state="base-reproduction"),
@@ -452,20 +452,20 @@ def _base_citation_outcome(observations, receipt, status):
     return ("accepted", parsed.rows[0].status, parsed.rows[0].caveats)
 
 
-_BASE_PASSES = ("live-base-other-head", "live-base-current-digest",
-                "restored-base-other-head", "restored-base-current-digest")
+_BASE_PASSES = ("live-base-5e6741348108b11e3f3ef936c335b1967d17ac6c", "live-base-current-digest",
+                "restored-base-5e6741348108b11e3f3ef936c335b1967d17ac6c", "restored-base-current-digest")
 
 
 def test_validation_seam_base_reproduction_citations_are_unchanged(monkeypatch, tmp_path):
     registry = EnvironmentIdentityRegistry()
     journal = [
-        _seam_row(registry, tmp_path, receipt="live-base-other-head", outcome="passed",
+        _seam_row(registry, tmp_path, receipt="live-base-5e6741348108b11e3f3ef936c335b1967d17ac6c", outcome="passed",
                   digest="tree-a", head="head-a", minute=0, state="base-reproduction",
                   claim="base-reproduction"),
         _seam_row(registry, tmp_path, receipt="live-base-current-digest", outcome="passed",
                   digest="tree-b", head="head-b", minute=1, state="base-reproduction",
                   claim="base-reproduction"),
-        _restored_base_pass("restored-base-other-head", digest="tree-a", head="head-a"),
+        _restored_base_pass("restored-base-5e6741348108b11e3f3ef936c335b1967d17ac6c", digest="tree-a", head="head-a"),
         _restored_base_pass("restored-base-current-digest", digest="tree-b", head="head-b"),
         _seam_row(registry, tmp_path, receipt="base-live-claim", outcome="failed",
                   digest="tree-a", head="head-a", minute=3, claim="base-reproduction"),
@@ -473,10 +473,10 @@ def test_validation_seam_base_reproduction_citations_are_unchanged(monkeypatch, 
     ]
 
     _row, _codes, now_journal = _validate_at_seam(
-        monkeypatch, tmp_path, journal, selected=["live-base-other-head"]
+        monkeypatch, tmp_path, journal, selected=["live-base-5e6741348108b11e3f3ef936c335b1967d17ac6c"]
     )
     _row, _codes, today_journal = _validate_at_seam(
-        monkeypatch, tmp_path, journal, selected=["live-base-other-head"],
+        monkeypatch, tmp_path, journal, selected=["live-base-5e6741348108b11e3f3ef936c335b1967d17ac6c"],
         disable_classification=True,
     )
 

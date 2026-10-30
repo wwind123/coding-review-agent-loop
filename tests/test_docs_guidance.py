@@ -1153,7 +1153,7 @@ def test_operator_docs_document_evidence_conversion_and_the_stall_option():
         assert term in text
     assert "not yet available" not in text
     assert "evidence_conversion.py" in architecture
-    message = render_evidence_stall_decision(77, "abc123", "f" * 64, {"row-b": "x", "row-a": "y"}, 2)
+    message = render_evidence_stall_decision(77, "6367c48dd193d56ea7b0baad25b19455e529f5ee", "f" * 64, {"row-b": "x", "row-a": "y"}, 2)
     assert "2. Convert the named rows to the operator evidence freeze: rerun with " in message
     assert "`--pr-convert-evidence-rows row-a,row-b`" in message
     assert "not yet available" not in message

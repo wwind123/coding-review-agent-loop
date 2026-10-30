@@ -112,7 +112,7 @@ def test_the_fallback_snapshot_carries_this_process_s_own_conversion_before_the_
     ({}, {"Codex"}),
     ({"role": "reviewer"}, {"Antigravity", "Codex"}),
     ({"agent": "Codex"}, {"Antigravity", "Codex"}),
-    ({"subject": "other-head"}, {"Antigravity", "Codex"}),
+    ({"subject": "5e6741348108b11e3f3ef936c335b1967d17ac6c"}, {"Antigravity", "Codex"}),
     ({"round_number": 4}, {"Antigravity", "Codex"}),
     ({"flow": "plan"}, {"Antigravity", "Codex"}),
 ])

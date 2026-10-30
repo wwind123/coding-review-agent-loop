@@ -915,7 +915,7 @@ def test_plan_first_deferred_stage_rerun_resumes_parent_one_shot_handoff(tmp_pat
         plan_hash=plan_hash,
         plan_subject=plan_subject,
         pr_number=77,
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     runner = FakeRunner(
         pr_payload={"body": "Fixes #56"},

@@ -50,7 +50,7 @@ def durable_record(items, *, role="coder", agent="Claude", round_number=2,
     if body is None:
         body = "Historical checkpoint.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"
     return _attach_round_metadata(body, PostedRoundMetadata(
-        flow="pr", role=role, agent=agent, round_number=round_number, subject="abc123",
+        flow="pr", role=role, agent=agent, round_number=round_number, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         prior_items=tuple(items), new_items=tuple(new_items), dispositions=tuple(dispositions), **kwargs,
     ))
 
@@ -59,7 +59,7 @@ def pr_payload(history=()):
     return {
         "number": 77, "state": "OPEN", "url": "https://github.com/OWNER/REPO/pull/77",
         "title": "Acknowledgement recovery", "headRefName": "fix/ack", "baseRefName": "main",
-        "headRefOid": "abc123", "reviews": [],
+        "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "reviews": [],
         "comments": [
             {"author": {"login": "maintainer"}, "createdAt": "2026-05-18T10:00:00Z",
              "body": "Please preserve the URL.\n\n-- Human Reviewer"},
@@ -101,7 +101,7 @@ def ack_resume_history(*, promoted=False, coder_ack=False, conflict=False, unrel
     from coding_review_agent_loop.round_state import RecoveryRoundBudget
     dispatch = durable_record(
         (alias, *other), role="summary", agent="Orchestrator", phase="coder-dispatch",
-        dispatch_round=1, dispatch_head="abc123", dispatch_attempt=1, recovery_dispatch=False,
+        dispatch_round=1, dispatch_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", dispatch_attempt=1, recovery_dispatch=False,
         recovery_round_budget=RecoveryRoundBudget(2, False, False),
     )
     return [dispatch, original, coder, review]
@@ -114,7 +114,7 @@ def ack_matrix_metadata():
     return {
         "risk_test_matrix_evidence": {"matrix_identity": "a" * 64, "rows": []},
         "risk_test_matrix_capture_classification": {
-            "version": 1, "matrix_identity": "a" * 64, "head": "abc123",
+            "version": 1, "matrix_identity": "a" * 64, "head": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "rows": {"ack": {"class": "not-capture-limited", "observation_classes": [],
                              "disqualifiers": ["verified"]}},
         },

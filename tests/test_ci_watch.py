@@ -103,7 +103,7 @@ def test_watch_success_and_head_change_are_terminal(tmp_path):
          patch("coding_review_agent_loop.github.get_pr_mergeability", return_value=_mergeability()), \
          patch("coding_review_agent_loop.github.get_pr_checks", return_value=_checks("passing")):
         assert watch_pr_checks(runner, make_config(tmp_path, watch_pending_ci=True), 7, metadata=_metadata()).status == "passed"
-    with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="new-sha"):
+    with patch("coding_review_agent_loop.github.get_pr_head_sha", return_value="fd2d39cf710f84ca537091424fc212fa5211885b"):
         assert watch_pr_checks(runner, make_config(tmp_path, watch_pending_ci=True), 7, metadata=_metadata()).status == "head_changed"
 
 
@@ -348,7 +348,7 @@ from agent_loop_helpers import FakeRunner, structured_coder_followup, structured
 
 PLUMBING = plumbing_check_names()
 RUN_URL = "https://github.com/OWNER/REPO/actions/runs/4242"
-HEAD = "abc123"
+HEAD = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
 
 
 def _publisher(status="failure", *, check_id=11):
@@ -770,8 +770,8 @@ def test_loop_plumbing_status_without_actions_url_is_unresolvable_infrastructure
 @pytest.mark.parametrize(
     ("run", "returncode", "reason"),
     [
-        (_ordinary_run(head="other-head"), 0, "not an ordinary run of abc123"),
-        (_ordinary_run(event="workflow_dispatch"), 0, "not an ordinary run of abc123"),
+        (_ordinary_run(head="5e6741348108b11e3f3ef936c335b1967d17ac6c"), 0, "not an ordinary run of 6367c48dd193d56ea7b0baad25b19455e529f5ee"),
+        (_ordinary_run(event="workflow_dispatch"), 0, "not an ordinary run of 6367c48dd193d56ea7b0baad25b19455e529f5ee"),
         (_ordinary_run(), 1, "gh run rerun failed"),
     ],
 )

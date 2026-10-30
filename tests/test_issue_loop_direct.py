@@ -229,3 +229,15 @@ def test_issue_loop_rejects_pr_number_before_running_claude(tmp_path):
         run_issue_loop(runner, issue_number=62, config=config)
 
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize('invalid', [False, True])
+def test_new_issue_pr_observation_precedes_head_bound_publication(tmp_path, invalid):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    runner = FakeRunner(claude_outputs=['Created PR.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->'])
+    runner.branch_tip = 'b' * 40
+    if invalid: runner.pr_payload['headRefOid'] = 'invalid'
+    with pytest.raises(PrHeadObservationError):
+        run_issue_loop(runner, issue_number=56, config=make_config(tmp_path))
+    assert not runner.pr_payload.get('comments')
+    assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)

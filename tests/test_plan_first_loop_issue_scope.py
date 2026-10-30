@@ -1137,7 +1137,7 @@ def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     bypass = {
         "id": 4242, "name": "CI", "display_title": "CI", "event": "workflow_dispatch",
-        "head_sha": "abc123", "head_branch": "agent-loop/managed-56", "created_at": now,
+        "head_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "head_branch": "agent-loop/managed-56", "created_at": now,
         "html_url": "https://github.com/OWNER/REPO/actions/runs/4242",
         "repository": {"full_name": "OWNER/REPO"},
     }
@@ -1197,7 +1197,7 @@ def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
         pr_payload={
             "body": f"Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}",
             "headRefName": "agent-loop/managed-56",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         },
     )
     config = make_config(
@@ -1222,7 +1222,7 @@ def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
     )
     monkeypatch.setattr(
         pr_loop, "wait_for_final_qualification",
-        lambda *_a, **_k: ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *_a, **_k: ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *_a, **_k: None)
     monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *_a, **_k: None)
@@ -1235,7 +1235,7 @@ def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
             if "Coder-turn CI dispatch audit" in comment["body"]
         ]
         assert len(notes) == 1
-        assert "run 4242 on `abc123`" in notes[0]
+        assert "run 4242 on `6367c48dd193d56ea7b0baad25b19455e529f5ee`" in notes[0]
         assert "non-authoritative diagnostic, not qualification" in notes[0]
         assert "coder response for this turn was rejected" in notes[0]
         assert "Coder-turn" not in str(rejected.value)
@@ -1258,8 +1258,8 @@ def test_direct_managed_issue_first_turn_is_guarded_and_bypass_dispatch_audited(
     # The bypass run on the reserved branch is reported once, as a diagnostic.
     assert any("branch=agent-loop%2Fmanaged-56" in query for query in runner.audit_queries)
     bodies = [comment["body"] for comment in runner.pr_payload.get("comments", [])]
-    noted = [body for body in bodies if "run 4242 on `abc123`" in body]
+    noted = [body for body in bodies if "run 4242 on `6367c48dd193d56ea7b0baad25b19455e529f5ee`" in body]
     assert len(noted) == 1
     assert "non-authoritative diagnostic, not qualification" in noted[0]
     # Never qualification: the orchestrator's exact-head dispatch still runs once.
-    assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["abc123"]
+    assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]

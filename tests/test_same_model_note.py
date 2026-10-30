@@ -358,7 +358,7 @@ def test_evidence_response_pass_gains_no_reconciliation_summary(tmp_path):
         run_pr_loop(runner, pr_number=77, config=config)
     before = len([c for c in runner.comments if "reconciliation" in c])
     assert before == 1  # the authoritative round carries the note
-    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    runner.pr_payload["comments"].append(_signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed.", 1))
     from pr_loop_test_helpers import _resolve
 
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))

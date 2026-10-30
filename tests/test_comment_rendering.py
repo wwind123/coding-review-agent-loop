@@ -1334,7 +1334,7 @@ def test_render_discuss_round_summary_comment_final_implement_heading():
         outcome="implement",
         reviewer_votes=[_discuss_vote("implement")],
         split_proposals=[],
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     assert "## Consensus: Implement" in rendered
 
@@ -1384,7 +1384,7 @@ def test_render_discuss_round_summary_comment_final_reviewer_table_row():
             _discuss_vote("implement", rationale="Clear value.", reviewer="OpenAI Codex"),
         ],
         split_proposals=[],
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     assert "| Gemini |" in rendered
     assert "| OpenAI Codex |" in rendered
@@ -1398,7 +1398,7 @@ def test_render_discuss_round_summary_comment_final_orchestrator_footer():
         outcome="implement",
         reviewer_votes=[_discuss_vote()],
         split_proposals=[],
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     assert "-- Orchestrator" in rendered
 
@@ -1439,7 +1439,7 @@ def test_render_discuss_round_summary_comment_final_converged_kind_and_rebuttals
             ],
         ],
         split_proposals=[],
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     assert "Consensus kind: `converged` after round 2." in rendered
     assert "### Final rebuttals" in rendered
@@ -1457,7 +1457,7 @@ def test_render_discuss_round_summary_comment_final_deadlock_summarizes_disagree
             _discuss_vote("do-not-implement", rationale="Out of scope.", reviewer="OpenAI Codex"),
         ],
         split_proposals=[],
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     assert "## Consensus: Needs Human Review (Deadlock)" in rendered
     assert "Consensus kind: `deadlock` after round 2." in rendered
@@ -1475,7 +1475,7 @@ def test_render_discuss_round_summary_comment_interim_round_has_agenda_and_no_ma
             _discuss_vote("do-not-implement", rationale="Out of scope.", reviewer="OpenAI Codex"),
         ],
         split_proposals=[],
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     assert "## Round 1 summary: Consensus Pending" in rendered
     assert "### Agenda for round 2" in rendered
@@ -1492,7 +1492,7 @@ def test_render_discuss_round_summary_comment_interim_round_lists_split_proposal
         round_number=1,
         reviewer_votes=[_discuss_vote("split", proposals=("Sub A",), reviewer="Gemini")],
         split_proposals=["Sub A"],
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     assert "### Proposed sub-issues raised this round" in rendered
     assert "- Sub A" in rendered
@@ -1524,7 +1524,7 @@ def test_render_discuss_round_summary_comment_final_includes_full_resumed_histor
             ],
         ],
         split_proposals=[],
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     assert "Round 1: Gemini: `do-not-implement`, OpenAI Codex: `implement`" in rendered
     assert "Round 2: Gemini: `do-not-implement`, OpenAI Codex: `implement`" in rendered
@@ -1586,7 +1586,7 @@ def _rendering_agenda(
 def test_render_discuss_summary_non_final_uses_analyzer_agenda_with_attribution():
     rendered = render_discuss_round_summary_comment(
         is_final=False,
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         round_number=1,
         reviewer_votes=[
             _discuss_vote("implement", rationale="Mechanical rationale.", reviewer="Codex"),
@@ -1619,7 +1619,7 @@ def test_render_discuss_answer_summary_non_final_uses_analyzer_agenda_with_attri
     )
     rendered = render_discuss_round_summary_comment(
         is_final=False,
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         round_number=1,
         reviewer_votes=[answer],
         analyzer_agenda=_rendering_agenda(),
@@ -1661,7 +1661,7 @@ def test_render_answer_round_synthesis_leads_and_neutralizes_historical_markers(
 
     rendered = render_discuss_round_summary_comment(
         is_final=False,
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         round_number=1,
         reviewer_votes=[answer],
         result_mode="answer",
@@ -1703,7 +1703,7 @@ def test_render_answer_final_synthesis_is_primary_and_raw_answers_are_secondary(
 
     rendered = render_discuss_round_summary_comment(
         is_final=True,
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         round_number=1,
         reviewer_votes=votes,
         outcome="answer",
@@ -1747,7 +1747,7 @@ def test_render_answer_synthesis_bounds_long_audit_and_drops_overflowing_audit()
 
     bounded = render_discuss_round_summary_comment(
         is_final=True,
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         round_number=1,
         reviewer_votes=votes,
         outcome="answer",
@@ -1770,7 +1770,7 @@ def test_render_answer_synthesis_bounds_long_audit_and_drops_overflowing_audit()
     )
     overflow = render_discuss_round_summary_comment(
         is_final=True,
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         round_number=1,
         reviewer_votes=votes,
         outcome="answer",
@@ -1785,7 +1785,7 @@ def test_render_answer_synthesis_bounds_long_audit_and_drops_overflowing_audit()
 def test_render_discuss_summary_non_final_without_agenda_keeps_mechanical_lines():
     rendered = render_discuss_round_summary_comment(
         is_final=False,
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         round_number=1,
         reviewer_votes=[_discuss_vote("implement", rationale="Mechanical rationale.", reviewer="Codex")],
     )
@@ -1799,7 +1799,7 @@ def test_render_discuss_summary_final_distinguishes_analyzer_consensus_from_vote
         is_final=True,
         outcome="needs-human",
         consensus_kind="deadlock",
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         round_number=3,
         reviewer_votes=[
             _discuss_vote("implement", reviewer="Codex"),
@@ -1825,7 +1825,7 @@ def test_render_discuss_summary_final_without_agenda_has_no_analyzer_section():
         is_final=True,
         outcome="implement",
         consensus_kind="unanimous",
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         reviewer_votes=[_discuss_vote("implement", reviewer="Codex")],
         split_proposals=[],
     )
@@ -1837,7 +1837,7 @@ def test_render_discuss_summary_final_empty_agenda_renders_placeholder():
         is_final=True,
         outcome="needs-human",
         consensus_kind="deadlock",
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         reviewer_votes=[_discuss_vote("implement", reviewer="Codex")],
         split_proposals=[],
         final_analyzer_agenda=ParsedDiscussAgenda(consensus=(), disagreements=(), missing_facts=()),
@@ -1957,7 +1957,7 @@ def test_render_discuss_summary_final_default_has_no_research_section():
         is_final=True,
         outcome="implement",
         consensus_kind="unanimous",
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         reviewer_votes=[_discuss_vote("implement", reviewer="Codex")],
         split_proposals=[],
     )
@@ -1969,7 +1969,7 @@ def test_render_discuss_summary_final_research_none_notes_disabled():
         is_final=True,
         outcome="implement",
         consensus_kind="unanimous",
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         reviewer_votes=[_discuss_vote("implement", reviewer="Codex")],
         split_proposals=[],
         research_mode="none",
@@ -1984,7 +1984,7 @@ def test_render_discuss_summary_final_research_distinguishes_facts_from_judgment
         is_final=True,
         outcome="implement",
         consensus_kind="unanimous",
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         reviewer_votes=[
             _discuss_research_vote(
                 reviewer="Codex",
@@ -2021,7 +2021,7 @@ def test_render_discuss_summary_final_research_auto_all_not_needed_is_explicit()
         is_final=True,
         outcome="implement",
         consensus_kind="unanimous",
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         reviewer_votes=[
             _discuss_research_vote(reviewer="Codex", research_status="not-needed"),
             _discuss_research_vote(reviewer="Gemini", research_status="not-needed"),
@@ -2041,7 +2041,7 @@ def test_render_discuss_summary_final_research_unreported_status_is_explicit():
         is_final=True,
         outcome="implement",
         consensus_kind="unanimous",
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         reviewer_votes=[
             _discuss_research_vote(reviewer="Codex", research_status="not-needed"),
             _discuss_research_vote(reviewer="Gemini"),
@@ -2070,7 +2070,7 @@ def test_render_discuss_summary_final_research_aggregates_facts_across_rounds():
         is_final=True,
         outcome="implement",
         consensus_kind="converged",
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         round_number=2,
         reviewer_votes=[round2_codex],
         round_history=[[round1_codex], [round2_codex]],
@@ -2091,7 +2091,7 @@ def test_render_discuss_summary_non_final_agenda_includes_research_brief():
     )
     rendered = render_discuss_round_summary_comment(
         is_final=False,
-        subject="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         round_number=1,
         reviewer_votes=[
             _discuss_vote("implement", reviewer="Codex"),
@@ -2123,9 +2123,9 @@ def test_staged_policy_public_audit_comments_identify_phase_and_neutral_accounti
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     audits = [comment for comment in runner.comments if comment.startswith("PR review scheduling audit:")]
     assert len(audits) == 2
-    assert "phase: primary; head: abc123; primary: Codex; active owners: (none); force-full: False (source: none)" in audits[0]
+    assert "phase: primary; head: 6367c48dd193d56ea7b0baad25b19455e529f5ee; primary: Codex; active owners: (none); force-full: False (source: none)" in audits[0]
     assert "selected Codex; paused Gemini" in audits[0]
-    assert "phase: secondary-audit; head: abc123; primary: Codex" in audits[1]
+    assert "phase: secondary-audit; head: 6367c48dd193d56ea7b0baad25b19455e529f5ee; primary: Codex" in audits[1]
     assert "selected Gemini; paused Codex" in audits[1]
     for comment in runner.comments:
         assert "selective-only calls avoided" not in comment
@@ -3051,12 +3051,12 @@ def test_deferred_evidence_request_text_is_withheld_from_public_labels():
 
     ledger, _ = _upsert_evidence_obligation(
         [], item_number=1, reviewer="Codex", text="Attach the secret live run output",
-        source_round=1, current_head_sha="abc123",
+        source_round=1, current_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     deferred = _format_unresolved_item_label(ledger[0])
     assert "Attach the secret live run output" not in deferred
     assert "deferred" in deferred
-    frozen = freeze_evidence_obligations(ledger, head_sha="abc123")
+    frozen = freeze_evidence_obligations(ledger, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert "Attach the secret live run output" in _format_unresolved_item_label(frozen[0])
 
 

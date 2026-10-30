@@ -5,6 +5,7 @@ and utility helpers shared across test_agent_loop.py, test_protocol.py,
 test_backends.py, and test_comment_rendering.py.
 """
 import base64
+import hashlib
 import datetime
 import json
 import os
@@ -237,7 +238,7 @@ class FakeRunner(Runner):
         git_status="",
         git_remote="git@github.com:OWNER/REPO.git",
         git_inside=True,
-        git_head="abc123",
+        git_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         tracked_files=None,
         changed_files=None,
         diff_returncode=0,
@@ -304,6 +305,9 @@ class FakeRunner(Runner):
         if issue_payload:
             self.issue_payload.update(issue_payload)
         self.issue_comments = list(issue_comments or [])
+        self.branch_tip = None
+        self.head_repository = "OWNER/REPO"
+        self.compare_status = "ahead"
         self.pr_payload = {
             "number": 77,
             "state": "OPEN",
@@ -312,7 +316,7 @@ class FakeRunner(Runner):
             "body": "PR description.",
             "headRefName": "feature/review-context",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [],
             "reviews": [],
         }
@@ -771,7 +775,7 @@ class FakeRunner(Runner):
             return
         self._coder_followup_counter += 1
         head_sha = self.pr_payload.get("headRefOid", self.git_head)
-        new_head_sha = f"{head_sha}-coder-{self._coder_followup_counter}"
+        new_head_sha = hashlib.sha1(f"{head_sha}-coder-{self._coder_followup_counter}".encode()).hexdigest()
         self.pr_payload["headRefOid"] = new_head_sha
         self._move_head(new_head_sha, cwd=self._last_agent_cwd)
 
@@ -1366,7 +1370,7 @@ class FakeRunner(Runner):
                 return CommandResult(
                     cmd,
                     cwd_path,
-                    f"{payload.get('headRefOid', 'abc123')}\n",
+                    f"{payload.get('headRefOid', '6367c48dd193d56ea7b0baad25b19455e529f5ee')}\n",
                     "",
                     0,
                 )
@@ -1407,6 +1411,25 @@ class FakeRunner(Runner):
                 ],
             }
             return CommandResult(cmd, cwd_path, json_dumps(payload), "", 0)
+
+        if cmd[:2] == ["gh", "api"]:
+            endpoint = cmd[2]
+            if re.fullmatch(r"repos/[^/]+/[^/]+/pulls/\d+", endpoint):
+                payload = self.pr_payload
+                data = {"head": {"repo": {"full_name": self.head_repository},
+                                  "ref": payload.get("headRefName"), "sha": payload.get("headRefOid")},
+                        "base": {"ref": payload.get("baseRefName"), "repo": {"full_name": "OWNER/REPO"}}}
+                return CommandResult(cmd, cwd_path, json_dumps(data), "", 0)
+            if "/git/ref/heads/" in endpoint:
+                from urllib.parse import unquote
+                ref = unquote(endpoint.split("/git/ref/heads/", 1)[1])
+                data = {"ref": f"refs/heads/{ref}", "object": {"sha": self.branch_tip if self.branch_tip is not None else self.pr_payload.get("headRefOid")}}
+                return CommandResult(cmd, cwd_path, json_dumps(data), "", 0)
+            if "/compare/" in endpoint:
+                head, tip = endpoint.split("/compare/", 1)[1].split("...")
+                data = {"status": self.compare_status, "base_commit": {"sha": head},
+                        "merge_base_commit": {"sha": tip if self.compare_status == "behind" else "d" * 40 if self.compare_status == "diverged" else head}}
+                return CommandResult(cmd, cwd_path, json_dumps(data), "", 0)
 
         rest_comments = (
             re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)/comments\?per_page=(\d+)&page=(\d+)(?:&since=[^&]+)?", cmd[2])
@@ -1467,7 +1490,7 @@ class FakeRunner(Runner):
             if self.pr_commit_pages:
                 payload = self.pr_commit_pages.pop(0)
             else:
-                head_sha = self.pr_payload.get("headRefOid") or "abc123"
+                head_sha = self.pr_payload.get("headRefOid") or "6367c48dd193d56ea7b0baad25b19455e529f5ee"
                 issue_number = self._provenance_issue_number
                 payload = {
                     "data": {
@@ -1495,7 +1518,7 @@ class FakeRunner(Runner):
                     }
                 }
             if isinstance(payload, list):
-                head_sha = self.pr_payload.get("headRefOid") or "abc123"
+                head_sha = self.pr_payload.get("headRefOid") or "6367c48dd193d56ea7b0baad25b19455e529f5ee"
                 payload = {
                     "data": {
                         "repository": {
@@ -2385,7 +2408,7 @@ def child_pr_handoff_comment(issue_number, pr_number):
             issue_number=issue_number,
             pr_number=pr_number,
             pr_url=f"https://github.com/OWNER/REPO/pull/{pr_number}",
-            pr_head_sha="abc123",
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             flow="issue-implementation",
             plan_hash=None,
         ),
@@ -2397,7 +2420,7 @@ def pr_payload_for_state(pr_number, state):
         "number": pr_number,
         "state": state,
         "url": f"https://github.com/OWNER/REPO/pull/{pr_number}",
-        "headRefOid": "abc123",
+        "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "comments": [],
         "reviews": [],
     }

@@ -6,6 +6,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .pr_head_sync import get_observed_pr_review_context, PrHeadObservationError
+
 import datetime
 from dataclasses import replace as dataclasses_replace
 from .worktree_hints import pushed_branch_recovery_scope
@@ -47,7 +49,6 @@ from .github import (
     IssueContext,
     PullRequestMetadata,
     deduplicate_human_requirements,
-    get_pr_review_context,
     post_trusted_pr_contract_record,
     post_trusted_pr_comment,
     reject_forged_protocol_markers,
@@ -409,7 +410,7 @@ def _implement_approved_issue_unscoped(
             )
         resumed_pr_context = None
         if resolved_pr.source == "legacy-closing-reference" or one_shot_parent_issue is not None:
-            resumed_pr_context = get_pr_review_context(
+            resumed_pr_context = get_observed_pr_review_context(
                 runner, config=implementation_config, pr_number=existing_pr_number
             )
         # Explicit managed recovery may be resuming a PR whose implementation
@@ -651,7 +652,7 @@ def _implement_approved_issue_unscoped(
             assigned_workdir=active_workdir(cfg),
         )
         validate_open_pr(runner, config=cfg, pr_number=pr_number)
-        context = get_pr_review_context(runner, config=cfg, pr_number=pr_number)
+        context = get_observed_pr_review_context(runner, config=cfg, pr_number=pr_number)
         handoff: AuthenticatedIssueCreatedHandoff | None = None
         if managed_ci_creation_intent is not None:
             handoff = authenticate_issue_created_handoff(
@@ -888,7 +889,7 @@ def _implement_approved_issue_unscoped(
             invocation_id=coder_response.acquisition_test_turn_id,
             _closed_execution_catalog=coder_response.acquisition_test_observations,
             _journal_observations=coder_response.acquisition_test_observations,
-            reauthenticate_head=lambda: get_pr_review_context(
+            reauthenticate_head=lambda: get_observed_pr_review_context(
                 runner, config=implementation_config, pr_number=pr_number
             ).metadata.head_sha,
         )
@@ -912,6 +913,8 @@ def _implement_approved_issue_unscoped(
             legacy_tests_run=implementation_result.tests_run,
             cwd=active_workdir(implementation_config),
         )
+    except PrHeadObservationError:
+        raise
     except AgentLoopError:
         if managed_pr_authenticated and managed_ci_creation_intent is not None:
             publish_rejected_coder_turn_dispatch_audit(

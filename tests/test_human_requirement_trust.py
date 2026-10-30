@@ -96,7 +96,7 @@ def _pr_projection(*, comments=(), reviews=()):
         "title": "t",
         "headRefName": "feature",
         "baseRefName": "main",
-        "headRefOid": "abc123",
+        "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "body": "",
         "comments": list(comments),
         "reviews": list(reviews),

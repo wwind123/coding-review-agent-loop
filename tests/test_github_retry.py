@@ -396,14 +396,14 @@ def test_issue_created_authorization_publish_keeps_active_label_diagnostics(tmp_
         issue_number=643,
         repository="OWNER/REPO",
         base_ref="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         branch="agent-loop/managed-643",
         trusted_actor_login="agent-loop",
         trusted_actor_id=1,
         protection_mode="voluntary",
         override_nonce="nonce-643",
     )
-    metadata = github.PullRequestMetadata(7, "OWNER/REPO", "t", "head", "main", "abc123", "u")
+    metadata = github.PullRequestMetadata(7, "OWNER/REPO", "t", "head", "main", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "u")
     runner = _exhausted_managed_runner()
     with pytest.raises(AgentLoopError) as info:
         managed_ci.publish_issue_created_authorization(
@@ -427,7 +427,7 @@ def test_continuity_publish_keeps_active_label_diagnostics(tmp_path, sleeps):
         issue_number=643,
         repository="OWNER/REPO",
         base_ref="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         branch="agent-loop/managed-643",
         trusted_actor_login="agent-loop",
         trusted_actor_id=1,
@@ -440,8 +440,8 @@ def test_continuity_publish_keeps_active_label_diagnostics(tmp_path, sleeps):
             runner,
             config=config,
             handoff=handoff,
-            predecessor_head="abc123",
-            new_head="def456",
+            predecessor_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+            new_head="0b3d8b29493059afd7f9912106279c4643ac4939",
             round_comment_ids=(1,),
         )
     assert "active managed-label event" in str(info.value)
@@ -476,7 +476,7 @@ def test_release_for_ordinary_recovery_surfaces_list_failure(tmp_path, sleeps):
             config=config,
             pr_number=7,
             base_ref="main",
-            expected_head_sha="abc123",
+            expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             active_event=(11, "agent-loop", 1),
             reason="test",
             recovery_capable=True,

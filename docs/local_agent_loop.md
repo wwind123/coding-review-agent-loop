@@ -10330,3 +10330,26 @@ Operator `--pr-review-force-full`, missing code approvals, uncertain ownership,
 changed code heads and unrelated code findings retain ordinary policy review.
 Partial or failed captures preserve unresolved evidence barriers and the existing
 capture-attempt limits. This behavior adds no flag or plan-review mode.
+
+## GitHub PR head lags its tracked branch
+
+A GitHub PR-head desync diagnostic reports the full PR-record SHA A, descendant
+branch tip B and actual head repository/ref after three observations two seconds
+apart. Review, qualification and merge stop. Verification failures instead mean
+that GitHub could not provide coherent, valid observations; they are never
+reported as unchanged coder progress.
+
+Recheck current remote PR and branch state first: lag may have cleared. If it
+persists, preserve B under a safe reference and verify remote state before an
+operator force-pushes the tracked branch back to A, then normally fast-forward
+re-pushes saved B. This is a manual recovery requiring preservation of the work.
+Rerun only once the PR record and tracked branch agree. agent-loop never performs
+this repair or treats B as the authoritative PR head.
+
+For an authenticated issue-created managed PR, this rewind invalidates managed
+continuity; normal stop cleanup may remove the managed label. Resume using fresh
+issue-scoped authorization (`--managed-ci-fresh --managed-ci-issue N`) with the
+authenticated owning issue N. Without authenticated origin/scope, this advice is
+conditional and N must not be guessed. Ordinary PRs need no managed flags.
+Source-managed and adopted PRs retain their existing origin-specific recovery;
+issue-created/source-managed suppression and adopted-label release are unchanged.

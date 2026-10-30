@@ -337,7 +337,7 @@ def test_managed_issue_invalid_post_pr_report_persists_authorization_before_reje
     reviewer_command = next(
         command for command, _cwd in runner.commands if command[:1] == ["claude"]
     )
-    assert "abc123" in " ".join(reviewer_command)
+    assert "6367c48dd193d56ea7b0baad25b19455e529f5ee" in " ".join(reviewer_command)
     assert any(
         "Reviewed the post-report recovery head." in comment
         for comment in runner.comments
@@ -526,7 +526,7 @@ def test_managed_issue_resume_reviews_same_head_after_post_pr_report_rejection(
     assert sum(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands) == coder_calls
     assert sum(command[:1] == ["claude"] for command, _cwd in runner.commands) == 1
     reviewer_command = next(command for command, _cwd in runner.commands if command[:1] == ["claude"])
-    assert "abc123" in " ".join(reviewer_command)
+    assert "6367c48dd193d56ea7b0baad25b19455e529f5ee" in " ".join(reviewer_command)
     assert runner.labels_posted is False
     assert runner.dispatch_count == 0
     assert any("Reviewed the resumed exact head." in comment for comment in runner.comments)
@@ -605,7 +605,7 @@ def test_invalid_post_pr_report_then_issue_resume_runs_real_activation_without_r
     assert runner.labels_posted is False
     assert runner.dispatch_count == 0
     reviewer_command = next(command for command, _cwd in runner.commands if command[:1] == ["claude"])
-    assert "abc123" in " ".join(reviewer_command)
+    assert "6367c48dd193d56ea7b0baad25b19455e529f5ee" in " ".join(reviewer_command)
     assert any("Reviewed the durable recovery head." in comment for comment in runner.comments)
     assert not any(
         marker in comment
@@ -696,7 +696,7 @@ def test_pre_pr_number_response_rejection_then_fresh_issue_recovery_uses_real_ac
     assert runner.labels_posted is True
     assert runner.dispatch_count == 0
     reviewer_command = next(command for command, _cwd in runner.commands if command[:1] == ["claude"])
-    assert "abc123" in " ".join(reviewer_command)
+    assert "6367c48dd193d56ea7b0baad25b19455e529f5ee" in " ".join(reviewer_command)
     assert any("Reviewed after explicit recovery." in comment for comment in runner.comments)
     assert not any(
         marker in comment
@@ -1009,7 +1009,7 @@ def test_managed_issue_authorization_publication_failure_prints_fresh_recovery(
             metadata=architecture_contract.PullRequestMetadata(
                 number=77, repo="OWNER/REPO", title="PR",
                 head_branch="agent-loop/managed-56", base_branch="main",
-                head_sha="abc123", url="https://github.test/pull/77",
+                head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url="https://github.test/pull/77",
             ),
             issue_number=56,
         )
@@ -1319,7 +1319,7 @@ def test_issue_loop_plan_first_one_shot_rerun_resumes_pr_loop(tmp_path):
         plan_hash=approved_plan_hash(plan),
         plan_subject=_plan_subject(plan),
         pr_number=77,
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     runner = FakeRunner(
         issue_comments=[

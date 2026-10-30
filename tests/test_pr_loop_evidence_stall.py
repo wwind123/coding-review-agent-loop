@@ -297,7 +297,7 @@ def test_stall_helper_is_not_called_on_the_merge_conflict_path(tmp_path, monkeyp
         claude_outputs=["Resolved the conflict.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude"],
         codex_outputs=[_review(resolved=[])],
         mergeability_payloads=[
-            {"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY", "headRefOid": "abc123", "baseRefName": "main"},
+            {"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "baseRefName": "main"},
         ],
     )
     assert run_pr_loop(
@@ -888,7 +888,7 @@ from coding_review_agent_loop.local_test_evidence import (  # noqa: E402
 from coding_review_agent_loop.protocol import validate_structured_coder_followup  # noqa: E402
 
 
-def _receipt(turn_id, head="abc123"):
+def _receipt(turn_id, head="6367c48dd193d56ea7b0baad25b19455e529f5ee"):
     return LocalTestObservation(
         command=("python3", "-m", "pytest", "tests/test_row_a.py", "-q"),
         outcome="passed",
@@ -956,7 +956,7 @@ def _run_followups(tmp_path, monkeypatch, *, reviews, turns, expected_error=None
     real_validated_agent = pr_loop_module._run_validated_agent
 
     def current_head():
-        return runner.pr_payload.get("headRefOid") or "abc123"
+        return runner.pr_payload.get("headRefOid") or "6367c48dd193d56ea7b0baad25b19455e529f5ee"
 
     def fake_validated_agent(*args, **kwargs):
         if kwargs.get("role") != "coder":
@@ -1032,9 +1032,9 @@ def test_citation_only_followup_at_unchanged_head_verifies_and_never_stalls(tmp_
             _review(resolved=["item-1"]),
         ],
         turns=[
-            (["item-1"], [], "head-2", "abc123"),
-            (["item-1"], [], None, "head-2"),
-            (["item-1"], [], "head-3", "head-3"),
+            (["item-1"], [], "2f36b5091671a29e8f73e18a3723e66714617f9e", "6367c48dd193d56ea7b0baad25b19455e529f5ee"),
+            (["item-1"], [], None, "2f36b5091671a29e8f73e18a3723e66714617f9e"),
+            (["item-1"], [], "a586f3aaed927059bbbfa9c6644835ed18f87874", "a586f3aaed927059bbbfa9c6644835ed18f87874"),
         ],
     )
 
@@ -1068,7 +1068,7 @@ def test_untagged_finding_evidence_only_followup_at_unchanged_head_verifies(tmp_
             ]),
             _review(resolved=["item-1"]),
         ],
-        turns=[(["item-1"], [], None, "abc123")],
+        turns=[(["item-1"], [], None, "6367c48dd193d56ea7b0baad25b19455e529f5ee")],
     )
 
     assert result == 0
@@ -1081,8 +1081,8 @@ def test_untagged_finding_evidence_only_followup_at_unchanged_head_verifies(tmp_
 @pytest.mark.parametrize(
     "turn_two",
     [
-        pytest.param((["item-1", "item-2"], [], None, "head-2"), id="mixed"),
-        pytest.param((["item-1"], ["item-2"], None, "head-2"), id="code-only"),
+        pytest.param((["item-1", "item-2"], [], None, "2f36b5091671a29e8f73e18a3723e66714617f9e"), id="mixed"),
+        pytest.param((["item-1"], ["item-2"], None, "2f36b5091671a29e8f73e18a3723e66714617f9e"), id="code-only"),
     ],
 )
 def test_code_claim_followup_at_unchanged_head_receipts_verify_and_reviewer_keeps_finding(
@@ -1103,9 +1103,9 @@ def test_code_claim_followup_at_unchanged_head_receipts_verify_and_reviewer_keep
             _review(resolved=["item-2"]),
         ],
         turns=[
-            (["item-1", "item-2"], [], "head-2", "abc123"),
+            (["item-1", "item-2"], [], "2f36b5091671a29e8f73e18a3723e66714617f9e", "6367c48dd193d56ea7b0baad25b19455e529f5ee"),
             turn_two,
-            (["item-2"], [], "head-3", "head-3"),
+            (["item-2"], [], "a586f3aaed927059bbbfa9c6644835ed18f87874", "a586f3aaed927059bbbfa9c6644835ed18f87874"),
         ],
     )
 
@@ -1126,7 +1126,7 @@ def test_unchanged_head_stop_still_fires_with_verified_evidence(tmp_path, monkey
     verified, yet the reviewer keeps the finding and the unchanged-head stop
     fires with its existing message.
     """
-    turns = [(["item-1"], [], None, "abc123")] * MAX_UNCHANGED_HEAD_CODER_TURNS
+    turns = [(["item-1"], [], None, "6367c48dd193d56ea7b0baad25b19455e529f5ee")] * MAX_UNCHANGED_HEAD_CODER_TURNS
     reviews = [_review(["A real code defect in the loader"])] + [
         _review(carried=["item-1"]) for _ in range(MAX_UNCHANGED_HEAD_CODER_TURNS)
     ]
@@ -1135,7 +1135,7 @@ def test_unchanged_head_stop_still_fires_with_verified_evidence(tmp_path, monkey
     )
 
     assert (
-        f"left head abc123 unchanged in {MAX_UNCHANGED_HEAD_CODER_TURNS} consecutive "
+        f"left head 6367c48dd193d56ea7b0baad25b19455e529f5ee unchanged in {MAX_UNCHANGED_HEAD_CODER_TURNS} consecutive "
         "follow-up rounds" in str(error)
     )
     assert len(coder_records) == MAX_UNCHANGED_HEAD_CODER_TURNS

@@ -84,7 +84,7 @@ def test_auto_merge_supported_repo_dispatches_and_merges_exact_approved_head(
     monkeypatch.setattr(
         pr_loop,
         "wait_for_final_qualification",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     merges = []
     monkeypatch.setattr(
@@ -100,8 +100,8 @@ def test_auto_merge_supported_repo_dispatches_and_merges_exact_approved_head(
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert dispatches[0]["expected_head_sha"] == "abc123"
-    assert merges == [{"expected_head_sha": "abc123"}]
+    assert dispatches[0]["expected_head_sha"] == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert merges == [{"expected_head_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"}]
 
 
 def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
@@ -116,8 +116,8 @@ def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
     failed_checks = _watch_check_board("failing", failing=(failed_check,))
     outcomes = iter(
         [
-            ManagedCiOutcome(status="failed", checks=failed_checks, head_sha="abc123"),
-            ManagedCiOutcome(status="passed", head_sha="abc123-coder-1"),
+            ManagedCiOutcome(status="failed", checks=failed_checks, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
+            ManagedCiOutcome(status="passed", head_sha="525753a4b04bd57d874211ba1fade250c3ff6d82"),
         ]
     )
     runner = FakeRunner(
@@ -156,7 +156,7 @@ def test_managed_ci_failure_routes_back_to_coder_and_uses_failure_extension(
     assert "GitHub managed exact-head CI unresolved blocking item [item-1]" in coder_prompt
     assert "final-ci/exact-head (failure)" in coder_prompt
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
-    assert merges == [{"expected_head_sha": "abc123-coder-1"}]
+    assert merges == [{"expected_head_sha": "525753a4b04bd57d874211ba1fade250c3ff6d82"}]
 
 
 def test_managed_qualification_resume_attaches_without_redispatch(
@@ -180,7 +180,7 @@ def test_managed_qualification_resume_attaches_without_redispatch(
         obligation_kind="managed-exact-head-ci",
         lifecycle="qualifying",
         failed_head_sha="old-head",
-        candidate_head_sha="abc123",
+        candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         obligation_identity="managed-exact-head-ci:item-1",
     )
     checkpoint = QualificationCheckpoint(
@@ -188,7 +188,7 @@ def test_managed_qualification_resume_attaches_without_redispatch(
         obligation_identity=item.obligation_identity,
         lifecycle="qualifying",
         failed_head_sha="old-head",
-        candidate_head_sha="abc123",
+        candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         base_branch="main",
         requirements_digest=pr_loop_support._qualification_digest(tuple()),
         acquisition_digest=pr_loop_support._qualification_digest(acquisition_contract),
@@ -206,7 +206,7 @@ def test_managed_qualification_resume_attaches_without_redispatch(
             role="reviewer",
             agent="Codex",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(dataclasses.replace(item, lifecycle="awaiting_current_head_review"),),
             state="approved",
             architecture_contract_version=1,
@@ -219,7 +219,7 @@ def test_managed_qualification_resume_attaches_without_redispatch(
             role="summary",
             agent="Orchestrator",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(item,),
             state="blocking",
             phase="qualification-checkpoint",
@@ -237,7 +237,7 @@ def test_managed_qualification_resume_attaches_without_redispatch(
         },
     )
     contract = ManagedCiContract(
-        protocol_version=2, attached_run_id=123, run_attempt=1, expected_head_sha="abc123"
+        protocol_version=2, attached_run_id=123, run_attempt=1, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
     dispatches = []
     merges = []
@@ -253,15 +253,15 @@ def test_managed_qualification_resume_attaches_without_redispatch(
     def wait(*a, **k):
         c = k["contract"]
         waited.append((c.attached_run_id, c.run_attempt, c.expected_head_sha))
-        return ManagedCiOutcome(status="passed", head_sha="abc123")
+        return ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
     monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait)
     monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: merges.append(k))
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert dispatches == []
-    assert waited == [(123, 1, "abc123")]
-    assert merges == [{"expected_head_sha": "abc123"}]
+    assert waited == [(123, 1, "6367c48dd193d56ea7b0baad25b19455e529f5ee")]
+    assert merges == [{"expected_head_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"}]
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
 
 
@@ -279,7 +279,7 @@ def _managed_qualifying_resume(tmp_path, *, managed=True, attempt_id="123/1", **
         text="Managed CI failed on the previous head.", status="blocking",
         source_status="blocking", authority="machine",
         obligation_kind="managed-exact-head-ci", lifecycle="qualifying",
-        failed_head_sha="old-head", candidate_head_sha="abc123",
+        failed_head_sha="old-head", candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         obligation_identity="managed-exact-head-ci:item-1",
     )
     checkpoint = QualificationCheckpoint(
@@ -287,7 +287,7 @@ def _managed_qualifying_resume(tmp_path, *, managed=True, attempt_id="123/1", **
         obligation_identity=item.obligation_identity,
         lifecycle="qualifying",
         failed_head_sha="old-head",
-        candidate_head_sha="abc123",
+        candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         base_branch="main",
         requirements_digest=pr_loop_support._qualification_digest(tuple()),
         acquisition_digest=pr_loop_support._qualification_digest(acquisition_contract),
@@ -301,7 +301,7 @@ def _managed_qualifying_resume(tmp_path, *, managed=True, attempt_id="123/1", **
     reviewer_comment = _attach_round_metadata(
         "Approved the repaired head.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
         PostedRoundMetadata(
-            flow="pr", role="reviewer", agent="Codex", round_number=1, subject="abc123",
+            flow="pr", role="reviewer", agent="Codex", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(dataclasses.replace(item, lifecycle="awaiting_current_head_review"),),
             state="approved", architecture_contract_version=1,
         ),
@@ -309,7 +309,7 @@ def _managed_qualifying_resume(tmp_path, *, managed=True, attempt_id="123/1", **
     checkpoint_comment = _attach_round_metadata(
         "Qualification was dispatched.",
         PostedRoundMetadata(
-            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="abc123",
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(item,), state="blocking", phase="qualification-checkpoint",
             qualification_checkpoint=checkpoint, architecture_contract_version=1,
         ),
@@ -356,16 +356,16 @@ def test_managed_qualification_fresh_process_resume_dispatches_a_fresh_attempt(
     def wait(*a, **k):
         c = k["contract"]
         waited.append((c.attached_run_id, c.run_attempt, c.expected_head_sha))
-        return ManagedCiOutcome(status="passed", head_sha="abc123")
+        return ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
     monkeypatch.setattr(pr_loop, "dispatch_final_qualification", dispatch)
     monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait)
     monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *a, **k: merges.append(k))
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    assert dispatches == [("abc123", "fresh-gen")]
-    assert waited == [(999, 1, "abc123")]
-    assert merges == [{"expected_head_sha": "abc123"}]
+    assert dispatches == [("6367c48dd193d56ea7b0baad25b19455e529f5ee", "fresh-gen")]
+    assert waited == [(999, 1, "6367c48dd193d56ea7b0baad25b19455e529f5ee")]
+    assert merges == [{"expected_head_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"}]
     assert not any(command[:2] == ["codex", "exec"] for command, _cwd in runner.commands)
     attempts = _posted_attempt_checkpoints(runner)
     assert attempts == ["PR #77 qualification checkpoint: attached attempt 999/1."]
@@ -381,7 +381,7 @@ def test_managed_qualification_fresh_process_resume_dispatches_a_fresh_attempt(
         pytest.param(
             ManagedCiContract(
                 protocol_version=2, attached_run_id=456, run_attempt=1,
-                expected_head_sha="abc123",
+                expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             ),
             id="mismatched-same-head-attachment",
         ),
@@ -468,18 +468,18 @@ def test_managed_checkpoint_needs_fresh_attempt_helper_covers_each_conjunct():
         obligation_identity="managed-exact-head-ci:item-1",
         lifecycle="qualifying",
         failed_head_sha="old-head",
-        candidate_head_sha="abc123",
+        candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         qualification_attempt_id="555/1",
     )
     fresh = ManagedCiContract(protocol_version=2, intent_generation="fresh-gen")
 
-    assert needs_fresh(checkpoint, fresh, "abc123")
-    assert needs_fresh(checkpoint, dataclasses.replace(fresh, expected_head_sha="abc123"), "abc123")
-    assert not needs_fresh(checkpoint, dataclasses.replace(fresh, expected_head_sha="old-head"), "abc123")
-    assert not needs_fresh(None, fresh, "abc123")
-    assert not needs_fresh(QualificationCheckpoint.invalid("stale"), fresh, "abc123")
+    assert needs_fresh(checkpoint, fresh, "6367c48dd193d56ea7b0baad25b19455e529f5ee")
+    assert needs_fresh(checkpoint, dataclasses.replace(fresh, expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"), "6367c48dd193d56ea7b0baad25b19455e529f5ee")
+    assert not needs_fresh(checkpoint, dataclasses.replace(fresh, expected_head_sha="old-head"), "6367c48dd193d56ea7b0baad25b19455e529f5ee")
+    assert not needs_fresh(None, fresh, "6367c48dd193d56ea7b0baad25b19455e529f5ee")
+    assert not needs_fresh(QualificationCheckpoint.invalid("stale"), fresh, "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert not needs_fresh(
-        dataclasses.replace(checkpoint, lifecycle="qualification_ready"), fresh, "abc123"
+        dataclasses.replace(checkpoint, lifecycle="qualification_ready"), fresh, "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
     assert not needs_fresh(
         dataclasses.replace(
@@ -487,15 +487,15 @@ def test_managed_checkpoint_needs_fresh_attempt_helper_covers_each_conjunct():
             obligation_identity="github-pr-checks:item-1",
         ),
         fresh,
-        "abc123",
+        "6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
-    assert not needs_fresh(checkpoint, fresh, "other-head")
+    assert not needs_fresh(checkpoint, fresh, "5e6741348108b11e3f3ef936c335b1967d17ac6c")
     assert not needs_fresh(checkpoint, fresh, None)
     assert not needs_fresh(checkpoint, fresh, "")
-    assert not needs_fresh(checkpoint, None, "abc123")
-    assert not needs_fresh(checkpoint, dataclasses.replace(fresh, protocol_version=1), "abc123")
+    assert not needs_fresh(checkpoint, None, "6367c48dd193d56ea7b0baad25b19455e529f5ee")
+    assert not needs_fresh(checkpoint, dataclasses.replace(fresh, protocol_version=1), "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert not needs_fresh(
-        checkpoint, dataclasses.replace(fresh, activation_path="ordinary_fallback"), "abc123"
+        checkpoint, dataclasses.replace(fresh, activation_path="ordinary_fallback"), "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
     for owned in (
         {"attached_run_id": 555},
@@ -503,7 +503,7 @@ def test_managed_checkpoint_needs_fresh_attempt_helper_covers_each_conjunct():
         {"nonce": "owned-nonce"},
         {"dispatch_issued": True},
     ):
-        assert not needs_fresh(checkpoint, dataclasses.replace(fresh, **owned), "abc123"), owned
+        assert not needs_fresh(checkpoint, dataclasses.replace(fresh, **owned), "6367c48dd193d56ea7b0baad25b19455e529f5ee"), owned
 
 
 @pytest.mark.parametrize(
@@ -546,7 +546,7 @@ def test_resume_qualification_identity_gap_forces_review_before_qualification(
         obligation_kind="github-pr-checks",
         lifecycle="qualification_ready",
         failed_head_sha="old-head",
-        candidate_head_sha="abc123",
+        candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         obligation_identity="github-pr-checks:item-1",
     )
     checkpoint = QualificationCheckpoint(
@@ -554,7 +554,7 @@ def test_resume_qualification_identity_gap_forces_review_before_qualification(
         obligation_identity=item.obligation_identity,
         lifecycle="qualifying",
         failed_head_sha="old-head",
-        candidate_head_sha="abc123",
+        candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         base_branch="main",
         requirements_digest=pr_loop_support._qualification_digest(tuple()),
         acquisition_digest=pr_loop_support._qualification_digest(
@@ -564,7 +564,7 @@ def test_resume_qualification_identity_gap_forces_review_before_qualification(
         scheduler_digest=pr_loop_support._qualification_digest(
             pr_loop_support._prior_item_ledger_signature((item,))
         ),
-        qualification_attempt_id="github-checks:abc123",
+        qualification_attempt_id="github-checks:6367c48dd193d56ea7b0baad25b19455e529f5ee",
         allowed_rounds=1,
     )
     checkpoint = dataclasses.replace(checkpoint, **{field: value})
@@ -575,7 +575,7 @@ def test_resume_qualification_identity_gap_forces_review_before_qualification(
             role="summary",
             agent="Orchestrator",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(item,),
             state="blocking",
             phase="qualification-checkpoint",
@@ -647,12 +647,12 @@ def test_managed_manual_success_publishes_result_without_merge_even_with_pending
     monkeypatch.setattr(
         pr_loop,
         "wait_for_final_qualification",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     monkeypatch.setattr(
         pr_loop,
         "publish_manual_v2_qualification",
-        lambda *args, **kwargs: published.append(kwargs["expected_head_sha"]) or "abc123",
+        lambda *args, **kwargs: published.append(kwargs["expected_head_sha"]) or "6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     monkeypatch.setattr(
         pr_loop_support,
@@ -662,7 +662,7 @@ def test_managed_manual_success_publishes_result_without_merge_even_with_pending
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    assert published == ["abc123"]
+    assert published == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
     out = capsys.readouterr().out
     assert "approved and qualified; manual merge required" in out
     assert "line containing exactly `-- Human Reviewer`, then rerun `agent-loop pr 77`" in out
@@ -726,9 +726,9 @@ def test_managed_ci_head_change_restarts_review_without_coder(tmp_path, monkeypa
         nonlocal call_count
         call_count += 1
         if call_count == 1:
-            runner.pr_payload["headRefOid"] = "new-head"
-            return ManagedCiOutcome(status="head_changed", head_sha="new-head")
-        return ManagedCiOutcome(status="passed", head_sha="new-head")
+            runner.pr_payload["headRefOid"] = "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"
+            return ManagedCiOutcome(status="head_changed", head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
+        return ManagedCiOutcome(status="passed", head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
 
     monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait_for_managed_ci)
     merges = []
@@ -739,7 +739,7 @@ def test_managed_ci_head_change_restarts_review_without_coder(tmp_path, monkeypa
     assert call_count == 2
     assert not any(cmd[:1] == ["claude"] for cmd, _cwd in runner.commands)
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]) == 2
-    assert merges == [{"expected_head_sha": "new-head"}]
+    assert merges == [{"expected_head_sha": "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"}]
 
 
 def test_managed_ci_merge_conflict_routes_through_reconciliation(tmp_path, monkeypatch):
@@ -747,7 +747,7 @@ def test_managed_ci_merge_conflict_routes_through_reconciliation(tmp_path, monke
         state="conflicted",
         mergeable_raw="CONFLICTING",
         merge_state_raw="DIRTY",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         base_branch="main",
     )
     outcomes = iter(
@@ -755,9 +755,9 @@ def test_managed_ci_merge_conflict_routes_through_reconciliation(tmp_path, monke
             ManagedCiOutcome(
                 status="merge_conflict",
                 mergeability=conflict,
-                head_sha="abc123",
+                head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             ),
-            ManagedCiOutcome(status="passed", head_sha="abc123-coder-1"),
+            ManagedCiOutcome(status="passed", head_sha="525753a4b04bd57d874211ba1fade250c3ff6d82"),
         ]
     )
     runner = FakeRunner(
@@ -811,7 +811,7 @@ def test_managed_ci_infrastructure_stall_stops_cleanly(tmp_path, monkeypatch):
         pr_loop,
         "wait_for_final_qualification",
         lambda *args, **kwargs: ManagedCiOutcome(
-            status="infrastructure_stall", head_sha="abc123", stall=stall
+            status="infrastructure_stall", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", stall=stall
         ),
     )
     monkeypatch.setattr(
@@ -859,7 +859,7 @@ def test_managed_ci_does_not_publish_readiness_without_configured_pre_review_gat
     monkeypatch.setattr(
         pr_loop,
         "wait_for_final_qualification",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
 
@@ -896,7 +896,7 @@ def test_managed_ci_publishes_readiness_after_configured_pre_review_gate(
     monkeypatch.setattr(
         pr_loop,
         "wait_for_final_qualification",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     monkeypatch.setattr(pr_loop_support, "merge_pr", lambda *args, **kwargs: None)
 
@@ -907,7 +907,7 @@ def test_managed_ci_publishes_readiness_after_configured_pre_review_gate(
         pre_review_test_pending=True,
     ) == 0
 
-    assert published_heads == ["abc123"]
+    assert published_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
     assert ["verify-managed-head"] in [cmd for cmd, _cwd in runner.commands]
 
 
@@ -952,7 +952,7 @@ def test_stale_older_head_managed_attachment_is_released_and_fresh_attempt_dispa
         obligation_kind="managed-exact-head-ci",
         lifecycle="awaiting_current_head_review",
         failed_head_sha="old-head",
-        candidate_head_sha="abc123",
+        candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         obligation_identity="managed-exact-head-ci:item-1",
     )
     coder_output = structured_coder_followup(
@@ -962,7 +962,7 @@ def test_stale_older_head_managed_attachment_is_released_and_fresh_attempt_dispa
         coder_output,
         PostedRoundMetadata(
             flow="pr", role="coder", agent="Claude", round_number=1,
-            subject="abc123", prior_items=(seeded,), state="blocking",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", prior_items=(seeded,), state="blocking",
             raw_structured_coder_response=coder_output,
         ),
     )
@@ -994,13 +994,13 @@ def test_stale_older_head_managed_attachment_is_released_and_fresh_attempt_dispa
     bodies = [str(c) for c in runner.comments]
     assert any(c[:2] == ["codex", "exec"] for c, _cwd in runner.commands)
     assert any("authoritative exact-head validation is in progress" in b for b in bodies)
-    assert state["dispatches"] == ["abc123"]
+    assert state["dispatches"] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
     assert not any("37061662125" in b for b in bodies)
     assert [b for b in bodies if "attached attempt" in b and "999/1" in b]
     assert len([b for b in bodies if "attached attempt" in b]) == 1
-    assert state["waited"] == [(999, "abc123")]
+    assert state["waited"] == [(999, "6367c48dd193d56ea7b0baad25b19455e529f5ee")]
     assert "resuming attached qualification attempt 37061662125" not in capsys.readouterr().err
-    assert state["merges"] == [{"expected_head_sha": "abc123"}]
+    assert state["merges"] == [{"expected_head_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"}]
 
 
 def test_pr1166_stale_attempt_failure_does_not_end_run_or_partial_the_approved_round(
@@ -1040,7 +1040,7 @@ def test_pr1166_stale_attempt_failure_does_not_end_run_or_partial_the_approved_r
         if contract.attached_run_id == 999:
             # Attempt A: bound to the first head and failing late.
             return ManagedCiOutcome(
-                status="failed", head_sha="abc123",
+                status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 checks=_watch_check_board("failing", failing=(failed_check,)),
             )
         return ManagedCiOutcome(status="passed", head_sha=metadata.head_sha)
@@ -1058,11 +1058,11 @@ def test_pr1166_stale_attempt_failure_does_not_end_run_or_partial_the_approved_r
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     bodies = [str(c) for c in runner.comments]
-    # A was dispatched for abc123; B for the coder's new head. A's failure is never
+    # A was dispatched for 6367c48dd193d56ea7b0baad25b19455e529f5ee; B for the coder's new head. A's failure is never
     # reported as B's verdict, and the run does not stop on it.
-    assert state["dispatches"] == ["abc123", "abc123-coder-1"]
-    assert state["waited"] == [(999, "abc123"), (1000, "abc123-coder-1")]
-    assert state["merges"] == [{"expected_head_sha": "abc123-coder-1"}]
+    assert state["dispatches"] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee", "525753a4b04bd57d874211ba1fade250c3ff6d82"]
+    assert state["waited"] == [(999, "6367c48dd193d56ea7b0baad25b19455e529f5ee"), (1000, "525753a4b04bd57d874211ba1fade250c3ff6d82")]
+    assert state["merges"] == [{"expected_head_sha": "525753a4b04bd57d874211ba1fade250c3ff6d82"}]
     attached = [b for b in bodies if "qualification checkpoint: attached attempt" in b]
     # Only the repair round carries a CI obligation, so only attempt B is checkpointed.
     assert [("999/1" in b, "1000/1" in b) for b in attached] == [(False, True)]
@@ -1077,21 +1077,21 @@ def test_pr1166_stale_attempt_failure_does_not_end_run_or_partial_the_approved_r
     assert reviewer_before == 4  # both reviewers approved both heads in run 1
     resumed = ManagedCiContract(
         protocol_version=2, attached_run_id=1000, run_attempt=1,
-        expected_head_sha="abc123-coder-1", nonce="fresh-nonce-2",
+        expected_head_sha="525753a4b04bd57d874211ba1fade250c3ff6d82", nonce="fresh-nonce-2",
     )
     state2 = _stale_attachment_stubs(
         monkeypatch, stale_contract=resumed,
         outcomes=lambda c, m: ManagedCiOutcome(status="passed", head_sha=m.head_sha),
     )
     runner.pr_payload["state"] = "OPEN"
-    assert runner.pr_payload["headRefOid"] == "abc123-coder-1"
+    assert runner.pr_payload["headRefOid"] == "525753a4b04bd57d874211ba1fade250c3ff6d82"
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert reviewer_runs() == reviewer_before
     assert state2["dispatches"] == []
-    assert state2["waited"] == [(1000, "abc123-coder-1")]
-    assert state2["merges"] == [{"expected_head_sha": "abc123-coder-1"}]
+    assert state2["waited"] == [(1000, "525753a4b04bd57d874211ba1fade250c3ff6d82")]
+    assert state2["merges"] == [{"expected_head_sha": "525753a4b04bd57d874211ba1fade250c3ff6d82"}]
 
 
 def test_managed_pr_recovery_keeps_closing_reference_gate_without_pr_contract(
@@ -1107,7 +1107,7 @@ def test_managed_pr_recovery_keeps_closing_reference_gate_without_pr_contract(
         issue_number=56,
         pr_number=77,
         base_ref="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         actor_login="agent-loop",
         actor_id=1,
         protection="voluntary",
@@ -1191,7 +1191,7 @@ class _M1047LivePrRunner(_FakeRunner):
             "state": "open",
             "draft": draft,
             "labels": [{"name": name} for name in labels],
-            "head": {"sha": self.pr_payload.get("headRefOid")},
+            "head": {"sha": self.pr_payload.get("headRefOid"), "ref": self.pr_payload.get("headRefName"), "repo": {"full_name": "OWNER/REPO"}},
             "base": {"ref": "main", "repo": {"full_name": "OWNER/REPO"}},
         }
         self.events = [{
@@ -1312,7 +1312,7 @@ def test_m1047_entry_normalization_runs_before_every_managed_resume_path(
     else:
         monkeypatch.setattr(
             pr_loop, "recover_managed_pr_origin",
-            lambda *a, **k: ("feature", "abc123", "agent-loop/managed-77", None),
+            lambda *a, **k: ("feature", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "agent-loop/managed-77", None),
         )
         monkeypatch.setattr(pr_loop, "validate_managed_pr_body", lambda *a, **k: None)
         monkeypatch.setattr(
@@ -1633,7 +1633,7 @@ def test_approach_alternative_stop_publishes_continuity_first_and_resume_stops(
             structured_coder_followup(addressed_items=["item-2"]),
             structured_coder_followup(
                 addressed_items=["item-3"],
-                summary="Approach alternative: drop the predecessor-head disqualifier.",
+                summary="Approach alternative: drop the aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c disqualifier.",
             ),
         ],
         codex_outputs=[
@@ -1720,3 +1720,26 @@ def test_approach_alternative_stop_publishes_continuity_first_and_resume_stops(
     assert events == [("stop-check", new_head), ("diagnostic", new_head)]
     assert len([cmd for cmd, _cwd in runner.commands if cmd[:1] == ["codex"]]) == 3
     assert not any(cmd[:3] == ["gh", "workflow", "run"] for cmd, _cwd in runner.commands)
+
+
+@pytest.mark.parametrize('origin', ['issue-created', 'source-managed', 'adopted'])
+def test_observation_stop_keeps_existing_origin_cleanup(tmp_path, monkeypatch, origin):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    runner = _M1047LivePrRunner(draft=True,
+        codex_outputs=[structured_pr_review(state='blocking', blocking_items=['Fix it.'])],
+        claude_outputs=[structured_coder_followup(addressed_items=['item-1'])],
+        advance_pr_head_on_coder_followup=False)
+    contract = _m1047_contract(origin)
+    contract.adopted_existing_pr = origin == 'adopted'
+    monkeypatch.setattr(pr_loop, 'revalidate_adopted_managed_ci', lambda *a, **k: True)
+    _m1047_reach_publication(monkeypatch, runner, contract)
+    original = runner._maybe_advance_pr_head_for_coder_followup
+    def push(cmd):
+        original(cmd)
+        if '"kind": "coder_followup"' in '\n'.join(cmd): runner.branch_tip = 'b' * 40
+    runner._maybe_advance_pr_head_for_coder_followup = push
+    release_calls = _m1047_release_spy(monkeypatch)
+    with pytest.raises(PrHeadObservationError, match='desync'):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, managed_ci=True))
+    assert bool(release_calls) is (origin == 'adopted')
+    assert runner.has_managed_label() is (origin != 'adopted')

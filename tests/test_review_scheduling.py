@@ -76,7 +76,7 @@ def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
     failed_check = PullRequestCheck(name="test", kind="check_run", status="failure")
 
     def checks(*args, **kwargs):
-        failing = kwargs["metadata"].head_sha == "abc123"
+        failing = kwargs["metadata"].head_sha == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
         return PullRequestChecks(
             state="failing" if failing else "passing",
             required_checks=("test",),
@@ -103,7 +103,7 @@ def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
         if (
             not interrupted and kwargs.get("role") == "reviewer"
             and str(kwargs.get("agent")) == "opus"
-            and runner.pr_payload["headRefOid"] != "abc123"
+            and runner.pr_payload["headRefOid"] != "6367c48dd193d56ea7b0baad25b19455e529f5ee"
         ):
             interrupted = True
             raise KeyboardInterrupt
@@ -115,14 +115,14 @@ def test_named_all_reviewers_require_both_fresh_approvals_after_coder_head_move(
             pr_loop.run_pr_loop(runner, pr_number=77, config=config)
 
     assert interrupted
-    assert runner.pr_payload["headRefOid"] != "abc123"
+    assert runner.pr_payload["headRefOid"] != "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     head = runner.pr_payload["headRefOid"]
     approvals = [
         record.metadata for record in records()
         if record.metadata.role == "reviewer" and record.metadata.state == "approved"
     ]
     assert {(record.agent, record.subject) for record in approvals} == {
-        ("flash", "abc123"), ("opus", "abc123"), ("flash", head),
+        ("flash", "6367c48dd193d56ea7b0baad25b19455e529f5ee"), ("opus", "6367c48dd193d56ea7b0baad25b19455e529f5ee"), ("flash", head),
     }
     assert not any(cmd[:3] == ["gh", "pr", "merge"] for cmd, _ in runner.commands)
     assert len([cmd for cmd, _ in runner.commands if cmd[0] == "agy"]) == 3
@@ -845,10 +845,10 @@ def test_fresh_qualification_rejects_a_scheduler_contract_change(tmp_path):
             role="summary",
             agent="Orchestrator",
             round_number=2,
-            subject="head",
+            subject="1a954628a960aaef81d7b2d4521929579f3541e6",
             scheduler_contract=changed_contract.as_dict(),
             scheduler_previous_sha="base",
-            scheduler_current_sha="head",
+            scheduler_current_sha="1a954628a960aaef81d7b2d4521929579f3541e6",
             scheduler_obligation_digest="0" * 16,
             scheduler_selected_reviewers=("Claude", "Codex", "Antigravity"),
             scheduler_paused_reviewers=(),
@@ -860,7 +860,7 @@ def test_fresh_qualification_rejects_a_scheduler_contract_change(tmp_path):
     )
     runner = FakeRunner(
         pr_payload={
-            "headRefOid": "head",
+            "headRefOid": "1a954628a960aaef81d7b2d4521929579f3541e6",
             "comments": [{"author": {"login": "bot"}, "body": audit}],
         }
     )
@@ -888,11 +888,11 @@ def test_fresh_qualification_rejects_scheduler_metadata_after_recovery_boundary(
             role="summary",
             agent="Orchestrator",
             round_number=2,
-            subject="head",
+            subject="1a954628a960aaef81d7b2d4521929579f3541e6",
             phase="reconciliation",
             scheduler_contract=_contract().as_dict(),
             scheduler_previous_sha=None,
-            scheduler_current_sha="head",
+            scheduler_current_sha="1a954628a960aaef81d7b2d4521929579f3541e6",
             scheduler_obligation_digest="0" * 16,
             scheduler_selected_reviewers=("Claude", "Codex", "Antigravity"),
             scheduler_paused_reviewers=(),
@@ -909,13 +909,13 @@ def test_fresh_qualification_rejects_scheduler_metadata_after_recovery_boundary(
             role="summary",
             agent="Orchestrator",
             round_number=3,
-            subject="head",
+            subject="1a954628a960aaef81d7b2d4521929579f3541e6",
             scheduler_contract={"policy": "selective-intermediate"},
         ),
     )
     runner = FakeRunner(
         pr_payload={
-            "headRefOid": "head",
+            "headRefOid": "1a954628a960aaef81d7b2d4521929579f3541e6",
             "comments": [
                 {"author": {"login": "bot"}, "body": valid_reconciliation},
                 {"author": {"login": "bot"}, "body": malformed_after_recovery},

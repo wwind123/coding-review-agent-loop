@@ -19,7 +19,7 @@ import coding_review_agent_loop.pr_loop as pr_loop
 import coding_review_agent_loop.pr_loop_support as pr_loop_support
 from agent_loop_helpers import patch_attr_in
 
-H = "abc123"
+H = "6367c48dd193d56ea7b0baad25b19455e529f5ee"
 
 
 PERSISTED_TEXT = "Failing checks: Python 3.12 full suite (failure)"

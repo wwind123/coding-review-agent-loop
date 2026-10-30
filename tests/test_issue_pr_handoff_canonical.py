@@ -17,7 +17,7 @@ def test_removed_canonical_handoff_does_not_recreate_from_incidental_pr(tmp_path
             issue_number=56,
             pr_number=77,
             pr_url="https://github.com/OWNER/REPO/pull/77",
-            pr_head_sha="abc123",
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             flow="issue-implementation",
             plan_hash=None,
         ),
