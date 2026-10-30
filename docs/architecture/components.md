@@ -141,6 +141,7 @@ Source paths below are relative to
 | Review rounds | `review_rounds.py` | Review outcome classification, round-ledger helpers, parallel reviewer-turn launch, spool replay, and partial-round refusal. |
 | Discuss loop | `discuss_loop.py` | The discuss mode entry point and its consensus and split-proposal analyzers. |
 | Execution policy | `execution_policy.py` | Execution-policy resolution, child routing and provenance, staged reporting, typed plan-stage extraction, and fresh-topology preflights. |
+| Execution retirement | `execution_retirement.py` | Complete terminal-work inventory, current-plan ownership partition and invocation-scoped history routing; covered by [retirement regressions](../../tests/test_execution_decision_retirement.py). |
 | Child plan binding | `child_plan_binding.py` | Inherited-matrix replan state, child-plan rebind and supersession, and structured plan-round assembly. |
 | PR loop support | `pr_loop_support.py` | Exact-head merge proof, finalization, evidence freeze, qualification snapshot, and PR transition observation; evidence conversion and signed-evidence references, read through the one authenticated comment accessor `authenticated_pr_comments`. |
 | PR loop decisions | `pr_loop_decisions.py` | Pure reviewer prelaunch classification, round-ledger settlement and CI plumbing routing, rerun-budget decisions and observation formatting; explicitly re-exported by `pr_loop.py`. |

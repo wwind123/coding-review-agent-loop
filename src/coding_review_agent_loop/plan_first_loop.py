@@ -111,6 +111,7 @@ from .github import (
 )
 from .publication_resume import context_digest as publication_context_digest
 from .issue_pr_handoff import (
+    authenticate_canonical_issue_pr,
     post_issue_pr_handoff_comment,
     require_pr_metadata_for_handoff,
     resolve_canonical_pr_for_issue,
@@ -4697,14 +4698,25 @@ def _run_plan_first_loop_body(
                 log(config, str(nested))
                 print(json.dumps(nested.as_dict(), sort_keys=True))
                 return 2
-            # A re-approval under a new hash supersedes a decision nothing has
-            # acted on yet (#1087); a realized one still fails closed here.
+            # Entry deferral grants no execution authority to legacy plans.
+            # Reapply the canonical barrier before any execution writes.
+            if recommendation is None and mode != "plan-only":
+                resolve_canonical_pr_for_issue(
+                    runner, config=config, issue_number=issue_number,
+                    issue_context=issue_context,
+                    expected_fallback_scope=IssuePrProvenanceScope(
+                        repository=config.repo, issue_number=issue_number,
+                        flow="approved", approved_plan_hash=plan_hash,
+                    ),
+                )
+            # Retirement verifies terminal history before any execution writes.
             retired_decision_hashes: frozenset[str] = frozenset()
             retiring_decision_hashes: tuple[str, ...] = ()
             if recommendation is not None and mode != "plan-only":
                 (
                     retired_decision_hashes,
                     retiring_decision_hashes,
+                    execution_history,
                 ) = _retirable_execution_decision_hashes(
                     runner,
                     config=config,
@@ -4712,6 +4724,9 @@ def _run_plan_first_loop_body(
                     comments=issue_context.comments,
                     plan_hash=plan_hash,
                 )
+                if execution_history is not None:
+                    config = dataclasses_replace(config, execution_history=execution_history)
+                    issue_context = execution_history.view(issue_context)
             normalized_topology = None
             if recommendation is not None and canonical_strategy == "staged":
                 normalized_topology = normalize_execution_recommendation(
@@ -4812,7 +4827,16 @@ def _run_plan_first_loop_body(
                 allow_issue_filing=mode in {"implement-one-shot", "implement-by-phase"},
                 usage_context=usage_context,
             )
-            split_scope_materialized = _handle_plan_first_split_scope(
+            # Terminal entry deferral permits planning, not split writes. Keep
+            # ordinary plan-only split behavior only without that handoff.
+            terminal_plan_only = False
+            if mode == "plan-only" and not config.dry_run:
+                canonical = authenticate_canonical_issue_pr(
+                    runner, config=config, issue_number=issue_number,
+                    issue_context=issue_context,
+                )
+                terminal_plan_only = canonical is not None and canonical.state in {"CLOSED", "MERGED"}
+            split_scope_materialized = False if terminal_plan_only else _handle_plan_first_split_scope(
                 runner,
                 issue_number=issue_number,
                 config=config,

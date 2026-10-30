@@ -534,6 +534,7 @@ def resolve_canonical_pr_for_issue(
     issue_number: int,
     issue_context: IssueContext,
     expected_fallback_scope: IssuePrProvenanceScope | None | object = _UNSET_FALLBACK_SCOPE,
+    defer_terminal: bool = False,
 ) -> ResolvedIssuePr | None:
     """Resolve the PR a rerun of `agent-loop issue <issue_number>` should resume.
 
@@ -545,10 +546,14 @@ def resolve_canonical_pr_for_issue(
     """
     if config.dry_run:
         return None
+    from .execution_retirement import execution_view
+    issue_context = execution_view(config, issue_context)
     authenticated = authenticate_canonical_issue_pr(
         runner, config=config, issue_number=issue_number, issue_context=issue_context
     )
     if authenticated is not None:
+        if defer_terminal and authenticated.state in {"CLOSED", "MERGED"}:
+            return None
         if authenticated.state != "OPEN":
             raise AgentLoopError(
                 f"Canonical handoff record for issue #{issue_number} references PR "

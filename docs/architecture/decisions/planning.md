@@ -21,3 +21,15 @@ never rewritten or deleted. The detail doc describes the current design.
 - Semantic refusals exposed by the post-repair test-observations fallback use the same shared correction allowance and terminal classification as direct and repaired candidates (#1738).
 
 - Initial and coverage-reask implementation acquisitions share the PR-follow-up typed report/selector correction policy, one allowance per acquisition; initial exhaustion stops before PR authentication, while coverage exhaustion discards the candidate and refreshes the original PR with post-authentication audit and recovery safeguards (#1768).
+
+- Re-approved plans may retire terminal execution history using complete inventories and resolved references; plan-first terminal handoffs defer to post-approval checks, and restart partitions current work before verified history without deleting durable records or branches (#1792, 2026-10-30).
+
+- Terminal-retirement recovery attributes post-decision split records through approved split keys and subject, retains retired split keys when filtering prior discuss proposals, and restores the pre-write canonical barrier for legacy plans without recommendations (#1792).
+
+- Plan-only approval after an authenticated terminal canonical handoff skips split materialization and unfiled-scope warnings; entry deferral does not grant split-writing authority (#1792).
+
+- Terminal retirement verifies historical child implementation PRs through complete PR inventories and authenticated child handoffs, including closed children whose PRs remain open (#1792).
+
+- Historical child retirement authenticates every handoff lineage, preserving same-PR contract supersession while checking earlier PRs for reopened or unreadable work on each restart (#1792).
+
+- Retirement assessment owns its strict listing reader and receives approved split ownership as a caller-supplied policy function, preserving the acyclic module layering enforced by the extraction registry (#1792).

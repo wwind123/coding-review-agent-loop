@@ -2,7 +2,7 @@
 
 The main lifecycle diagram and the plan-first path up to the implementation PR: the canonical approved plan and its handoff binding, the generation-1 risk-based mode and transition matrix and its inheritance by child plans, implementation evidence claims and their selector, row-ID and launcher rules, deterministic planning-validation recovery, and the generation-1 execution strategy with staged child phases.
 
-Source paths: `src/coding_review_agent_loop/plan_first_loop.py`, `src/coding_review_agent_loop/issue_implementation.py`, `src/coding_review_agent_loop/child_plan_binding.py`, `src/coding_review_agent_loop/execution_policy.py`, `src/coding_review_agent_loop/plan_assembly.py`, `src/coding_review_agent_loop/risk_coverage_map.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/decomposition.py`, `src/coding_review_agent_loop/child_topology.py`, `src/coding_review_agent_loop/phase_progress.py`, `tests/test_plan_first_loop_review.py`, `tests/test_plan_first_loop_staged.py`, `tests/test_plan_first_loop_step_back.py`, `tests/test_plan_first_loop_execution_strategy.py`, `tests/test_issue_implementation_handoff.py`, `tests/test_issue_implementation_recovery.py`, `tests/test_issue_loop_resume.py`, `tests/test_plan_assembly.py`.
+Source paths: `src/coding_review_agent_loop/execution_retirement.py`, `tests/test_execution_decision_retirement.py`, `src/coding_review_agent_loop/plan_first_loop.py`, `src/coding_review_agent_loop/issue_implementation.py`, `src/coding_review_agent_loop/child_plan_binding.py`, `src/coding_review_agent_loop/execution_policy.py`, `src/coding_review_agent_loop/plan_assembly.py`, `src/coding_review_agent_loop/risk_coverage_map.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/decomposition.py`, `src/coding_review_agent_loop/child_topology.py`, `src/coding_review_agent_loop/phase_progress.py`, `tests/test_plan_first_loop_review.py`, `tests/test_plan_first_loop_staged.py`, `tests/test_plan_first_loop_step_back.py`, `tests/test_plan_first_loop_execution_strategy.py`, `tests/test_issue_implementation_handoff.py`, `tests/test_issue_implementation_recovery.py`, `tests/test_issue_loop_resume.py`, `tests/test_plan_assembly.py`.
 
 ## Main Lifecycle
 
@@ -387,6 +387,48 @@ follow-up, child, handoff, coder, or PR mutation, and staged execution is
 bounded to one `agent-pr` child per run while the parent remains open.
 Repair may preserve a complete v1 source, but cannot synthesize missing
 recommendation data.
+
+Execution re-approval uses `execution_retirement.py` and its strict inventory
+reader to assess complete child and all-state PR listings plus every referenced
+handoff, decomposition, checkpoint and split record. Callers supply the approved
+split ownership derivation from execution policy, keeping retirement assessment
+independent of that higher policy layer. A stale decision may be retired only when its work is absent
+or positively terminal (CLOSED children; CLOSED or MERGED PRs), with confirmed
+absence of the encoded reserved-branch endpoint. Unknown, truncated or unreadable
+state fails closed. A leftover branch requires manual deletion after verifying
+finished work; retirement never mutates old work or changes stage-completion rules.
+Historical children from every record and inventory source also require terminal
+implementation PRs: the assessment correlates child closing references and managed
+branches, reads complete child comment histories, and authenticates canonical child
+handoffs from every lineage, including earlier lineages displaced by a different
+PR, even when their PRs are absent from listings. Each lineage retains its
+same-PR contract supersession checks. Unreadable child histories
+or PR references block retirement.
+The existing decision records retired hashes and explains terminal supersession.
+
+`issue_loop.py` defers only an authenticated terminal canonical handoff in
+plan-first mode; approval must still prove retirement under a different plan.
+Hash-less split materializations after a retiring decision belong to its current
+one-shot plan only when the recovered approved plan permits every split key and
+the materialization subject matches. Verified retired split keys suppress prior
+discuss proposals, preserving completed work without recreating children. Legacy
+plans without an execution recommendation repeat strict canonical handoff
+resolution before execution writes; entry deferral alone provides no dispatch
+authority. Plan-only runs with an authenticated terminal canonical handoff return
+the approved plan without materializing split proposals or posting unfiled-scope
+warnings, whether or not split materialization was requested.
+
+Same-plan and direct-mode terminal recovery refuse. Restart rebuilds a read-only,
+invocation-scoped execution history view before PR recovery and fresh preflights.
+Current-plan records positively attribute children and PRs first, including the
+current managed branch. Earlier hash-bearing records follow per-record retirement
+ordering, preserving A/B/A recurrence. Hash-less records before a retirement
+boundary and unclaimed parent-linked inventory may become history only after
+terminal verification and complete inventory correlation. Reopened, ambiguous or
+unattributed open work refuses. The view excludes individual historical record
+spans and child identities from execution selection, preserves other comment
+content and all durable records, and is carried through refetch, decomposition,
+split discovery, canonical handoff and implementation recovery.
 
 Staged decomposition returns an explicit topology outcome - the materialized
 children, one resolved stage identity and automation per index, the run's own

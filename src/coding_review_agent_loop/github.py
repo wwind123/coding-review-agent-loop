@@ -2685,7 +2685,7 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
         surface=f"Issue #{issue_number} text",
         texts=[title, body, *(comment.body for comment in comments)],
     )
-    return IssueContext(
+    context = IssueContext(
         number=int(data.get("number") or issue_number),
         repo=config.repo,
         title=title,
@@ -2699,6 +2699,8 @@ def get_issue_context(runner: Runner, *, config: AgentLoopConfig, issue_number: 
             candidates=_parse_issue_human_requirements(data),
         ),
     )
+    from .execution_retirement import execution_view
+    return execution_view(config, context)
 
 
 def _parse_issue_human_requirements(data: dict[str, object]) -> tuple[HumanReviewRequirement, ...]:
@@ -4815,6 +4817,9 @@ def search_issues(
                 body=_optional_str(item.get("body")),
             )
         )
+    history = getattr(config, "execution_history", None)
+    if history is not None:
+        found = [issue for issue in found if issue.number not in history.child_numbers]
     return tuple(found)
 
 

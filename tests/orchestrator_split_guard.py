@@ -58,6 +58,7 @@ EXTRACTED_MODULES: tuple[str, ...] = (
     'panel_evidence',
     'review_rounds',
     'discuss_loop',
+    'execution_retirement',
     'execution_policy',
     'child_plan_binding',
     'evidence_stall',
