@@ -247,3 +247,29 @@ def test_an_unlocatable_boundary_advises_no_deletion_at_all():
     rendered = _render_recovery(recovery)
     assert "No deletion list is given" in rendered
     assert "issuecomment" not in rendered and "c/10" not in rendered
+
+
+def test_closed_planning_round_never_advises_deletion_with_rest_or_snapshot():
+    from dataclasses import replace
+    from coding_review_agent_loop.errors import AgentLoopError
+
+    history = _History()
+    history.add_record(replace(_meta(role="coder"), flow="plan"))
+    history.add_record(replace(_meta(), flow="plan"))
+    history.orphan(replace(_meta(), flow="plan"))
+    history.add_record(replace(_meta(role="summary", phase="reconciliation"), flow="plan"))
+    history.add_record(replace(_meta(role="summary", phase="scheduler-prelaunch"),
+                               flow="plan", scheduler_contract=None))
+
+    def unavailable():
+        raise AgentLoopError("REST unavailable")
+
+    for read in (lambda: history.comments, lambda: history.comments[:2], unavailable):
+        recovery = compute_partial_round_recovery(
+            snapshot=history.comments, read_rest=read, flow="plan", round_number=ROUND,
+            subject=HEAD, reviewer_names=REVIEWERS,
+            resume=lambda _: (_ for _ in ()).throw(AssertionError("must stop before deletion simulation")),
+        )
+        assert not recovery.targets and not recovery.uncertain
+        assert "reconciled and closed" in recovery.reason
+        assert "round 4" in recovery.reason

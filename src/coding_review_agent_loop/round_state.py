@@ -3580,14 +3580,18 @@ def _select_current_round_records(
     subject_records = [record for record in records if record.metadata.subject == subject]
     if not subject_records:
         return None
-    anchor_record = subject_records[-1]
+    anchor_record = select_plan_round_anchor(subject_records)
     anchor_metadata = anchor_record.metadata
     prior_items_signature = _prior_item_ledger_signature(anchor_metadata.prior_items)
     current_round_records = tuple(
         record
         for record in subject_records
         if record.metadata.round_number == anchor_metadata.round_number
-        and _prior_item_ledger_signature(record.metadata.prior_items) == prior_items_signature
+        and (
+            _prior_item_ledger_signature(record.metadata.prior_items) == prior_items_signature
+            or (anchor_metadata.flow == "plan" and record.metadata.role == "reviewer"
+                and record.index > anchor_record.index)
+        )
     )
     # A head-review recovery handoff for this round is a boundary: records the
     # same head, round and ledger published before it are never part of the
@@ -3624,29 +3628,12 @@ def _select_current_round_records(
     )
 
 
-# Planning summary records that are posted *before* reviewer reconciliation.
-# Staged planning writes a `scheduler-prelaunch` record at the top of every
-# round and a `plan-phase-advance` record before a reviewer-only round, so an
-# interruption at either checkpoint must not be read as a settled round
-# (#905, from #841).
-PRE_RECONCILIATION_PLAN_SUMMARY_PHASES = frozenset(
-    {"scheduler-prelaunch", "plan-phase-advance"}
+from .plan_round_closure import (  # re-export planning history helpers
+    PRE_RECONCILIATION_PLAN_SUMMARY_PHASES,
+    _plan_round_is_reconciled,
+    project_plan_history,
+    select_plan_round_anchor,
 )
-
-
-def _plan_round_is_reconciled(records: Sequence[PostedRoundRecord]) -> bool:
-    """True when the round holds an actual planning reconciliation checkpoint.
-
-    The reconciliation record carries `phase="reconciliation"`.  A legacy
-    summary record written before the phase labels existed carries the default
-    `authoritative` phase and still counts, so historical rounds resume exactly
-    as they did before staged planning existed.
-    """
-    return any(
-        record.metadata.role == "summary"
-        and record.metadata.phase not in PRE_RECONCILIATION_PLAN_SUMMARY_PHASES
-        for record in records
-    )
 
 
 PR_PRE_RECONCILIATION_PHASES = frozenset(
@@ -5669,7 +5656,7 @@ def _resume_plan_round(
     configured_reviewers: Sequence[AgentName],
     min_round_number: int = 1,
 ) -> tuple[str, ResumedReviewRound] | None:
-    records = _extract_round_metadata_records(comments, flow="plan")
+    records = project_plan_history(_extract_round_metadata_records(comments, flow="plan"))
     if min_round_number > 1:
         # Planning-scope projection (#1390): records of an earlier planning
         # scope never select the resumed plan or its carried ledger.

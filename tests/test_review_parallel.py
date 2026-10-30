@@ -1957,14 +1957,18 @@ def test_ordinary_round_withheld_reviewer_is_not_reinvoked_blind_after_a_peer_pu
 
 
 @pytest.mark.parametrize("review_parallel", [True, False])
-def test_plan_partial_round_with_invalid_spool_record_stops_before_invoking(tmp_path, review_parallel):
+@pytest.mark.parametrize("spool_state", ["missing", "invalid"])
+def test_plan_partial_round_with_invalid_spool_record_stops_before_invoking(tmp_path, review_parallel, spool_state):
     runner, markers = _plan_partial_round_runner()
     config = make_config(tmp_path, reviewer=("codex", "gemini"), review_parallel=True)
     _interrupt_plan_round_between_publications(runner, config, markers)
     for path in _spool_files(config):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["response"]["text"] = "not a structured plan review"
-        path.write_text(json.dumps(payload), encoding="utf-8")
+        if spool_state == "missing":
+            path.unlink()
+        else:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["response"]["text"] = "not a structured plan review"
+            path.write_text(json.dumps(payload), encoding="utf-8")
     launches_before = len(runner.reviewer_launches)
 
     with pytest.raises(review_rounds.PartialReviewRoundError, match="partially published"):

@@ -6,6 +6,11 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .plan_round_closure import (
+    project_plan_history, plan_amendment_activation_round, attach_plan_rollover_metadata,
+    plan_force_full_latch_records,
+)
+
 import hashlib
 from types import SimpleNamespace
 import json
@@ -1287,7 +1292,7 @@ def _run_plan_first_loop_body(
                 plan_scope_start_round,
             )
         try:
-            records = _extract_round_metadata_records(comments, flow="plan")
+            records = project_plan_history(_extract_round_metadata_records(comments, flow="plan"))
             if plan_lineage_links:
                 # Recorded board changes (#1377): approvals are judged by the
                 # lineage (fresh-from rounds), never by one global binding.  A
@@ -1778,7 +1783,7 @@ def _run_plan_first_loop_body(
                 "changed board is resolved, floor-checked and applied; no further agent was "
                 "invoked and nothing was approved."
             )
-    for record in plan_drift_records:
+    for record in plan_force_full_latch_records(plan_drift_records):
         metadata = record.metadata
         if not staged_planning or plan_approved_shortcut:
             continue
@@ -1911,6 +1916,9 @@ def _run_plan_first_loop_body(
     # re-enters.
     plan_amendment_start_round = (
         resume_state[1].round_number if resume_state is not None else plan_scope_start_round
+    )
+    plan_amendment_start_round = plan_amendment_activation_round(
+        plan_drift_records, plan_contract_lineage, plan_amendment_start_round
     )
     require_amendment_activation(
         plan_contract_lineage,
@@ -2944,6 +2952,190 @@ def _run_plan_first_loop_body(
                     name == plan_primary_name or plan_panel_evidence.opened
                 ),
             )
+            plan_selected_names = set(plan_scheduler_decision.selected_reviewers)
+            round_reviewers = tuple(
+                reviewer for reviewer in configured_reviewers
+                if agent_display_name(reviewer) in plan_selected_names
+            )
+        resumed_by_name = {
+            record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
+        }
+        # A resumed approval bound to a stale requirement set (issue or
+        # authoritative parent) is never reused: its reviewer reviews the plan
+        # again under the current requirements (#1377).
+        resumed_legacy_fallback = legacy_requirement_fallback(
+            plan_coder_dispositions_complete(
+                current_coder_output,
+                plan_hr_ids,
+                sidecar_payload=(
+                    current_plan_sidecar.to_payload() if current_plan_sidecar is not None else None
+                ),
+                response_form=current_response_form,
+            ),
+            plan_hr_ids,
+        )
+        for stale_name in [
+            name
+            for name, record in resumed_by_name.items()
+            if record.metadata.state == "approved"
+            and (
+                (staged_planning and plan_history_class == PLAN_HISTORY_CONTRADICTORY_KEY)
+                or approval_record_binding(
+                    record,
+                    current_key=current_plan_key,
+                    surfaced_ids=plan_hr_ids,
+                    parent_ids=plan_parent_requirement_ids,
+                    legacy_fallback=resumed_legacy_fallback,
+                    check_acknowledgement=False,
+                ) == "stale"
+            )
+        ]:
+            log(
+                config,
+                f"Planning round {round_number}: {stale_name}'s resumed approval is bound to "
+                "a stale requirement set; it reviews the current plan again",
+            )
+            resumed_by_name.pop(stale_name)
+        # Superseded pre-panel plan reviews, replayed to their own author only
+        # as non-authoritative context under the operator planning override.
+        superseded_plan_prepanel: dict[str, PostedRoundRecord] = {}
+        # Item IDs claimed only by superseded pre-panel reviews; excluded from
+        # the ledger even when the record itself is not replayed as context.
+        superseded_prepanel_item_ids: set[str] = set()
+        if staged_planning and plan_primary_name is not None:
+            def _is_unqualified_prepanel(record: PostedRoundRecord) -> bool:
+                return not (
+                    plan_panel_evidence.opening_index is not None
+                    and record.index > plan_panel_evidence.opening_index
+                )
+
+            if plan_operator_force_full:
+                # The override authorizes the complete board over exactly the
+                # artifacts the pre-panel diagnostic would otherwise stop on,
+                # so each superseded secondary gets its own earlier claims back
+                # as context, and never as findings, ownership, or approval.
+                # A reviewer that already produced a qualified post-opening
+                # review has had its fresh turn, so it needs no replay.
+                already_freshly_invoked = {
+                    record.metadata.agent
+                    for record in plan_records
+                    if record.metadata.role == "reviewer"
+                    and not _is_unqualified_prepanel(record)
+                }
+                for record in sorted(plan_records, key=lambda item: item.index):
+                    metadata = record.metadata
+                    if (
+                        metadata.role == "reviewer"
+                        and metadata.agent
+                        and metadata.agent != plan_primary_name
+                        and metadata.agent in plan_reviewer_names
+                        and metadata.agent not in already_freshly_invoked
+                        and _is_unqualified_prepanel(record)
+                    ):
+                        superseded_plan_prepanel[metadata.agent] = record
+                        superseded_prepanel_item_ids.update(
+                            item.item_id for item in metadata.new_items
+                        )
+            # A secondary plan review recorded before any qualified panel
+            # opening is an unqualified artifact: it is never resumed as
+            # settled work, never an approval, and never ownership.  The
+            # reviewer is freshly invoked once a qualified opening exists.
+            for name in [
+                name
+                for name, record in resumed_by_name.items()
+                if name != plan_primary_name and _is_unqualified_prepanel(record)
+            ]:
+                log(
+                    config,
+                    f"Planning round {round_number}: {name}'s plan review predates any "
+                    "qualified panel opening; it is superseded, non-authoritative "
+                    "context and is not resumed as settled work",
+                )
+                if plan_operator_force_full:
+                    superseded_plan_prepanel[name] = resumed_by_name[name]
+                superseded_prepanel_item_ids.update(
+                    item.item_id for item in resumed_by_name[name].metadata.new_items
+                )
+                resumed_by_name.pop(name, None)
+            if superseded_prepanel_item_ids:
+                # A reconciled resume rehydrates every current-round item,
+                # including the superseded secondary's own claims (and their
+                # duplicates on the reconciliation summary).  Those claims are
+                # excluded from finding and ownership accounting, so they must
+                # not survive as must-fix obligations once the same secondary
+                # is freshly invoked.
+                rehydrated = [
+                    item
+                    for item in round_new_unresolved_items
+                    if item.item_id in superseded_prepanel_item_ids
+                ]
+                if rehydrated:
+                    log(
+                        config,
+                        f"Planning round {round_number}: dropping superseded pre-panel plan "
+                        "item(s) "
+                        + ", ".join(sorted({item.item_id for item in rehydrated}))
+                        + " from the current-round ledger; they establish no obligation",
+                    )
+                    round_new_unresolved_items[:] = [
+                        item
+                        for item in round_new_unresolved_items
+                        if item.item_id not in superseded_prepanel_item_ids
+                    ]
+            if superseded_plan_prepanel:
+                log(
+                    config,
+                    f"Planning round {round_number}: replaying superseded pre-panel plan "
+                    "review context to "
+                    + ", ".join(sorted(superseded_plan_prepanel))
+                    + " as non-authoritative context only",
+                )
+
+        if current_resume is not None and current_resume.reconciled and any(
+            agent_display_name(reviewer) not in resumed_by_name
+            for reviewer in round_reviewers
+        ):
+            # Settlement precedes rollover; superseded secondary claims above
+            # establish no obligation. Qualified findings and dispositions stay.
+            if round_number >= plan_round_limit:
+                raise AgentLoopError(
+                    f"Planning round {round_number} is reconciled; fresh reviews require "
+                    f"round {round_number + 1}, beyond --max-rounds. No fresh review was published."
+                )
+            carry = carry_over_anchor_round(
+                prior_items=prior_unresolved_items,
+                completed_reviews=tuple(
+                    record for record in current_resume.completed_reviews
+                    if not (staged_planning and record.metadata.agent != plan_primary_name
+                            and (plan_panel_evidence.opening_index is None
+                                 or record.index <= plan_panel_evidence.opening_index))
+                ),
+                settled_new_items=tuple(round_new_unresolved_items),
+                records=plan_history_records(),
+                round_number=round_number,
+                reconciliation_mode="aggregate", evidence_clearances=(),
+                next_item_number=next_unresolved_item_number,
+                same_status="same-plan", surface=PLAN_SURFACE,
+            )
+            unresolved_items = list(carry.items)
+            next_unresolved_item_number = carry.next_item_number
+            post_issue_comment(
+                runner, config=config, issue_number=issue_number,
+                body=attach_plan_rollover_metadata(
+                    f"Closed planning round {round_number}; reviewer-only advance to "
+                    f"round {round_number + 1} on the unchanged canonical plan.",
+                    bound_plan_metadata(
+                        flow="plan", role="summary", agent="Orchestrator",
+                        round_number=round_number + 1, subject=current_plan_subject,
+                        prior_items=tuple(unresolved_items), phase="plan-phase-advance",
+                        **_architecture_metadata_fields(config),
+                    ),
+                    staged=staged_planning,
+                ),
+            )
+            resumed_round = None
+            continue
+        if staged_planning and plan_scheduler_decision is not None:
             if plan_scheduler_decision.latches_force_full:
                 plan_automatic_force_full = True
             plan_scheduler_calls_avoided += plan_scheduler_decision.calls_avoided
@@ -3072,137 +3264,6 @@ def _run_plan_first_loop_body(
         # Actual models of reviewers that reviewed in THIS round (fresh or resumed
         # same-round records), for the same-model panel note (#1236).
         round_review_models: dict[str, str | None] = {}
-        resumed_by_name = {
-            record.metadata.agent: record for record in (current_resume.completed_reviews if current_resume is not None else ())
-        }
-        # A resumed approval bound to a stale requirement set (issue or
-        # authoritative parent) is never reused: its reviewer reviews the plan
-        # again under the current requirements (#1377).
-        resumed_legacy_fallback = legacy_requirement_fallback(
-            plan_coder_dispositions_complete(
-                current_coder_output,
-                plan_hr_ids,
-                sidecar_payload=(
-                    current_plan_sidecar.to_payload() if current_plan_sidecar is not None else None
-                ),
-                response_form=current_response_form,
-            ),
-            plan_hr_ids,
-        )
-        for stale_name in [
-            name
-            for name, record in resumed_by_name.items()
-            if record.metadata.state == "approved"
-            and approval_record_binding(
-                record,
-                current_key=current_plan_key,
-                surfaced_ids=plan_hr_ids,
-                parent_ids=plan_parent_requirement_ids,
-                legacy_fallback=resumed_legacy_fallback,
-                check_acknowledgement=False,
-            ) == "stale"
-        ]:
-            log(
-                config,
-                f"Planning round {round_number}: {stale_name}'s resumed approval is bound to "
-                "a stale requirement set; it reviews the current plan again",
-            )
-            resumed_by_name.pop(stale_name)
-        # Superseded pre-panel plan reviews, replayed to their own author only
-        # as non-authoritative context under the operator planning override.
-        superseded_plan_prepanel: dict[str, PostedRoundRecord] = {}
-        # Item IDs claimed only by superseded pre-panel reviews; excluded from
-        # the ledger even when the record itself is not replayed as context.
-        superseded_prepanel_item_ids: set[str] = set()
-        if staged_planning and plan_primary_name is not None:
-            def _is_unqualified_prepanel(record: PostedRoundRecord) -> bool:
-                return not (
-                    plan_panel_evidence.opening_index is not None
-                    and record.index > plan_panel_evidence.opening_index
-                )
-
-            if plan_operator_force_full:
-                # The override authorizes the complete board over exactly the
-                # artifacts the pre-panel diagnostic would otherwise stop on,
-                # so each superseded secondary gets its own earlier claims back
-                # as context, and never as findings, ownership, or approval.
-                # A reviewer that already produced a qualified post-opening
-                # review has had its fresh turn, so it needs no replay.
-                already_freshly_invoked = {
-                    record.metadata.agent
-                    for record in plan_records
-                    if record.metadata.role == "reviewer"
-                    and not _is_unqualified_prepanel(record)
-                }
-                for record in sorted(plan_records, key=lambda item: item.index):
-                    metadata = record.metadata
-                    if (
-                        metadata.role == "reviewer"
-                        and metadata.agent
-                        and metadata.agent != plan_primary_name
-                        and metadata.agent in plan_reviewer_names
-                        and metadata.agent not in already_freshly_invoked
-                        and _is_unqualified_prepanel(record)
-                    ):
-                        superseded_plan_prepanel[metadata.agent] = record
-                        superseded_prepanel_item_ids.update(
-                            item.item_id for item in metadata.new_items
-                        )
-            # A secondary plan review recorded before any qualified panel
-            # opening is an unqualified artifact: it is never resumed as
-            # settled work, never an approval, and never ownership.  The
-            # reviewer is freshly invoked once a qualified opening exists.
-            for name in [
-                name
-                for name, record in resumed_by_name.items()
-                if name != plan_primary_name and _is_unqualified_prepanel(record)
-            ]:
-                log(
-                    config,
-                    f"Planning round {round_number}: {name}'s plan review predates any "
-                    "qualified panel opening; it is superseded, non-authoritative "
-                    "context and is not resumed as settled work",
-                )
-                if plan_operator_force_full:
-                    superseded_plan_prepanel[name] = resumed_by_name[name]
-                superseded_prepanel_item_ids.update(
-                    item.item_id for item in resumed_by_name[name].metadata.new_items
-                )
-                resumed_by_name.pop(name, None)
-            if superseded_prepanel_item_ids:
-                # A reconciled resume rehydrates every current-round item,
-                # including the superseded secondary's own claims (and their
-                # duplicates on the reconciliation summary).  Those claims are
-                # excluded from finding and ownership accounting, so they must
-                # not survive as must-fix obligations once the same secondary
-                # is freshly invoked.
-                rehydrated = [
-                    item
-                    for item in round_new_unresolved_items
-                    if item.item_id in superseded_prepanel_item_ids
-                ]
-                if rehydrated:
-                    log(
-                        config,
-                        f"Planning round {round_number}: dropping superseded pre-panel plan "
-                        "item(s) "
-                        + ", ".join(sorted({item.item_id for item in rehydrated}))
-                        + " from the current-round ledger; they establish no obligation",
-                    )
-                    round_new_unresolved_items[:] = [
-                        item
-                        for item in round_new_unresolved_items
-                        if item.item_id not in superseded_prepanel_item_ids
-                    ]
-            if superseded_plan_prepanel:
-                log(
-                    config,
-                    f"Planning round {round_number}: replaying superseded pre-panel plan "
-                    "review context to "
-                    + ", ".join(sorted(superseded_plan_prepanel))
-                    + " as non-authoritative context only",
-                )
-
         inherited_review_deltas, inherited_review_failure = inherited_review_context(
             current_plan
         )

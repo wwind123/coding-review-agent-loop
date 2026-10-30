@@ -2150,3 +2150,83 @@ def test_open_prelaunch_checkpoint_preserves_later_round_identity(round_number, 
     if round_number > 1:
         assert resumed.prior_items == (_item(),)
         assert resumed.next_unresolved_item_number == 9
+
+
+@pytest.mark.parametrize("source", ["automatic", "operator"])
+@pytest.mark.parametrize("different_ledger", [False, True])
+@pytest.mark.parametrize("used", [False, True])
+def test_planning_reconciliation_owns_ledger_and_preserves_used_openings(source, different_ledger, used):
+    from coding_review_agent_loop.round_state import _resume_plan_round, _extract_round_metadata_records
+    from coding_review_agent_loop.plan_round_closure import project_plan_history
+    from coding_review_agent_loop.protocol import UnresolvedReviewItem
+
+    item = UnresolvedReviewItem(item_id="item-12", reviewer="Codex", source_round=1,
+                               text="Qualified settled finding", status="blocking")
+    metadata = [
+        PostedRoundMetadata(flow="plan", role="coder", agent="Claude", subject="s", round_number=1),
+        PostedRoundMetadata(flow="plan", role="summary", agent="Orchestrator", subject="s",
+                            round_number=1, phase="reconciliation", prior_items=(item,)),
+        PostedRoundMetadata(flow="plan", role="summary", agent="Orchestrator", subject="s",
+                            round_number=1, phase="scheduler-prelaunch", scheduler_force_full=True,
+                            scheduler_force_full_source=source, prior_items=() if different_ledger else (item,)),
+    ]
+    if used:
+        metadata.append(PostedRoundMetadata(flow="plan", role="reviewer", agent="Codex", subject="s",
+                                            round_number=1, state="blocking", phase="publication"))
+    comments = [SimpleNamespace(body=_attach_round_metadata("Canonical plan", m)) for m in metadata]
+    records = _extract_round_metadata_records(comments, flow="plan")
+    projected = project_plan_history(records)
+    assert (2 in {record.index for record in projected}) == used
+    plan, resumed = _resume_plan_round(comments, configured_reviewers=("codex",))
+    assert resumed.reconciled and resumed.round_number == 1
+    assert resumed.prior_items == (item,)
+    assert len(resumed.completed_reviews) == int(used)
+    assert resumed.next_unresolved_item_number == 13
+
+
+@pytest.mark.parametrize("phase", ["plan-phase-advance", "scheduler-prelaunch"])
+def test_planning_open_next_round_checkpoint_is_not_closed(phase):
+    from coding_review_agent_loop.round_state import _resume_plan_round
+
+    records = [
+        PostedRoundMetadata(flow="plan", role="coder", agent="Claude", subject="s", round_number=1),
+        PostedRoundMetadata(flow="plan", role="summary", agent="Orchestrator", subject="s",
+                            round_number=1, phase="reconciliation"),
+        PostedRoundMetadata(flow="plan", role="summary", agent="Orchestrator", subject="s",
+                            round_number=2, phase=phase),
+    ]
+    comments = [SimpleNamespace(body=_attach_round_metadata("Canonical plan", m)) for m in records]
+    _, resumed = _resume_plan_round(comments, configured_reviewers=("codex",))
+    assert resumed.round_number == 2 and not resumed.reconciled
+
+
+@pytest.mark.parametrize("defect", [None, "absent", "subject", "round", "phase", "intervening", "after", "effective"])
+def test_plan_amendment_activation_boundary_requires_closed_immediate_predecessor(defect):
+    from coding_review_agent_loop.plan_round_closure import plan_amendment_activation_round
+
+    def record(index, role="summary", phase="reconciliation", round_number=1, subject="s"):
+        return PostedRoundRecord(index, PostedRoundMetadata(
+            flow="plan", role=role, agent="Orchestrator", phase=phase,
+            round_number=round_number, subject=subject,
+        ), "body")
+
+    prior = record(1)
+    advance = record(4, phase="plan-phase-advance", round_number=2)
+    amendment = SimpleNamespace(comment_index=2, effective_from_round=1)
+    records = [prior, advance]
+    if defect == "absent":
+        records = [advance]
+    elif defect == "subject":
+        records[0] = record(1, subject="different")
+    elif defect == "round":
+        records[1] = record(4, phase="plan-phase-advance", round_number=3)
+    elif defect == "phase":
+        records[1] = record(4, phase="authoritative", round_number=2)
+    elif defect == "intervening":
+        records.insert(1, record(3, role="reviewer", phase="publication"))
+    elif defect == "after":
+        amendment.comment_index = 5
+    elif defect == "effective":
+        amendment.effective_from_round = 0
+    lineage = SimpleNamespace(pending_amendments=(amendment,))
+    assert plan_amendment_activation_round(records, lineage, 2) == (1 if defect is None else 2)

@@ -9565,7 +9565,10 @@ re-invokes the reviewer:
   removed. A strictly public prefix: only the missing suffix is posted verbatim.
   A gap (an absent body followed by a public later one), an ambiguous or
   out-of-order match, or an unreadable listing stops without posting; repair it
-  with the partial-round recovery list (#1142).
+  with the partial-round recovery list (#1142) for an unreconciled round.
+  A reconciled planning round is closed history: recovery lists no comments or
+  attachments for deletion. Necessary fresh reviews advance to the next round
+  within the configured round budget, without another planner turn.
 - Records written before this protocol are legacy and carry no actor. A complete
   listing of every author must show no round-transport sidecar and no anchor for
   this reviewer and round created after the record was written; otherwise the run

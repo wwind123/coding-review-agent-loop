@@ -109,6 +109,9 @@ def latest_round_checkpoint_index(
     records: Sequence[PostedRoundRecord], *, flow: str, round_number: int, subject: str
 ) -> int | None:
     """Index of the round's latest scheduler-prelaunch checkpoint, if any."""
+    from .plan_round_closure import project_plan_history
+
+    records = project_plan_history(records)
     indexes = [
         record.index for record in records
         if record.metadata.flow == flow

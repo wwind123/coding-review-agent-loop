@@ -18,6 +18,34 @@ points and patched-name lookups remain in `github.py`. The extraction preserves
 reference grammar, Markdown exclusions and existing import identities without
 changing the trust or persistence contracts.
 
+## Closed planning rounds
+
+`plan_round_closure.py` projects admitted planning history before resume ledger
+selection and scheduling. Reconciliation (including legacy authoritative
+summaries) closes a subject's round and owns its settled ledger. A later
+scheduler checkpoint is idle when no later admitted reviewer on that same
+subject and round follows it. Idle checkpoints cannot replace the ledger,
+open a panel, or supply approvals; reviewer-backed checkpoints retain their
+historical opening authority under the existing candidate and approval checks.
+Raw history remains available for board lineage and amendment-use validation.
+An open next-round phase advance or prelaunch remains a resume anchor.
+
+When a closed round needs fresh reviews, planning settles qualified findings
+and dispositions and advances to the next round before spool preflight,
+scheduling publication or invocation. Canonical plan bytes and assembled state
+stay unchanged, with no planner turn. Superseded pre-panel claims establish no
+obligation; an operator override sends that context only to its original author.
+Finding identifiers retain their high-water mark. Round limits still apply:
+without room for the next round, planning stops before fresh publication.
+Qualifying completed approvals keep the existing shortcut. Unreconciled partial
+rounds still require independent withheld spool outcomes or refuse new turns.
+
+Planning recovery checks reconciliation before collecting deletion targets,
+including when REST fails or is incomplete and the snapshot supplies history.
+Closed rounds return no reviewer, summary or attachment deletion targets and
+advise resuming fresh reviews in the next round. PR conversion recovery keeps
+its existing boundary rules.
+
 ## State and Recovery
 
 There is no application database or always-running server. State is split

@@ -635,6 +635,9 @@ def _derive_plan_panel_evidence(
     key K that lists the primary as approved and is preceded by the primary's
     own approved plan review of K.
     """
+    from .plan_round_closure import project_plan_history
+
+    records = project_plan_history(records)
     secondaries = set(required_reviewers) - {primary_reviewer}
     primary_approved_keys: set[tuple[object, ...]] = set()
     artifacts: list[str] = []
@@ -804,6 +807,9 @@ def _classify_staged_plan_history(
     caller's record extraction).  Shared by the live planning scheduler and
     managed-CI plan recovery so both read the same history as authoritative.
     """
+    from .plan_round_closure import project_plan_history
+
+    plan_records = project_plan_history(plan_records)
     latest_scheduler_record = next(
         (
             record
