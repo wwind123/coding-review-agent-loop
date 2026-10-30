@@ -1274,7 +1274,8 @@ def _run_plan_first_loop_body(
         raise AssertionError("unreachable inherited replan state")
 
     def plan_history_records(
-        *, refresh: bool = False, round_number: int | None = None
+        *, refresh: bool = False, round_number: int | None = None,
+        include_idle_checkpoints: bool = False,
     ) -> tuple[PostedRoundRecord, ...]:
         """Planning round-metadata records, or the class-D stop.
 
@@ -1291,7 +1292,9 @@ def _run_plan_first_loop_body(
                 plan_scope_start_round,
             )
         try:
-            records = project_plan_history(_extract_round_metadata_records(comments, flow="plan"))
+            records = _extract_round_metadata_records(comments, flow="plan")
+            if not include_idle_checkpoints:
+                records = project_plan_history(records)
             if plan_lineage_links:
                 # Recorded board changes (#1377): approvals are judged by the
                 # lineage (fresh-from rounds), never by one global binding.  A
@@ -2674,7 +2677,10 @@ def _run_plan_first_loop_body(
                     "execution-strategy recommendation and a risk matrix, or rerun with the "
                     "compatibility default --plan-review-policy all-reviewers."
                 )
-            plan_records = plan_history_records(refresh=True, round_number=round_number)
+            raw_plan_records = plan_history_records(
+                refresh=True, round_number=round_number, include_idle_checkpoints=True
+            )
+            plan_records = project_plan_history(raw_plan_records)
             plan_panel_evidence = _derive_plan_panel_evidence(
                 plan_records,
                 primary_reviewer=plan_primary_name,
@@ -2694,7 +2700,7 @@ def _run_plan_first_loop_body(
                 parent_requirement_ids=plan_parent_requirement_ids,
             )
             plan_history = _classify_staged_plan_history(
-                plan_records, current_key=current_plan_key
+                raw_plan_records, current_key=current_plan_key
             )
             latest_scheduler_record = plan_history.latest_scheduler_record
             plan_previous_key = plan_history.previous_key

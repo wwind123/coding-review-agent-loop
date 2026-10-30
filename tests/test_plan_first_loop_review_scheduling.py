@@ -2331,3 +2331,78 @@ def test_resumed_primary_approval_skips_panel_for_required_revision(tmp_path, ga
     fresh = _plan_round_records(resumed)[before:]
     assert not any(record.role == "reviewer" or record.phase == "scheduler-prelaunch" for record in fresh)
     assert not any(record.phase == "plan-phase-advance" for record in fresh)
+
+
+@pytest.mark.parametrize("source", [None, "automatic", "operator"])
+@pytest.mark.parametrize("ledger_differs", [False, True])
+@pytest.mark.parametrize("restart", [None, "plan-phase-advance", "scheduler-prelaunch"])
+def test_idle_only_contradiction_requires_fresh_closed_round_review(
+    tmp_path, source, ledger_differs, restart
+):
+    """Idle identity evidence invalidates exact approvals without gaining authority."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=3)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    records = _plan_round_records(runner)
+    checkpoint = next(r for r in reversed(records) if r.phase == "scheduler-prelaunch")
+    canonical = next(r.canonical_plan for r in records if r.role == "coder")
+    closed_round = checkpoint.round_number
+    assert closed_round == 2
+    # Serial staged approvals need not publish a reconciliation themselves.
+    runner.issue_comments.append({"author": {"login": "bot"},
+        "createdAt": f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z",
+        "body": _attach_round_metadata("Settled planning round", PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", round_number=closed_round,
+            subject=_plan_subject(canonical), phase="reconciliation"))})
+    item = UnresolvedReviewItem(item_id="item-17", reviewer="Codex", source_round=closed_round,
+                                text="Idle ledger has no authority", status="blocking")
+    idle = replace(
+        checkpoint,
+        plan_candidate_key={**checkpoint.plan_candidate_key, "aggregate_plan_identity": "old"},
+        scheduler_force_full=source is not None, scheduler_force_full_source=source,
+        prior_items=(item,) if ledger_differs else (),
+    )
+    for metadata in (idle, replace(idle, plan_candidate_key=checkpoint.plan_candidate_key)):
+        # Even a later idle matching key must not erase the negative evidence.
+        runner.issue_comments.append({"author": {"login": "bot"},
+            "createdAt": f"2026-05-23T00:00:{len(runner.issue_comments):02d}Z",
+            "body": _attach_round_metadata("Idle historical checkpoint", metadata)})
+    before = len(_plan_round_records(runner))
+    calls_before = len(runner.commands)
+    runner.codex_outputs.append(structured_plan_review(state="approved"))
+    runner.gemini_outputs.append(structured_plan_review(state="approved", reviewer="Google Gemini"))
+    real_post = plan_first_loop_module.post_issue_comment
+
+    def interrupt(*args, **kwargs):
+        result = real_post(*args, **kwargs)
+        match = re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", kwargs["body"])
+        if match:
+            metadata = _decode_round_metadata(match.group(1))
+            if metadata.round_number == closed_round + 1 and metadata.phase == restart:
+                raise KeyboardInterrupt
+        return result
+
+    if restart:
+        with patch.object(plan_first_loop_module, "post_issue_comment", side_effect=interrupt):
+            with pytest.raises(KeyboardInterrupt):
+                run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    fresh = _plan_round_records(runner)[before:]
+    assert {r.round_number for r in fresh} == {closed_round + 1}
+    assert {r.agent for r in fresh if r.role == "reviewer"} == {"Codex", "Gemini"}
+    decision = next(r for r in fresh if r.phase == "scheduler-prelaunch")
+    assert decision.scheduler_selected_reviewers == ("Codex", "Gemini")
+    assert decision.scheduler_force_full_source == "automatic"
+    assert not any(r.prior_items or r.role == "coder" for r in fresh)
+    assert all(r.subject == _plan_subject(canonical) for r in fresh)
+    assert sorted(command[0] for command, _ in runner.commands[calls_before:]
+                  if command[0] in {"claude", "codex", "gemini"}) == ["codex", "gemini"]
+    # The real current-key N+1 prelaunch clears degradation and permits completion.
+    calls_after = len(runner.commands)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert not any(command[0] in {"claude", "codex", "gemini"}
+                   for command, _ in runner.commands[calls_after:])

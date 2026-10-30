@@ -28,6 +28,11 @@ subject and round follows it. Idle checkpoints cannot replace the ledger,
 open a panel, or supply approvals; reviewer-backed checkpoints retain their
 historical opening authority under the existing candidate and approval checks.
 Raw history remains available for board lineage and amendment-use validation.
+Idle checkpoints retain negative candidate-key and invalid-metadata evidence
+until a legitimate scheduler recovery checkpoint supersedes it. A later idle
+matching checkpoint cannot restore intact history or completed approvals.
+A legitimate force-full prelaunch retires its selected reviewers' earlier
+approvals until those reviewers complete fresh turns, including across restart.
 Even an idle checkpoint carrying the first use of an amendment digest cannot
 restore an operator force-full latch or scheduler savings; digest admission
 and scheduling authority are separate.

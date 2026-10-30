@@ -748,9 +748,22 @@ def _carried_plan_approvals(
         return ()
     required = set(required_reviewers)
     surfaced = {str(item) for item in surfaced_requirement_ids}
+    from .plan_round_closure import project_plan_history
+
     carried: dict[str, bool] = {}
-    for record in sorted(records, key=lambda item: item.index):
+    for record in sorted(project_plan_history(records), key=lambda item: item.index):
         metadata = record.metadata
+        if (
+            metadata.role == "summary"
+            and metadata.phase == "scheduler-prelaunch"
+            and metadata.scheduler_metadata_status == "valid"
+            and metadata.scheduler_force_full
+        ):
+            # A durable forced review must finish its selected fresh turns.
+            # Otherwise its current-key prelaunch could clear degradation and
+            # immediately resurrect the approvals that caused the rollover.
+            for name in metadata.scheduler_selected_reviewers:
+                carried.pop(name, None)
         if metadata.role != "reviewer" or metadata.agent not in required:
             continue
         if predates_restoration(
@@ -809,7 +822,8 @@ def _classify_staged_plan_history(
     """
     from .plan_round_closure import project_plan_history
 
-    plan_records = project_plan_history(plan_records)
+    raw_records = plan_records
+    plan_records = project_plan_history(raw_records)
     latest_scheduler_record = next(
         (
             record
@@ -840,10 +854,25 @@ def _classify_staged_plan_history(
     recovery_boundary_index = (
         latest_scheduler_record.index if latest_scheduler_record is not None else -1
     )
+    # Idle closed-round checkpoints have no scheduling authority, but their
+    # negative identity evidence survives until a legitimate recovery boundary.
+    # In particular, another idle matching checkpoint cannot clear a mismatch.
+    authoritative_indices = {record.index for record in plan_records}
+    for record in raw_records:
+        if record.index in authoritative_indices or record.index <= recovery_boundary_index:
+            continue
+        record_key = _plan_key_from_payload(record.metadata.plan_candidate_key)
+        if (
+            record_key is not None
+            and record_key.subject == current_key.subject
+            and not record_key.matches(current_key)
+        ):
+            key_contradiction = True
+            previous_key = record_key
     if any(
         record.index > recovery_boundary_index
         and record.metadata.scheduler_metadata_status == "invalid"
-        for record in plan_records
+        for record in raw_records
     ):
         history_class = classify_plan_history("invalid")
     elif has_planning_history and latest_scheduler_record is None:

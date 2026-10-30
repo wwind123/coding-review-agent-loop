@@ -73,6 +73,11 @@ even when it is the first carrier of an amendment digest. The raw carrier
 remains available to amendment-use and lineage validation.
 
 History projection discards only idle post-reconciliation scheduling decisions.
+Idle checkpoints retain negative candidate-key and invalid-metadata evidence
+until a legitimate scheduler recovery checkpoint supersedes it. A later idle
+matching checkpoint cannot restore intact history or completed approvals.
+A legitimate force-full prelaunch retires its selected reviewers' earlier
+approvals until those reviewers complete fresh turns, including across restart.
 Checkpoints followed by same-subject, same-round reviewers retain qualified
 primary-approved secondary-audit or operator openings, including blocking
 findings. Reconciliation remains the settled ledger anchor. Automatic latches
