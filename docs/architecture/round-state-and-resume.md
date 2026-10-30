@@ -31,8 +31,11 @@ Raw history remains available for board lineage and amendment-use validation.
 Idle checkpoints retain negative candidate-key and invalid-metadata evidence
 until a legitimate scheduler recovery checkpoint supersedes it. A later idle
 matching checkpoint cannot restore intact history or completed approvals.
-A legitimate force-full prelaunch retires its selected reviewers' earlier
-approvals until those reviewers complete fresh turns, including across restart.
+A legitimate force-full or contradictory-key recovery prelaunch retires its
+selected reviewers' approvals from earlier rounds, including across restart.
+This also covers primary-only unopened recovery without a force-full latch.
+Completed same-round reviews survive repeated prelaunches, matching live reuse
+and frozen publication replay.
 Even an idle checkpoint carrying the first use of an amendment digest cannot
 restore an operator force-full latch or scheduler savings; digest admission
 and scheduling authority are separate.
