@@ -1017,3 +1017,67 @@ def test_ack_failure_boundary_resumes_round_ledger_and_numbering(tmp_path, monke
         assert resumed.next_unresolved_item_number == 42
         assert not resumed.reconciled
         assert not resumed.completed_reviews
+
+
+@pytest.mark.parametrize("policy,force_full", [("selective-intermediate", False),
+                                                     ("selective-intermediate", True),
+                                                     ("primary-then-panel", True)])
+@pytest.mark.parametrize("fresh_read", [True, False])
+def test_ack_failure_parallel_restart_reruns_board_and_clears(tmp_path, monkeypatch, policy, force_full, fresh_read):
+    """The reopened pass can read old publications and still launch a fresh board."""
+    calls = _exhaust_ack_repair(monkeypatch)
+    runner = FakeRunner(
+        pr_payload=ack_pr_payload(),
+        codex_outputs=[structured_pr_review(human_requirements_resolved=False)],
+        gemini_outputs=[structured_pr_review(reviewer="Google Gemini")],
+    )
+    config = make_config(
+        tmp_path, reviewer=("codex", "gemini"), review_parallel=True,
+        pr_review_force_full=force_full, pr_review_policy=policy, primary_reviewer="codex" if policy == "primary-then-panel" else None,
+        max_rounds=1,
+    )
+    with pytest.raises(AgentLoopError, match="blocking issues after round 1"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    from types import SimpleNamespace
+    def records():
+        return _extract_round_metadata_records(
+            [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]], flow="pr")
+    before = records()
+    publications = [r for r in before if r.metadata.phase == "publication"]
+    assert {r.metadata.agent for r in publications} == {"Codex", "Gemini"}
+    assert len(calls) == 2
+    runner.codex_outputs.append(structured_pr_review(human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
+    runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini", human_requirements_resolved=True, prior_item_dispositions=[{"item_id": ACK_ID, "disposition": "resolved"}]))
+    if not fresh_read:
+        real_context = pr_loop.get_pr_review_context
+        failed_reads = []
+        def unavailable_after_checkpoint(*args, **kwargs):
+            if not failed_reads and sum(r.metadata.phase == "scheduler-prelaunch" for r in records()) > sum(
+                r.metadata.phase == "scheduler-prelaunch" for r in before
+            ):
+                failed_reads.append(True)
+                raise AgentLoopError("Transient fresh visibility read failure.")
+            return real_context(*args, **kwargs)
+        monkeypatch.setattr(pr_loop, "get_pr_review_context", unavailable_after_checkpoint)
+    snapshots = []
+    real_clear = pr_loop._clear_human_requirements_ack_item
+    def capture(items):
+        result = real_clear(items)
+        snapshots.append((tuple(items), tuple(result)))
+        return result
+    monkeypatch.setattr(pr_loop, "_clear_human_requirements_ack_item", capture)
+    assert run_pr_loop(runner, pr_number=77, config=config) == 0
+    after = records()
+    assert len([r for r in after if r.metadata.phase == "publication"]) == 4
+    assert not runner.codex_outputs and not runner.gemini_outputs
+    assert len(calls) == 2
+    assert snapshots and any(i.item_id == ACK_ID for i in snapshots[-1][0])
+    assert not snapshots[-1][1]
+    assert after[:len(before)] == before
+    from coding_review_agent_loop.round_state import _max_unresolved_item_number_from_records
+    assert _max_unresolved_item_number_from_records(after) == 0
+    if not fresh_read:
+        assert failed_reads
+    assert all(r.metadata.round_number == 1 for r in after)
+    assert not any(cmd[:3] == ["gh", "api", "--method"] and "DELETE" in cmd
+                   for cmd, _ in runner.commands)

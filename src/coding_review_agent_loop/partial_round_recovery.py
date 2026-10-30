@@ -10,7 +10,9 @@ decision and never deletes anything.
 A conversion repeat (#1664) reopens a round at the same head.  The caller then
 passes a resolver that locates the trusted conversion record in whichever
 history is analysed; everything at or before it belongs to the earlier pass and
-is never listed, attributed or required to disappear.
+is never listed, attributed or required to disappear. Failed acknowledgement
+repair boundaries apply the same lower bound automatically in each analysed
+history, preserving the boundary and its carried ledger.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from .round_state import (
 )
 from .round_visibility import (
     PRIMARY_APPROVAL_OPENING,
+    acknowledgement_failure_boundary_index,
     latest_round_checkpoint_index,
     primary_gate_records,
     same_round_public_publications,
@@ -391,6 +394,12 @@ def compute_partial_round_recovery(
                 ),
             )
     try:
+        failure_boundary = acknowledgement_failure_boundary_index(
+            _extract_round_metadata_records(comments, flow=flow),
+            flow=flow, round_number=round_number, subject=subject,
+        )
+        if failure_boundary is not None:
+            boundary = max(boundary if boundary is not None else -1, failure_boundary)
         return _compute(
             comments, complete=complete, flow=flow, round_number=round_number,
             subject=subject, reviewer_names=reviewer_names, resume=resume,

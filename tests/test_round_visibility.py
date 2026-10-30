@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+from dataclasses import replace
+
 from coding_review_agent_loop.pr_loop_support import _visibility_snapshot
 from coding_review_agent_loop.round_state import PostedRoundMetadata, PostedRoundRecord
 from coding_review_agent_loop.round_visibility import (
@@ -103,3 +106,21 @@ def test_the_fallback_snapshot_carries_this_process_s_own_conversion_before_the_
         fresh_records=base, base_records=base, base_length=2, checkpoint=checkpoint, own_conversion=own,
     )
     assert "evidence-conversion" not in [record.metadata.phase for record in fresh]
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({}, {"Codex"}),
+    ({"role": "reviewer"}, {"Antigravity", "Codex"}),
+    ({"agent": "Codex"}, {"Antigravity", "Codex"}),
+    ({"subject": "other-head"}, {"Antigravity", "Codex"}),
+    ({"round_number": 4}, {"Antigravity", "Codex"}),
+    ({"flow": "plan"}, {"Antigravity", "Codex"}),
+])
+def test_ack_failure_visibility_matches_resume_boundary_scope(overrides, expected):
+    records = _history()
+    records[4] = replace(records[4], metadata=replace(
+        records[4].metadata, **{"phase": "acknowledgement-repair-failed", **overrides}))
+    assert _peers(records) == expected
+    # A later explicit conversion or coder boundary continues to take precedence.
+    assert _peers(records, boundary=5) == set()
+    assert _peers([*records, _record(6, role="coder"), _record(7, agent="Gemini")]) == {"Gemini"}

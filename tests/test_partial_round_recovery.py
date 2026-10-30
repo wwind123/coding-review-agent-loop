@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 import random
 import string
 
@@ -273,3 +275,25 @@ def test_closed_planning_round_never_advises_deletion_with_rest_or_snapshot():
         assert not recovery.targets and not recovery.uncertain
         assert "reconciled and closed" in recovery.reason
         assert "round 4" in recovery.reason
+
+
+@pytest.mark.parametrize("shift", [False, True])
+@pytest.mark.parametrize("later_publication", [False, True])
+def test_ack_failure_recovery_retains_boundary_and_earlier_pass(shift, later_publication):
+    from acknowledgement_helpers import dedicated_ack
+    history = _History()
+    history.add_record(_meta(agent="Codex"))
+    history.add_record(_meta(agent="Gemini"))
+    boundary = history.add_record(_meta(
+        role="summary", agent="Orchestrator", phase="acknowledgement-repair-failed",
+        prior_items=(dedicated_ack(),), state="blocking",
+    ))
+    history.add_record(_meta(role="summary", agent="Orchestrator", phase="scheduler-prelaunch",
+                             prior_items=(dedicated_ack(),)))
+    later = history.add_record(_meta(agent="Codex", prior_items=(dedicated_ack(),))) if later_publication else None
+    rest = ([IssueComment(author="other", created_at=None, body="earlier")] if shift else []) + history.comments
+    recovery = _recover(history.comments, rest, resolver=None)
+    assert _listed(recovery) == (history.ids([later]) if later is not None else set())
+    assert not _listed(recovery) & history.ids(range(boundary + 1))
+    if later_publication:
+        assert recovery.verified, recovery.reason

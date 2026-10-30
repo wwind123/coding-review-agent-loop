@@ -67,7 +67,11 @@ An exhausted acknowledgement repair publishes an explicit
 `acknowledgement-repair-failed` boundary. Same-head resume preserves its round,
 full carried ledger and the history-wide item-number high-water mark, including
 round 1. Earlier reviews saw a different ledger and are rerun; the boundary is
-not reconciliation or approval. It reopens scheduler checkpoint admission after
+not reconciliation or approval. Parallel-review peer visibility and partial-round
+recovery use the same latest same-head, same-round boundary in the history being
+read: earlier publications are historical context, and neither they nor the
+boundary are deletion targets. Publications after the boundary remain peers.
+It reopens scheduler checkpoint admission after
 a prior reconciliation. A subsequent unrecorded push carries its active ledger,
 round and history-wide numbering into a fresh review on the new head without
 requiring the operator recovery override.
