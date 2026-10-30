@@ -203,9 +203,15 @@ def test_comment_references_are_resolved_when_search_misses(tmp_path, kind, stat
 
 
 @pytest.mark.parametrize("origin", ["phase", "split", "summary", "stage", "inventory"])
-@pytest.mark.parametrize("association", ["closing-reference", "managed-branch", "canonical-listed", "canonical-only"])
+@pytest.mark.parametrize("association,lifecycle", [
+    ("closing-reference", "fresh"), ("managed-branch", "fresh"),
+    ("canonical-listed", "fresh"), ("canonical-only", "fresh"),
+    ("earlier-listed", "fresh"), ("earlier-only", "fresh"),
+    ("earlier-same-comment", "fresh"),
+    ("earlier-listed", "restart"), ("earlier-only", "restart"),
+])
 @pytest.mark.parametrize("state", ["OPEN", "CLOSED", "MERGED", "unreadable"])
-def test_historical_child_implementation_pr_is_assessed(tmp_path, origin, association, state):
+def test_historical_child_implementation_pr_is_assessed(tmp_path, origin, association, lifecycle, state):
     records = [_m1087_stale_decision_comment()]
     if origin in {"phase", "split"}:
         records.append(comment(old_record(origin)))
@@ -219,16 +225,36 @@ def test_historical_child_implementation_pr_is_assessed(tmp_path, origin, associ
             parent_issue=56, plan_hash=_M1087_STALE_HASH,
             child=s.MaterializedSplitChild("Old", "a" * 64,
                 "https://github.com/OWNER/REPO/issues/90", 90, "created"))))
-    implementation = dict(pr(83, state), body="Fixes #90" if association == "closing-reference" else "",
+    initial_state = "MERGED" if lifecycle == "restart" else state
+    implementation = dict(pr(83, initial_state), body="Fixes #90" if association == "closing-reference" else "",
         headRefName="agent-loop/managed-90" if association == "managed-branch" else "other-branch",
         url="https://github.com/OWNER/REPO/pull/83", headRefOid="abc123", comments=[])
     handoff = format_issue_pr_handoff_comment(issue_number=90, pr_number=83,
         pr_url=implementation["url"], pr_head_sha="abc123", flow="issue-implementation", plan_hash=None)
+    child_comments = [comment(handoff)] if association.startswith(("canonical-", "earlier-")) else []
+    latest = dict(implementation, number=84, state="MERGED", url="https://github.com/OWNER/REPO/pull/84")
+    if association.startswith("earlier-"):
+        later_handoff = format_issue_pr_handoff_comment(issue_number=90, pr_number=84,
+            pr_url=latest["url"], pr_head_sha="abc123", flow="issue-implementation", plan_hash=None)
+        if association == "earlier-same-comment":
+            child_comments[0]["body"] += "\n" + later_handoff
+        else:
+            child_comments.append(comment(later_handoff, 2))
+    unreadable = state == "unreadable" and lifecycle == "fresh"
     runner = RetirementRunner(children=[child()], issue_comments=records,
-        prs=[implementation] if association != "canonical-only" else [],
-        issue_comments_by_number={90: [comment(handoff)] if association.startswith("canonical-") else []},
-        pr_payloads_by_number={83: implementation} if state != "unreadable" else {},
-        malformed_pr_view_numbers=[83] if state == "unreadable" else [])
+        prs=[implementation] if association not in {"canonical-only", "earlier-only"} else [],
+        issue_comments_by_number={90: child_comments},
+        pr_payloads_by_number={84: latest, **({83: implementation} if not unreadable else {})},
+        malformed_pr_view_numbers=[83] if unreadable else [])
+    if lifecycle == "restart":
+        assert run(runner, tmp_path) == 0
+        implementation["state"] = state
+        runner.pr_payloads_by_number[83]["state"] = state
+        if state == "unreadable":
+            runner.malformed_pr_view_numbers.add(83)
+        # An open current PR must not hide the reopened historical child PR.
+        runner.prs.append(dict(pr(77, "OPEN"), headRefName="agent-loop/managed-56"))
+    before = (list(runner.comments), list(runner.issues), list(runner.claude_outputs), list(runner.codex_outputs))
     if state in {"CLOSED", "MERGED"}:
         assert run(runner, tmp_path) == 0
         assert _m1087_implementation_dispatched(runner)
@@ -238,8 +264,11 @@ def test_historical_child_implementation_pr_is_assessed(tmp_path, origin, associ
             run(runner, tmp_path)
         assert "#83" in str(error.value)
         assert "#90 is OPEN" not in str(error.value)
-        no_dispatch(runner)
-        assert not any("AGENT_ISSUE_PR_HANDOFF" in b for b in runner.comments)
+        if lifecycle == "fresh":
+            no_dispatch(runner)
+            assert not any("AGENT_ISSUE_PR_HANDOFF" in b for b in runner.comments)
+        else:
+            assert (runner.comments, runner.issues, runner.claude_outputs, runner.codex_outputs) == before
 
 
 @pytest.mark.parametrize("fault", ["failure", "invalid-json", "empty", "malformed-handoff"])

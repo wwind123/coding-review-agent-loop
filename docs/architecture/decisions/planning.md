@@ -29,3 +29,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Plan-only approval after an authenticated terminal canonical handoff skips split materialization and unfiled-scope warnings; entry deferral does not grant split-writing authority (#1792).
 
 - Terminal retirement verifies historical child implementation PRs through complete PR inventories and authenticated child handoffs, including closed children whose PRs remain open (#1792).
+
+- Historical child retirement authenticates every handoff lineage, preserving same-PR contract supersession while checking earlier PRs for reopened or unreadable work on each restart (#1792).

@@ -398,7 +398,9 @@ finished work; retirement never mutates old work or changes stage-completion rul
 Historical children from every record and inventory source also require terminal
 implementation PRs: the assessment correlates child closing references and managed
 branches, reads complete child comment histories, and authenticates canonical child
-handoffs even when their PRs are absent from listings. Unreadable child histories
+handoffs from every lineage, including earlier lineages displaced by a different
+PR, even when their PRs are absent from listings. Each lineage retains its
+same-PR contract supersession checks. Unreadable child histories
 or PR references block retirement.
 The existing decision records retired hashes and explains terminal supersession.
 

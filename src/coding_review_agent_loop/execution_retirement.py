@@ -45,6 +45,39 @@ def execution_view(config, context):
     return history.view(context) if history is not None else context
 
 
+def _authenticate_child_pr_history(runner, *, config, context):
+    """Authenticate the endpoint of every child handoff lineage.
+
+    A different PR starts a new lineage without proving the previous PR is
+    terminal. Keep each lineage's full prefix so same-PR contract replacements
+    still authenticate against their original closing contract.
+    """
+    from .issue_pr_handoff import (
+        AGENT_ISSUE_PR_HANDOFF_RE, decode_issue_pr_handoff_record,
+        authenticate_canonical_issue_pr, resolve_issue_pr_handoff_lineage,
+    )
+    # Preserve validation of the complete history, including unrelated or
+    # malformed records after the last applicable handoff.
+    resolve_issue_pr_handoff_lineage(
+        context.comments, issue_number=context.number, repo=config.repo,
+    )
+    endpoints = []
+    for index, comment in enumerate(context.comments):
+        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(comment.body or ""):
+            record = decode_issue_pr_handoff_record(match["payload"])
+            if record.issue_number != context.number:
+                continue
+            prefix = (*context.comments[:index], replace(comment, body=comment.body[:match.end()]))
+            if endpoints and endpoints[-1][0] == record.pr_number:
+                endpoints[-1] = (record.pr_number, prefix)
+            else:
+                endpoints.append((record.pr_number, prefix))
+    return tuple(authenticate_canonical_issue_pr(
+        runner, config=config, issue_number=context.number,
+        issue_context=replace(context, comments=prefix),
+    ) for _, prefix in endpoints)
+
+
 def _number(value, label):
     if type(value) is not int or value <= 0:
         raise AgentLoopError(f"Cannot verify {label}: invalid number {value!r}.")
@@ -318,18 +351,19 @@ def assess_execution_history(runner, *, config, issue_number, comments, plan_has
             purpose="historical child implementation cannot be retired safely",
             reject_empty_output=True,
         )
-        canonical = authenticate_canonical_issue_pr(
-            runner, config=config, issue_number=number,
-            issue_context=IssueContext(number, config.repo, None, None, None, child_comments),
+        canonicals = _authenticate_child_pr_history(
+            runner, config=config,
+            context=IssueContext(number, config.repo, None, None, None, child_comments),
         )
+        referenced_prs = {canonical.pr_number for canonical in canonicals}
         linked_prs = set()
         for item in all_prs:
             if item["headRefName"] == f"agent-loop/managed-{number}" or parse_strong_issue_reference_evidence(
                 item["body"], repo=config.repo, issue_number=number
-            ) or (canonical is not None and item["number"] == canonical.pr_number):
+            ) or item["number"] in referenced_prs:
                 accept(item, pr_items, "PR")
                 linked_prs.add(item["number"])
-        if canonical is not None:
+        for canonical in canonicals:
             accept(dict(pr_items.get(canonical.pr_number, {}),
                         number=canonical.pr_number, state=canonical.state), pr_items, "PR")
             linked_prs.add(canonical.pr_number)
