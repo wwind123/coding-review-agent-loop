@@ -336,7 +336,7 @@ class ExecutionDecision:
     final_integration_status: str = "none"
     architecture_identity: dict | None = None
     architecture_impact: dict | None = None
-    # Plan hashes of unrealized decisions this one supersedes (#1087).  Audit
+    # Plan hashes of terminal or unrealized decisions this one supersedes. Audit
     # state only, never identity: the superseded records stay on the thread.
     retires_plan_hashes: tuple[str, ...] = ()
 
@@ -2363,7 +2363,7 @@ def format_execution_decision(decision: ExecutionDecision) -> str:
             f"Recommendation digest: {decision.recommendation_digest}",
             *(
                 (
-                    "Supersedes unrealized decision(s) under plan hash "
+                    "Supersedes terminal or unrealized decision(s) under plan hash "
                     + ", ".join(decision.retires_plan_hashes)
                     + ".",
                 )
@@ -2397,7 +2397,7 @@ def find_existing_execution_decision(
     of them is history, not a competing topology, and is skipped.  Any other
     decision under a different hash still fails closed.
 
-    A decision that superseded unrealized ones (#1087) names their hashes;
+    A decision that superseded terminal or unrealized ones (#1087) names their hashes;
     the records it replaced are history too, so a resume after that decision
     was acted on does not resurrect them.  Supersession is per record, not per
     hash (see ``live_execution_decisions``).
@@ -2426,7 +2426,7 @@ def find_existing_execution_decision(
                 f"approved plan hash ({decision.plan_hash} vs {plan_hash}); repair or "
                 "resume the recorded plan before publishing a new execution decision. "
                 "A plan-first re-approval retires the recorded decision automatically "
-                "only while nothing has acted on it (no PR, branch, handoff, or child issue)."
+                "only after all prior work is verified terminal and the managed branch is absent."
             )
         if decision.identity() != expected_identity:
             raise AgentLoopError(

@@ -21,3 +21,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Semantic refusals exposed by the post-repair test-observations fallback use the same shared correction allowance and terminal classification as direct and repaired candidates (#1738).
 
 - Initial and coverage-reask implementation acquisitions share the PR-follow-up typed report/selector correction policy, one allowance per acquisition; initial exhaustion stops before PR authentication, while coverage exhaustion discards the candidate and refreshes the original PR with post-authentication audit and recovery safeguards (#1768).
+
+- Re-approved plans may retire terminal execution history using complete inventories and resolved references; plan-first terminal handoffs defer to post-approval checks, and restart partitions current work before verified history without deleting durable records or branches (#1792, 2026-10-30).

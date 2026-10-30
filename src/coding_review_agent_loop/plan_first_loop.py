@@ -4697,14 +4697,14 @@ def _run_plan_first_loop_body(
                 log(config, str(nested))
                 print(json.dumps(nested.as_dict(), sort_keys=True))
                 return 2
-            # A re-approval under a new hash supersedes a decision nothing has
-            # acted on yet (#1087); a realized one still fails closed here.
+            # Retirement verifies terminal history before any execution writes.
             retired_decision_hashes: frozenset[str] = frozenset()
             retiring_decision_hashes: tuple[str, ...] = ()
             if recommendation is not None and mode != "plan-only":
                 (
                     retired_decision_hashes,
                     retiring_decision_hashes,
+                    execution_history,
                 ) = _retirable_execution_decision_hashes(
                     runner,
                     config=config,
@@ -4712,6 +4712,9 @@ def _run_plan_first_loop_body(
                     comments=issue_context.comments,
                     plan_hash=plan_hash,
                 )
+                if execution_history is not None:
+                    config = dataclasses_replace(config, execution_history=execution_history)
+                    issue_context = execution_history.view(issue_context)
             normalized_topology = None
             if recommendation is not None and canonical_strategy == "staged":
                 normalized_topology = normalize_execution_recommendation(

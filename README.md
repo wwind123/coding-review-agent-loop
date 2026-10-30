@@ -535,6 +535,11 @@ scope/plan decision, not silently replaced by review prose.
 Use plan-first mode for work whose design should be challenged before files are
 changed. `--plan-first` alone stops after plan approval. Add
 `--implement-after-approval` to continue into implementation and PR review.
+A re-approved plan may supersede a completed execution decision after the loop
+verifies all historical children and PRs are terminal and the managed branch is
+absent. If a merged PR left its managed branch behind, verify the work is finished
+and delete that branch manually before retrying. Open or unreadable work still
+blocks; historical records remain intact. See [execution strategy guidance](docs/local_agent_loop.md).
 
 ```bash
 agent-loop issue 123 \

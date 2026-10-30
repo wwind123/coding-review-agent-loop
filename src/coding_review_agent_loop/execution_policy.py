@@ -1524,100 +1524,20 @@ def _execution_decision_realization_evidence(
     issue_number: int,
     comments: Sequence[object],
 ) -> list[str]:
-    """What, if anything, has acted on an execution decision for this parent (#1087).
-
-    A decision only forks a topology once something depends on it: a PR
-    handoff, an implementation or phase handoff, a decomposition record, a
-    child issue, a PR in any state closing the parent or on the reserved
-    managed branch, or that branch.  Unreadable, incomplete, or unavailable
-    state counts as evidence, so the caller fails closed.
-    """
-    evidence: list[str] = []
-    for comment in comments:
-        body = getattr(comment, "body", None)
-        if not isinstance(body, str):
-            continue
-        for match in AGENT_ISSUE_PR_HANDOFF_RE.finditer(body):
-            try:
-                handoff = decode_issue_pr_handoff_record(match.group("payload"))
-            except AgentLoopError:
-                evidence.append("an unreadable issue-to-PR handoff record")
-                continue
-            if handoff.issue_number == issue_number:
-                evidence.append(f"an issue-to-PR handoff to PR #{handoff.pr_number}")
-        for marker in SPLIT_CHILD_MARKER_RE.finditer(body):
-            if int(marker.group("parent")) == issue_number:
-                evidence.append("a split child record")
-    if find_decompositions_for_parent(comments, parent_issue=issue_number):
-        evidence.append("a decomposition summary")
-    if find_topology_checkpoints_for_parent(comments, parent_issue=issue_number):
-        evidence.append("a topology checkpoint")
-    if find_phase_implementation_handoffs_for_parent(comments, parent_issue=issue_number):
-        evidence.append("a phase implementation handoff")
-    if find_one_shot_impl_handoffs(
-        comments, parent_issue=issue_number, mode="implement-one-shot"
-    ):
-        evidence.append("a one-shot implementation handoff")
-    materialization = find_existing_split_materialization(comments, parent_issue=issue_number)
-    if materialization is not None and materialization.children:
-        evidence.append("a split materialization")
-    if config.dry_run:
-        # Remote inventory is not read in a dry run, which publishes nothing.
-        return list(dict.fromkeys(evidence))
-    # Both inventories are read strictly: an unreadable or possibly truncated
-    # listing is evidence, never proof of absence (`search_issues` maps bad
-    # output to an empty result, which is right for adoption, not here).
-    for query in parent_child_search_queries(issue_number):
-        children = _strict_gh_listing(
-            runner,
-            config=config,
-            args=[
-                "issue", "list", "--repo", config.repo, "--search", query,
-                "--state", "all", "--limit", str(_REALIZATION_LISTING_LIMIT),
-                "--json", "number,title",
-            ],
+    """Compatibility diagnostic facade over the strict terminal assessment."""
+    from .execution_retirement import assess_execution_history, _records
+    try:
+        hashes = tuple(dict.fromkeys(
+            record_hash for _, _, record_hash, _, _ in _records(comments, issue_number, config.repo)
+            if record_hash is not None
+        ))
+        assess_execution_history(
+            runner, config=config, issue_number=issue_number, comments=comments,
+            plan_hash="", newly_retired=hashes or ("diagnostic",),
         )
-        if children is None:
-            evidence.append(f"child issues that could not be listed ({query})")
-            continue
-        for candidate in children:
-            evidence.append(f"child issue #{candidate.get('number')}")
-    managed_branch = f"agent-loop/managed-{issue_number}"
-    # Closed PRs count too: a PR opened before its handoff record was posted,
-    # then closed with its branch deleted, still acted on the decision.
-    pr_items = _strict_gh_listing(
-        runner,
-        config=config,
-        args=[
-            "pr", "list", "--repo", config.repo, "--state", "all",
-            "--json", "number,body,headRefName", "--limit", str(_REALIZATION_LISTING_LIMIT),
-        ],
-    )
-    if pr_items is None:
-        evidence.append("pull requests that could not be listed")
-        pr_items = []
-    for item in pr_items:
-        if item.get("headRefName") == managed_branch or parse_strong_issue_reference_evidence(
-            str(item.get("body") or ""), repo=config.repo, issue_number=issue_number
-        ):
-            evidence.append(f"PR #{item.get('number')}")
-    # The branch name contains `/`, which the branches endpoint only accepts
-    # encoded; an unencoded path 404s even when the branch exists.
-    branch = runner.run(
-        [
-            config.gh_cmd,
-            "api",
-            f"repos/{config.repo}/branches/{urllib.parse.quote(managed_branch, safe='')}",
-        ],
-        cwd=active_workdir(config),
-        check=False,
-    )
-    branch_error = branch.stderr or ""
-    if branch.returncode == 0:
-        evidence.append(f"branch `{managed_branch}`")
-    elif "404" not in branch_error and "Not Found" not in branch_error:
-        evidence.append(f"branch `{managed_branch}`, whose existence could not be checked")
-    return list(dict.fromkeys(evidence))
+    except AgentLoopError as exc:
+        return [str(exc)]
+    return []
 
 
 def _retirable_execution_decision_hashes(
@@ -1627,41 +1547,29 @@ def _retirable_execution_decision_hashes(
     issue_number: int,
     comments: Sequence[object],
     plan_hash: str,
-) -> tuple[frozenset[str], tuple[str, ...]]:
-    """Resolve the decisions a plan-first re-approval supersedes (#1087).
-
-    Returns ``(retired, newly_retired)``: the hashes the preflight may skip
-    and the ones the next published decision records.  Only *live* records
-    count (``live_execution_decisions``): supersession is per record, so a
-    plan re-approved back to a retired hash yields a live record that still
-    needs the realization check before a later plan replaces it.
-
-    A decision under another hash that something has already acted on still
-    fails closed: replacing it would fork the parent's topology.
-    """
+):
+    """Return retirement hashes and a verified execution view, also on restart."""
+    from .execution_retirement import assess_execution_history
     stale = tuple(dict.fromkeys(
         decision.plan_hash
         for decision in live_execution_decisions(comments, parent_issue=issue_number)
         if decision.plan_hash != plan_hash
     ))
-    if not stale:
-        return frozenset(), ()
-    evidence = _execution_decision_realization_evidence(
-        runner, config=config, issue_number=issue_number, comments=comments
+    if getattr(config, "execution_history", None) is not None:
+        # A prior recovery assessment may have supplied a routing view. Read
+        # original records again before a new approval/retirement assessment.
+        from dataclasses import replace
+        comments = get_issue_context(
+            runner, config=replace(config, execution_history=None), issue_number=issue_number,
+        ).comments
+    history = assess_execution_history(
+        runner, config=config, issue_number=issue_number, comments=comments,
+        plan_hash=plan_hash, newly_retired=stale,
     )
-    if evidence:
-        raise AgentLoopError(
-            "Conflicting execution decision exists for this parent under a different "
-            f"approved plan hash ({', '.join(stale)} vs {plan_hash}) and has already been "
-            f"acted on ({'; '.join(evidence)}). Resume or close that work before "
-            "publishing a decision for the re-approved plan."
-        )
-    log(
-        config,
-        f"Issue #{issue_number}: superseding unrealized execution decision(s) under plan "
-        f"hash {', '.join(stale)}; nothing has acted on them.",
-    )
-    return frozenset(stale), stale
+    if stale:
+        log(config, f"Issue #{issue_number}: superseding terminal or unrealized execution "
+            f"decision(s) under plan hash {', '.join(stale)}; prior work remains history.")
+    return (history.retired_hashes if history else frozenset()), stale, history
 
 
 def _preflight_fresh_staged_topology(

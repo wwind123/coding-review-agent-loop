@@ -465,7 +465,7 @@ def test_execution_decision_honors_a_recorded_supersession():
     )
     assert new.identity() == replace(new, retires_plan_hashes=()).identity()
     body = format_execution_decision(new)
-    assert "Supersedes unrealized decision(s) under plan hash old-plan-hash." in body
+    assert "Supersedes terminal or unrealized decision(s) under plan hash old-plan-hash." in body
     comments = (
         SimpleNamespace(body=format_execution_decision(old)),
         SimpleNamespace(body=body),

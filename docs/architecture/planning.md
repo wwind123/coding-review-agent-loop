@@ -388,6 +388,29 @@ bounded to one `agent-pr` child per run while the parent remains open.
 Repair may preserve a complete v1 source, but cannot synthesize missing
 recommendation data.
 
+Execution re-approval uses `execution_retirement.py` to assess complete child and
+all-state PR inventories plus every referenced handoff, decomposition, checkpoint
+and split record. A stale decision may be retired only when its work is absent
+or positively terminal (CLOSED children; CLOSED or MERGED PRs), with confirmed
+absence of the encoded reserved-branch endpoint. Unknown, truncated or unreadable
+state fails closed. A leftover branch requires manual deletion after verifying
+finished work; retirement never mutates old work or changes stage-completion rules.
+The existing decision records retired hashes and explains terminal supersession.
+
+`issue_loop.py` defers only an authenticated terminal canonical handoff in
+plan-first mode; approval must still prove retirement under a different plan.
+Same-plan and direct-mode terminal recovery refuse. Restart rebuilds a read-only,
+invocation-scoped execution history view before PR recovery and fresh preflights.
+Current-plan records positively attribute children and PRs first, including the
+current managed branch. Earlier hash-bearing records follow per-record retirement
+ordering, preserving A/B/A recurrence. Hash-less records before a retirement
+boundary and unclaimed parent-linked inventory may become history only after
+terminal verification and complete inventory correlation. Reopened, ambiguous or
+unattributed open work refuses. The view excludes individual historical record
+spans and child identities from execution selection, preserves other comment
+content and all durable records, and is carried through refetch, decomposition,
+split discovery, canonical handoff and implementation recovery.
+
 Staged decomposition returns an explicit topology outcome - the materialized
 children, one resolved stage identity and automation per index, the run's own
 approved-plan hash and mode, and the recorded retained-parent and

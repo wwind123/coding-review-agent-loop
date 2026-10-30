@@ -498,7 +498,7 @@ class _M1087Runner(FakeRunner):
         if (
             self.unreadable_child_search
             and cmd[:3] == ["gh", "issue", "list"]
-            and cmd[cmd.index("--json") + 1] == "number,title"
+            and cmd[cmd.index("--json") + 1] == "number,title,body,state"
         ):
             # The realization inventory's own search; adoption searches differ.
             cmd, cwd_path = self._record_command(cmd, cwd)
@@ -601,7 +601,7 @@ def test_1087_superseded_decision_stays_retired_after_the_pr_exists(tmp_path):
 def test_1087_decision_with_an_open_managed_pr_still_refuses(tmp_path):
     runner = _m1087_runner(
         open_prs_payload=[
-            {"number": 81, "body": "Work in progress.", "headRefName": "agent-loop/managed-56"}
+            {"number": 81, "state": "OPEN", "body": "Work in progress.", "headRefName": "agent-loop/managed-56"}
         ]
     )
 
@@ -617,7 +617,7 @@ def test_1087_decision_with_an_open_managed_pr_still_refuses(tmp_path):
     assert not _m1087_implementation_dispatched(runner)
 
 
-def test_1087_decision_with_a_closed_pr_still_refuses(tmp_path):
+def test_1792_decision_with_a_closed_pr_is_superseded(tmp_path):
     # A PR opened before its handoff record was posted, then closed with its
     # branch deleted, still acted on the decision.
     runner = _m1087_runner(
@@ -631,21 +631,20 @@ def test_1087_decision_with_a_closed_pr_still_refuses(tmp_path):
         ]
     )
 
-    with pytest.raises(AgentLoopError, match="PR #82"):
-        run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True)
+    assert run_issue_loop(runner, issue_number=56, config=_m1087_config(tmp_path), plan_first=True) == 0
 
     inventory = [
         cmd for cmd, _cwd in runner.commands
         if cmd[:3] == ["gh", "pr", "list"] and "headRefName" in cmd[cmd.index("--json") + 1]
     ]
     assert inventory and inventory[-1][inventory[-1].index("--state") + 1] == "all"
-    assert _m1087_posted_decisions(runner) == []
-    assert not _m1087_implementation_dispatched(runner)
+    assert _m1087_posted_decisions(runner)[0].retires_plan_hashes == (_M1087_STALE_HASH,)
+    assert _m1087_implementation_dispatched(runner)
 
 
 def test_1087_reapproved_retired_hash_is_live_again_and_still_checked(tmp_path):
     # A, B retiring A, then A retiring B: the last A is live.  A PR that acted
-    # on it (closed before its handoff record, branch deleted) must still
+    # on it and remains open must still
     # block the re-approved plan C, even though both hashes were once retired.
     other_hash = "0123456789abcdef"
     runner = _m1087_runner(
@@ -657,7 +656,7 @@ def test_1087_reapproved_retired_hash_is_live_again_and_still_checked(tmp_path):
         open_prs_payload=[
             {
                 "number": 83,
-                "state": "CLOSED",
+                "state": "OPEN",
                 "body": "Abandoned attempt.",
                 "headRefName": "agent-loop/managed-56",
             }

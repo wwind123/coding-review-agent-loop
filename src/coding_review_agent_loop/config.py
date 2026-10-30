@@ -10,7 +10,7 @@ import shlex
 import shutil
 import sys
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .agents.base import AgentName
@@ -235,6 +235,8 @@ class AgentLoopConfig:
     codex_cmd: str
     gemini_cmd: str
     gh_cmd: str
+    # Invocation-scoped verified terminal history; never persisted.
+    execution_history: object | None = field(default=None, compare=False, repr=False, kw_only=True)
     claude_args: tuple[str, ...]
     codex_args: tuple[str, ...]
     gemini_args: tuple[str, ...]
