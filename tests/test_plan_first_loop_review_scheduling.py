@@ -2642,19 +2642,26 @@ def test_approved_resume_preserves_substantive_tail(tmp_path, tail):
 
 
 @pytest.mark.parametrize("neutral", [False, True])
-@pytest.mark.parametrize("mode", ["plan-only", "auto"])
-def test_approved_resume_with_historical_board_link_keeps_approving_board(tmp_path, neutral, mode):
+@pytest.mark.parametrize("strategy,mode", [("one-shot", "plan-only"), ("one-shot", "auto"), ("staged", "auto")])
+def test_approved_resume_with_historical_board_link_keeps_approving_board(tmp_path, neutral, mode, strategy):
+    from issue_loop_test_helpers import _fresh_staged_plan_for_recovery
+    from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
+    raw = _fresh_staged_plan_for_recovery()[0] if strategy == "staged" else structured_v1_plan_state()
     runner = _FakeRunner(
         serve_rest_issue_comments=True, authenticated_actor=("agent-loop", 4242),
-        claude_outputs=[structured_v1_plan_state()],
+        claude_outputs=[raw],
         codex_outputs=[structured_plan_review(state="approved")],
         gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
     )
-    original = _staged_plan_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=1)
+    original = _staged_plan_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=1, plan_execution_mode="auto" if strategy == "staged" else "plan-only")
     with pytest.raises(AgentLoopError, match="phase advance was still pending"):
         run_issue_loop(runner, issue_number=56, config=original, plan_first=True)
-    reduced = _staged_plan_config(tmp_path, max_rounds=3)
-    assert run_issue_loop(runner, issue_number=56, config=reduced, plan_first=True) == 0
+    reduced = _staged_plan_config(tmp_path, max_rounds=3, plan_execution_mode="auto" if strategy == "staged" else "plan-only")
+    with patch.object(plan_first_loop_module, "_decompose_approved_plan", return_value=StagedTopologyOutcome(
+            created=(), stage_ids=(), automations=(), plan_hash="test-plan",
+            mode="implement-by-phase", topology_source="approved-plan-v1")), \
+         patch.object(plan_first_loop_module, "_dispatch_current_decomposition_phase", return_value=0):
+        assert run_issue_loop(runner, issue_number=56, config=reduced, plan_first=True) == 0
     checkpoint = next(r for r in reversed(_plan_round_records(runner)) if r.phase == "scheduler-prelaunch")
     runner.issue_comments.append({"body": _attach_round_metadata("Settled", PostedRoundMetadata(
         flow="plan", role="summary", agent="Orchestrator", round_number=checkpoint.round_number,
@@ -2671,22 +2678,35 @@ def test_approved_resume_with_historical_board_link_keeps_approving_board(tmp_pa
             reviewer_board_change_digest=checkpoint.reviewer_board_change_digest)),
             "author": {"login": "agent-loop"}, "_rest_author_id": 4242,
             "createdAt": runner.issue_comments[-1]["createdAt"]})
+    calls = len(runner.commands)
     before = len(_plan_round_records(runner))
     links = [c for c in runner.issue_comments if "AGENT_PLAN_BOARD_CHANGE" in c["body"]]
     assert len(links) == 1
     logs = []
     with patch.object(plan_first_loop_module, "log", side_effect=lambda _config, message: logs.append(message)), \
          patch.object(plan_first_loop_module, "_implement_approved_issue", return_value=0) as implement, \
-         patch.object(plan_first_loop_module, "select_plan_reviewers", side_effect=AssertionError("scheduled")):
+         patch.object(plan_first_loop_module, "select_plan_reviewers", side_effect=AssertionError("scheduled")), \
+         patch.object(plan_first_loop_module, "_decompose_approved_plan", return_value=StagedTopologyOutcome(
+             created=(), stage_ids=(), automations=(), plan_hash="test-plan",
+             mode="implement-by-phase", topology_source="approved-plan-v1")) as decompose, \
+         patch.object(plan_first_loop_module, "_dispatch_current_decomposition_phase", return_value=0) as dispatch:
         try:
             result = run_issue_loop(runner, issue_number=56, config=replace(
                 original, max_rounds=checkpoint.round_number, plan_execution_mode=mode), plan_first=True)
         except AgentLoopError as exc:
             pytest.fail(f"{exc}; startup logs: {logs}")
         assert result == 0
-        assert implement.call_count == (mode == "auto")
+        assert implement.call_count == (mode == "auto" and strategy == "one-shot")
+        assert decompose.call_count == (mode == "auto" and strategy == "staged")
+        assert dispatch.call_count == decompose.call_count
         if mode == "auto":
-            assert implement.call_args.kwargs["config"].reviewer == original.reviewer
+            action = decompose if strategy == "staged" else implement
+            assert action.call_args.kwargs["config"].reviewer == original.reviewer
+            if strategy == "staged":
+                assert action.call_args.kwargs["mode"] == "implement-by-phase"
+                assert dispatch.call_args.kwargs["config"].reviewer == original.reviewer
+    assert not any(command[0] in {"claude", "codex", "gemini", "antigravity"}
+                   for command, _ in runner.commands[calls:])
     assert len(_plan_round_records(runner)) == before
     assert len([c for c in runner.issue_comments if "AGENT_PLAN_BOARD_CHANGE" in c["body"]]) == 1
     assert any("no new plan board-change link is recorded" in message for message in logs)
@@ -2839,3 +2859,80 @@ def test_approved_publication_resume_preserves_followups(tmp_path, policy, mode,
     output = "\n".join(issue["body"] for issue in runner.issues) if runner.issues else "\n".join(
         c["body"] for c in runner.issue_comments if c["body"].startswith("Planning complete for issue"))
     assert "Retain predecessor follow-up." in output
+
+
+@pytest.mark.parametrize("failure", ["requirement", "lost-obligation", "must-fix"])
+@pytest.mark.parametrize("round_limit", [2, 3])
+def test_approved_shortcut_nonbinding_disagreement_refuses_without_writes(tmp_path, failure, round_limit):
+    runner, config, checkpoint = _approved_closed_history(tmp_path)
+    requirement = HumanReviewRequirement(
+        source_type="Issue comment", author="maintainer", created_at="2026-01-01T01:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56#issuecomment-42", body="Preserve the audit trail.")
+    obligation = UnresolvedReviewItem(
+        item_id="item-42", reviewer="Codex", status="blocking", source_round=1,
+        text="Preserve the obligation.")
+    real_classify = plan_first_loop_module.classify_plan_approval
+    real_context = plan_first_loop_module.get_issue_context
+    real_ledger = plan_first_loop_module.plan_ledger_unreconstructible_items
+    real_apply = plan_first_loop_module._apply_unresolved_item_dispositions
+    classified = False
+
+    def classify(*args, **kwargs):
+        nonlocal classified
+        result = real_classify(*args, **kwargs)
+        assert result.approved
+        classified = True
+        return result
+
+    def context(*args, **kwargs):
+        result = real_context(*args, **kwargs)
+        if classified and failure == "requirement":
+            return replace(result, human_requirements=(requirement,))
+        return result
+
+    def ledger(records, plan_round, **kwargs):
+        # Model a live history change after independently proven startup
+        # approval; retain the real obligation reconstruction predicate.
+        if classified and failure == "lost-obligation":
+            records = (*records, SimpleNamespace(metadata=PostedRoundMetadata(
+                flow="plan", role="reviewer", agent="Codex", round_number=1,
+                subject=checkpoint.subject, new_items=(obligation,))))
+        return real_ledger(records, plan_round, **kwargs)
+
+    def apply(*args, **kwargs):
+        items, number = real_apply(*args, **kwargs)
+        if classified and failure == "must-fix":
+            items = [*items, obligation]
+        return items, number
+
+    before = len(runner.issue_comments)
+    calls = len(runner.commands)
+    messages = []
+    for _ in range(2):
+        classified = False
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(plan_first_loop_module, "classify_plan_approval", side_effect=classify))
+            stack.enter_context(patch.object(plan_first_loop_module, "get_issue_context", side_effect=context))
+            stack.enter_context(patch.object(plan_first_loop_module, "plan_ledger_unreconstructible_items", side_effect=ledger))
+            stack.enter_context(patch.object(plan_first_loop_module, "_apply_unresolved_item_dispositions", side_effect=apply))
+            with pytest.raises(AgentLoopError) as exc:
+                run_issue_loop(runner, issue_number=56, config=replace(
+                    config, max_rounds=round_limit), plan_first=True)
+        messages.append(str(exc.value))
+    assert messages[0] == messages[1]
+    message = messages[0].lower()
+    assert checkpoint.subject.rsplit("-", 1)[-1][:16] in message
+    assert "round 2" in message
+    if failure == "requirement":
+        assert requirement.requirement_id in message
+        assert "re-run planning" in message
+    elif failure == "lost-obligation":
+        assert "item-42" in message and "cannot be reconstructed" in message
+        assert "inspect" in message and "rerun" in message
+    else:
+        assert "review verdict or unresolved obligations" in message
+        assert "item-42" in message
+        assert "restore qualifying exact-plan" in message
+    assert len(runner.issue_comments) == before
+    assert not any(command[0] in {"claude", "codex", "gemini"}
+                   for command, _ in runner.commands[calls:])
