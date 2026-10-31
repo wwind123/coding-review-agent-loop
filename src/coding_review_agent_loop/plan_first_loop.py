@@ -3973,7 +3973,7 @@ def _run_plan_first_loop_body(
         same_model_note = same_model_panel_note(round_review_models)
         if same_model_note is not None:
             log(config, f"Planning round {round_number}: {same_model_note}")
-        if not plan_approved_shortcut and (
+        if (
             plan_round_parallel or same_model_note is not None
         ) and not (current_resume is not None and current_resume.reconciled):
             settled = ", ".join(agent_display_name(reviewer) for reviewer in round_reviewers)

@@ -29,3 +29,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - An independently approved plan may recover an unused neutral advance through its reconciled predecessor and lifecycle-replayed future ledger without changing durable records (#1805).
 
 - Approved publication resumes retain settlement-time item minting; refusal diagnostics use scoped unfiltered history to explain excluded approval bindings (#1805).
+
+- Approved resume preserves an owed same-model reconciliation note, while settled rounds suppress duplicates (#1805).

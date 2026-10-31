@@ -272,8 +272,10 @@ def test_slice_timeout_observes_signal_cancellation(tmp_path, monkeypatch, logs)
 
 # --- signals -------------------------------------------------------------------
 
-def _signal_when_waiting(signum, *, count=1):
+def _signal_when_waiting(signum, *, count=1, executor_ready=None):
     def fire():
+        if executor_ready is not None:
+            assert executor_ready.wait(20)
         deadline = time.monotonic() + 20
         while quota_wait.active_wait_count() < count and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -337,6 +339,17 @@ def _waiting_worker(config, name):
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
 def test_signal_cancels_a_waiting_reviewer_worker(tmp_path, monkeypatch, capsys, signum):
+    # Interrupt the waiting executor, after submit has registered its threads.
+    # ThreadPoolExecutor.start itself has an interruptible startup window;
+    # signalling there tests startup interruption rather than waiter cleanup.
+    executor_ready = threading.Event()
+    real_as_completed = review_rounds.as_completed
+
+    def waiting_as_completed(futures):
+        executor_ready.set()
+        return real_as_completed(futures)
+
+    monkeypatch.setattr(review_rounds, "as_completed", waiting_as_completed)
     previous = signal.getsignal(signal.SIGTERM)
     runner = FakeRunner()
     terminations = _record_terminations(runner)
@@ -357,7 +370,7 @@ def test_signal_cancels_a_waiting_reviewer_worker(tmp_path, monkeypatch, capsys,
 
     monkeypatch.setattr(cli, "run_pr_loop", fake_pr_loop)
     started = time.monotonic()
-    firing = _signal_when_waiting(signum)
+    firing = _signal_when_waiting(signum, executor_ready=executor_ready)
     assert cli.main(PR_ARGS) == QuotaResetExceededError.EXIT_CODE
     firing.join(5)
     assert time.monotonic() - started < 20

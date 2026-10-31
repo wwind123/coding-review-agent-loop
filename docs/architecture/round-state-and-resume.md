@@ -436,7 +436,9 @@ ignore retains its existing summary behavior. Non-approved rollover semantics
 are unchanged. Unreconciled publication reviews instead mint their items from
 saved canonical responses at the settlement barrier, including on approved
 resume; provisional empty item lists are not a settled ledger. Repeated resume
-uses the existing follow-up publication deduplication.
+uses the existing follow-up publication deduplication. An owed same-model
+reconciliation note is also published on approved resume; an existing
+reconciliation prevents duplicate notes.
 
 Approval refusal diagnostics inspect the full current-scope history, preserving
 excluded approval status, round and recorded bindings for operator recovery.
