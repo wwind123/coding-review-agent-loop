@@ -52,3 +52,22 @@ out.write_text(json.dumps({'head_sha':os.environ['AGENT_LOOP_REVIEW_IMAGES_HEAD_
     git('add', '.')
     git('commit', '-qm', 'capture fixture')
     return root, git('rev-parse', 'HEAD'), git
+
+
+def stub_capture_prerequisites(monkeypatch):
+    """Let service unit tests reach their branch without host prerequisites."""
+    from coding_review_agent_loop import containment, review_images_isolation
+    calls = []
+    def containment_ready(_):
+        calls.append('containment')
+        return containment.CapabilityManifest('systemd-cgroup-v2', True)
+    def bubblewrap_ready(_):
+        calls.append('bubblewrap')
+        return '/mock-runtime/bwrap'
+    def validator_ready(_):
+        calls.append('validator')
+        return ()
+    monkeypatch.setattr(containment, 'preflight_containment', containment_ready)
+    monkeypatch.setattr(review_images_isolation, 'preflight', bubblewrap_ready)
+    monkeypatch.setattr(review_images_isolation, 'validator_grants', validator_ready)
+    return calls

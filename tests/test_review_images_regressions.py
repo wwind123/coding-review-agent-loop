@@ -17,7 +17,7 @@ from coding_review_agent_loop.review_images_cgroup import CaptureTree, delegate
 from coding_review_agent_loop import review_images_host as host
 from coding_review_agent_loop.review_images_config import CaptureConfig
 from coding_review_agent_loop.review_images_channel import write_record
-from review_images_helpers import repository, manifest, png
+from review_images_helpers import repository, manifest, png, stub_capture_prerequisites
 from test_review_images_capture import config, supported, required
 
 service = importlib.import_module('coding_review_agent_loop.review_images_capture')
@@ -110,9 +110,7 @@ def test_delegation_refuses_missing_enforcement(tmp_path, monkeypatch, failure):
 
 def test_identity_excludes_host_namespaces_and_validator_caps_cpu(tmp_path, monkeypatch):
     root, head, _ = repository(tmp_path)
-    monkeypatch.setattr(containment, 'preflight_containment', lambda _: containment.CapabilityManifest('systemd-cgroup-v2', True))
-    monkeypatch.setattr('coding_review_agent_loop.review_images_isolation.preflight', lambda _: '/usr/bin/bwrap')
-    monkeypatch.setattr('coding_review_agent_loop.review_images_isolation.validator_grants', lambda _: ())
+    stub_capture_prerequisites(monkeypatch)
     raw = json.dumps(manifest(head)).encode()
     stream = io.BytesIO()
     for path,data in [('manifest.json',raw), ('one.png',png()), ('base.png',png())]:

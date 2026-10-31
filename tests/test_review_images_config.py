@@ -75,17 +75,20 @@ def test_unsupported_platform_refuses_before_linux_imports_and_probes(monkeypatc
 @pytest.mark.skipif(sys.platform != 'linux', reason='Linux host namespace metadata')
 def test_missing_host_namespace_metadata_refuses_before_staging(monkeypatch):
     import importlib
-    isolation=importlib.import_module('coding_review_agent_loop.review_images_isolation')
+    from review_images_helpers import stub_capture_prerequisites
     worktree=importlib.import_module('coding_review_agent_loop.review_images_worktree')
-    monkeypatch.setattr(isolation,'preflight',lambda *_:'/usr/bin/bwrap')
-    monkeypatch.setattr(isolation,'validator_grants',lambda *_:())
+    calls=stub_capture_prerequisites(monkeypatch)
+    namespaces=[]
     monkeypatch.setattr(worktree,'stage',lambda *_:pytest.fail('namespace refusal reached staging'))
     real_readlink=os.readlink
     def readlink(path,*args,**kwargs):
         if str(path).startswith('/proc/self/ns/'):
+            namespaces.append(str(path))
             raise OSError('host namespace metadata unavailable')
         return real_readlink(path,*args,**kwargs)
     monkeypatch.setattr(os,'readlink',readlink)
     result=capture(Path('/unavailable'),'a'*40,CaptureConfig(paths=('*.py',),command='capture'),
                    [{'status':'added','filename':'view.py'}])
     assert result.state=='isolation-unavailable' and 'namespace' in result.diagnostic
+    assert calls==['containment','bubblewrap','validator']
+    assert namespaces==['/proc/self/ns/user']

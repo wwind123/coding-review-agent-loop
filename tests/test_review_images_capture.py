@@ -17,7 +17,7 @@ from coding_review_agent_loop.review_images_config import CaptureConfig
 from coding_review_agent_loop.review_images_isolation import preflight, argv
 from coding_review_agent_loop.review_images_channel import records
 from coding_review_agent_loop.review_images_worktree import stage
-from review_images_helpers import repository
+from review_images_helpers import repository, stub_capture_prerequisites
 
 
 def config(**kwargs):
@@ -125,7 +125,8 @@ def test_live_output_attacks_discard_set(tmp_path,attack):
 
 
 @pytest.mark.parametrize('location', ['/scratch/work','/scratch/home','/tmp','/var/tmp','/dev/shm','/scratch/output'])
-def test_real_tmpfs_enospc(tmp_path,location):
+@pytest.mark.parametrize('probe_passes', [True, False])
+def test_real_tmpfs_enospc(tmp_path,location,probe_passes):
     root,head,git=repository(tmp_path)
     supported(root,head)
     script="""import errno,os
@@ -138,8 +139,15 @@ except OSError as e:
 else: raise AssertionError('filesystem was unbounded')
 os.unlink(p)
 """.replace('LOCATION',repr(location))
-    altered=dataclasses.replace(config(scratch_bytes=8*1024**2),command='/usr/bin/python3 -c '+shlex.quote(script)+'; /usr/bin/python3 capture.py')
-    result=required(capture(root,head,altered,[{'status':'modified','filename':'capture.py'}]))
+    if not probe_passes:
+        script="raise AssertionError('deliberately failing ENOSPC probe')\n"+script
+    altered=dataclasses.replace(config(scratch_bytes=8*1024**2),command='/usr/bin/python3 -c '+shlex.quote(script)+' && /usr/bin/python3 capture.py')
+    result=capture(root,head,altered,[{'status':'modified','filename':'capture.py'}])
+    if not probe_passes:
+        assert result.state=='failed' and result.snapshots is None,result
+        assert result.diagnostic=='capture nonzero exit'
+        return
+    result=required(result)
     assert result.isolation_proof[0]['scratch_bytes']==8*1024**2
     result.snapshots.close()
 
@@ -281,10 +289,18 @@ def test_parent_independently_rejects_export_framing(tmp_path,monkeypatch,attack
     if attack=='truncated': data=data[:-2]
     if attack=='trailing': data+=b'x'
     if attack=='oversized': data=struct.pack('>I',8193)
-    monkeypatch.setattr(service,'_attempt',lambda *args: ({'state':'ok','proof':{}},data))
-    monkeypatch.setattr('coding_review_agent_loop.review_images_isolation.preflight',lambda _: '/usr/bin/bwrap')
+    prerequisites=stub_capture_prerequisites(monkeypatch)
+    attempts=[]
+    def attempt(config,settings,source):
+        attempts.append(settings['mode'])
+        return {'state':'ok','proof':{}},data
+    monkeypatch.setattr(service,'_attempt',attempt)
+    real_readlink=os.readlink
+    monkeypatch.setattr(os,'readlink',lambda path: 'mock-namespace' if str(path).startswith('/proc/self/ns/') else real_readlink(path))
     result=capture(root,head,config(),[{'status':'modified','filename':'capture.py'}])
     assert result.state=='failed' and result.snapshots is None
+    assert prerequisites==['containment','bubblewrap','validator']
+    assert attempts==['capture']
 
 
 def test_live_validator_corruption_and_whole_set_deadline(tmp_path,monkeypatch):
