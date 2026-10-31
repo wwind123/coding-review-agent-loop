@@ -194,6 +194,7 @@ class ResourceLimits:
     memory_max: int | None
     memory_swap_max: int | None
     tasks_max: int | None
+    cpu_percent: int | None = None
 
     def validate(self, *, name: str = "resource limits") -> "ResourceLimits":
         if self.memory_high is not None and self.memory_max is not None and self.memory_high > self.memory_max:
@@ -204,6 +205,8 @@ class ResourceLimits:
                 raise AgentLoopError(f"{name}: {field_name} cannot be negative.")
         if self.tasks_max is not None and self.tasks_max < 1:
             raise AgentLoopError(f"{name}: TasksMax must be positive.")
+        if self.cpu_percent is not None and (isinstance(self.cpu_percent, bool) or not isinstance(self.cpu_percent, int) or self.cpu_percent < 1):
+            raise AgentLoopError(f"{name}: CPU quota must be a positive integer.")
         return self
 
     def restrict(self, other: "ResourceLimits") -> "ResourceLimits":
@@ -224,6 +227,7 @@ class ResourceLimits:
             memory_max,
             minimum(self.memory_swap_max, other.memory_swap_max),
             minimum(self.tasks_max, other.tasks_max),
+            minimum(self.cpu_percent, other.cpu_percent),
         ).validate()
 
     def as_properties(self) -> tuple[str, ...]:
@@ -234,7 +238,7 @@ class ResourceLimits:
             f"MemoryMax={render(self.memory_max)}",
             f"MemorySwapMax={render(self.memory_swap_max)}",
             f"TasksMax={render(self.tasks_max)}",
-        )
+        ) + ((f"CPUQuota={self.cpu_percent}%",) if self.cpu_percent is not None else ())
 
     def to_dict(self) -> dict[str, int | None]:
         return {
@@ -242,6 +246,7 @@ class ResourceLimits:
             "MemoryMax": self.memory_max,
             "MemorySwapMax": self.memory_swap_max,
             "TasksMax": self.tasks_max,
+            **({"CPUQuotaPercent": self.cpu_percent} if self.cpu_percent is not None else {}),
         }
 
     @classmethod
@@ -251,6 +256,7 @@ class ResourceLimits:
             int(payload["MemoryMax"]) if payload.get("MemoryMax") is not None else None,
             int(payload["MemorySwapMax"]) if payload.get("MemorySwapMax") is not None else None,
             int(payload["TasksMax"]) if payload.get("TasksMax") is not None else None,
+            int(payload["CPUQuotaPercent"]) if payload.get("CPUQuotaPercent") is not None else None,
         )
 
 
@@ -276,7 +282,7 @@ class ContainmentPolicy:
         self.aggregate.validate(name="aggregate resource limits")
         known = dict(self.roles)
         for role, limits in known.items():
-            if role not in CONTAINED_ROLES:
+            if role not in (*CONTAINED_ROLES, "capture"):
                 raise AgentLoopError(f"unknown containment role: {role}")
             limits.validate(name=f"{role} resource limits")
             _validate_child_limits(role, limits, self.aggregate)
@@ -653,6 +659,7 @@ def build_scope_argv(
     unit_name: str,
     limits: ResourceLimits,
     supervisor_fd: int,
+    capture_delegated: bool = False,
 ) -> list[str]:
     """Build the exact foreground systemd scope argv used in production.
 
@@ -665,9 +672,11 @@ def build_scope_argv(
         f"--slice={policy.slice_name}", f"--unit={unit_name}",
         *[arg for prop in limits.as_properties() for arg in ("--property", prop)],
         "--property", "OOMPolicy=kill",
+        *(["--property", "Delegate=yes"] if capture_delegated else []),
         "--", sys.executable, "-m", "coding_review_agent_loop.containment",
         "--shim", "--report", str(report_path), "--unit", unit_name,
-        "--supervisor-fd", str(int(supervisor_fd)), "--", *map(str, target_argv),
+        "--supervisor-fd", str(int(supervisor_fd)),
+        *(["--capture-delegated", "yes"] if capture_delegated else []), "--", *map(str, target_argv),
     ]
 
 
@@ -980,7 +989,7 @@ def _parse_shim_args(tokens: Sequence[str]) -> tuple[dict[str, str], list[str]] 
         token = tokens[index]
         if token == "--":
             return options, list(tokens[index + 1 :])
-        if token not in {"--report", "--unit", "--supervisor-fd"} or index + 1 >= len(tokens):
+        if token not in {"--report", "--unit", "--supervisor-fd", "--capture-delegated"} or index + 1 >= len(tokens):
             return None
         options[token] = tokens[index + 1]
         index += 2
@@ -1084,6 +1093,17 @@ def _escalate_scope_kill(scope: Path, unit_name: str | None) -> None:
             pass
 
 
+def _kill_delegated_scope(scope: Path, unit_name: str | None) -> None:
+    # A successful hierarchical kill includes this shim. If the kernel or
+    # manager cannot kill it yet, retain supervision and retry, never return
+    # a normal completion while descendants may still be running.
+    delay = 0.05
+    while True:
+        _escalate_scope_kill(scope, unit_name)
+        time.sleep(delay)
+        delay = min(delay * 2, 1.0)
+
+
 def _empty_scope(child: subprocess.Popen, scope: Path | None, unit_name: str | None) -> None:
     """SIGKILL the target and return only once nothing but the shim remains.
 
@@ -1121,6 +1141,14 @@ def _try_write_report(path: Path, payload: Mapping[str, object]) -> None:
         pass
 
 
+def _open_descriptor(fd: int) -> bool:
+    try:
+        os.fstat(fd)
+        return True
+    except OSError:
+        return False
+
+
 def _shim(argv: Sequence[str]) -> int:
     parsed = _parse_shim_args(list(argv))
     if parsed is None or "--report" not in parsed[0]:
@@ -1140,8 +1168,23 @@ def _shim(argv: Sequence[str]) -> int:
     if problem is not None:
         _write_report(report_path, {"state": "target-exec-error", "errno": errno.EPIPE, "error": f"supervisor liveness check failed: {problem}"})
         return 125
+    delegated = options.get("--capture-delegated") == "yes"
+    if delegated:
+        try:
+            from .review_images_cgroup import delegate
+            if scope is None:
+                raise RuntimeError("capture requires a pinned scope")
+            delegate(scope)
+        except (OSError, RuntimeError) as exc:
+            _write_report(report_path, {"state": "target-exec-error", "errno": errno.EPERM, "error": str(exc)})
+            return 125
     try:
-        child = subprocess.Popen(remainder, start_new_session=False)
+        inherited = ()
+        if delegated:
+            inherited = tuple(int(fd) for fd in os.listdir("/proc/self/fd")
+                              if fd.isdigit() and int(fd) > 2 and int(fd) != supervisor_fd
+                              and _open_descriptor(int(fd)))
+        child = subprocess.Popen(remainder, start_new_session=False, pass_fds=inherited)
     except OSError as exc:
         _write_report(report_path, {"state": "target-exec-error", "errno": exc.errno, "error": str(exc)})
         return 127 if exc.errno == errno.ENOENT else 126
@@ -1154,7 +1197,10 @@ def _shim(argv: Sequence[str]) -> int:
 
     def empty_scope() -> None:
         with kill_lock:
-            _empty_scope(child, scope, unit_name)
+            if delegated:
+                _kill_delegated_scope(scope, unit_name)
+            else:
+                _empty_scope(child, scope, unit_name)
 
     def watch() -> None:
         while not stop.is_set():
@@ -1176,12 +1222,22 @@ def _shim(argv: Sequence[str]) -> int:
     try:
         watcher.start()
         watcher_started = True
-        target_cgroup = cgroup_path_for_pid(child.pid)
+        target_cgroup = scope if delegated else cgroup_path_for_pid(child.pid)
         _write_report(report_path, {"state": "target-started", "pid": child.pid, "cgroup_path": str(target_cgroup) if target_cgroup else None})
         code = child.wait()
+        if delegated:
+            from .review_images_cgroup import CaptureTree
+            tree = CaptureTree(scope)
+            try:
+                tree.kill("payload")
+            finally:
+                tree.close()
+            if not _sweep_scope(scope / "control"):
+                _kill_delegated_scope(scope, unit_name)
         # The direct target has exited; any background or new-session
         # descendant is killed before the watch ends and the shim exits.
-        empty_scope()
+        if not delegated:
+            empty_scope()
     except BaseException:
         empty_scope()
         raise
@@ -1241,6 +1297,7 @@ class InvocationHandle:
     applicable_limit: str | None = None
     target_exec_errno: int | None = None
     diagnostics: tuple[str, ...] = ()
+    _capture_cgroup_identity: tuple[int, int] | None = field(default=None, repr=False, compare=False)
     _resource_result: str | None = field(default=None, repr=False, compare=False)
     _resource_result_reset: bool = field(default=False, repr=False, compare=False)
     _supervisor_read_fd: int | None = field(default=None, repr=False, compare=False)
@@ -1320,6 +1377,7 @@ class InvocationHandle:
                 build_scope_argv(
                     self.policy, launch, report_path=self.report_path, unit_name=self.unit_name,
                     limits=self.child_limits, supervisor_fd=self._supervisor_read_fd,
+                    capture_delegated=self.role == "capture",
                 )
             )
         self.launcher_argv = launch
@@ -1432,12 +1490,15 @@ class InvocationHandle:
         while time.monotonic() < deadline:
             report = self.refresh_report()
             if self.cgroup_path is not None:
-                try:
-                    members = (self.cgroup_path / "cgroup.procs").read_text(encoding="ascii").split()
-                except FileNotFoundError:
-                    members = []
-                except OSError:
-                    members = None
+                if self.role == "capture":
+                    members = self._cgroup_members()
+                else:
+                    try:
+                        members = (self.cgroup_path / "cgroup.procs").read_text(encoding="ascii").split()
+                    except FileNotFoundError:
+                        members = []
+                    except OSError:
+                        members = None
                 if members == []:
                     self.cleanup_confirmed = True
                     return True
@@ -1458,6 +1519,26 @@ class InvocationHandle:
     def _cgroup_members(self) -> list[str] | None:
         if self.cgroup_path is None:
             return None
+        if self.role == "capture":
+            try:
+                if self.cgroup_path.name != self.unit_name:
+                    return None
+                info = self.cgroup_path.stat()
+                identity = (info.st_dev, info.st_ino)
+                if self._capture_cgroup_identity is None:
+                    self._capture_cgroup_identity = identity
+                elif identity != self._capture_cgroup_identity:
+                    return None
+                from .review_images_cgroup import CaptureTree
+                tree = CaptureTree(self.cgroup_path)
+                try:
+                    return [] if tree.empty() else ["hierarchically-populated"]
+                finally:
+                    tree.close()
+            except FileNotFoundError:
+                return [] if self._unit_inactive() else None
+            except (OSError, RuntimeError, ValueError):
+                return None
         try:
             return (self.cgroup_path / "cgroup.procs").read_text(encoding="ascii").split()
         except FileNotFoundError:
@@ -1468,6 +1549,24 @@ class InvocationHandle:
     def _unit_inactive(self) -> bool:
         if not self.managed or shutil.which(self.policy.systemctl) is None:
             return False
+        if self.role == "capture":
+            # A manager error is never evidence of teardown, and a still
+            # present pinned subtree must be proved empty via cgroup.events.
+            try:
+                if self.cgroup_path is not None and self.cgroup_path.exists():
+                    return False
+                result = subprocess.run(
+                    (self.policy.systemctl, "--user", "show", self.unit_name,
+                     "--property=LoadState", "--property=ActiveState", "--property=ControlGroup"),
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, timeout=2,
+                )
+                values = dict(line.split("=", 1) for line in result.stdout.decode().splitlines() if "=" in line)
+                return result.returncode == 0 and (
+                    values.get("LoadState") == "not-found" or
+                    (values.get("ActiveState") in {"inactive", "failed"} and values.get("ControlGroup") == "")
+                )
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                return False
         try:
             result = subprocess.run(
                 (self.policy.systemctl, "--user", "is-active", "--quiet", self.unit_name),

@@ -1709,3 +1709,113 @@ def test_contained_spawn_uses_runner_retry_and_cleans_on_exception(monkeypatch, 
     assert calls == [[sys.executable, "-c", "pass"]]
     assert handle.terminated and handle.confirmed and handle.closed
     assert runner._active_handles == {}
+
+
+def test_capture_cpu_quota_is_optional_and_does_not_change_existing_roles():
+    plain = ResourceLimits(100, 200, 0, 8)
+    assert plain.as_properties() == ('MemoryHigh=100', 'MemoryMax=200', 'MemorySwapMax=0', 'TasksMax=8')
+    quota = ResourceLimits(100, 200, 0, 8, 50)
+    assert quota.as_properties()[-1] == 'CPUQuota=50%'
+    assert ResourceLimits.from_dict(quota.to_dict()) == quota
+    assert quota.restrict(ResourceLimits(None, None, 0, None, 25)).cpu_percent == 25
+
+
+@pytest.mark.parametrize('target_exits_first', [False, True])
+def test_real_capture_delegation_hierarchical_cleanup(tmp_path, monkeypatch, target_exits_first):
+    import subprocess
+    import time
+    from coding_review_agent_loop.review_images_cgroup import CaptureTree
+    monkeypatch.delenv('AGENT_LOOP_INVOCATION_ID', raising=False)
+    limits = ResourceLimits(128*1024**2,256*1024**2,0,32,100)
+    policy = ContainmentPolicy(mode='required', aggregate=ResourceLimits(None,None,0,None),
+                               roles=(('capture',limits),),cache_dir=tmp_path/'runtime')
+    try:
+        manifest = preflight_containment(policy)
+    except AgentLoopError as exc:
+        if os.environ.get('AGENT_LOOP_CAPTURE_SECURITY_REQUIRED') == '1': raise
+        pytest.skip(str(exc))
+    ready=tmp_path/'ready'
+    code='''import os,sys,subprocess,time
+from pathlib import Path
+from coding_review_agent_loop.containment import cgroup_path_for_pid
+root=cgroup_path_for_pid(os.getpid()).parent
+nested=root/'payload'/'capture'/'nested'
+nested.mkdir()
+child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],start_new_session=True,stdin=subprocess.DEVNULL)
+(nested/'cgroup.procs').write_text(str(child.pid))
+Path(sys.argv[1]).write_text(str(child.pid))
+time.sleep(30)
+'''
+    if target_exits_first:
+        code=code.rsplit('time.sleep(30)',1)[0]
+    handle=InvocationHandle.prepare(policy,role='capture',target_argv=[sys.executable,'-c',code,str(ready)],manifest=manifest)
+    process=None
+    try:
+        env={**os.environ,'PYTHONPATH':str(Path(__file__).resolve().parents[1]/'src')}
+        process=subprocess.Popen(handle.launcher_argv,env=env,pass_fds=handle.pass_fds,stdin=subprocess.DEVNULL)
+        deadline=time.monotonic()+10
+        while not ready.exists() and process.poll() is None and time.monotonic()<deadline:
+            time.sleep(.02)
+        if not ready.exists():
+            if os.environ.get('AGENT_LOOP_CAPTURE_SECURITY_REQUIRED') != '1': pytest.skip('capture delegation unavailable')
+            pytest.fail('delegated capture launcher did not start')
+        if target_exits_first:
+            process.wait(timeout=10)
+            assert handle.confirm_empty(timeout=5)
+            from coding_review_agent_loop.containment import _pid_alive
+            assert not _pid_alive(int(ready.read_text()))
+            return
+        handle.refresh_report()
+        root=handle.cgroup_path
+        assert root.name == handle.unit_name
+        assert not (root/'cgroup.procs').read_text().strip()
+        assert not handle.confirm_empty(timeout=.1)
+        tree=CaptureTree(root)
+        try:
+            assert not tree.empty('payload')
+            assert not (root/'payload'/'cgroup.procs').read_text().strip()
+        finally:
+            tree.close()
+        # Losing the parent supervision pipe must kill nested setsid writers,
+        # even though the pinned root and payload root have no direct members.
+        handle._close_supervisor_pipe()
+        process.wait(timeout=10)
+        assert handle.confirm_empty(timeout=5)
+        from coding_review_agent_loop.containment import _pid_alive
+        assert not _pid_alive(int(ready.read_text()))
+    finally:
+        if process is not None and process.poll() is None:
+            handle.terminate(signal_name='KILL')
+            process.wait(timeout=10)
+        handle.close()
+
+
+def test_capture_cleanup_does_not_treat_manager_failure_as_teardown(tmp_path,monkeypatch):
+    import subprocess
+    policy=ContainmentPolicy(mode='required')
+    handle=InvocationHandle(policy,'capture','test','owned.scope',tmp_path/'report',(),
+                            ResourceLimits(1,2,0,3,100),ResourceLimits(None,None,0,None),backend='systemd-cgroup-v2')
+    monkeypatch.setattr(containment_module.subprocess,'run',lambda *args,**kwargs: subprocess.CompletedProcess(args,1,stdout=b''))
+    assert not handle._unit_inactive()
+    root=tmp_path/'owned.scope'
+    root.mkdir()
+    (root/'cgroup.procs').write_text('')
+    (root/'cgroup.events').write_text('populated 1\nfrozen 0\n')
+    handle.cgroup_path=root
+    assert handle._cgroup_members()==['hierarchically-populated']
+    assert not handle._unit_inactive()
+    (root/'cgroup.events').unlink()
+    assert handle._cgroup_members() is None
+    assert not handle.confirm_empty(timeout=.01)
+
+
+def test_capture_lost_supervision_retries_uncertain_scope_kill(monkeypatch,tmp_path):
+    calls=[]
+    class StopProbe(Exception): pass
+    def escalate(*args):
+        calls.append(args)
+        if len(calls)==3: raise StopProbe()
+    monkeypatch.setattr(containment_module,'_escalate_scope_kill',escalate)
+    monkeypatch.setattr(containment_module.time,'sleep',lambda _:None)
+    with pytest.raises(StopProbe): containment_module._kill_delegated_scope(tmp_path,'owned.scope')
+    assert len(calls)==3

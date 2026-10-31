@@ -454,6 +454,9 @@ EXCLUDED_PROTOCOL_LITERALS = frozenset(
         "AGENT_LOOP_TRUSTED_BASES",
         "AGENT_LOOP_MANAGED_CI_TRUSTED_BASES_V1",
         "AGENT_LOOP_WORKDIR",
+        # Service-owned capture command environment, not durable records (#1793).
+        "AGENT_LOOP_REVIEW_IMAGES_HEAD_SHA",
+        "AGENT_LOOP_REVIEW_IMAGES_MANIFEST",
         # Advisory per-run-worktree dependency remedy selector (#1651).
         "AGENT_LOOP_WORKTREE_DEPENDENCY_HINT",
         "AGENT_LOOP_GIT_GUARD_PROBE_FD",
