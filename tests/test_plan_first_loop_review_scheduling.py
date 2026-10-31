@@ -2613,7 +2613,8 @@ def test_approved_resume_preserves_substantive_tail(tmp_path, tail):
     runner, config, checkpoint = _approved_closed_history(tmp_path)
     meta = PostedRoundMetadata(flow="plan", role="summary", agent="Orchestrator",
                                round_number=3, subject=checkpoint.subject, phase="plan-phase-advance")
-    runner.issue_comments.append({"body": _attach_round_metadata("Unused advance", meta)})
+    runner.issue_comments.append({"author": {"login": "coding-review-agent-loop"}, "createdAt": "2026-06-01T00:00:00Z",
+                                  "body": _attach_round_metadata("Unused advance", meta)})
     if tail == "advance-with-finding":
         runner.issue_comments.pop()
         later = replace(meta, new_items=(UnresolvedReviewItem(
@@ -2628,7 +2629,8 @@ def test_approved_resume_preserves_substantive_tail(tmp_path, tail):
         later = replace(checkpoint, round_number=3, plan_candidate_key={
             **checkpoint.plan_candidate_key, "aggregate_plan_identity": "contradictory",
         })
-    runner.issue_comments.append({"body": _attach_round_metadata("Substantive later activity", later)})
+    runner.issue_comments.append({"author": {"login": "coding-review-agent-loop"}, "createdAt": "2026-06-01T00:00:01Z",
+                                  "body": _attach_round_metadata("Substantive later activity", later)})
     comments = [SimpleNamespace(body=c["body"]) for c in runner.issue_comments]
     resumed = _resume_plan_round(comments, configured_reviewers=("codex", "gemini"))
     view = approved_plan_resume_view(comments, resumed, config=config, human_requirements=())
@@ -2639,6 +2641,17 @@ def test_approved_resume_preserves_substantive_tail(tmp_path, tail):
         comments, config=config, issue_number=56, trusted_actor=None, human_requirements=(),
     )
     assert not classification.approved
+    # Drive the actual entry path too: later substantive round 3 cannot be
+    # discarded to recover approval of round 2, even at the old round limit.
+    before = len(_plan_round_records(runner))
+    calls = len(runner.commands)
+    with patch.object(plan_first_loop_module, "_implement_approved_issue", side_effect=AssertionError("implemented")), \
+         patch.object(plan_first_loop_module, "_decompose_approved_plan", side_effect=AssertionError("decomposed")):
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not any(r.phase == "plan-phase-advance" for r in _plan_round_records(runner)[before:])
+    assert not any(command[0] in {"claude", "codex", "gemini"}
+                   for command, _ in runner.commands[calls:])
 
 
 @pytest.mark.parametrize("neutral", [False, True])
