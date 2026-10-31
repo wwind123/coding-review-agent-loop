@@ -9830,6 +9830,10 @@ example `3600`, `90m`, `6h` or `1h30m`. It must be positive and no longer than
   exit code 3, so the run can be resumed. This also applies to waits in parallel
   reviewer or debater threads. Waits request slices of at most one second so
   a pending signal missed by the blocking wait is observed after a short slice.
+  Main-thread reviewer and discuss executor observation also polls at the same
+  interval, so worker slices cannot leave the main thread in an unbounded wait.
+  Empty polls do not fail a turn or impose an overall execution deadline;
+  reviewer completion collection and the discuss publication barrier are retained.
   Once the main thread handles the interrupt, it cancels waiting workers,
   terminates active agent processes, and then exits. Scheduling and executor
   cleanup add overhead; the slice limit is not an absolute one-second

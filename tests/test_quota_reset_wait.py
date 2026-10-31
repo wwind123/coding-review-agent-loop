@@ -1,14 +1,14 @@
 """Opt-in waiting for a parsed usage-limit reset (#1601)."""
 import os
 import signal
-import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+from quota_signal_support import run_child, run_signal_scenario, child_environment
 
 from agent_loop_helpers import FakeRunner, make_config, patch_attr_in, patch_object_in
 from coding_review_agent_loop import (
@@ -272,156 +272,33 @@ def test_slice_timeout_observes_signal_cancellation(tmp_path, monkeypatch, logs)
 
 # --- signals -------------------------------------------------------------------
 
-def _signal_when_waiting(signum, *, count=1, executor_ready=None):
-    def fire():
-        if executor_ready is not None:
-            assert executor_ready.wait(20)
-        deadline = time.monotonic() + 20
-        while quota_wait.active_wait_count() < count and time.monotonic() < deadline:
-            time.sleep(0.01)
-        # Direct the signal at the main thread, as a terminal or supervisor
-        # signal effectively is.  A process-directed os.kill from this thread
-        # may be delivered to any other live thread in the test process, and
-        # then the main thread can stay blocked until its timed slice ends.
-        signal.pthread_kill(threading.main_thread().ident, signum)
-
-    thread = threading.Thread(target=fire, daemon=True)
-    thread.start()
-    return thread
-
-
 PR_ARGS = ["pr", "77", "--repo", "OWNER/REPO", "--wait-for-quota-reset", "6h"]
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
-def test_signal_during_main_thread_wait_is_a_clean_quota_stop(tmp_path, monkeypatch, capsys, signum):
-    previous = signal.getsignal(signal.SIGTERM)
-    runner = FakeRunner()
-    config = make_config(tmp_path, agent_max_retries=0, wait_for_quota_reset_seconds=SIX_HOURS)
-
-    def fake_pr_loop(*_a, **_k):
-        with patch.object(validated_agent, "run_agent_result", side_effect=[_claude_limit(), OK]):
-            validated_agent._run_validated_agent(
-                runner, agent="claude", config=config, prompt="P",
-                marker_description="none", validate=lambda t: t,
-            )
-        pytest.fail("the wait was not interrupted")
-
-    monkeypatch.setattr(cli, "run_pr_loop", fake_pr_loop)
-    started = time.monotonic()
-    firing = _signal_when_waiting(signum)
-    assert cli.main(PR_ARGS) == QuotaResetExceededError.EXIT_CODE
-    firing.join(5)
-    assert time.monotonic() - started < 20
-    assert "Claude quota reset wait interrupted; rerun to resume" in capsys.readouterr().err
-    assert signal.getsignal(signal.SIGTERM) == previous
-    assert runner.comments == []  # the wait writes nothing to GitHub
-    assert not quota_wait.wait_was_interrupted()  # cleared for the next command
-    assert quota_wait.active_wait_count() == 0
-
-
-def _record_terminations(runner):
-    calls = []
-    original = runner.terminate_active_processes
-
-    def spy():
-        calls.append(True)
-        return original()
-
-    runner.terminate_active_processes = spy
-    return calls
-
-
-def _waiting_worker(config, name):
-    reservation = quota_wait.QuotaWaitReservation(7200, 1, 2)
-    quota_wait.wait_for_reset(config, name, reservation)
+def test_signal_during_main_thread_wait_is_a_clean_quota_stop(tmp_path, signum):
+    run_signal_scenario("signal_during_main_thread_wait_is_a_clean_quota_stop", tmp_path, signum=signum)
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
-def test_signal_cancels_a_waiting_reviewer_worker(tmp_path, monkeypatch, capsys, signum):
-    # Interrupt the waiting executor, after submit has registered its threads.
-    # ThreadPoolExecutor.start itself has an interruptible startup window;
-    # signalling there tests startup interruption rather than waiter cleanup.
-    executor_ready = threading.Event()
-    real_as_completed = review_rounds.as_completed
-
-    def waiting_as_completed(futures):
-        executor_ready.set()
-        return real_as_completed(futures)
-
-    monkeypatch.setattr(review_rounds, "as_completed", waiting_as_completed)
-    previous = signal.getsignal(signal.SIGTERM)
-    runner = FakeRunner()
-    terminations = _record_terminations(runner)
-    config = make_config(tmp_path, wait_for_quota_reset_seconds=SIX_HOURS)
-    outcomes = []
-
-    def run_turn(reviewer):
-        try:
-            _waiting_worker(config, "Codex")
-        except QuotaResetExceededError as exc:
-            outcomes.append(exc)
-            return review_rounds._ReviewerTurnResult(reviewer_name="Codex", error=exc)
-        return review_rounds._ReviewerTurnResult(reviewer_name="Codex")
-
-    def fake_pr_loop(*_a, **_k):
-        review_rounds._launch_reviewer_turns(runner, ["codex"], thread_name_prefix="t", run_turn=run_turn)
-        pytest.fail("the interrupt did not reach the main thread")
-
-    monkeypatch.setattr(cli, "run_pr_loop", fake_pr_loop)
-    started = time.monotonic()
-    firing = _signal_when_waiting(signum, executor_ready=executor_ready)
-    assert cli.main(PR_ARGS) == QuotaResetExceededError.EXIT_CODE
-    firing.join(5)
-    assert time.monotonic() - started < 20
-    assert terminations == [True]
-    assert len(outcomes) == 1 and "wait interrupted" in str(outcomes[0])
-    assert "quota reset wait interrupted" in capsys.readouterr().err
-    assert signal.getsignal(signal.SIGTERM) == previous
-    assert quota_wait.active_wait_count() == 0
-
-
-@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
-def test_signal_cancels_waiting_discuss_debaters(tmp_path, monkeypatch, capsys, signum):
-    runner = FakeRunner()
-    terminations = _record_terminations(runner)
-    config = make_config(
-        tmp_path, reviewer=("codex", "gemini"), discuss_parallel=True,
-        wait_for_quota_reset_seconds=SIX_HOURS,
-    )
-    outcomes = []
-
-    def debater_turn(_runner, *, reviewer_name, **_kwargs):
-        try:
-            _waiting_worker(config, reviewer_name)
-        except QuotaResetExceededError as exc:
-            outcomes.append(exc)
-            raise
-        pytest.fail("the debater wait was not cancelled")
-
-    monkeypatch.setattr(discuss_loop, "_run_discuss_debater_turn", debater_turn)
-
-    def fake_discuss(*_a, **_k):
-        discuss_loop.run_discuss_loop(runner, issue_number=56, config=config)
-        pytest.fail("the interrupt did not reach the main thread")
-
-    monkeypatch.setattr(cli, "run_discuss_loop", fake_discuss)
-    started = time.monotonic()
-    firing = _signal_when_waiting(signum, count=2)
-    assert cli.main(
-        ["discuss", "56", "--repo", "OWNER/REPO", "--wait-for-quota-reset", "6h"]
-    ) == QuotaResetExceededError.EXIT_CODE
-    firing.join(5)
-    assert time.monotonic() - started < 20
-    assert terminations == [True]
-    # The second debater records its cancellation only once its thread has
-    # unwound, which can land just after main() returns; wait briefly for it.
-    deadline = time.monotonic() + 5
-    while len(outcomes) < 2 and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert len(outcomes) == 2
-    assert quota_wait.active_wait_count() == 0
-    assert "quota reset wait interrupted" in capsys.readouterr().err
+@pytest.mark.parametrize("scenario, entry, worker_names", [
+    ("signal_cancels_a_waiting_reviewer_worker", "reviewer wait entry", ["Codex"]),
+    ("signal_cancels_waiting_discuss_debaters", "discuss wait entry", ["Codex", "Gemini"]),
+], ids=["reviewer", "discuss"])
+def test_signal_cancels_executor_workers_in_order(tmp_path, signum, scenario, entry, worker_names):
+    output = run_signal_scenario(scenario, tmp_path, signum=signum)
+    lines = output.splitlines()
+    deliveries = [i for i, line in enumerate(lines) if line.startswith("signal delivery:")]
+    exits = [i for i, line in enumerate(lines) if line.startswith("worker exit:")]
+    assert len(deliveries) == 1, output  # No repeated rescue signal.
+    assert lines[deliveries[0]] == f"signal delivery: registered={len(worker_names)}", output
+    assert sorted(lines[i] for i in exits) == sorted(f"worker exit: {name}" for name in worker_names), output
+    assert lines.index(entry) < deliveries[0], output
+    assert all(deliveries[0] < i for i in exits), output
+    assert lines.count("main cancellation / terminate processes") == 1, output
+    # Cancellation wakes workers before the termination spy; either can print first.
+    assert all(i < lines.index("scenario completed: " + scenario) for i in exits), output
+    print(output, end="")  # Keep the controlled sequence in managed -s evidence.
 
 
 def test_sigterm_without_active_wait_keeps_default_termination(tmp_path):
@@ -433,142 +310,34 @@ def test_sigterm_without_active_wait_keeps_default_termination(tmp_path):
         "time.sleep(10)\n"
         "raise SystemExit(0)\n"
     )
-    src = Path(quota_wait.__file__).resolve().parents[1]
-    env = {**os.environ, "PYTHONPATH": str(src)}
-    completed = subprocess.run(
-        [sys.executable, "-c", script], env=env, timeout=60, capture_output=True, text=True,
-    )
+    completed = run_child([sys.executable, "-c", script], env=child_environment(), timeout=30)
     assert completed.returncode == -signal.SIGTERM, completed.stderr
 
 
-def test_sigterm_without_active_wait_chains_to_a_python_handler():
-    received = []
-    original = signal.signal(signal.SIGTERM, lambda signum, _frame: received.append(signum))
-    try:
-        previous = quota_wait.install_sigterm_handler()
-        os.kill(os.getpid(), signal.SIGTERM)
-        deadline = time.monotonic() + 5
-        while not received and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert received == [signal.SIGTERM]
-        assert not quota_wait.wait_was_interrupted()
-        quota_wait.restore_sigterm_handler(previous)
-        assert signal.getsignal(signal.SIGTERM) is previous
-    finally:
-        signal.signal(signal.SIGTERM, original)
+def test_sigterm_without_active_wait_chains_to_a_python_handler(tmp_path):
+    run_signal_scenario("sigterm_without_active_wait_chains_to_a_python_handler", tmp_path)
 
 
-def test_ordinary_keyboard_interrupt_still_propagates(monkeypatch):
-    previous = signal.getsignal(signal.SIGTERM)
-    monkeypatch.setattr(cli, "run_pr_loop", lambda *_a, **_k: (_ for _ in ()).throw(KeyboardInterrupt))
-    with pytest.raises(KeyboardInterrupt):
-        cli.main(PR_ARGS)
-    assert signal.getsignal(signal.SIGTERM) == previous
+def test_ordinary_keyboard_interrupt_still_propagates(tmp_path):
+    run_signal_scenario("ordinary_keyboard_interrupt_still_propagates", tmp_path)
 
 
-def test_option_off_installs_no_sigterm_handler(monkeypatch):
-    previous = signal.getsignal(signal.SIGTERM)
-    seen = []
-    monkeypatch.setattr(cli, "run_pr_loop", lambda *_a, **_k: seen.append(signal.getsignal(signal.SIGTERM)) or 0)
-    assert cli.main(["pr", "77", "--repo", "OWNER/REPO"]) == 0
-    assert seen == [previous]
-    monkeypatch.setattr(cli, "run_pr_loop", lambda *_a, **_k: seen.append(signal.getsignal(signal.SIGTERM)) or 0)
-    assert cli.main(PR_ARGS) == 0
-    assert seen[-1] != previous
-    assert signal.getsignal(signal.SIGTERM) == previous
+def test_option_off_installs_no_sigterm_handler(tmp_path):
+    run_signal_scenario("option_off_installs_no_sigterm_handler", tmp_path)
 
 
 # --- repeated in-process main() calls (#1607) -----------------------------------
 
-def test_repeated_main_after_cancelled_wait_waits_normally(tmp_path, monkeypatch, capsys):
-    runner = FakeRunner()
-    config = make_config(tmp_path, agent_max_retries=0, wait_for_quota_reset_seconds=SIX_HOURS)
-
-    def interrupted_pr_loop(*_a, **_k):
-        with patch.object(validated_agent, "run_agent_result", side_effect=[_claude_limit(), OK]):
-            validated_agent._run_validated_agent(
-                runner, agent="claude", config=config, prompt="P",
-                marker_description="none", validate=lambda t: t,
-            )
-        pytest.fail("the wait was not interrupted")
-
-    monkeypatch.setattr(cli, "run_pr_loop", interrupted_pr_loop)
-    firing = _signal_when_waiting(signal.SIGINT)
-    assert cli.main(PR_ARGS) == QuotaResetExceededError.EXIT_CODE
-    firing.join(5)
-    assert "quota reset wait interrupted" in capsys.readouterr().err
-
-    slept: list[float] = []
-    monkeypatch.setattr(quota_wait, "_sleeper", slept.append)
-    responses = []
-
-    def waiting_pr_loop(*_a, **_k):
-        with patch.object(validated_agent, "run_agent_result", side_effect=[_claude_limit(), OK]) as invoke:
-            responses.append(validated_agent._run_validated_agent(
-                runner, agent="claude", config=config, prompt="P",
-                marker_description="none", validate=lambda t: t,
-            ))
-        assert invoke.call_count == 2
-        return 0
-
-    monkeypatch.setattr(cli, "run_pr_loop", waiting_pr_loop)
-    assert cli.main(PR_ARGS) == 0
-    assert [r.text for r in responses] == ["fine"]
-    assert sum(slept) == 7200 + quota_wait.QUOTA_WAIT_MARGIN_SECONDS
-    assert "quota reset wait interrupted" not in capsys.readouterr().err
+def test_repeated_main_after_cancelled_wait_waits_normally(tmp_path):
+    run_signal_scenario("repeated_main_after_cancelled_wait_waits_normally", tmp_path)
 
 
-def test_option_off_keyboard_interrupt_clears_cancel_latch(tmp_path, monkeypatch):
-    previous = signal.getsignal(signal.SIGTERM)
-    seen = []
-
-    def interrupted_pr_loop(*_a, **_k):
-        seen.append(signal.getsignal(signal.SIGTERM))
-        quota_wait.cancel_active_waits()  # what an executor does on Ctrl-C
-        raise KeyboardInterrupt
-
-    monkeypatch.setattr(cli, "run_pr_loop", interrupted_pr_loop)
-    with pytest.raises(KeyboardInterrupt):
-        cli.main(["pr", "77", "--repo", "OWNER/REPO"])
-    assert seen == [previous]
-    assert signal.getsignal(signal.SIGTERM) == previous
-    # Checked in the test body, before the autouse fixture resets state.
-    assert not quota_wait._cancel_event.is_set()
-    assert not quota_wait.wait_was_interrupted()
-
-    slept: list[float] = []
-    monkeypatch.setattr(quota_wait, "_sleeper", slept.append)
-    reservation = quota_wait.QuotaWaitReservation(7200, 1, 2)
-    quota_wait.wait_for_reset(make_config(tmp_path), "Claude", reservation)
-    assert sum(slept) == reservation.sleep_seconds
+def test_option_off_keyboard_interrupt_clears_cancel_latch(tmp_path):
+    run_signal_scenario("option_off_keyboard_interrupt_clears_cancel_latch", tmp_path)
 
 
-def test_main_chains_sigterm_to_host_python_handler(monkeypatch):
-    received = []
-
-    def host_handler(signum, _frame):
-        received.append(signum)
-
-    original = signal.signal(signal.SIGTERM, host_handler)
-    try:
-        installed = []
-
-        def pr_loop(*_a, **_k):
-            installed.append(signal.getsignal(signal.SIGTERM))
-            os.kill(os.getpid(), signal.SIGTERM)
-            deadline = time.monotonic() + 5
-            while not received and time.monotonic() < deadline:
-                time.sleep(0.01)
-            return 0
-
-        monkeypatch.setattr(cli, "run_pr_loop", pr_loop)
-        assert cli.main(PR_ARGS) == 0
-        assert installed and installed[0] is not host_handler  # main's handler chained
-        assert received == [signal.SIGTERM]
-        assert not quota_wait.wait_was_interrupted()
-        assert signal.getsignal(signal.SIGTERM) is host_handler
-    finally:
-        signal.signal(signal.SIGTERM, original)
+def test_main_chains_sigterm_to_host_python_handler(tmp_path):
+    run_signal_scenario("main_chains_sigterm_to_host_python_handler", tmp_path)
 
 
 # --- signals at wait-lifecycle boundaries (subprocess: a deadlock times out) ----
@@ -630,10 +399,9 @@ sys.exit(0)
 
 
 def _run_boundary(boundary, signum):
-    src = Path(quota_wait.__file__).resolve().parents[1]
-    return subprocess.run(
+    return run_child(
         [sys.executable, "-c", _BOUNDARY_SCRIPT, boundary, str(int(signum))],
-        env={**os.environ, "PYTHONPATH": str(src)}, timeout=60, capture_output=True, text=True,
+        env=child_environment(), timeout=30,
     )
 
 
@@ -842,3 +610,58 @@ def test_concurrent_run_is_admitted_only_after_the_first_runs_reset(tmp_path, sl
     a_done.set()
     thread_a.join(10)
     assert not thread_a.is_alive()
+
+
+@pytest.fixture(autouse=True)
+def _parent_signal_state_is_preserved():
+    if sys.platform != 'linux':
+        yield
+        return
+    watched = (signal.SIGINT, signal.SIGTERM, signal.SIGALRM)
+    handlers = {sig: signal.getsignal(sig) for sig in watched}
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    timer = signal.getitimer(signal.ITIMER_REAL)
+    yield
+    assert {sig: signal.getsignal(sig) for sig in watched} == handlers
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == mask
+    remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+    assert interval == timer[1]
+    if timer[0]:
+        assert 0 < remaining <= timer[0]
+    else:
+        assert remaining == 0
+
+
+def test_missing_readiness_never_delivers_a_signal(tmp_path):
+    output = run_signal_scenario('missing_readiness', tmp_path)
+    assert 'signal delivery:' not in output
+
+
+def test_stuck_signal_child_is_killed_and_reaped(tmp_path):
+    from quota_signal_support import ChildDeadlineExceeded
+    with pytest.raises(ChildDeadlineExceeded, match='child deadline exceeded') as caught:
+        run_signal_scenario('stuck_child', tmp_path, timeout=5)
+    with pytest.raises(ProcessLookupError):
+        os.kill(caught.value.pid, 0)
+    output = str(caught.value)
+    assert 'intentional stuck child' in output
+    assert 'scenario_stuck_child' in output  # independent faulthandler stack
+
+
+@pytest.mark.parametrize('signum', [signal.SIGINT, signal.SIGTERM, signal.SIGALRM],
+                         ids=['sigint', 'sigterm', 'sigalrm'])
+def test_signal_during_condition_lock_restoration_explains_unlock_error(tmp_path, signum):
+    output = run_signal_scenario('condition_reacquire', tmp_path, signum=signum)
+    assert 'release unlocked lock' in output
+    assert 'interrupted_restore' in output
+
+
+def test_pending_alarm_during_sigterm_lock_restoration_is_contained(tmp_path):
+    output = run_signal_scenario('pending_alarm_during_sigterm_reacquire', tmp_path)
+    assert 'release unlocked lock' in output
+    assert 'controlled pending alarm' in output
+    assert 'KeyboardInterrupt' in output
+
+
+def test_sender_failures_are_reported(tmp_path):
+    run_signal_scenario('sender_failure', tmp_path)

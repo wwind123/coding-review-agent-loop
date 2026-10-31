@@ -4205,3 +4205,50 @@ def test_m953_discuss_round_comment_with_spilled_prior_items_is_bot_authored():
         )
 
     assert _discuss_subject(context(spilled)) == _discuss_subject(context())
+
+
+@pytest.mark.parametrize('outcome', ['success', 'exception', 'interrupt'])
+def test_discuss_executor_polls_with_barrier_and_configured_order(tmp_path, monkeypatch, outcome):
+    from concurrent.futures import ALL_COMPLETED
+    from types import SimpleNamespace
+    from quota_executor_helpers import ScriptedExecutor
+    from coding_review_agent_loop import quota_wait
+    executor = ScriptedExecutor(max_workers=2, thread_name_prefix='test')
+    monkeypatch.setattr(discuss_loop, 'ThreadPoolExecutor', lambda **kwargs: executor)
+    runner = FakeRunner(codex_outputs=[_discuss_review_text()], gemini_outputs=[_discuss_review_text()])
+    polls = []
+    def wait(futures, *, timeout, return_when=ALL_COMPLETED):
+        assert timeout == quota_wait.QUOTA_WAIT_SLICE_SECONDS
+        assert return_when == ALL_COMPLETED
+        assert not executor.consumed  # no result reads before the barrier
+        assert runner.comments == []  # no early publication or analyzer work
+        assert set(futures) == set(executor.futures)
+        polls.append(True)
+        if len(polls) <= 2:
+            return SimpleNamespace(not_done=set(executor.futures))
+        if len(polls) == 3:
+            if outcome == 'interrupt':
+                raise KeyboardInterrupt
+            executor.complete(1)
+            return SimpleNamespace(not_done={executor.futures[0]})
+        executor.complete(0, error=ValueError('worker failed') if outcome == 'exception' else None)
+        return SimpleNamespace(not_done=set())
+    monkeypatch.setattr(discuss_loop, 'wait', wait)
+    terminated = []
+    def terminate():
+        assert quota_wait._cancel_event.is_set()
+        terminated.append(True)
+    monkeypatch.setattr(runner, 'terminate_active_processes', terminate)
+    config = make_config(tmp_path, reviewer=('codex', 'gemini'), discuss_parallel=True)
+    if outcome == 'success':
+        assert run_discuss_loop(runner, issue_number=56, config=config) == 0
+        assert executor.consumed == ['Codex', 'Gemini']
+        assert 'Codex position' in runner.comments[0]
+        assert 'Gemini position' in runner.comments[1]
+        assert len(polls) == 4
+    else:
+        with pytest.raises(KeyboardInterrupt if outcome == 'interrupt' else ValueError):
+            run_discuss_loop(runner, issue_number=56, config=config)
+        assert runner.comments == []
+        assert terminated == ([True] if outcome == 'interrupt' else [])
+    assert executor.shutdown_calls == [{'wait': True, 'cancel_futures': True}]

@@ -640,3 +640,52 @@ def test_evidence_approval_normalizer_preserves_real_blockers_and_requests(mixed
         assert normalized.exact_head_evidence_requests == parsed.exact_head_evidence_requests
         assert parsed.dispositions == (disposition,)
         assert items[0].status == "blocking" and items[0].lifecycle == "evidence_deferred"
+
+
+@pytest.mark.parametrize('outcome', ['success', 'exception', 'interrupt'])
+def test_reviewer_executor_polls_and_consumes_completions_once(monkeypatch, outcome):
+    from concurrent.futures import FIRST_COMPLETED
+    from agent_loop_helpers import FakeRunner
+    from quota_executor_helpers import ScriptedExecutor
+    from coding_review_agent_loop import quota_wait
+    executor = ScriptedExecutor(max_workers=2, thread_name_prefix='test')
+    monkeypatch.setattr(review_rounds, 'ThreadPoolExecutor', lambda **kwargs: executor)
+    polls = []
+    def wait(pending, *, timeout, return_when):
+        assert timeout == quota_wait.QUOTA_WAIT_SLICE_SECONDS
+        assert return_when == FIRST_COMPLETED
+        polls.append(set(pending))
+        if len(polls) <= 2:
+            return set(), set(pending)
+        if len(polls) == 3:
+            if outcome == 'interrupt':
+                raise KeyboardInterrupt
+            executor.complete(1, error=ValueError('worker failed') if outcome == 'exception' else None)
+            return {executor.futures[1]}, {executor.futures[0]}
+        assert executor.consumed == ['gemini']
+        assert set(pending) == {executor.futures[0]}
+        executor.complete(0)
+        return {executor.futures[0]}, set()
+    monkeypatch.setattr(review_rounds, 'wait', wait)
+    runner = FakeRunner()
+    terminated = []
+    def terminate():
+        assert quota_wait._cancel_event.is_set()
+        terminated.append(True)
+    monkeypatch.setattr(runner, 'terminate_active_processes', terminate)
+    def launch():
+        return review_rounds._launch_reviewer_turns(
+            runner, ['codex', 'gemini'], thread_name_prefix='test',
+            run_turn=lambda reviewer: review_rounds._ReviewerTurnResult(reviewer_name=reviewer),
+        )
+    if outcome == 'success':
+        results = launch()
+        assert list(results) == ['gemini', 'codex']
+        assert executor.consumed == ['gemini', 'codex']
+        assert len(polls) == 4
+    else:
+        with pytest.raises(KeyboardInterrupt if outcome == 'interrupt' else ValueError):
+            launch()
+        assert terminated == ([True] if outcome == 'interrupt' else [])
+        assert executor.consumed == ([] if outcome == 'interrupt' else ['gemini'])
+    assert executor.shutdown_calls == [{'wait': True, 'cancel_futures': True}]

@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 from .agents.base import AgentName
@@ -1903,6 +1903,10 @@ def _run_discuss_loop(
                     for reviewer in pending
                 }
                 # The analyzer synchronization point: wait for every debater.
+                # Finite observation slices allow pending main-thread signals
+                # to run without weakening the all-debaters publication barrier.
+                while wait(futures.values(), timeout=quota_wait.QUOTA_WAIT_SLICE_SECONDS).not_done:
+                    pass
                 turn_results = {name: future.result() for name, future in futures.items()}
             except KeyboardInterrupt:
                 # Workers never receive the terminal SIGINT; kill their agent
