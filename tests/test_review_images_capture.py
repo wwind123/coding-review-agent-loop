@@ -217,18 +217,28 @@ def test_setup_nonzero_never_publishes(tmp_path):
     assert result.state=='failed' and result.snapshots is None,result
 
 
-@pytest.mark.parametrize('reason', ['version','size'])
+@pytest.mark.parametrize('reason', ['missing','version','size'])
 def test_bubblewrap_prerequisites_refused(monkeypatch, reason):
     from coding_review_agent_loop import review_images_isolation as isolation
-    real=isolation.subprocess.run
+    calls=[]
+    def trusted_path(path, *, executable):
+        assert path=='/usr/bin/bwrap' and executable
+        if reason=='missing':
+            raise FileNotFoundError(path)
+        return '/mock-runtime/bwrap'
     def run(command,**kwargs):
+        assert command[0]=='/mock-runtime/bwrap'
+        calls.append(command[-1])
         if command[-1]=='--version':
             return subprocess.CompletedProcess(command,0,b'bubblewrap 0.8.0' if reason=='version' else b'bubblewrap 0.9.0',b'')
-        if command[-1]=='--help':
-            return subprocess.CompletedProcess(command,0,b'no support',b'')
-        return real(command,**kwargs)
+        assert command[-1]=='--help'
+        return subprocess.CompletedProcess(command,0,b'no support',b'')
+    monkeypatch.setattr(isolation,'_trusted_path',trusted_path)
     monkeypatch.setattr(isolation.subprocess,'run',run)
-    with pytest.raises(ValueError): preflight(('/usr/bin',))
+    error,message=(FileNotFoundError,'/usr/bin/bwrap') if reason=='missing' else (
+        ValueError,'Bubblewrap >= 0.9.0' if reason=='version' else 'Bubblewrap lacks --size')
+    with pytest.raises(error,match=message): preflight(('/usr/bin',))
+    assert calls==([] if reason=='missing' else ['--version'] if reason=='version' else ['--version','--help'])
 
 
 @pytest.mark.parametrize('change', ['type','nodev','nosuid','noexec','size','root','dev','extra'])
