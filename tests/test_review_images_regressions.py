@@ -231,7 +231,7 @@ def test_phase_completion_prioritizes_fresh_resource_events(phase, code, event):
 
 
 @pytest.mark.parametrize('phase', ['setup', 'capture'])
-@pytest.mark.parametrize('noise', [b'x', b'\x1b[31m\xc3\xa9\xff'])
+@pytest.mark.parametrize('noise', [b'x', b'\x1b[31m\xc3\xa9\xff', '😀'.encode()])
 def test_large_payload_output_preserves_success(tmp_path, phase, noise):
     root, head, _ = repository(tmp_path)
     supported(root, head)
@@ -243,7 +243,9 @@ def test_large_payload_output_preserves_success(tmp_path, phase, noise):
     with result.snapshots:
         assert result.diagnostic
         assert len(result.diagnostic.encode()) <= host.MONITOR_REPLY_BYTES
-        if noise != b'x':
+        if noise == '😀'.encode():
+            assert '😀' in result.diagnostic
+        elif noise != b'x':
             assert '\x1b' in result.diagnostic and 'é' in result.diagnostic and '\ufffd' in result.diagnostic
 
 

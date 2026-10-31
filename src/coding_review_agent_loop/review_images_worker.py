@@ -239,8 +239,10 @@ def main():
         os.close(original_out)
         os.close(original_err)
     diagnostic = bytes(tail).decode(errors='replace')
-    for start in range(0, len(diagnostic), 8192):
-        send(channel, {'diagnostic': diagnostic[start:start + 8192]})
+    # JSON can expand one non-BMP character into two six-byte escapes.
+    # Keep every diagnostic packet below the monitor's 64 KiB recvmsg cap.
+    for start in range(0, len(diagnostic), 4096):
+        send(channel, {'diagnostic': diagnostic[start:start + 4096]})
     send(channel, {'export': 'ready'})
     if receive(channel) != {'export': 'accepted'}:
         raise ValueError('export not authorized')

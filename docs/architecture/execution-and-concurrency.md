@@ -751,6 +751,8 @@ setup dependencies. Each defaults to a separate 300-second deadline; input and
 export each have a 30-second deadline. Diagnostics retain only a 64 KiB tail on
 a channel separate from output framing. The monitor further trims that tail to fit
 the 64 KiB encoded JSON reply budget, including escaping and proof metadata.
+Supervisor diagnostic chunks also fit their control-channel budget under
+worst-case JSON escaping, including non-BMP characters.
 After each phase, resource counters are checked after payload teardown and before
 evaluating the exit status; any resource event takes precedence over nonzero
 exit or timeout classification. Positive finite limits exclude booleans.
