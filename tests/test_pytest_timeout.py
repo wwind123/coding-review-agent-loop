@@ -83,7 +83,6 @@ def test_quota_signal_scenarios_preserve_timeout_continuity(tmp_path, workers):
 import pytest
 from quota_signal_support import run_signal_scenario
 
-@pytest.mark.xdist_group(name='signal-continuity')
 class TestContinuity:
     def test_01_successful_signals(self, tmp_path):
         before = signal.getsignal(signal.SIGALRM)
@@ -123,7 +122,10 @@ class TestContinuity:
     command = [
         sys.executable, '-m', 'pytest', '-c', str(CONFIG), '--rootdir', str(tmp_path),
         '--confcutdir', str(tmp_path), '-p', 'pytest_timeout', '-p', 'xdist.plugin',
-        '-n', str(workers), '--dist=loadgroup', '-p', 'no:cacheprovider',
+        # The entire class is one continuity sequence. Use structural class
+        # affinity rather than marker-based grouping: splitting this sequence
+        # across workers makes the control/timeout checks meaningless.
+        '-n', str(workers), '--dist=loadscope', '-p', 'no:cacheprovider',
         '--timeout=20', '-q', str(suite),
     ]
     result = run_child(command, env=env, cwd=tmp_path, timeout=60)
