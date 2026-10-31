@@ -80,6 +80,7 @@ EXTRACTED_MODULES: tuple[str, ...] = (
     'pr_loop',
     'issue_implementation',
     'plan_issue_scope',
+    'plan_ownership',
     'plan_first_loop',
     'history_export',
     'triage',
