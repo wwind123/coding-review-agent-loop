@@ -170,11 +170,20 @@ Source paths below are relative to
 | Local evidence and diagnostics | `test_runtime.py`, `local_test_evidence.py`, `salvage.py`, `usage.py`, `tool_provenance.py`, `logging.py`, `worker_telemetry.py` | Record invocation-local test selectors and authoritative observations, preserve partial work, and account for calls without treating estimates or self-reports as verified success; `tool_provenance.py` validates the Git executable's location and reads the tool checkout only through `run_hardened_git` to record the running commit; runtime rows persist the launch triple (`wrapper_bootstrap`, `inner_exec`, `suite_start`) as diagnostics beside `launch_integrity`; launched run-tests observations whose suite start stayed `unknown` may also persist a diagnostic-only, closed-set `suite_start_reason` (`unrecognized-launcher` or `probe-unavailable`) that selects operator wording and never decides admission or citability; `worker_telemetry.py` appends a disposable host-scoped worker-reservation log whose broker-lane attribution comes from the runner while standalone `run-tests` attribution is self-reported. `lifecycle_probe.py` and the `_agent_loop_lifecycle_probe` pytest plugin (beside the worker-cap plugin) give a direct-pytest run positive parent-observed lifecycle provenance, and with the parent importability check let `test_runtime.py` classify a run that exited before any test could run as a persisted non-evidence `launch-failed` row (pre-collection caveat first) that every authoritative-failure consumer excludes. `test_runtime.run_exit_code_probe` bounds every interpreter probe and tears down its process tree on every exit path; `run-tests` prints a pre-launch foreground-budget notice (suppressed only by the orchestrator-authored `AGENT_LOOP_SHELL_CAP_MS`), a pre-admission missing-xdist advisory for module launches and a timeout advisory, none of which is evidence. `fixture_runtime.py` and the standard-library `fixture_supervisor.py` implement `run-tests --fixture`: a provenance gate (tracked `100755` blob equal to `HEAD`, clean tree) and a host-process-authority gate before launch, a child-subreaper supervisor that runs the fixture's setup and teardown around the unchanged inner command under one absolute request deadline, a graceful teardown handshake on broker shutdown, and a host-wide census before cleanup is confirmed; the optional fixture record on the observation feeds the citation gate, which requires a clean fixture lifecycle. |
 
 `orchestrator.py` is a thin re-export facade over the lifecycle modules listed
-above, which were extracted from it by pure moves. Each extracted module
-imports alone, never imports the facade, and imports only modules extracted
-before it, so the lifecycle layers form an acyclic chain ending at
-`issue_loop.py`; [tests/test_orchestrator_split.py](../../tests/test_orchestrator_split.py) enforces those rules and
-that the facade stays docstring-and-imports only. Tests patch the owning
+above, which were extracted from it by pure moves. The frozen historical
+`EXTRACTED_MODULES` registry preserves extraction order: registered modules may
+import only earlier entries and retain facade binding-coherence checks. New
+package modules do not require registration. Automatic discovery covers nested
+modules and subpackages; ordinary modules must import alone in a fresh
+interpreter without loading the facade. Only the facade itself and `cli.py`,
+its intentional entry-point consumer, are exempt from facade protection.
+The fixed standalone helpers `git_windows_launcher.py` (module-level Windows
+API initialization) and `inspect_git_subprocess.py` (module-level caller-supplied
+argument access), plus `review_images_worker.py` (executed as sealed source
+with sibling imports under `/trusted`), instead receive static no-facade import
+checks at every nesting level. They retain facade protection without being executed as ordinary imports.
+[tests/test_orchestrator_split.py](../../tests/test_orchestrator_split.py)
+enforces these rules and that the facade stays docstring-and-imports only. Tests patch the owning
 extracted modules directly, since a facade patch would not reach them, and a
 static guard in [tests/test_orchestrator_split.py](../../tests/test_orchestrator_split.py) rejects test imports
 and patch targets of the facade outside that file and its guard helper. The table describes code ownership, not a

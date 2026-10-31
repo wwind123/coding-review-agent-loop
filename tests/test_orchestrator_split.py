@@ -72,29 +72,8 @@ def test_registered_modules_respect_layering():
     assert guard.layering_problems(guard.registered_module_names(), _registered_sources()) == []
 
 
-def test_every_new_package_module_is_registered():
-    # Git boundary and shared-source health helpers are independent package
-    # modules, not orchestrator moves subject to the extraction order.
-    independent_infrastructure_modules = {
-        "secure_git", "git_transport", "git_windows_launcher", "inspect_git_subprocess",
-        "transport_check",
-        "worktree_link_integrity",
-        # Independent capture infrastructure; no orchestrator symbols moved.
-        "review_images_config", "review_images_capture", "review_images_worktree",
-        "review_images_isolation", "review_images_host", "review_images_worker",
-        "review_images_cgroup", "review_images_channel", "review_images_mounts",
-        "review_images_manifest", "review_images_png",
-    }
-    problems = guard.unregistered_modules(
-        guard.package_module_names(), (*BASELINE["modules"], *independent_infrastructure_modules),
-        guard.registered_module_names()
-    )
-    assert problems == []
-
-
-def test_registered_modules_import_alone_in_a_fresh_interpreter():
-    problems = [guard.fresh_import_problem(name) for name in guard.registered_module_names()]
-    assert [problem for problem in problems if problem] == []
+def test_package_modules_import_without_the_facade():
+    assert guard.package_import_problems() == []
 
 
 def test_autouse_repair_stub_is_bound_on_validated_agent():
@@ -201,12 +180,6 @@ def test_layering_guard_accepts_earlier_and_pre_existing_modules():
     assert guard.layering_problems(("early", "later"), sources) == []
 
 
-def test_completeness_guard_names_an_unregistered_module():
-    assert guard.unregistered_modules(["a", "b", "new_one", "registered"], ["a", "b"], ["registered"]) == [
-        "new package module 'new_one' is not in EXTRACTED_MODULES"
-    ]
-
-
 def test_coherence_guard_names_divergent_bindings_and_allows_module_only_names():
     facade = types.ModuleType("synthetic_facade")
     shared, divergent = object(), object()
@@ -225,6 +198,79 @@ def test_fresh_import_guard_accepts_a_standalone_module_and_rejects_a_facade_imp
     assert guard.fresh_import_problem("usage") is None
     assert guard.fresh_import_problem("cli") == "cli imports the orchestrator facade"
     assert "does not import alone" in guard.fresh_import_problem("no_such_module_for_split_guard")
+
+
+@pytest.fixture
+def synthetic_package(tmp_path, monkeypatch):
+    package_dir = tmp_path / guard.PACKAGE
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(guard, "SRC_ROOT", tmp_path)
+    monkeypatch.setattr(guard, "PACKAGE_DIR", package_dir)
+
+    def write(name, source):
+        path = package_dir / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+
+    return package_dir, write
+
+
+def test_discovered_unregistered_modules_and_subpackages_pass(synthetic_package):
+    package_dir, write = synthetic_package
+    write("new_standalone.py", "VALUE = 1\n")
+    write("nested/__init__.py", "from . import leaf\n")
+    write("nested/leaf.py", "VALUE = 2\n")
+    assert guard.package_module_names(package_dir) == ["nested", "nested.leaf", "new_standalone"]
+    assert "new_standalone" not in guard.registered_module_names()
+    assert guard.package_import_problems(package_dir) == []
+
+
+@pytest.mark.parametrize("name", ["direct", "transitive", "broken", "git_windows_launcher_extra", "nested.leaf", "nested"])
+def test_discovered_ordinary_modules_cannot_opt_out(synthetic_package, name):
+    package_dir, write = synthetic_package
+    write("orchestrator.py", "VALUE = 1\n")
+    write("bridge.py", "from . import orchestrator\n")
+    write("nested/__init__.py", "")
+    source = {
+        "direct": "from . import orchestrator\n",
+        "transitive": "from . import bridge\n",
+        "broken": "raise RuntimeError('ordinary module must execute')\n",
+        "git_windows_launcher_extra": "raise RuntimeError('not a standalone helper')\n",
+        "nested.leaf": "from .. import orchestrator\n",
+        "nested": "from .. import orchestrator\n",
+    }[name]
+    filename = "nested/__init__.py" if name == "nested" else name.replace(".", "/") + ".py"
+    write(filename, source)
+    problems = guard.package_import_problems(package_dir)
+    expected = "does not import alone" if name in {"broken", "git_windows_launcher_extra"} else "imports the orchestrator facade"
+    assert any(problem.startswith(f"{name} {expected}") for problem in problems), problems
+
+
+def test_only_facade_and_cli_are_exempt(synthetic_package):
+    package_dir, write = synthetic_package
+    for name in ("orchestrator", "cli"):
+        write(f"{name}.py", "raise RuntimeError('intentional exemption')\n")
+    assert guard.package_module_names(package_dir) == ["cli", "orchestrator"]
+    assert guard.package_import_problems(package_dir) == []
+
+
+@pytest.mark.parametrize("name", ["git_windows_launcher", "inspect_git_subprocess", "review_images_worker"])
+@pytest.mark.parametrize("source", [
+    "raise RuntimeError('must never execute standalone helpers')\n",
+    "import coding_review_agent_loop.orchestrator\n",
+    "import coding_review_agent_loop.orchestrator.member\n",
+    "from coding_review_agent_loop import orchestrator\n",
+    "from coding_review_agent_loop.orchestrator import member\n",
+    "from . import orchestrator\n",
+    "from .orchestrator import member\n",
+    "def f():\n    from .orchestrator import member\n",
+])
+def test_standalone_helpers_receive_static_facade_checks(synthetic_package, name, source):
+    package_dir, write = synthetic_package
+    write(f"{name}.py", source)
+    expected = [] if source.startswith("raise ") else [f"{name} imports the orchestrator facade"]
+    assert guard.package_import_problems(package_dir) == expected
 
 
 # --- Facade-use guard on synthetic sources -------------------------------------
