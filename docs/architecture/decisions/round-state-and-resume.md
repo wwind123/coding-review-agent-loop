@@ -26,3 +26,4 @@ never rewritten or deleted. The detail doc describes the current design.
 - 2026-10-30: All recovery transport phases are lineage-neutral for legacy acknowledgement origin selection; ordinary coder evidence fields do not veto producer eligibility, while conversion origins remain excluded. The acknowledgement failure boundary also hands off active state after an unrecorded push and reopens scheduler checkpoint admission after reconciliation (#1791).
 
 - 2026-10-30: Same-head failed acknowledgement repair bounds peer visibility and partial-round recovery with the same predicate as resume; earlier publications and the ledger boundary are retained, while later publications remain peers (#1791).
+- An independently approved plan may recover an unused neutral advance through its reconciled predecessor and lifecycle-replayed future ledger without changing durable records (#1805).

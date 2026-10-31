@@ -421,6 +421,14 @@ startup.
   unreconstructible obligation, inherited inadmissibility and a pending
   signed supersession.
 
+## Approved resume routing
+
+Approved-plan resume retains the approving board even across a recovered unused
+neutral advance. Historical board-change links remain effective; the shortcut
+log says that no **new** link is recorded. Pending post-approval links remain
+inactive. The live approval gate must still qualify every approving seat before
+restoring the invocation's PR board for execution.
+
 ## Decisions
 
 [Decision log](decisions/reviewer-boards.md)

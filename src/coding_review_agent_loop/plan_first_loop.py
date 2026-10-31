@@ -7,6 +7,7 @@ orchestrator re-exports every name defined here.
 from __future__ import annotations
 
 from .pr_head_sync import get_observed_pr_review_context
+from .approved_plan_resume import approved_plan_resume_view, approval_shortcut_disagreement
 
 from .plan_round_closure import (
     project_plan_history, plan_amendment_activation_round, attach_plan_rollover_metadata,
@@ -1624,7 +1625,7 @@ def _run_plan_first_loop_body(
             f"Planning issue #{issue_number}: plan {plan_approval.plan_hash} is completely "
             "approved by its approving board "
             f"{', '.join(approving.effective_reviewers)}; planning is not reopened and "
-            "no plan board change is recorded",
+            "no new plan board-change link is recorded",
         )
         config = _approving_plan_board_config(config, approving)
         seat_binding = reviewer_seat_binding(config)
@@ -1829,6 +1830,12 @@ def _run_plan_first_loop_body(
         issue_context.comments, configured_reviewers=configured_reviewers,
         min_round_number=plan_scope_start_round,
     )
+    if plan_approved_shortcut:
+        resume_state = approved_plan_resume_view(
+            issue_context.comments, resume_state, config=config,
+            human_requirements=issue_context.human_requirements,
+            min_round_number=plan_scope_start_round,
+        )
     plan_board_reentry: int | None = None
     plan_board_anchor_state = None
     # A fresh planning scope with no planner record yet (just opened, or a
@@ -2419,12 +2426,9 @@ def _run_plan_first_loop_body(
 
     for round_number in range(start_round_number, plan_round_limit + 1):
         if plan_approved_shortcut and round_number != start_round_number:
-            # The approval classification and the live approval boundary
-            # disagree; never revise an approved plan under its old board.
-            raise AgentLoopError(
-                f"Planning issue #{issue_number}: plan {plan_approval.plan_hash} was classified "
-                "completely approved, but the approval boundary did not approve it. Rerun "
-                "after resolving the reported condition; no planner turn was started."
+            raise approval_shortcut_disagreement(
+                plan_hash=plan_approval.plan_hash, round_number=start_round_number,
+                predicate="unexpected review-round consumption",
             )
         if round_number != start_round_number:
             # Later rounds re-read and re-validate the durable board history
@@ -2942,7 +2946,7 @@ def _run_plan_first_loop_body(
                 ),
             )
             try:
-                plan_scheduler_decision = select_plan_reviewers(
+                plan_scheduler_decision = None if plan_approved_shortcut else select_plan_reviewers(
                     plan_snapshot,
                     plan_classification,
                     qualifying_approvals=plan_qualifying_approvals,
@@ -2951,7 +2955,7 @@ def _run_plan_first_loop_body(
             except PlanPrePanelSafetyError as exc:
                 stop_plan_pre_panel(str(exc), round_number=round_number)
                 raise
-            plan_scheduler_decision = _keep_reused_amendment_round_reviews(
+            plan_scheduler_decision = None if plan_approved_shortcut else _keep_reused_amendment_round_reviews(
                 plan_scheduler_decision,
                 lineage=plan_contract_lineage,
                 round_number=round_number,
@@ -2960,7 +2964,7 @@ def _run_plan_first_loop_body(
                     name == plan_primary_name or plan_panel_evidence.opened
                 ),
             )
-            plan_selected_names = set(plan_scheduler_decision.selected_reviewers)
+            plan_selected_names = set(plan_scheduler_decision.selected_reviewers) if plan_scheduler_decision else set()
             round_reviewers = tuple(
                 reviewer for reviewer in configured_reviewers
                 if agent_display_name(reviewer) in plan_selected_names
@@ -3099,7 +3103,10 @@ def _run_plan_first_loop_body(
                     + " as non-authoritative context only",
                 )
 
-        if current_resume is not None and current_resume.reconciled and any(
+        if plan_approved_shortcut:
+            round_reviewers = tuple(reviewer for reviewer in configured_reviewers
+                                    if agent_display_name(reviewer) in resumed_by_name)
+        if not plan_approved_shortcut and current_resume is not None and current_resume.reconciled and any(
             agent_display_name(reviewer) not in resumed_by_name
             for reviewer in round_reviewers
         ):
@@ -3488,7 +3495,9 @@ def _run_plan_first_loop_body(
         # A round that holds withheld outcomes began as a parallel round; finish
         # it through the same withhold-then-publish launcher even when this run
         # is sequential, so no retried reviewer sees a same-round peer's body.
-        plan_round_parallel = config.review_parallel or plan_round_spool.has_records()
+        plan_round_parallel = not plan_approved_shortcut and (
+            config.review_parallel or plan_round_spool.has_records()
+        )
         plan_today_peers = tuple(
             reviewer for reviewer in round_reviewers
             if (record := resumed_by_name.get(agent_display_name(reviewer))) is not None
@@ -3586,7 +3595,7 @@ def _run_plan_first_loop_body(
                 )),
             )
 
-        if not plan_round_parallel:
+        if not plan_round_parallel and not plan_approved_shortcut:
             _refuse_partial_round_before_sequential_turns(
                 spool=plan_round_spool,
                 fresh_turn_reviewers=[
@@ -3886,7 +3895,7 @@ def _run_plan_first_loop_body(
                 approved_review_outputs.append((reviewer_name, review_output))
                 accepted_review_carriers[reviewer_name] = parsed_review
             if resumed_record is None or (
-                resumed_record.metadata.phase == "publication"
+                not plan_approved_shortcut and resumed_record.metadata.phase == "publication"
                 and not (current_resume is not None and current_resume.reconciled)
             ):
                 for item in parsed_review.items.blocking:
@@ -3962,7 +3971,7 @@ def _run_plan_first_loop_body(
         same_model_note = same_model_panel_note(round_review_models)
         if same_model_note is not None:
             log(config, f"Planning round {round_number}: {same_model_note}")
-        if (
+        if not plan_approved_shortcut and (
             plan_round_parallel or same_model_note is not None
         ) and not (current_resume is not None and current_resume.reconciled):
             settled = ", ".join(agent_display_name(reviewer) for reviewer in round_reviewers)
@@ -4360,12 +4369,24 @@ def _run_plan_first_loop_body(
             plan_missing_approvals = tuple(
                 name for name in plan_reviewer_names if name not in plan_round_qualifying
             )
+        elif plan_approved_shortcut:
+            approved_this_round = {name for name, _output in approved_review_outputs}
+            plan_missing_approvals = tuple(name for name in plan_reviewer_names
+                                           if name not in approved_this_round)
         plan_phase_advance_pending = bool(
             staged_planning
             and all_approved
             and not must_fix_items
             and plan_missing_approvals
         )
+        if plan_approved_shortcut and plan_missing_approvals:
+            raise approval_shortcut_disagreement(
+                plan_hash=plan_approval.plan_hash, round_number=round_number,
+                missing=plan_missing_approvals, records=plan_history_records(), seat_binding=seat_binding,
+                restoration_rounds=plan_fresh_from_rounds,
+                parent_requirement_ids=plan_parent_requirement_ids,
+                predicate="live exact-plan approval qualification",
+            )
         growth_guard_revision = None
         if plan_growth_notice is not None and all_approved and not must_fix_items:
             # A non-compliant candidate can never pass, so neither a
@@ -4437,6 +4458,18 @@ def _run_plan_first_loop_body(
             plan_supersession is not None
             and approved_plan_hash(current_plan) == plan_supersession.superseded_hash
         )
+        if plan_approved_shortcut and (
+            not all_approved or must_fix_items or growth_guard_revision or narrow_revision
+            or inherited_review_failure or supersession_revision_pending
+        ):
+            raise approval_shortcut_disagreement(
+                plan_hash=plan_approval.plan_hash, round_number=round_number,
+                predicate=str(inherited_review_failure or growth_guard_revision or narrow_revision
+                              or ("signed supersession" if supersession_revision_pending else None)
+                              or "review verdict or unresolved obligations"),
+                obligations=tuple(item.item_id for item in must_fix_items),
+            )
+
         if (
             all_approved
             and not must_fix_items
@@ -4549,7 +4582,8 @@ def _run_plan_first_loop_body(
             )
             if lost_obligations:
                 raise AgentLoopError(
-                    f"Planning round {round_number}: every reviewer approved, but plan "
+                    f"Planning round {round_number}, plan {approved_plan_hash(current_plan)}: "
+                    "every reviewer approved, but plan "
                     f"obligation(s) {', '.join(lost_obligations)} published earlier are neither "
                     "carried in the current ledger nor cleared by recorded history, so the "
                     "plan ledger cannot be reconstructed. Refusing to approve; inspect the "
@@ -4568,6 +4602,7 @@ def _run_plan_first_loop_body(
                 # the approvals acknowledging a requirement that no longer
                 # exists (#905, from #841).
                 raise AgentLoopError(
+                    f"Plan {approved_plan_hash(current_plan)}, round {round_number}: "
                     f"Issue #{issue_number} signed human requirement(s) changed after plan "
                     "approval: "
                     f"{_describe_requirement_set_change(previous_requirement_ids, refreshed_requirement_ids)}. "
@@ -4589,6 +4624,7 @@ def _run_plan_first_loop_body(
                 }
                 if refreshed_parent_requirement_ids != previous_parent_requirement_ids:
                     raise AgentLoopError(
+                        f"Plan {approved_plan_hash(current_plan)}, round {round_number}: "
                         f"Authoritative parent issue #{parent_issue_context.number} signed human "
                         "requirement(s) changed after plan approval: "
                         f"{_describe_requirement_set_change(previous_parent_requirement_ids, refreshed_parent_requirement_ids)}"

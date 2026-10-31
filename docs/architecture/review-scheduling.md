@@ -438,6 +438,19 @@ receives real runs, and the real-run pair (`review_contract_runs.json` and
 documented data-only
 [freezing procedure](../local_agent_loop.md#freezing-a-real-run).
 
+## Completely approved resume
+
+Completely approved plans are an exception to fresh-review rollover. Startup
+proves approval on the approving board, then resumes the live approval gate
+without selecting reviewers, writing a scheduling decision or recovering a
+fresh-turn spool. Current-round dispositions still settle the ledger; paused
+seats count only through qualifying exact-plan carried approvals. Neither the
+reconciled-round rollover nor the later missing-approval advance may write or
+consume another round under this shortcut. Live qualification disagreements
+refuse before either write, including at the round limit, with the plan, round,
+missing seats and their seat/restoration/parent-requirement bindings. Requirement,
+obligation, inherited-matrix and growth checks still govern execution.
+
 ## Decisions
 
 [Decision log](decisions/review-scheduling.md)

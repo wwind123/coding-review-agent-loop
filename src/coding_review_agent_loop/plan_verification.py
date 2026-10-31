@@ -1240,6 +1240,12 @@ def classify_plan_approval(
         )
     if resumed is None:
         return PlanApprovalClassification("unfinished", "no reconstructible plan round", context)
+    from .approved_plan_resume import approved_plan_resume_view
+
+    resumed = approved_plan_resume_view(
+        plan_comments, resumed, config=plan_config, human_requirements=human_requirements,
+        min_round_number=scope_start_round,
+    )
     plan_text, plan_round = resumed
     plan_hash = approved_plan_hash(plan_text)
 
