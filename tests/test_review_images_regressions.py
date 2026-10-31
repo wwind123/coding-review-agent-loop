@@ -198,3 +198,64 @@ def test_tmpfs_memory_event_with_zero_exit_discards_set(tmp_path):
                             command='/usr/bin/python3 -c '+shlex.quote(script)+'; /usr/bin/python3 capture.py')
     result=service.capture(root,head,cfg,[{'status':'added','filename':'capture.py'}])
     assert result.state=='resource-limit' and result.snapshots is None,result
+
+
+@pytest.mark.parametrize('text', ['x', '\x1b[31m', 'é', '😀', '\ufffd'])
+def test_monitor_reply_bounds_encoded_diagnostics(text):
+    result = {'state': 'ok', 'proof': {'mounts': 'p' * 4096},
+              'dimensions': {'one.png': [2, 2]}, 'diagnostic': text * 65536}
+    raw = host.encode_reply(result)
+    assert len(raw) <= host.MONITOR_REPLY_BYTES
+    decoded = json.loads(raw)
+    assert decoded.pop('diagnostic')
+    assert result['diagnostic'].endswith(json.loads(raw)['diagnostic'])
+    assert decoded == {k: v for k, v in result.items() if k != 'diagnostic'}
+
+
+@pytest.mark.parametrize('phase', ['setup', 'capture'])
+@pytest.mark.parametrize('code', [0, 17, None])
+@pytest.mark.parametrize('event', [False, True])
+def test_phase_completion_prioritizes_fresh_resource_events(phase, code, event):
+    from types import SimpleNamespace
+    killed = []
+    def counters():
+        assert killed == ['payload']
+        return {'max': int(event)}
+    tree = SimpleNamespace(kill=killed.append, empty=lambda _: True, counters=counters)
+    expected = host.ResourceLimit if event else TimeoutError if code is None else ValueError if code else None
+    if expected:
+        with pytest.raises(expected):
+            host.finish_phase(tree, {'max': 0}, phase, code)
+    else:
+        assert host.finish_phase(tree, {'max': 0}, phase, code)
+
+
+@pytest.mark.parametrize('phase', ['setup', 'capture'])
+@pytest.mark.parametrize('noise', [b'x', b'\x1b[31m\xc3\xa9\xff'])
+def test_large_payload_output_preserves_success(tmp_path, phase, noise):
+    root, head, _ = repository(tmp_path)
+    supported(root, head)
+    script = 'import os; os.write(1, ' + repr(noise) + ' * (2 * 1024**2))'
+    cfg = config()
+    command = '/usr/bin/python3 -c ' + shlex.quote(script) + '; ' + getattr(cfg, 'setup' if phase == 'setup' else 'command')
+    cfg = dataclasses.replace(cfg, **{('setup' if phase == 'setup' else 'command'): command})
+    result = required(service.capture(root, head, cfg, [{'status': 'added', 'filename': 'capture.py'}]))
+    with result.snapshots:
+        assert result.diagnostic
+        assert len(result.diagnostic.encode()) <= host.MONITOR_REPLY_BYTES
+        if noise != b'x':
+            assert '\x1b' in result.diagnostic and 'é' in result.diagnostic and '\ufffd' in result.diagnostic
+
+
+@pytest.mark.parametrize('phase', ['setup', 'capture'])
+@pytest.mark.parametrize('exit_code', [0, 17])
+def test_denied_fork_is_resource_limit_for_every_phase_exit(tmp_path, phase, exit_code):
+    root, head, _ = repository(tmp_path)
+    supported(root, head)
+    script = ('import os,time\ntry:\n while True:\n'
+              '  if os.fork()==0: time.sleep(20); os._exit(0)\n'
+              'except OSError: raise SystemExit(' + str(exit_code) + ')')
+    cfg = dataclasses.replace(config(), tasks=32, setup_timeout=5, capture_timeout=5,
+                              **{('setup' if phase == 'setup' else 'command'): '/usr/bin/python3 -c ' + shlex.quote(script)})
+    result = service.capture(root, head, cfg, [{'status': 'added', 'filename': 'capture.py'}])
+    assert result.state == 'resource-limit' and result.snapshots is None, result

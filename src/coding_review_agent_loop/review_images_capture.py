@@ -33,6 +33,7 @@ def _policy(settings):
 
 
 def _attempt(config, settings, source):
+    from .review_images_host import MONITOR_REPLY_BYTES
     from .containment import InvocationHandle
     from .review_images_isolation import sealed
     from .errors import AgentLoopError
@@ -70,8 +71,8 @@ def _attempt(config, settings, source):
                 process.wait(timeout=10)
                 return {'state': 'timeout', 'error': 'whole-attempt watchdog'}, b''
             result.seek(0)
-            raw = result.read(65537)
-            if len(raw) > 65536:
+            raw = result.read(MONITOR_REPLY_BYTES + 1)
+            if len(raw) > MONITOR_REPLY_BYTES:
                 raise ValueError('oversized monitor reply')
             errors.seek(0)
             detail = errors.read(8192).decode(errors='replace')

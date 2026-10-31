@@ -33,6 +33,46 @@ def failure_state(exc):
     return "failed"
 
 
+MONITOR_REPLY_BYTES = 65536
+
+
+def encode_reply(result):
+    """Fit diagnostics to the wire budget after JSON escaping and metadata."""
+    result = dict(result)
+    diagnostic = result.pop('diagnostic', None)
+    if diagnostic is None:
+        encoded = json.dumps(result).encode()
+    else:
+        low, high = 0, len(diagnostic)
+        result['diagnostic'] = ''
+        encoded = json.dumps(result).encode()
+        while low < high:
+            length = (low + high + 1) // 2
+            result['diagnostic'] = diagnostic[-length:]
+            candidate = json.dumps(result).encode()
+            if len(candidate) <= MONITOR_REPLY_BYTES:
+                low, encoded = length, candidate
+            else:
+                high = length - 1
+    if len(encoded) > MONITOR_REPLY_BYTES:
+        raise ValueError('oversized monitor metadata')
+    return encoded
+
+
+def finish_phase(tree, initial, phase, code):
+    tree.kill('payload')
+    empty = tree.empty('payload')
+    # Events can arrive while select waits for phase_done. Resource evidence
+    # takes precedence over every exit status, including timeout and nonzero.
+    if tree.counters() != initial:
+        raise ResourceLimit('capture resource event')
+    if code is None:
+        raise TimeoutError(phase + ' timeout')
+    if code != 0:
+        raise ValueError(phase + ' nonzero exit')
+    return empty
+
+
 def start_identity(pid):
     value = Path(f'/proc/{pid}/stat').read_text()
     rest = value[value.rfind(')') + 2:].split()
@@ -156,14 +196,8 @@ def monitor(config, input_fd, output_fd):
                     loaded = True
                     channel.send(b'{"loaded":"accepted"}')
                 elif 'phase_done' in message and message['phase_done'] == gate_phase and gate_phase:
-                    tree.kill('payload')
-                    proof[gate_phase + '_empty'] = tree.empty('payload')
+                    proof[gate_phase + '_empty'] = finish_phase(tree, initial, gate_phase, message.get('code'))
                     channel.send(json.dumps({'empty': gate_phase}).encode())
-                    code = message.get('code')
-                    if code is None:
-                        raise TimeoutError(gate_phase + ' timeout')
-                    if code != 0:
-                        raise ValueError(gate_phase + ' nonzero exit')
                     done.append(phases.pop(0))
                     gate_phase = None
                     deadline = time.monotonic() + config['transfer_timeout']
@@ -212,11 +246,13 @@ def main():
     config = json.loads(os.pread(config_fd, 65536, 0))
     try:
         result = monitor(config, input_fd, output_fd)
+        encoded = encode_reply(result)
     except BaseException as exc:
         message = str(exc)[:4096]
         state = failure_state(exc)
         result = {'state': state, 'error': message}
-    os.write(result_fd, json.dumps(result).encode())
+        encoded = encode_reply(result)
+    os.write(result_fd, encoded)
     return 0 if result['state'] == 'ok' else 1
 
 
