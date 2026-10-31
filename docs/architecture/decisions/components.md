@@ -37,3 +37,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Permit stable current-head passing receipts to supersede explicitly unstable parent-observed failures in live and resumed reconciliation; waive only failure-side tree authority, retain live environment equivalence and restart pass-side gates, recompute links after decode, and keep unstable failures authoritative without a qualifying pass (#1753, 2026-10-27).
 
 - Retire mandatory registration for new package modules in the finished split registry; keep its historical ordering and coherence checks, discover ordinary modules for fresh-interpreter facade protection, and statically protect the two non-importable standalone helpers (#1806).
+
+- Preserve static facade protection for the standalone `review_images_worker.py` sandbox supervisor when merging the package import guard with its sealed `/trusted` execution layout (#1806).

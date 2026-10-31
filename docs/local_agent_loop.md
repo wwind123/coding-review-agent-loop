@@ -9830,6 +9830,10 @@ example `3600`, `90m`, `6h` or `1h30m`. It must be positive and no longer than
   exit code 3, so the run can be resumed. This also applies to waits in parallel
   reviewer or debater threads. Waits request slices of at most one second so
   a pending signal missed by the blocking wait is observed after a short slice.
+  Main-thread reviewer and discuss executor observation also polls at the same
+  interval, so worker slices cannot leave the main thread in an unbounded wait.
+  Empty polls do not fail a turn or impose an overall execution deadline;
+  reviewer completion collection and the discuss publication barrier are retained.
   Once the main thread handles the interrupt, it cancels waiting workers,
   terminates active agent processes, and then exits. Scheduling and executor
   cleanup add overhead; the slice limit is not an absolute one-second
@@ -10353,3 +10357,30 @@ authenticated owning issue N. Without authenticated origin/scope, this advice is
 conditional and N must not be guessed. Ordinary PRs need no managed flags.
 Source-managed and adopted PRs retain their existing origin-specific recovery;
 issue-created/source-managed suppression and adopted-label release are unchanged.
+
+### Risk-matrix execution ownership
+
+Before publication, fresh plans, full revisions, and assembled semantic revisions
+validate matrix owners against their own execution recommendation. Invalid owners
+return to the planner through bounded deterministic correction, without publication
+or envelope repair changing the topology. Exhaustion identifies ownership validation
+and preserves the diagnostic for the next invocation.
+
+Published unapproved plans are checked before review as well. An ownership failure
+skips fresh reviewer calls and reviewer-only phase advancement, and sends the
+diagnostic and existing review obligations directly to planner correction. No new
+approvals are published for that invalid candidate, so interruption or correction
+exhaustion cannot turn it into an approved shortcut on rerun. At the round limit,
+raise `--max-rounds` and rerun to continue correction. Historical completely approved
+plans retain their approval reuse and post-approval guard.
+
+Human-only checks in staged plans use a `human-action` child stage and its actual
+stage id. One-shot checks use `one-shot` with exact-head human evidence at the final
+head through the existing evidence and reviewer mechanisms. Roles and person names
+belong in descriptive context, not execution owners.
+
+Completely approved resumes retain approval reuse and the post-approval ownership
+guards. To correct an invalid approved plan, post a new signed human requirement
+requesting a corrected plan, then rerun. The reopened plan enters the unapproved
+round-start correction path. An ordinary issue edit or rerun alone does not retire
+approvals. Compatible legacy plans without recommendations keep their existing route.

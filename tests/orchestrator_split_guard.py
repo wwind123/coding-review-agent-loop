@@ -80,6 +80,7 @@ EXTRACTED_MODULES: tuple[str, ...] = (
     'pr_loop',
     'issue_implementation',
     'plan_issue_scope',
+    'plan_ownership',
     'plan_first_loop',
     'history_export',
     'triage',
@@ -273,7 +274,7 @@ def package_import_problems(package_dir: Path | None = None) -> list[str]:
     """Discover package modules and enforce no-facade import safety.
 
     The facade itself and cli (its intentional entry-point consumer) are exempt.
-    The two standalone helper scripts cannot execute as ordinary imports, so
+    The standalone helper scripts cannot execute as ordinary imports, so
     their imports are checked statically; all other modules use fresh processes.
     """
     package_dir = PACKAGE_DIR if package_dir is None else package_dir
@@ -281,7 +282,7 @@ def package_import_problems(package_dir: Path | None = None) -> list[str]:
     for name in package_module_names(package_dir):
         if name in {"orchestrator", "cli"}:
             continue
-        if name in {"git_windows_launcher", "inspect_git_subprocess"}:
+        if name in {"git_windows_launcher", "inspect_git_subprocess", "review_images_worker"}:
             source = (package_dir / f"{name}.py").read_text(encoding="utf-8")
             imported = _imported_module_names(source, f"{PACKAGE}.{name}")
             if any(_names_facade(target) for target in imported):

@@ -1286,16 +1286,20 @@ def test_narrowing_revision_inside_an_active_episode_carries_directive_and_ancho
     owns that round's revision (the step-back gate is excluded); the anchor must
     still follow the narrowing directive, and no new step-back entry is recorded.
     """
-    from types import SimpleNamespace
+    from coding_review_agent_loop.protocol import validate_structured_plan_state
 
     history = _m1278_episode_history(tmp_path)
     claude, codex = _m1275_scripts(first_round=8, last_round=9)
     real = plan_first_loop_module._current_execution_recommendation
-    calls = []
+    staged = validate_structured_plan_state(_m1268_staged_raw()).execution_recommendation
+    initial_plan = []
 
-    def recommendation(*args, **kwargs):
-        calls.append(1)
-        return SimpleNamespace(strategy="staged") if len(calls) == 1 else real(*args, **kwargs)
+    def recommendation(plan, *args, **kwargs):
+        # Both ownership validation and narrowing inspect the same candidate.
+        # Keep its topology stable across reads until the planner revises it.
+        if not initial_plan:
+            initial_plan.append(plan)
+        return staged if plan == initial_plan[0] else real(plan, *args, **kwargs)
 
     with patch.object(
         plan_first_loop_module, "_current_execution_recommendation", recommendation

@@ -255,7 +255,7 @@ def test_only_facade_and_cli_are_exempt(synthetic_package):
     assert guard.package_import_problems(package_dir) == []
 
 
-@pytest.mark.parametrize("name", ["git_windows_launcher", "inspect_git_subprocess"])
+@pytest.mark.parametrize("name", ["git_windows_launcher", "inspect_git_subprocess", "review_images_worker"])
 @pytest.mark.parametrize("source", [
     "raise RuntimeError('must never execute standalone helpers')\n",
     "import coding_review_agent_loop.orchestrator\n",
