@@ -2,7 +2,7 @@
 
 The main lifecycle diagram and the plan-first path up to the implementation PR: the canonical approved plan and its handoff binding, the generation-1 risk-based mode and transition matrix and its inheritance by child plans, implementation evidence claims and their selector, row-ID and launcher rules, deterministic planning-validation recovery, and the generation-1 execution strategy with staged child phases.
 
-Source paths: `src/coding_review_agent_loop/execution_retirement.py`, `tests/test_execution_decision_retirement.py`, `src/coding_review_agent_loop/plan_first_loop.py`, `src/coding_review_agent_loop/issue_implementation.py`, `src/coding_review_agent_loop/child_plan_binding.py`, `src/coding_review_agent_loop/execution_policy.py`, `src/coding_review_agent_loop/plan_assembly.py`, `src/coding_review_agent_loop/risk_coverage_map.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/decomposition.py`, `src/coding_review_agent_loop/child_topology.py`, `src/coding_review_agent_loop/phase_progress.py`, `tests/test_plan_first_loop_review.py`, `tests/test_plan_first_loop_staged.py`, `tests/test_plan_first_loop_step_back.py`, `tests/test_plan_first_loop_execution_strategy.py`, `tests/test_issue_implementation_handoff.py`, `tests/test_issue_implementation_recovery.py`, `tests/test_issue_loop_resume.py`, `tests/test_plan_assembly.py`.
+Source paths: `src/coding_review_agent_loop/plan_ownership.py`, `tests/test_plan_ownership.py`, `src/coding_review_agent_loop/execution_retirement.py`, `tests/test_execution_decision_retirement.py`, `src/coding_review_agent_loop/plan_first_loop.py`, `src/coding_review_agent_loop/issue_implementation.py`, `src/coding_review_agent_loop/child_plan_binding.py`, `src/coding_review_agent_loop/execution_policy.py`, `src/coding_review_agent_loop/plan_assembly.py`, `src/coding_review_agent_loop/risk_coverage_map.py`, `src/coding_review_agent_loop/protocol.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/decomposition.py`, `src/coding_review_agent_loop/child_topology.py`, `src/coding_review_agent_loop/phase_progress.py`, `tests/test_plan_first_loop_review.py`, `tests/test_plan_first_loop_staged.py`, `tests/test_plan_first_loop_step_back.py`, `tests/test_plan_first_loop_execution_strategy.py`, `tests/test_issue_implementation_handoff.py`, `tests/test_issue_implementation_recovery.py`, `tests/test_issue_loop_resume.py`, `tests/test_plan_assembly.py`.
 
 ## Main Lifecycle
 
@@ -495,6 +495,34 @@ and integration-base verification minus the closure write; an undelivered
 earlier phase stops the run with `DependencyNotMergedError` (exit code 5).
 The decomposition summary's per-child relaunch lines are advisory operator
 guidance and carry no protocol authority.
+
+### Risk-matrix execution ownership
+
+Before publication, fresh plans, full revisions, and assembled semantic revisions
+validate matrix owners against their own execution recommendation. Invalid owners
+return to the planner through bounded deterministic correction, without publication
+or envelope repair changing the topology. Exhaustion identifies ownership validation
+and preserves the diagnostic for the next invocation.
+
+Published unapproved plans are checked before review as well. An ownership failure
+skips fresh reviewer calls and reviewer-only phase advancement, and sends the
+diagnostic and existing review obligations directly to planner correction. No new
+approvals are published for that invalid candidate, so interruption or correction
+exhaustion cannot turn it into an approved shortcut on rerun. At the round limit,
+raise `--max-rounds` and rerun to continue correction. Historical completely approved
+plans retain their approval reuse and post-approval guard.
+
+Human-only checks in staged plans use a `human-action` child stage and its actual
+stage id. One-shot checks use `one-shot` with exact-head human evidence at the final
+head through the existing evidence and reviewer mechanisms. Roles and person names
+belong in descriptive context, not execution owners.
+
+Completely approved resumes retain approval reuse and the post-approval ownership
+guards. To correct an invalid approved plan, post a new signed human requirement
+requesting a corrected plan, then rerun. The reopened plan enters the unapproved
+round-start correction path. An ordinary issue edit or rerun alone does not retire
+approvals. Compatible legacy plans without recommendations keep their existing route.
+
 
 ## Decisions
 

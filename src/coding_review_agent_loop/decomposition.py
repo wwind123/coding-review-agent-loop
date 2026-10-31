@@ -459,56 +459,56 @@ def normalize_execution_recommendation(
     return decomposition, retained_scope
 
 
+class RiskMatrixOwnershipError(AgentLoopError):
+    """Execution ownership needs producer correction."""
+
+
+HUMAN_MATRIX_OWNERSHIP_GUIDANCE = (
+    "For human-only checks in staged plans, use a human-action child stage and its actual "
+    "stage id as owner. In one-shot plans, use one-shot and require exact-head human "
+    "evidence at the final head through existing evidence and reviewer mechanisms. "
+    "Person names and roles belong in descriptive context."
+)
+
+
 def validate_risk_matrix_ownership(
     matrix: RiskTestMatrix | dict[str, object] | None,
     recommendation: ExecutionStrategyRecommendation,
 ) -> None:
-    """Ensure every matrix owner is a real owner in the approved topology."""
+    """Validate owners against the candidate's effective execution topology."""
     if matrix is None:
         return
     parsed = matrix if isinstance(matrix, RiskTestMatrix) else parse_risk_test_matrix(matrix)
-    stage_ids = {stage.stage_id for stage in recommendation.child_stages}
-    allowed = {"one-shot", "retained-parent", "final-integration", *stage_ids}
-    unknown = sorted({row.execution_owner for row in parsed.rows} - allowed)
-    if unknown:
-        raise AgentLoopError(
-            "Risk matrix rows name execution owners absent from the approved topology: "
-            + ", ".join(unknown)
-        )
-    if recommendation.strategy == "one-shot":
-        invalid = sorted(
-            {
-                row.execution_owner
-                for row in parsed.rows
-                if row.execution_owner != "one-shot"
-            }
-        )
-        if invalid:
-            raise AgentLoopError(
-                "One-shot recommendations may assign matrix rows only to `one-shot`: "
-                + ", ".join(invalid)
-            )
+    allowed = {"one-shot"} if recommendation.strategy == "one-shot" else {
+        stage.stage_id for stage in recommendation.child_stages
+    }
     if recommendation.strategy == "staged":
-        invalid = sorted(
-            {
-                row.execution_owner
-                for row in parsed.rows
-                if row.execution_owner == "one-shot"
-            }
+        if recommendation.retained_parent_work.status != "none":
+            allowed.add("retained-parent")
+        if recommendation.final_integration_work.status != "none":
+            allowed.add("final-integration")
+    invalid = sorted({row.execution_owner for row in parsed.rows} - allowed)
+    if invalid:
+        raise RiskMatrixOwnershipError(
+            "Risk-matrix ownership validation failed. Invalid execution owners: "
+            + ", ".join(invalid) + ". Allowed execution owners: "
+            + (", ".join(sorted(allowed)) or "(none)") + ". "
+            + HUMAN_MATRIX_OWNERSHIP_GUIDANCE
         )
-        if invalid:
-            raise AgentLoopError(
-                "Staged recommendations must assign matrix rows to a reviewed stage, "
-                "retained-parent, or final-integration owner."
-            )
-    if "retained-parent" in {row.execution_owner for row in parsed.rows} and recommendation.retained_parent_work.status == "none":
-        raise AgentLoopError(
-            "Risk matrix rows cannot be owned by retained-parent when retained parent work is not approved."
-        )
-    if "final-integration" in {row.execution_owner for row in parsed.rows} and recommendation.final_integration_work.status == "none":
-        raise AgentLoopError(
-            "Risk matrix rows cannot be owned by final-integration when final integration work is not approved."
-        )
+
+
+def validate_approved_risk_matrix_ownership(
+    matrix: RiskTestMatrix | dict[str, object] | None,
+    recommendation: ExecutionStrategyRecommendation,
+) -> None:
+    """Retain the approved-plan defense with accurate recovery advice."""
+    try:
+        validate_risk_matrix_ownership(matrix, recommendation)
+    except RiskMatrixOwnershipError as exc:
+        raise RiskMatrixOwnershipError(
+            f"{exc} To request a corrected plan, post a new signed human requirement "
+            "requesting correction, then rerun."
+        ) from exc
 
 
 def risk_matrix_row_ids_for_owner(
