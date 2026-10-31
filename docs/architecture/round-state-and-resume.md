@@ -2,7 +2,7 @@
 
 Where workflow state lives and how a run resumes: the GitHub and local state table, durable comment carriers and write read-back, transient GitHub failure handling, the known host comment footer, evidence freeze records, rejected coder follow-up recovery, and the context and trust contracts that every prompt and resume path must preserve.
 
-Source paths: `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
+Source paths: `src/coding_review_agent_loop/approved_plan_resume.py`, `src/coding_review_agent_loop/review_approval.py`, `src/coding_review_agent_loop/round_state.py`, `src/coding_review_agent_loop/legacy_machine_items.py`, `src/coding_review_agent_loop/qualification_checkpoint.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/round_state_scheduler.py`, `src/coding_review_agent_loop/round_transport.py`, `src/coding_review_agent_loop/comment_rendering.py`, `src/coding_review_agent_loop/github.py`, `src/coding_review_agent_loop/github_issue_references.py`, `src/coding_review_agent_loop/github_retry.py`, `src/coding_review_agent_loop/protocol_markers.py`, `src/coding_review_agent_loop/partial_round_recovery.py`, `src/coding_review_agent_loop/publication_resume.py`, `src/coding_review_agent_loop/prompts.py`, `src/coding_review_agent_loop/memory.py`, `src/coding_review_agent_loop/architecture_context.py`, `tests/test_round_state.py`, `tests/test_round_transport.py`, `tests/test_protocol_markers.py`, `tests/test_pr_loop_resume.py`, `tests/test_pr_loop_closed_round.py`.
 
 Scheduler metadata decoding and its key sets live in `round_state_scheduler.py`,
 with explicit re-exports from `round_state.py`. Round entry points, encoding,
@@ -414,6 +414,35 @@ Key contracts to preserve when changing the implementation:
 These are design contracts and validation responsibilities, not a claim that
 every integration path is bug-free. Use source inspection and regression tests
 to check them when a change crosses module boundaries.
+
+## Approved planning resume
+
+For completely approved planning history, `approved_plan_resume.py` supplies a
+read-only predecessor view when the final record is a single unused same-plan
+reviewer-only advance immediately after reconciliation. Independent complete
+approval must still hold against the full history. A later reviewer, candidate
+or scheduling checkpoint is substantive and prevents this recovery. The raw
+comments remain available to lineage and amendment validation; no persisted
+format or global rollover projection changes.
+
+The predecessor's ledger and current-round dispositions remain authoritative.
+Existing lifecycle replay reconstructs future follow-ups from the predecessor
+and earlier rounds, preserving identities, provenance and numbering while
+excluding resolved or promoted deferrals. Conflicting provenance or
+unreconstructible obligations fail closed. Direct reconciled resume uses the
+same future-item replay. Existing publication policy and follow-up deduplication
+apply to both views: plan-only summarizes; implementation may file issues once;
+ignore retains its existing summary behavior. Non-approved rollover semantics
+are unchanged. Unreconciled publication reviews instead mint their items from
+saved canonical responses at the settlement barrier, including on approved
+resume; provisional empty item lists are not a settled ledger. Repeated resume
+uses the existing follow-up publication deduplication. An owed same-model
+reconciliation note is also published on approved resume; an existing
+reconciliation prevents duplicate notes.
+
+Approval refusal diagnostics inspect the full current-scope history, preserving
+excluded approval status, round and recorded bindings for operator recovery.
+Qualification continues to use its filtered evidence view.
 
 ## Decisions
 

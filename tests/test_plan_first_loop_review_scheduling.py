@@ -5,6 +5,7 @@ import re
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
+from contextlib import ExitStack
 
 import pytest
 
@@ -2484,3 +2485,467 @@ def test_recovery_prelaunch_retires_only_older_round_approvals(tmp_path, opened,
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     assert not any(command[0] in {"claude", "codex", "gemini"}
                    for command, _ in runner.commands[calls_before:])
+
+
+def _approved_closed_history(tmp_path, *, future=False):
+    """Real generation-1 approval across primary/panel rounds, then settlement."""
+    runner = _FakeRunner(
+        claude_outputs=[structured_v1_plan_state()],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini",
+                                              future_followups=["Retain predecessor follow-up."] if future else [])],
+    )
+    config = _staged_plan_config(tmp_path, max_rounds=2)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    records = _plan_round_records(runner)
+    checkpoint = next(r for r in reversed(records) if r.phase == "scheduler-prelaunch")
+    new_items = tuple(item for r in records if r.round_number == 2 for item in r.new_items)
+    runner.issue_comments.append({"author": {"login": "bot"}, "createdAt": "2026-01-01T01:00:00Z",
+                                 "body": _attach_round_metadata("Settled", PostedRoundMetadata(
+                                     flow="plan", role="summary", agent="Orchestrator",
+                                     round_number=checkpoint.round_number, subject=checkpoint.subject,
+                                     phase="reconciliation", new_items=new_items,
+                                     plan_board_root=checkpoint.plan_board_root,
+                                     plan_board_identity=checkpoint.plan_board_identity,
+                                     reviewer_board_change_digest=checkpoint.reviewer_board_change_digest))})
+    return runner, config, checkpoint
+
+
+@pytest.mark.parametrize("neutral", [False, True])
+@pytest.mark.parametrize("mode", ["plan-only", "auto"])
+def test_approved_reconciled_resume_reaches_execution_without_scheduling(tmp_path, neutral, mode):
+    runner, config, checkpoint = _approved_closed_history(tmp_path, future=True)
+    if neutral:
+        runner.issue_comments.append({"author": {"login": "bot"}, "createdAt": "2026-01-01T01:00:01Z",
+                                     "body": _attach_round_metadata("Unused advance", PostedRoundMetadata(
+                                         flow="plan", role="summary", agent="Orchestrator",
+                                         round_number=3, subject=checkpoint.subject,
+                                         phase="plan-phase-advance"))})
+    config = replace(config, plan_execution_mode=mode)
+    before = len(_plan_round_records(runner))
+    calls = len(runner.commands)
+    for _ in range(2):
+        with patch.object(plan_first_loop_module, "select_plan_reviewers", side_effect=AssertionError("scheduled")), \
+             patch.object(plan_first_loop_module, "_implement_approved_issue", return_value=0) as implement:
+            assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+            assert implement.call_count == (mode == "auto")
+    assert len(_plan_round_records(runner)) == before
+    assert not any(command[0] in {"claude", "codex", "gemini"}
+                   for command, _ in runner.commands[calls:])
+    summaries = [c["body"] for c in runner.issue_comments if "Approved plan future follow-ups:" in c["body"]]
+    assert summaries and all("Retain predecessor follow-up." in body for body in summaries)
+
+
+@pytest.mark.parametrize("exclusion", ["seat", "restoration", "parent"])
+@pytest.mark.parametrize("round_limit", [2, 3])
+@pytest.mark.parametrize("reconciled", [False, True])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_approved_shortcut_live_binding_disagreement_refuses_before_advance(tmp_path, round_limit, reconciled, parallel, exclusion):
+    runner, config, checkpoint = _approved_closed_history(tmp_path)
+    if not reconciled:
+        runner.issue_comments.pop()
+        if parallel:
+            from coding_review_agent_loop.round_state import _extract_round_metadata_records
+            records = _extract_round_metadata_records([SimpleNamespace(body=c["body"]) for c in runner.issue_comments], flow="plan")
+            secondary = next(r for r in records if r.metadata.role == "reviewer" and r.metadata.agent == "Gemini")
+            runner.issue_comments[secondary.index]["body"] = _attach_round_metadata(secondary.body, replace(
+                secondary.metadata, phase="publication", canonical_reviewer_response=structured_plan_review(
+                    state="approved", reviewer="Google Gemini")))
+    records = plan_first_loop_module._extract_round_metadata_records(
+        [SimpleNamespace(body=c["body"]) for c in runner.issue_comments], flow="plan")
+    primary = next(r for r in records if r.metadata.role == "reviewer" and r.metadata.agent == "Codex")
+    if exclusion == "parent":
+        primary = replace(primary, metadata=replace(primary.metadata, parent_requirement_ids=("old-parent",)))
+    runner.issue_comments[primary.index]["body"] = _attach_round_metadata(primary.body, primary.metadata)
+    recorded_binding = primary.metadata.seat_binding
+    config = replace(config, review_parallel=parallel)
+    before = len(runner.issue_comments)
+    calls = len(runner.commands)
+    messages = []
+    real_lineage = plan_first_loop_module.resolve_plan_lineage
+    real_classify = plan_first_loop_module.classify_plan_approval
+
+    def classify_before_parent_refresh(*args, **kwargs):
+        # Simulate startup's older parent context, then exercise the real
+        # live carried-approval predicate against the current empty parent set.
+        kwargs["parent_requirement_ids"] = None
+        return real_classify(*args, **kwargs)
+
+    def restored_lineage(*args, **kwargs):
+        lineage = real_lineage(*args, **kwargs)
+        fields = {name: getattr(lineage, name) for name in dir(lineage) if not name.startswith("_")}
+        fields.update(restoration_rounds={"Codex": 2}, fresh_from_rounds={})
+        return SimpleNamespace(**fields)
+
+    for _ in range(2):
+        with ExitStack() as stack:
+            if exclusion == "seat":
+                stack.enter_context(patch("coding_review_agent_loop.reviewer_seats.reviewer_seat_binding", return_value={
+                    "version": 1, "seats": [{"id": "Codex", "backend": "codex",
+                    "model_chain": ["obsolete-seat"], "effort": None}]}))
+            elif exclusion == "restoration":
+                stack.enter_context(patch.object(plan_first_loop_module, "resolve_plan_lineage", side_effect=restored_lineage))
+            else:
+                stack.enter_context(patch.object(plan_first_loop_module, "_infer_staged_parent_issue", return_value=99))
+                stack.enter_context(patch.object(plan_first_loop_module, "classify_plan_approval", side_effect=classify_before_parent_refresh))
+            with pytest.raises(AgentLoopError) as exc:
+                run_issue_loop(runner, issue_number=56, config=replace(config, max_rounds=round_limit), plan_first=True)
+        messages.append(str(exc.value))
+    assert messages[0] == messages[1]
+    assert f"Codex: status=approved, approval round=1, seat binding={recorded_binding!r}" in messages[0]
+    assert "resumed round 2" in messages[0] and checkpoint.subject.rsplit("-", 1)[-1][:16] in messages[0]
+    assert "restore qualifying exact-plan" in messages[0]
+    if exclusion == "seat":
+        assert "obsolete-seat" in messages[0]
+    elif exclusion == "restoration":
+        assert "restoration round=2" in messages[0]
+    else:
+        assert "parent requirement binding=('old-parent',) (required ())" in messages[0]
+    assert len(runner.issue_comments) == before
+    assert not any(command[0] in {"claude", "codex", "gemini"}
+                   for command, _ in runner.commands[calls:])
+
+
+@pytest.mark.parametrize("tail", ["blocking-review", "changed-candidate", "contradictory-checkpoint", "advance-with-finding"])
+def test_approved_resume_preserves_substantive_tail(tmp_path, tail):
+    from coding_review_agent_loop.round_state import _resume_plan_round
+    from coding_review_agent_loop.approved_plan_resume import approved_plan_resume_view
+    runner, config, checkpoint = _approved_closed_history(tmp_path)
+    meta = PostedRoundMetadata(flow="plan", role="summary", agent="Orchestrator",
+                               round_number=3, subject=checkpoint.subject, phase="plan-phase-advance")
+    runner.issue_comments.append({"author": {"login": "coding-review-agent-loop"}, "createdAt": "2026-06-01T00:00:00Z",
+                                  "body": _attach_round_metadata("Unused advance", meta)})
+    if tail == "advance-with-finding":
+        runner.issue_comments.pop()
+        later = replace(meta, new_items=(UnresolvedReviewItem(
+            item_id="item-99", reviewer="Codex", source_round=3, text="Substantive obligation", status="blocking"),))
+    elif tail == "blocking-review":
+        later = replace(meta, role="reviewer", agent="Codex", state="blocking", phase="authoritative")
+    elif tail == "changed-candidate":
+        # A later candidate is never mistaken for a summary-only neutral tail.
+        later = PostedRoundMetadata(flow="plan", role="coder", agent="Claude", round_number=3,
+                                    subject=_plan_subject("Changed candidate"), canonical_plan="Changed candidate")
+    else:
+        later = replace(checkpoint, round_number=3, plan_candidate_key={
+            **checkpoint.plan_candidate_key, "aggregate_plan_identity": "contradictory",
+        })
+    runner.issue_comments.append({"author": {"login": "coding-review-agent-loop"}, "createdAt": "2026-06-01T00:00:01Z",
+                                  "body": _attach_round_metadata("Substantive later activity", later)})
+    comments = [SimpleNamespace(body=c["body"]) for c in runner.issue_comments]
+    resumed = _resume_plan_round(comments, configured_reviewers=("codex", "gemini"))
+    view = approved_plan_resume_view(comments, resumed, config=config, human_requirements=())
+    assert view == resumed
+    assert view[1].round_number == 3
+    from coding_review_agent_loop.plan_verification import classify_plan_approval
+    classification = classify_plan_approval(
+        comments, config=config, issue_number=56, trusted_actor=None, human_requirements=(),
+    )
+    assert not classification.approved
+    # Drive the actual entry path too: later substantive round 3 cannot be
+    # discarded to recover approval of round 2, even at the old round limit.
+    before = len(_plan_round_records(runner))
+    calls = len(runner.commands)
+    with patch.object(plan_first_loop_module, "_implement_approved_issue", side_effect=AssertionError("implemented")), \
+         patch.object(plan_first_loop_module, "_decompose_approved_plan", side_effect=AssertionError("decomposed")):
+        with pytest.raises(AgentLoopError):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not any(r.phase == "plan-phase-advance" for r in _plan_round_records(runner)[before:])
+    assert not any(command[0] in {"claude", "codex", "gemini"}
+                   for command, _ in runner.commands[calls:])
+
+
+@pytest.mark.parametrize("neutral", [False, True])
+@pytest.mark.parametrize("strategy,mode", [("one-shot", "plan-only"), ("one-shot", "auto"), ("staged", "auto")])
+def test_approved_resume_with_historical_board_link_keeps_approving_board(tmp_path, neutral, mode, strategy):
+    from issue_loop_test_helpers import _fresh_staged_plan_for_recovery
+    from coding_review_agent_loop.phase_progress import StagedTopologyOutcome
+    raw = _fresh_staged_plan_for_recovery()[0] if strategy == "staged" else structured_v1_plan_state()
+    runner = _FakeRunner(
+        serve_rest_issue_comments=True, authenticated_actor=("agent-loop", 4242),
+        claude_outputs=[raw],
+        codex_outputs=[structured_plan_review(state="approved")],
+        gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini")],
+    )
+    original = _staged_plan_config(tmp_path, reviewer=("codex", "gemini", "antigravity"), max_rounds=1, plan_execution_mode="auto" if strategy == "staged" else "plan-only")
+    with pytest.raises(AgentLoopError, match="phase advance was still pending"):
+        run_issue_loop(runner, issue_number=56, config=original, plan_first=True)
+    reduced = _staged_plan_config(tmp_path, max_rounds=3, plan_execution_mode="auto" if strategy == "staged" else "plan-only")
+    with patch.object(plan_first_loop_module, "_decompose_approved_plan", return_value=StagedTopologyOutcome(
+            created=(), stage_ids=(), automations=(), plan_hash="test-plan",
+            mode="implement-by-phase", topology_source="approved-plan-v1")), \
+         patch.object(plan_first_loop_module, "_dispatch_current_decomposition_phase", return_value=0):
+        assert run_issue_loop(runner, issue_number=56, config=reduced, plan_first=True) == 0
+    checkpoint = next(r for r in reversed(_plan_round_records(runner)) if r.phase == "scheduler-prelaunch")
+    runner.issue_comments.append({"body": _attach_round_metadata("Settled", PostedRoundMetadata(
+        flow="plan", role="summary", agent="Orchestrator", round_number=checkpoint.round_number,
+        subject=checkpoint.subject, phase="reconciliation", plan_board_root=checkpoint.plan_board_root,
+        plan_board_identity=checkpoint.plan_board_identity,
+        reviewer_board_change_digest=checkpoint.reviewer_board_change_digest)),
+        "author": {"login": "agent-loop"}, "_rest_author_id": 4242,
+        "createdAt": runner.issue_comments[-1]["createdAt"]})
+    if neutral:
+        runner.issue_comments.append({"body": _attach_round_metadata("Unused advance", PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", round_number=checkpoint.round_number + 1,
+            subject=checkpoint.subject, phase="plan-phase-advance",
+            plan_board_root=checkpoint.plan_board_root, plan_board_identity=checkpoint.plan_board_identity,
+            reviewer_board_change_digest=checkpoint.reviewer_board_change_digest)),
+            "author": {"login": "agent-loop"}, "_rest_author_id": 4242,
+            "createdAt": runner.issue_comments[-1]["createdAt"]})
+    calls = len(runner.commands)
+    before = len(_plan_round_records(runner))
+    links = [c for c in runner.issue_comments if "AGENT_PLAN_BOARD_CHANGE" in c["body"]]
+    assert len(links) == 1
+    logs = []
+    with patch.object(plan_first_loop_module, "log", side_effect=lambda _config, message: logs.append(message)), \
+         patch.object(plan_first_loop_module, "_implement_approved_issue", return_value=0) as implement, \
+         patch.object(plan_first_loop_module, "select_plan_reviewers", side_effect=AssertionError("scheduled")), \
+         patch.object(plan_first_loop_module, "_decompose_approved_plan", return_value=StagedTopologyOutcome(
+             created=(), stage_ids=(), automations=(), plan_hash="test-plan",
+             mode="implement-by-phase", topology_source="approved-plan-v1")) as decompose, \
+         patch.object(plan_first_loop_module, "_dispatch_current_decomposition_phase", return_value=0) as dispatch:
+        try:
+            result = run_issue_loop(runner, issue_number=56, config=replace(
+                original, max_rounds=checkpoint.round_number, plan_execution_mode=mode), plan_first=True)
+        except AgentLoopError as exc:
+            pytest.fail(f"{exc}; startup logs: {logs}")
+        assert result == 0
+        assert implement.call_count == (mode == "auto" and strategy == "one-shot")
+        assert decompose.call_count == (mode == "auto" and strategy == "staged")
+        assert dispatch.call_count == decompose.call_count
+        if mode == "auto":
+            action = decompose if strategy == "staged" else implement
+            assert action.call_args.kwargs["config"].reviewer == original.reviewer
+            if strategy == "staged":
+                assert action.call_args.kwargs["mode"] == "implement-by-phase"
+                assert dispatch.call_args.kwargs["config"].reviewer == original.reviewer
+    assert not any(command[0] in {"claude", "codex", "gemini", "antigravity"}
+                   for command, _ in runner.commands[calls:])
+    assert len(_plan_round_records(runner)) == before
+    assert len([c for c in runner.issue_comments if "AGENT_PLAN_BOARD_CHANGE" in c["body"]]) == 1
+    assert any("no new plan board-change link is recorded" in message for message in logs)
+    assert any("changed by recorded board-change link" in message for message in logs)
+
+
+@pytest.mark.parametrize("mode,policy", [("auto", "issue"), ("auto", "ignore"), ("plan-only", "issue")])
+def test_approved_neutral_resume_preserves_lifecycle_and_publication_parity(tmp_path, mode, policy):
+    from coding_review_agent_loop.protocol import ReviewItemDisposition
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    seed, config, checkpoint = _approved_closed_history(tmp_path, future=True)
+    records = _extract_round_metadata_records([SimpleNamespace(body=c["body"]) for c in seed.issue_comments], flow="plan")
+    primary = next(r for r in records if r.metadata.role == "reviewer" and r.metadata.agent == "Codex")
+    secondary = next(r for r in records if r.metadata.role == "reviewer" and r.metadata.agent == "Gemini")
+    earlier = tuple(UnresolvedReviewItem(item_id=f"item-{number}", reviewer="Codex", source_round=1,
+                                        text=text, status="future", source_status="future")
+                    for number, text in [(11, "Retain earlier follow-up."), (12, "Resolved earlier follow-up."),
+                                         (13, "Promoted then resolved follow-up.")])
+    carried = (*earlier[:2], replace(earlier[2], status="same-plan"))
+    dispositions = tuple(ReviewItemDisposition(item_id=f"item-{number}", disposition="resolved", reviewer="Gemini") for number in (12, 13))
+    # Preserve a real generation-1 plan/approval key and add durable lifecycle
+    # records: early deferral, later promotion, and reviewer clearances.
+    for record in records:
+        meta = record.metadata
+        if record.index == primary.index:
+            meta = replace(meta, new_items=earlier)
+        elif meta.round_number == 2:
+            meta = replace(meta, prior_items=carried)
+            if record.index == secondary.index:
+                meta = replace(meta, dispositions=dispositions)
+        seed.issue_comments[record.index]["body"] = _attach_round_metadata(record.body, meta)
+    # Remove the previous publication announcement so both paths must derive
+    # and publish their sources afresh. Durable planning records stay intact.
+    history = [c for c in seed.issue_comments if "Planning complete for issue" not in c["body"]]
+    results = []
+    for neutral in (False, True):
+        comments = list(history)
+        if neutral:
+            comments.append({"body": _attach_round_metadata("Unused active-only advance", PostedRoundMetadata(
+                flow="plan", role="summary", agent="Orchestrator", round_number=3,
+                subject=checkpoint.subject, phase="plan-phase-advance")),
+                "author": {"login": "bot"}, "createdAt": "2026-01-01T02:00:00Z"})
+        runner = _FakeRunner(issue_comments=comments, issue_urls=["https://github.com/OWNER/REPO/issues/99",
+                                                                 "https://github.com/OWNER/REPO/issues/100"])
+        selected = replace(config, plan_execution_mode=mode, approved_followups=policy)
+        before = len(_plan_round_records(runner))
+        for _ in range(2):
+            with patch.object(plan_first_loop_module, "_implement_approved_issue", return_value=0):
+                assert run_issue_loop(runner, issue_number=56, config=selected, plan_first=True) == 0
+        assert len(_plan_round_records(runner)) == before
+        assert not any(command[0] in {"claude", "codex", "gemini"} for command, _ in runner.commands)
+        assert len(runner.issues) == (2 if mode == "auto" and policy == "issue" else 0)
+        output = "\n".join(issue["body"] for issue in runner.issues) if runner.issues else "\n".join(
+            c["body"] for c in runner.issue_comments if c["body"].startswith("Planning complete for issue"))
+        assert "Retain earlier follow-up." in output and "Retain predecessor follow-up." in output
+        assert "Resolved earlier follow-up." not in output and "Promoted then resolved follow-up." not in output
+        if runner.issues:
+            assert any("item-11" in issue["body"] and "Codex" in issue["body"] for issue in runner.issues)
+        results.append((runner.issues, output))
+    assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("round_limit", [2, 3])
+def test_unapproved_reconciled_resume_rolls_over_only_with_budget(tmp_path, round_limit):
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+    runner, config, _ = _approved_closed_history(tmp_path)
+    records = _extract_round_metadata_records([SimpleNamespace(body=c["body"]) for c in runner.issue_comments], flow="plan")
+    secondary = next(r for r in records if r.metadata.role == "reviewer" and r.metadata.agent == "Gemini")
+    runner.issue_comments[secondary.index]["body"] = "Review was never published."
+    runner.gemini_outputs.append(structured_plan_review(state="approved", reviewer="Google Gemini"))
+    before = len(_plan_round_records(runner))
+    selected = replace(config, max_rounds=round_limit)
+    if round_limit == 2:
+        with pytest.raises(AgentLoopError, match="fresh reviews require round 3, beyond --max-rounds"):
+            run_issue_loop(runner, issue_number=56, config=selected, plan_first=True)
+        assert len(_plan_round_records(runner)) == before
+    else:
+        assert run_issue_loop(runner, issue_number=56, config=selected, plan_first=True) == 0
+        new = _plan_round_records(runner)[before:]
+        assert new[0].phase == "plan-phase-advance" and new[0].round_number == 3
+        assert all(r.round_number == 3 for r in new)
+        assert [(r.agent, r.round_number) for r in new if r.role == "reviewer"] == [("Gemini", 3)]
+        assert not any(r.role == "coder" for r in new)
+
+
+def test_approved_resume_does_not_activate_pending_post_approval_link(tmp_path):
+    from coding_review_agent_loop.board_change import (
+        BoardIdentity, PLAN_SURFACE, board_change_link_payload, render_board_change_link,
+        plan_identity_from_config,
+    )
+    runner, config, checkpoint = _approved_closed_history(tmp_path)
+    runner.authenticated_actor = ("agent-loop", 4242)
+    runner.serve_rest_issue_comments = True
+    for comment in runner.issue_comments:
+        comment.update(author={"login": "agent-loop"}, _rest_author_id=4242,
+                       createdAt="2026-05-23T00:00:00Z")
+    root = BoardIdentity.from_payload(checkpoint.plan_board_root)
+    wider = plan_identity_from_config(replace(config, reviewer=("codex", "gemini", "antigravity")))
+    payload = board_change_link_payload(
+        pr_number=56, root=root, predecessor=root.digest, old_board=root, new_board=wider,
+        old_seat_binding=root.seat_binding(), binding_init={}, anchor_round=2,
+        advance=True, surface=PLAN_SURFACE,
+    )
+    runner.issue_comments.append({"body": str(render_board_change_link(payload, surface=PLAN_SURFACE)),
+                                 "author": {"login": "agent-loop"}, "_rest_author_id": 4242,
+                                 "createdAt": "2026-05-23T00:00:00Z"})
+    before = len(runner.issue_comments)
+    logs = []
+    with patch.object(plan_first_loop_module, "log", side_effect=lambda _config, message: logs.append(message)):
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    assert len(runner.issue_comments) == before
+    assert any("does not reopen planning; it is not activated" in message for message in logs)
+
+
+@pytest.mark.parametrize("policy", ["issue", "ignore"])
+@pytest.mark.parametrize("mode", ["plan-only", "auto"])
+@pytest.mark.parametrize("review_policy", ["primary-then-panel", "all-reviewers"])
+def test_approved_publication_resume_preserves_followups(tmp_path, policy, mode, review_policy):
+    runner, config, _ = _approved_closed_history(tmp_path, future=True)
+    if review_policy == "all-reviewers":
+        runner = _FakeRunner(claude_outputs=[structured_v1_plan_state()],
+            codex_outputs=[structured_plan_review(state="approved")],
+            gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini",
+                future_followups=["Retain predecessor follow-up."])])
+        config = replace(config, plan_review_policy=review_policy, primary_plan_reviewer=None)
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    records = plan_first_loop_module._extract_round_metadata_records(
+        [SimpleNamespace(body=c["body"]) for c in runner.issue_comments], flow="plan")
+    history = []
+    for record in records:
+        if record.metadata.phase == "reconciliation":
+            continue
+        meta = record.metadata
+        if meta.role == "reviewer" and (review_policy == "all-reviewers" or meta.round_number == 2):
+            meta = replace(meta, phase="publication", new_items=(),
+                canonical_reviewer_response=structured_plan_review(state="approved", reviewer="Google Gemini" if meta.agent == "Gemini" else "Codex",
+                    future_followups=["Retain predecessor follow-up."] if meta.agent == "Gemini" else []))
+        history.append({"body": _attach_round_metadata(record.body, meta),
+                        "author": {"login": "bot"}, "createdAt": "2026-01-01T01:00:00Z"})
+    runner = _FakeRunner(issue_comments=history, issue_urls=["https://github.com/OWNER/REPO/issues/99"])
+    selected = replace(config, plan_execution_mode=mode, approved_followups=policy,
+                       plan_review_policy=review_policy, primary_plan_reviewer=None if review_policy == "all-reviewers" else "codex", review_parallel=True)
+    before = len(_plan_round_records(runner))
+    for _ in range(2):
+        with patch.object(plan_first_loop_module, "_implement_approved_issue", return_value=0):
+            assert run_issue_loop(runner, issue_number=56, config=selected, plan_first=True) == 0
+    assert len(_plan_round_records(runner)) == before
+    assert not any(command[0] in {"claude", "codex", "gemini"} for command, _ in runner.commands)
+    assert len(runner.issues) == (1 if mode == "auto" and policy == "issue" else 0)
+    output = "\n".join(issue["body"] for issue in runner.issues) if runner.issues else "\n".join(
+        c["body"] for c in runner.issue_comments if c["body"].startswith("Planning complete for issue"))
+    assert "Retain predecessor follow-up." in output
+
+
+@pytest.mark.parametrize("failure", ["requirement", "lost-obligation", "must-fix"])
+@pytest.mark.parametrize("round_limit", [2, 3])
+def test_approved_shortcut_nonbinding_disagreement_refuses_without_writes(tmp_path, failure, round_limit):
+    runner, config, checkpoint = _approved_closed_history(tmp_path)
+    requirement = HumanReviewRequirement(
+        source_type="Issue comment", author="maintainer", created_at="2026-01-01T01:00:00Z",
+        url="https://github.com/OWNER/REPO/issues/56#issuecomment-42", body="Preserve the audit trail.")
+    obligation = UnresolvedReviewItem(
+        item_id="item-42", reviewer="Codex", status="blocking", source_round=1,
+        text="Preserve the obligation.")
+    real_classify = plan_first_loop_module.classify_plan_approval
+    real_context = plan_first_loop_module.get_issue_context
+    real_ledger = plan_first_loop_module.plan_ledger_unreconstructible_items
+    real_apply = plan_first_loop_module._apply_unresolved_item_dispositions
+    classified = False
+
+    def classify(*args, **kwargs):
+        nonlocal classified
+        result = real_classify(*args, **kwargs)
+        assert result.approved
+        classified = True
+        return result
+
+    def context(*args, **kwargs):
+        result = real_context(*args, **kwargs)
+        if classified and failure == "requirement":
+            return replace(result, human_requirements=(requirement,))
+        return result
+
+    def ledger(records, plan_round, **kwargs):
+        # Model a live history change after independently proven startup
+        # approval; retain the real obligation reconstruction predicate.
+        if classified and failure == "lost-obligation":
+            records = (*records, SimpleNamespace(metadata=PostedRoundMetadata(
+                flow="plan", role="reviewer", agent="Codex", round_number=1,
+                subject=checkpoint.subject, new_items=(obligation,))))
+        return real_ledger(records, plan_round, **kwargs)
+
+    def apply(*args, **kwargs):
+        items, number = real_apply(*args, **kwargs)
+        if classified and failure == "must-fix":
+            items = [*items, obligation]
+        return items, number
+
+    before = len(runner.issue_comments)
+    calls = len(runner.commands)
+    messages = []
+    for _ in range(2):
+        classified = False
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(plan_first_loop_module, "classify_plan_approval", side_effect=classify))
+            stack.enter_context(patch.object(plan_first_loop_module, "get_issue_context", side_effect=context))
+            stack.enter_context(patch.object(plan_first_loop_module, "plan_ledger_unreconstructible_items", side_effect=ledger))
+            stack.enter_context(patch.object(plan_first_loop_module, "_apply_unresolved_item_dispositions", side_effect=apply))
+            with pytest.raises(AgentLoopError) as exc:
+                run_issue_loop(runner, issue_number=56, config=replace(
+                    config, max_rounds=round_limit), plan_first=True)
+        messages.append(str(exc.value))
+    assert messages[0] == messages[1]
+    message = messages[0].lower()
+    assert checkpoint.subject.rsplit("-", 1)[-1][:16] in message
+    assert "round 2" in message
+    if failure == "requirement":
+        assert requirement.requirement_id in message
+        assert "re-run planning" in message
+    elif failure == "lost-obligation":
+        assert "item-42" in message and "cannot be reconstructed" in message
+        assert "inspect" in message and "rerun" in message
+    else:
+        assert "review verdict or unresolved obligations" in message
+        assert "item-42" in message
+        assert "restore qualifying exact-plan" in message
+    assert len(runner.issue_comments) == before
+    assert not any(command[0] in {"claude", "codex", "gemini"}
+                   for command, _ in runner.commands[calls:])

@@ -232,6 +232,10 @@ def test_resume_before_reconciliation_posts_note_once(tmp_path, kind, parallel):
     posted = [c for c in runner.comments if "reconciliation" in c]
     assert len(posted) == 1 and NOTE_OPUS in posted[0]
 
+    assert _run(kind, runner, config) == 0
+    assert _agent_calls(runner) == calls
+    assert len([c for c in runner.comments if "reconciliation" in c]) == 1
+
 
 def test_carried_prior_round_approval_never_contributes_and_note_resets_per_round(tmp_path):
     runner = FakeRunner(

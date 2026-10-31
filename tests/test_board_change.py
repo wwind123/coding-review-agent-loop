@@ -4727,16 +4727,9 @@ def test_approved_staged_plan_implemented_under_default_flags_is_not_reopened(tm
     assert [cmd[0] for cmd in turns] == ["claude"]
     assert turns[0][-1].startswith("Implement the approved plan for GitHub issue #56")
     new = [r.metadata for r in _plan_records(runner)[records:]]
-    # The only new plan record is the pre-implementation final-sweep checkpoint,
-    # judged under the approving identity (primary-then-panel, primary Codex),
-    # never the invocation's all-reviewers flags, and selecting no reviewer.
-    (sweep,) = new
-    assert (sweep.phase, sweep.scheduler_phase, sweep.scheduler_selected_reviewers) == (
-        "scheduler-prelaunch", "final-secondary-sweep", (),
-    )
-    assert (sweep.scheduler_contract["policy"], sweep.scheduler_contract["primary_reviewer"]) == (
-        "primary-then-panel", "Codex",
-    )
+    # Completed approval goes straight to the live execution gate without
+    # publishing a redundant scheduling decision under the approving board.
+    assert new == []
     assert _plan_links(runner) == []
 
 
