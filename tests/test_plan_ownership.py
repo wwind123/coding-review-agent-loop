@@ -67,7 +67,10 @@ def test_fresh_owner_retry_precedes_review(tmp_path, monkeypatch, staged):
     assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     agents = [cmd[0] for cmd, _ in runner.commands if cmd[0] in {"claude", "codex"}]
     assert agents[:3] == ["claude", "claude", "codex"]
-    assert not any('Invalid execution owners' in body and '## Plan' in body for body in runner.comments)
+    assert not any('operator' in body for body in runner.comments)
+    retry_prompt = next(cmd[-1] for cmd, _ in runner.commands
+                        if cmd[0] == "claude" and "Invalid execution owners: operator" in cmd[-1])
+    assert "Allowed execution owners: " + ("stage-1, stage-2" if staged else "one-shot") in retry_prompt
 
 
 @pytest.mark.parametrize("staged", [False, True])
@@ -83,9 +86,8 @@ def test_owner_retry_exhaustion_is_specific_and_persisted(tmp_path, staged):
     assert not any(cmd[0] == "codex" for cmd, _ in runner.commands)
 
 
-@pytest.mark.parametrize("compact", [False, True])
-@pytest.mark.parametrize("blocking", [False, True])
-def test_published_invalid_owner_forces_planner_feedback(tmp_path, compact, blocking):
+@pytest.mark.parametrize("compact,blocking", [(False, False), (True, False), (False, True)])
+def test_published_invalid_owner_forces_planner_feedback(tmp_path, monkeypatch, compact, blocking):
     config = make_config(tmp_path, plan_execution_mode="plan-only", max_rounds=3,
                          planning_context_mode="compact" if compact else "full")
     review = structured_plan_review(state="blocking" if blocking else "approved",
@@ -93,18 +95,28 @@ def test_published_invalid_owner_forces_planner_feedback(tmp_path, compact, bloc
     from test_child_plan_provenance import _ChildPlanningRunner
     runner = _ChildPlanningRunner(issue_comments=[history(candidate(), config, round_number=2 if compact else 1)], codex_outputs=[review],
                         claude_outputs=[candidate().replace('"kind": "plan_state"', '"kind": "plan_revision", "prior_plan_item_dispositions": []')] * 5)
-    with pytest.raises(AgentInvocationError, match="ownership validation"):
+    if blocking:
+        import coding_review_agent_loop.plan_first_loop as loop
+        seed_runner = FakeRunner(issue_comments=runner.issue_comments, codex_outputs=[review])
+        original = loop._run_validated_agent
+        def stop_seed(*args, **kwargs):
+            if kwargs["agent"] == config.coder:
+                raise RuntimeError("seed blocker published")
+            return original(*args, **kwargs)
+        with monkeypatch.context() as seed:
+            seed.setattr(loop, "plan_ownership_diagnostic", lambda *args: None)
+            seed.setattr(loop, "_run_validated_agent", stop_seed)
+            with pytest.raises(RuntimeError, match="seed blocker published"):
+                run_issue_loop(seed_runner, issue_number=56, config=config, plan_first=True)
+        runner.issue_comments = seed_runner.issue_comments
+    with pytest.raises(AgentInvocationError):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
     commands = [cmd for cmd, _ in runner.commands if cmd[0] in {"claude", "codex"}]
-    if compact:
-        assert "Planning round: 2" in commands[0][-1]
-    assert commands[0][0] == "codex"
-    assert commands[1][0] == "claude"
+    assert all(cmd[0] == "claude" for cmd in commands)
+    if blocking:
+        assert "Unrelated blocker" in commands[0][-1]
     assert "Invalid execution owners: operator" in commands[0][-1]
     assert "Allowed execution owners: one-shot" in commands[0][-1]
-    assert "Invalid execution owners: operator" in commands[1][-1]
-    if blocking:
-        assert "Unrelated blocker" in commands[1][-1]
     assert not any("Plan approved" in body for body in runner.comments)
 
 
@@ -368,3 +380,71 @@ def test_ownership_feedback_preserves_simultaneous_inherited_failure(tmp_path, m
     assert "Invalid execution owners: operator" in prompts[0]
     assert "forbidden_side_effects dropped" in prompts[0]
     assert "Preserve the immutable audit" in prompts[0]
+
+
+@pytest.mark.parametrize("stop", ["round-limit", "correction-exhaustion", "interruption"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_invalid_published_plan_remains_correctable_after_stop(tmp_path, monkeypatch, stop, parallel):
+    from dataclasses import replace
+    from test_child_plan_provenance import _ChildPlanningRunner
+    import coding_review_agent_loop.plan_first_loop as loop
+    config = make_config(tmp_path, plan_execution_mode="plan-only", max_rounds=1 if stop == "round-limit" else 3,
+                         review_parallel=parallel)
+    runner = _ChildPlanningRunner(issue_comments=[history(candidate(), config)],
+        claude_outputs=[candidate().replace('"kind": "plan_state"', '"kind": "plan_revision", "prior_plan_item_dispositions": []')] * 5,
+        codex_outputs=[structured_plan_review(state="approved")])
+    with monkeypatch.context() as patch:
+        if stop == "interruption":
+            original = loop._run_validated_agent
+            def interrupt(*args, **kwargs):
+                if kwargs["agent"] == config.coder:
+                    raise RuntimeError("interrupted correction")
+                return original(*args, **kwargs)
+            patch.setattr(loop, "_run_validated_agent", interrupt)
+        expected = AgentLoopError if stop == "round-limit" else AgentInvocationError if stop == "correction-exhaustion" else RuntimeError
+        with pytest.raises(expected):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert not any(cmd[0] == "codex" for cmd, _ in runner.commands)
+    assert not any('AGENT_PLAN_STATE: approved' in body for body in runner.comments)
+    # Persist every comment, including any correction diagnostic, into a fresh run.
+    resumed = FakeRunner(issue_comments=runner.issue_comments)
+    prompts = []
+    def capture(*args, **kwargs):
+        assert kwargs["agent"] == config.coder
+        prompts.append(kwargs["prompt"])
+        raise RuntimeError("resumed planner correction")
+    monkeypatch.setattr(loop, "_run_validated_agent", capture)
+    with pytest.raises(RuntimeError, match="resumed planner correction"):
+        run_issue_loop(resumed, issue_number=56, config=replace(config, max_rounds=4), plan_first=True)
+    assert "Invalid execution owners: operator" in prompts[0]
+    assert "Allowed execution owners: one-shot" in prompts[0]
+
+
+@pytest.mark.parametrize("at_limit", [False, True])
+def test_reconciled_primary_invalid_owner_skips_rollover(tmp_path, monkeypatch, at_limit):
+    from dataclasses import replace
+    import coding_review_agent_loop.plan_first_loop as loop
+    config = make_config(tmp_path, reviewer=("codex", "gemini"), max_rounds=1,
+                         review_parallel=True, plan_execution_mode="plan-only",
+                         plan_review_policy="primary-then-panel", primary_plan_reviewer="codex")
+    runner = FakeRunner(claude_outputs=[candidate()], codex_outputs=[structured_plan_review(state="approved")])
+    with monkeypatch.context() as seed:
+        seed.setattr(loop, "validate_candidate_ownership", lambda *args: None)
+        seed.setattr(loop, "plan_ownership_diagnostic", lambda *args: None)
+        with pytest.raises(AgentLoopError, match="reviewer-only plan phase advance"):
+            run_issue_loop(runner, issue_number=56, config=config, plan_first=True)
+    assert any("reconciliation" in body for body in runner.comments)
+    resumed = FakeRunner(issue_comments=runner.issue_comments)
+    prompts = []
+    def capture(*args, **kwargs):
+        assert kwargs["agent"] == config.coder
+        prompts.append(kwargs["prompt"])
+        raise RuntimeError("planner correction reached")
+    monkeypatch.setattr(loop, "_run_validated_agent", capture)
+    with pytest.raises(AgentLoopError if at_limit else RuntimeError,
+                       match="ownership validation.*planning round budget" if at_limit else "planner correction reached"):
+        run_issue_loop(resumed, issue_number=56, config=replace(config, max_rounds=1 if at_limit else 3), plan_first=True)
+    if not at_limit:
+        assert "Invalid execution owners: operator" in prompts[0]
+    assert not any("reviewer-only advance" in body or "Plan review phase advance" in body for body in resumed.comments)
+    assert not any(cmd[0] in {"codex", "gemini"} for cmd, _ in resumed.commands)

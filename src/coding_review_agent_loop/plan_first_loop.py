@@ -3119,7 +3119,10 @@ def _run_plan_first_loop_body(
         if plan_approved_shortcut:
             round_reviewers = tuple(reviewer for reviewer in configured_reviewers
                                     if agent_display_name(reviewer) in resumed_by_name)
-        if not plan_approved_shortcut and current_resume is not None and current_resume.reconciled and any(
+        # Reuse existing obligations; publish no approvals for a known-invalid plan.
+        if ownership_review_failure is not None:
+            round_reviewers = tuple(r for r in configured_reviewers if agent_display_name(r) in resumed_by_name)
+        if ownership_review_failure is None and not plan_approved_shortcut and current_resume is not None and current_resume.reconciled and any(
             agent_display_name(reviewer) not in resumed_by_name
             for reviewer in round_reviewers
         ):
@@ -3163,7 +3166,7 @@ def _run_plan_first_loop_body(
             )
             resumed_round = None
             continue
-        if staged_planning and plan_scheduler_decision is not None:
+        if staged_planning and plan_scheduler_decision is not None and ownership_review_failure is None:
             if plan_scheduler_decision.latches_force_full:
                 plan_automatic_force_full = True
             plan_scheduler_calls_avoided += plan_scheduler_decision.calls_avoided
@@ -3509,7 +3512,7 @@ def _run_plan_first_loop_body(
         # A round that holds withheld outcomes began as a parallel round; finish
         # it through the same withhold-then-publish launcher even when this run
         # is sequential, so no retried reviewer sees a same-round peer's body.
-        plan_round_parallel = not plan_approved_shortcut and (
+        plan_round_parallel = ownership_review_failure is None and not plan_approved_shortcut and (
             config.review_parallel or plan_round_spool.has_records()
         )
         plan_today_peers = tuple(

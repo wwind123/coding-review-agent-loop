@@ -504,10 +504,13 @@ return to the planner through bounded deterministic correction, without publicat
 or envelope repair changing the topology. Exhaustion identifies ownership validation
 and preserves the diagnostic for the next invocation.
 
-Published unapproved plans are checked before review as well. Reviewers see the
-ownership diagnostic even without inherited parent rows; approval and reviewer-only
-phase advancement cannot bypass the required planner correction. At the round limit,
-raise `--max-rounds` and rerun to continue correction.
+Published unapproved plans are checked before review as well. An ownership failure
+skips fresh reviewer calls and reviewer-only phase advancement, and sends the
+diagnostic and existing review obligations directly to planner correction. No new
+approvals are published for that invalid candidate, so interruption or correction
+exhaustion cannot turn it into an approved shortcut on rerun. At the round limit,
+raise `--max-rounds` and rerun to continue correction. Historical completely approved
+plans retain their approval reuse and post-approval guard.
 
 Human-only checks in staged plans use a `human-action` child stage and its actual
 stage id. One-shot checks use `one-shot` with exact-head human evidence at the final
