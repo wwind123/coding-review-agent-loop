@@ -712,10 +712,18 @@ def preflight_containment(policy: ContainmentPolicy, *, cgroup_root: Path = Path
             # transient scope.  Looking only at /sys/fs/cgroup itself is wrong
             # on hosts where controllers are delegated below the root.
             supervisor_fds = open_supervisor_pipe()
+            probe_launch = {}
+            if "capture" in dict(policy.roles):
+                # Capture may be called from a hostile PR checkout. The trusted
+                # preflight shim needs the same host import boundary as capture.
+                probe_env = {key: value for key, value in os.environ.items() if key in {
+                    "PATH", "HOME", "USER", "LOGNAME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"}}
+                probe_env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+                probe_launch = {"cwd": "/", "env": probe_env}
             process = subprocess.Popen(
                 _probe_argv(policy, unit=unit, report=report, supervisor_fd=supervisor_fds[0]),
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                pass_fds=(supervisor_fds[0],),
+                pass_fds=(supervisor_fds[0],), **probe_launch,
             )
             deadline = time.monotonic() + 5
             parsed: dict[str, object] | None = None

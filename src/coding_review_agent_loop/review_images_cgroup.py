@@ -40,11 +40,13 @@ class CaptureTree:
     def counters(self):
         self.check()
         result = {}
-        for name in ('memory.events', 'pids.events'):
-            for line in (self.root / name).read_text().splitlines():
-                key, value = line.split()
-                if key in {'high', 'max', 'oom', 'oom_kill', 'oom_group_kill'}:
-                    result[name + ':' + key] = int(value)
+        # Older kernels and memory_localevents expose events only at leaves.
+        for relative in ('', 'control', 'payload', 'payload/setup', 'payload/capture'):
+            for name in ('memory.events', 'pids.events'):
+                for line in (self.root / relative / name).read_text().splitlines():
+                    key, value = line.split()
+                    if key in {'high', 'max', 'oom', 'oom_kill', 'oom_group_kill'}:
+                        result[relative + '/' + name + ':' + key] = int(value)
         return result
 
 

@@ -740,6 +740,8 @@ capture emptiness. The host kills and verifies the entire payload subtree after
 each phase, before capture and before export. Only trusted control processes
 remain for export; whole-scope emptiness precedes PNG validation and publication.
 Memory high/max/OOM and task-limit events prohibit success even on zero exit.
+Counters are checked at every control, interior and phase cgroup as well as the
+scope root, including kernels with local-only event reporting.
 CPU quota and deadlines bound saturation. The 2 GiB tmpfs is a filesystem ceiling,
 not an allocation promise: tmpfs pages share the lower memory budget with all
 processes. Small-tmpfs ENOSPC and memory-first failures are distinct tests.
@@ -748,6 +750,10 @@ Setup and capture run sequentially in the same sandbox, preserving private
 setup dependencies. Each defaults to a separate 300-second deadline; input and
 export each have a 30-second deadline. Diagnostics retain only a 64 KiB tail on
 a channel separate from output framing. Positive finite limits exclude booleans.
+Containment and Bubblewrap preflight precede staging. Trusted capture preflight
+and monitor launches use `/` and a scrubbed environment to prevent imports from
+the caller checkout. Failure classes come from trusted exception types and monitor
+state, never diagnostic text or output filenames.
 Failures are bounded typed outcomes (`isolation-unavailable`, `failed`,
 `resource-limit`, `timeout`); cancellation tears down the scope and propagates.
 Ordinary-review continuation remains the caller's responsibility.
@@ -795,7 +801,8 @@ and maximum dimension 16000. Baseline references count toward aggregate limits.
 Any invalid image, worker crash/reply, resource event, deadline or uncertain
 cleanup discards the entire unpublished set. `review_images_manifest.py` hashes
 actual copied bytes and binds the head, command/config identity, metadata and
-file digests into a deterministic set digest. Publication exposes sealed,
+file digests into a deterministic set digest. Per-host namespace identities are
+probe evidence and are excluded from configuration identity. Publication exposes sealed,
 read-only memory descriptors and immutable metadata. `SnapshotSet` survives all
 sandbox/worktree cleanup and belongs to its caller, which must `close` it or use
 its context manager. This does not establish durable retention/resume authority.

@@ -25,12 +25,18 @@ class CaptureResult:
     isolation_proof: tuple[dict, ...] = ()
 
 
+def _policy(settings):
+    from .containment import ContainmentPolicy, ResourceLimits
+    limits = ResourceLimits(settings["memory_bytes"] * 3 // 4, settings["memory_bytes"], 0,
+                            settings["tasks"], settings["cpu_percent"])
+    return ContainmentPolicy(mode="required", aggregate=ResourceLimits(None, None, 0, None), roles=(("capture", limits),))
+
+
 def _attempt(config, settings, source):
-    from .containment import ContainmentPolicy, InvocationHandle, ResourceLimits
+    from .containment import InvocationHandle
     from .review_images_isolation import sealed
-    limits = ResourceLimits(settings['memory_bytes'] * 3 // 4, settings['memory_bytes'], 0,
-                            settings['tasks'], settings['cpu_percent'])
-    policy = ContainmentPolicy(mode='required', aggregate=ResourceLimits(None, None, 0, None), roles=(('capture', limits),))
+    from .errors import AgentLoopError
+    policy = _policy(settings)
     # Inherit the operator's existing aggregate ceiling through the shared
     # lease; never request an unbounded capture child or execution fallback.
     control = sealed(json.dumps(settings).encode())
@@ -41,15 +47,18 @@ def _attempt(config, settings, source):
         try:
             command = [sys.executable, '-m', 'coding_review_agent_loop.review_images_host',
                        str(control), str(source_read), str(output.fileno()), str(result.fileno())]
-            handle = InvocationHandle.prepare(policy, role='capture', target_argv=command)
+            try:
+                handle = InvocationHandle.prepare(policy, role='capture', target_argv=command)
+            except AgentLoopError as exc:
+                return {'state': 'isolation-unavailable', 'error': str(exc)[:4096]}, b''
             if not handle.managed:
-                raise ValueError('capture requires delegated systemd cgroup-v2')
+                return {'state': 'isolation-unavailable', 'error': 'capture requires delegated systemd cgroup-v2'}, b''
             # Only trusted monitor receives these FDs. It closes them on the
             # Bubblewrap boundary and never mounts any writable host path.
             env = {key: value for key, value in os.environ.items() if key in {
                 'PATH', 'HOME', 'USER', 'LOGNAME', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS'}}
             env['PYTHONPATH'] = str(Path(__file__).resolve().parent.parent)
-            process = subprocess.Popen(handle.launcher_argv, env=env, stdin=subprocess.DEVNULL,
+            process = subprocess.Popen(handle.launcher_argv, env=env, cwd='/', stdin=subprocess.DEVNULL,
                                        stdout=subprocess.DEVNULL, stderr=errors,
                                        pass_fds=(*handle.pass_fds, control, source_read, output.fileno(), result.fileno()))
             cap = (settings['setup_timeout'] + settings['capture_timeout'] + 3 * settings['transfer_timeout'] + 10
@@ -103,8 +112,13 @@ def _attempt(config, settings, source):
 
 def capture(checkout: Path, head: str, config: CaptureConfig, changes: list[dict[str, str]]) -> CaptureResult:
     # Disabled operation does not load workers, probe dependencies or allocate.
-    if not eligible(config, changes):
+    if not config.paths:
         return CaptureResult('disabled')
+    try:
+        if not eligible(config, changes):
+            return CaptureResult('disabled')
+    except ValueError as exc:
+        return CaptureResult('failed', str(exc)[:4096])
     if sys.platform != 'linux':
         return CaptureResult('isolation-unavailable', 'capture isolation requires Linux')
     from .errors import AgentLoopError
@@ -113,16 +127,20 @@ def capture(checkout: Path, head: str, config: CaptureConfig, changes: list[dict
     from .review_images_manifest import schema, publish
     from .review_images_worktree import stage
     try:
+        from .containment import preflight_containment
+        manifest = preflight_containment(_policy(asdict(config)))
+        if not manifest.ready or manifest.backend != "systemd-cgroup-v2":
+            raise ValueError("capture requires systemd cgroup-v2: " + manifest.reason)
         bwrap = preflight(config.runtime_grants)
         png_grants = validator_grants(config.runtime_grants)
     except (OSError, ValueError, AgentLoopError, subprocess.SubprocessError) as exc:
         return CaptureResult('isolation-unavailable', str(exc)[:4096])
     try:
         settings = asdict(config)
-        settings.update({'bwrap': bwrap, 'head': head, 'mode': 'capture',
-                         'host_namespaces': {name: os.readlink('/proc/self/ns/' + name)
-                                             for name in ('user', 'mnt', 'pid', 'ipc', 'uts', 'net')}})
+        settings.update({'bwrap': bwrap, 'head': head, 'mode': 'capture'})
         identity = hashlib.sha256(json.dumps(settings, sort_keys=True).encode()).hexdigest()
+        settings['host_namespaces'] = {name: os.readlink('/proc/self/ns/' + name)
+                                       for name in ('user', 'mnt', 'pid', 'ipc', 'uts', 'net')}
     except OSError as exc:
         return CaptureResult('isolation-unavailable', str(exc)[:4096])
     try:
@@ -148,6 +166,7 @@ def capture(checkout: Path, head: str, config: CaptureConfig, changes: list[dict
         # Whole-set validation has one parent watchdog, no per-file resets.
         worker = {**settings, 'mode': 'validate', 'runtime_grants': png_grants, 'scratch_bytes': min(config.scratch_bytes, 8 * 1024**2),
                   'memory_bytes': min(config.memory_bytes, 256 * 1024**2), 'tasks': min(config.tasks, 16),
+                  'cpu_percent': min(config.cpu_percent, 100),
                   'transfer_timeout': min(config.validation_timeout, 30)}
         with tempfile.TemporaryFile() as source:
             for path, data in inventory.items():

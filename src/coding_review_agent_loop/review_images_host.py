@@ -15,6 +15,24 @@ from .review_images_cgroup import CaptureTree
 from .review_images_isolation import argv, sealed
 
 
+class IsolationUnavailable(ValueError):
+    pass
+
+
+class ResourceLimit(RuntimeError):
+    pass
+
+
+def failure_state(exc):
+    if isinstance(exc, TimeoutError):
+        return "timeout"
+    if isinstance(exc, ResourceLimit):
+        return "resource-limit"
+    if isinstance(exc, IsolationUnavailable):
+        return "isolation-unavailable"
+    return "failed"
+
+
 def start_identity(pid):
     value = Path(f'/proc/{pid}/stat').read_text()
     rest = value[value.rfind(')') + 2:].split()
@@ -46,7 +64,7 @@ def release_launcher(pid, supervisor, phase, tree, channel):
 def monitor(config, input_fd, output_fd):
     own = cgroup_path_for_pid(os.getpid())
     if own is None or own.name != 'control' or not own.parent.name.endswith('.scope'):
-        raise ValueError('capture monitor is outside delegated control leaf')
+        raise IsolationUnavailable('capture monitor is outside delegated control leaf')
     tree = CaptureTree(own.parent)
     initial = tree.counters()
     channel, sandbox_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
@@ -63,7 +81,7 @@ def monitor(config, input_fd, output_fd):
                 or effective['memory.swap.max'] != '0'
                 or int(effective['pids.max']) > config['tasks']
                 or int(quota) * 100 > config['cpu_percent'] * int(period)):
-            raise ValueError('isolation-unavailable: effective capture resource limits exceed configured bounds')
+            raise IsolationUnavailable('effective capture resource limits exceed configured bounds')
         version = subprocess.run([config['bwrap'], '--version'], stdin=subprocess.DEVNULL,
                                  capture_output=True, timeout=5, check=True,
                                  env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C'})
@@ -93,7 +111,7 @@ def monitor(config, input_fd, output_fd):
         done = []
         while True:
             if tree.counters() != initial:
-                raise RuntimeError('resource-limit event')
+                raise ResourceLimit('capture resource event')
             if time.monotonic() >= deadline:
                 raise TimeoutError('capture stage deadline exceeded')
             if select.select([channel], [], [], .02)[0]:
@@ -166,11 +184,12 @@ def monitor(config, input_fd, output_fd):
         code = process.wait(timeout=2)
         error = process.stderr.read(8192).decode(errors='replace')
         if tree.counters() != initial:
-            raise RuntimeError('resource-limit event')
+            raise ResourceLimit('capture resource event')
         tree.kill('payload')
         proof['payload_empty'] = tree.empty('payload')
         if code or supervisor is None or (config['mode'] == 'capture' and not exported):
-            raise ValueError(('isolation-unavailable: ' if supervisor is None else 'sandbox failed: ') + error)
+            failure = IsolationUnavailable if supervisor is None else ValueError
+            raise failure('sandbox failed: ' + error)
         if config['mode'] == 'validate' and validated is None:
             raise ValueError('missing validator reply')
         return {'state': 'ok', 'proof': proof, 'dimensions': validated, 'diagnostic': diagnostic}
@@ -195,9 +214,7 @@ def main():
         result = monitor(config, input_fd, output_fd)
     except BaseException as exc:
         message = str(exc)[:4096]
-        state = ('timeout' if isinstance(exc, TimeoutError) else
-                 'resource-limit' if 'resource-limit' in message else
-                 'isolation-unavailable' if 'isolation-unavailable:' in message or 'probe' in message or 'mount' in message else 'failed')
+        state = failure_state(exc)
         result = {'state': state, 'error': message}
     os.write(result_fd, json.dumps(result).encode())
     return 0 if result['state'] == 'ok' else 1

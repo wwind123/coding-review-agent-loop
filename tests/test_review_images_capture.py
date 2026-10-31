@@ -100,7 +100,7 @@ def supported(root,head):
     result.snapshots.close()
 
 
-@pytest.mark.parametrize('attack', ['symlink-image','symlink-parent','symlink-baseline','hardlink','fifo','wrong-head','bad-png','bad-baseline','empty','duplicate'])
+@pytest.mark.parametrize('attack', ['symlink-image','symlink-parent','symlink-baseline','hardlink','fifo','wrong-head','bad-png','bad-baseline','empty','duplicate','missing-mount','missing-resource-limit','missing-probe'])
 def test_live_output_attacks_discard_set(tmp_path,attack):
     root,head,git=repository(tmp_path)
     supported(root,head)
@@ -116,10 +116,12 @@ def test_live_output_attacks_discard_set(tmp_path,attack):
         'empty': "m['images']=[]",
         'duplicate': "m['images'].append(dict(m['images'][0]))",
     }
+    for name in ('mount', 'resource-limit', 'probe'):
+        mutations['missing-' + name] = "m['images'][0]['path']='" + name + "-panel.png'"
     script="import json,os; from pathlib import Path; p=Path(os.environ['AGENT_LOOP_REVIEW_IMAGES_MANIFEST']); o=p.parent; m=json.loads(p.read_text()); "+mutations[attack]+"; p.write_text(json.dumps(m))"
     altered=dataclasses.replace(config(),command='/usr/bin/python3 capture.py; /usr/bin/python3 -c '+shlex.quote(script))
     result=capture(root,head,altered,[{'status':'modified','filename':'capture.py'}])
-    assert result.state!='success' and result.snapshots is None, result
+    assert result.state=='failed' and result.snapshots is None, result
 
 
 @pytest.mark.parametrize('location', ['/scratch/work','/scratch/home','/tmp','/var/tmp','/dev/shm','/scratch/output'])
@@ -154,6 +156,17 @@ assert not Path('/sys/fs/cgroup').exists()
 for path in ('/root','/home','/run'):
  assert not Path(path).exists()
 assert set(os.listdir('/proc/self/fd')) <= {'0','1','2','3'}
+for path in ('/proc/1/fd', '/proc/1/mem'):
+ try:
+  if path.endswith('/fd'): os.listdir(path)
+  else: os.open(path, os.O_RDONLY)
+ except OSError: pass
+ else: raise AssertionError('supervisor accessible: '+path)
+import ctypes
+libc=ctypes.CDLL(None, use_errno=True)
+assert libc.ptrace(16, 1, 0, 0)==-1
+assert ctypes.get_errno() in (1,3,13)
+
 try: Path('/escape').write_text('x')
 except OSError: pass
 else: raise AssertionError('root writable')
@@ -196,8 +209,8 @@ def test_background_setsid_writers_killed_before_export(tmp_path):
     result.snapshots.close()
 
 
-@pytest.mark.parametrize('command', ['kill -KILL 1', 'exit 19'])
-def test_supervisor_or_setup_loss_never_publishes(tmp_path,command):
+def test_setup_nonzero_never_publishes(tmp_path):
+    command = 'exit 19'
     root,head,git=repository(tmp_path)
     supported(root,head)
     result=capture(root,head,dataclasses.replace(config(),setup=command),[{'status':'added','filename':'capture.py'}])
@@ -286,43 +299,59 @@ def test_live_validator_corruption_and_whole_set_deadline(tmp_path,monkeypatch):
     assert result.state=='timeout' and result.snapshots is None,result
 
 
-def test_real_supervisor_death_aborts_export(tmp_path,monkeypatch):
-    import concurrent.futures
-    import signal
-    import time
+@pytest.mark.parametrize('phase', ['setup', 'export'])
+def test_real_supervisor_death_during_stage(tmp_path,monkeypatch,phase):
     from coding_review_agent_loop.containment import InvocationHandle
     root,head,git=repository(tmp_path)
     supported(root,head)
-    ready=tmp_path/'supervisor.pid'
-    # Instrument the trusted host monitor, keeping the actual namespace,
-    # SCM_CREDENTIALS handshake, delegated scope and kill path intact.
-    script='''import sys
+    # Kill from the host namespace, after setup gate release or after the
+    # first exported record. Same-namespace SIGKILL of PID 1 is ignored.
+    ready=tmp_path/'death-injected'
+    target="        write_record(sys.stdout.buffer, {'path': 'manifest.json', 'size': len(raw)}, raw)"
+    script=r'''import sys,os,json,struct,signal
 from pathlib import Path
 from coding_review_agent_loop import review_images_host as host
-real=host.release_launcher
-def release(pid, supervisor, phase, tree, channel):
- result=real(pid,supervisor,phase,tree,channel)
- if phase=='capture': Path(READY).write_text(str(supervisor))
+real_sealed=host.sealed
+real_release=host.release_launcher
+real_recv=host.socket.socket.recvmsg
+def kill(supervisor):
+ Path(READY).write_text(PHASE)
+ os.kill(supervisor,signal.SIGKILL)
+def sealed(data, *args):
+ if PHASE=='export' and args and args[0]=='review_images_worker.py':
+  text=data.decode()
+  target=TARGET
+  assert text.count(target)==1
+  text=text.replace(target,target+"\n        sys.stdout.buffer.flush()\n        send(channel, {'diagnostic':'test-export-started'})\n        time.sleep(10)")
+  data=text.encode()
+ return real_sealed(data,*args)
+def release(pid,supervisor,phase,tree,channel):
+ result=real_release(pid,supervisor,phase,tree,channel)
+ if PHASE=='setup' and phase=='setup': kill(supervisor)
  return result
+def recv(channel,*args):
+ result=real_recv(channel,*args)
+ if PHASE=='export' and result[0]==b'{"diagnostic": "test-export-started"}':
+  credentials=[struct.unpack('3i',value) for level,kind,value in result[1]
+               if level==host.socket.SOL_SOCKET and kind==host.socket.SCM_CREDENTIALS]
+  kill(credentials[0][0])
+ return result
+host.sealed=sealed
 host.release_launcher=release
+host.socket.socket.recvmsg=recv
 raise SystemExit(host.main())
-'''.replace('READY',repr(str(ready)))
+'''.replace('TARGET',repr(target)).replace('PHASE',repr(phase)).replace('READY',repr(str(ready)))
     prepare=InvocationHandle.prepare
     def instrument(policy,**kwargs):
         target=kwargs['target_argv']
         kwargs['target_argv']=[target[0],'-c',script,*target[3:]]
         return prepare(policy,**kwargs)
     monkeypatch.setattr(InvocationHandle,'prepare',instrument)
-    altered=dataclasses.replace(config(),command='/usr/bin/python3 capture.py; sleep 5',capture_timeout=8)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future=executor.submit(capture,root,head,altered,[{'status':'modified','filename':'capture.py'}])
-        deadline=time.monotonic()+15
-        while not ready.exists() and not future.done() and time.monotonic()<deadline:
-            time.sleep(.02)
-        assert ready.exists()
-        os.kill(int(ready.read_text()),signal.SIGKILL)
-        result=future.result(timeout=15)
+    cfg=dataclasses.replace(config(),setup='sleep 10') if phase=='setup' else config()
+    result=capture(root,head,cfg,[{'status':'modified','filename':'capture.py'}])
     assert result.state=='failed' and result.snapshots is None,result
+    assert ready.read_text()==phase
+    assert 'SyntaxError' not in result.diagnostic
 
 
 def test_live_confined_input_loader_rejects_truncation(tmp_path,monkeypatch):
