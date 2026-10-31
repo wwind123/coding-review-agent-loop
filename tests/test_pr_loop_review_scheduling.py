@@ -230,13 +230,13 @@ def test_selective_resume_with_malformed_scheduler_metadata_recovers_after_full_
             role="summary",
             agent="Orchestrator",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             scheduler_contract={"policy": "selective-intermediate"},
         ),
     )
     runner = FakeRunner(
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [{"author": {"login": "bot"}, "body": malformed_checkpoint}],
         },
         codex_outputs=[structured_pr_review(summary="Codex reviewed the full board.")],
@@ -545,12 +545,12 @@ def test_selective_resume_uses_a_valid_persisted_scheduler_checkpoint(tmp_path):
             role="summary",
             agent="Orchestrator",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(item,),
             phase="reconciliation",
             scheduler_contract=contract.as_dict(),
-            scheduler_previous_sha="abc123",
-            scheduler_current_sha="abc123",
+            scheduler_previous_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+            scheduler_current_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             scheduler_obligation_digest="0" * 16,
             scheduler_selected_reviewers=("Codex",),
             scheduler_paused_reviewers=(
@@ -583,7 +583,7 @@ def test_selective_resume_uses_a_valid_persisted_scheduler_checkpoint(tmp_path):
 
     runner = FakeRunner(
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [{"author": {"login": "bot"}, "body": checkpoint}],
         },
         codex_outputs=[
@@ -638,7 +638,7 @@ def test_selective_same_head_requirement_edit_invalidates_approval_before_merge(
         title="Selective requirement edit",
         head_branch="feature/review-context",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/77",
     )
     context_calls = 0
@@ -654,7 +654,7 @@ def test_selective_same_head_requirement_edit_invalidates_approval_before_merge(
 
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context", changing_context)
+    ), "get_observed_pr_review_context", changing_context)
     runner = FakeRunner(
         claude_outputs=[],
         codex_outputs=[
@@ -708,7 +708,7 @@ def test_selective_plan_handoff_change_stops_before_migration_or_merge(tmp_path,
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation",
         plan_hash=plan_context.plan_hash,
     )
@@ -792,7 +792,7 @@ def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation",
         plan_hash=old_plan_context.plan_hash,
     )
@@ -806,7 +806,7 @@ def test_selective_valid_plan_handoff_replacement_sweeps_before_migration(
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation",
         plan_hash=new_plan_context.plan_hash,
         supersedes_hash=old_handoff_metadata.contract_hash,
@@ -942,11 +942,11 @@ def test_selective_scheduler_contract_change_during_managed_ci_blocks_merge(
             role="summary",
             agent="Orchestrator",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             phase="reconciliation",
             scheduler_contract=changed_contract.as_dict(),
             scheduler_previous_sha=None,
-            scheduler_current_sha="abc123",
+            scheduler_current_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             scheduler_obligation_digest="0" * 16,
             scheduler_selected_reviewers=("Codex",),
             scheduler_paused_reviewers=(),
@@ -961,7 +961,7 @@ def test_selective_scheduler_contract_change_during_managed_ci_blocks_merge(
         runner.pr_payload.setdefault("comments", []).append(
             {"author": {"login": "bot"}, "body": changed_audit}
         )
-        return ManagedCiOutcome(status="passed", head_sha="abc123")
+        return ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
     monkeypatch.setattr(
         pr_loop,
@@ -1004,13 +1004,13 @@ def test_staged_primary_blocking_loop_gates_panel_then_independent_audit(tmp_pat
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
-    # Primary blocks (head abc123), coder fixes, primary re-checks alone
+    # Primary blocks (head 6367c48dd193d56ea7b0baad25b19455e529f5ee), coder fixes, primary re-checks alone
     # (still the primary phase), then both secondaries audit the new head.
     assert _agent_sequence(runner) == ["codex", "claude", "codex", "gemini", "agy"]
     phases = _audit_phases(runner)
     assert [phase for phase, _head in phases] == ["primary", "primary", "secondary-audit"]
-    assert phases[0][1] == "abc123"
-    assert phases[1][1] == phases[2][1] == "abc123-coder-1"
+    assert phases[0][1] == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert phases[1][1] == phases[2][1] == "525753a4b04bd57d874211ba1fade250c3ff6d82"
     assert not any("final-secondary-sweep" in comment for comment in runner.comments)
     assert not any("remediation" in phase for phase, _head in phases)
     # The secondary prompts carry the independent-audit instruction and the
@@ -1231,7 +1231,7 @@ def test_staged_force_full_selects_complete_board_from_the_primary_phase(tmp_pat
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     assert _agent_sequence(runner) == ["codex", "gemini", "agy"]
-    assert _audit_phases(runner) == [("full-board", "abc123")]
+    assert _audit_phases(runner) == [("full-board", "6367c48dd193d56ea7b0baad25b19455e529f5ee")]
     assert "force-full: True" in runner.comments[0]
     assert all(item.scheduler_force_full is True for item in _posted_scheduler_metadata(runner))
 
@@ -1249,10 +1249,10 @@ def test_staged_legacy_scheduler_payload_before_panel_is_strict_primary_only(tmp
             role="summary",
             agent="Orchestrator",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             scheduler_contract=contract.as_dict(),
             scheduler_previous_sha=None,
-            scheduler_current_sha="abc123",
+            scheduler_current_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             scheduler_obligation_digest="0" * 16,
             scheduler_selected_reviewers=("Codex",),
             scheduler_paused_reviewers=(("Gemini", "primary phase"), ("Antigravity", "primary phase")),
@@ -1313,9 +1313,9 @@ def test_staged_legacy_selective_payload_is_contract_drift(tmp_path):
     checkpoint = _attach_round_metadata(
         "Selective checkpoint.",
         PostedRoundMetadata(
-            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="abc123",
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             scheduler_contract=contract.as_dict(), scheduler_previous_sha=None,
-            scheduler_current_sha="abc123", scheduler_obligation_digest="0" * 16,
+            scheduler_current_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", scheduler_obligation_digest="0" * 16,
             scheduler_selected_reviewers=("Codex", "Gemini"), scheduler_reasons=("full board",),
             scheduler_final_sweep=False, scheduler_force_full=False, scheduler_calls_avoided=0,
         ),
@@ -1337,9 +1337,9 @@ def test_staged_primary_change_is_a_recorded_board_change(tmp_path):
     checkpoint = _attach_round_metadata(
         "Staged checkpoint.",
         PostedRoundMetadata(
-            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="abc123",
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             scheduler_contract=contract.as_dict(), scheduler_previous_sha=None,
-            scheduler_current_sha="abc123", scheduler_obligation_digest="0" * 16,
+            scheduler_current_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", scheduler_obligation_digest="0" * 16,
             scheduler_selected_reviewers=("Gemini",), scheduler_paused_reviewers=(("Codex", "primary phase"),),
             scheduler_reasons=("primary phase",), scheduler_final_sweep=False,
             scheduler_force_full=False, scheduler_calls_avoided=1, scheduler_phase="primary",
@@ -1407,7 +1407,7 @@ def test_staged_secondary_failure_keeps_healthy_result_and_resume_dispatches_onl
     # Completed exact-head work (Codex, Gemini) is reused once; only the
     # outstanding secondary is dispatched.
     assert _agent_sequence(runner) == ["codex", "gemini", "agy", "agy"]
-    assert merges == [{"expected_head_sha": "abc123"}]
+    assert merges == [{"expected_head_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"}]
 
 
 def test_staged_resume_after_remediation_checkpoint_dispatches_final_sweep_only(tmp_path, monkeypatch):
@@ -1468,7 +1468,7 @@ def test_staged_external_head_change_invalidates_primary_approval_before_panel(t
         if kwargs.get("role") == "reviewer" and kwargs.get("agent") == "codex":
             calls.append(True)
             if len(calls) == 1:
-                runner.pr_payload["headRefOid"] = "external-head"
+                runner.pr_payload["headRefOid"] = "d6736bfa7d2f4e674190376e7805c8055597c618"
         return response
 
     patch_attr_in(monkeypatch, (
@@ -1480,13 +1480,13 @@ def test_staged_external_head_change_invalidates_primary_approval_before_panel(t
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     sequence = _agent_sequence(runner)
-    # The stale primary approval on abc123 never opens the panel: the primary
+    # The stale primary approval on 6367c48dd193d56ea7b0baad25b19455e529f5ee never opens the panel: the primary
     # must approve the external head first, then the secondaries audit it.
     assert sequence == ["codex", "codex", "gemini", "agy"]
     phases = _audit_phases(runner)
     assert [phase for phase, _head in phases][-1] == "secondary-audit"
-    assert phases[-1][1] == "external-head"
-    assert all(head == "external-head" for _phase, head in phases[1:])
+    assert phases[-1][1] == "d6736bfa7d2f4e674190376e7805c8055597c618"
+    assert all(head == "d6736bfa7d2f4e674190376e7805c8055597c618" for _phase, head in phases[1:])
 
 
 def test_staged_head_change_during_final_sweep_invalidates_partial_sweep_evidence(tmp_path, monkeypatch):
@@ -1534,7 +1534,7 @@ def test_staged_head_change_during_final_sweep_invalidates_partial_sweep_evidenc
             agy_calls.append(True)
             if len(agy_calls) == 2:
                 # An external actor pushes while the final sweep is settling.
-                runner.pr_payload["headRefOid"] = "pushed-during-sweep"
+                runner.pr_payload["headRefOid"] = "e0784dc3fc93886c0e9558c3f2c5c3a871894af2"
         return response
 
     patch_attr_in(monkeypatch, (
@@ -1551,11 +1551,11 @@ def test_staged_head_change_during_final_sweep_invalidates_partial_sweep_evidenc
     # the secondaries that had just approved) re-reviews the complete diff.
     # No partial sweep approval carries across the mutation.
     assert phases == [
-        ("primary", "abc123"),
-        ("secondary-audit", "abc123"),
-        ("remediation", "abc123-coder-1"),
-        ("final-secondary-sweep", "abc123-coder-1"),
-        ("full-board", "pushed-during-sweep"),
+        ("primary", "6367c48dd193d56ea7b0baad25b19455e529f5ee"),
+        ("secondary-audit", "6367c48dd193d56ea7b0baad25b19455e529f5ee"),
+        ("remediation", "525753a4b04bd57d874211ba1fade250c3ff6d82"),
+        ("final-secondary-sweep", "525753a4b04bd57d874211ba1fade250c3ff6d82"),
+        ("full-board", "e0784dc3fc93886c0e9558c3f2c5c3a871894af2"),
     ]
     sequence = _agent_sequence(runner)
     assert sequence == [
@@ -1599,7 +1599,7 @@ def test_staged_unacknowledged_human_requirement_remains_blocking_after_panel_se
         url="https://github.com/OWNER/REPO/pull/77#issuecomment-1",
         body="Keep the audit trail intact.",
     )
-    original_context = pr_loop_support.get_pr_review_context
+    original_context = pr_loop_support.get_observed_pr_review_context
 
     def context_with_requirement(runner, *args, **kwargs):
         context = original_context(runner, *args, **kwargs)
@@ -1607,7 +1607,7 @@ def test_staged_unacknowledged_human_requirement_remains_blocking_after_panel_se
 
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context", context_with_requirement)
+    ), "get_observed_pr_review_context", context_with_requirement)
     runner = FakeRunner(
         codex_outputs=[_staged_review(reviewer="OpenAI Codex", resolved=True)],
         # Gemini approves without acknowledging the signed requirement.
@@ -1728,9 +1728,9 @@ def test_840_broad_or_out_of_scope_change_before_primary_approval_is_primary_onl
     # No secondary is invoked before the primary approves the exact head.
     assert _agent_sequence(runner) == ["codex", "claude", "codex", "gemini", "agy"]
     assert _audit_phases(runner) == [
-        ("primary", "abc123"),
-        ("primary", "abc123-coder-1"),
-        ("secondary-audit", "abc123-coder-1"),
+        ("primary", "6367c48dd193d56ea7b0baad25b19455e529f5ee"),
+        ("primary", "525753a4b04bd57d874211ba1fade250c3ff6d82"),
+        ("secondary-audit", "525753a4b04bd57d874211ba1fade250c3ff6d82"),
     ]
     strict_audit = _scheduling_audits(runner)[1]
     assert "reason: strict pre-panel fallback: " in strict_audit
@@ -1878,7 +1878,7 @@ def test_840_post_panel_automatic_fallback_latches_with_automatic_source(tmp_pat
     stale_observations = []
 
     def observation(comments, *, head_sha):
-        if head_sha == "abc123-coder-1" and not stale_observations:
+        if head_sha == "525753a4b04bd57d874211ba1fade250c3ff6d82" and not stale_observations:
             stale_observations.append(head_sha)
             return {"stale": "identity"}
         return None
@@ -1921,7 +1921,7 @@ def test_840_resumed_primary_phase_with_incomplete_metadata_is_primary_only(tmp_
             if "scheduler_contract" in payload else None
         ),
         "contradictory": lambda payload: (
-            {**payload, "scheduler_current_sha": "some-other-head"}
+            {**payload, "scheduler_current_sha": "some-5e6741348108b11e3f3ef936c335b1967d17ac6c"}
             if "scheduler_contract" in payload else None
         ),
     }
@@ -1985,7 +1985,7 @@ def test_840_resumed_primary_phase_with_incomplete_metadata_is_primary_only(tmp_
 
 
 def _seed_premature_full_board_round(tmp_path, *, gemini_output, parallel=False):
-    """Simulate a pre-#840 run: an automatic pre-approval full board on abc123.
+    """Simulate a pre-#840 run: an automatic pre-approval full board on 6367c48dd193d56ea7b0baad25b19455e529f5ee.
 
     The operator flag produces the full board; the operator attribution is then
     stripped so the history matches the unattributed latch pre-#840 runs wrote.
@@ -2065,7 +2065,7 @@ def test_840_premature_secondary_approvals_are_not_resumed_carried_or_counted(tm
     opening_record = next(item for item in posted if item.phase == "scheduler-prelaunch" and item.scheduler_phase == "secondary-audit")
     # The premature Gemini approval never entered the opening's approval set.
     assert opening_record.scheduler_approved_reviewers == ("Codex",)
-    assert merges == [{"expected_head_sha": "abc123"}]
+    assert merges == [{"expected_head_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"}]
 
 
 def test_840_premature_historical_secondary_approvals_are_not_carried(tmp_path):
@@ -2122,7 +2122,7 @@ def test_840_blocking_premature_secondary_completion_stops_with_diagnostic(tmp_p
     assert len(new_comments) == 1
     assert new_comments[0]["body"].startswith("PR review scheduling diagnostic (round 1): pre-panel safety")
     assert "AGENT_LOOP_META" not in new_comments[0]["body"]
-    assert "Gemini (round 1, head abc123, state blocking" in new_comments[0]["body"]
+    assert "Gemini (round 1, head 6367c48dd193d56ea7b0baad25b19455e529f5ee, state blocking" in new_comments[0]["body"]
 
 
 def test_840_operator_override_supersedes_blocking_premature_completion(tmp_path):
@@ -2162,7 +2162,7 @@ def test_840_operator_override_supersedes_blocking_premature_completion(tmp_path
     assert "phase: full-board" in opening_text
     assert "force-full: True (source: operator)" in opening_text
     assert "Superseded premature panel reviews" in opening_text
-    assert "Gemini (round 1, head abc123, state blocking; items: item-1)" in opening_text
+    assert "Gemini (round 1, head 6367c48dd193d56ea7b0baad25b19455e529f5ee, state blocking; items: item-1)" in opening_text
     for marker in ("OpenAI Codex review", "Google Gemini review", "Antigravity review"):
         assert _comment_index(runner, lambda c, marker=marker: marker in c, start=seeded) > opening
     gemini_prompt = [command[-1] for command, _cwd in runner.commands if command[:1] == ["gemini"]][-1]
@@ -2232,7 +2232,7 @@ def test_840_stale_identity_premature_blocking_completion_is_not_silently_droppe
         new_comments = runner.comments[seeded:]
         assert len(new_comments) == 1
         assert new_comments[0].startswith("PR review scheduling diagnostic (round 1): pre-panel safety")
-        assert "Gemini (round 1, head abc123, state blocking; items: item-1)" in new_comments[0]
+        assert "Gemini (round 1, head 6367c48dd193d56ea7b0baad25b19455e529f5ee, state blocking; items: item-1)" in new_comments[0]
         return
 
     runner.codex_outputs.append(_staged_review(reviewer="OpenAI Codex", resolved=True))
@@ -2248,7 +2248,7 @@ def test_840_stale_identity_premature_blocking_completion_is_not_silently_droppe
     opening_text = runner.comments[opening]
     assert "force-full: True (source: operator)" in opening_text
     assert "Superseded premature panel reviews" in opening_text
-    assert "Gemini (round 1, head abc123, state blocking; items: item-1)" in opening_text
+    assert "Gemini (round 1, head 6367c48dd193d56ea7b0baad25b19455e529f5ee, state blocking; items: item-1)" in opening_text
     assert _comment_index(runner, lambda c: "Google Gemini review" in c, start=seeded) > opening
     gemini_prompt = [command[-1] for command, _cwd in runner.commands if command[:1] == ["gemini"]][-1]
     assert "Superseded pre-panel review context (non-authoritative; context only):" in gemini_prompt
@@ -2568,9 +2568,9 @@ def test_840_startup_undecodable_history_stops_with_diagnostic(tmp_path, operato
     checkpoint = _attach_round_metadata(
         "Staged checkpoint.",
         PostedRoundMetadata(
-            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="abc123",
+            flow="pr", role="summary", agent="Orchestrator", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             scheduler_contract=contract.as_dict(), scheduler_previous_sha=None,
-            scheduler_current_sha="abc123", scheduler_obligation_digest="0" * 16,
+            scheduler_current_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", scheduler_obligation_digest="0" * 16,
             scheduler_selected_reviewers=("Codex",),
             scheduler_paused_reviewers=(("Gemini", "primary phase"), ("Antigravity", "primary phase")),
             scheduler_reasons=("primary phase",), scheduler_final_sweep=False,
@@ -2621,7 +2621,7 @@ def test_840_startup_undecodable_history_keeps_legacy_error_for_other_policies(t
 
     body = _attach_round_metadata(
         "Reviewer record.",
-        PostedRoundMetadata(flow="pr", role="reviewer", agent="Codex", round_number=1, subject="abc123", state="approved"),
+        PostedRoundMetadata(flow="pr", role="reviewer", agent="Codex", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", state="approved"),
     )
     match = ROUND_RESUME_MARKER_RE.search(body)
     payload = decode_mapping(match.group("payload"))
@@ -2675,7 +2675,7 @@ def test_evidence_response_pass_with_unavailable_reviewer_stops_before_the_gate_
     patch_attr_in(monkeypatch, (pr_loop_support, pr_loop), "_evidence_freeze_gate",
         lambda *a, **k: gate_calls.append(1) or real_gate(*a, **k),
     )
-    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    runner.pr_payload["comments"].append(_signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed.", 1))
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
     runner.gemini_outputs.append(_AGENT_UNAVAILABLE_ENV)
     with pytest.raises(AgentLoopError, match="missing required input from Gemini") as excinfo:
@@ -2795,7 +2795,7 @@ def test_scheduler_stop_survives_a_failing_fresh_context_fetch(tmp_path, monkeyp
     """Row advisory-lookup-failure-fallback: the fresh PR-context fetch raises."""
     stopping = []
     real_advisory = review_rounds._unavailable_reviewer_amendment_advisory
-    real_fetch = pr_loop_support.get_pr_review_context
+    real_fetch = pr_loop_support.get_observed_pr_review_context
 
     def mark_advisory(**kwargs):
         stopping.append(True)
@@ -2811,7 +2811,7 @@ def test_scheduler_stop_survives_a_failing_fresh_context_fetch(tmp_path, monkeyp
     ), "_unavailable_reviewer_amendment_advisory", mark_advisory)
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context", fetch)
+    ), "get_observed_pr_review_context", fetch)
     runner = _scheduler_stop_runner()
     with pytest.raises(AgentLoopError, match="missing required input from Antigravity") as excinfo:
         run_pr_loop(runner, pr_number=77, config=_staged_config(tmp_path))
@@ -2907,7 +2907,7 @@ def test_strict_managed_all_reviewers_stop_suggests_restore_only(tmp_path, monke
     monkeypatch.setattr(plan_verification, "require_recoverable_plan_approval", lambda *a, **k: None)
     handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="abc123", branch="agent-loop/managed-56",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="strict", override_nonce=None,
     )
@@ -3013,7 +3013,7 @@ def test_refresh_pass_with_unavailable_reviewer_publishes_no_release_and_reruns_
     config = make_config(tmp_path, reviewer=("codex", "gemini"))
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
-    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    runner.pr_payload["comments"].append(_signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed.", 1))
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
     runner.gemini_outputs.append(
         _evidence_review(

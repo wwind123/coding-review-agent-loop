@@ -6,6 +6,8 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .pr_head_sync import get_observed_pr_review_context
+
 from .plan_round_closure import (
     project_plan_history, plan_amendment_activation_round, attach_plan_rollover_metadata,
 )
@@ -101,7 +103,6 @@ from .errors import (
 from .github import (
     IssueContext,
     get_issue_context,
-    get_pr_review_context,
     get_pr_state,
     post_issue_comment,
     read_rest_issue_comments,
@@ -5064,7 +5065,7 @@ def _run_plan_first_loop_body(
                             issue_number=staged_parent_issue,
                         )
                     if resolved_pr.source == "legacy-closing-reference":
-                        resumed_pr_context = get_pr_review_context(
+                        resumed_pr_context = get_observed_pr_review_context(
                             runner, config=config, pr_number=resolved_pr.pr_number
                         )
                         pr_url, pr_head_sha = require_pr_metadata_for_handoff(resumed_pr_context.metadata)

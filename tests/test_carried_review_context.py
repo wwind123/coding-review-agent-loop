@@ -185,7 +185,7 @@ def test_note_survives_publication_metadata_and_reconciliation():
         human_requirements_resolved_flag=False,
     )
     saved = _attach_round_metadata(public, PostedRoundMetadata(
-        flow="pr", role="reviewer", agent="Codex", round_number=2, subject="abc123",
+        flow="pr", role="reviewer", agent="Codex", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         prior_items=(carried_item(),), dispositions=parsed.dispositions, state="blocking",
     ))
     reparsed = parse_review(saved, reviewer="Codex")
@@ -204,7 +204,7 @@ def test_carried_machine_obligation_keeps_authority_after_reparsed_approval():
         text="Managed exact-head CI failed.", status="blocking",
         authority=MACHINE_AUTHORITY, obligation_kind="managed-exact-head-ci",
         lifecycle="awaiting_current_head_review", failed_head_sha="old-head",
-        candidate_head_sha="new-head", obligation_identity="managed:item-30",
+        candidate_head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6", obligation_identity="managed:item-30",
     )
     review = structured_pr_review(
         state="approved",
@@ -217,7 +217,7 @@ def test_carried_machine_obligation_keeps_authority_after_reparsed_approval():
         "Published review.\n<!-- AGENT_STATE: approved -->\n-- Codex",
         PostedRoundMetadata(
             flow="pr", role="reviewer", agent="Codex", round_number=14,
-            subject="new-head", prior_items=(machine_item,),
+            subject="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6", prior_items=(machine_item,),
             dispositions=parsed.dispositions, state="approved",
         ),
     )
@@ -229,7 +229,7 @@ def test_carried_machine_obligation_keeps_authority_after_reparsed_approval():
 
     assert len(retained) == 1
     assert retained[0].obligation_kind == "managed-exact-head-ci"
-    assert retained[0].candidate_head_sha == "new-head"
+    assert retained[0].candidate_head_sha == "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"
     assert retained[0].failed_head_sha == "old-head"
 
 
@@ -241,7 +241,7 @@ def test_coder_receives_latest_summary_separately_from_carried_claim(tmp_path, p
     coder_comment = _attach_round_metadata(
         "Updated the PR.\n<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         PostedRoundMetadata(
-            flow="pr", role="coder", agent="Claude", round_number=2, subject="abc123",
+            flow="pr", role="coder", agent="Claude", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item(),),
         ),
     )
@@ -250,7 +250,7 @@ def test_coder_receives_latest_summary_separately_from_carried_claim(tmp_path, p
         # Historical reviews with no note must not be subjected to live validation.
         review = carried_review(disposition=disposition)
         saved = _attach_round_metadata(review, PostedRoundMetadata(
-            flow="pr", role="reviewer", agent="Codex", round_number=2, subject="abc123",
+            flow="pr", role="reviewer", agent="Codex", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item(),), dispositions=parse_pr_review(review, reviewer="Codex").dispositions,
             state="blocking",
         ))
@@ -270,7 +270,7 @@ def test_coder_receives_latest_summary_separately_from_carried_claim(tmp_path, p
     prompt = next(cmd[-1] for cmd, _ in runner.commands if cmd[:1] == ["claude"])
     assert "Latest reviewer summaries (review-level context):" in prompt
     assert SUMMARY in prompt
-    assert "Codex (round 2, head abc123):" in prompt
+    assert "Codex (round 2, head 6367c48dd193d56ea7b0baad25b19455e529f5ee):" in prompt
     assert CLAIM in prompt
     assert "[item-2] from round" not in prompt
     if resume:
@@ -291,7 +291,7 @@ def test_reviewer_summary_context_is_neutralized_as_historical_text():
         "and after the reserved record."
     )
     context = _reviewer_summary_context(
-        "Codex", unsafe_summary, round_number=2, head_sha="abc123"
+        "Codex", unsafe_summary, round_number=2, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
 
     assert "AGENT_DISCUSS_CONSENSUS" not in context
@@ -316,7 +316,7 @@ def test_saved_reviewer_summary_is_neutralized_before_coder_prompt(tmp_path):
             role="reviewer",
             agent="Codex",
             round_number=2,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item(),),
             dispositions=parse_pr_review(review, reviewer="Codex").dispositions,
             state="blocking",
@@ -367,7 +367,7 @@ def test_reviewers_receive_head_bound_coder_notes(tmp_path, parallel, context, r
     # Resume must read the saved structured response, not depend on rendered prose.
     saved = _attach_round_metadata("Published coder explanation.", PostedRoundMetadata(
         flow="pr", role="coder", agent="Claude", round_number=2 if resume else 1,
-        subject="abc123", prior_items=items,
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", prior_items=items,
         raw_structured_coder_response=output if resume else None,
     ))
     comments = [{"author": {"login": "bot"}, "createdAt": "2026-05-20T10:00:00Z", "body": saved}]
@@ -481,12 +481,12 @@ def test_coder_context_preserves_disputes_and_missing_notes():
         addressed_items=["item-1"], remaining_items=["item-2"],
         disputed_items=["item-3"], dispute_evidence={"item-3": "The base-commit test also fails."},
     )
-    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=4, subject="abc123")
-    context = _coder_followup_review_context(output, metadata, head_sha="abc123")
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=4, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee")
+    context = _coder_followup_review_context(output, metadata, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert '"addressed_item_notes": {}' in context
     assert '"remaining_item_notes": {}' in context
     assert "The base-commit test also fails." in context
-    assert "Codex; review round 4; head abc123" in context
+    assert "Codex; review round 4; head 6367c48dd193d56ea7b0baad25b19455e529f5ee" in context
 
 
 def test_coder_context_carries_persisted_local_failures_to_reviewers():
@@ -499,15 +499,15 @@ def test_coder_context_carries_persisted_local_failures_to_reviewers():
         "receipt_id": "carried-failure",
         "turn_id": "prior-turn",
         "environment": "identity-unknown",
-        "attribution": {"state": "current-head", "head": "abc123"},
+        "attribution": {"state": "current-head", "head": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     }]})
     output = structured_coder_followup(summary="A smaller rerun passed.")
     metadata = PostedRoundMetadata(
         flow="pr", role="coder", agent="Codex", round_number=4,
-        subject="abc123", local_test_evidence=evidence,
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", local_test_evidence=evidence,
     )
 
-    context = _coder_followup_review_context(output, metadata, head_sha="abc123")
+    context = _coder_followup_review_context(output, metadata, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
     assert "carried-failure" in context
     assert "local_test_evidence" in context
@@ -541,12 +541,12 @@ def test_coder_context_carries_derived_matrix_evidence_and_diagnostics():
     },)
     output = structured_coder_followup(summary="The implementation is handed off.")
     metadata = PostedRoundMetadata(
-        flow="pr", role="coder", agent="Codex", round_number=4, subject="abc123",
+        flow="pr", role="coder", agent="Codex", round_number=4, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         risk_test_matrix_evidence=evidence,
         risk_test_matrix_diagnostics=diagnostics,
     )
 
-    context = _coder_followup_review_context(output, metadata, head_sha="abc123")
+    context = _coder_followup_review_context(output, metadata, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
     assert '"risk_test_matrix_evidence"' in context
     assert "implementation-derived-evidence" in context
@@ -558,18 +558,18 @@ def test_coder_context_carries_derived_matrix_evidence_and_diagnostics():
 @pytest.mark.parametrize("head", [None, "different-head"])
 def test_coder_notes_not_presented_as_current_after_head_change(head):
     output = structured_coder_followup(summary="Unique old-head fix claim.")
-    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=2, subject="abc123")
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     context = _coder_followup_review_context(output, metadata, head_sha=head)
     assert "does not match" in context
     assert "Unique old-head fix claim" not in context
 
 
 def test_coder_context_legacy_and_malformed_responses_are_not_invented():
-    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=2, subject="abc123")
-    assert _coder_followup_review_context(None, metadata, head_sha="abc123") == ""
-    assert _coder_followup_review_context("legacy", None, head_sha="abc123") == ""
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee")
+    assert _coder_followup_review_context(None, metadata, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee") == ""
+    assert _coder_followup_review_context("legacy", None, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee") == ""
     for text in ("legacy prose", '{"kind":"coder_followup","summary":"invalid"}'):
-        assert "no valid structured resolution details" in _coder_followup_review_context(text, metadata, head_sha="abc123")
+        assert "no valid structured resolution details" in _coder_followup_review_context(text, metadata, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
 
 def test_recovered_head_advance_retains_original_coder_binding():
@@ -578,10 +578,10 @@ def test_recovered_head_advance_retains_original_coder_binding():
                                    raw_structured_coder_response=structured_coder_followup(summary="Old fix claim."))
     comments = [IssueComment(author="bot", created_at="2026-05-20T10:00:00Z",
                              body=_attach_round_metadata("Published explanation.", metadata))]
-    resumed = _resume_pr_round(comments, head_sha="new-head", configured_reviewers=("codex",))
+    resumed = _resume_pr_round(comments, head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6", configured_reviewers=("codex",))
     assert resumed.unrecorded_head_advance
     assert resumed.coder_metadata.subject == "old-head"
-    context = _coder_followup_review_context(resumed.coder_output, resumed.coder_metadata, head_sha="new-head")
+    context = _coder_followup_review_context(resumed.coder_output, resumed.coder_metadata, head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
     assert "Old fix claim" not in context
     assert "does not match" in context
 
@@ -601,12 +601,12 @@ def test_returning_reviewer_gets_orchestrator_observed_span_and_fresh_review_ins
         Runner(),
         reviewer="gemini",
         checkout=".",
-        current_head_sha="new-head",
+        current_head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6",
         current_round=3,
         latest_reviewer_records={"Gemini": record},
     )
     assert "Missed 1 intervening review round(s)" in context
-    assert "Observed diff from old-head to new-head: M\tsrc/worker.py" in context
+    assert "Observed diff from old-head to 4ebf8a1679f50e9e49fc965072f996bfe0dc18c6: M\tsrc/worker.py" in context
     assert "complete current base-to-head diff" in context
 
 
@@ -624,8 +624,8 @@ def test_coder_context_is_neutralized_as_historical_text(tmp_path, compact):
 def test_initial_implementation_summary_and_test_caveats_are_preserved():
     output = structured_issue_implementation(summary="Initial implementation, not a follow-up.",
                                              tests_run=["pytest -q (subset only)"])
-    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=1, subject="abc123")
-    context = _coder_followup_review_context(output, metadata, head_sha="abc123")
+    metadata = PostedRoundMetadata(flow="pr", role="coder", agent="Codex", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee")
+    context = _coder_followup_review_context(output, metadata, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert "Initial implementation, not a follow-up." in context
     assert "pytest -q (subset only)" in context
     assert "addressed_item_notes" not in context
@@ -641,11 +641,11 @@ def test_coder_context_keeps_out_of_checkout_baseline_as_non_evidence(tmp_path, 
     else:
         output = structured_issue_implementation(tests_run=tests_run)
     metadata = PostedRoundMetadata(
-        flow="pr", role="coder", agent="Codex", round_number=2, subject="abc123"
+        flow="pr", role="coder", agent="Codex", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
 
     context = _coder_followup_review_context(
-        output, metadata, head_sha="abc123", assigned_workdir=tmp_path
+        output, metadata, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", assigned_workdir=tmp_path
     )
 
     payload = json.loads(context[context.index("{"):])
@@ -664,14 +664,14 @@ def test_reviewer_context_shows_dropped_citations_restored_from_metadata_927():
     parsed = response_validation.validate_structured_coder_followup(text)
     [record] = parsed.test_observation_degradations
     metadata = PostedRoundMetadata(
-        flow="pr", role="coder", agent="Codex", round_number=2, subject="abc123",
+        flow="pr", role="coder", agent="Codex", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         test_observation_degradations=(record,),
     )
-    context = _coder_followup_review_context(text, metadata, head_sha="abc123")
+    context = _coder_followup_review_context(text, metadata, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert '"test_observation_degradations"' in context
     assert "coder_followup.test_observations[1]" in context
     without = _coder_followup_review_context(
-        text, dataclasses.replace(metadata, test_observation_degradations=()), head_sha="abc123"
+        text, dataclasses.replace(metadata, test_observation_degradations=()), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
     assert "test_observation_degradations" not in without
 

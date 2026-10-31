@@ -131,8 +131,8 @@ def test_bound_capture_reconciliation_preserves_other_owners_and_machine_items()
 def test_scoped_records_cannot_establish_recovery_coherence_or_latches():
     from coding_review_agent_loop.round_state import _latest_prior_pr_subject_is_coherent, startup_force_full_latch
     scoped = record(review_scope=SCOPE, scheduler_force_full=True, scheduler_force_full_source="operator")
-    assert not _latest_prior_pr_subject_is_coherent((scoped,), head_sha="new-head")
+    assert not _latest_prior_pr_subject_is_coherent((scoped,), head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
     assert startup_force_full_latch((scoped,), requires_primary=False) == (False, False)
     ordinary = record(scheduler_force_full=True, scheduler_force_full_source="operator")
-    assert _latest_prior_pr_subject_is_coherent((ordinary,), head_sha="new-head")
+    assert _latest_prior_pr_subject_is_coherent((ordinary,), head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6")
     assert startup_force_full_latch((ordinary,), requires_primary=False) == (True, False)

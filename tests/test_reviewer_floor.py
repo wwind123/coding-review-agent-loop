@@ -248,7 +248,7 @@ def _amended_named_pr(
         pr_review_policy="selective-intermediate", pre_review_tests=False, agent_max_retries=0,
     )
     assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, **board)) == 0
-    runner.pr_payload["headRefOid"] = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     body = format_reviewer_board_amendment_comment(
         flow="pr", issue=None, pr_number=amendment_pr,
         original_required_reviewers=("Codex", "Gemini", "flash", "opus"),
@@ -443,7 +443,7 @@ def test_staged_malformed_history_with_a_signed_amendment_writes_nothing(
     _m943_append(runner, _m943_amendment_from_error(str(excinfo.value)))
     # An anchor whose spilled sidecar is missing cannot be decoded.
     anchor = transport.prepare_round_comment(_attach_round_metadata("Visible review", PostedRoundMetadata(
-        flow="pr", role="reviewer", agent="codex", round_number=1, subject="abc123",
+        flow="pr", role="reviewer", agent="codex", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         phase="provisional", canonical_reviewer_response=base64.urlsafe_b64encode(os.urandom(46_000)).decode(),
     )))[-1]
     _m943_append(runner, anchor, login="bot")
@@ -521,7 +521,7 @@ def _standalone_plan_pr(tmp_path, *, plan_reduction, scope):
         "author": {"login": "bot"}, "createdAt": "2026-05-23T00:01:00Z", "id": 99,
         "body": format_issue_pr_handoff_comment(
             issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
-            pr_head_sha="abc123", flow="approved-plan-implementation",
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="approved-plan-implementation",
             plan_hash=handed_off.plan_hash,
         ),
     })

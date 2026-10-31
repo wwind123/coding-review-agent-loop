@@ -50,26 +50,26 @@ def test_pr_loop_runs_tests_and_merge_only_after_codex_approval(tmp_path):
     assert [
         "gh",
         "api",
-        "repos/OWNER/REPO/commits/abc123/check-runs",
+        "repos/OWNER/REPO/commits/6367c48dd193d56ea7b0baad25b19455e529f5ee/check-runs",
     ] in commands
     assert [
         "gh",
         "api",
-        "repos/OWNER/REPO/commits/abc123/status",
+        "repos/OWNER/REPO/commits/6367c48dd193d56ea7b0baad25b19455e529f5ee/status",
     ] in commands
     assert [
         "gh",
         "api",
         "repos/OWNER/REPO/branches/main/protection/required_status_checks",
     ] in commands
-    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"] in commands
+    assert ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "6367c48dd193d56ea7b0baad25b19455e529f5ee"] in commands
 
 
 def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
     runner = FakeRunner()
     config = make_config(tmp_path, auto_merge=True)
     capability = OrdinaryRecoveryCapability(
-        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100,
     )
     validations = []
@@ -81,15 +81,15 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
         lambda *args, **kwargs: ManagedCiOutcome(
             status="passed",
             checks=_watch_check_board("passing"),
-            head_sha="abc123",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
-            base_branch="main", head_sha="abc123", url=None,
+            base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
         )),
     )
     monkeypatch.setattr(
@@ -108,7 +108,7 @@ def test_ordinary_recovery_readies_and_merges_exact_head(monkeypatch, tmp_path):
     )
 
     assert validations == [True, None]
-    assert merged == ["abc123"]
+    assert merged == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
     assert ["gh", "pr", "ready", "77", "--repo", "OWNER/REPO"] in [
         command for command, _cwd in runner.commands
     ]
@@ -124,7 +124,7 @@ def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
         pr_number=77,
         repository="OWNER/REPO",
         base_ref="main",
-        expected_head_sha="abc123",
+        expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101,
         released_at=100,
     )
@@ -144,19 +144,19 @@ def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
         pr_loop_support,
         "wait_for_ordinary_recovery",
         lambda *args, **kwargs: ManagedCiOutcome(
-            status="passed", checks=snapshot, head_sha="abc123"
+            status="passed", checks=snapshot, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"
         ),
     )
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77,
             repo="OWNER/REPO",
             title="draft",
             head_branch="feature",
             base_branch="main",
-            head_sha="abc123",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             url=None,
         )),
     )
@@ -174,7 +174,7 @@ def test_ordinary_recovery_does_not_ready_or_merge_without_authoritative_board(
         pr_number=77,
         round_number=1,
         items=items,
-        current_head_sha="abc123",
+        current_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         capability=capability,
     )
     assert items == [ordinary_item]
@@ -186,14 +186,14 @@ def test_ordinary_recovery_refuses_head_changed_before_ready(monkeypatch, tmp_pa
     runner = FakeRunner()
     config = make_config(tmp_path, auto_merge=True)
     capability = OrdinaryRecoveryCapability(
-        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100,
     )
     monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
     monkeypatch.setattr(
         pr_loop_support,
         "wait_for_ordinary_recovery",
-        lambda *args, **kwargs: ManagedCiOutcome(status="head_changed", head_sha="new-head"),
+        lambda *args, **kwargs: ManagedCiOutcome(status="head_changed", head_sha="4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"),
     )
 
     with pytest.raises(AgentLoopError, match="head_changed"):
@@ -208,7 +208,7 @@ def test_ordinary_recovery_refuses_provenance_change_after_ready(monkeypatch, tm
     runner = FakeRunner()
     config = make_config(tmp_path, auto_merge=True)
     capability = OrdinaryRecoveryCapability(
-        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100,
     )
     validations = iter([True, False])
@@ -219,15 +219,15 @@ def test_ordinary_recovery_refuses_provenance_change_after_ready(monkeypatch, tm
         lambda *args, **kwargs: ManagedCiOutcome(
             status="passed",
             checks=_watch_check_board("passing"),
-            head_sha="abc123",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
-            base_branch="main", head_sha="abc123", url=None,
+            base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
         )),
     )
     monkeypatch.setattr(
@@ -249,7 +249,7 @@ def test_ordinary_recovery_merge_failure_leaves_pr_ready(monkeypatch, tmp_path):
     runner = FakeRunner()
     config = make_config(tmp_path, auto_merge=True)
     capability = OrdinaryRecoveryCapability(
-        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100,
     )
     monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *args, **kwargs: capability)
@@ -259,15 +259,15 @@ def test_ordinary_recovery_merge_failure_leaves_pr_ready(monkeypatch, tmp_path):
         lambda *args, **kwargs: ManagedCiOutcome(
             status="passed",
             checks=_watch_check_board("passing"),
-            head_sha="abc123",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *args, **kwargs: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
-            base_branch="main", head_sha="abc123", url=None,
+            base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
         )),
     )
     monkeypatch.setattr(pr_loop_support, "validate_ordinary_recovery_capability", lambda *args, **kwargs: True)
@@ -301,7 +301,7 @@ class _AmbiguousMergeRunner(FakeRunner):
         self.merge_script = list(merge_script)
         self.events = events if events is not None else []
         self.merge_view = {
-            "state": "OPEN", "mergedAt": None, "headRefOid": "abc123", "mergeCommit": None,
+            "state": "OPEN", "mergedAt": None, "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "mergeCommit": None,
         }
 
     def run(self, args, *, cwd, input_text=None, check=True, env=None):
@@ -360,7 +360,7 @@ def test_managed_merge_502_is_one_attempt_and_a_rerun_requalifies_before_merging
     )
     monkeypatch.setattr(
         pr_loop, "wait_for_final_qualification",
-        lambda *a, **k: events.append("qualified") or ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *a, **k: events.append("qualified") or ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
 
     with pytest.raises(AgentLoopError, match="rerun to re-execute every merge gate"):
@@ -384,22 +384,22 @@ def test_ordinary_recovery_merge_502_is_one_attempt_and_a_rerun_revalidates_befo
     runner = _AmbiguousMergeRunner(events=events)
     config = make_config(tmp_path, auto_merge=True)
     capability = OrdinaryRecoveryCapability(
-        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100,
     )
     monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
     monkeypatch.setattr(
         pr_loop_support, "wait_for_ordinary_recovery",
         lambda *a, **k: events.append("recovery-gate") or ManagedCiOutcome(
-            status="passed", checks=_watch_check_board("passing"), head_sha="abc123",
+            status="passed", checks=_watch_check_board("passing"), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
-            base_branch="main", head_sha="abc123", url=None,
+            base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
         )),
     )
     monkeypatch.setattr(
@@ -429,7 +429,7 @@ def test_ordinary_recovery_merge_502_is_one_attempt_and_a_rerun_revalidates_befo
 @pytest.mark.parametrize("path", ["full-board", "ordinary-recovery"])
 def test_merge_502_that_actually_merged_is_recovered_with_no_second_merge(tmp_path, monkeypatch, path):
     runner = _AmbiguousMergeRunner()
-    runner.merge_view = {"state": "MERGED", "mergedAt": "t", "headRefOid": "abc123", "mergeCommit": {"oid": "m"}}
+    runner.merge_view = {"state": "MERGED", "mergedAt": "t", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "mergeCommit": {"oid": "m"}}
     if path == "full-board":
         approval = "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"
         runner.codex_outputs = [approval]
@@ -438,22 +438,22 @@ def test_merge_502_that_actually_merged_is_recovered_with_no_second_merge(tmp_pa
     else:
         config = make_config(tmp_path, auto_merge=True)
         capability = OrdinaryRecoveryCapability(
-            pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+            pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             released_label_event_id=101, released_at=100,
         )
         monkeypatch.setattr(pr_loop_support, "refresh_ordinary_recovery_capability", lambda *a, **k: capability)
         monkeypatch.setattr(
             pr_loop_support, "wait_for_ordinary_recovery",
             lambda *a, **k: ManagedCiOutcome(
-                status="passed", checks=_watch_check_board("passing"), head_sha="abc123",
+                status="passed", checks=_watch_check_board("passing"), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             ),
         )
         patch_attr_in(monkeypatch, (
             pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-        ), "get_pr_review_context",
+        ), "get_observed_pr_review_context",
             lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
                 number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
-                base_branch="main", head_sha="abc123", url=None,
+                base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
             )),
         )
         monkeypatch.setattr(pr_loop_support, "validate_ordinary_recovery_capability", lambda *a, **k: True)
@@ -532,7 +532,7 @@ class _ReadyAmbiguityRunner(FakeRunner):
 
 def _ordinary_recovery_ready_setup(monkeypatch, runner_tmp):
     capability = OrdinaryRecoveryCapability(
-        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="abc123",
+        pr_number=77, repository="OWNER/REPO", base_ref="main", expected_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         released_label_event_id=101, released_at=100,
     )
     validations = []
@@ -540,15 +540,15 @@ def _ordinary_recovery_ready_setup(monkeypatch, runner_tmp):
     monkeypatch.setattr(
         pr_loop_support, "wait_for_ordinary_recovery",
         lambda *a, **k: ManagedCiOutcome(
-            status="passed", checks=_watch_check_board("passing"), head_sha="abc123",
+            status="passed", checks=_watch_check_board("passing"), head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         ),
     )
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context",
+    ), "get_observed_pr_review_context",
         lambda *a, **k: SimpleNamespace(metadata=PullRequestMetadata(
             number=77, repo="OWNER/REPO", title="draft", head_branch="feature",
-            base_branch="main", head_sha="abc123", url=None,
+            base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url=None,
         )),
     )
     monkeypatch.setattr(

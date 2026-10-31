@@ -382,7 +382,7 @@ def test_managed_implementation_rejected_during_correction_still_publishes_dispa
     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     bypass = {
         "id": 9001, "name": "CI", "display_title": "CI", "event": "workflow_dispatch",
-        "head_sha": "correction-head", "head_branch": "agent-loop/managed-56", "created_at": now,
+        "head_sha": "ac6d2e52d9d919e0a3a8517c2805378d6c1e15f2", "head_branch": "agent-loop/managed-56", "created_at": now,
         "html_url": "https://github.com/OWNER/REPO/actions/runs/9001",
         "repository": {"full_name": "OWNER/REPO"},
     }
@@ -403,7 +403,7 @@ def test_managed_implementation_rejected_during_correction_still_publishes_dispa
         if "Coder-turn CI dispatch audit" in item.get("body", "")
     ]
     assert len(notes) == 1
-    assert "run 9001 on `correction-head`" in notes[0]
+    assert "run 9001 on `ac6d2e52d9d919e0a3a8517c2805378d6c1e15f2`" in notes[0]
     assert "non-authoritative diagnostic, not qualification" in notes[0]
     assert "coder response for this turn was rejected" in notes[0]
     assert h.run_pr_calls == []  # no review, qualification or dispatch follows
@@ -1108,3 +1108,34 @@ def test_workflow_report_correction_refreshes_original_pr(tmp_path, monkeypatch,
     assert handoffs and all(refreshed in body and h.head not in body for body in handoffs)
     if managed:
         assert events == [("authenticate", h.head), ("authenticate", refreshed), ("publish", refreshed)]
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_reask_head_observation_precedes_authorization_and_publication(tmp_path, monkeypatch, invalid):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    h = CoverageHarness(tmp_path, monkeypatch)
+
+    def reask(harness):
+        harness.runner.branch_tip = "b" * 40
+        if invalid:
+            harness.runner.pr_payload["headRefOid"] = "invalid"
+        return harness.response(response_text(claims=complete_claims()))
+
+    h.script = [h.response(_incomplete_text()), reask]
+    after_reask_guards = []
+    references = issue_implementation.validate_pr_references_issue
+
+    def check_references(*args, **kwargs):
+        if len(h.calls) == 2:
+            after_reask_guards.append(kwargs)
+        return references(*args, **kwargs)
+
+    monkeypatch.setattr(issue_implementation, "validate_pr_references_issue", check_references)
+    authorized = []
+    monkeypatch.setattr(issue_implementation, "_publish_issue_authorization_with_recovery",
+                        lambda *a, **k: authorized.append(k))
+    with pytest.raises(PrHeadObservationError):
+        h.run()
+    assert len(h.calls) == 2
+    assert not after_reask_guards and not authorized and not h.run_pr_calls
+    assert not h.all_comments()

@@ -71,7 +71,7 @@ def _implementation_matrix_context():
 @pytest.mark.parametrize(
     ("checkout_head", "expected_status", "expected_diagnostic"),
     [
-        ("abc123", "verified", None),
+        ("6367c48dd193d56ea7b0baad25b19455e529f5ee", "verified", None),
         ("checkout-mismatch", "stale/unverified", "checkout-head-mismatch"),
     ],
 )
@@ -82,7 +82,7 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
     observation = _workflow_observation(
         execution_ref="coder-turn:observation-1",
         receipt_id="receipt-current-head",
-        head="abc123",
+        head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     implementation_text = _semantic_issue_implementation_text(observation.execution_ref)
     parsed = validate_structured_issue_implementation(
@@ -99,7 +99,7 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
         acquisition_test_observations=(observation,),
     )
     runner = FakeRunner(
-        pr_payload={"body": "Fixes #56", "headRefOid": "abc123"},
+        pr_payload={"body": "Fixes #56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     )
     config = make_config(tmp_path, coder="claude")
     issue_context = IssueContext(
@@ -113,7 +113,7 @@ def test_issue_implementation_keeps_pr_and_persists_derived_evidence_after_head_
     )
     patch_attr_in(monkeypatch, (validated_agent_module, discuss_loop, pr_loop, issue_implementation, plan_first_loop_module, triage, issue_loop), "_run_validated_agent",
         lambda *_args, **_kwargs: (
-            setattr(runner, "git_head", "abc123-agent-1") or coder_response
+            setattr(runner, "git_head", "6367c48dd193d56ea7b0baad25b19455e529f5ee-agent-1") or coder_response
         ),
     )
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue",
@@ -260,7 +260,7 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
     current = _workflow_observation(
         execution_ref="coder-turn:observation-2",
         receipt_id="receipt-current-head",
-        head="abc123",
+        head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     initial_text = _semantic_issue_implementation_text(wrong.execution_ref)
     corrected_text = _semantic_issue_implementation_text(current.execution_ref)
@@ -270,7 +270,7 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
         execution_catalog=(wrong, current),
     )
     assert initial_parsed is not None
-    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "abc123"})
+    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
     config = make_config(tmp_path, coder="claude")
     issue_context = IssueContext(
         number=56,
@@ -293,17 +293,17 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
     )
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None
     )
-    real_get_pr_review_context = pr_loop_support.get_pr_review_context
+    real_get_pr_review_context = pr_loop_support.get_observed_pr_review_context
     review_context_calls = 0
 
     def get_pr_review_context_with_optional_race(*args, **kwargs):
         nonlocal review_context_calls
         review_context_calls += 1
         if mode == "head-race" and review_context_calls >= 2:
-            runner.pr_payload["headRefOid"] = "raced-head"
+            runner.pr_payload["headRefOid"] = "a607eb2974b572fbd8ce0410e987804f1e0775a6"
         return real_get_pr_review_context(*args, **kwargs)
 
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_pr_review_context",
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_observed_pr_review_context",
         get_pr_review_context_with_optional_race,
     )
     patch_attr_in(monkeypatch, (issue_implementation, issue_loop), "sync_coder_base_before_implementation",
@@ -322,7 +322,7 @@ def test_issue_implementation_runs_bounded_post_auth_correction_without_losing_p
         lambda observations, **_kwargs: SimpleNamespace(observations=tuple(observations)),
     )
     snapshot_heads = iter(
-        ("abc123", "abc123") if mode != "head-race" else ("abc123", "raced-head")
+        ("6367c48dd193d56ea7b0baad25b19455e529f5ee", "6367c48dd193d56ea7b0baad25b19455e529f5ee") if mode != "head-race" else ("6367c48dd193d56ea7b0baad25b19455e529f5ee", "a607eb2974b572fbd8ce0410e987804f1e0775a6")
     )
     monkeypatch.setattr(
         response_validation,
@@ -413,7 +413,7 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
     current = _workflow_observation(
         execution_ref="coder-turn:observation-1",
         receipt_id="receipt-current-head",
-        head="abc123",
+        head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     initial_text = _selector_only_issue_implementation_text(current.execution_ref)
     corrected_text = (
@@ -428,7 +428,7 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
     )
     assert initial_parsed is not None
     assert initial_parsed.risk_test_matrix_claims.claims[0].workflow_path_claim == ""
-    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "abc123"})
+    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
     config = make_config(tmp_path, coder="claude")
     issue_context = IssueContext(
         number=56,
@@ -505,7 +505,7 @@ def test_issue_implementation_accepts_selector_only_claim_and_corrects_once_afte
         response_validation,
         "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
-            head="abc123",
+            head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             tracked_digest="tree-current",
             complete=True,
             stable=True,
@@ -587,7 +587,7 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
     current = _workflow_observation(
         execution_ref="coder-turn:observation-1",
         receipt_id="receipt-current-head",
-        head="abc123",
+        head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     initial_text = _command_string_issue_implementation_text()
     corrected_text = (
@@ -612,7 +612,7 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
     assert initial_claim.dropped_execution_refs == (
         _COMMAND_STRING_REF, "python3 -m pytest tests/ -q",
     )
-    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "abc123"})
+    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
     config = make_config(tmp_path, coder="claude")
     issue_context = IssueContext(
         number=56,
@@ -680,7 +680,7 @@ def test_issue_implementation_with_command_string_refs_is_handed_off_and_unverif
         response_validation,
         "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
-            head="abc123",
+            head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             tracked_digest="tree-current",
             complete=True,
             stable=True,
@@ -735,15 +735,15 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
     """#1240: the real approved-plan hand-off re-asks once and hands off PR #77."""
     approved_plan, plan_context = _implementation_matrix_context()
     unverified = _workflow_observation(
-        execution_ref="turn-1:observation-1", receipt_id="receipt-1", head="abc123"
+        execution_ref="turn-1:observation-1", receipt_id="receipt-1", head="6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
     unverified.turn_id = "turn-1"
     unverified.suite_start = "not-started"
     fresh = _workflow_observation(
-        execution_ref="turn-2:observation-1", receipt_id="receipt-2", head="abc123"
+        execution_ref="turn-2:observation-1", receipt_id="receipt-2", head="6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
     fresh.turn_id = "turn-2"
-    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "abc123"})
+    runner = FakeRunner(pr_payload={"body": "Fixes #56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
     config = make_config(tmp_path, coder="claude")
     issue_context = IssueContext(
         number=56,
@@ -800,7 +800,7 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
     monkeypatch.setattr(
         response_validation, "stable_tracked_tree_snapshot",
         lambda _workdir: SimpleNamespace(
-            head="abc123", tracked_digest="tree-current", complete=True,
+            head="6367c48dd193d56ea7b0baad25b19455e529f5ee", tracked_digest="tree-current", complete=True,
             stable=True, status_clean=True,
         ),
     )
@@ -823,3 +823,52 @@ def test_issue_implementation_reasks_unverified_citation_through_real_call_site(
     assert run_pr_calls and run_pr_calls[0]["pr_number"] == 77
     assert any("AGENT_ISSUE_PR_HANDOFF" in comment for comment in runner.comments)
     assert not any("turn-1:observation-1" in comment for comment in runner.comments)
+
+
+@pytest.mark.parametrize('one_shot', [False, True])
+@pytest.mark.parametrize('outcome', ['desync', 'invalid', 'converged'])
+def test_approved_resume_observation_precedes_contract_and_handoffs(tmp_path, monkeypatch, one_shot, outcome):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    runner = FakeRunner(pr_payload={'body': 'Fixes #56'})
+    runner.branch_tip = 'b' * 40
+    if outcome == 'invalid': runner.pr_payload['headRefOid'] = 'invalid'
+    original = runner.run
+
+    def run(args, **kwargs):
+        if args == ['sleep', '2'] and outcome == 'converged':
+            runner.pr_payload.update(headRefOid='b' * 40, url='https://example.test/latest', title='Latest context')
+        return original(args, **kwargs)
+
+    runner.run = run
+    delegated = []
+    monkeypatch.setattr(issue_implementation, 'run_pr_loop', lambda *a, **k: delegated.append(k) or 0)
+    monkeypatch.setattr(issue_implementation, 'resolve_canonical_pr_for_issue', lambda *a, **k: SimpleNamespace(
+        source='legacy-closing-reference', pr_number=77, metadata=None, evidence_summary='authenticated fixture'))
+    config = make_config(tmp_path)
+    issue = IssueContext(number=56, repo='OWNER/REPO', title='Issue', body='Issue', url='https://github.com/OWNER/REPO/issues/56', comments=())
+    def invoke():
+        return issue_implementation._implement_approved_issue(runner, issue_number=56, approved_plan='Approved plan.',
+            config=config, memory=None, issue_context=issue, coder_session_id=None,
+            usage_context=validated_agent_module._new_usage_context(config),
+            one_shot_parent_issue=56 if one_shot else None)
+
+    if outcome == 'converged':
+        assert invoke() == 0
+        assert delegated
+        handoffs = [body for body in runner.comments if 'AGENT_ISSUE_PR_HANDOFF' in body or 'AGENT_PLAN_ONE_SHOT_IMPL' in body]
+        assert len(handoffs) == (2 if one_shot else 1)
+        for body in handoffs:
+            if 'AGENT_PLAN_ONE_SHOT_IMPL' in body:
+                from coding_review_agent_loop.decomposition import _decode_one_shot_impl_handoff_metadata
+                encoded = body.split('AGENT_PLAN_ONE_SHOT_IMPL: ', 1)[1].split(' -->', 1)[0]
+                assert _decode_one_shot_impl_handoff_metadata(encoded).pr_head_sha == 'b' * 40
+            else:
+                assert 'b' * 40 in body and 'https://example.test/latest' in body
+                assert '6367c48dd193d56ea7b0baad25b19455e529f5ee' not in body
+    else:
+        with pytest.raises(PrHeadObservationError):
+            invoke()
+        assert not delegated
+        assert not runner.pr_payload.get('comments')
+        assert not any('handoff' in body.lower() for body in runner.comments)
+    assert not any(cmd[:1] in (['claude'], ['codex']) for cmd, _ in runner.commands)

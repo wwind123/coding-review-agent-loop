@@ -451,12 +451,12 @@ def test_format_unfiled_split_warning_lists_titles():
 def test_has_unfiled_split_warning_matches_issue_and_subject():
     body = (
         "### Split follow-ups are NOT filed as issues\n\n"
-        "<!-- AGENT_SPLIT_UNFILED_WARNING: issue=56 subject=abc123 -->\n"
+        "<!-- AGENT_SPLIT_UNFILED_WARNING: issue=56 subject=6367c48dd193d56ea7b0baad25b19455e529f5ee -->\n"
         "-- coding-review-agent-loop"
     )
-    assert has_unfiled_split_warning((_comment(body),), issue_number=56, subject="abc123")
+    assert has_unfiled_split_warning((_comment(body),), issue_number=56, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert not has_unfiled_split_warning((_comment(body),), issue_number=56, subject="different")
-    assert not has_unfiled_split_warning((_comment(body),), issue_number=99, subject="abc123")
+    assert not has_unfiled_split_warning((_comment(body),), issue_number=99, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
 
 def test_resolve_selected_stage_child_by_split_stage_flag():

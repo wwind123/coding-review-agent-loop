@@ -115,7 +115,7 @@ def _append(runner, body, *, login="operator", author_id=None):
     comments.append(entry)
 
 
-def _legacy(role, agent, round_number, *, subject="abc123", state=None, new_items=(),
+def _legacy(role, agent, round_number, *, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", state=None, new_items=(),
             prior_items=(), dispositions=(), **extra):
     """A pre-upgrade round record: no board identity fields."""
     if role == "reviewer":
@@ -390,7 +390,7 @@ def test_reviewer_text_naming_the_link_marker_is_neutralized(tmp_path):
         structured_pr_review(summary=f"Board update {marker} applied.")
     )
     runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini"))
-    runner.pr_payload["headRefOid"] = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     try:
         run_pr_loop(runner, pr_number=77, config=config)
     except AgentLoopError:
@@ -469,7 +469,7 @@ def _dispositions(reviewer, *item_ids, disposition="resolved"):
 
 
 def _gemini_blocker_history(*, evidence=()):
-    """Round 2 on head abc123: item-1 resolved by both, Gemini alone raises item-2."""
+    """Round 2 on head 6367c48dd193d56ea7b0baad25b19455e529f5ee: item-1 resolved by both, Gemini alone raises item-2."""
     item1 = _item(1, "Gemini")
     item2 = _item(2, "Gemini", round_number=2)
     return [
@@ -570,7 +570,7 @@ def test_removed_reviewer_evidence_request_is_rebuilt_and_blocks(tmp_path):
         round_number=2,
         reconciliation_mode="aggregate",
         evidence_clearances=tuple(
-            (item.obligation_identity, "abc123") for item in evidence if item.obligation_identity
+            (item.obligation_identity, "6367c48dd193d56ea7b0baad25b19455e529f5ee") for item in evidence if item.obligation_identity
         ),
         next_item_number=3,
     )
@@ -739,7 +739,7 @@ def _signed_three_to_two(tmp_path, **floor):
     with pytest.raises(AgentLoopError, match="below the floor of 3") as refused:
         run_pr_loop(runner, pr_number=77, config=reduced)
     _append(runner, _amendment_from(str(refused.value)).replace("Gemini quota", "Antigravity quota"))
-    runner.pr_payload["headRefOid"] = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     runner.codex_outputs.append(structured_pr_review())
     runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini"))
     assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
@@ -752,7 +752,7 @@ def test_signed_reduction_stays_authorized_through_later_links_but_never_further
     runner, reduced = _signed_three_to_two(tmp_path)
     # A binding-only change of a remaining seat posts one link and stays admissible.
     rebound = dataclasses.replace(reduced, reviewer_codex_model="gpt-alternate")
-    runner.pr_payload["headRefOid"] = "fed789"
+    runner.pr_payload["headRefOid"] = "59e9fef4edb549af995ec1617c78fd9f54405f29"
     runner.codex_outputs.append(structured_pr_review())
     runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini"))
     assert run_pr_loop(runner, pr_number=77, config=rebound) == 0
@@ -820,7 +820,7 @@ def _record_body(round_number, root, identity, *, change=None, amendment=None,
         structured_pr_review(reviewer=agent or identity.names[0]),
         PostedRoundMetadata(
             flow="pr", role="reviewer", agent=agent or identity.names[0],
-            round_number=round_number, subject="abc123", state="approved",
+            round_number=round_number, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", state="approved",
             pr_board_root=root.payload(), pr_board_identity=identity.payload(),
             reviewer_board_change_digest=change, reviewer_board_amendment_digest=amendment,
             seat_binding=seat_binding, **extra,
@@ -953,7 +953,7 @@ def test_coder_only_anchor_round_advances_once(tmp_path, monkeypatch):
     reviews = [r.metadata for r in _records(runner) if r.metadata.pr_board_root]
     assert {m.round_number for m in reviews} == {3}
     # The anchor round's coder output is the artifact the new board reviews.
-    assert all(m.subject == "abc123" for m in reviews)
+    assert all(m.subject == "6367c48dd193d56ea7b0baad25b19455e529f5ee" for m in reviews)
 
 
 def test_prelaunch_only_anchor_round_keeps_its_round_and_ledger(tmp_path, monkeypatch):
@@ -1181,7 +1181,7 @@ def test_link_then_signed_amendment_then_link_resolves_one_ordered_chain(tmp_pat
     signed = _amendment_from(str(refused.value))
     assert '"Antigravity"' in signed.split('"original_required_reviewers"')[1].split("]")[0]
     _append(runner, signed)
-    runner.pr_payload["headRefOid"] = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     runner.codex_outputs.append(structured_pr_review())
     runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini"))
     # Original flags of the link's board take the #1133 rebind.
@@ -1261,7 +1261,7 @@ def test_legacy_signed_chain_keeps_its_original_root_after_upgrade(tmp_path):
     runner, reduced = _signed_three_to_two(tmp_path)
     _strip_board_identity(runner)
     assert all(r.metadata.pr_board_root is None for r in _records(runner))
-    runner.pr_payload["headRefOid"] = "fed789"
+    runner.pr_payload["headRefOid"] = "59e9fef4edb549af995ec1617c78fd9f54405f29"
     runner.codex_outputs.append(structured_pr_review())
     runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini"))
     assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
@@ -1276,7 +1276,7 @@ def test_legacy_signed_chain_keeps_its_original_root_after_upgrade(tmp_path):
     assert all(m.reviewer_board_amendment_digest for m in upgraded)
     assert _links(runner) == []
     _qualify(runner, reduced)
-    runner.pr_payload["headRefOid"] = "aaa111"
+    runner.pr_payload["headRefOid"] = "4a0cde71aee7158542d013fc0c9f5acfc735c612"
     runner.codex_outputs.append(structured_pr_review())
     runner.gemini_outputs.append(structured_pr_review(reviewer="Google Gemini"))
     assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
@@ -1418,7 +1418,7 @@ def test_malformed_board_history_fails_closed(defect):
         bound_review = _attach_round_metadata(
             structured_pr_review(reviewer="a"),
             PostedRoundMetadata(
-                flow="pr", role="reviewer", agent="a", round_number=1, subject="abc123",
+                flow="pr", role="reviewer", agent="a", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 state="approved", seat_binding=root.seat_binding(),
             ),
         )
@@ -1428,7 +1428,7 @@ def test_malformed_board_history_fails_closed(defect):
     if defect == "identity-without-root":
         bad = _attach_round_metadata(
             "x", PostedRoundMetadata(
-                flow="pr", role="summary", agent="Orchestrator", round_number=2, subject="abc123",
+                flow="pr", role="summary", agent="Orchestrator", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 reviewer_board_change_digest="a" * 64,
             ),
         )
@@ -1483,7 +1483,7 @@ def _review_record(index, agent, new_items, *, round_number=2):
         index=index,
         metadata=PostedRoundMetadata(
             flow="pr", role="reviewer", agent=agent, round_number=round_number,
-            subject="abc123", state="blocking", new_items=tuple(new_items),
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", state="blocking", new_items=tuple(new_items),
         ),
     )
 
@@ -1579,7 +1579,7 @@ _CANARY = "Attach the canary dashboard for this head."
 def _evidence_history(release_head):
     """Gemini's deploy-log request was cleared at ``release_head`` by a durable
     release; in round 2 Gemini (outgoing) re-emits it and Codex (retained)
-    emits a new request, at head abc123."""
+    emits a new request, at head 6367c48dd193d56ea7b0baad25b19455e529f5ee."""
     from coding_review_agent_loop.round_state import EvidenceReleaseRecord
     from coding_review_agent_loop.unresolved_items import evidence_obligation_identity
 
@@ -1587,9 +1587,9 @@ def _evidence_history(release_head):
         "## Exact-head evidence accepted\n\n-- coding-review-agent-loop",
         PostedRoundMetadata(
             flow="pr", role="summary", agent="Orchestrator", round_number=1,
-            subject="abc123", state="blocking", phase="evidence-release",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", state="blocking", phase="evidence-release",
             evidence_release=EvidenceReleaseRecord(
-                released_head="abc123", reason="evidence-cleared",
+                released_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", reason="evidence-cleared",
                 signed_requirement_ids_surfaced=(), allowed_rounds=5,
                 watch_failure_extension_used=False, watch_head_extension_used=False,
             ),
@@ -1606,7 +1606,7 @@ def _evidence_history(release_head):
 
 
 @pytest.mark.parametrize("activation", ["immediate", "after-crash"])
-@pytest.mark.parametrize("cleared_at", ["same-head", "other-head"])
+@pytest.mark.parametrize("cleared_at", ["same-head", "5e6741348108b11e3f3ef936c335b1967d17ac6c"])
 def test_evidence_requests_survive_a_board_change_with_their_head_scoped_clearances(
     tmp_path, monkeypatch, activation, cleared_at
 ):
@@ -1616,7 +1616,7 @@ def test_evidence_requests_survive_a_board_change_with_their_head_scoped_clearan
     another head it is a new obligation.  The retained reviewer's request is
     rebuilt.  Open evidence obligations block qualification.
     """
-    runner = _legacy_runner(_evidence_history("abc123" if cleared_at == "same-head" else "f" * 40))
+    runner = _legacy_runner(_evidence_history("6367c48dd193d56ea7b0baad25b19455e529f5ee" if cleared_at == "same-head" else "f" * 40))
     swapped = make_config(tmp_path, reviewer=("codex", "antigravity"))
     if activation == "after-crash":
         with monkeypatch.context() as patch:
@@ -1629,7 +1629,7 @@ def test_evidence_requests_survive_a_board_change_with_their_head_scoped_clearan
     owed = [
         {"item_id": item_id, "disposition": "resolved",
          "note": "The code looks right; the human evidence is still owed."}
-        for item_id in (("item-1", "item-2") if cleared_at == "other-head" else ("item-1",))
+        for item_id in (("item-1", "item-2") if cleared_at == "5e6741348108b11e3f3ef936c335b1967d17ac6c" else ("item-1",))
     ]
     runner.codex_outputs.append(structured_pr_review(prior_item_dispositions=owed))
     runner.antigravity_outputs.append(
@@ -1648,7 +1648,7 @@ def test_evidence_requests_survive_a_board_change_with_their_head_scoped_clearan
     assert round_three
     texts = {item.text for item in round_three[0].prior_items if item.obligation_kind}
     assert _CANARY in texts
-    assert (_DEPLOY_LOG in texts) is (cleared_at == "other-head")
+    assert (_DEPLOY_LOG in texts) is (cleared_at == "5e6741348108b11e3f3ef936c335b1967d17ac6c")
     # Human-only evidence is still owed: the run neither approves nor merges.
     assert outcome != 0
     assert not any(c.startswith("PR #77 approved") for c in runner.comments)
@@ -1671,7 +1671,7 @@ def test_frozen_evidence_is_answered_by_the_new_board_after_a_change(
     unreconciled pass, so carry-over keeps both obligations frozen, and the
     freeze stays in force across the change.  The new board answers the
     signed input in an evidence-response pass whose reconciliation clears
-    both at abc123.  Gemini's re-emission reopens nothing, and the PR
+    both at 6367c48dd193d56ea7b0baad25b19455e529f5ee.  Gemini's re-emission reopens nothing, and the PR
     qualifies.
     """
     from pr_loop_test_helpers import _evidence_review, _signed
@@ -1681,10 +1681,10 @@ def test_frozen_evidence_is_answered_by_the_new_board_after_a_change(
         gemini_outputs=[_evidence_review(reviewer="Google Gemini", evidence=[_LIVE_SUITE])],
     )
     original = make_config(tmp_path, reviewer=("codex", "gemini"))
-    with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
         run_pr_loop(runner, pr_number=77, config=original)
     runner.pr_payload["comments"].append(
-        _signed("Live suite and deploy log at abc123: 11 passed, deploy healthy.", 1)
+        _signed("Live suite and deploy log at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed, deploy healthy.", 1)
     )
     resolved = [
         {"item_id": item_id, "disposition": "resolved",
@@ -1739,13 +1739,13 @@ def test_frozen_evidence_is_answered_by_the_new_board_after_a_change(
     }
     # The freeze stayed in force across the change: the new board answered the
     # signed input in an evidence-response pass, and its reconciliation
-    # cleared both requests at abc123 (Gemini's, whose requester left the
+    # cleared both requests at 6367c48dd193d56ea7b0baad25b19455e529f5ee (Gemini's, whose requester left the
     # board, needed every configured reviewer).  Gemini's re-emission at that
     # head reopened nothing: one freeze, one release, nothing owed.
     assert {m.phase for m in after} == {"evidence-response"}
     releases = [r.metadata for r in _records(runner) if r.metadata.phase == "evidence-release"]
     assert [m.evidence_release.reason for m in releases] == ["evidence-cleared"]
-    assert {identity for identity, head in releases[0].evidence_clearances if head == "abc123"} >= {
+    assert {identity for identity, head in releases[0].evidence_clearances if head == "6367c48dd193d56ea7b0baad25b19455e529f5ee"} >= {
         item.obligation_identity for item in after[0].prior_items if item.obligation_kind
     }
     assert len([r for r in _records(runner) if r.metadata.phase == "evidence-freeze"]) == 1
@@ -1753,7 +1753,7 @@ def test_frozen_evidence_is_answered_by_the_new_board_after_a_change(
 
 
 @pytest.mark.parametrize("activation", ["immediate", "after-crash"])
-@pytest.mark.parametrize("head", ["same-head", "new-head"])
+@pytest.mark.parametrize("head", ["same-head", "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6"])
 def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
     tmp_path, monkeypatch, activation, head
 ):
@@ -1766,7 +1766,7 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
     clearances) is recorded, then the run stops.  After the board change --
     immediate or recovered after a crash -- carry-over keeps that
     post-reconciliation ledger as it is (D4b step 2), so the re-emission at
-    abc123 reopens nothing: no obligation, no second freeze, and the PR
+    6367c48dd193d56ea7b0baad25b19455e529f5ee reopens nothing: no obligation, no second freeze, and the PR
     qualifies.  (Rebuilding an unreconciled anchor round's requests against
     the accumulated clearances is pinned by
     test_evidence_requests_survive_a_board_change_with_their_head_scoped_clearances.)  At a different head the retained requester's same request is a
@@ -1779,10 +1779,10 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
         gemini_outputs=[_evidence_review(reviewer="Google Gemini", evidence=[_LIVE_SUITE])],
     )
     original = make_config(tmp_path, reviewer=("codex", "gemini"))
-    with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
         run_pr_loop(runner, pr_number=77, config=original)
     runner.pr_payload["comments"].append(
-        _signed("Live suite and deploy log at abc123: 11 passed, deploy healthy.", 1)
+        _signed("Live suite and deploy log at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed, deploy healthy.", 1)
     )
     resolved = [
         {"item_id": item_id, "disposition": "resolved",
@@ -1809,7 +1809,7 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
             run_pr_loop(runner, pr_number=77, config=original)
     (release,) = [r.metadata for r in _records(runner) if r.metadata.phase == "evidence-release"]
     assert release.evidence_release.reason == "evidence-cleared"
-    cleared = {identity for identity, at in release.evidence_clearances if at == "abc123"}
+    cleared = {identity for identity, at in release.evidence_clearances if at == "6367c48dd193d56ea7b0baad25b19455e529f5ee"}
     assert len(cleared) == 2
     anchor = board_anchor(_records(runner))
     assert release.round_number == anchor.round_number
@@ -1819,8 +1819,8 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
         for r in _records(runner)
     )
     swapped = make_config(tmp_path, reviewer=("codex", "antigravity"))
-    if head == "new-head":
-        runner.pr_payload["headRefOid"] = "def456"
+    if head == "4ebf8a1679f50e9e49fc965072f996bfe0dc18c6":
+        runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     if activation == "after-crash":
         with monkeypatch.context() as patch:
             _crash_after_link(patch)
@@ -1833,10 +1833,10 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
         assert run_pr_loop(runner, pr_number=77, config=swapped) == 0
         assert "gemini" not in _agents(runner, start)
     else:
-        # At def456 Codex, the retained requester, asks for its evidence again.
+        # At 0b3d8b29493059afd7f9912106279c4643ac4939 Codex, the retained requester, asks for its evidence again.
         runner.codex_outputs.append(_evidence_review(evidence=[_LIVE_LOG], hr=True))
         runner.antigravity_outputs.append(_evidence_review(reviewer="Antigravity", hr=True))
-        with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head def456"):
+        with pytest.raises(pr_loop_support_module.HumanDecisionRequiredError, match="frozen at head 0b3d8b29493059afd7f9912106279c4643ac4939"):
             run_pr_loop(runner, pr_number=77, config=swapped)
     (payload,) = _link_payloads(runner)
     assert payload["anchor_round"] == anchor.round_number and payload["advance"] is True
@@ -1851,15 +1851,15 @@ def test_evidence_released_in_the_anchor_round_stays_cleared_at_that_head(
     assert carried == []
     freezes = [r.metadata for r in _records(runner) if r.metadata.phase == "evidence-freeze"]
     if head == "same-head":
-        assert [m.subject for m in freezes] == ["abc123"]
+        assert [m.subject for m in freezes] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
         assert not any(m.phase == "evidence-response" for m in after)
         _qualify(runner, swapped)
     else:
-        assert [m.subject for m in freezes] == ["abc123", "def456"]
+        assert [m.subject for m in freezes] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee", "0b3d8b29493059afd7f9912106279c4643ac4939"]
         owed = [item for item in freezes[-1].prior_items if item.obligation_kind]
-        # The same obligation identity, cleared only at abc123, is owed at def456.
+        # The same obligation identity, cleared only at 6367c48dd193d56ea7b0baad25b19455e529f5ee, is owed at 0b3d8b29493059afd7f9912106279c4643ac4939.
         assert [(item.text, item.reviewer, item.candidate_head_sha) for item in owed] == [
-            (_LIVE_LOG, "Codex", "def456")
+            (_LIVE_LOG, "Codex", "0b3d8b29493059afd7f9912106279c4643ac4939")
         ]
         assert owed[0].obligation_identity in cleared
 
@@ -2127,7 +2127,7 @@ def test_co_owned_pre_epoch_item_is_carried_while_an_owner_is_pending():
 
 
 def _selective_prelaunch_history():
-    """Round 1 reviewed at abc123 (Gemini raised item-1); round 2 holds only its
+    """Round 1 reviewed at 6367c48dd193d56ea7b0baad25b19455e529f5ee (Gemini raised item-1); round 2 holds only its
     scheduler-prelaunch record (the run stopped right after posting it)."""
     from coding_review_agent_loop.review_scheduling import make_contract
 
@@ -2138,7 +2138,7 @@ def _selective_prelaunch_history():
         return _legacy(
             "summary", "Orchestrator", round_number, phase="scheduler-prelaunch",
             prior_items=prior, scheduler_contract=contract.as_dict(),
-            scheduler_previous_sha=None, scheduler_current_sha="abc123",
+            scheduler_previous_sha=None, scheduler_current_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             scheduler_obligation_digest="0" * 16, scheduler_selected_reviewers=("Codex", "Gemini"),
             scheduler_reasons=("full board",), scheduler_final_sweep=False,
             scheduler_force_full=False, scheduler_calls_avoided=0,
@@ -2339,7 +2339,7 @@ def test_pending_signed_removal_after_a_link_is_authorized_from_the_link_board(t
         changed = (a, b, c, _seat(tmp_path, "d", "codex", "gpt-d"))
         floor = {"min_reviewers": 4}
         refusal = "3 reviewer\\(s\\) is below the floor of 4"
-    runner.pr_payload["headRefOid"] = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     _queue_reviews(runner, changed)
     assert run_pr_loop(runner, pr_number=77, config=_named(tmp_path, *changed, **selective, **floor)) == 0
     (first,) = _link_payloads(runner)
@@ -2354,7 +2354,7 @@ def test_pending_signed_removal_after_a_link_is_authorized_from_the_link_board(t
     template = refused.value.args[0][refused.value.args[0].index("Reviewer board amendment:"):]
     assert '"c"' in template.split('"removed_reviewers"')[1].split("]")[0]
     _append(runner, template.replace("<why the removed reviewer cannot be reached>", "c is out of quota."))
-    runner.pr_payload["headRefOid"] = "fed789"
+    runner.pr_payload["headRefOid"] = "59e9fef4edb549af995ec1617c78fd9f54405f29"
     _queue_reviews(runner, reduced_seats)
     assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
     assert len(_link_payloads(runner)) == 1
@@ -2395,7 +2395,7 @@ def test_named_legacy_all_reviewers_signed_reduction(tmp_path, floor, flags):
     kept = (sol, opus)
     reduced = _named(tmp_path, *kept, **floor_kwargs)
     original = _named(tmp_path, *board, **floor_kwargs)
-    runner.pr_payload["headRefOid"] = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     comments = len(runner.pr_payload["comments"])
     before = len(runner.commands)
     with pytest.raises(AgentLoopError, match="below the floor of 3") as refused:
@@ -4144,7 +4144,7 @@ def _unanimous_with_open_same_plan_item(tmp_path, kind="same-plan"):
                 dataclasses.replace(
                     item, authority="machine", obligation_kind="github-pr-checks",
                     lifecycle="qualification_ready", failed_head_sha="old-head",
-                    candidate_head_sha="abc123", obligation_identity="github-pr-checks:item-1",
+                    candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", obligation_identity="github-pr-checks:item-1",
                 )
                 if item.item_id == "item-1" else item
                 for item in items
@@ -4268,7 +4268,7 @@ def _legacy_keyless_plan_with_handoff(tmp_path, monkeypatch, requirement, *, ack
     plan = next(r.metadata.canonical_plan for r in _plan_records(runner) if r.metadata.role == "coder")
     _append_issue_comment(runner, format_one_shot_impl_handoff_comment(
         parent_issue=56, mode="implement-one-shot", plan_hash=unanchored.plan_hash,
-        plan_subject=_plan_subject(plan), pr_number=77, pr_head_sha="abc123",
+        plan_subject=_plan_subject(plan), pr_number=77, pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     ), login="agent-loop", author_id=_PLAN_ACTOR[1])
     classified = _classify(runner, config, [requirement])
     if acknowledged:
@@ -4628,7 +4628,7 @@ def _legacy_plan_with_one_shot_handoff(tmp_path, monkeypatch, requirement):
     identity = _current_execution_recommendation(plan, []).identity()
     _append_issue_comment(runner, format_one_shot_impl_handoff_comment(
         parent_issue=56, mode="implement-one-shot", plan_hash=approved_plan_hash(plan),
-        plan_subject=_plan_subject(plan), pr_number=77, pr_head_sha="abc123",
+        plan_subject=_plan_subject(plan), pr_number=77, pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         strategy="one-shot", topology_source=identity["topology_source"],
         execution_strategy_contract_version=1,
         recommendation_digest=identity["recommendation_sha256"],
@@ -4811,7 +4811,7 @@ def _owning_handoff(*, issue_number=56, login="coding-review-agent-loop", author
         "createdAt": "2026-05-19T09:00:00Z",
         "body": format_issue_pr_handoff_comment(
             issue_number=issue_number, pr_number=77,
-            pr_url="https://github.com/OWNER/REPO/pull/77", pr_head_sha="abc123",
+            pr_url="https://github.com/OWNER/REPO/pull/77", pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             flow="issue-implementation", plan_hash=None,
         ),
         "_rest_author_id": author_id,

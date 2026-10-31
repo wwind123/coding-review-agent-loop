@@ -130,7 +130,7 @@ def test_legacy_cli_pr_fallback_counts_one_exact_head_approval(tmp_path):
     reviews = [comment for comment in runner.comments if "**Review verdict:**" in comment]
     assert len(reviews) == 1
     assert "Approved" in reviews[0]
-    assert "abc123" == runner.pr_payload["headRefOid"]
+    assert "6367c48dd193d56ea7b0baad25b19455e529f5ee" == runner.pr_payload["headRefOid"]
 
 
 def test_two_named_antigravity_seats_approve_one_pr_head(tmp_path):
@@ -954,9 +954,9 @@ def test_antigravity_after_snapshot_runs_after_gemini_cleanup_under_lock(
     runner = ObservedRunner(
         antigravity_outputs=[(output, 1)],
         git_probe_results=[
-            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "6367c48dd193d56ea7b0baad25b19455e529f5ee\n", "returncode": 0},
             {"stdout": "", "returncode": 0},
-            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "6367c48dd193d56ea7b0baad25b19455e529f5ee\n", "returncode": 0},
             {"stdout": "", "returncode": 0},
         ],
     )

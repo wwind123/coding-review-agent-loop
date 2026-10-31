@@ -129,7 +129,7 @@ def test_pr_fresh_authorization_binds_server_recovered_approved_plan(tmp_path, m
     runner = FakeRunner(
         issue_comments=_approved_issue_plan_comments(plan),
         pr_payload={
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
@@ -162,13 +162,13 @@ def test_pr_ordinary_resume_binds_server_recovered_approved_plan_before_activati
     runner = FakeRunner(
         issue_comments=_approved_issue_plan_comments(plan),
         pr_payload={
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
     handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="abc123", branch="agent-loop/managed-56",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="voluntary", override_nonce="opening-nonce",
     )
@@ -293,13 +293,13 @@ def test_managed_issue_fix_round_publishes_correlated_head_continuity(
         ],
         claude_outputs=[structured_coder_followup(addressed_items=["item-1"])],
         pr_payload={
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
     handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="abc123", branch="agent-loop/managed-56",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="voluntary", override_nonce="root",
         authorization_kind="creation", authorization_comment_id=17,
@@ -336,8 +336,8 @@ def test_managed_issue_fix_round_publishes_correlated_head_continuity(
         )
 
     assert len(selected) == len(published) == 1
-    assert selected[0]["predecessor_head"] == "abc123"
-    assert selected[0]["new_head"] == "abc123-coder-1"
+    assert selected[0]["predecessor_head"] == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert selected[0]["new_head"] == "525753a4b04bd57d874211ba1fade250c3ff6d82"
     assert selected[0]["after_comment_id"] == 17
     assert published[0]["round_comment_ids"] == (88, 89)
 
@@ -463,7 +463,7 @@ def test_pr_review_runs_when_pr_and_issue_text_name_a_reserved_token(tmp_path, c
 def test_plain_pr_recovery_accepts_loop_created_managed_pr_body(tmp_path):
     encoded = base64.urlsafe_b64encode(
         json.dumps(
-            {"source_branch": "feature/review-context", "source_sha": "abc123"},
+            {"source_branch": "feature/review-context", "source_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
@@ -483,7 +483,7 @@ def test_plain_pr_recovery_accepts_loop_created_managed_pr_body(tmp_path):
 def test_plain_pr_recovery_accepts_managed_pr_head_after_creation_sha_advanced(tmp_path):
     encoded = base64.urlsafe_b64encode(
         json.dumps(
-            {"source_branch": "feature/review-context", "source_sha": "abc123"},
+            {"source_branch": "feature/review-context", "source_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
@@ -493,7 +493,7 @@ def test_plain_pr_recovery_accepts_managed_pr_head_after_creation_sha_advanced(t
         pr_payload={
             "body": f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {encoded} -->",
             "headRefName": "agent-loop/managed-direct-token",
-            "headRefOid": "abc123-coder-1",
+            "headRefOid": "525753a4b04bd57d874211ba1fade250c3ff6d82",
         },
     )
 
@@ -504,7 +504,7 @@ def test_plain_pr_recovery_accepts_managed_pr_head_after_creation_sha_advanced(t
 def test_in_process_managed_pr_handoff_still_requires_creation_sha(tmp_path):
     encoded = base64.urlsafe_b64encode(
         json.dumps(
-            {"source_branch": "feature/review-context", "source_sha": "abc123"},
+            {"source_branch": "feature/review-context", "source_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
             separators=(",", ":"),
             sort_keys=True,
         ).encode()
@@ -513,7 +513,7 @@ def test_in_process_managed_pr_handoff_still_requires_creation_sha(tmp_path):
         pr_payload={
             "body": f"<!-- AGENT_MANAGED_PR_SOURCE_V1 {encoded} -->",
             "headRefName": "agent-loop/managed-direct-token",
-            "headRefOid": "abc123-coder-1",
+            "headRefOid": "525753a4b04bd57d874211ba1fade250c3ff6d82",
         },
     )
 
@@ -524,7 +524,7 @@ def test_in_process_managed_pr_handoff_still_requires_creation_sha(tmp_path):
             config=make_config(tmp_path),
             managed_pr_origin=(
                 "feature/review-context",
-                "abc123",
+                "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "agent-loop/managed-direct-token",
                 None,
             ),
@@ -554,7 +554,7 @@ def test_approved_followup_public_renderings_sanitize_historical_marker_mentions
     plan_reconciliation = reconcile_plan_approved_followups([source])
     plan_body = _plan_followup_issue_body(
         issue_number=56,
-        plan_hash="abc123",
+        plan_hash="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         plan_subject="Plan AGENT_MANAGED_PR_SOURCE_V1 handling.",
         followup=plan_reconciliation.selected_groups[0],
     )
@@ -749,7 +749,7 @@ def test_direct_pr_resume_uses_handoff_bound_plan_when_later_plan_exists(tmp_pat
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation",
         plan_hash=panel_evidence.approved_plan_hash(old_plan),
     )
@@ -802,7 +802,7 @@ def _handoff_comment(plan_hash: str) -> IssueComment:
         body=format_issue_pr_handoff_comment(
             issue_number=56, pr_number=77,
             pr_url="https://github.com/OWNER/REPO/pull/77",
-            pr_head_sha="abc123", flow="approved-plan-implementation",
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="approved-plan-implementation",
             plan_hash=plan_hash,
         ),
     )
@@ -819,7 +819,7 @@ def _issue(number: int, comments: tuple[IssueComment, ...]) -> IssueContext:
 def _managed_resume_runner() -> FakeRunner:
     return FakeRunner(
         pr_payload={
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
@@ -836,7 +836,7 @@ def _ordinary_managed_config(tmp_path, **overrides):
 def _issue_created_handoff() -> pr_loop_support.AuthenticatedIssueCreatedHandoff:
     return pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="abc123", branch="agent-loop/managed-56",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="voluntary", override_nonce="opening-nonce",
     )

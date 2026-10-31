@@ -1487,13 +1487,13 @@ def _evidence_stop_messages(oversized=False):
         item_id=f"item-{index}", reviewer="Human requester" * (100 if oversized else 1),
         text="Run the live suite", source_round=1, status="blocking", authority="machine",
         obligation_kind="human-exact-head-evidence", lifecycle="evidence_frozen",
-        candidate_head_sha="abc123", obligation_identity=f"request-{index}",
+        candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", obligation_identity=f"request-{index}",
     ) for index in range(100 if oversized else 1)]
     return (
         (render_evidence_stall_decision(
-            PR, "abc123", "matrix", {f"row-{i}": "missing" for i in range(5000 if oversized else 1)}, 2
+            PR, "6367c48dd193d56ea7b0baad25b19455e529f5ee", "matrix", {f"row-{i}": "missing" for i in range(5000 if oversized else 1)}, 2
         ), "pr-evidence-stall"),
-        (_evidence_freeze_diagnostic(pr_number=PR, head_sha="abc123", items=items), "pr-evidence-freeze"),
+        (_evidence_freeze_diagnostic(pr_number=PR, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", items=items), "pr-evidence-freeze"),
     )
 
 
@@ -1515,7 +1515,7 @@ def test_evidence_stop_renderers_classify_and_bound_short_and_oversized_messages
                 assert body == render_pr_scheduling_diagnostic("round 5", message)
             assert recognize_diagnostic(message) is None
             assert recognize_diagnostic(body + "\n<!-- AGENT_LOOP_" + "META: e30= -->") is None
-            for negative in ("unrelated stop\n" + message, "Detail: " + message, "PR #0 is frozen at head abc123"):
+            for negative in ("unrelated stop\n" + message, "Detail: " + message, "PR #0 is frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
                 other = recognize_diagnostic(render_pr_scheduling_diagnostic("round 5", negative))
                 assert other.reason == "scheduling-stop"
 

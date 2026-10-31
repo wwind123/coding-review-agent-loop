@@ -354,7 +354,7 @@ def test_plan_first_pr_recovery_reconciles_fresh_strategy_before_resume(
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation",
         plan_hash=approved_plan_hash(canonical_plan),
     )
@@ -383,7 +383,7 @@ def test_plan_first_plan_only_legacy_pr_recovery_still_reviews_without_plan_roun
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="issue-implementation",
         plan_hash=None,
     )
@@ -443,7 +443,7 @@ def test_plan_first_plan_only_reconciles_one_shot_against_staged_state(tmp_path)
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation",
         plan_hash=approved_plan_hash(canonical_plan),
     )

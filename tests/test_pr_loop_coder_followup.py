@@ -168,19 +168,19 @@ def test_m1034_followup_dispatch_head_round_trips_and_legacy_records_stay_byte_s
 
     recorded = PostedRoundMetadata(
         flow="pr", role="coder", agent="Claude", round_number=2,
-        subject="abc123", followup_dispatch_head="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", followup_dispatch_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     decoded = _decode_round_metadata(_encode_round_metadata(recorded))
-    assert decoded.followup_dispatch_head == "abc123"
-    assert followup_head_unchanged_sha(decoded) == "abc123"
+    assert decoded.followup_dispatch_head == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert followup_head_unchanged_sha(decoded) == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     # An advanced head never yields the signal.
-    assert followup_head_unchanged_sha(dataclasses.replace(recorded, subject="def456")) is None
+    assert followup_head_unchanged_sha(dataclasses.replace(recorded, subject="0b3d8b29493059afd7f9912106279c4643ac4939")) is None
     assert followup_head_unchanged_sha(dataclasses.replace(recorded, subject="unknown")) is None
     assert followup_head_unchanged_sha(dataclasses.replace(recorded, role="reviewer")) is None
     assert followup_head_unchanged_sha(None) is None
 
     legacy = PostedRoundMetadata(
-        flow="pr", role="coder", agent="Claude", round_number=2, subject="abc123",
+        flow="pr", role="coder", agent="Claude", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     encoded = _encode_round_metadata(legacy)
     legacy_decoded = _decode_round_metadata(encoded)
@@ -200,10 +200,10 @@ def test_m1034_malformed_followup_dispatch_head_is_rejected():
     with pytest.raises(ValueError):
         PostedRoundMetadata(
             flow="pr", role="coder", agent="Claude", round_number=2,
-            subject="abc123", followup_dispatch_head="not a sha!",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", followup_dispatch_head="not a sha!",
         )
     # Placeholders and non-hex names are not Git commit SHAs.
-    for bad in ("unknown", "new-sha", "arbitrary.word"):
+    for bad in ("unknown", "new-head", "arbitrary.word"):
         with pytest.raises(ValueError, match="followup_dispatch_head"):
             PostedRoundMetadata(
                 flow="pr", role="coder", agent="Claude", round_number=2,
@@ -211,11 +211,11 @@ def test_m1034_malformed_followup_dispatch_head_is_rejected():
             )
     valid = dict(decode_mapping(_encode_round_metadata(PostedRoundMetadata(
         flow="pr", role="coder", agent="Claude", round_number=2,
-        subject="abc123", followup_dispatch_head="abc123",
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", followup_dispatch_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     ))))
-    assert _decode_round_metadata_mapping(valid).followup_dispatch_head == "abc123"
+    assert _decode_round_metadata_mapping(valid).followup_dispatch_head == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     for bad in (
-        "", 7, "x" * 200, "bad sha", None, "unknown", "new-sha", "arbitrary.word",
+        "", 7, "x" * 200, "bad sha", None, "unknown", "new-head", "arbitrary.word",
         "ABC123", "abc", "a" * 65,
     ):
         with pytest.raises(AgentLoopError, match="followup_dispatch_head"):
@@ -250,15 +250,15 @@ def test_m1034_renderer_frames_unchanged_head_follow_up_as_claims():
     assert "Orchestrator note" not in baseline
 
     framed = render_public_agent_comment(
-        kind="coder_followup", parsed=parsed, agent="Claude", head_unchanged_sha="abc123"
+        kind="coder_followup", parsed=parsed, agent="Claude", head_unchanged_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
     assert framed.startswith(
-        "## Coder follow-up\n\n> Orchestrator note: the PR head was unchanged at `abc123` "
+        "## Coder follow-up\n\n> Orchestrator note: the PR head was unchanged at `6367c48dd193d56ea7b0baad25b19455e529f5ee` "
         "after this follow-up; no new commit is visible on the PR branch."
     )
     assert "no commit was made" not in framed
     assert "Coder summary (claim, unverified): Fixed both items." in framed
-    assert "### Claimed already present at `abc123` (PR head unchanged)" in framed
+    assert "### Claimed already present at `6367c48dd193d56ea7b0baad25b19455e529f5ee` (PR head unchanged)" in framed
     assert "### Addressed items" not in framed
     assert "  - Coder claim: Qualified the network advice." in framed
     assert "Resolution:" not in framed
@@ -272,8 +272,8 @@ def test_m1034_freeform_notice_prefixes_body():
         add_coder_followup_head_unchanged_notice,
     )
 
-    framed = add_coder_followup_head_unchanged_notice("Fixed it.\n-- Claude", "abc123")
-    assert framed.startswith("> Orchestrator note: the PR head was unchanged at `abc123`")
+    framed = add_coder_followup_head_unchanged_notice("Fixed it.\n-- Claude", "6367c48dd193d56ea7b0baad25b19455e529f5ee")
+    assert framed.startswith("> Orchestrator note: the PR head was unchanged at `6367c48dd193d56ea7b0baad25b19455e529f5ee`")
     assert framed.endswith("\n\nFixed it.\n-- Claude")
 
 
@@ -284,20 +284,20 @@ def test_m1034_reviewer_context_flags_unchanged_head_and_keeps_other_bytes():
         addressed_item_notes={"item-1": "Qualified the network advice."},
     )
     legacy = PostedRoundMetadata(
-        flow="pr", role="coder", agent="Claude", round_number=2, subject="abc123",
+        flow="pr", role="coder", agent="Claude", round_number=2, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     advanced = dataclasses.replace(legacy, followup_dispatch_head="0dd000")
-    unchanged = dataclasses.replace(legacy, followup_dispatch_head="abc123")
+    unchanged = dataclasses.replace(legacy, followup_dispatch_head="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
-    legacy_text = pr_loop_support._coder_followup_review_context(raw, legacy, head_sha="abc123")
+    legacy_text = pr_loop_support._coder_followup_review_context(raw, legacy, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert '"summary": "Fixed both items."' in legacy_text
     assert "pr_head_unchanged_during_followup" not in legacy_text
     # Changed-head records render exactly like historical records.
-    assert pr_loop_support._coder_followup_review_context(raw, advanced, head_sha="abc123") == legacy_text
+    assert pr_loop_support._coder_followup_review_context(raw, advanced, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee") == legacy_text
 
-    framed = pr_loop_support._coder_followup_review_context(raw, unchanged, head_sha="abc123")
+    framed = pr_loop_support._coder_followup_review_context(raw, unchanged, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert '"pr_head_unchanged_during_followup": true' in framed
-    assert '"followup_dispatch_head": "abc123"' in framed
+    assert '"followup_dispatch_head": "6367c48dd193d56ea7b0baad25b19455e529f5ee"' in framed
     assert '"coder_summary_claim": "Fixed both items."' in framed
     assert '"claimed_addressed_items"' in framed
     assert '"claimed_addressed_item_notes"' in framed
@@ -335,16 +335,16 @@ def test_m1034_unchanged_head_follow_up_is_logged_and_recorded_as_claims(tmp_pat
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     err = capsys.readouterr().err
-    assert "Round 1: Claude follow-up left PR head abc123 unchanged (1/2); re-reviewing" in err
+    assert "Round 1: Claude follow-up left PR head 6367c48dd193 unchanged (1/2); re-reviewing" in err
     assert "pushed updates" not in err
     (coder_comment,) = _m1034_coder_comments(runner)
-    assert "> Orchestrator note: the PR head was unchanged at `abc123`" in coder_comment
+    assert "> Orchestrator note: the PR head was unchanged at `6367c48dd193d56ea7b0baad25b19455e529f5ee`" in coder_comment
     assert "Coder summary (claim, unverified): Fixed both items." in coder_comment
-    assert "### Claimed already present at `abc123` (PR head unchanged)" in coder_comment
+    assert "### Claimed already present at `6367c48dd193d56ea7b0baad25b19455e529f5ee` (PR head unchanged)" in coder_comment
     assert "  - Coder claim: Qualified the network advice." in coder_comment
     assert "### Addressed items" not in coder_comment
     metadata = _m1034_metadata(coder_comment)
-    assert metadata.followup_dispatch_head == metadata.subject == "abc123"
+    assert metadata.followup_dispatch_head == metadata.subject == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     # The ledger meaning of addressed_items and the raw response are unchanged.
     raw = validate_structured_coder_followup(metadata.raw_structured_coder_response)
     assert raw is not None and tuple(raw.addressed_items) == ("item-1", "item-2")
@@ -379,7 +379,7 @@ def test_m1034_advanced_head_follow_up_keeps_legacy_framing(tmp_path, capsys):
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     err = capsys.readouterr().err
-    assert "Round 1: PR head advanced abc123..abc123-coder during Claude follow-up; re-reviewing" in err
+    assert "Round 1: PR head advanced 6367c48dd193..525753a4b04b during Claude follow-up; re-reviewing" in err
     assert "pushed updates" not in err
     (coder_comment,) = _m1034_coder_comments(runner)
     assert "### Addressed items" in coder_comment
@@ -387,8 +387,8 @@ def test_m1034_advanced_head_follow_up_keeps_legacy_framing(tmp_path, capsys):
     assert "Orchestrator note" not in coder_comment
     assert "Claimed already present" not in coder_comment
     metadata = _m1034_metadata(coder_comment)
-    assert metadata.followup_dispatch_head == "abc123"
-    assert metadata.subject == "abc123-coder-1"
+    assert metadata.followup_dispatch_head == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert metadata.subject == "525753a4b04bd57d874211ba1fade250c3ff6d82"
     second_review = _m1034_reviewer_prompts(runner)[1]
     assert "pr_head_unchanged_during_followup" not in second_review
     assert '"summary": "Fixed the README."' in second_review
@@ -424,15 +424,15 @@ def test_m1034_unchanged_head_limit_still_stops_without_push_log(tmp_path, capsy
     assert len(_m1034_reviewer_prompts(runner)) == 2
     err = capsys.readouterr().err
     assert "pushed updates for re-review" not in err
-    assert "left PR head abc123 unchanged (1/2)" in err
+    assert "left PR head 6367c48dd193 unchanged (1/2)" in err
     assert "unchanged (2/2)" not in err
     coder_comments = _m1034_coder_comments(runner)
     assert len(coder_comments) == 2
     for comment in coder_comments:
-        assert "### Claimed already present at `abc123` (PR head unchanged)" in comment
+        assert "### Claimed already present at `6367c48dd193d56ea7b0baad25b19455e529f5ee` (PR head unchanged)" in comment
 
 
-def _m1034_recovery_runner(head_sha="c0ffee42"):
+def _m1034_recovery_runner(head_sha="1c8c4b99308a327bd47c96b4e086e7804c18649b"):
     old_item = UnresolvedReviewItem(
         item_id="item-2",
         reviewer="Google Gemini",
@@ -487,7 +487,7 @@ def test_m1034_recovery_round_without_commit_records_claims(tmp_path, capsys):
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
-    assert "Recovery context: the PR head `c0ffee42` was advanced by a commit" in coder_prompt
+    assert "Recovery context: the PR head `1c8c4b99308a327bd47c96b4e086e7804c18649b` was advanced by a commit" in coder_prompt
     assert "may or may not satisfy the recovered items" in coder_prompt
     assert "Check each recovered item against the current head." in coder_prompt
     assert "keep any unsatisfied item in remaining_items" in coder_prompt
@@ -497,34 +497,27 @@ def test_m1034_recovery_round_without_commit_records_claims(tmp_path, capsys):
         runner.commands, ["codex", "exec"]
     )
     err = capsys.readouterr().err
-    assert "Claude follow-up left PR head c0ffee42 unchanged (1/2)" in err
+    assert "Claude follow-up left PR head 1c8c4b99308a unchanged (1/2)" in err
     assert "pushed updates" not in err
     (coder_comment,) = _m1034_coder_comments(runner)
-    assert "> Orchestrator note: the PR head was unchanged at `c0ffee42`" in coder_comment
-    assert "### Claimed already present at `c0ffee42` (PR head unchanged)" in coder_comment
+    assert "> Orchestrator note: the PR head was unchanged at `1c8c4b99308a327bd47c96b4e086e7804c18649b`" in coder_comment
+    assert "### Claimed already present at `1c8c4b99308a327bd47c96b4e086e7804c18649b` (PR head unchanged)" in coder_comment
     metadata = _m1034_metadata(coder_comment)
-    assert metadata.followup_dispatch_head == metadata.subject == "c0ffee42"
+    assert metadata.followup_dispatch_head == metadata.subject == "1c8c4b99308a327bd47c96b4e086e7804c18649b"
     reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
     assert '"pr_head_unchanged_during_followup": true' in reviewer_prompt
     assert _M1034_VERIFY_INSTRUCTION in reviewer_prompt
 
 
-@pytest.mark.parametrize("head_sha", ["new-sha", "arbitrary.word"])
+@pytest.mark.parametrize("head_sha", ["new-head", "arbitrary.word"])
 def test_m1034_non_sha_head_is_not_persisted_or_claimed_unchanged(tmp_path, head_sha):
     runner = _m1034_recovery_runner(head_sha=head_sha)
     config = make_config(tmp_path, reviewer="codex")
 
-    assert run_pr_loop(runner, pr_number=77, config=config) == 0
-
-    (coder_comment,) = _m1034_coder_comments(runner)
-    assert "Orchestrator note" not in coder_comment
-    assert "Claimed already present" not in coder_comment
-    assert "### Addressed items" in coder_comment
-    metadata = _m1034_metadata(coder_comment)
-    assert metadata.followup_dispatch_head is None
-    reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
-    assert "pr_head_unchanged_during_followup" not in reviewer_prompt
-    assert _M1034_VERIFY_INSTRUCTION not in reviewer_prompt
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    with pytest.raises(PrHeadObservationError, match="full hexadecimal"):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert not _m1034_coder_comments(runner)
 
 
 def test_m1034_non_recovery_follow_up_prompt_has_no_recovery_context(tmp_path):
@@ -555,7 +548,7 @@ def _m1034_resume_runner(*, dispatch_head):
         structured_pr_review(state="blocking", summary="Fix it.", blocking_items=["Fix the README."]),
         PostedRoundMetadata(
             flow="pr", role="reviewer", agent="Codex", round_number=1,
-            subject="abc123", prior_items=(), new_items=(item,), state="blocking",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", prior_items=(), new_items=(item,), state="blocking",
         ),
     )
     raw = structured_coder_followup(
@@ -567,7 +560,7 @@ def _m1034_resume_runner(*, dispatch_head):
         raw,
         PostedRoundMetadata(
             flow="pr", role="coder", agent="Claude", round_number=2,
-            subject="abc123", prior_items=(item,),
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", prior_items=(item,),
             raw_structured_coder_response=raw,
             followup_dispatch_head=dispatch_head,
         ),
@@ -588,7 +581,7 @@ def _m1034_resume_runner(*, dispatch_head):
 
 
 def test_m1034_resume_rebuilds_unchanged_head_reviewer_context(tmp_path):
-    runner, raw, coder_comment = _m1034_resume_runner(dispatch_head="abc123")
+    runner, raw, coder_comment = _m1034_resume_runner(dispatch_head="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert run_pr_loop(runner, pr_number=77, config=make_config(tmp_path, reviewer="codex")) == 0
     reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
     assert '"pr_head_unchanged_during_followup": true' in reviewer_prompt
@@ -605,9 +598,9 @@ def test_m1034_resume_from_historical_coder_record_keeps_legacy_context(tmp_path
     reviewer_prompt = _m1034_reviewer_prompts(runner)[0]
     legacy_metadata = PostedRoundMetadata(
         flow="pr", role="coder", agent="Claude", round_number=2,
-        subject="abc123", raw_structured_coder_response=raw,
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", raw_structured_coder_response=raw,
     )
-    expected = pr_loop_support._coder_followup_review_context(raw, legacy_metadata, head_sha="abc123")
+    expected = pr_loop_support._coder_followup_review_context(raw, legacy_metadata, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert "pr_head_unchanged_during_followup" not in expected
     assert expected.splitlines()[1] in reviewer_prompt
     assert '"summary": "Fixed both items."' in reviewer_prompt
@@ -684,13 +677,13 @@ def test_post_push_rejection_records_the_pushed_head_and_resumes_a_coder_recover
         run_pr_loop(runner, pr_number=77, config=config)
 
     pushed = runner.pr_payload["headRefOid"]
-    assert pushed != "abc123"
+    assert pushed != "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     (dispatch,) = _records_1292(runner, "coder-dispatch")
     (rejection,) = _records_1292(runner, "coder-followup-rejected")
-    assert (dispatch.subject, dispatch.dispatch_head, dispatch.dispatch_attempt) == ("abc123", "abc123", 1)
+    assert (dispatch.subject, dispatch.dispatch_head, dispatch.dispatch_attempt) == ("6367c48dd193d56ea7b0baad25b19455e529f5ee", "6367c48dd193d56ea7b0baad25b19455e529f5ee", 1)
     assert dispatch.recovery_dispatch is False and dispatch.round_number == 2
     assert rejection.subject == pushed  # keyed to the pushed head ...
-    assert rejection.dispatch_head == rejection.rejected_coder_followup_from_head == "abc123"
+    assert rejection.dispatch_head == rejection.rejected_coder_followup_from_head == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     assert rejection.round_number == rejection.dispatch_round == 1
     assert "live remote target" in rejection.rejected_coder_followup_reason
     assert [item.item_id for item in rejection.prior_items] == ["item-1"]
@@ -703,7 +696,7 @@ def test_post_push_rejection_records_the_pushed_head_and_resumes_a_coder_recover
     recovery_prompt = _coder_prompts_1292(runner)[2]
     assert "live remote target" in recovery_prompt
     assert "attempt 1" in recovery_prompt
-    assert "`abc123`" in recovery_prompt and f"`{pushed}`" in recovery_prompt
+    assert "`6367c48dd193d56ea7b0baad25b19455e529f5ee`" in recovery_prompt and f"`{pushed}`" in recovery_prompt
     assert "Nothing from that attempt was reviewed or recorded" in recovery_prompt
     second_dispatch = _records_1292(runner, "coder-dispatch")[1]
     assert second_dispatch.dispatch_attempt == 2 and second_dispatch.recovery_dispatch is True
@@ -730,7 +723,7 @@ def test_unchanged_head_first_attempt_rejection_records_nothing_and_resume_is_un
             )
             for comment in runner.pr_payload["comments"]
         ],
-        head_sha="abc123", configured_reviewers=("claude",),
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", configured_reviewers=("claude",),
         trusted_actor=_ACTOR_1292,
     )
     # The first-attempt dispatch is ignored: resume is the ordinary checkpoint-free round.
@@ -1452,7 +1445,7 @@ def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_t
     with pytest.raises(AgentLoopError, match="live remote target"):
         run_pr_loop(runner, pr_number=77, config=config)
     pushed = runner.pr_payload["headRefOid"]
-    assert qualified_heads == ["abc123"]
+    assert qualified_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
     (first_dispatch,) = _records_1292(runner, "coder-dispatch")
     assert first_dispatch.recovery_round_budget == _Budget1292(2, True, False)
     (rejection,) = _records_1292(runner, "coder-followup-rejected")
@@ -1465,7 +1458,7 @@ def test_watcher_extension_survives_a_post_push_rejection_and_is_never_granted_t
         run_pr_loop(runner, pr_number=77, config=config)
     recovered_head = runner.pr_payload["headRefOid"]
     assert recovered_head != pushed
-    assert qualified_heads == ["abc123", pushed, recovered_head]  # the third failure was observed
+    assert qualified_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee", pushed, recovered_head]  # the third failure was observed
     second_dispatch = _records_1292(runner, "coder-dispatch")[1]
     assert second_dispatch.dispatch_attempt == 2 and second_dispatch.dispatch_round == 1
     assert second_dispatch.recovery_round_budget == _Budget1292(2, True, False)
@@ -1716,8 +1709,8 @@ def test_run_pr_loop_followup_comment_carries_coverage_map_without_reask(
                 prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
             ),
         ],
-        pr_payload={"headRefOid": "predecessor-head"},
-        git_head="predecessor-head",
+        pr_payload={"headRefOid": "aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c"},
+        git_head="aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c",
     )
     coder_calls = []
     real_validated_agent = validated_agent._run_validated_agent
@@ -1847,7 +1840,7 @@ def test_run_pr_loop_followup_semantic_correction_keeps_original_gaps_and_fixes_
                 prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
             ),
         ],
-        pr_payload={"headRefOid": "predecessor-head"}, git_head="predecessor-head",
+        pr_payload={"headRefOid": "aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c"}, git_head="aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c",
     )
     coder_calls = []
     real_validated_agent = validated_agent._run_validated_agent
@@ -1941,7 +1934,7 @@ def _unchanged_head_runner(*, with_failure_receipt, tmp_path):
             outcome="failed", provenance="parent-observed", scope=EvidenceScope("unknown", ()),
             receipt_id="receipt-open", turn_id="turn-opaque", cwd=str(tmp_path),
             normalized_command="python3 -m pytest tests/test_x.py -q -n 0", returncode=4,
-            attribution=TreeAttribution(state="current-head", head="abc123", stable=True),
+            attribution=TreeAttribution(state="current-head", head="6367c48dd193d56ea7b0baad25b19455e529f5ee", stable=True),
             environment_identity=registry.capture({"PATH": "/usr/bin"}),
         ))
     return runner
@@ -1986,7 +1979,7 @@ _PROSE_1626 = (
 
 
 class _EvidenceRunner1626(FakeRunner):
-    """A PR whose open item is evidence: one parent-observed failure at abc123.
+    """A PR whose open item is evidence: one parent-observed failure at 6367c48dd193d56ea7b0baad25b19455e529f5ee.
 
     ``turn_receipts`` lists, per coder turn, the run-tests receipts that turn
     captures as ``(receipt_id, outcome, environment)``.
@@ -2017,7 +2010,7 @@ class _EvidenceRunner1626(FakeRunner):
             timestamp=f"2026-10-23T20:{minute:02d}:00+00:00",
             normalized_command=_CMD_TEXT_1626, returncode=0 if outcome == "passed" else 4,
             attribution=TreeAttribution(
-                state="current-head", head="abc123", tracked_digest="tree-a", stable=True,
+                state="current-head", head="6367c48dd193d56ea7b0baad25b19455e529f5ee", tracked_digest="tree-a", stable=True,
             ),
             environment_identity=self.registry.capture(environment),
         )
@@ -2115,7 +2108,7 @@ def _reviews_run_1626(runner):
 def test_evidence_only_followup_repaired_and_cited_gets_one_review_round_1626(tmp_path, monkeypatch, capsys):
     """Matrix row `evidence-only-1738` (repair succeeds).
 
-    The prior follow-up already left abc123 unchanged; the next one reruns the
+    The prior follow-up already left 6367c48dd193d56ea7b0baad25b19455e529f5ee unchanged; the next one reruns the
     command, gets a compatible pass, and writes prose.  Repair (which repoints
     the runner's latest test turn) returns a cited array, live reconciliation
     supersedes the failure with the coder turn's pass, and the grant lets the
@@ -2186,7 +2179,7 @@ def test_uncited_supersession_or_no_supersession_still_stops_1626(tmp_path, monk
     )
     assert isinstance(outcome, AgentLoopError), outcome
     assert re.fullmatch(
-        r"PR #77: Claude left head abc123 unchanged in 2 consecutive follow-up rounds, so another "
+        r"PR #77: Claude left head 6367c48dd193d56ea7b0baad25b19455e529f5ee unchanged in 2 consecutive follow-up rounds, so another "
         r"review of the same diff cannot change the verdict\. Stopping before round \d+; "
         r"human review required\.",
         str(outcome),
@@ -2261,7 +2254,7 @@ def test_bounded_metadata_eviction_never_grants_a_round_1626(tmp_path, monkeypat
     live = runner.last_reconciled_local_test_evidence
     assert next(row for row in live.observations if row.receipt_id == "fail-1").superseded_by is None
     bounded = _evidence_module_1626.decode_bounded_evidence(
-        runner.render_local_test_evidence(current_head="abc123")
+        runner.render_local_test_evidence(current_head="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     )
     assert bounded is None or not any(row.receipt_id == "fail-1" for row in bounded.observations)
     assert _reviews_run_1626(runner) == 2
@@ -2287,7 +2280,7 @@ def test_uncited_count_survives_bounding_and_runner_repointing_1626(tmp_path, mo
     assert len(launches) == 1 and runner.latest_test_turn_id == "repair-turn-1"
     assert runner.current_test_turn_observations() == ()
     bounded = _evidence_module_1626.decode_bounded_evidence(
-        runner.render_local_test_evidence(current_head="abc123")
+        runner.render_local_test_evidence(current_head="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     )
     assert [row.receipt_id for row in bounded.observations] == ["fail-1"]
 
@@ -2298,11 +2291,11 @@ def test_stop_message_is_byte_identical_without_a_non_array_drop_1626():
     from coding_review_agent_loop.pr_loop_support import FollowupCitationDiagnosis
 
     base = dict(
-        pr=77, coder_name="Claude", previous_head="abc123", turns=2, round_number=3,
+        pr=77, coder_name="Claude", previous_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", turns=2, round_number=3,
         evidence=None, route=" ROUTE",
     )
     expected = (
-        "PR #77: Claude left head abc123 unchanged in 2 consecutive follow-up rounds, so another "
+        "PR #77: Claude left head 6367c48dd193d56ea7b0baad25b19455e529f5ee unchanged in 2 consecutive follow-up rounds, so another "
         "review of the same diff cannot change the verdict. Stopping before round 4; "
         "human review required. ROUTE"
     )
@@ -2354,7 +2347,7 @@ def _tool_flagged_evidence_1632(*, status_client_commit="42340e7"):
             normalized_command="python -m pytest tests/test_protocol.py -q",
             returncode=0 if outcome == "passed" else 1,
             attribution=TreeAttribution(
-                state="current-head", head="abc123", pre_digest="p", post_digest="p",
+                state="current-head", head="6367c48dd193d56ea7b0baad25b19455e529f5ee", pre_digest="p", post_digest="p",
                 tracked_digest="tree-a", stable=True,
             ),
             environment_state="not-compared",
@@ -2397,7 +2390,7 @@ def test_unchanged_head_stop_names_the_tool_mismatch_1632():
 
     encoded = _tool_flagged_evidence_1632()
     message = unchanged_head_stop_message(
-        pr=77, coder_name="Claude", previous_head="abc123", turns=2, round_number=3,
+        pr=77, coder_name="Claude", previous_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", turns=2, round_number=3,
         evidence=encoded, route=" ROUTE",
     )
     assert "unsuperseded failure receipts" in message
@@ -2412,12 +2405,12 @@ def test_unchanged_head_stop_names_the_tool_mismatch_1632():
 def test_evidence_stall_decision_names_the_tool_mismatch_1632():
     encoded = _tool_flagged_evidence_1632()
     text = pr_loop_support.render_evidence_stall_decision(
-        77, "abc123", "f" * 64, {"row-a": "no citation"}, 3, evidence=encoded
+        77, "6367c48dd193d56ea7b0baad25b19455e529f5ee", "f" * 64, {"row-a": "no citation"}, 3, evidence=encoded
     )
     assert "run-tests-tool-mismatch: receipt produced by agent-loop 42340e7" in text
     assert text.index("run-tests-tool-mismatch") < text.index("Decide how to proceed")
     plain = pr_loop_support.render_evidence_stall_decision(
-        77, "abc123", "f" * 64, {"row-a": "no citation"}, 3
+        77, "6367c48dd193d56ea7b0baad25b19455e529f5ee", "f" * 64, {"row-a": "no citation"}, 3
     )
     assert "run-tests-tool" not in plain
 
@@ -2446,7 +2439,7 @@ def test_unstable_failure_cited_rerun_reaches_review_1753(tmp_path, monkeypatch,
                     "old-pass", "passed", {"PATH": "/usr/bin"}, turn="old", minute=1,
                 ))
                 cleared = evidence.reconcile_test_observations(
-                    rows, registry=self.registry, current_head="abc123", current_snapshot=snapshot,
+                    rows, registry=self.registry, current_head="6367c48dd193d56ea7b0baad25b19455e529f5ee", current_snapshot=snapshot,
                 )
                 assert cleared.authoritative_failures == ()
                 rows = list(cleared.observations)
@@ -2472,7 +2465,7 @@ def test_unstable_failure_cited_rerun_reaches_review_1753(tmp_path, monkeypatch,
             return row
 
     snapshot = SimpleNamespace(
-        head="abc123", tracked_digest="tree-a", complete=True, stable=True, status_clean=True,
+        head="6367c48dd193d56ea7b0baad25b19455e529f5ee", tracked_digest="tree-a", complete=True, stable=True, status_clean=True,
     )
     monkeypatch.setattr(evidence, "stable_tracked_tree_snapshot", lambda _cwd: snapshot)
     monkeypatch.setitem(globals(), "_EvidenceRunner1626", UnstableRunner)
@@ -2702,3 +2695,105 @@ def test_invalid_acquisition_receipts_never_verify_canonical_rows_1758(tmp_path,
     )
     assert result.evidence.rows[0].status != "verified"
     assert derived.risk_test_matrix_evidence.rows[0].status != "verified"
+
+
+@pytest.mark.parametrize('tip,status', [('b' * 40, 'ahead'), ('c' * 40, 'diverged'), ('b' * 40, 'transient')])
+def test_post_coder_branch_observation_precedes_publication(tmp_path, monkeypatch, tip, status):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state='blocking', blocking_items=['Fix it.']),
+                       structured_pr_review(state='approved', prior_item_dispositions=[{'item_id': 'item-1', 'disposition': 'resolved'}])],
+        claude_outputs=[structured_coder_followup(addressed_items=['item-1'])],
+        advance_pr_head_on_coder_followup=False,
+    )
+    original = runner._maybe_advance_pr_head_for_coder_followup
+    def push(cmd):
+        original(cmd)
+        if '"kind": "coder_followup"' in '\n'.join(cmd):
+            runner.branch_tip = tip
+            runner.compare_status = 'ahead' if status == 'transient' else status
+    runner._maybe_advance_pr_head_for_coder_followup = push
+    original_run = runner.run
+    def run(args, **kwargs):
+        if status == 'transient' and args == ['sleep', '2']:
+            runner.pr_payload.update(headRefOid=tip, title='Latest post-coder title')
+        return original_run(args, **kwargs)
+    runner.run = run
+    observations = []
+    original_observe = pr_loop._UnchangedHeadTracker.observe
+    def track(self, *args, **kwargs):
+        observations.append(kwargs)
+        return original_observe(self, *args, **kwargs)
+    monkeypatch.setattr(pr_loop._UnchangedHeadTracker, 'observe', track)
+    config = make_config(tmp_path)
+    if status == 'ahead':
+        with pytest.raises(PrHeadObservationError, match='desync'):
+            run_pr_loop(runner, pr_number=77, config=config)
+        assert not observations
+        assert len(runner.codex_outputs) == 1
+        assert not _m1034_coder_comments(runner)
+        assert not any('Coder follow-up rejected' in body for body in runner.comments)
+        assert not any(cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
+    else:
+        assert run_pr_loop(runner, pr_number=77, config=config) == 0
+        if status == 'transient':
+            assert runner.pr_payload['headRefOid'] == tip
+            assert all('PR head was unchanged' not in body for body in _m1034_coder_comments(runner))
+            assert len([cmd for cmd, _ in runner.commands if cmd == ['sleep', '2']]) == 1
+
+
+def test_recovery_dispatch_desync_bypasses_guarded_rejection_audit(tmp_path, monkeypatch):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    records = [*_history_1292('Claude'), _dispatch_1292(), _rejection_1292()]
+    runner = FakeRunner(codex_outputs=[_VALID_FOLLOWUP],
+                        pr_payload={'headRefOid': _B_1292, 'comments': _seed_1292(*records)},
+                        authenticated_actor=_ACTOR_1292,
+                        advance_pr_head_on_coder_followup=False)
+    original = runner._maybe_advance_pr_head_for_coder_followup
+    def push(cmd):
+        original(cmd)
+        if '"kind": "coder_followup"' in '\n'.join(cmd): runner.branch_tip = 'f' * 40
+    runner._maybe_advance_pr_head_for_coder_followup = push
+    calls = []
+    monkeypatch.setattr(pr_loop, 'activate_managed_ci', lambda *a, **k: ManagedCiContract(origin='source-managed'))
+    monkeypatch.setattr(pr_loop, 'revalidate_adopted_managed_ci', lambda *a, **k: True)
+    monkeypatch.setattr(pr_loop, 'managed_label_present', lambda *a, **k: True)
+    monkeypatch.setattr(pr_loop, 'publish_rejected_coder_turn_dispatch_audit', lambda *a, **k: calls.append('audit'))
+    monkeypatch.setattr(pr_loop, '_record_coder_followup_rejection', lambda *a, **k: calls.append('rejection'))
+    config = make_config(tmp_path, coder='codex', reviewer='claude')
+    with pytest.raises(PrHeadObservationError, match='desync'):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert calls == []
+    dispatches = _records_1292(runner, 'coder-dispatch')
+    assert dispatches[-1].dispatch_attempt == 2
+    assert not _records_1292(runner, 'coder')
+
+
+def test_prefetched_round_observation_stops_before_next_reviewer(tmp_path, monkeypatch):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    runner = FakeRunner(
+        codex_outputs=[structured_pr_review(state='blocking', blocking_items=['Fix it.']),
+                       structured_pr_review(state='approved')],
+        claude_outputs=[structured_coder_followup(addressed_items=['item-1'])],
+        advance_pr_head_on_coder_followup=False)
+    original_run = runner.run
+    def run(args, **kwargs):
+        result = original_run(args, **kwargs)
+        # The external branch advance occurs after acceptance of the first
+        # unchanged turn, so only the next selected snapshot can detect it.
+        if args[:3] == ['gh', 'pr', 'comment'] and _m1034_coder_comments(runner):
+            runner.branch_tip = 'b' * 40
+        return result
+    runner.run = run
+    selected = []
+    original_observe = pr_loop.observe_pr_head
+    def observe(*args, **kwargs):
+        selected.append(kwargs['context'])
+        return original_observe(*args, **kwargs)
+    monkeypatch.setattr(pr_loop, 'observe_pr_head', observe)
+    with pytest.raises(PrHeadObservationError, match='desync'):
+        run_pr_loop(runner, pr_number=77, config=make_config(tmp_path))
+    assert len(selected) == 1
+    assert len(_m1034_coder_comments(runner)) == 1
+    assert len(runner.codex_outputs) == 1
+    assert len([cmd for cmd, _ in runner.commands if cmd == ['sleep', '2']]) == 2

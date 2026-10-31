@@ -585,7 +585,7 @@ def test_named_pr_two_local_failures_template_recovers_on_original_board(tmp_pat
         pre_review_tests=False, agent_max_retries=0,
     )
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    runner.pr_payload["headRefOid"] = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     with pytest.raises(AgentLoopError, match="missing required input") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     message = str(excinfo.value)
@@ -643,7 +643,7 @@ def test_named_pr_mixed_stop_template_recovers_on_original_board(tmp_path):
     )
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     runner.gemini_outputs = [unavailable("Model access exhausted.", "Google Gemini")]
-    runner.pr_payload["headRefOid"] = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     with pytest.raises(AgentLoopError, match="missing required input") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     message = str(excinfo.value)
@@ -753,7 +753,7 @@ def test_named_pr_signed_outage_resumes_with_removed_then_restored_seats(tmp_pat
         pre_review_tests=False, agent_max_retries=0,
     )
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
-    runner.pr_payload["headRefOid"] = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
     if seat_local:
         runner.antigravity_outputs.append((
             structured_pr_review(reviewer="opus (Google Antigravity: Model B)"), 0,

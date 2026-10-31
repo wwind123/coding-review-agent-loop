@@ -1126,3 +1126,13 @@ def test_same_named_check_runs_from_different_suites_are_all_reported():
     result = run_shim(["pr", "checks", "5", "--repo", REPO], api)
     assert result.code == 1
     assert sorted(result.out.splitlines()) == ["ci\tfail\t\t", "ci\tpass\t\t"]
+
+
+def test_head_observation_encoded_api_reads_are_passthrough():
+    api = FakeApi()
+    for endpoint in ('repos/FORK/REPO/git/ref/heads/fix%2Ftopic',
+                     'repos/FORK/REPO/compare/' + 'a' * 40 + '...' + 'b' * 40):
+        result = run_shim(['api', endpoint], api)
+        assert result.code == 0
+        assert result.passthrough == [('/usr/bin/real-gh', ['api', endpoint])]
+        assert not api.calls

@@ -1973,7 +1973,7 @@ def test_phase_implementation_handoff_rejects_malformed_marker():
         find_existing_phase_implementation_handoff(
             (comment,),
             parent_issue=56,
-            plan_hash="abc123",
+            plan_hash="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             mode="implement-by-phase",
             phase_index=1,
             child_issue_number=99,

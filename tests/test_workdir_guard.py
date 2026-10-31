@@ -290,7 +290,7 @@ def test_prefixed_malformed_managed_run_tests_has_no_exemption(tmp_path, prefix,
 def test_workdir_snapshot_runs_exact_read_only_git_probes_and_accepts_clean_status(tmp_path):
     runner = FakeRunner(
         git_probe_results=[
-            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "6367c48dd193d56ea7b0baad25b19455e529f5ee\n", "returncode": 0},
             {"stdout": "", "returncode": 0},
         ]
     )
@@ -298,7 +298,7 @@ def test_workdir_snapshot_runs_exact_read_only_git_probes_and_accepts_clean_stat
     snapshot = capture_workdir_snapshot(runner, tmp_path)
 
     assert snapshot.available
-    assert snapshot.head.value == "abc123"
+    assert snapshot.head.value == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     assert snapshot.status.value == ""
     assert runner.git_probe_calls == [
         ("git", "rev-parse", "HEAD"),
@@ -309,13 +309,13 @@ def test_workdir_snapshot_runs_exact_read_only_git_probes_and_accepts_clean_stat
 def test_workdir_snapshot_preserves_identical_dirty_status_and_detects_changes(tmp_path):
     before_runner = FakeRunner(
         git_probe_results=[
-            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "6367c48dd193d56ea7b0baad25b19455e529f5ee\n", "returncode": 0},
             {"stdout": " M src/app.py\n", "returncode": 0},
         ]
     )
     after_runner = FakeRunner(
         git_probe_results=[
-            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "6367c48dd193d56ea7b0baad25b19455e529f5ee\n", "returncode": 0},
             {"stdout": " M src/app.py\n", "returncode": 0},
         ]
     )
@@ -329,7 +329,7 @@ def test_workdir_snapshot_preserves_identical_dirty_status_and_detects_changes(t
     changed = capture_workdir_snapshot(
         FakeRunner(
             git_probe_results=[
-                {"stdout": "def456\n", "returncode": 0},
+                {"stdout": "0b3d8b29493059afd7f9912106279c4643ac4939\n", "returncode": 0},
                 {"stdout": " M src/app.py\n", "returncode": 0},
             ]
         ),
@@ -387,11 +387,11 @@ def test_workdir_snapshot_tolerates_agent_loop_error_and_oserror_per_probe(tmp_p
 
 def test_workdir_replay_gate_preserves_provider_label_and_changed_status_refusal():
     before = WorkdirSnapshot(
-        GitProbeResult(("git", "rev-parse", "HEAD"), "available", "abc123"),
+        GitProbeResult(("git", "rev-parse", "HEAD"), "available", "6367c48dd193d56ea7b0baad25b19455e529f5ee"),
         GitProbeResult(("git", "status", "--porcelain"), "available", ""),
     )
     after = WorkdirSnapshot(
-        GitProbeResult(("git", "rev-parse", "HEAD"), "available", "abc123"),
+        GitProbeResult(("git", "rev-parse", "HEAD"), "available", "6367c48dd193d56ea7b0baad25b19455e529f5ee"),
         GitProbeResult(("git", "status", "--porcelain"), "available", " M file.py\n"),
     )
 
@@ -572,7 +572,7 @@ ACCEPTED_STRUCTURED_PATH_COMMANDS = [
     "/usr/bin/env python3 -m pytest tests/test_foo.py",
     "sudo /usr/bin/python3 -m pytest tests/test_foo.py",
     "~/.pyenv/versions/3.12.1/bin/python -m pytest tests/test_foo.py",
-    "/nix/store/abc123-python3-3.12.1/bin/python3 -m pytest tests/test_foo.py",
+    "/nix/store/6367c48dd193d56ea7b0baad25b19455e529f5ee-python3-3.12.1/bin/python3 -m pytest tests/test_foo.py",
     "PYTHONPATH=/usr/lib/python3.12 pytest tests/test_foo.py",
     "tox --python=/usr/bin/python3.12",
 ]

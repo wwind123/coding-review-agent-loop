@@ -58,7 +58,7 @@ def test_issue_to_pr_workflow_carries_outer_run_and_pr_number_through_a_real_att
             "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         ],
         codex_outputs=[structured_plan_review(state="approved", summary="Plan approved.")],
-        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "abc123"},
+        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     )
     config = make_config(tmp_path)
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
@@ -135,7 +135,7 @@ def test_real_nested_pr_loop_runs_broker_attempt_with_outer_run_and_both_numbers
             "<!-- AGENT_STATE: blocking -->\n-- Anthropic Claude",
         ],
         codex_outputs=[structured_plan_review(state="approved", summary="Plan approved.")],
-        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "abc123"},
+        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     )
     config = make_config(tmp_path)
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)
@@ -144,7 +144,7 @@ def test_real_nested_pr_loop_runs_broker_attempt_with_outer_run_and_both_numbers
     seen = {}
     real_pr_loop = pr_loop.run_pr_loop
 
-    real_pr_context = pr_loop_support.get_pr_review_context
+    real_pr_context = pr_loop_support.get_observed_pr_review_context
 
     def observed_pr_loop(*args, **kwargs):
         seen["in_pr_loop"] = True
@@ -176,7 +176,7 @@ def test_real_nested_pr_loop_runs_broker_attempt_with_outer_run_and_both_numbers
         raise AgentLoopError("stop after broker attempt")
 
     patch_attr_in(monkeypatch, (pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "run_pr_loop", observed_pr_loop)
-    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_pr_review_context", first_pr_read)
+    patch_attr_in(monkeypatch, (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop), "get_observed_pr_review_context", first_pr_read)
     with pytest.raises(AgentLoopError, match="stop after broker attempt"):
         run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)
 
@@ -275,7 +275,7 @@ def test_real_issue_to_pr_coder_turn_runs_through_its_own_broker(tmp_path, monke
                 prior_item_dispositions=[{"item_id": "item-1", "disposition": "resolved"}],
             ),
         ],
-        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "abc123"},
+        pr_payload={"body": "Fixes #56", "headRefName": "agent-loop/x", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     )
     config = make_config(tmp_path, max_rounds=3)
     patch_attr_in(monkeypatch, (execution_policy, issue_implementation, plan_first_loop_module, issue_loop), "resolve_canonical_pr_for_issue", lambda *_a, **_k: None)

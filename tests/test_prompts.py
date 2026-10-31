@@ -868,7 +868,7 @@ def test_review_prompt_includes_prior_unresolved_items_and_disposition_instructi
             title="Improve review prompt context",
             head_branch="feature/review-context",
             base_branch="main",
-            head_sha="abc123",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             url="https://github.com/OWNER/REPO/pull/77",
         ),
         unresolved_items=(
@@ -1021,7 +1021,7 @@ def test_compact_review_prompt_excludes_prose_disposition_heading(tmp_path):
             title="Improve review prompt context",
             head_branch="feature/review-context",
             base_branch="main",
-            head_sha="abc123",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             url="https://github.com/OWNER/REPO/pull/77",
         ),
         unresolved_items=(
@@ -1053,7 +1053,7 @@ def test_review_prompt_indents_multiline_prior_unresolved_item_text(tmp_path):
             title="Improve review prompt context",
             head_branch="feature/review-context",
             base_branch="main",
-            head_sha="abc123",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             url="https://github.com/OWNER/REPO/pull/77",
         ),
         unresolved_items=(
@@ -1239,8 +1239,8 @@ def _compact_issue_context() -> IssueContext:
 def _compact_memory_context(tmp_path: Path) -> AgentMemoryContext:
     return AgentMemoryContext(
         memory_dir=tmp_path / "memory",
-        current_commit="abc123",
-        last_analyzed_commit="def456",
+        current_commit="6367c48dd193d56ea7b0baad25b19455e529f5ee",
+        last_analyzed_commit="0b3d8b29493059afd7f9912106279c4643ac4939",
         changed_files=("src/coding_review_agent_loop/prompts.py",),
         repo_summary="Repo memory summary for compact prefix.",
         architecture_map=None,
@@ -1417,7 +1417,7 @@ def _compact_pr_metadata() -> PullRequestMetadata:
         title="Compact PR context",
         head_branch="feature/context",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/77",
         body="PR body with author intent and scope.",
     )
@@ -1488,7 +1488,7 @@ def test_compact_pr_review_prompt_preserves_context_and_omits_raw_history(tmp_pa
             "Tests: python -m pytest tests/test_agent_loop.py -k compact_pr\n"
         ),
         compact_tail=CompactPrReviewTailContext(
-            head_sha="abc123",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             round_number=2,
             action="Review compact PR context mode.",
         ),
@@ -1516,7 +1516,7 @@ def test_compact_pr_review_prompt_preserves_context_and_omits_raw_history(tmp_pa
     assert "duplicated helper or prompt wording introduced by this PR" in prefix
     assert "Before approving, self-check every `future_followups` entry" in prefix
     assert "Review compact PR context mode." in tail
-    assert "Head SHA: abc123" in tail
+    assert "Head SHA: 6367c48dd193d56ea7b0baad25b19455e529f5ee" in tail
     assert "Read the verified checkout and local base-to-head diff first." in tail
     assert "gh pr diff" not in tail
 
@@ -1544,7 +1544,7 @@ def test_compact_pr_review_prompt_stable_prefix_is_byte_identical_across_rounds(
         compact_context=True,
         compact_prior=CompactPriorContext(("[item-9] resolved: unchanged",)),
         coder_followup_context="Stable coder summary.\nTests: pytest -k stable\n",
-        compact_tail=CompactPrReviewTailContext(head_sha="abc123", round_number=2, action="Review A."),
+        compact_tail=CompactPrReviewTailContext(head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=2, action="Review A."),
     )
     second = build_review_prompt(
         77,
@@ -1559,7 +1559,7 @@ def test_compact_pr_review_prompt_stable_prefix_is_byte_identical_across_rounds(
         compact_context=True,
         compact_prior=CompactPriorContext(("[item-9] resolved: unchanged",)),
         coder_followup_context="Stable coder summary.\nTests: pytest -k stable\n",
-        compact_tail=CompactPrReviewTailContext(head_sha="def456", round_number=3, action="Review B."),
+        compact_tail=CompactPrReviewTailContext(head_sha="0b3d8b29493059afd7f9912106279c4643ac4939", round_number=3, action="Review B."),
     )
 
     first_prefix, first_tail = first.split(COMPACT_PR_REVIEW_VOLATILE_TAIL_MARKER, 1)
@@ -1570,7 +1570,7 @@ def test_compact_pr_review_prompt_stable_prefix_is_byte_identical_across_rounds(
     assert "Stable coder summary." not in first_prefix
     assert "Stable coder summary." in first_tail
     assert "PR body with author intent and scope." in first_prefix
-    for volatile in ("round 2", "Head SHA: abc123", "Review A."):
+    for volatile in ("round 2", "Head SHA: 6367c48dd193d56ea7b0baad25b19455e529f5ee", "Review A."):
         assert volatile not in first_prefix
         assert volatile in first_tail
 
@@ -2270,7 +2270,7 @@ def test_review_prompt_includes_pr_metadata_and_suggested_commands(tmp_path):
     assert "- Title: Improve review prompt context" in prompt
     assert "- Head branch: feature/review-context" in prompt
     assert "- Base branch: main" in prompt
-    assert "- Head SHA: abc123" in prompt
+    assert "- Head SHA: 6367c48dd193d56ea7b0baad25b19455e529f5ee" in prompt
     assert "Use this PR metadata as authoritative." in prompt
     assert "Do not spend time discovering the\nPR branch." in prompt
     assert "gh pr view 77 --repo OWNER/REPO --json comments,reviews" in prompt
@@ -2302,7 +2302,7 @@ def test_review_prompt_includes_signed_human_requirements(tmp_path):
             "title": "Improve review prompt context",
             "headRefName": "feature/review-context",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [
                 {
                     "author": {"login": "maintainer"},
@@ -2607,7 +2607,7 @@ def test_coder_prompt_renders_remembered_runtime_context_without_test_gate(tmp_p
     )
     memory = AgentMemoryContext(
         memory_dir=memory_dir,
-        current_commit="abc123",
+        current_commit="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         last_analyzed_commit=None,
         changed_files=(),
         repo_summary="REPO SUMMARY TEXT",
@@ -2660,7 +2660,7 @@ def test_coder_prompt_never_recommends_runs_refused_as_evidence(tmp_path):
         )
     memory = AgentMemoryContext(
         memory_dir=memory_dir,
-        current_commit="abc123",
+        current_commit="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         last_analyzed_commit=None,
         changed_files=(),
         repo_summary="REPO SUMMARY TEXT",
@@ -2708,7 +2708,7 @@ def test_coder_prompt_reuses_stored_runtime_keys_for_redacted_and_external_comma
         )
     memory = AgentMemoryContext(
         memory_dir=memory_dir,
-        current_commit="abc123",
+        current_commit="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         last_analyzed_commit=None,
         changed_files=(),
         repo_summary="REPO SUMMARY TEXT",
@@ -2969,7 +2969,7 @@ def test_review_prompt_uses_safe_base_placeholder_when_base_is_unknown(
         title="Review prompt",
         head_branch="feature/review",
         base_branch=None,
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url=None,
     )
 
@@ -3081,7 +3081,7 @@ def test_blocking_followup_prompt_includes_human_requirements_before_ai_feedback
             "title": "Improve review prompt context",
             "headRefName": "feature/review-context",
             "baseRefName": "main",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [
                 {
                     "author": {"login": "maintainer"},
@@ -3223,7 +3223,7 @@ def test_agent_memory_is_created_and_added_to_review_prompt(tmp_path):
     assert (memory_dir / "module-index.json").exists()
     assert (memory_dir / "test-profile.md").exists()
     assert (memory_dir / "toolchain.json").exists()
-    assert (memory_dir / "last-analyzed-commit").read_text(encoding="utf-8") == "abc123\n"
+    assert (memory_dir / "last-analyzed-commit").read_text(encoding="utf-8") == "6367c48dd193d56ea7b0baad25b19455e529f5ee\n"
     architecture_map = (memory_dir / "architecture-map.md").read_text(encoding="utf-8")
     assert "## Top-level Layout" in architecture_map
     assert "## Python Modules" in architecture_map
@@ -3286,7 +3286,7 @@ def test_pr_loop_carries_new_future_followups_into_later_reviewer_prompts(tmp_pa
 def test_codex_review_prompt_prefers_pinned_checkout_local_diff(tmp_path):
     runner = FakeRunner(
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
-        git_head="abc123",
+        git_head="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     config = make_config(tmp_path, reviewer="codex")
 
@@ -3298,7 +3298,7 @@ def test_codex_review_prompt_prefers_pinned_checkout_local_diff(tmp_path):
     prompt = codex_command[-1]
     assert review_cwd == config.codex_dir
     assert f"Assigned checkout: `{config.codex_dir.resolve()}`" in prompt
-    assert "- Head SHA: abc123" in prompt
+    assert "- Head SHA: 6367c48dd193d56ea7b0baad25b19455e529f5ee" in prompt
     assert "`git diff main...HEAD`" in prompt
     assert "Prefer the verified local checkout and direct file reads over web search" in prompt
     assert "gh pr diff" not in prompt
@@ -4118,7 +4118,7 @@ def test_superseded_prepanel_review_context_block_is_non_authoritative(tmp_path)
     superseded = SupersededPrepanelReview(
         reviewer="Gemini",
         round_number=3,
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         state="blocking",
         summary="Gemini premature summary",
         claims=("premature cache race", "x" * 2000),
@@ -4374,7 +4374,7 @@ def test_review_prompt_neutralizes_reserved_token_named_in_pr_title(
         title=f"Rename the {token} label",
         head_branch="fix/891",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/77",
     )
 
@@ -4948,7 +4948,7 @@ def test_exhaustiveness_rule_sits_inside_the_compact_stable_prefixes(tmp_path):
     for plan_execution_mode in ("auto", "plan-only"):
         config = make_config(tmp_path, plan_execution_mode=plan_execution_mode)
         pr_prefixes, plan_prefixes = [], []
-        for round_number, head in ((2, "abc123"), (3, "def456")):
+        for round_number, head in ((2, "6367c48dd193d56ea7b0baad25b19455e529f5ee"), (3, "0b3d8b29493059afd7f9912106279c4643ac4939")):
             pr_prompt = build_review_prompt(
                 77, round_number, config, reviewer="codex", compact_context=True,
                 compact_tail=CompactPrReviewTailContext(
@@ -5109,7 +5109,7 @@ def test_parallel_sample_never_shortens_a_possibly_serial_watchdog(
     assert parallel_only.recommended_timeout_seconds < 1800
     memory = AgentMemoryContext(
         memory_dir=memory_dir,
-        current_commit="abc123",
+        current_commit="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         last_analyzed_commit=None,
         changed_files=(),
         repo_summary="REPO SUMMARY TEXT",
@@ -5795,7 +5795,7 @@ def test_rendered_recommendation_matches_recorded_package_script_rows_1294(tmp_p
 
     def render() -> str:
         memory = AgentMemoryContext(
-            memory_dir=memory_dir, current_commit="abc123", last_analyzed_commit=None,
+            memory_dir=memory_dir, current_commit="6367c48dd193d56ea7b0baad25b19455e529f5ee", last_analyzed_commit=None,
             changed_files=(), repo_summary="REPO SUMMARY TEXT", architecture_map=None,
             test_profile=None, toolchain=None,
             runtime_observations=tuple(runtime.load_runtime_memory(memory_dir)),
@@ -5821,7 +5821,7 @@ def test_format_pr_checks_lists_excluded_dispatch_checks_separately():
         missing_required=(),
         branch_protection_status="not_found",
         excluded=(excluded,),
-        exclusion_notes=("validate (failure) from ad hoc workflow_dispatch run 7000 (check suite 9) on abc123: not a PR check",),
+        exclusion_notes=("validate (failure) from ad hoc workflow_dispatch run 7000 (check suite 9) on 6367c48dd193d56ea7b0baad25b19455e529f5ee: not a PR check",),
     )
 
     rendered = format_pr_checks(checks)
@@ -6013,7 +6013,7 @@ def test_pr_review_with_local_receipts_carries_receipt_guidance_1568(tmp_path, c
         "receipt_id": "receipt-1568",
         "turn_id": "coder-turn",
         "environment": "identity-unknown",
-        "attribution": {"state": "current-head", "head": "abc123"},
+        "attribution": {"state": "current-head", "head": "6367c48dd193d56ea7b0baad25b19455e529f5ee"},
     }]})
     output = structured_coder_followup(
         summary="Ran the plain commands through the capture runner.",
@@ -6022,16 +6022,16 @@ def test_pr_review_with_local_receipts_carries_receipt_guidance_1568(tmp_path, c
     )
     metadata = PostedRoundMetadata(
         flow="pr", role="coder", agent="Claude", round_number=3,
-        subject="abc123", local_test_evidence=evidence,
+        subject="6367c48dd193d56ea7b0baad25b19455e529f5ee", local_test_evidence=evidence,
     )
-    context = _coder_followup_review_context(output, metadata, head_sha="abc123")
+    context = _coder_followup_review_context(output, metadata, head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
     assert "receipt-1568" in context and "local_test_evidence" in context
 
     config = make_config(tmp_path, coder="claude", reviewer="codex")
     kwargs = {}
     if compact:
         kwargs["compact_tail"] = CompactPrReviewTailContext(
-            head_sha="abc123", round_number=3, action="Review the PR.",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", round_number=3, action="Review the PR.",
         )
     prompt = build_review_prompt(
         77, 3, config, reviewer="codex", compact_context=compact,
@@ -6056,7 +6056,7 @@ def test_compact_stable_prefixes_keep_unproducible_guidance_head_independent_156
     pr_guidance = prompts_module._reviewer_unproducible_evidence_guidance("pr")
     plan_guidance = prompts_module._reviewer_unproducible_evidence_guidance("plan")
     pr_prefixes, plan_prefixes = [], []
-    for head in ("aaa111", "bbb222"):
+    for head in ("4a0cde71aee7158542d013fc0c9f5acfc735c612", "bbb222"):
         prompt = build_review_prompt(
             77, 2, config, reviewer="codex", compact_context=True,
             compact_tail=CompactPrReviewTailContext(head_sha=head, round_number=2, action=f"Review {head}."),
@@ -6322,7 +6322,7 @@ def test_scope_block_sits_in_byte_identical_compact_stable_prefixes(tmp_path):
     config = make_config(tmp_path)
     context = _issue_context_1389()
     pr_prefixes, plan_prefixes, revision_prefixes = [], [], []
-    for round_number, head in ((2, "abc123"), (3, "def456")):
+    for round_number, head in ((2, "6367c48dd193d56ea7b0baad25b19455e529f5ee"), (3, "0b3d8b29493059afd7f9912106279c4643ac4939")):
         pr_prompt = build_review_prompt(
             77, round_number, config, reviewer="codex", compact_context=True, issue_context=context,
             compact_tail=CompactPrReviewTailContext(

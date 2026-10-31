@@ -49,7 +49,7 @@ def _phases(runner):
 
 
 def _frozen_runner(tmp_path, *, codex_outputs=(), **runner_kwargs):
-    """Run one clean round that ends in a freeze at abc123."""
+    """Run one clean round that ends in a freeze at 6367c48dd193d56ea7b0baad25b19455e529f5ee."""
     runner = FakeRunner(
         codex_outputs=[_evidence_review(evidence=[_EVIDENCE_TEXT]), *codex_outputs],
         **runner_kwargs,
@@ -78,7 +78,7 @@ def test_clean_board_with_evidence_publishes_one_freeze_and_exits_at_decision_bo
     runner = _frozen_runner(tmp_path)
     config = make_config(tmp_path, auto_merge=merge)
 
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123") as excinfo:
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     assert excinfo.value.EXIT_CODE == 4
     _assert_freeze_diagnostic(runner, str(excinfo.value))
@@ -86,16 +86,16 @@ def test_clean_board_with_evidence_publishes_one_freeze_and_exits_at_decision_bo
     freezes = _freeze_records(runner)
     assert len(freezes) == 1
     freeze = freezes[0].metadata
-    assert freeze.subject == "abc123"
-    assert freeze.evidence_freeze.frozen_head == "abc123"
+    assert freeze.subject == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
+    assert freeze.evidence_freeze.frozen_head == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     assert freeze.evidence_freeze.allowed_rounds == config.max_rounds
     evidence = [item for item in freeze.prior_items if item.obligation_kind == "human-exact-head-evidence"]
     assert [(item.lifecycle, item.candidate_head_sha) for item in evidence] == [
-        ("evidence_frozen", "abc123")
+        ("evidence_frozen", "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     ]
     assert freeze.evidence_freeze.evidence_identities == (evidence[0].obligation_identity,)
     body = freezes[0].body
-    assert "Evidence requested at `abc123`. No further code changes will be accepted" in body
+    assert "Evidence requested at `6367c48dd193d56ea7b0baad25b19455e529f5ee`. No further code changes will be accepted" in body
     assert _EVIDENCE_TEXT in body and "-- Human Reviewer" in body
     # The freeze notice is the first public comment that shows the request.
     first_public = next(
@@ -132,7 +132,7 @@ def test_frozen_rerun_without_new_signed_input_adds_only_one_diagnostic(tmp_path
     posted -= 1
     frozen_before = _freeze_records(runner)[0].metadata
     commands_before = len(runner.commands)
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123") as excinfo:
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     assert len(runner.pr_payload["comments"]) == posted + 1
     _assert_freeze_diagnostic(runner, str(excinfo.value), count=2)
@@ -152,7 +152,7 @@ def test_frozen_rerun_detects_an_edited_signed_comment_by_identity(tmp_path):
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
 
-    signed["body"] = "Keep backwards compatibility. Live suite at abc123: 11 passed.\n\n-- Human Reviewer"
+    signed["body"] = "Keep backwards compatibility. Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed.\n\n-- Human Reviewer"
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert runner.codex_outputs == []
@@ -243,7 +243,7 @@ def test_evidence_stays_deferred_across_heads_while_code_findings_remain(tmp_pat
     assert not any(_EVIDENCE_TEXT in comment for comment in runner.comments)
     # One deduplicated obligation, still deferred, carried to the new head.
     records = _pr_records(runner)
-    latest = [record for record in records if record.metadata.subject == "abc123-coder-1"][-1]
+    latest = [record for record in records if record.metadata.subject == "525753a4b04bd57d874211ba1fade250c3ff6d82"][-1]
     evidence = [
         item for item in latest.metadata.prior_items
         if item.obligation_kind == "human-exact-head-evidence"
@@ -328,7 +328,7 @@ def test_managed_qualification_completes_before_the_freeze(tmp_path, monkeypatch
     """Row managed-qualification-before-freeze (success)."""
     runner = _frozen_runner(tmp_path)
     config = make_config(tmp_path, managed_ci=True, max_rounds=1)
-    events = _managed_setup(monkeypatch, outcome=ManagedCiOutcome(status="passed", head_sha="abc123"))
+    events = _managed_setup(monkeypatch, outcome=ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"))
     real_post = pr_loop_support.post_pr_comment
 
     def recording_post(runner_, *, config, pr_number, body):
@@ -351,7 +351,7 @@ def test_managed_qualification_failure_is_repaired_without_a_freeze(tmp_path, mo
     config = make_config(tmp_path, managed_ci=True, max_rounds=1)
     _managed_setup(
         monkeypatch,
-        outcome=ManagedCiOutcome(status="failed", head_sha="abc123", failure_details=("unit tests failed",)),
+        outcome=ManagedCiOutcome(status="failed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", failure_details=("unit tests failed",)),
     )
     runner.claude_outputs.append(structured_coder_followup(addressed_items=["item-2"]))
     with pytest.raises(AgentLoopError) as excinfo:
@@ -366,7 +366,7 @@ def test_managed_qualification_failure_is_repaired_without_a_freeze(tmp_path, mo
 
 def _inject_signed_input_before(monkeypatch, runner, *, body, when):
     """Post a signed comment the first time ``when()`` holds at a context read."""
-    real_context = pr_loop_support.get_pr_review_context
+    real_context = pr_loop_support.get_observed_pr_review_context
     injected = []
 
     def context_with_injection(runner_, **kwargs):
@@ -377,7 +377,7 @@ def _inject_signed_input_before(monkeypatch, runner, *, body, when):
 
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context", context_with_injection)
+    ), "get_observed_pr_review_context", context_with_injection)
     return injected
 
 
@@ -422,21 +422,21 @@ def test_external_push_breaks_the_freeze_and_the_new_head_is_reviewed_in_full(tm
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
 
-    runner.pr_payload["headRefOid"] = "def456"
-    runner.git_head = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
+    runner.git_head = "0b3d8b29493059afd7f9912106279c4643ac4939"
     runner.simulate_new_process()  # the rerun is a fresh agent-loop process
     runner.codex_outputs.append(
         _evidence_review(
             evidence=[_EVIDENCE_TEXT],
-            dispositions=[_resolve("item-1", "Evidence for abc123 does not cover def456.")],
+            dispositions=[_resolve("item-1", "Evidence for 6367c48dd193d56ea7b0baad25b19455e529f5ee does not cover 0b3d8b29493059afd7f9912106279c4643ac4939.")],
         )
     )
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head def456"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 0b3d8b29493059afd7f9912106279c4643ac4939"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert runner.codex_outputs == []
     assert any("was broken by an external push" in comment for comment in runner.comments)
     freezes = _freeze_records(runner)
-    assert [record.metadata.subject for record in freezes] == ["abc123", "def456"]
+    assert [record.metadata.subject for record in freezes] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee", "0b3d8b29493059afd7f9912106279c4643ac4939"]
     assert not _claude_prompts(runner)
 
 
@@ -446,9 +446,9 @@ def test_kept_evidence_reposts_a_still_frozen_record_and_reexits(tmp_path):
     config = make_config(tmp_path)
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
-    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 10 passed, 1 failed.", 1))
+    runner.pr_payload["comments"].append(_signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 10 passed, 1 failed.", 1))
     runner.codex_outputs.append(_evidence_review(state="blocking", dispositions=[_keep()], hr=True))
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123") as excinfo:
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee") as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     _assert_freeze_diagnostic(runner, str(excinfo.value), count=2)
     freezes = _freeze_records(runner)
@@ -458,7 +458,7 @@ def test_kept_evidence_reposts_a_still_frozen_record_and_reexits(tmp_path):
     assert not _claude_prompts(runner)
     codex_prompts = ["\n".join(cmd) for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"]]
     response_prompt = " ".join(codex_prompts[-1].split())
-    assert "evidence-response re-review at frozen head `abc123`" in response_prompt
+    assert "evidence-response re-review at frozen head `6367c48dd193d56ea7b0baad25b19455e529f5ee`" in response_prompt
     assert _EVIDENCE_TEXT in response_prompt
     # The kept obligation stays frozen at the same head and round.
     assert freezes[-1].metadata.round_number == freezes[0].metadata.round_number
@@ -472,7 +472,7 @@ def test_cleared_evidence_with_signed_input_during_the_pass_refreshes_at_the_cei
     config = make_config(tmp_path, max_rounds=1)
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
-    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    runner.pr_payload["comments"].append(_signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed.", 1))
     runner.codex_outputs.extend(
         [
             _evidence_review(dispositions=[_resolve()], hr=True),
@@ -497,7 +497,7 @@ def test_restart_after_cleared_release_refreshes_for_newer_signed_input(tmp_path
     config = make_config(tmp_path)
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
-    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    runner.pr_payload["comments"].append(_signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed.", 1))
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
     real_checks = pr_loop.get_pr_checks
     stops = []
@@ -553,7 +553,7 @@ def test_freeze_at_the_ceiling_is_answered_twice_across_a_restart(tmp_path):
     # A watcher extension had raised the effective ceiling before the freeze.
     _retag_freeze_budget(runner, allowed_rounds=2, watch_failure_extension_used=True)
 
-    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 10 passed, 1 failed.", 1))
+    runner.pr_payload["comments"].append(_signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 10 passed, 1 failed.", 1))
     runner.codex_outputs.append(_evidence_review(state="blocking", dispositions=[_keep()], hr=True))
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -562,7 +562,7 @@ def test_freeze_at_the_ceiling_is_answered_twice_across_a_restart(tmp_path):
     assert still_frozen.evidence_freeze.allowed_rounds == 2
     assert still_frozen.evidence_freeze.watch_failure_extension_used is True
 
-    runner.pr_payload["comments"].append(_signed("Rerun at abc123: 11 passed, 0 failed.", 2))
+    runner.pr_payload["comments"].append(_signed("Rerun at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed, 0 failed.", 2))
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
     assert runner.codex_outputs == []
@@ -577,7 +577,7 @@ def test_out_of_bound_freeze_budget_keeps_the_freeze_and_posts_one_correction(tm
         run_pr_loop(runner, pr_number=77, config=config)
     _retag_freeze_budget(runner, allowed_rounds=99)
 
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
         run_pr_loop(runner, pr_number=77, config=config)
     freezes = _freeze_records(runner)
     assert len(freezes) == 2
@@ -590,7 +590,7 @@ def test_out_of_bound_freeze_budget_keeps_the_freeze_and_posts_one_correction(tm
         run_pr_loop(runner, pr_number=77, config=config)
     assert len(_freeze_records(runner)) == 2
 
-    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    runner.pr_payload["comments"].append(_signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed.", 1))
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -606,7 +606,7 @@ def test_interrupted_evidence_response_pass_is_rerun_in_full(tmp_path, monkeypat
         run_pr_loop(runner, pr_number=77, config=config)
     freeze = _freeze_records(runner)[0].metadata
 
-    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    runner.pr_payload["comments"].append(_signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed.", 1))
     runner.codex_outputs.append(_evidence_review(dispositions=[_resolve()], hr=True))
     real_post = pr_loop_support.post_pr_comment
     stopped = []
@@ -657,7 +657,7 @@ def test_evidence_revealing_a_defect_releases_the_freeze_and_dispatches_the_code
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
     runner.pr_payload["comments"].append(
-        _signed("Live suite at abc123: 10 passed, 1 failed (sandbox escape via submodule).", 1)
+        _signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 10 passed, 1 failed (sandbox escape via submodule).", 1)
     )
     runner.codex_outputs.extend(
         [
@@ -677,7 +677,7 @@ def test_evidence_revealing_a_defect_releases_the_freeze_and_dispatches_the_code
             ),
         ]
     )
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123-coder-1"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 525753a4b04bd57d874211ba1fade250c3ff6d82"):
         run_pr_loop(runner, pr_number=77, config=config)
     releases = _release_records(runner)
     assert [record.metadata.evidence_release.reason for record in releases] == ["findings"]
@@ -688,9 +688,9 @@ def test_evidence_revealing_a_defect_releases_the_freeze_and_dispatches_the_code
     assert [item.lifecycle for item in released] == ["evidence_deferred"]
     prompts = _claude_prompts(runner)
     assert len(prompts) == 1 and "submodule config gate" in prompts[0]
-    # The fix head gets a fresh freeze; abc123 evidence did not carry forward.
+    # The fix head gets a fresh freeze; 6367c48dd193d56ea7b0baad25b19455e529f5ee evidence did not carry forward.
     assert [record.metadata.subject for record in _freeze_records(runner)] == [
-        "abc123", "abc123-coder-1"
+        "6367c48dd193d56ea7b0baad25b19455e529f5ee", "525753a4b04bd57d874211ba1fade250c3ff6d82"
     ]
 
 
@@ -721,7 +721,7 @@ def test_failing_check_while_frozen_releases_before_repair(tmp_path):
         return real_run(args, **kwargs)
 
     runner.run = checks_recover_after_coder
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123-coder-1"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 525753a4b04bd57d874211ba1fade250c3ff6d82"):
         run_pr_loop(runner, pr_number=77, config=config)
     phases = _phases(runner)
     release_index = phases.index("evidence-release")
@@ -742,7 +742,7 @@ def test_merge_conflict_while_frozen_releases_before_conflict_resolution(tmp_pat
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
     runner.mergeability_payloads = [
-        {"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY", "headRefOid": "abc123", "baseRefName": "main"},
+        {"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "baseRefName": "main"},
     ]
     with pytest.raises(AgentLoopError):
         run_pr_loop(runner, pr_number=77, config=config)
@@ -821,7 +821,7 @@ def test_malformed_persisted_freeze_blocks_without_approval(tmp_path):
     with pytest.raises(HumanDecisionRequiredError):
         run_pr_loop(runner, pr_number=77, config=config)
     _retag_freeze_budget(runner, evidence_identities=("not-the-frozen-identity",))
-    runner.pr_payload["comments"].append(_signed("Live suite at abc123: 11 passed.", 1))
+    runner.pr_payload["comments"].append(_signed("Live suite at 6367c48dd193d56ea7b0baad25b19455e529f5ee: 11 passed.", 1))
     with pytest.raises(AgentLoopError, match="malformed or contradictory persisted exact-head evidence"):
         run_pr_loop(runner, pr_number=77, config=config)
     commands = [cmd for cmd, _cwd in runner.commands]
@@ -859,7 +859,7 @@ def test_selective_policy_signed_input_with_pending_evidence_stays_in_the_round(
         monkeypatch, runner, body="Keep the legacy flag.",
         when=lambda: len(runner.codex_outputs) == 1 and len(runner.gemini_outputs) == 1,
     )
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert injected
     assert runner.codex_outputs == [] and runner.gemini_outputs == []
@@ -871,19 +871,19 @@ def test_head_moving_at_the_gate_read_publishes_no_freeze(tmp_path, monkeypatch)
     """Row freeze-on-clean-board (variant: live head is H' at the last read)."""
     runner = _frozen_runner(tmp_path)
     config = make_config(tmp_path, max_rounds=1)
-    real_context = pr_loop_support.get_pr_review_context
+    real_context = pr_loop_support.get_observed_pr_review_context
     moved = []
 
     def head_moves_before_gate(runner_, **kwargs):
         if not moved and not runner.codex_outputs:
             moved.append(True)
-            runner.pr_payload["headRefOid"] = "def456"
-            runner.git_head = "def456"
+            runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
+            runner.git_head = "0b3d8b29493059afd7f9912106279c4643ac4939"
         return real_context(runner_, **kwargs)
 
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context", head_moves_before_gate)
+    ), "get_observed_pr_review_context", head_moves_before_gate)
     with pytest.raises(AgentLoopError) as excinfo:
         run_pr_loop(runner, pr_number=77, config=config)
     assert moved
@@ -945,7 +945,7 @@ def test_refresh_pass_with_deferred_evidence_survives_a_pending_check_stop(tmp_p
         "check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}]
     }
     commands_before = len(runner.commands)
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert not any(cmd[:1] == ["codex"] for cmd, _cwd in runner.commands[commands_before:])
     freezes = _freeze_records(runner)
@@ -960,13 +960,13 @@ def test_evidence_only_approval_publication_roundtrips_without_clearing_barrier(
     from coding_review_agent_loop.protocol import parse_review
     runner = _frozen_runner(tmp_path)
     config = make_config(tmp_path, review_parallel=parallel)
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
         run_pr_loop(runner, pr_number=77, config=config)
-    runner.pr_payload["headRefOid"] = "def456"
-    runner.git_head = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
+    runner.git_head = "0b3d8b29493059afd7f9912106279c4643ac4939"
     runner.simulate_new_process()
     runner.codex_outputs.append(_evidence_review(state="blocking", dispositions=[_keep()]))
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head def456"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 0b3d8b29493059afd7f9912106279c4643ac4939"):
         run_pr_loop(runner, pr_number=77, config=config)
     records = _pr_records(runner)
     reviews = [r for r in records if r.metadata.role == "reviewer" and r.metadata.state == "approved"]
@@ -985,12 +985,12 @@ def test_legacy_contradictory_approval_forces_fresh_native_evidence_review(tmp_p
     from coding_review_agent_loop.comment_rendering import render_public_agent_comment
     runner = _frozen_runner(tmp_path)
     config = make_config(tmp_path, pr_review_policy=policy)
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head abc123"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee"):
         run_pr_loop(runner, pr_number=77, config=config)
     original = next(r for r in _pr_records(runner) if r.metadata.role == "reviewer")
     freeze = _freeze_records(runner)[-1]
-    runner.pr_payload["headRefOid"] = "def456"
-    runner.git_head = "def456"
+    runner.pr_payload["headRefOid"] = "0b3d8b29493059afd7f9912106279c4643ac4939"
+    runner.git_head = "0b3d8b29493059afd7f9912106279c4643ac4939"
     from coding_review_agent_loop.protocol import ReviewItemDisposition
     disposition = ReviewItemDisposition(item_id="item-1", reviewer="Codex", disposition="blocking", note="Still needed.")
     approved = dataclasses.replace(parse_review(original.body, reviewer="Codex"), dispositions=(disposition,))
@@ -998,16 +998,16 @@ def test_legacy_contradictory_approval_forces_fresh_native_evidence_review(tmp_p
                                       prior_items=freeze.metadata.prior_items, dispositions=(disposition,))
     with pytest.raises(AgentLoopError, match="fully complete"):
         parse_review(body, reviewer="Codex")
-    metadata = dataclasses.replace(original.metadata, subject="def456", round_number=2,
+    metadata = dataclasses.replace(original.metadata, subject="0b3d8b29493059afd7f9912106279c4643ac4939", round_number=2,
                                    prior_items=freeze.metadata.prior_items, dispositions=(disposition,),
-                                   scheduler_current_sha="def456" if policy == "selective-intermediate" else None)
+                                   scheduler_current_sha="0b3d8b29493059afd7f9912106279c4643ac4939" if policy == "selective-intermediate" else None)
     runner.pr_payload["comments"].append({"body": _attach_round_metadata(body, metadata),
                                          "author": {"login": "coding-review-agent-loop"},
                                          "createdAt": "2026-10-01T00:00:00Z"})
     before = len([cmd for cmd, _ in runner.commands if cmd[:2] == ["codex", "exec"]])
     runner.simulate_new_process()
     runner.codex_outputs.append(_evidence_review(state="blocking", dispositions=[_keep()]))
-    with pytest.raises(HumanDecisionRequiredError, match="frozen at head def456"):
+    with pytest.raises(HumanDecisionRequiredError, match="frozen at head 0b3d8b29493059afd7f9912106279c4643ac4939"):
         run_pr_loop(runner, pr_number=77, config=config)
     assert len([cmd for cmd, _ in runner.commands if cmd[:2] == ["codex", "exec"]]) == before + 1
     assert not any(cmd[:1] == ["claude"] for cmd, _ in runner.commands)
@@ -1042,7 +1042,7 @@ def test_freeze_diagnostic_failure_preserves_original_stop(tmp_path, monkeypatch
         run_pr_loop(runner, pr_number=77, config=config)
     assert original == [raised.value] and original[0] is raised.value
     assert raised.value.EXIT_CODE == 4
-    assert "frozen at head abc123" in str(raised.value)
+    assert "frozen at head 6367c48dd193d56ea7b0baad25b19455e529f5ee" in str(raised.value)
     assert len(_freeze_records(runner)) == 1
     assert "Warning: could not post the human-decision diagnostic" in capsys.readouterr().err
     assert not _claude_prompts(runner)

@@ -340,3 +340,139 @@ def test_959_direct_issue_implementation_metadata_anchors_to_own_round(
         assert metadata.risk_test_matrix_evidence_full_round_status == "absent"
         assert "matrix evidence" not in visible
         assert "<details>" not in visible
+
+
+@pytest.mark.parametrize('invalid', [False, True])
+def test_plan_first_legacy_resume_observation_precedes_handoff(tmp_path, monkeypatch, invalid):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from issue_loop_test_helpers import _provenance_pages
+    from types import SimpleNamespace
+    monkeypatch.setattr(issue_loop, 'resolve_canonical_pr_for_issue', lambda *a, **k: None)
+    monkeypatch.setattr(plan_first_loop_module, 'resolve_canonical_pr_for_issue', lambda *a, **k: SimpleNamespace(source='legacy-closing-reference', pr_number=77, metadata=None, evidence_summary='authenticated fixture'))
+    plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    runner = FakeRunner(
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:00Z",
+                "body": _attach_round_metadata(
+                    plan,
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="coder",
+                        agent="Claude",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                    ),
+                ),
+            },
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:01Z",
+                "body": _attach_round_metadata(
+                    "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="reviewer",
+                        agent="Codex",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                        state="approved",
+                    ),
+                ),
+            },
+        ],
+        codex_outputs=[
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
+        pr_commit_pages=_provenance_pages(
+            "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=approved "
+            f"plan={approved_plan_hash(plan)}"
+        ),
+    )
+    config = make_config(tmp_path)
+
+
+    before = len(runner.comments)
+    runner.branch_tip = 'b' * 40
+    if invalid: runner.pr_payload['headRefOid'] = 'invalid'
+    with pytest.raises(PrHeadObservationError):
+        run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True)
+    assert not runner.pr_payload.get('comments')
+    assert not any('Flow: approved-plan-implementation' in body for body in runner.comments[before:])
+    assert not any(cmd[:1] in (['claude'], ['codex']) for cmd, _ in runner.commands)
+
+
+def test_plan_first_legacy_resume_convergence_binds_complete_handoff(tmp_path, monkeypatch):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    from coding_review_agent_loop.round_state import PostedRoundMetadata, _attach_round_metadata, _plan_subject
+    from coding_review_agent_loop.decomposition import approved_plan_hash
+    from issue_loop_test_helpers import _provenance_pages
+    from types import SimpleNamespace
+    monkeypatch.setattr(issue_loop, 'resolve_canonical_pr_for_issue', lambda *a, **k: None)
+    monkeypatch.setattr(plan_first_loop_module, 'resolve_canonical_pr_for_issue', lambda *a, **k: SimpleNamespace(source='legacy-closing-reference', pr_number=77, metadata=None, evidence_summary='authenticated fixture'))
+    plan = "Plan:\n- Make the change.\n<!-- AGENT_PLAN_STATE: blocking -->\n-- Anthropic Claude"
+    runner = FakeRunner(
+        issue_comments=[
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:00Z",
+                "body": _attach_round_metadata(
+                    plan,
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="coder",
+                        agent="Claude",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                    ),
+                ),
+            },
+            {
+                "author": {"login": "bot"},
+                "createdAt": "2026-05-23T00:00:01Z",
+                "body": _attach_round_metadata(
+                    "Plan looks sound.\n<!-- AGENT_PLAN_STATE: approved -->\n-- OpenAI Codex",
+                    PostedRoundMetadata(
+                        flow="plan",
+                        role="reviewer",
+                        agent="Codex",
+                        round_number=1,
+                        subject=_plan_subject(plan),
+                        state="approved",
+                    ),
+                ),
+            },
+        ],
+        codex_outputs=[
+            "LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex",
+        ],
+        open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
+        pr_commit_pages=_provenance_pages(
+            "Implement issue.\n\nAgent-Issue-Provenance: v1 repo=owner/repo issue=56 flow=approved "
+            f"plan={approved_plan_hash(plan)}"
+        ),
+    )
+    config = make_config(tmp_path)
+
+
+
+    tip = 'b' * 40
+    runner.branch_tip = tip
+    original = runner.run
+    def run(args, **kwargs):
+        if args == ['sleep', '2']:
+            runner.pr_payload.update(headRefOid=tip, url='https://github.com/owner/repo/pull/77/')
+        return original(args, **kwargs)
+    runner.run = run
+    delegated = []
+    monkeypatch.setattr(plan_first_loop_module, 'run_pr_loop', lambda *a, **k: delegated.append(k) or 0)
+    assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True, implement_after_approval=True) == 0
+    handoffs = [body for body in runner.comments if 'Flow: approved-plan-implementation' in body]
+    assert len(handoffs) == 1
+    assert tip in handoffs[0]
+    assert 'https://github.com/owner/repo/pull/77/' in handoffs[0]
+    assert len(delegated) == 1

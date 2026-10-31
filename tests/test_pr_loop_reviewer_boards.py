@@ -59,7 +59,8 @@ from coding_review_agent_loop.board_amendment import (  # noqa: E402
 
 
 @pytest.mark.parametrize("linked_issue", [False, True], ids=["standalone", "issue-mode"])
-def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkeypatch, linked_issue):
+@pytest.mark.parametrize("delete_branch", [False, True])
+def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkeypatch, linked_issue, delete_branch, capsys):
     """Row pr-qualification, standalone (issue_context=None) and with a linked issue."""
     payload = (
         {
@@ -82,10 +83,27 @@ def test_pr_board_amendment_resumes_and_qualifies_standalone_pr(tmp_path, monkey
     assert '"issue": null' in template
 
     _m943_append(runner, template)
-    monkeypatch.setattr(
-        pr_loop_support, "merge_pr", lambda *args, **kwargs: None
-    )
+    merged = False
+    original_run = runner.run
+
+    def run(args, **kwargs):
+        result = original_run(args, **kwargs)
+        if merged and delete_branch and len(args) > 2 and '/git/ref/heads/' in args[2]:
+            return dataclasses.replace(result, returncode=1, stderr="HTTP 404: deleted branch")
+        return result
+
+    def merge(*args, **kwargs):
+        nonlocal merged
+        merged = True
+
+    runner.run = run
+    monkeypatch.setattr(pr_loop_support, "merge_pr", merge)
+    completions = []
+    monkeypatch.setattr(pr_loop, "_record_staged_parent_completion_after_merge", lambda *a, **k: completions.append(1))
     assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
+    assert merged and completions
+    assert "merged" in capsys.readouterr().out.lower()
+    merged = False  # Remaining assertions inspect the pre-merge qualification contract.
 
     # The qualification gate re-reads the fresh PR comments, including the
     # pre-amendment three-reviewer records, and accepts the amended board.
@@ -147,9 +165,9 @@ def test_pr_board_amendment_qualification_refuses_a_stale_contract(tmp_path, mon
     stale = _attach_round_metadata(
         "A stale-board scheduler record posted while managed CI was running.",
         PostedRoundMetadata(
-            flow="pr", role="summary", agent="Orchestrator", round_number=9, subject="abc123",
+            flow="pr", role="summary", agent="Orchestrator", round_number=9, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             phase="reconciliation", scheduler_contract=stale_contract.as_dict(),
-            scheduler_previous_sha=None, scheduler_current_sha="abc123",
+            scheduler_previous_sha=None, scheduler_current_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             scheduler_obligation_digest="0" * 16, scheduler_selected_reviewers=("Codex",),
             scheduler_reasons=("stale",), scheduler_final_sweep=False,
             scheduler_force_full=False, scheduler_calls_avoided=0,
@@ -163,7 +181,7 @@ def test_pr_board_amendment_qualification_refuses_a_stale_contract(tmp_path, mon
 
     def wait_and_inject(*args, **kwargs):
         _m943_append(runner, stale, login="bot")
-        return ManagedCiOutcome(status="passed", head_sha="abc123")
+        return ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
     monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait_and_inject)
     monkeypatch.setattr(
@@ -212,7 +230,7 @@ def test_pr_board_amendment_managed_completion_names_the_reduced_board(
     monkeypatch.setattr(
         pr_loop,
         "wait_for_final_qualification",
-        lambda *args, **kwargs: waits.append(True) or ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *args, **kwargs: waits.append(True) or ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     merges = []
     monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *args, **kwargs: None)
@@ -221,7 +239,7 @@ def test_pr_board_amendment_managed_completion_names_the_reduced_board(
     ), "_merge_with_exact_head_proof", lambda *args, **kwargs: merges.append(kwargs)
     )
     monkeypatch.setattr(
-        pr_loop, "publish_manual_v2_qualification", lambda *args, **kwargs: "abc123"
+        pr_loop, "publish_manual_v2_qualification", lambda *args, **kwargs: "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     )
     capsys.readouterr()
     assert run_pr_loop(runner, pr_number=77, config=reduced) == 0
@@ -256,7 +274,7 @@ def test_pr_board_amendment_qualification_refuses_a_digest_on_a_contract_neutral
     neutral = _attach_round_metadata(
         _staged_review(reviewer="OpenAI Codex"),
         PostedRoundMetadata(
-            flow="pr", role="reviewer", agent="Codex", round_number=9, subject="abc123",
+            flow="pr", role="reviewer", agent="Codex", round_number=9, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             reviewer_board_amendment_digest=amendment.digest,
         ),
     )
@@ -272,7 +290,7 @@ def test_pr_board_amendment_qualification_refuses_a_digest_on_a_contract_neutral
     def wait_and_inject(*args, **kwargs):
         _m943_append(runner, neutral, login="bot")
         injected.append(True)
-        return ManagedCiOutcome(status="passed", head_sha="abc123")
+        return ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
     monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait_and_inject)
     monkeypatch.setattr(
@@ -587,7 +605,7 @@ def test_1133_unreadable_amendment_posted_during_managed_ci_does_not_block_quali
 
     def wait_and_inject(*args, **kwargs):
         _m943_append(runner, unreadable, login="operator")
-        return ManagedCiOutcome(status="passed", head_sha="abc123")
+        return ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee")
 
     monkeypatch.setattr(pr_loop, "wait_for_final_qualification", wait_and_inject)
     merges = []
@@ -806,7 +824,7 @@ def test_1133_post_panel_automatic_latch_uses_the_amended_board(
     assert not any("missing required input" in c for c in new_comments)
     # Qualification: exactly one exact-head merge, after every latched review,
     # followed by the durable reduced-board completion note.
-    assert runner.merge_calls == [{"expected_head_sha": "abc123-coder-1"}]
+    assert runner.merge_calls == [{"expected_head_sha": "525753a4b04bd57d874211ba1fade250c3ff6d82"}]
     notes = [c for c in new_comments if c.startswith("Review completed on a reduced reviewer board.")]
     assert len(notes) == 1 and "required board now Codex, Gemini" in notes[0]
     last_review = max(i for i, c in enumerate(new_comments) if "Google Gemini review" in c)
@@ -875,7 +893,7 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
     )
     handoff = AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="abc123", branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56", trusted_actor_login="agent-loop",
         trusted_actor_id=1, protection_mode="strict", override_nonce=None,
     )
     monkeypatch.setattr(pr_loop, "recover_issue_created_handoff", lambda *a, **k: handoff)
@@ -891,7 +909,7 @@ def _m1133_ordinary_resume_strict(tmp_path, monkeypatch, *, supplied, entry="ord
     monkeypatch.setattr(
         pr_loop,
         "wait_for_final_qualification",
-        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *args, **kwargs: ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     monkeypatch.setattr(pr_loop, "prepare_v2_merge", lambda *args, **kwargs: None)
     merges = []
@@ -1078,7 +1096,7 @@ def _affected_issue_created_pr_1365(tmp_path, monkeypatch):
             )
     (coder,) = _records_1365(runner)
     assert (coder.metadata.role, coder.metadata.phase, coder.metadata.subject) == (
-        "coder", "authoritative", runner.pr_payload.get("headRefOid", "abc123"),
+        "coder", "authoritative", runner.pr_payload.get("headRefOid", "6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     assert coder.metadata.seat_binding is None and coder.metadata.pr_board_root is None
     return runner, seats, config
@@ -1104,9 +1122,9 @@ def test_affected_issue_created_named_pr_recovers_into_review_by_rerun(tmp_path,
     coder, *later = _records_1365(runner)
     assert coder.metadata.role == "coder" and coder.metadata.seat_binding is None
     assert [(r.metadata.role, r.metadata.agent, r.metadata.subject, r.metadata.state) for r in later] == [
-        ("reviewer", "sol", "abc123", "approved"),
-        ("reviewer", "flash", "abc123", "approved"),
-        ("reviewer", "opus-low", "abc123", "approved"),
+        ("reviewer", "sol", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "approved"),
+        ("reviewer", "flash", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "approved"),
+        ("reviewer", "opus-low", "6367c48dd193d56ea7b0baad25b19455e529f5ee", "approved"),
     ]
     assert all(r.metadata.pr_board_root is not None for r in later)
     # Historical comments are untouched and nothing was backfilled.
@@ -1188,7 +1206,7 @@ def test_foreign_canonical_handoff_record_is_refused_at_named_pr_entry(tmp_path,
     assert _writes_1365(runner, start) == [] and _agents_1365(runner, start) == []
 
 
-@pytest.mark.parametrize("head", ["abc123", "def456"], ids=["exact-head", "stale-head"])
+@pytest.mark.parametrize("head", ["6367c48dd193d56ea7b0baad25b19455e529f5ee", "0b3d8b29493059afd7f9912106279c4643ac4939"], ids=["exact-head", "stale-head"])
 def test_named_pr_adopts_the_legacy_coder_record_only_at_its_exact_head(tmp_path, monkeypatch, head):
     """Row wrong-head-coder: a coder record at another head is not this round's output."""
     from coding_review_agent_loop.round_state import pr_resume_needs_author_admission
@@ -1197,7 +1215,7 @@ def test_named_pr_adopts_the_legacy_coder_record_only_at_its_exact_head(tmp_path
     runner.pr_payload["headRefOid"] = head
     comments = [SimpleNamespace(body=c["body"]) for c in runner.pr_payload["comments"]]
     # A record-less live head is the existing unrecorded-head path.
-    assert pr_resume_needs_author_admission(comments, head) is (head != "abc123")
+    assert pr_resume_needs_author_admission(comments, head) is (head != "6367c48dd193d56ea7b0baad25b19455e529f5ee")
     _queue_1365(runner, seats)
     start = len(runner.commands)
 
@@ -1221,7 +1239,7 @@ def test_named_pr_adopts_the_legacy_coder_record_only_at_its_exact_head(tmp_path
     assert len(prompts) == 3
     # Only the exact-head coder record reaches the reviewers as the round's
     # coder output; the stale one is never shown for the live head.
-    assert all(("Implemented approved plan." in prompt) is (head == "abc123") for prompt in prompts)
+    assert all(("Implemented approved plan." in prompt) is (head == "6367c48dd193d56ea7b0baad25b19455e529f5ee") for prompt in prompts)
 
 
 def _issue_created_named_pr_after_review_1365(tmp_path):
@@ -1258,7 +1276,7 @@ def test_issue_created_named_pr_changes_board_mid_run_and_merges_the_approved_he
         r.metadata for r in _records_1365(runner)
         if r.metadata.role == "reviewer" and r.metadata.agent == "opus-high"
     ]
-    assert replacement and all(m.state == "approved" and m.subject == "abc123" for m in replacement)
+    assert replacement and all(m.state == "approved" and m.subject == "6367c48dd193d56ea7b0baad25b19455e529f5ee" for m in replacement)
     # The initial coder record never pinned the board: every later record keeps
     # the handoff root while the run's identity is the changed board.
     roots = {
@@ -1276,7 +1294,7 @@ def test_issue_created_named_pr_changes_board_mid_run_and_merges_the_approved_he
     assert len(_links_1365(runner)) == 1
     merges = [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["gh", "pr", "merge"]]
     assert merges == [
-        ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "abc123"]
+        ["gh", "pr", "merge", "77", "--repo", "OWNER/REPO", "--merge", "--match-head-commit", "6367c48dd193d56ea7b0baad25b19455e529f5ee"]
     ]
 
 

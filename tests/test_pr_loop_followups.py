@@ -1,3 +1,4 @@
+import hashlib
 """PR-loop tests for followups and pr_loop_support: PR follow-up filing (#1542)."""
 
 import dataclasses
@@ -188,14 +189,14 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
     wrong = _followup_observation(
         execution_ref="coder-turn:observation-1",
         receipt_id="receipt-wrong-head",
-        head="predecessor-head",
+        head="aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c",
         timestamp="2026-01-01T00:00:00Z",
         tracked_digest="tree-predecessor",
     )
     current = _followup_observation(
         execution_ref="coder-turn:observation-2",
         receipt_id="receipt-current-head",
-        head="repaired-head",
+        head="15cab520f7c90f2ab1738eb929c70e65374e7bb8",
         timestamp="2026-01-01T00:00:01Z",
     )
     initial_text = _semantic_coder_followup_text(wrong.execution_ref)
@@ -232,16 +233,16 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
                 ],
             ),
         ],
-        pr_payload={"headRefOid": "predecessor-head"},
-        git_head="predecessor-head",
+        pr_payload={"headRefOid": "aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c"},
+        git_head="aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c",
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
     real_validated_agent = validated_agent._run_validated_agent
 
     def fake_validated_agent(*args, **kwargs):
         if kwargs.get("role") == "coder":
-            runner.pr_payload["headRefOid"] = "repaired-head"
-            runner.simulate_agent_turn(config, config.claude_dir, head="repaired-head")
+            runner.pr_payload["headRefOid"] = "15cab520f7c90f2ab1738eb929c70e65374e7bb8"
+            runner.simulate_agent_turn(config, config.claude_dir, head="15cab520f7c90f2ab1738eb929c70e65374e7bb8")
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
@@ -267,23 +268,23 @@ def test_run_pr_loop_derives_followup_evidence_through_real_coder_caller(
     )
 
     real_run_agent_result = validated_agent.run_agent_result
-    real_get_pr_review_context = pr_loop_support.get_pr_review_context
+    real_get_pr_review_context = pr_loop_support.get_observed_pr_review_context
     race_pending = False
 
     def get_pr_context(*args, **kwargs):
         nonlocal race_pending
         if mode == "head-race" and race_pending:
-            runner.pr_payload["headRefOid"] = "raced-head"
+            runner.pr_payload["headRefOid"] = "a607eb2974b572fbd8ce0410e987804f1e0775a6"
             try:
                 return real_get_pr_review_context(*args, **kwargs)
             finally:
-                runner.pr_payload["headRefOid"] = "repaired-head"
+                runner.pr_payload["headRefOid"] = "15cab520f7c90f2ab1738eb929c70e65374e7bb8"
                 race_pending = False
         return real_get_pr_review_context(*args, **kwargs)
 
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context", get_pr_context)
+    ), "get_observed_pr_review_context", get_pr_context)
 
     def fake_correction(*_args, **kwargs):
         nonlocal race_pending
@@ -351,7 +352,7 @@ def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
     current = _followup_observation(
         execution_ref="coder-turn:observation-1",
         receipt_id="receipt-current-head",
-        head="repaired-head",
+        head="15cab520f7c90f2ab1738eb929c70e65374e7bb8",
         timestamp="2026-01-01T00:00:01Z",
     )
     command_ref = "python3 -m pytest tests/test_orchestrator_pr.py -q"
@@ -390,16 +391,16 @@ def test_run_pr_loop_accepts_followup_with_command_string_refs_as_unverified(
                 ],
             ),
         ],
-        pr_payload={"headRefOid": "predecessor-head"},
-        git_head="predecessor-head",
+        pr_payload={"headRefOid": "aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c"},
+        git_head="aa4ef5c453dd923aedb5e86e4c3b67aa90d1646c",
     )
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=2)
     real_validated_agent = validated_agent._run_validated_agent
 
     def fake_validated_agent(*args, **kwargs):
         if kwargs.get("role") == "coder":
-            runner.pr_payload["headRefOid"] = "repaired-head"
-            runner.simulate_agent_turn(config, config.claude_dir, head="repaired-head")
+            runner.pr_payload["headRefOid"] = "15cab520f7c90f2ab1738eb929c70e65374e7bb8"
+            runner.simulate_agent_turn(config, config.claude_dir, head="15cab520f7c90f2ab1738eb929c70e65374e7bb8")
             return coder_response
         return real_validated_agent(*args, **kwargs)
 
@@ -518,7 +519,7 @@ def test_run_pr_loop_replays_derived_followup_evidence_without_ephemeral_selecto
             role="coder",
             agent="Claude",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
             raw_structured_coder_response=raw_coder,
             risk_test_matrix_evidence=evidence,
@@ -544,7 +545,7 @@ def test_run_pr_loop_replays_derived_followup_evidence_without_ephemeral_selecto
             role="reviewer",
             agent="Codex",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=(carried_item,),
             dispositions=(
                 ReviewItemDisposition(
@@ -565,7 +566,7 @@ def test_run_pr_loop_replays_derived_followup_evidence_without_ephemeral_selecto
             )
         ],
         pr_payload={
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "comments": [
                 {"author": {"login": "bot"}, "createdAt": "2026-06-01T00:00:00Z", "body": coder_comment},
                 {"author": {"login": "bot"}, "createdAt": "2026-06-01T00:01:00Z", "body": review_comment},
@@ -681,7 +682,7 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
             "body": (
                 "Future follow-up from approved review on PR #77.\n\n"
                 "Source context:\n"
-                "- Lookup context: repository=OWNER/REPO; source=pr#77; identity=abc123; related PR(s)=#77\n\n"
+                "- Lookup context: repository=OWNER/REPO; source=pr#77; identity=6367c48dd193d56ea7b0baad25b19455e529f5ee; related PR(s)=#77\n\n"
                 "Reviewer: Codex\n\n"
                 "Follow-up:\n"
                 "- Add cleanup docs.\n\n"
@@ -695,7 +696,7 @@ def test_pr_loop_creates_issues_for_approved_followups(tmp_path):
             "body": (
                 "Future follow-up from approved review on PR #77.\n\n"
                 "Source context:\n"
-                "- Lookup context: repository=OWNER/REPO; source=pr#77; identity=abc123; related PR(s)=#77\n\n"
+                "- Lookup context: repository=OWNER/REPO; source=pr#77; identity=6367c48dd193d56ea7b0baad25b19455e529f5ee; related PR(s)=#77\n\n"
                 "Reviewer: Claude\n\n"
                 "Follow-up:\n"
                 "- Add regression coverage.\n\n"
@@ -1753,7 +1754,7 @@ def _advance_head_after_coder_1389(monkeypatch, runner, *, interrupt=None):
                 raise Interrupted
         response = original(*args, **kwargs)
         if role == "coder":
-            runner.pr_payload["headRefOid"] = f"repaired-{next(counter)}"
+            runner.pr_payload["headRefOid"] = hashlib.sha1(f"repaired-{next(counter)}".encode()).hexdigest()
         return response
 
     patch_attr_in(monkeypatch, (
@@ -1931,7 +1932,7 @@ def test_resume_after_blocking_round_future_followup_publishes_it_once(tmp_path,
     with pytest.raises(interrupted):
         run_pr_loop(runner, pr_number=77, config=config)
     assert runner.issues == []
-    assert runner.pr_payload["headRefOid"] == "repaired-2"
+    assert runner.pr_payload["headRefOid"] == "b922ce25aedcf47d31bdeb16ec4eeb5a7a5099ae"
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
@@ -2021,9 +2022,9 @@ def test_merge_conflict_handoff_omits_retained_future_followup_and_still_files_i
         ],
         mergeability_payloads=[
             {"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
-             "headRefOid": "abc123", "baseRefName": "main"},
+             "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "baseRefName": "main"},
             {"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY",
-             "headRefOid": "abc123", "baseRefName": "main"},
+             "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee", "baseRefName": "main"},
         ],
     )
     _advance_head_after_coder_1389(monkeypatch, runner)
@@ -2147,12 +2148,13 @@ def _run_1388_acknowledgement_round(tmp_path, monkeypatch, *, recorded_history):
         ],
         claude_outputs=[ack_markdown, ack_markdown, resolved_claim],
     )
+    runner.pr_payload["headRefName"] = "feature/x"
     metadata = PullRequestMetadata(
         number=77, repo="OWNER/REPO", title="Acknowledgement", head_branch="feature/x",
-        base_branch="main", head_sha="abc123", url="https://github.com/OWNER/REPO/pull/77",
+        base_branch="main", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", url="https://github.com/OWNER/REPO/pull/77",
     )
     fetches = []
-    real_context = github_module.get_pr_review_context
+    real_context = pr_loop_support.get_observed_pr_review_context
 
     def review_context(*args, **kwargs):
         fetches.append(True)
@@ -2165,7 +2167,7 @@ def _run_1388_acknowledgement_round(tmp_path, monkeypatch, *, recorded_history):
 
     patch_attr_in(monkeypatch, (
         pr_loop_support, pr_loop, issue_implementation, plan_first_loop, issue_loop,
-    ), "get_pr_review_context", review_context)
+    ), "get_observed_pr_review_context", review_context)
     repairs = []
     real_repair = validated_agent_module._run_structured_repair
 
@@ -2301,10 +2303,10 @@ def test_resumed_scratch_report_classification(tmp_path, monkeypatch):
     raw = structured_coder_followup(tests_run=[audit, baseline])
     metadata = PostedRoundMetadata(
         flow='pr', role='coder', agent='Codex', round_number=2,
-        subject='abc123', raw_structured_coder_response=raw,
+        subject='6367c48dd193d56ea7b0baad25b19455e529f5ee', raw_structured_coder_response=raw,
     )
     context = pr_loop_support._coder_followup_review_context(
-        raw, metadata, head_sha='abc123', assigned_workdir=tmp_path / 'checkout',
+        raw, metadata, head_sha='6367c48dd193d56ea7b0baad25b19455e529f5ee', assigned_workdir=tmp_path / 'checkout',
     )
     assert json.dumps(audit) in context
     payload, _ = json.JSONDecoder().raw_decode(context[context.index("{"):])

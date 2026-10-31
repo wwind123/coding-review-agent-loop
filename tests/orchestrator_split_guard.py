@@ -63,6 +63,7 @@ EXTRACTED_MODULES: tuple[str, ...] = (
     'child_plan_binding',
     'evidence_stall',
     'evidence_conversion',
+    'pr_head_sync',
     'pr_loop_plumbing',
     'code_approval',
     'pr_plan_recovery',

@@ -63,7 +63,7 @@ def test_conflict_at_round_start_skips_reviewers_and_routes_to_coder(tmp_path):
             {
                 "mergeable": "CONFLICTING",
                 "mergeStateStatus": "DIRTY",
-                "headRefOid": "abc123",
+                "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "baseRefName": "main",
             },
         ],
@@ -101,13 +101,13 @@ def test_conflict_after_review_before_merge_blocks_watcher_and_merge(tmp_path):
             {
                 "mergeable": "MERGEABLE",
                 "mergeStateStatus": "CLEAN",
-                "headRefOid": "abc123",
+                "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "baseRefName": "main",
             },
             {
                 "mergeable": "CONFLICTING",
                 "mergeStateStatus": "DIRTY",
-                "headRefOid": "abc123",
+                "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "baseRefName": "main",
             },
         ],
@@ -151,13 +151,13 @@ def test_persistent_conflict_with_unchanged_head_stops_cleanly(tmp_path):
             {
                 "mergeable": "CONFLICTING",
                 "mergeStateStatus": "DIRTY",
-                "headRefOid": "abc123",
+                "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "baseRefName": "main",
             },
             {
                 "mergeable": "CONFLICTING",
                 "mergeStateStatus": "DIRTY",
-                "headRefOid": "abc123",
+                "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "baseRefName": "main",
             },
         ],
@@ -191,7 +191,7 @@ def test_confirmed_conflict_survives_transient_unknown_reprobe_on_same_head(tmp_
             {
                 "mergeable": "CONFLICTING",
                 "mergeStateStatus": "DIRTY",
-                "headRefOid": "abc123",
+                "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "baseRefName": "main",
             },
             {"mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN"},
@@ -223,7 +223,7 @@ def test_conflict_resolution_requires_fresh_ci_and_review(tmp_path):
             {
                 "mergeable": "CONFLICTING",
                 "mergeStateStatus": "DIRTY",
-                "headRefOid": "abc123",
+                "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
                 "baseRefName": "main",
             },
         ],

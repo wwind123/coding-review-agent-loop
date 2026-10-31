@@ -53,7 +53,7 @@ def _carried_ci_obligations() -> tuple[UnresolvedReviewItem, ...]:
             obligation_kind=kind,
             lifecycle="qualification_ready",
             failed_head_sha="old-head",
-            candidate_head_sha="abc123",
+            candidate_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             obligation_identity=f"{kind}:item-{index}",
         )
         for index, (reviewer, kind) in enumerate(
@@ -85,7 +85,7 @@ def _carried_ci_review_comment(items):
             role="reviewer",
             agent="Codex",
             round_number=1,
-            subject="abc123",
+            subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             prior_items=items,
             dispositions=dispositions,
             state="approved",

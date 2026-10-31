@@ -711,7 +711,7 @@ def test_every_counted_run_belongs_to_exactly_one_policy_row_of_its_flow():
 
 REAL_RUN_ARTIFACTS = REPO_ROOT / "docs" / "evaluation" / "review_contract_runs.json"
 REAL_RUN_REPORT = REPO_ROOT / "docs" / "evaluation" / "review_contract_report.json"
-LABEL_EVIDENCE = {"source": "tool commit abc123 for every review round", "verified": True}
+LABEL_EVIDENCE = {"source": "tool commit 6367c48dd193d56ea7b0baad25b19455e529f5ee for every review round", "verified": True}
 CONTRACT_VALUE_KEYS = (
     "review_rounds",
     "reviewer_calls",

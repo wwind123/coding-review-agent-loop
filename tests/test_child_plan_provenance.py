@@ -271,7 +271,7 @@ def fresh_child_contexts(
         comments=(comment(format_issue_pr_handoff_comment(
             issue_number=56, pr_number=77,
             pr_url="https://github.com/OWNER/REPO/pull/77",
-            pr_head_sha="abc123", flow="approved-plan-implementation", plan_hash=parent_hash,
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="approved-plan-implementation", plan_hash=parent_hash,
         )),),
     )
     parent_children = (
@@ -315,7 +315,7 @@ def fresh_child_contexts(
                 comment(format_issue_pr_handoff_comment(
                     issue_number=56, pr_number=77,
                     pr_url="https://github.com/OWNER/REPO/pull/77",
-                    pr_head_sha="abc123", flow="approved-plan-implementation",
+                    pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="approved-plan-implementation",
                     plan_hash=child_hash,
                 )),
             ),
@@ -349,7 +349,7 @@ def test_separately_planned_child_preserves_both_plan_bindings(tmp_path, monkeyp
         child_body = replace_phase_plan_hash(child_body, "")
     handoff = format_issue_pr_handoff_comment(
         issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123", flow="approved-plan-implementation", plan_hash=child_hash,
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="approved-plan-implementation", plan_hash=child_hash,
     )
     child = IssueContext(
         number=56, repo="OWNER/REPO", title="Child", body=child_body,
@@ -544,7 +544,7 @@ def test_planning_handoff_pr_binds_to_distinct_reviewed_child_plan(
                 comment(format_issue_pr_handoff_comment(
                     issue_number=56, pr_number=77,
                     pr_url="https://github.com/OWNER/REPO/pull/77",
-                    pr_head_sha="abc123", flow="approved-plan-implementation",
+                    pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="approved-plan-implementation",
                     plan_hash=approved_plan_hash(parent_plan),
                 )),
             ),
@@ -598,7 +598,7 @@ def test_direct_and_legacy_handoff_pr_still_require_parent_phase_hash(
         child,
         comments=(comment(format_issue_pr_handoff_comment(
             issue_number=56, pr_number=77,
-            pr_url="https://github.com/OWNER/REPO/pull/77", pr_head_sha="abc123",
+            pr_url="https://github.com/OWNER/REPO/pull/77", pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             flow="approved-plan-implementation", plan_hash="wrong-child-hash",
         )),),
     )
@@ -882,7 +882,7 @@ def test_m780_12_separately_planned_child_requires_parent_row_and_uses_child_pro
     child_hash = approved_plan_hash(child_plan)
     child_handoff = format_issue_pr_handoff_comment(
         issue_number=56, pr_number=77,
-        pr_url="https://github.com/OWNER/REPO/pull/77", pr_head_sha="abc123",
+        pr_url="https://github.com/OWNER/REPO/pull/77", pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation", plan_hash=child_hash,
     )
     child = dataclasses.replace(
@@ -1138,7 +1138,7 @@ def managed_ci_resume(
         "recover_issue_created_handoff",
         lambda *_a, **_k: pr_loop_support.AuthenticatedIssueCreatedHandoff(
             pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-            head_sha="abc123", branch="agent-loop/managed-56",
+            head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56",
             trusted_actor_login="agent-loop", trusted_actor_id=1,
             protection_mode="voluntary", override_nonce="opening-nonce",
         ),
@@ -1159,7 +1159,7 @@ def managed_ci_resume(
     monkeypatch.setattr(pr_loop, "authorize_fresh_issue_created_resume", authorize)
     runner = FakeRunner(
         pr_payload={
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "baseRefName": "main", "body": "Fixes #56",
         },
     )
@@ -1411,7 +1411,7 @@ def test_managed_ci_pr_mode_derived_parent_hash_mismatch_fails_closed(
         comments=(comment(format_issue_pr_handoff_comment(
             issue_number=56, pr_number=77,
             pr_url="https://github.com/OWNER/REPO/pull/77",
-            pr_head_sha="abc123", flow="approved-plan-implementation",
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="approved-plan-implementation",
             plan_hash=approved_plan_hash(other_plan),
         )),),
     )
@@ -2952,7 +2952,7 @@ class _M936World:
             *plan_comments,
             comment(format_issue_pr_handoff_comment(
                 issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
-                pr_head_sha="abc123", flow="approved-plan-implementation", plan_hash=self.old_hash,
+                pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="approved-plan-implementation", plan_hash=self.old_hash,
             )),
         ]
         if signed:
@@ -3636,7 +3636,7 @@ def test_m936_pr_mode_names_the_issue_route_and_proceeds_after_a_rebind(tmp_path
         world.comments, expected_hash=world.old_hash
     )
     stale_approval = _attach_round_metadata(PR_APPROVAL, PostedRoundMetadata(
-        flow="pr", role="reviewer", agent="Codex", round_number=1, subject="abc123",
+        flow="pr", role="reviewer", agent="Codex", round_number=1, subject="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         state="approved", approved_plan_hash=world.old_hash,
         approved_plan_subject=old_context.plan_subject,
     ))
@@ -3659,13 +3659,13 @@ def test_m936_pr_mode_names_the_issue_route_and_proceeds_after_a_rebind(tmp_path
         ).plan_hash,
     )
     carried = _latest_pr_approved_reviews_for_head(
-        [comment(stale_approval)], head_sha="abc123", configured_reviewers=("codex",),
+        [comment(stale_approval)], head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", configured_reviewers=("codex",),
         approved_plan_context=new_context,
     )
     assert carried == {}
     # The same record would have carried under the plan it was recorded for.
     assert list(_latest_pr_approved_reviews_for_head(
-        [comment(stale_approval)], head_sha="abc123", configured_reviewers=("codex",),
+        [comment(stale_approval)], head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", configured_reviewers=("codex",),
         approved_plan_context=old_context,
     )) == ["Codex"]
 
@@ -4441,7 +4441,7 @@ def test_m988_earlier_edge_with_its_handoff_transition_is_retired(tmp_path, monk
     index = _m988_old_handoff_index(world)
     handoff = dict(
         issue_number=56, pr_number=77, pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123", flow="approved-plan-implementation",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", flow="approved-plan-implementation",
     )
     earlier = format_issue_pr_handoff_comment(plan_hash=_M988_EARLIER, **handoff)
     earlier_meta = find_latest_issue_pr_handoff(
@@ -4491,7 +4491,7 @@ def _m993_fresh_scope(world, monkeypatch):
     world.runner = _ChildPlanningRunner(
         pr_payload={
             "number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77",
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "baseRefName": "main",
         },
     )
@@ -4534,7 +4534,7 @@ def _m993_ordinary_scope(world, monkeypatch):
     """Run the PR-mode ordinary managed resume and capture the bound handoff."""
     handoff = pr_loop_support.AuthenticatedIssueCreatedHandoff(
         pr_number=77, issue_number=56, repository="OWNER/REPO", base_ref="main",
-        head_sha="abc123", branch="agent-loop/managed-56",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee", branch="agent-loop/managed-56",
         trusted_actor_login="agent-loop", trusted_actor_id=1,
         protection_mode="voluntary", override_nonce="opening-nonce",
     )
@@ -4552,7 +4552,7 @@ def _m993_ordinary_scope(world, monkeypatch):
     world.runner = _ChildPlanningRunner(
         pr_payload={
             "number": 77, "body": "Fixes #56", "url": "https://github.com/OWNER/REPO/pull/77",
-            "headRefName": "agent-loop/managed-56", "headRefOid": "abc123",
+            "headRefName": "agent-loop/managed-56", "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
             "baseRefName": "main",
         },
     )
@@ -4837,7 +4837,7 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
             outcome="failed", provenance="parent-observed", scope=EvidenceScope("unknown", ()),
             receipt_id="receipt-open", turn_id="turn-opaque", cwd=str(tmp_path),
             normalized_command="python3 -m pytest tests/test_x.py -q -n 0", returncode=4,
-            attribution=TreeAttribution(state="current-head", head="abc123", stable=True),
+            attribution=TreeAttribution(state="current-head", head="6367c48dd193d56ea7b0baad25b19455e529f5ee", stable=True),
             environment_identity=registry.capture({"PATH": "/usr/bin"}),
         ))
     config = make_config(tmp_path, coder="claude", reviewer="codex", max_rounds=6)
@@ -4852,7 +4852,7 @@ def test_unchanged_head_stop_in_a_planning_child_keeps_the_route_and_names_recei
         f"child-plan supersession record on child issue #56 and rerun `{hint}`."
     )
     legacy = (
-        "PR #77: Claude left head abc123 unchanged in 2 consecutive follow-up rounds, so another "
+        "PR #77: Claude left head 6367c48dd193d56ea7b0baad25b19455e529f5ee unchanged in 2 consecutive follow-up rounds, so another "
         "review of the same diff cannot change the verdict. Stopping before round 3; "
         "human review required."
     )

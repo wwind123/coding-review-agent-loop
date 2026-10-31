@@ -65,10 +65,10 @@ def _write_codex_rollout(
     return rollout_path
 
 def test_parse_claude_output_extracts_text_and_session_id():
-    raw = json.dumps({"result": "Hello.", "session_id": "abc123"})
+    raw = json.dumps({"result": "Hello.", "session_id": "6367c48dd193d56ea7b0baad25b19455e529f5ee"})
     text, sid, usage, raw_usage, model = _parse_claude_output(raw)
     assert text == "Hello."
-    assert sid == "abc123"
+    assert sid == "6367c48dd193d56ea7b0baad25b19455e529f5ee"
     assert usage is None
     assert raw_usage is None
     assert model is None
@@ -114,13 +114,13 @@ def test_claude_self_update_workdir_gate_reports_changed_status_without_replacin
     )
     before_runner = FakeRunner(
         git_probe_results=[
-            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "6367c48dd193d56ea7b0baad25b19455e529f5ee\n", "returncode": 0},
             {"stdout": "", "returncode": 0},
         ]
     )
     after_runner = FakeRunner(
         git_probe_results=[
-            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "6367c48dd193d56ea7b0baad25b19455e529f5ee\n", "returncode": 0},
             {"stdout": " M changed.py\n", "returncode": 0},
         ]
     )
@@ -163,9 +163,9 @@ def test_claude_backend_probes_before_every_call_but_after_only_for_candidates(t
     candidate_runner = ObservedRunner(
         claude_outputs=[("fatal: auto-update in progress", 1)],
         git_probe_results=[
-            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "6367c48dd193d56ea7b0baad25b19455e529f5ee\n", "returncode": 0},
             {"stdout": "", "returncode": 0},
-            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "6367c48dd193d56ea7b0baad25b19455e529f5ee\n", "returncode": 0},
             {"stdout": " M changed.py\n", "returncode": 0},
         ],
     )
@@ -182,7 +182,7 @@ def test_claude_backend_probes_before_every_call_but_after_only_for_candidates(t
     ordinary_runner = ObservedRunner(
         claude_outputs=[("ordinary failure", 1)],
         git_probe_results=[
-            {"stdout": "abc123\n", "returncode": 0},
+            {"stdout": "6367c48dd193d56ea7b0baad25b19455e529f5ee\n", "returncode": 0},
             {"stdout": "", "returncode": 0},
         ],
     )
@@ -248,7 +248,7 @@ def _replacement_result(*, command, stdout="", returncode=1, changed=True, **kwa
     )
 
 
-def _snapshot(head="abc123", status=""):
+def _snapshot(head="6367c48dd193d56ea7b0baad25b19455e529f5ee", status=""):
     from coding_review_agent_loop.workdir_guard import GitProbeResult, WorkdirSnapshot
 
     return WorkdirSnapshot(

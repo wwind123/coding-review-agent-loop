@@ -2635,7 +2635,7 @@ def _pr_payload_with_human_requirement():
         "title": "Improve review prompt context",
         "headRefName": "feature/review-context",
         "baseRefName": "main",
-        "headRefOid": "abc123",
+        "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "comments": [
             {
                 "author": {"login": "maintainer"},

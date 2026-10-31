@@ -321,7 +321,7 @@ def test_issue_loop_plan_first_resume_uses_handoff_bound_plan_when_later_plan_ex
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation",
         plan_hash=approved_plan_hash(old_plan),
     )
@@ -401,7 +401,7 @@ def test_issue_loop_plan_first_staged_child_recovers_parent_owned_plan(tmp_path,
                     issue_number=56,
                     pr_number=77,
                     pr_url="https://github.com/OWNER/REPO/pull/77",
-                    pr_head_sha="abc123",
+                    pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
                     flow="approved-plan-implementation",
                     plan_hash=approved_plan_hash(parent_plan),
                 ),
@@ -460,7 +460,7 @@ def test_issue_loop_plan_first_one_shot_rerun_with_closed_pr_stops(tmp_path, cap
         plan_hash=approved_plan_hash(plan),
         plan_subject=_plan_subject(plan),
         pr_number=77,
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     runner = FakeRunner(
         issue_comments=[
@@ -576,7 +576,7 @@ def test_issue_loop_plan_first_one_shot_rerun_pr_missing_issue_reference(tmp_pat
         plan_hash=approved_plan_hash(plan),
         plan_subject=_plan_subject(plan),
         pr_number=77,
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
     )
     runner = FakeRunner(
         issue_comments=[
@@ -805,7 +805,7 @@ def test_issue_loop_direct_mode_resumes_existing_canonical_pr(tmp_path, capsys):
             issue_number=56,
             pr_number=77,
             pr_url="https://github.com/OWNER/REPO/pull/77",
-            pr_head_sha="abc123",
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             flow="issue-implementation",
             plan_hash=None,
         ),
@@ -916,7 +916,7 @@ def test_issue_loop_direct_mode_stale_canonical_record_raises(tmp_path):
             issue_number=56,
             pr_number=77,
             pr_url="https://github.com/OWNER/REPO/pull/77",
-            pr_head_sha="abc123",
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             flow="issue-implementation",
             plan_hash=None,
         ),
@@ -964,7 +964,7 @@ def test_issue_loop_direct_mode_canonical_record_resumes_refs_only_pr(tmp_path):
             issue_number=56,
             pr_number=77,
             pr_url="https://github.com/OWNER/REPO/pull/77",
-            pr_head_sha="abc123",
+            pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
             flow="issue-implementation",
             plan_hash=None,
         ),
@@ -1294,7 +1294,7 @@ def test_1088_plain_issue_mode_refuses_handoff_only_planning_record(tmp_path):
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation",
         plan_hash=approved_plan_hash("Plan:\n- Make the change."),
     )
@@ -1310,7 +1310,7 @@ def test_1088_later_direct_handoff_does_not_hide_approved_plan_handoff(tmp_path)
         issue_number=56,
         pr_number=77,
         pr_url="https://github.com/OWNER/REPO/pull/77",
-        pr_head_sha="abc123",
+        pr_head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         flow="approved-plan-implementation",
         plan_hash=approved_plan_hash("Plan:\n- Make the change."),
     )
@@ -1318,7 +1318,7 @@ def test_1088_later_direct_handoff_does_not_hide_approved_plan_handoff(tmp_path)
         issue_number=56,
         pr_number=78,
         pr_url="https://github.com/OWNER/REPO/pull/78",
-        pr_head_sha="def456",
+        pr_head_sha="0b3d8b29493059afd7f9912106279c4643ac4939",
         flow="issue-implementation",
         plan_hash=None,
     )
@@ -1415,3 +1415,37 @@ def test_1088_plain_issue_mode_without_planning_records_needs_no_rest_history(tm
     )
 
     _m1088_assert_ran_directly(runner, make_config(tmp_path))
+
+
+@pytest.mark.parametrize("outcome", ["desync", "invalid", "converged"])
+def test_legacy_resume_observes_before_publication(tmp_path, monkeypatch, outcome):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    runner = FakeRunner(open_prs_payload=[{"number": 77, "body": "Fixes #56"}],
+                        pr_payload={"body": "Fixes #56"})
+    before = runner.pr_payload["headRefOid"]
+    runner.branch_tip = "b" * 40
+    if outcome == "invalid":
+        runner.pr_payload["headRefOid"] = "invalid"
+    original = runner.run
+
+    def run(args, **kwargs):
+        if args == ["sleep", "2"] and outcome == "converged":
+            runner.pr_payload.update(headRefOid="b" * 40, url="https://example.test/latest", title="Latest complete context")
+        return original(args, **kwargs)
+
+    runner.run = run
+    delegated = []
+    monkeypatch.setattr(issue_loop, "run_pr_loop", lambda *a, **k: delegated.append(k) or 0)
+    if outcome == "converged":
+        assert run_issue_loop(runner, issue_number=56, config=make_config(tmp_path)) == 0
+        assert delegated
+        handoffs = [body for body in runner.comments if "AGENT_ISSUE_PR_HANDOFF" in body]
+        assert len(handoffs) == 1
+        assert "b" * 40 in handoffs[0] and "https://example.test/latest" in handoffs[0]
+        assert before not in handoffs[0]
+    else:
+        with pytest.raises(PrHeadObservationError):
+            run_issue_loop(runner, issue_number=56, config=make_config(tmp_path))
+        assert not delegated
+        assert not runner.comments
+        assert not runner.pr_payload.get("comments")

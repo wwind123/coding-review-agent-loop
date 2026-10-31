@@ -102,7 +102,7 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
         pr_payload={
             "body": body,
             "headRefName": "agent-loop/managed-56",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         },
     )
     config = make_config(
@@ -169,7 +169,7 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
     monkeypatch.setattr(
         pr_loop,
         "wait_for_final_qualification",
-        lambda *_args, **_kwargs: ManagedCiOutcome(status="passed", head_sha="abc123"),
+        lambda *_args, **_kwargs: ManagedCiOutcome(status="passed", head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee"),
     )
     monkeypatch.setattr(
         pr_loop,
@@ -187,10 +187,10 @@ def test_direct_issue_managed_draft_nonce_reaches_review_and_exact_head_merge(tm
     assert len(authentication_calls) == 1
     assert len(publication_calls) == 1
     assert ["verify-managed-head"] in [command for command, _cwd in runner.commands]
-    assert readiness_heads == ["abc123"]
-    assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["abc123"]
-    assert prepared_heads == ["abc123"]
-    assert merged_heads == ["abc123"]
+    assert readiness_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
+    assert [dispatch["expected_head_sha"] for dispatch in dispatches] == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
+    assert prepared_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
+    assert merged_heads == ["6367c48dd193d56ea7b0baad25b19455e529f5ee"]
 
 
 def test_direct_issue_conflict_posts_once_and_stops_before_pr_handoff_gates(tmp_path, monkeypatch):
@@ -214,7 +214,7 @@ def test_direct_issue_conflict_posts_once_and_stops_before_pr_handoff_gates(tmp_
 
     for name, owners in (
         ("validate_open_pr", (response_validation, pr_loop, issue_implementation, issue_loop)),
-        ("get_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
+        ("get_observed_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
         ("post_issue_pr_handoff_comment", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
         ("run_pr_loop", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
     ):
@@ -249,7 +249,7 @@ def test_approved_plan_implementation_conflict_posts_once_and_stops_before_pr_ga
 
     for name, owners in (
         ("validate_open_pr", (response_validation, pr_loop, issue_implementation, issue_loop)),
-        ("get_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
+        ("get_observed_pr_review_context", (pr_loop_support, pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
         ("post_issue_pr_handoff_comment", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
         ("run_pr_loop", (pr_loop, issue_implementation, plan_first_loop_module, issue_loop)),
     ):
@@ -366,7 +366,7 @@ def test_plan_first_issue_managed_draft_nonce_is_authenticated_before_pr_review(
         pr_payload={
             "body": body,
             "headRefName": "agent-loop/managed-56",
-            "headRefOid": "abc123",
+            "headRefOid": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         },
     )
     config = make_config(
@@ -416,3 +416,30 @@ def test_plan_first_issue_managed_draft_nonce_is_authenticated_before_pr_review(
     )
 
     assert len(reviewed) == 1
+
+
+@pytest.mark.parametrize('approved', [False, True])
+def test_new_managed_pr_observation_precedes_authorization(tmp_path, monkeypatch, approved):
+    from coding_review_agent_loop.pr_head_sync import PrHeadObservationError
+    from agent_loop_helpers import structured_issue_implementation
+    from coding_review_agent_loop.github import IssueContext
+    nonce = 'observation-order'
+    intent = ManagedCiCreationIntent(branch='agent-loop/managed-56', trusted_actor='agent-loop', protection_mode='voluntary', audit_nonce=nonce)
+    runner = FakeRunner(claude_outputs=[structured_issue_implementation(pr_number=77)],
+        pr_payload={'body': f'Fixes #56\n\n{UNPROTECTED_OVERRIDE_TRAILER} nonce={nonce}', 'headRefName': intent.branch})
+    runner.branch_tip = 'b' * 40
+    config = make_config(tmp_path, managed_ci=True, managed_ci_trusted_actor='agent-loop', allow_unprotected_managed_ci=True)
+    calls = []
+    for module in (issue_loop, issue_implementation):
+        monkeypatch.setattr(module, 'preflight_managed_ci_creation', lambda *a, **k: intent)
+        monkeypatch.setattr(module, 'authenticate_issue_created_handoff', lambda *a, **k: calls.append('authorization'))
+    with pytest.raises(PrHeadObservationError):
+        if approved:
+            issue = IssueContext(number=56, repo='OWNER/REPO', title='Issue', body='Issue', url='https://github.com/OWNER/REPO/issues/56', comments=())
+            issue_implementation._implement_approved_issue(runner, issue_number=56, approved_plan='Approved plan.',
+                config=config, memory=None, issue_context=issue, coder_session_id=None,
+                usage_context=validated_agent_module._new_usage_context(config))
+        else:
+            run_issue_loop(runner, issue_number=56, config=config)
+    assert calls == []
+    assert not runner.pr_payload.get('comments')

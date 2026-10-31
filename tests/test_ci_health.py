@@ -373,7 +373,7 @@ def _metadata():
         title="Title",
         head_branch="feature",
         base_branch="main",
-        head_sha="abc123",
+        head_sha="6367c48dd193d56ea7b0baad25b19455e529f5ee",
         url="https://github.com/OWNER/REPO/pull/77",
     )
 
@@ -563,7 +563,7 @@ def _dispatch(run_id=7000, suite=SUITE_DISPATCH, name="Negative evidence", **ext
         "name": name,
         "display_title": name,
         "event": "workflow_dispatch",
-        "head_sha": "abc123",
+        "head_sha": "6367c48dd193d56ea7b0baad25b19455e529f5ee",
         "check_suite_id": suite,
         "repository": {"full_name": "owner/repo"},
     }
@@ -597,7 +597,7 @@ def test_dispatch_failing_check_is_excluded(tmp_path):
     assert checks.state == "passing"
     assert not checks.failing
     assert [c.name for c in checks.excluded] == ["validate"]
-    assert any("7000" in n and "abc123" in n for n in checks.exclusion_notes)
+    assert any("7000" in n and "6367c48dd193d56ea7b0baad25b19455e529f5ee" in n for n in checks.exclusion_notes)
 
 
 def test_pull_request_failing_check_still_counts(tmp_path):

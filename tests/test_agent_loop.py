@@ -409,40 +409,40 @@ def test_agent_memory_does_not_ignore_custom_parent_directory(tmp_path):
 def test_agent_memory_detects_changed_files_since_previous_commit(tmp_path):
     runner = FakeRunner(
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
-        git_head="def456",
+        git_head="0b3d8b29493059afd7f9912106279c4643ac4939",
         changed_files=["src/coding_review_agent_loop/prompts.py", "tests/test_agent_loop.py"],
     )
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
-    (memory_dir / "last-analyzed-commit").write_text("abc123\n", encoding="utf-8")
+    (memory_dir / "last-analyzed-commit").write_text("6367c48dd193d56ea7b0baad25b19455e529f5ee\n", encoding="utf-8")
     config = make_config(tmp_path, agent_memory_dir=memory_dir)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     diff_commands = [cmd for cmd, _cwd in runner.commands if cmd[:3] == ["git", "diff", "--name-only"]]
-    assert ["git", "diff", "--name-only", "abc123..def456"] in diff_commands
+    assert ["git", "diff", "--name-only", "6367c48dd193d56ea7b0baad25b19455e529f5ee..0b3d8b29493059afd7f9912106279c4643ac4939"] in diff_commands
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     assert "src/coding_review_agent_loop/prompts.py" in prompt
     assert "tests/test_agent_loop.py" in prompt
-    assert (memory_dir / "last-analyzed-commit").read_text(encoding="utf-8") == "def456\n"
+    assert (memory_dir / "last-analyzed-commit").read_text(encoding="utf-8") == "0b3d8b29493059afd7f9912106279c4643ac4939\n"
 
 
 def test_agent_memory_logs_when_changed_file_diff_falls_back(tmp_path, capsys):
     runner = FakeRunner(
         codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
-        git_head="def456",
+        git_head="0b3d8b29493059afd7f9912106279c4643ac4939",
         diff_returncode=128,
-        diff_stderr="fatal: bad revision 'abc123..def456'",
+        diff_stderr="fatal: bad revision '6367c48dd193d56ea7b0baad25b19455e529f5ee..0b3d8b29493059afd7f9912106279c4643ac4939'",
     )
     memory_dir = tmp_path / "memory"
     memory_dir.mkdir()
-    (memory_dir / "last-analyzed-commit").write_text("abc123\n", encoding="utf-8")
+    (memory_dir / "last-analyzed-commit").write_text("6367c48dd193d56ea7b0baad25b19455e529f5ee\n", encoding="utf-8")
     config = make_config(tmp_path, agent_memory_dir=memory_dir, quiet=False)
 
     assert run_pr_loop(runner, pr_number=77, config=config) == 0
 
     captured = capsys.readouterr()
-    assert "Could not diff agent memory baseline abc123..def456" in captured.err
+    assert "Could not diff agent memory baseline 6367c48dd193d56ea7b0baad25b19455e529f5ee..0b3d8b29493059afd7f9912106279c4643ac4939" in captured.err
     assert "treating all tracked files as changed" in captured.err
     prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:2] == ["codex", "exec"])
     assert "README.md" in prompt
@@ -620,10 +620,12 @@ def test_non_codex_loop_uses_active_workdir_for_github_and_tests(tmp_path, monke
     assert actor_cwds == [api_cwd]
     # Managed-PR discovery still explicitly uses the invocation directory.
     bootstrap_api = ["gh", "api", "repos/OWNER/REPO/pulls/77"]
-    assert [cwd for cmd, cwd in runner.commands if cmd == bootstrap_api] == [Path.cwd()]
+    assert [cwd for cmd, cwd in runner.commands if cmd == bootstrap_api] == [Path.cwd(), Path.cwd()]
+    observation_ref = ["gh", "api", "repos/OWNER/REPO/git/ref/heads/feature%2Freview-context"]
+    assert [cwd for cmd, cwd in runner.commands if cmd == observation_ref] == [Path.cwd()]
     api_read_cwds = [
         cwd for cmd, cwd in runner.commands
-        if cmd[:2] == ["gh", "api"] and "--method" not in cmd and cmd != bootstrap_api
+        if cmd[:2] == ["gh", "api"] and "--method" not in cmd and cmd not in (bootstrap_api, observation_ref)
     ]
     assert len(api_read_cwds) > len(actor_cwds)
     assert set(api_read_cwds) == {api_cwd}
@@ -1823,7 +1825,7 @@ def test_issue_loop_plan_first_can_switch_implementation_coder_end_to_end(tmp_pa
             from coding_review_agent_loop.workdirs import agent_workdir
 
             runner_arg._last_agent_cwd = agent_workdir(config, agent)
-            runner_arg.git_head = "def456"
+            runner_arg.git_head = "0b3d8b29493059afd7f9912106279c4643ac4939"
             record_checkout_baseline(
                 config, runner_arg, agent_workdir(config, agent), source="coder turn"
             )

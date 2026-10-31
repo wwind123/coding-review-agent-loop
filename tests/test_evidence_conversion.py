@@ -243,7 +243,7 @@ def test_unknown_and_cross_turn_selectors_are_capture_limitations():
 @pytest.mark.parametrize(
     "observation_kwargs,derive_kwargs,disqualifier",
     [
-        ({"head": "other-head"}, {}, "head-mismatch"),
+        ({"head": "5e6741348108b11e3f3ef936c335b1967d17ac6c"}, {}, "head-mismatch"),
         ({"tree": "other-tree"}, {}, "tree-mismatch"),
         ({}, {"checkout_head": "elsewhere"}, "checkout-head-mismatch"),
         ({}, {"tree_clean": False}, "checkout-tree-unavailable"),
@@ -416,7 +416,7 @@ def test_two_bound_capture_limited_attempts_convert_the_row():
         "legacy-snapshot",
         "non-qualifying",
         "repeat-attempt",
-        "other-head-classification",
+        "5e6741348108b11e3f3ef936c335b1967d17ac6c-classification",
     ],
 )
 def test_an_ineligible_earlier_attempt_resets_the_count(earlier):
@@ -435,7 +435,7 @@ def test_an_ineligible_earlier_attempt_resets_the_count(earlier):
             1,
             ["row-a"],
             limited=earlier != "not-limited",
-            head="elsewhere" if earlier == "other-head-classification" else None,
+            head="elsewhere" if earlier == "5e6741348108b11e3f3ef936c335b1967d17ac6c-classification" else None,
         ),
         2: _classification(2, ["row-a"]),
         3: _classification(3, ["row-a"]),
