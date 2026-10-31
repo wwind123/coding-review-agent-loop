@@ -433,7 +433,14 @@ unreconstructible obligations fail closed. Direct reconciled resume uses the
 same future-item replay. Existing publication policy and follow-up deduplication
 apply to both views: plan-only summarizes; implementation may file issues once;
 ignore retains its existing summary behavior. Non-approved rollover semantics
-are unchanged.
+are unchanged. Unreconciled publication reviews instead mint their items from
+saved canonical responses at the settlement barrier, including on approved
+resume; provisional empty item lists are not a settled ledger. Repeated resume
+uses the existing follow-up publication deduplication.
+
+Approval refusal diagnostics inspect the full current-scope history, preserving
+excluded approval status, round and recorded bindings for operator recovery.
+Qualification continues to use its filtered evidence view.
 
 ## Decisions
 

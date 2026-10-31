@@ -27,3 +27,5 @@ never rewritten or deleted. The detail doc describes the current design.
 
 - 2026-10-30: Same-head failed acknowledgement repair bounds peer visibility and partial-round recovery with the same predicate as resume; earlier publications and the ledger boundary are retained, while later publications remain peers (#1791).
 - An independently approved plan may recover an unused neutral advance through its reconciled predecessor and lifecycle-replayed future ledger without changing durable records (#1805).
+
+- Approved publication resumes retain settlement-time item minting; refusal diagnostics use scoped unfiltered history to explain excluded approval bindings (#1805).

@@ -5,6 +5,7 @@ import re
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
+from contextlib import ExitStack
 
 import pytest
 
@@ -2535,10 +2536,11 @@ def test_approved_reconciled_resume_reaches_execution_without_scheduling(tmp_pat
     assert summaries and all("Retain predecessor follow-up." in body for body in summaries)
 
 
+@pytest.mark.parametrize("exclusion", ["seat", "restoration", "parent"])
 @pytest.mark.parametrize("round_limit", [2, 3])
 @pytest.mark.parametrize("reconciled", [False, True])
 @pytest.mark.parametrize("parallel", [False, True])
-def test_approved_shortcut_live_binding_disagreement_refuses_before_advance(tmp_path, round_limit, reconciled, parallel):
+def test_approved_shortcut_live_binding_disagreement_refuses_before_advance(tmp_path, round_limit, reconciled, parallel, exclusion):
     runner, config, checkpoint = _approved_closed_history(tmp_path)
     if not reconciled:
         runner.issue_comments.pop()
@@ -2549,20 +2551,56 @@ def test_approved_shortcut_live_binding_disagreement_refuses_before_advance(tmp_
             runner.issue_comments[secondary.index]["body"] = _attach_round_metadata(secondary.body, replace(
                 secondary.metadata, phase="publication", canonical_reviewer_response=structured_plan_review(
                     state="approved", reviewer="Google Gemini")))
+    records = plan_first_loop_module._extract_round_metadata_records(
+        [SimpleNamespace(body=c["body"]) for c in runner.issue_comments], flow="plan")
+    primary = next(r for r in records if r.metadata.role == "reviewer" and r.metadata.agent == "Codex")
+    if exclusion == "parent":
+        primary = replace(primary, metadata=replace(primary.metadata, parent_requirement_ids=("old-parent",)))
+    runner.issue_comments[primary.index]["body"] = _attach_round_metadata(primary.body, primary.metadata)
+    recorded_binding = primary.metadata.seat_binding
     config = replace(config, review_parallel=parallel)
     before = len(runner.issue_comments)
     calls = len(runner.commands)
     messages = []
+    real_lineage = plan_first_loop_module.resolve_plan_lineage
+    real_classify = plan_first_loop_module.classify_plan_approval
+
+    def classify_before_parent_refresh(*args, **kwargs):
+        # Simulate startup's older parent context, then exercise the real
+        # live carried-approval predicate against the current empty parent set.
+        kwargs["parent_requirement_ids"] = None
+        return real_classify(*args, **kwargs)
+
+    def restored_lineage(*args, **kwargs):
+        lineage = real_lineage(*args, **kwargs)
+        fields = {name: getattr(lineage, name) for name in dir(lineage) if not name.startswith("_")}
+        fields.update(restoration_rounds={"Codex": 2}, fresh_from_rounds={})
+        return SimpleNamespace(**fields)
+
     for _ in range(2):
-        with patch("coding_review_agent_loop.reviewer_seats.reviewer_seat_binding", return_value={"version": 1, "seats": [
-                 {"id": "Codex", "backend": "codex", "model_chain": ["obsolete-seat"], "effort": None}]}), \
-             pytest.raises(AgentLoopError) as exc:
-            run_issue_loop(runner, issue_number=56, config=replace(config, max_rounds=round_limit), plan_first=True)
+        with ExitStack() as stack:
+            if exclusion == "seat":
+                stack.enter_context(patch("coding_review_agent_loop.reviewer_seats.reviewer_seat_binding", return_value={
+                    "version": 1, "seats": [{"id": "Codex", "backend": "codex",
+                    "model_chain": ["obsolete-seat"], "effort": None}]}))
+            elif exclusion == "restoration":
+                stack.enter_context(patch.object(plan_first_loop_module, "resolve_plan_lineage", side_effect=restored_lineage))
+            else:
+                stack.enter_context(patch.object(plan_first_loop_module, "_infer_staged_parent_issue", return_value=99))
+                stack.enter_context(patch.object(plan_first_loop_module, "classify_plan_approval", side_effect=classify_before_parent_refresh))
+            with pytest.raises(AgentLoopError) as exc:
+                run_issue_loop(runner, issue_number=56, config=replace(config, max_rounds=round_limit), plan_first=True)
         messages.append(str(exc.value))
     assert messages[0] == messages[1]
-    assert "Codex" in messages[0] and "obsolete-seat" in messages[0]
+    assert f"Codex: status=approved, approval round=1, seat binding={recorded_binding!r}" in messages[0]
     assert "resumed round 2" in messages[0] and checkpoint.subject.rsplit("-", 1)[-1][:16] in messages[0]
-    assert "seat binding" in messages[0] and "restore qualifying exact-plan" in messages[0]
+    assert "restore qualifying exact-plan" in messages[0]
+    if exclusion == "seat":
+        assert "obsolete-seat" in messages[0]
+    elif exclusion == "restoration":
+        assert "restoration round=2" in messages[0]
+    else:
+        assert "parent requirement binding=('old-parent',) (required ())" in messages[0]
     assert len(runner.issue_comments) == before
     assert not any(command[0] in {"claude", "codex", "gemini"}
                    for command, _ in runner.commands[calls:])
@@ -2761,3 +2799,43 @@ def test_approved_resume_does_not_activate_pending_post_approval_link(tmp_path):
         assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
     assert len(runner.issue_comments) == before
     assert any("does not reopen planning; it is not activated" in message for message in logs)
+
+
+@pytest.mark.parametrize("policy", ["issue", "ignore"])
+@pytest.mark.parametrize("mode", ["plan-only", "auto"])
+@pytest.mark.parametrize("review_policy", ["primary-then-panel", "all-reviewers"])
+def test_approved_publication_resume_preserves_followups(tmp_path, policy, mode, review_policy):
+    runner, config, _ = _approved_closed_history(tmp_path, future=True)
+    if review_policy == "all-reviewers":
+        runner = _FakeRunner(claude_outputs=[structured_v1_plan_state()],
+            codex_outputs=[structured_plan_review(state="approved")],
+            gemini_outputs=[structured_plan_review(state="approved", reviewer="Google Gemini",
+                future_followups=["Retain predecessor follow-up."])])
+        config = replace(config, plan_review_policy=review_policy, primary_plan_reviewer=None)
+        assert run_issue_loop(runner, issue_number=56, config=config, plan_first=True) == 0
+    records = plan_first_loop_module._extract_round_metadata_records(
+        [SimpleNamespace(body=c["body"]) for c in runner.issue_comments], flow="plan")
+    history = []
+    for record in records:
+        if record.metadata.phase == "reconciliation":
+            continue
+        meta = record.metadata
+        if meta.role == "reviewer" and (review_policy == "all-reviewers" or meta.round_number == 2):
+            meta = replace(meta, phase="publication", new_items=(),
+                canonical_reviewer_response=structured_plan_review(state="approved", reviewer="Google Gemini" if meta.agent == "Gemini" else "Codex",
+                    future_followups=["Retain predecessor follow-up."] if meta.agent == "Gemini" else []))
+        history.append({"body": _attach_round_metadata(record.body, meta),
+                        "author": {"login": "bot"}, "createdAt": "2026-01-01T01:00:00Z"})
+    runner = _FakeRunner(issue_comments=history, issue_urls=["https://github.com/OWNER/REPO/issues/99"])
+    selected = replace(config, plan_execution_mode=mode, approved_followups=policy,
+                       plan_review_policy=review_policy, primary_plan_reviewer=None if review_policy == "all-reviewers" else "codex", review_parallel=True)
+    before = len(_plan_round_records(runner))
+    for _ in range(2):
+        with patch.object(plan_first_loop_module, "_implement_approved_issue", return_value=0):
+            assert run_issue_loop(runner, issue_number=56, config=selected, plan_first=True) == 0
+    assert len(_plan_round_records(runner)) == before
+    assert not any(command[0] in {"claude", "codex", "gemini"} for command, _ in runner.commands)
+    assert len(runner.issues) == (1 if mode == "auto" and policy == "issue" else 0)
+    output = "\n".join(issue["body"] for issue in runner.issues) if runner.issues else "\n".join(
+        c["body"] for c in runner.issue_comments if c["body"].startswith("Planning complete for issue"))
+    assert "Retain predecessor follow-up." in output

@@ -3894,8 +3894,10 @@ def _run_plan_first_loop_body(
             else:
                 approved_review_outputs.append((reviewer_name, review_output))
                 accepted_review_carriers[reviewer_name] = parsed_review
+            # Publication item lists are provisional until settlement, even
+            # when their saved approval qualifies for the approved shortcut.
             if resumed_record is None or (
-                not plan_approved_shortcut and resumed_record.metadata.phase == "publication"
+                resumed_record.metadata.phase == "publication"
                 and not (current_resume is not None and current_resume.reconciled)
             ):
                 for item in parsed_review.items.blocking:
@@ -4382,7 +4384,13 @@ def _run_plan_first_loop_body(
         if plan_approved_shortcut and plan_missing_approvals:
             raise approval_shortcut_disagreement(
                 plan_hash=plan_approval.plan_hash, round_number=round_number,
-                missing=plan_missing_approvals, records=plan_history_records(), seat_binding=seat_binding,
+                missing=plan_missing_approvals,
+                # Keep excluded approvals visible so the refusal explains why.
+                records=_extract_round_metadata_records(
+                    scope_plan_comments(round_outcome_issue_context.comments, plan_scope_start_round),
+                    flow="plan",
+                ),
+                seat_binding=seat_binding,
                 restoration_rounds=plan_fresh_from_rounds,
                 parent_requirement_ids=plan_parent_requirement_ids,
                 predicate="live exact-plan approval qualification",
