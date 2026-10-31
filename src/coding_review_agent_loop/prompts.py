@@ -86,6 +86,7 @@ from .review_step_back import (
     render_plan_sweep_guidance,
     render_provenance_baseline_block,
 )
+from .decomposition import HUMAN_MATRIX_OWNERSHIP_GUIDANCE
 from .workdirs import agent_workdir
 from .test_runtime import (
     CITABLE_TEST_RUNNERS_SUMMARY,
@@ -2111,7 +2112,7 @@ matrix generation gate. Do not add `risk_test_matrix_contract_version`,
 Only an explicitly fresh generation-1 planning lifecycle may introduce those
 fields, and the validator rejects an unsolicited matrix here.
 """
-    return execution_guidance + _risk_test_matrix_contract_guidance()
+    return execution_guidance + HUMAN_MATRIX_OWNERSHIP_GUIDANCE + "\n" + _risk_test_matrix_contract_guidance()
 
 
 def _risk_test_matrix_contract_guidance() -> str:
@@ -2922,6 +2923,7 @@ def build_plan_review_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
     inherited_check_failure: str | None = None,
+    ownership_check_failure: str | None = None,
     plan_growth_notice: str | None = None,
     plan_growth_measurements: str | None = None,
     step_back_review_notice: bool = False,
@@ -2946,6 +2948,7 @@ def build_plan_review_prompt(
             inherited_matrix_binding=inherited_matrix_binding,
             inherited_reviewed_deltas=inherited_reviewed_deltas,
             inherited_check_failure=inherited_check_failure,
+            ownership_check_failure=ownership_check_failure,
             plan_growth_notice=plan_growth_notice,
             plan_growth_measurements=plan_growth_measurements,
             step_back_review_notice=step_back_review_notice,
@@ -2991,7 +2994,7 @@ branch, commit, push, or open a pull request during this planning review.
 Plan from {coder_name}:
 
 {plan}
-{render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
+{render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}{("Deterministic ownership check (producer correction required): " + ownership_check_failure) if ownership_check_failure else ""}
 {_plan_growth_review_guidance(config, plan_growth_notice, plan_growth_measurements)}{render_smallest_alternative_review_guidance()}{render_plan_step_back_review_notice() if step_back_review_notice else ''}{_step_back_anchor_review_block(step_back_anchor)}{_plan_review_volatile_blocks(plan, config, plan_sweep_classes=plan_sweep_classes, provenance_baseline=provenance_baseline)}
 Review the plan for correctness, architecture fit, missing edge cases within
 the issue's scope, test strategy, and ambiguity. Use this mandatory structured JSON response format:
@@ -3087,6 +3090,7 @@ def _build_compact_plan_review_prompt(
     inherited_matrix_binding: InheritedMatrixBinding | None = None,
     inherited_reviewed_deltas: Sequence[InheritedRowDifference] | None = None,
     inherited_check_failure: str | None = None,
+    ownership_check_failure: str | None = None,
     plan_growth_notice: str | None = None,
     plan_growth_measurements: str | None = None,
     step_back_review_notice: bool = False,
@@ -3157,7 +3161,7 @@ Action for this call: {action}
 Current implementation plan from {coder_name}:
 
 {plan}
-{render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}
+{render_inherited_matrix_obligations(inherited_matrix_binding)}{render_inherited_coverage_delta(inherited_matrix_binding, inherited_reviewed_deltas, check_failure=inherited_check_failure)}{superseded_prepanel_block}{("Deterministic ownership check (producer correction required): " + ownership_check_failure) if ownership_check_failure else ""}
 {(plan_growth_measurements + chr(10)) if plan_growth_measurements else ""}{(plan_growth_notice + chr(10)) if plan_growth_notice else ""}{render_plan_step_back_review_notice() if step_back_review_notice else ""}{_step_back_anchor_review_block(step_back_anchor)}{_plan_review_volatile_blocks(plan, config, plan_sweep_classes=plan_sweep_classes, provenance_baseline=provenance_baseline)}{_agent_unavailable_guidance(reviewer_signature)}
 {_plan_review_scheduling_guidance(config, reviewer_group, compact=True)}Use approved only if there are no
 blocking plan issues, no Same-plan follow-ups, and no carried-forward plan
@@ -3365,6 +3369,7 @@ every `row`/`target_row`/`target_rows` entry is a complete matrix row):
   `merge`, and `value` may add `not_applicable_rationale`.
 No other operation names exist.
 
+{HUMAN_MATRIX_OWNERSHIP_GUIDANCE}
 {_plan_growth_planner_guidance(config, plan_growth_notice, semantic_patch=True)}{render_smallest_alternative_guidance()}
 Operations are applied atomically and simultaneously. The patch must contain
 at least one real change, and its binding must match the authenticated values

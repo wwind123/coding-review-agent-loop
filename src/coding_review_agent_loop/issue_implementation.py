@@ -28,7 +28,7 @@ from .decomposition import (
     post_one_shot_impl_handoff_comment,
     adapt_typed_child_stages,
     normalize_execution_recommendation,
-    validate_risk_matrix_ownership,
+    validate_approved_risk_matrix_ownership,
     EXECUTION_TOPOLOGY_SOURCE,
     reject_legacy_topology_collision,
     find_existing_topology_checkpoint,
@@ -330,7 +330,7 @@ def _implement_approved_issue_unscoped(
             expected_subject=plan_subject,
         )
     if execution_recommendation is not None and approved_plan_context.matrix_available:
-        validate_risk_matrix_ownership(
+        validate_approved_risk_matrix_ownership(
             approved_plan_context.risk_test_matrix_payload,
             execution_recommendation,
         )
@@ -1058,7 +1058,7 @@ def _decompose_approved_plan(
         )
         if parent_matrix_context.matrix_available:
             risk_matrix_payload = parent_matrix_context.risk_test_matrix_payload
-            validate_risk_matrix_ownership(
+            validate_approved_risk_matrix_ownership(
                 parent_matrix_context.risk_test_matrix_payload,
                 execution_recommendation,
             )

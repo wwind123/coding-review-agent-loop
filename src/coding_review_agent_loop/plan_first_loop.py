@@ -6,6 +6,7 @@ orchestrator re-exports every name defined here.
 
 from __future__ import annotations
 
+from .plan_ownership import plan_ownership_diagnostic, validate_candidate_ownership
 from .pr_head_sync import get_observed_pr_review_context
 from .approved_plan_resume import approved_plan_resume_view, approval_shortcut_disagreement
 
@@ -74,6 +75,7 @@ from .pr_board_state import check_lineage_floor
 from .reviewer_floor import board_floor_enabled
 from .decomposition import (
     CreatedPhaseIssue,
+    RiskMatrixOwnershipError,
     approved_plan_hash,
     find_existing_one_shot_impl_handoff,
     find_latest_one_shot_impl_handoff,
@@ -1228,8 +1230,10 @@ def _run_plan_first_loop_body(
                     return response
                 except AgentLoopError as exc:
                     rejection = sanitize_plan_validation_diagnostic(str(exc))
+                    ownership_failure = isinstance(exc, RiskMatrixOwnershipError)
                 candidate_text = response.text
                 failure_description = (
+                    "fail risk-matrix ownership validation" if ownership_failure else
                     "weaken inherited parent matrix rows"
                     if inherited_matrix_binding is not None
                     else "fail deterministic plan assembly"
@@ -2154,6 +2158,7 @@ def _run_plan_first_loop_body(
                 ),
             )
             if isinstance(candidate, StructuredPlanState):
+                validate_candidate_ownership(candidate)
                 check_candidate_growth(
                     candidate,
                     canonical_text=(
@@ -2543,6 +2548,12 @@ def _run_plan_first_loop_body(
         )
         plan_scheduler_decision = None
         plan_history_class = None  # Growth/narrowing may skip classification this round.
+        ownership_review_failure = None
+        if not plan_approved_shortcut:
+            ownership_review_failure = plan_ownership_diagnostic(
+                current_plan, _current_execution_recommendation(current_plan, issue_context.comments)
+            )
+
         stall_deferred_for_step_back = False
         step_back_candidate_review = False
         step_back_review_anchor: PlanStepBackAnchor | None = None
@@ -2713,7 +2724,7 @@ def _run_plan_first_loop_body(
             plan_history_class = plan_history.history_class
             step_back_history_intact = plan_history_class == PLAN_HISTORY_INTACT
             step_back_history_class = str(plan_history_class)
-            if config.plan_step_back_rounds > 0 and plan_primary_name is not None:
+            if config.plan_step_back_rounds > 0 and plan_primary_name is not None and ownership_review_failure is None:
                 step_back_candidate_review = (
                     current_plan_sidecar.round_number
                     if current_plan_sidecar is not None
@@ -2799,6 +2810,7 @@ def _run_plan_first_loop_body(
                         )
             if (
                 config.plan_step_back_rounds > 0
+                and ownership_review_failure is None
                 and not staged_mode_revision
                 and not plan_reset_round
                 and plan_primary_name is not None
@@ -2833,6 +2845,7 @@ def _run_plan_first_loop_body(
                         stop_plan_pre_panel(step_back_stop, round_number=round_number)
             if (
                 config.plan_primary_stall_rounds > 0
+                and ownership_review_failure is None
                 and not staged_mode_revision
                 and not plan_reset_round
                 and plan_primary_name is not None
@@ -3387,6 +3400,7 @@ def _run_plan_first_loop_body(
                 inherited_matrix_binding=inherited_matrix_binding,
                 inherited_reviewed_deltas=inherited_review_deltas,
                 inherited_check_failure=inherited_review_failure,
+                ownership_check_failure=ownership_review_failure,
                 plan_growth_notice=plan_growth_notice,
                 plan_growth_measurements=plan_growth_measurements,
                 step_back_review_notice=step_back_candidate_review,
@@ -4478,7 +4492,14 @@ def _run_plan_first_loop_body(
                 obligations=tuple(item.item_id for item in must_fix_items),
             )
 
-        if (
+        if ownership_review_failure is not None:
+            plan_phase_advance_pending = False
+            if round_number == plan_round_limit:
+                raise AgentLoopError(
+                    "Risk-matrix ownership validation blocks approval; planning round budget "
+                    "is exhausted. Raise --max-rounds and rerun.\n" + ownership_review_failure
+                )
+        elif (
             all_approved
             and not must_fix_items
             and not plan_missing_approvals
@@ -5250,6 +5271,7 @@ def _run_plan_first_loop_body(
             and current_plan_sidecar is not None
             and not plan_panel_evidence.opened
             and not plan_phase_advance_pending
+            and ownership_review_failure is None
             and inherited_guard_revision is None
             and growth_guard_revision is None
             and narrow_revision is None
@@ -5351,8 +5373,8 @@ def _run_plan_first_loop_body(
         revision_initial_diagnostic: object | None = plan_validation_diagnostic
         if inherited_guard_revision is not None:
             # Attributed to the orchestrator; no synthetic reviewer item exists.
-            combined_review = (
-                "Orchestrator inherited-matrix check (not a reviewer finding):\n\n"
+            combined_review += (
+                "\n\nOrchestrator inherited-matrix check (not a reviewer finding):\n\n"
                 f"{inherited_guard_revision}"
             )
             revision_initial_diagnostic = _InheritedReplanDiagnostic(
@@ -5362,6 +5384,15 @@ def _run_plan_first_loop_body(
             )
             # The revised subject gets the complete board and carries no
             # approval from the superseded one.
+            plan_automatic_force_full = True
+        if ownership_review_failure is not None:
+            if inherited_review_failure is not None and inherited_guard_revision is None:
+                combined_review += "\n\n" + inherited_review_failure
+            combined_review += "\n\nOrchestrator ownership check (not a reviewer finding):\n" + ownership_review_failure
+            revision_initial_diagnostic = _InheritedReplanDiagnostic(
+                diagnostic=ownership_review_failure, failure_attempt=1,
+                candidate_digest=hashlib.sha256(current_plan.encode("utf-8")).hexdigest(),
+            )
             plan_automatic_force_full = True
         if growth_guard_revision is not None:
             # Attributed to the orchestrator; no reviewer item ID is minted.
@@ -5643,6 +5674,7 @@ def _run_plan_first_loop_body(
                     response.marker_value,
                     result_round_number=round_number + 1,
                 )
+                validate_candidate_ownership(assembled_candidate)
                 check_candidate_growth(
                     assembled_candidate,
                     canonical_text=render_canonical_plan_revision(
@@ -5653,6 +5685,7 @@ def _run_plan_first_loop_body(
                 )
                 return assembled_candidate.risk_test_matrix
             if isinstance(response.marker_value, StructuredPlanRevision):
+                validate_candidate_ownership(response.marker_value)
                 check_candidate_growth(
                     response.marker_value,
                     canonical_text=render_canonical_plan_revision(
