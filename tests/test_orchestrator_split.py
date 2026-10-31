@@ -79,6 +79,11 @@ def test_every_new_package_module_is_registered():
         "secure_git", "git_transport", "git_windows_launcher", "inspect_git_subprocess",
         "transport_check",
         "worktree_link_integrity",
+        # Independent capture infrastructure; no orchestrator symbols moved.
+        "review_images_config", "review_images_capture", "review_images_worktree",
+        "review_images_isolation", "review_images_host", "review_images_worker",
+        "review_images_cgroup", "review_images_channel", "review_images_mounts",
+        "review_images_manifest", "review_images_png",
     }
     problems = guard.unregistered_modules(
         guard.package_module_names(), (*BASELINE["modules"], *independent_infrastructure_modules),

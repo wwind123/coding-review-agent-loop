@@ -670,6 +670,155 @@ guards remain intact. Display acceptance grants no strict citation eligibility.
   never auto-merges. Host-session work is outside the external-agent process
   boundary. See [skill architecture](../skill_mode.md#architecture).
 
+## Internal exact-head image capture
+
+`review_images_config.py` and `review_images_capture.py` expose a disconnected
+library service. There are no public visual flags, provider calls, PR dispatch,
+CI policy changes, screenshot clearance or durable visual history in this phase.
+`CaptureConfig` defaults to no path patterns or commands. `eligible` performs
+case-sensitive matching of normalized changed paths, including both rename
+names and deleted names, without filesystem access. Disabled calls allocate
+nothing and do not import the capture workers.
+
+The operator supplies a command, optional setup and explicit read-only offline
+runtime grants. Grants are restricted to trusted system runtime installations;
+checkout configuration cannot select grants. Whole installation prefixes such as
+`/usr`, `/usr/local` and `/usr/share` are refused; choose specific binary/library
+directories or individual runtime assets instead. Capture requires Linux, trusted
+Bubblewrap >=0.9.0 with `--size`, user/mount/PID/IPC/UTS/network namespaces and
+systemd >=253 with delegated cgroup-v2 memory/pids/cpu enforcement. There is no
+process-group or unsandboxed fallback. Missing prerequisites return
+`isolation-unavailable`. No host tmpfs provisioning or scratch environment
+variable is required. No runtime, test or optional image-library dependency is
+added. Shell/browser/Python runtimes, libraries, fonts and offline caches must
+be available through the operator's grants; downloads and external networking
+are unavailable.
+
+`review_images_worktree.py` verifies a caller-pinned full commit OID with
+`secure_git.local_command`, imports only local objects into a private independent
+repository, and checks out a fresh detached worktree. The staging root identity
+is held until cleanup; an unexpected replacement is left untouched. It never prepares a shared
+store or dependency link. Confined Git commands cannot launch hooks, filters,
+submodules or network helpers. Staging limits both compressed and expanded
+input. A bounded descriptor channel transfers at most 100000 entries, paths of
+1024 characters and the configured scratch byte limit. The trusted sandbox
+loader refuses duplicate/unsafe layouts, follows no directory symlinks, preserves
+executable modes and symlink text, and checks a service-pinned transfer digest
+before setup. Git administration and host staging paths are never mounted into
+the sandbox.
+
+`review_images_isolation.py`, `review_images_host.py`,
+`review_images_worker.py`, `review_images_mounts.py` and
+`review_images_channel.py` own the launch and trusted channels. One sandbox
+creates its own scratch using `--size <bytes> --tmpfs /scratch`, default 2 GiB.
+Worktree, dependencies, output, HOME, temporary paths and `/dev/shm` are all
+subdirectories or symlinks into that mount. A separate 64 KiB device-construction
+tmpfs is read-only before execution; only named character devices are writable.
+There are no writable host-disk binds. The internal root and `/proc` are also
+remounted read-only. The trusted probe inventories every mount and verifies
+scratch tmpfs type, nodev/nosuid, execution permission and page-rounded capacity
+before loading input or running setup. Nested user namespaces are disabled and
+probed, so payloads cannot gain mount capabilities to add writable filesystems. An executable probe and distinct namespace
+identities must also pass. Failed checks refuse execution without fallback.
+
+Capture alone uses `InvocationHandle`'s delegated scope path and optional CPU
+quota. Existing roles retain their scope arguments and defaults. Defaults are
+MemoryHigh=768 MiB, MemoryMax=1 GiB, zero swap, TasksMax=128 and CPUQuota=100%,
+restricted by active aggregate limits. The shim pins its original scope root,
+moves to a control leaf and enables controllers only on empty interior nodes.
+The protected supervisor and Bubblewrap stay in control; fresh gated launchers
+move to setup/capture payload leaves. The host receives kernel SCM_CREDENTIALS
+across the PID namespace, pins a pidfd/start identity, verifies ancestry and
+membership, migrates the blocked launcher, verifies again, then releases it.
+Payload exec closes control descriptors and uses a minimal environment. The
+non-dumpable supervisor denies payload memory/descriptor inspection. Supervisor
+loss aborts publication; parent-pipe loss kills the whole hierarchical scope.
+
+`review_images_cgroup.py` uses pinned cgroup identities, hierarchical
+`cgroup.events` and `cgroup.kill`. Empty top-level `cgroup.procs` never proves
+capture emptiness. The host kills and verifies the entire payload subtree after
+each phase, before capture and before export. Only trusted control processes
+remain for export; whole-scope emptiness precedes PNG validation and publication.
+Memory high/max/OOM and task-limit events prohibit success even on zero exit.
+Counters are checked at every control, interior and phase cgroup as well as the
+scope root, including kernels with local-only event reporting.
+CPU quota and deadlines bound saturation. The 2 GiB tmpfs is a filesystem ceiling,
+not an allocation promise: tmpfs pages share the lower memory budget with all
+processes. Small-tmpfs ENOSPC and memory-first failures are distinct tests.
+
+Setup and capture run sequentially in the same sandbox, preserving private
+setup dependencies. Each defaults to a separate 300-second deadline; input and
+export each have a 30-second deadline. Diagnostics retain only a 64 KiB tail on
+a channel separate from output framing. The monitor further trims that tail to fit
+the 64 KiB encoded JSON reply budget, including escaping and proof metadata.
+Supervisor diagnostic chunks also fit their control-channel budget under
+worst-case JSON escaping, including non-BMP characters.
+After each phase, resource counters are checked after payload teardown and before
+evaluating the exit status; any resource event takes precedence over nonzero
+exit or timeout classification. Positive finite limits exclude booleans.
+Containment and Bubblewrap preflight precede staging. Trusted capture preflight
+and monitor launches use `/` and a scrubbed environment to prevent imports from
+the caller checkout. Failure classes come from trusted exception types and monitor
+state, never diagnostic text or output filenames.
+Failures are bounded typed outcomes (`isolation-unavailable`, `failed`,
+`resource-limit`, `timeout`); cancellation tears down the scope and propagates.
+Ordinary-review continuation remains the caller's responsibility.
+
+Both stages receive service-owned `AGENT_LOOP_REVIEW_IMAGES_HEAD_SHA` (the
+verified caller-pinned OID) and `AGENT_LOOP_REVIEW_IMAGES_MANIFEST` (absolute
+`/scratch/output/manifest.json`). Inherited values cannot override these.
+The manifest requires `head_sha` and nonempty `images` with unique `id`, relative
+`path`, `viewport: {width, height}`, `locale` and `state`. Optional `baseline_path`
+has identical confinement; finite numeric `diff_score` is advisory. Duplicate
+JSON keys, control characters, unsafe paths and malformed metadata are rejected.
+Text limits are ID 128, locale 64, state 256 and path 1024 characters. Viewport
+dimensions are positive bounded integers, independent of PNG dimensions.
+
+The supervisor pins scratch and output root descriptors before repository
+execution. Only after payload emptiness does it read output relative to that
+held output descriptor; replacing the output root invalidates the attempt. Every path component uses no-follow opens. Symlinks, hardlinks,
+special files, size overruns and changed file identities/metadata are refused.
+Export consists of bounded records and an explicit completion, never payload
+stdout. Parent validation independently checks the pinned head/schema, inventory,
+record counts, sizes, duplicates, truncation and trailing data. Whole-scope
+teardown must pass before these copied bytes reach validation.
+
+`review_images_png.py` checks PNG structure with only `struct` and `zlib`.
+A second no-network Bubblewrap worker receives bounded copied bytes, never
+capture/snapshot paths or writable snapshot descriptors. Input descriptors are
+reopened read-only; validator stdout uses the null device rather than a host file. Its runtime allowlist is
+narrowed from the operator grants to root-owned system Python, its standard
+library and their ELF dependencies (inventoried with trusted system `ldd`);
+browser binaries and broad capture grants are absent. It has its own verified
+8 MiB scratch, read-only root/dev, at most 256 MiB address space/cgroup memory,
+zero swap, 16 tasks, 100% CPU quota and a single 30-second whole-set deadline.
+No capture worktree is present. It checks signature, every chunk length/type/CRC,
+first single IHDR, legal bit-depth/color-type combinations, PLTE ordering/size,
+one consecutive IDAT run and final empty IEND without trailing bytes. Interlacing,
+APNG and unknown critical chunks are refused. Incremental zlib output is bounded
+by `height * (1 + ceil(width * samples * bit_depth / 8))`, including filter bytes.
+Fixed buffers, valid scanline filters, exact decompressed size, EOF and absence of
+unused/trailing compressed data are required. Pixel reconstruction and baseline
+comparison belong to the repository's capture/compare command.
+
+Manifest defaults are 16 entries, 256 KiB JSON, 8 MiB per image/baseline, 64 MiB
+aggregate encoded bytes, 16 million pixels per file, 64 million aggregate pixels
+and maximum dimension 16000. Baseline references count toward aggregate limits.
+Any invalid image, worker crash/reply, resource event, deadline or uncertain
+cleanup discards the entire unpublished set. `review_images_manifest.py` hashes
+actual copied bytes and binds the head, command/config identity, metadata and
+file digests into a deterministic set digest. Per-host namespace identities are
+probe evidence and are excluded from configuration identity. Publication exposes sealed,
+read-only memory descriptors and immutable metadata. `SnapshotSet` survives all
+sandbox/worktree cleanup and belongs to its caller, which must `close` it or use
+its context manager. This does not establish durable retention/resume authority.
+
+Security tests use `AGENT_LOOP_CAPTURE_SECURITY_REQUIRED=1` to make unavailable
+host prerequisites fail rather than skip. Real setup/capture/export/PNG-worker
+and delegated cleanup receipts are required evidence; ordinary CI skips or mock
+launches cannot demonstrate confinement.
+
+
 ## Decisions
 
 [Decision log](decisions/execution-and-concurrency.md)
