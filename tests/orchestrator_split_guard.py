@@ -2,8 +2,8 @@
 
 This module is NOT a test file.  It holds:
 
-* ``EXTRACTED_MODULES`` -- the ordered registry of modules extracted from
-  ``orchestrator.py``.  Each extraction stage appends exactly one name.
+* ``EXTRACTED_MODULES`` -- the frozen historical ordered registry of modules extracted from
+  ``orchestrator.py``. New package modules do not join this registry.
 * Baseline helpers that freeze the ``orchestrator`` import surface and the
   package module list at the start of the split.  The per-definition digest
   freeze that kept every extraction a pure move was retired once the split
@@ -32,7 +32,7 @@ from pathlib import Path
 PACKAGE = "coding_review_agent_loop"
 FACADE = f"{PACKAGE}.orchestrator"
 
-# Ordered: an extracted module may import only modules listed before it.
+# Frozen historical order: an extracted module may import only earlier entries.
 EXTRACTED_MODULES: tuple[str, ...] = (
     'review_scope',
     'managed_ci_obligations',
@@ -269,11 +269,28 @@ def layering_problems(registry: Sequence[str], module_sources: Mapping[str, str]
     return problems
 
 
-def unregistered_modules(
-    current: Iterable[str], baseline: Iterable[str], registry: Iterable[str]
-) -> list[str]:
-    known = set(baseline) | set(registry)
-    return [f"new package module {name!r} is not in EXTRACTED_MODULES" for name in sorted(set(current) - known)]
+def package_import_problems(package_dir: Path | None = None) -> list[str]:
+    """Discover package modules and enforce no-facade import safety.
+
+    The facade itself and cli (its intentional entry-point consumer) are exempt.
+    The two standalone helper scripts cannot execute as ordinary imports, so
+    their imports are checked statically; all other modules use fresh processes.
+    """
+    package_dir = PACKAGE_DIR if package_dir is None else package_dir
+    problems: list[str] = []
+    for name in package_module_names(package_dir):
+        if name in {"orchestrator", "cli"}:
+            continue
+        if name in {"git_windows_launcher", "inspect_git_subprocess"}:
+            source = (package_dir / f"{name}.py").read_text(encoding="utf-8")
+            imported = _imported_module_names(source, f"{PACKAGE}.{name}")
+            if any(_names_facade(target) for target in imported):
+                problems.append(f"{name} imports the orchestrator facade")
+        else:
+            problem = fresh_import_problem(name)
+            if problem:
+                problems.append(problem)
+    return problems
 
 
 def fresh_import_problem(name: str) -> str | None:
