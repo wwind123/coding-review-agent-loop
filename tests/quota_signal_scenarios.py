@@ -24,6 +24,11 @@ from coding_review_agent_loop import cli, discuss_loop, quota_wait, review_round
 from coding_review_agent_loop.errors import QuotaResetExceededError
 from test_quota_reset_wait import _claude_limit, OK, SIX_HOURS, PR_ARGS
 
+def _record_event(message):
+    # One pipe write keeps concurrent worker records on separate lines.
+    os.write(sys.stdout.fileno(), (message + "\n").encode())
+
+
 @contextlib.contextmanager
 def _signal_when_waiting(signum, *, count=1, executor_ready=None, readiness_timeout=10):
     stop = threading.Event()
@@ -33,7 +38,7 @@ def _signal_when_waiting(signum, *, count=1, executor_ready=None, readiness_time
         while not stop.is_set():
             ready = executor_ready is None or executor_ready.is_set()
             if ready and quota_wait.active_wait_count() >= count:
-                print('signal delivery: registered=' + str(count), flush=True)
+                _record_event('signal delivery: registered=' + str(count))
                 signal.pthread_kill(threading.main_thread().ident, signum)
                 return
             if time.monotonic() >= deadline:
@@ -62,7 +67,7 @@ def _waiting_worker(config, name):
     try:
         quota_wait.wait_for_reset(config, name, reservation)
     finally:
-        print('worker exit: ' + name, flush=True)
+        _record_event('worker exit: ' + name)
 
 
 def _record_terminations(runner):
@@ -70,7 +75,7 @@ def _record_terminations(runner):
     original = runner.terminate_active_processes
 
     def spy():
-        print('main cancellation / terminate processes', flush=True)
+        _record_event('main cancellation / terminate processes')
         calls.append(True)
         return original()
 
@@ -111,8 +116,8 @@ def scenario_signal_cancels_a_waiting_reviewer_worker(tmp_path, monkeypatch, cap
     real_wait = review_rounds.wait
 
     def waiting_wait(*args, **kwargs):
+        _record_event("reviewer wait entry")
         executor_ready.set()
-        print("reviewer wait entry", flush=True)
         return real_wait(*args, **kwargs)
 
     monkeypatch.setattr(review_rounds, "wait", waiting_wait)
@@ -176,8 +181,8 @@ def scenario_signal_cancels_waiting_discuss_debaters(tmp_path, monkeypatch, caps
     executor_ready = threading.Event()
     real_wait = discuss_loop.wait
     def waiting_wait(*args, **kwargs):
+        _record_event('discuss wait entry')
         executor_ready.set()
-        print('discuss wait entry', flush=True)
         return real_wait(*args, **kwargs)
     monkeypatch.setattr(discuss_loop, 'wait', waiting_wait)
     with _signal_when_waiting(signum, count=2, executor_ready=executor_ready):

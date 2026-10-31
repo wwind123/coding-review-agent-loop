@@ -281,13 +281,24 @@ def test_signal_during_main_thread_wait_is_a_clean_quota_stop(tmp_path, signum):
 
 
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
-def test_signal_cancels_a_waiting_reviewer_worker(tmp_path, signum):
-    run_signal_scenario("signal_cancels_a_waiting_reviewer_worker", tmp_path, signum=signum)
-
-
-@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM], ids=["sigint", "sigterm"])
-def test_signal_cancels_waiting_discuss_debaters(tmp_path, signum):
-    run_signal_scenario("signal_cancels_waiting_discuss_debaters", tmp_path, signum=signum)
+@pytest.mark.parametrize("scenario, entry, worker_names", [
+    ("signal_cancels_a_waiting_reviewer_worker", "reviewer wait entry", ["Codex"]),
+    ("signal_cancels_waiting_discuss_debaters", "discuss wait entry", ["Codex", "Gemini"]),
+], ids=["reviewer", "discuss"])
+def test_signal_cancels_executor_workers_in_order(tmp_path, signum, scenario, entry, worker_names):
+    output = run_signal_scenario(scenario, tmp_path, signum=signum)
+    lines = output.splitlines()
+    deliveries = [i for i, line in enumerate(lines) if line.startswith("signal delivery:")]
+    exits = [i for i, line in enumerate(lines) if line.startswith("worker exit:")]
+    assert len(deliveries) == 1, output  # No repeated rescue signal.
+    assert lines[deliveries[0]] == f"signal delivery: registered={len(worker_names)}", output
+    assert sorted(lines[i] for i in exits) == sorted(f"worker exit: {name}" for name in worker_names), output
+    assert lines.index(entry) < deliveries[0], output
+    assert all(deliveries[0] < i for i in exits), output
+    assert lines.count("main cancellation / terminate processes") == 1, output
+    # Cancellation wakes workers before the termination spy; either can print first.
+    assert all(i < lines.index("scenario completed: " + scenario) for i in exits), output
+    print(output, end="")  # Keep the controlled sequence in managed -s evidence.
 
 
 def test_sigterm_without_active_wait_keeps_default_termination(tmp_path):

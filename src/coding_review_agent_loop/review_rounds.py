@@ -10,7 +10,7 @@ import contextvars
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 from .agents.base import AgentName

@@ -1,4 +1,8 @@
 {
+ "tests/test_quota_reset_wait.py::test_signal_cancels_executor_workers_in_order[reviewer-sigint]": 1.0,
+ "tests/test_quota_reset_wait.py::test_signal_cancels_executor_workers_in_order[reviewer-sigterm]": 1.0,
+ "tests/test_quota_reset_wait.py::test_signal_cancels_executor_workers_in_order[discuss-sigint]": 1.0,
+ "tests/test_quota_reset_wait.py::test_signal_cancels_executor_workers_in_order[discuss-sigterm]": 1.0,
  "tests/test_agent_failure.py::test_repair_provider_failure_suggestion_matches_transient_reason_only": 0.0035,
  "tests/test_agent_failure.py::test_task_and_pr_followup_salvage_scopes_post_no_github_comment": 0.0069,
  "tests/test_agent_failure_classification.py::test_at_capacity_message_is_transient_and_public_diagnostic": 0.0031,
