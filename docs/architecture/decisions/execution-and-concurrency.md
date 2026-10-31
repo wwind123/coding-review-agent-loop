@@ -35,3 +35,5 @@ never rewritten or deleted. The detail doc describes the current design.
 
 - Report guards and receipt consumers share strict managed-wrapper interpretation; unknown long options never consume option-shaped next tokens, and canonical redacted inner argv correlate equivalent citations without granting scratch display inputs evidence authority (#1768).
 - Shared link sources use persisted bounded structural witnesses and capped child counts, with clone-local stale health checked at startup and around checked turns; recovery requires trusted operator setup with nonempty output validation, while large sources reduce coverage and shared write-through remains opt-in PR-local isolation's responsibility (#1775).
+
+- Reviewer and parallel discuss executor observation use finite quota-slice polls to allow pending main-thread signals to run; empty polls are not turn failures or overall deadlines, and completion-driven reviewer consumption, the discuss publication barrier and configured order, and interrupt cleanup remain intact. Signal tests use disposable interpreters with independent parent process-group deadlines so they cannot corrupt pytest timeout state (#1814).

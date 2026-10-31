@@ -10,7 +10,7 @@ import contextvars
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, replace as dataclasses_replace
 from pathlib import Path
 from .agents.base import AgentName
@@ -1354,8 +1354,16 @@ def _launch_reviewer_turns(
                 executor.submit(contextvars.copy_context().run, run_turn, reviewer): reviewer
                 for reviewer in to_launch
             }
-            for future in as_completed(futures):
-                results[futures[future]] = future.result()
+            pending = set(futures)
+            while pending:
+                # A finite wait returns control to Python for pending signals.
+                # Poll expiry is not a turn timeout or a failed reviewer.
+                done, pending = wait(
+                    pending, timeout=quota_wait.QUOTA_WAIT_SLICE_SECONDS,
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in done:
+                    results[futures[future]] = future.result()
         except KeyboardInterrupt:
             # Wake workers sleeping out a quota reset before the shutdown join (#1601).
             quota_wait.cancel_active_waits()

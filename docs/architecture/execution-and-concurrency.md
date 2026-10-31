@@ -522,7 +522,14 @@ DURATION. A pre-dispatch all-exhausted wait builds the next invocation
 normally, and a post-failure wait replays the failed one. Waits sleep in
 requested slices of at most one second on a process-level cancel event in a
 waiter registry. Short timed slices bound deferred pending-signal observation
-when the blocking wait misses an interrupt. Scheduling and executor cleanup
+when the blocking wait misses an interrupt. Main-thread reviewer observation
+uses finite `wait(..., FIRST_COMPLETED)` polls over the remaining futures;
+discuss uses finite all-completed polls before collecting results in configured
+order. Both use `QUOTA_WAIT_SLICE_SECONDS`, because slicing worker quota
+waits alone cannot bound a main thread blocked in executor observation. Empty
+polls are neither failed turns nor overall deadlines. Reviewer results are
+consumed once in completion-driven order, and discuss retains its publication
+barrier. Scheduling and executor cleanup
 can add overhead; this is not an absolute one-second wall-clock shutdown guarantee.
 The CLI installs a SIGTERM handler for the command only when the option is
 set. The handler is lock-free (it reads the registry and sets a flag), because
