@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import select
 import shlex
 import shutil
 import subprocess
@@ -890,17 +891,37 @@ def test_process_group_is_signalled_only_while_the_leader_is_unreaped(tmp_path, 
 def test_surviving_setup_child_cannot_write_after_the_command_ends(tmp_path, exit_command):
     """A background writer left by setup is killed before run_setup_command returns or raises."""
     state = tmp_path / "state"
-    command = f"(sleep 1; echo damaged > {state}) & {exit_command}"
-    started = time.monotonic()
+    ready = tmp_path / "ready"
+    lifetime = tmp_path / "lifetime"
+    os.mkfifo(lifetime)
+    # The child holds the FIFO open for its entire lifetime. EOF proves it
+    # cannot perform the delayed write, without racing a one-second sleep on
+    # a loaded CI worker. Readiness ensures the exit variants also exercise
+    # a live background child.
+    command = (
+        f"(exec 3>{shlex.quote(str(lifetime))}; "
+        f"touch {shlex.quote(str(ready))}; sleep 30; "
+        f"echo damaged > {shlex.quote(str(state))}) & "
+        f"while [ ! -e {shlex.quote(str(ready))} ]; do sleep 0.01; done; {exit_command}"
+    )
+    reader = os.open(lifetime, os.O_RDONLY | os.O_NONBLOCK)
     try:
-        worktree_setup.run_setup_command(tmp_path, command, timeout_seconds=0.5 if "sleep" in exit_command else 10)
-    except AgentLoopError:
-        assert exit_command != "exit 0"
-    else:
-        assert exit_command == "exit 0"
-    assert time.monotonic() - started < 1
-    time.sleep(1.5)
-    assert not state.exists()
+        try:
+            worktree_setup.run_setup_command(
+                tmp_path, command, timeout_seconds=0.5 if "sleep" in exit_command else 10,
+            )
+        except AgentLoopError as caught:
+            expected = "timed out" if "sleep" in exit_command else "exited 1"
+            assert exit_command != "exit 0"
+            assert expected in str(caught)
+        else:
+            assert exit_command == "exit 0"
+        assert ready.exists(), "background writer never reached readiness"
+        assert select.select([reader], [], [], 10)[0], "background writer survived setup cleanup"
+        assert os.read(reader, 1) == b""
+        assert not state.exists()
+    finally:
+        os.close(reader)
 
 
 def test_failed_setup_child_cannot_damage_the_environment_after_a_retry(tmp_path, monkeypatch):

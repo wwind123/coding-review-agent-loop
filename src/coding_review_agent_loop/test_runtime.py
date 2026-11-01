@@ -1012,7 +1012,12 @@ def _lexical_stat_identity(path: Path) -> dict[str, object]:
 
 def _shebang_interpreter(path: Path) -> str | None:
     try:
-        first = path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        # Native interpreters can be large binaries. Identity checks need only
+        # the script header, not a decode and split of the entire executable.
+        with path.open(encoding="utf-8", errors="replace") as handle:
+            if handle.read(2) != "#!":
+                return None
+            first = ("#!" + handle.readline()).splitlines()[0]
     except (OSError, IndexError):
         return None
     if not first.startswith("#!"):

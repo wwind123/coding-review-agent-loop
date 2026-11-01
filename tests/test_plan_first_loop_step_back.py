@@ -2,6 +2,7 @@
 
 import json
 import re
+from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1018,7 +1019,19 @@ def test_resumed_episode_prompts_match_the_uninterrupted_run(tmp_path):
     uninterrupted, _error = _m1251_run(
         tmp_path, last_round=8, max_rounds=12, plan_step_back_escalation_rounds=9,
     )
-    history = _m1278_episode_history(tmp_path)
+    # The uninterrupted run already constructed the same seven-round prefix.
+    # Copy it at the round-8 review boundary instead of executing it twice;
+    # the resumed runner must still reconstruct its own anchor from history.
+    history = []
+    for comment in uninterrupted.issue_comments:
+        match = re.search(r"<!-- AGENT_LOOP_META: (?P<payload>\S+) -->", comment["body"])
+        if match is not None:
+            metadata = _decode_round_metadata(match.group("payload"))
+            if metadata.role == "reviewer" and metadata.round_number == 8:
+                break
+        history.append(deepcopy(comment))
+    else:
+        pytest.fail("uninterrupted history did not reach round 8's review")
     claude, codex = _m1275_scripts(first_round=8, last_round=9)
     resumed, _e, _m = _m1275_resume(
         tmp_path, history, claude=claude[:1], codex=codex[:1],
