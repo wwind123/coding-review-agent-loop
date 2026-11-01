@@ -41,3 +41,5 @@ testpaths = ["tests"]
 # Bound setup, call and teardown; signal keeps named failures in xdist workers.
 timeout = 600
 timeout_method = "signal"
+# Independent watchdog prints stacks without terminating the test.
+faulthandler_timeout = 300

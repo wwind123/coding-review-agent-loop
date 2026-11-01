@@ -9938,6 +9938,24 @@ than producing a normal failure, and xdist may restart the worker. Do not disabl
 timeout protection to hide hangs. This per-test policy is distinct from the
 whole-command watchdog and the hosted shard job budget described above.
 
+Pytest's built-in `faulthandler_timeout = 300` adds a SIGALRM-independent,
+non-terminating stack diagnostic after 300 seconds, before the existing
+600-second signal failure limit and default 30-minute shard ceiling.
+Override it with `-o faulthandler_timeout=<seconds>`; coordinate shorter consumer
+shard budgets explicitly so the diagnostic has time to reach the log.
+It covers a hang in setup, call or teardown when no earlier phase of that test
+raised. Pytest's exception-interaction hook unconditionally cancels the diagnostic
+timer on ordinary phase exceptions: an early setup or call failure followed by a
+teardown hang may produce no dump. Nested in-process pytest sessions share the
+process-global faulthandler timer; an inner test failure can cancel the outer
+timer even with inner `faulthandler_timeout = 0`. Timer rearming and refactoring
+nested sessions are outside this diagnostic's scope.
+Stacks identify active Python test/fixture frames, without guaranteeing full
+parametrized node IDs. There is no attribution guarantee for startup/collection
+hangs, external subprocess internals, disabled faulthandler, runner loss or
+cancellation before the threshold. The diagnostic does not terminate the test
+or replace existing timeout and shard failure gates.
+
 The run-level command ceiling is configured with
 `--coder-test-command-timeout-seconds SECONDS` and defaults to 1,800 seconds.
 It is separate from a framework's per-test timeout and from the backend's
