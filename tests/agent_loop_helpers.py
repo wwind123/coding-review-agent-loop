@@ -2108,7 +2108,7 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
         "gemini_args": (),
         "test_command": None,
         "pre_review_tests": True,
-        "ci_timeout_seconds": 1200,
+        "ci_timeout_seconds": 2400,
         "ci_poll_interval_seconds": 30,
         "quiet": True,
         "log_dir": tmp_path / "logs",

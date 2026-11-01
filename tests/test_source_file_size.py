@@ -22,7 +22,7 @@ DEFAULT_LIMIT = 6000
 # Repo-relative POSIX path -> line ceiling. Each ceiling is the file's size
 # when it was listed; lower it (or delete the entry) when the file is split.
 ALLOWLIST: dict[str, int] = {
-    "src/coding_review_agent_loop/managed_ci.py": 9769,
+    "src/coding_review_agent_loop/managed_ci.py": 9755,
     "src/coding_review_agent_loop/protocol.py": 10238,
     "src/coding_review_agent_loop/pr_loop.py": 9976,
 }

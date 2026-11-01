@@ -292,7 +292,7 @@ def test_readme_documents_ci_watcher_controls():
     section_end = readme_text.index("## Claude Code Skill Mode", section_start)
     section = " ".join(readme_text[section_start:section_end].split())
 
-    assert "`--ci-timeout-seconds` (default 1200)" in section
+    assert "`--ci-timeout-seconds` (default 2400)" in section
     assert "`--ci-poll-interval-seconds` (default 30)" in section
 
 
@@ -1731,7 +1731,7 @@ def test_ci_timeout_policy_and_consumer_budget_guidance():
         "single-shard suite", "update the pinned callee revision",
         "**both** caller routes", "shard_timeout_minutes: 60",
         "--ci-timeout-seconds 1200", "--ci-timeout-seconds 2400",
-        "expiry does not cancel hosted CI", "validation,", "queueing, setup, aggregation and publication",
+        "expiry does not cancel hosted CI", "2400 seconds", "--ci-timeout-seconds 4200", "validation,", "queueing, setup, aggregation and publication",
         "Larger consumer budgets", "Whole-run cancellation, runner loss",
     ):
         assert phrase in section

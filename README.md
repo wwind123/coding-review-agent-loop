@@ -2079,8 +2079,21 @@ For ordinary CI, auto-merge waits for a reliable, non-empty check board on the
 current head. Without auto-merge, `--watch-pending-ci` can wait and report that
 an approved PR is merge-ready without merging. It is off by default; a run that
 stops on pending checks prints a hint naming it. Set the total watcher budget
-with `--ci-timeout-seconds` (default 1200) and its polling interval with
-`--ci-poll-interval-seconds` (default 30). After approval, a test failure
+with `--ci-timeout-seconds` (default 2400) and its polling interval with
+`--ci-poll-interval-seconds` (default 30). This 40-minute ordinary and managed
+watch covers the default 30-minute shard budget with ten minutes overhead;
+queue delays can still exhaust it. Explicit shorter overrides such as
+`--ci-timeout-seconds 1200` stay unchanged; longer consumer shard budgets need
+longer watches, for example `--ci-timeout-seconds 4200` for 60-minute shards.
+Hosted job budgets and local watching are independent; watch expiry does not
+cancel hosted work. Managed v2 watching reports completed test jobs with
+`failure` or `timed_out` before sibling jobs finish, using complete jobs from
+the authenticated current attempt. Cancelled and infrastructure conclusions
+retain existing recovery. Before coder handoff, the original attachment and
+live job evidence are checked again, including on restart. Active audit
+records stay attached until the exact baseline finishes; historical clearance
+still needs a completed record and a later completed successful attempt.
+After approval, a test failure
 resumes the coder. A failure in plumbing jobs only (status publishing,
 routing, attestation), with every test check passed on a complete board, is
 re-run once and watched again. If plumbing fails again, the loop stops with

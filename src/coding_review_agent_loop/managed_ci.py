@@ -9083,35 +9083,7 @@ def _v2_run_name(contract: ManagedCiContract) -> str:
     return f"{V2_RUN_NAME_PREFIX}{contract.nonce}"
 
 
-def _is_v2_intent_run(
-    run: dict[str, object], *, contract: ManagedCiContract, run_name: str
-) -> bool:
-    """Validate the API fields available for a dispatched base workflow."""
-    if (
-        run_name not in (run.get("name"), run.get("display_title"))
-        or run.get("event") != "workflow_dispatch"
-    ):
-        return False
-    path = run.get("path")
-    if isinstance(path, str) and f".github/workflows/{WORKFLOW_FILE}" not in path:
-        return False
-    run_ref = contract.dispatch_ref or contract.base_ref
-    if isinstance(run.get("head_branch"), str) and run_ref and run["head_branch"] != run_ref:
-        return False
-    if isinstance(run.get("head_sha"), str) and contract.workflow_revision and run["head_sha"] != contract.workflow_revision:
-        return False
-    for field in ("actor", "triggering_actor"):
-        identity = run.get(field)
-        if not isinstance(identity, dict):
-            continue
-        login = identity.get("login")
-        actor_id = identity.get("id")
-        if (
-            login != contract.trusted_actor_login
-            or actor_id != contract.trusted_actor_id
-        ):
-            return False
-    return True
+from .managed_ci_failure import _is_v2_intent_run, observe_active_failure
 
 
 def wait_for_final_qualification(
@@ -9287,6 +9259,20 @@ def wait_for_final_qualification(
                 run_id=run_id, final_status=status,
                 run_attempt=contract.run_attempt if contract is not None else None,
                 jobs=jobs, attempts_used=attempt + 1,
+            )
+        early = observe_active_failure(
+            runner, config=config, pr_number=pr_number, metadata=metadata,
+            contract=contract, minimum=min_run_attempt,
+        ) if run_snapshot is not None and run_snapshot.status == "in_progress" else None
+        if early is not None:
+            snapshot, jobs = early
+            return ManagedCiOutcome(
+                status="failed", checks=latest, head_sha=live_head, jobs=jobs,
+                run_id=snapshot.run_id, run_attempt=snapshot.live_run_attempt,
+                workflow_status=snapshot.status, workflow_conclusion=snapshot.conclusion,
+                failure_details=(f"Managed CI run {snapshot.run_id} attempt {snapshot.live_run_attempt}",)
+                + _format_v2_failed_jobs(snapshot.run_id, jobs),
+                attempts_used=attempt + 1, final_status=last_status,
             )
         stall_checks = intermediate_managed_checks(latest)
         if is_wholly_infrastructure_blocked(stall_checks):

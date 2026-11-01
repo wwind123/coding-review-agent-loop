@@ -708,8 +708,8 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument(
             "--ci-timeout-seconds",
             type=int,
-            default=1200,
-            help="Maximum time to watch the full CI board before auto-merge (default: 1200).",
+            default=2400,
+            help="Maximum ordinary or managed CI watch time in seconds (default: 2400; explicit overrides preserved).",
         )
         subparser.add_argument(
             "--ci-poll-interval-seconds",

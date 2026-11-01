@@ -262,11 +262,17 @@ def require_repair_handoff_failure(runner, *, config, pr_number, metadata, contr
     message = (f'PR #{pr_number}: recorded managed run {ref.run_id} is pending, unreadable, '
                'or lacks authoritative failure evidence; repair remains unresolved. Resume after '
                'the current attempt and complete check board are inspectable.')
+    from .managed_ci_failure import require_live_failure
+    if require_live_failure(runner, config=config, pr_number=pr_number, metadata=metadata,
+                            contract=contract, checkpoint=checkpoint):
+        return
     try:
         page = ci._read_intent_comment_page(runner, config, pr_number)
         record = _record(page, contract, ref)
         if record is None or ci._advertised_managed_actor(runner, config) != contract.trusted_actor_login:
             raise AgentLoopError(message)
+        # Completed historical baselines retain their existing authentication;
+        # a newer live intent does not revoke their repair obligation.
         view = replace(contract, nonce=ref.nonce, attached_run_id=ref.run_id,
                        run_attempt=ref.failed_attempt, workflow_revision=ref.workflow_revision,
                        terminal_attempts=tuple((x['run_id'], x['run_attempt']) for x in record['terminal_attempts']))
