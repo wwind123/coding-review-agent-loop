@@ -15,10 +15,13 @@ The original recording intentionally mutated a tracked output. Its execution
 receipt therefore cannot alone be cited as a stable-tree current-head pass.
 An ordinary full-suite pass also does not prove that recording ran.
 For independent current-input verification, run the same unsharded replacement
-recorder with an output outside the checkout, preserving the committed store:
+recorder with an output outside the checkout, preserving the committed store. Clear
+inherited shard selectors, manifest/duration inputs and `PYTEST_ADDOPTS` in the
+invoking shell first; keep the wrapper target as the recognized `env KEY=value`
+launcher (its evidence parser does not recognize `env -u` options):
 
 ```bash
-agent-loop run-tests --timeout-seconds 1800 -- env -u CI_SHARD_INDEX -u CI_SHARD_COUNT -u CI_SHARD_MANIFEST -u CI_SHARD_DURATIONS -u PYTEST_ADDOPTS PYTHONPATH=ci/managed CI_SHARD_STORE_DURATIONS=/tmp/coding-review-agent-loop/scratch/1852-evidence/durations.json CI_SHARD_STORE_DURATIONS_MODE=replace /home/wwind123/tools/coding-review-agent-loop/.venv/bin/python -m pytest -p ci_shard_plugin -n 6 tests/ -q
+agent-loop run-tests --timeout-seconds 1800 -- env PYTHONPATH=ci/managed CI_SHARD_STORE_DURATIONS=/tmp/coding-review-agent-loop/scratch/1852-evidence/durations.json CI_SHARD_STORE_DURATIONS_MODE=replace /home/wwind123/tools/coding-review-agent-loop/.venv/bin/python -m pytest -p ci_shard_plugin -n 6 tests/ -q
 ```
 
 Use the managed receipt from that invocation, not this procedure, as execution
