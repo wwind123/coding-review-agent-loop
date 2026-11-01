@@ -1737,3 +1737,25 @@ def test_ci_timeout_policy_and_consumer_budget_guidance():
         assert phrase in section
     for phrase in ("600 seconds", "timeout_method = signal", "setup, call and teardown", "--timeout-method=thread"):
         assert phrase in text
+
+
+def test_hang_diagnostic_timing_and_attribution_limits():
+    for document in (README, LOCAL_AGENT_LOOP_DOC):
+        text = " ".join(document.read_text().split())
+        for phrase in (
+            "faulthandler_timeout = 300", "SIGALRM-independent", "non-terminating",
+            "600-second signal failure limit", "default 30-minute shard ceiling",
+            "-o faulthandler_timeout=<seconds>", "shorter consumer shard budgets",
+            "setup, call or teardown when no earlier phase of that test raised",
+            "exception-interaction hook unconditionally cancels",
+            "ordinary phase exceptions", "teardown hang may produce no dump",
+            "Nested in-process pytest sessions share", "process-global faulthandler timer",
+            "inner test failure can cancel the outer timer",
+            "even with inner `faulthandler_timeout = 0`",
+            "Timer rearming and refactoring nested sessions are outside",
+            "without guaranteeing full parametrized node IDs",
+            "startup/collection hangs", "external subprocess internals",
+            "disabled faulthandler", "runner loss or cancellation before the threshold",
+            "does not terminate the test", "existing timeout and shard failure gates",
+        ):
+            assert phrase in text, (document, phrase)

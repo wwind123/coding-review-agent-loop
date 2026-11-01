@@ -937,6 +937,7 @@ def test_repository_callers_use_reusable_budget_defaults():
         assert "shard_timeout_minutes" not in job["with"]
         assert "timeout-minutes" not in job
         assert job["with"]["shards"] == 3
+        assert job["with"]["test_command"] == "python -m pytest -n auto"
 
 
 def test_actual_publisher_scheduling_and_validated_bindings():

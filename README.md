@@ -2192,6 +2192,24 @@ job ceiling and accept the optional numeric `shard_timeout_minutes` input.
 See the [CI budget and consumer guidance](docs/local_agent_loop.md#managed-exact-head-ci)
 for longer consumer budgets and the independent local CI watch.
 
+Pytest's built-in `faulthandler_timeout = 300` adds a SIGALRM-independent,
+non-terminating stack diagnostic after 300 seconds, before the existing
+600-second signal failure limit and default 30-minute shard ceiling.
+Override it with `-o faulthandler_timeout=<seconds>`; coordinate shorter consumer
+shard budgets explicitly so the diagnostic has time to reach the log.
+It covers a hang in setup, call or teardown when no earlier phase of that test
+raised. Pytest's exception-interaction hook unconditionally cancels the diagnostic
+timer on ordinary phase exceptions: an early setup or call failure followed by a
+teardown hang may produce no dump. Nested in-process pytest sessions share the
+process-global faulthandler timer; an inner test failure can cancel the outer
+timer even with inner `faulthandler_timeout = 0`. Timer rearming and refactoring
+nested sessions are outside this diagnostic's scope.
+Stacks identify active Python test/fixture frames, without guaranteeing full
+parametrized node IDs. There is no attribution guarantee for startup/collection
+hangs, external subprocess internals, disabled faulthandler, runner loss or
+cancellation before the threshold. The diagnostic does not terminate the test
+or replace existing timeout and shard failure gates.
+
 Use focused tests while changing one subsystem, for example:
 
 ```bash
