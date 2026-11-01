@@ -58,6 +58,72 @@ def watch(fixture, **kwargs):
 
 
 @pytest.mark.parametrize('conclusion', ['failure', 'timed_out'])
+def test_waiting_for_next_attempt_ignores_active_baseline_failure(tmp_path, monkeypatch, conclusion):
+    fixture = live_fixture(tmp_path, monkeypatch)
+    runner = fixture[1]
+    runner.attempt_jobs[0]['conclusion'] = conclusion
+    before = copy.deepcopy(runner.intent_comments)
+    outcome, contract = watch(fixture, attempts=2, min_run_attempt=2)
+    assert outcome.status == 'timeout'
+    assert contract.run_attempt == 1 and not contract.terminal_attempts
+    assert runner.intent_comments == before and runner.dispatch_count == 0
+    assert not any('/attempts/1/jobs?' in str(arg) for cmd, _ in runner.commands for arg in cmd)
+    assert not any('PATCH' in cmd or 'rerun' in cmd or 'cancel' in cmd for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+def test_real_restart_advanced_head_uses_fresh_intent(tmp_path, monkeypatch, auto_merge):
+    from coding_review_agent_loop.managed_ci_failure import require_live_failure
+    from coding_review_agent_loop.managed_ci_reconciliation import reconcile_repair_checkpoint
+    from coding_review_agent_loop.round_state import _extract_round_metadata_records
+
+    fixture = live_fixture(tmp_path, monkeypatch, auto_merge=auto_merge)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    new_head = 'f' * 40
+    runner.pr_payload['headRefOid'] = new_head
+    runner.rest_pr['head']['sha'] = new_head
+    metadata = dataclasses.replace(metadata, head_sha=new_head)
+    before = copy.deepcopy(runner.intent_comments[1])
+    assert not require_live_failure(runner, config=config, pr_number=7, metadata=metadata,
+                                    contract=contract, checkpoint=cp)
+    result, checkpoint, items = reconcile_repair_checkpoint(
+        runner, config=config, pr_number=7, metadata=metadata, contract=contract,
+        checkpoint=cp, items=[item])
+    assert result is None and checkpoint.verified_managed_result is None
+    assert items == [item] and items[0].lifecycle == 'repair_required'
+
+    runner.codex_outputs = [structured_pr_review(
+        state='approved', summary='New head reviewed.',
+        prior_item_dispositions=[{'item_id': item.item_id, 'disposition': 'resolved'}],
+    )] * 2
+    real = runner._run_locked
+    dispatches = []
+    def stop_at_dispatch(args, **kwargs):
+        if any(str(arg).endswith('/dispatches') for arg in args):
+            dispatches.append(list(args))
+            raise RepairReached('fresh dispatch')
+        return real(args, **kwargs)
+    monkeypatch.setattr(runner, '_run_locked', stop_at_dispatch)
+    with pytest.raises(RepairReached, match='fresh dispatch'):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert len(dispatches) == 1
+    assert f'inputs[expected_head_sha]={new_head}' in dispatches[0]
+    nonce_arg = next(arg for arg in dispatches[0] if arg.startswith('inputs[managed_nonce]='))
+    nonce = nonce_arg.split('=', 1)[1]
+    assert nonce != ref.nonce
+    fresh = [c for c in runner.intent_comments if nonce in c['body']]
+    assert len(fresh) == 1
+    assert new_head in fresh[0]['body'] and '"state":"dispatch-requested"' in fresh[0]['body']
+    assert runner.intent_comments[1] == before
+    records = _extract_round_metadata_records(
+        [type('C', (), {'body': c['body']})() for c in runner.pr_payload['comments']], flow='pr')
+    assert not any(r.metadata.qualification_checkpoint
+                   and r.metadata.qualification_checkpoint.verified_managed_result for r in records)
+    assert not any(cmd[:1] == ['claude'] or 'rerun' in cmd or 'cancel' in cmd
+                   or cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize('conclusion', ['failure', 'timed_out'])
 @pytest.mark.parametrize('final_state', ['absent', 'pending'])
 def test_watch_reports_live_failure_without_completing_intent(tmp_path, monkeypatch, conclusion, final_state):
     fixture = live_fixture(tmp_path, monkeypatch)
