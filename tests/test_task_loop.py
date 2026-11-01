@@ -267,3 +267,58 @@ def test_task_head_observation_precedes_publication(tmp_path, monkeypatch, inval
     with pytest.raises(PrHeadObservationError):
         run_task_loop(runner, task_text="Add an endpoint.", config=make_config(tmp_path))
     assert not delegated and not runner.comments and not runner.pr_payload.get("comments")
+
+
+@pytest.mark.parametrize("mode", ["blocking", "non-interactive", "exhausted", "empty", "input-error", "continue"])
+@pytest.mark.parametrize("diff", [True, False])
+def test_task_terminal_salvage_is_local_and_only_on_stop(tmp_path, monkeypatch, mode, diff):
+    import coding_review_agent_loop.issue_loop as issue_loop
+    routed = []
+    monkeypatch.setattr(issue_loop, "run_pr_loop", lambda *args, **kwargs: routed.append(kwargs["pr_number"]) or 0)
+    from test_issue_implementation_salvage import TERMINAL_PATCH
+    outputs = ["Need details.\n<!-- AGENT_CLARIFY -->"]
+    if mode == "blocking":
+        outputs = ["Cannot proceed.\n<!-- AGENT_STATE: blocking -->"]
+    elif mode == "continue":
+        outputs.append("Done.\n<!-- AGENT_PR: 77 -->\n<!-- AGENT_STATE: blocking -->")
+    runner = FakeRunner(claude_outputs=outputs,
+                        codex_outputs=["LGTM.\n<!-- AGENT_STATE: approved -->\n-- OpenAI Codex"],
+                        post_agent_git_diff=TERMINAL_PATCH if diff else "",
+                        post_agent_git_status="M  file.txt\n" if diff else "?? ignored.txt\n")
+    config = make_config(tmp_path)
+    def answer():
+        if mode == "input-error":
+            raise EOFError("closed input")
+        return "" if mode == "empty" else "Use the default."
+    kwargs = dict(runner=runner, task_text="Implement the change.", config=config,
+                  interactive=mode != "non-interactive", max_clarification_rounds=0 if mode == "exhausted" else 1,
+                  clarification_input=answer)
+    if mode == "continue":
+        assert run_task_loop(**kwargs) == 0
+    else:
+        with pytest.raises(AgentLoopError) as stop:
+            run_task_loop(**kwargs)
+        if diff:
+            assert "partial.patch" in str(stop.value)
+            assert "local-only" in str(stop.value)
+        else:
+            assert "No eligible tracked/staged diff" in str(stop.value)
+            assert "Untracked-only contents" in str(stop.value)
+    patches = list((config.log_dir / "salvage").glob("*/partial.patch"))
+    assert len(patches) == int(diff and mode != "continue")
+    assert runner.issue_comments == []
+    assert routed == ([77] if mode == "continue" else [])
+
+
+def test_task_terminal_capture_error_does_not_replace_blocking_reason(tmp_path, monkeypatch):
+    import coding_review_agent_loop.salvage as salvage
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+    monkeypatch.setattr(salvage, "capture_salvage_artifacts", fail)
+    runner = FakeRunner(claude_outputs=["Cannot proceed.\n<!-- AGENT_STATE: blocking -->"])
+    config = make_config(tmp_path)
+    with pytest.raises(AgentLoopError, match="task.*blocking") as stop:
+        run_task_loop(runner, task_text="Implement.", config=config)
+    assert "capture failed (disk full)" in str(stop.value)
+    assert "preserving the original terminal reason" in str(stop.value)
+    assert runner.issue_comments == []

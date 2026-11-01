@@ -92,6 +92,7 @@ from .protocol import (
 )
 from .runner import Runner
 from .salvage import (
+    capture_terminal_salvage,
     SalvageContext,
     latest_salvage_context,
 )
@@ -599,6 +600,20 @@ def _implement_approved_issue_unscoped(
     )
     coder_output = coder_response.text
     implementation_result = coder_response.marker_value
+    terminal_diagnostic = ""
+    if (isinstance(implementation_result, (_TerminalIssueImplementationConflict, _TerminalNoPrImplementation))
+            or isinstance(implementation_result, StructuredIssueImplementation) and implementation_result.pr_number is None):
+        terminal_diagnostic = capture_terminal_salvage(
+            runner, config=implementation_config,
+            context=SalvageContext(repo=implementation_config.repo, issue_number=issue_number,
+                scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE, agent=implementation_config.coder,
+                run_id=usage_context.run_id, approved_plan_hash=plan_hash),
+            reason=(implementation_result.parsed.summary
+                    if isinstance(implementation_result, _TerminalIssueImplementationConflict)
+                    else implementation_result.summary
+                    if isinstance(implementation_result, StructuredIssueImplementation)
+                    else f"Coder returned a terminal {implementation_result.state} response without a PR."),
+        )
     if isinstance(implementation_result, _TerminalIssueImplementationConflict):
         implementation_result = _TerminalIssueImplementationConflict(
             _degrade_out_of_checkout_tests(
@@ -614,7 +629,7 @@ def _implement_approved_issue_unscoped(
         )
         raise AgentLoopError(
             "Coder implementation result was not accepted for handoff because a signed "
-            "human requirement is blocked."
+            "human requirement is blocked." + terminal_diagnostic
         )
     if isinstance(implementation_result, StructuredIssueImplementation):
         if implementation_result.pr_number is None:
@@ -629,7 +644,7 @@ def _implement_approved_issue_unscoped(
                 model_used=coder_response.model_used,
             )
             raise AgentLoopError(
-                "Coder did not create a valid PR; implementation is blocking."
+                "Coder did not create a valid PR; implementation is blocking." + terminal_diagnostic
             )
         pr_number = implementation_result.pr_number
     elif isinstance(implementation_result, _TerminalNoPrImplementation):
@@ -641,6 +656,7 @@ def _implement_approved_issue_unscoped(
         )
         raise AgentLoopError(
             "Coder did not create a valid PR; implementation is " + implementation_result.state + "."
+            + terminal_diagnostic
         )
     else:
         raise AgentLoopError("Issue implementation validator returned an unknown result type.")
@@ -739,6 +755,13 @@ def _implement_approved_issue_unscoped(
                 else:
                     reask_result = reask_response.marker_value
                     if isinstance(reask_result, _TerminalIssueImplementationConflict):
+                        terminal_diagnostic = capture_terminal_salvage(
+                            runner, config=implementation_config,
+                            context=SalvageContext(repo=implementation_config.repo,
+                                issue_number=issue_number, scope=APPROVED_PLAN_IMPLEMENTATION_SALVAGE_SCOPE,
+                                agent=implementation_config.coder, run_id=usage_context.run_id,
+                                approved_plan_hash=plan_hash), reason=reask_result.parsed.summary,
+                        )
                         reask_result = _TerminalIssueImplementationConflict(
                             _degrade_out_of_checkout_tests(
                                 reask_result.parsed, config=implementation_config
@@ -753,7 +776,7 @@ def _implement_approved_issue_unscoped(
                         )
                         raise AgentLoopError(
                             "Coder implementation result was not accepted for handoff because a signed "
-                            "human requirement is blocked."
+                            "human requirement is blocked." + terminal_diagnostic
                         )
                     if (
                         isinstance(reask_result, StructuredIssueImplementation)

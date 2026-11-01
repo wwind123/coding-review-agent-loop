@@ -230,7 +230,7 @@ def test_issue_implementation_rerun_prompt_includes_latest_salvage_summary(tmp_p
         for cmd, _cwd in runner.commands
         if cmd[:1] == ["claude"] and "Fix GitHub issue #56" in cmd[-1]
     )
-    assert "Previous failed implementation attempt salvage:" in coder_prompt
+    assert "Previous implementation attempt salvage:" in coder_prompt
     assert "new failed attempt summary" in coder_prompt
     assert "old failed attempt summary" not in coder_prompt
     assert "Do not auto-apply the patch" in coder_prompt
@@ -357,7 +357,7 @@ def test_issue_implementation_rerun_discovers_remote_salvage_when_local_log_dir_
         for cmd, _cwd in runner.commands
         if cmd[:1] == ["claude"] and "Fix GitHub issue #56" in cmd[-1]
     )
-    assert "Previous failed implementation attempt salvage:" in coder_prompt
+    assert "Previous implementation attempt salvage:" in coder_prompt
     assert "recovered from a GitHub issue comment" in coder_prompt
     assert "remote-only failure summary" in coder_prompt
     assert "```diff" in coder_prompt
@@ -425,7 +425,7 @@ def test_issue_implementation_rerun_ignores_remote_salvage_for_a_different_issue
         for cmd, _cwd in runner.commands
         if cmd[:1] == ["claude"] and "Fix GitHub issue #56" in cmd[-1]
     )
-    assert "Previous failed implementation attempt salvage:" not in coder_prompt
+    assert "Previous implementation attempt salvage:" not in coder_prompt
 
 
 def test_approved_plan_implementation_rerun_discovers_remote_salvage_with_matching_plan_hash(tmp_path):
@@ -462,7 +462,7 @@ def test_approved_plan_implementation_rerun_discovers_remote_salvage_with_matchi
 
     assert result == 0
     coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
-    assert "Previous failed implementation attempt salvage:" in coder_prompt
+    assert "Previous implementation attempt salvage:" in coder_prompt
     assert "recovered from a GitHub issue comment" in coder_prompt
     assert "remote approved-plan failure" in coder_prompt
 
@@ -541,4 +541,122 @@ def test_approved_plan_implementation_rerun_ignores_remote_salvage_on_plan_hash_
 
     assert result == 0
     coder_prompt = next(cmd[-1] for cmd, _cwd in runner.commands if cmd[:1] == ["claude"])
-    assert "Previous failed implementation attempt salvage:" not in coder_prompt
+    assert "Previous implementation attempt salvage:" not in coder_prompt
+
+
+TERMINAL_PATCH = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
+
+
+def _run_terminal(runner, config, approved):
+    if not approved:
+        return run_issue_loop(runner, issue_number=56, config=config)
+    return issue_implementation._implement_approved_issue(
+        runner, issue_number=56, approved_plan="Plan:\n- Do the thing.",
+        config=config, memory=None,
+        issue_context=get_issue_context(runner, config=config, issue_number=56),
+        coder_session_id=None, usage_context=validated_agent_module._new_usage_context(config),
+    )
+
+
+@pytest.mark.parametrize("approved", [False, True])
+@pytest.mark.parametrize("outcome", ["structured", "blocking", "clarification"])
+def test_valid_terminal_issue_preserves_work_and_rerun_context(tmp_path, approved, outcome):
+    from agent_loop_helpers import structured_issue_implementation
+    from coding_review_agent_loop.salvage import latest_salvage_context
+    text = (structured_issue_implementation(pr_number=None, summary="Required test timed out.")
+            if outcome == "structured" else "Cannot proceed.\n" + (
+                "<!-- AGENT_CLARIFY -->" if outcome == "clarification" else "<!-- AGENT_STATE: blocking -->"))
+    runner = FakeRunner(claude_outputs=[text], post_agent_git_diff=TERMINAL_PATCH,
+                        post_agent_git_status="M  file.txt\n?? ignored.txt\n")
+    config = make_config(tmp_path)
+    with pytest.raises(AgentLoopError):
+        _run_terminal(runner, config, approved)
+    directory, = _salvage_dirs(config)
+    metadata = json.loads((directory / "metadata.json").read_text())
+    assert metadata["failure_category"] == "valid-terminal-stop"
+    assert metadata["scope"] == ("approved-plan-implementation" if approved else "issue-implementation")
+    assert (directory / "partial.patch").read_text() == TERMINAL_PATCH
+    assert "valid terminal response" in (directory / "salvage-summary.md").read_text()
+    assert "failed before" not in (directory / "salvage-summary.md").read_text()
+    assert "valid terminal response" in runner.issue_comments[0]["body"]
+    kwargs = dict(repo=config.repo, issue_number=56, scope=metadata["scope"],
+                  approved_plan_hash=metadata["approved_plan_hash"])
+    # Stable absolute directory permits local discovery; a new default directory
+    # needs a remote breadcrumb and must not search other runs.
+    local = latest_salvage_context(config.log_dir, [], **kwargs)
+    assert local and str(directory) in local
+    from coding_review_agent_loop.github import IssueComment
+    comment = IssueComment(author="test", created_at="2026-11-01T00:00:00Z", body=runner.issue_comments[0]["body"])
+    remote = latest_salvage_context(tmp_path / "next-run", comments=[comment], **kwargs)
+    assert remote and "valid terminal response" in remote
+    assert latest_salvage_context(tmp_path / "next-run", [], **kwargs) is None
+    assert not any(cmd[:3] == ["gh", "pr", "view"] for cmd, _ in runner.commands)
+    assert not any(cmd[:1] == ["codex"] for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize("approved", [False, True])
+@pytest.mark.parametrize("policy", ["disabled", "dry-run", "post-error", "capture-error", "clean", "untracked"])
+def test_terminal_issue_degradation_preserves_reason(tmp_path, monkeypatch, capsys, approved, policy):
+    import coding_review_agent_loop.salvage as salvage
+    from agent_loop_helpers import structured_issue_implementation
+    config = make_config(tmp_path, quiet=False, salvage_comments=policy != "disabled", dry_run=policy == "dry-run")
+    runner = FakeRunner(claude_outputs=[structured_issue_implementation(pr_number=None)],
+                        post_agent_git_diff="" if policy in {"clean", "untracked"} else TERMINAL_PATCH,
+                        post_agent_git_status="?? ignored.txt\n" if policy == "untracked" else "")
+    def fail(*args, **kwargs):
+        raise OSError("disk or network unavailable")
+    if policy == "capture-error":
+        monkeypatch.setattr(salvage, "capture_salvage_artifacts", fail)
+    if policy == "post-error":
+        monkeypatch.setattr(salvage, "post_salvage_comment", fail)
+    with pytest.raises(AgentLoopError, match="implementation is blocking") as stop:
+        _run_terminal(runner, config, approved)
+    message = str(stop.value) + capsys.readouterr().err
+    if policy == "capture-error":
+        assert "capture failed" in message
+    elif policy in {"clean", "untracked"}:
+        assert "No eligible tracked/staged diff" in message
+        assert "Untracked-only contents" in message
+        assert not _salvage_dirs(config)
+    else:
+        assert "partial.patch" in message
+        assert "only recovery route" in message
+        assert "stable absolute --log-dir" in message
+        assert _salvage_dirs(config)
+    assert not any("Implementation salvage breadcrumb" in c["body"] for c in runner.issue_comments)
+
+
+@pytest.mark.parametrize("approved", [False, True])
+@pytest.mark.parametrize("discovery", ["stable-local", "remote", "disabled", "post-error", "dry-run", "stale-plan"])
+def test_terminal_issue_rerun_prompt_discovery(tmp_path, monkeypatch, approved, discovery):
+    from dataclasses import replace
+    import coding_review_agent_loop.salvage as salvage
+    from agent_loop_helpers import structured_issue_implementation
+    config = make_config(tmp_path, salvage_comments=discovery != "disabled", dry_run=discovery == "dry-run")
+    text = structured_issue_implementation(pr_number=None, summary="Saved terminal work from prior run.")
+    first = FakeRunner(claude_outputs=[text], post_agent_git_diff=TERMINAL_PATCH)
+    if discovery == "post-error":
+        monkeypatch.setattr(salvage, "post_salvage_comment", lambda *a, **kw: False)
+    with pytest.raises(AgentLoopError):
+        _run_terminal(first, config, approved)
+    if discovery != "stable-local":
+        config = replace(config, log_dir=tmp_path / "different-run-logs")
+    comments = first.issue_comments
+    if discovery == "stable-local":
+        comments = []
+    if discovery == "stale-plan":
+        # Use a direct-issue capture on an approved-plan restart or vice versa;
+        # the existing exact hash tests additionally cover changed plan content.
+        approved = not approved
+    second = FakeRunner(claude_outputs=[structured_issue_implementation(pr_number=None)], issue_comments=comments)
+    with pytest.raises(AgentLoopError):
+        _run_terminal(second, config, approved)
+    prompt = next(cmd[-1] for cmd, _ in second.commands if cmd[:1] == ["claude"])
+    expected = discovery in {"stable-local", "remote"}
+    assert ("Previous implementation attempt salvage:" in prompt) is expected
+    if expected:
+        assert "Saved terminal work from prior run." in prompt
+        assert "valid terminal response" in prompt
+        assert "The previous attempt failed." not in prompt
+    else:
+        assert "valid terminal response without an accepted PR handoff" not in prompt

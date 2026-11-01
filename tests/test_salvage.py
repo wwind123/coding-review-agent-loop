@@ -431,3 +431,28 @@ def test_latest_salvage_summary_filters_approved_plan_hash(tmp_path):
     )
 
     assert summary == "current approved-plan summary"
+
+
+def test_terminal_and_historical_renderers_use_existing_category(tmp_path):
+    for category in ["valid-terminal-stop", "transient"]:
+        config = make_config(tmp_path / category)
+        runner = FakeRunner(git_diff=CLEAN_PATCH, git_status="M  file.txt\n")
+        context = SalvageContext(repo=config.repo, issue_number=56, scope="issue-implementation", agent="claude")
+        artifacts = capture_salvage_artifacts(
+            runner, checkout=config.claude_dir, log_dir=config.log_dir, context=context,
+            failure_category=category, failure_reason="stop reason", required_marker="", result=None,
+        )
+        assert artifacts
+        assert post_salvage_comment(runner, config=config, artifacts=artifacts, context=context,
+                                    failure_category=category, failure_reason="stop reason")
+        record = find_latest_remote_salvage(_comments_from_runner(runner), repo=config.repo,
+                                           issue_number=56, scope=context.scope)
+        assert record
+        for text in [artifacts.summary, runner.issue_comments[0]["body"], render_remote_salvage_summary(record)]:
+            if category == "valid-terminal-stop":
+                assert "valid terminal response" in text
+                assert "failed before producing" not in text
+                assert "present but failed validation" not in text
+                assert "missing or invalid" not in text
+            else:
+                assert "failed before producing a valid public response" in text

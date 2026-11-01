@@ -341,8 +341,23 @@ recovery still requires the original host-local spool.
 Resume reconstructs state from recorded evidence and then checks it against the
 live PR, issue, plan, requirements, and policy. GitHub metadata is durable but
 not a blanket authorization token. A lost local response or uncommitted patch
-cannot necessarily be recovered from GitHub alone. Default checkouts can be
-cleaned on rerun; inspect and preserve salvage before reusing them.
+cannot necessarily be recovered from GitHub alone. Default managed checkouts are
+removed at run end. Before terminal implementation
+reporting, valid no-PR stops and signed-requirement conflicts (including coverage
+re-ask conflicts) capture tracked/staged changes through the existing salvage
+mechanism. Task blocking and terminal clarification stops save local-only salvage;
+answered clarification continues without capture. Capture/publication errors are
+additive diagnostics and preserve the original terminal reason. Valid terminal
+categories use the existing metadata field and breadcrumb schema, while historical
+failed-acquisition records retain their failure semantics.
+
+Untracked contents are intentionally excluded; intended new files must be staged
+before required tests. Default relative artifact directories are isolated per run.
+Automatic local issue discovery requires a stable absolute `--log-dir`; distinct
+run directories require an eligible posted issue breadcrumb. Without a breadcrumb
+(failed, disabled or skipped publication), no summary is injected on a default
+rerun and the printed patch path is the only recovery route. Persisted artifacts
+may require access to the original host. No patch is automatically applied.
 
 Salvage is partial implementation evidence, not approval or a guaranteed full
 backup. Usage can be exact, partial, or estimated. Test receipts must retain

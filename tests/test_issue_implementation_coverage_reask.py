@@ -655,6 +655,7 @@ def test_workflow_signed_requirement_conflict_on_reask_is_terminal(tmp_path, mon
     from coding_review_agent_loop.protocol import HumanRequirementDisposition
 
     h = CoverageHarness(tmp_path, monkeypatch)
+    h.runner.git_diff = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
     first = h.response(response_text(claims=[claim("row-wf")]))
 
     def conflict(harness):
@@ -671,6 +672,10 @@ def test_workflow_signed_requirement_conflict_on_reask_is_terminal(tmp_path, mon
     assert len(h.calls) == 2
     assert not any("AGENT_ISSUE_PR_HANDOFF" in body for body in h.all_comments())
     assert h.run_pr_calls == []
+
+    summaries = list((h.config.log_dir / "salvage").glob("*/salvage-summary.md"))
+    assert len(summaries) == 1
+    assert "valid terminal response" in summaries[0].read_text()
 
 
 @pytest.mark.parametrize("plan_mode", ["none", "not-applicable"])
@@ -896,12 +901,14 @@ def test_workflow_corroborated_near_miss_on_still_incomplete_reask_is_canonicali
     assert h.run_pr_calls
 
 
-def test_workflow_initial_signed_requirement_conflict_never_reaches_the_gate(tmp_path, monkeypatch):
+@pytest.mark.parametrize("direct", [False, True])
+def test_workflow_initial_signed_requirement_conflict_never_reaches_the_gate(tmp_path, monkeypatch, direct):
     from coverage_reask_helpers import CoverageHarness, claim, response_text
     from coding_review_agent_loop.architecture_contract import _TerminalIssueImplementationConflict
     from coding_review_agent_loop.protocol import HumanRequirementDisposition
 
     h = CoverageHarness(tmp_path, monkeypatch)
+    h.runner.git_diff = "diff --git a/file.txt b/file.txt\n--- a/file.txt\n+++ b/file.txt\n@@ -1 +1 @@\n-old\n+new\n"
     first = h.response(response_text(claims=[claim("row-wf")]))
     blocked = replace(
         first.marker_value,
@@ -909,9 +916,16 @@ def test_workflow_initial_signed_requirement_conflict_never_reaches_the_gate(tmp
     )
     h.script = [replace(first, marker_value=_TerminalIssueImplementationConflict(blocked))]
     with pytest.raises(AgentLoopError, match="signed human requirement is blocked"):
-        h.run()
+        if direct:
+            issue_loop.run_issue_loop(h.runner, issue_number=56, config=h.config)
+        else:
+            h.run()
     assert len(h.calls) == 1 and h.run_pr_calls == []
     assert not any("AGENT_ISSUE_PR_HANDOFF" in body for body in h.all_comments())
+
+    summaries = list((h.config.log_dir / "salvage").glob("*/salvage-summary.md"))
+    assert len(summaries) == 1
+    assert "valid terminal response" in summaries[0].read_text()
 
 
 @pytest.mark.parametrize("outcome", ["null-pr", "different-pr", "failure", "adopted"])

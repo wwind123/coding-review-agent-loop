@@ -80,6 +80,7 @@ from .protocol import (
 )
 from .runner import Runner
 from .salvage import (
+    capture_terminal_salvage,
     SalvageContext,
     latest_salvage_context,
 )
@@ -953,6 +954,20 @@ def run_issue_loop(
         coder_output = coder_response.text
         coder_session_id = coder_response.session_id
         implementation_result = coder_response.marker_value
+        terminal_diagnostic = ""
+        if (isinstance(implementation_result, (_TerminalIssueImplementationConflict, _TerminalNoPrImplementation))
+                or isinstance(implementation_result, StructuredIssueImplementation) and implementation_result.pr_number is None):
+            terminal_diagnostic = capture_terminal_salvage(
+                runner, config=config,
+                context=SalvageContext(repo=config.repo, issue_number=issue_number,
+                    scope=ISSUE_IMPLEMENTATION_SALVAGE_SCOPE, agent=config.coder,
+                    run_id=usage_context.run_id, approved_plan_hash=None),
+                reason=(implementation_result.parsed.summary
+                    if isinstance(implementation_result, _TerminalIssueImplementationConflict)
+                    else implementation_result.summary
+                    if isinstance(implementation_result, StructuredIssueImplementation)
+                    else f"Coder returned a terminal {implementation_result.state} response without a PR."),
+            )
         if isinstance(implementation_result, _TerminalIssueImplementationConflict):
             implementation_result = _TerminalIssueImplementationConflict(
                 _degrade_out_of_checkout_tests(implementation_result.parsed, config=config)
@@ -971,7 +986,7 @@ def run_issue_loop(
             )
             raise AgentLoopError(
                 "Coder implementation result was not accepted for handoff because a signed "
-                "human requirement is blocked."
+                "human requirement is blocked." + terminal_diagnostic
             )
         if isinstance(implementation_result, StructuredIssueImplementation):
             if implementation_result.pr_number is None:
@@ -991,7 +1006,7 @@ def run_issue_loop(
                     model_used=coder_response.model_used,
                 )
                 raise AgentLoopError(
-                    "Coder did not create a valid PR; implementation is blocking."
+                    "Coder did not create a valid PR; implementation is blocking." + terminal_diagnostic
                 )
             pr_number = implementation_result.pr_number
         else:
@@ -1006,7 +1021,7 @@ def run_issue_loop(
                 raise AgentLoopError(
                     "Coder did not create a valid PR; implementation is "
                     + implementation_result.state
-                    + "."
+                    + "." + terminal_diagnostic
                 )
             raise AgentLoopError("Issue implementation validator returned an unknown result type.")
         validate_assigned_head_advanced(
@@ -1322,6 +1337,15 @@ def run_task_loop(
             coder_output = coder_response.text
             session_id = coder_response.session_id
 
+            def terminal_task_error(reason):
+                diagnostic = capture_terminal_salvage(
+                    runner, config=config,
+                    context=SalvageContext(repo=config.repo, issue_number=None,
+                        scope=TASK_IMPLEMENTATION_SALVAGE_SCOPE, agent=config.coder,
+                        run_id=usage_context.run_id), reason=reason,
+                )
+                return AgentLoopError(reason + diagnostic)
+
             structured_task = (
                 coder_response.marker_value
                 if isinstance(coder_response.marker_value, StructuredTaskResult)
@@ -1329,7 +1353,7 @@ def run_task_loop(
             )
 
             if isinstance(coder_response.marker_value, _TerminalNoPrImplementation):
-                raise AgentLoopError(
+                raise terminal_task_error(
                     "Coder did not create a valid PR; task implementation is "
                     f"{coder_response.marker_value.state}.\n\n{coder_output}"
                 )
@@ -1389,20 +1413,20 @@ def run_task_loop(
                 )
 
             if structured_task is not None and structured_task.outcome == "blocking":
-                raise AgentLoopError(
+                raise terminal_task_error(
                     "Coder returned a structured task blocking result without a PR.\n\n"
                     + coder_output
                 )
 
             if not interactive:
-                raise AgentLoopError(
+                raise terminal_task_error(
                     f"{coder_name} requested clarification but the loop is non-interactive. "
                     "Add the missing details to the task text or rerun with --interactive.\n\n"
                     f"{coder_name}'s questions:\n{coder_output}"
                 )
 
             if attempt >= max_clarification_rounds:
-                raise AgentLoopError(
+                raise terminal_task_error(
                     f"{coder_name} still requested clarification after "
                     f"{max_clarification_rounds} rounds; "
                     "human intervention required."
@@ -1410,9 +1434,12 @@ def run_task_loop(
 
             log(config, f"{coder_name} requested clarification (round {attempt + 1}); awaiting user input")
             print(coder_output, flush=True)
-            answers = read_clarification()
+            try:
+                answers = read_clarification()
+            except (EOFError, OSError) as exc:
+                raise terminal_task_error(f"Clarification input failed; aborting task: {exc}") from exc
             if not answers.strip():
-                raise AgentLoopError("Empty clarification reply; aborting task.")
+                raise terminal_task_error("Empty clarification reply; aborting task.")
             history.append((coder_output, answers))
             prompt = build_task_clarification_prompt(task_text, history, config, memory)
 
