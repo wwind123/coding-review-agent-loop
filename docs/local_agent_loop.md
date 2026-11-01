@@ -3173,6 +3173,9 @@ agent-loop issue 123 --repo OWNER/REPO \
   --reviewer-codex-reasoning-effort medium
 ```
 
+`--claude-model` selects the Claude model to run and stamp in the signature; it
+is mutually exclusive with `--claude-arg --model`.
+
 Use `--reviewer-claude-model` and `--reviewer-claude-effort` for the equivalent
 Claude reviewer overrides. Models and efforts are selected independently:
 

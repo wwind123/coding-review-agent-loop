@@ -1494,7 +1494,7 @@ snapshot with bounded, spillable excerpts.
 
 | Backend | CLI | Notes |
 | --- | --- | --- |
-| Claude | `claude` | Default coder. Select a model with `--claude-model`. |
+| Claude | `claude` | Default coder. `--claude-model` selects the model to run and stamp in the signature. |
 | Codex | `codex` | Default reviewer. Select a model with `--codex-model`. |
 | Antigravity | `agy` | Accepted as `agy` or `antigravity`; supports coder and reviewer roles. |
 | Gemini | `gemini` | Legacy, best-effort path for accounts that still have CLI access. |

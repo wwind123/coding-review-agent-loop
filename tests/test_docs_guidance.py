@@ -1723,3 +1723,12 @@ def test_hang_diagnostic_timing_and_attribution_limits():
             "does not terminate the test", "existing timeout and shard failure gates",
         ):
             assert phrase in text, (document, phrase)
+
+
+@pytest.mark.parametrize("command", ["issue", "pr", "managed-pr", "task", "discuss"])
+def test_claude_model_help_describes_execution_and_signature(command):
+    parser = build_parser()
+    subparsers = parser._subparsers._group_actions[0].choices
+    help_text = " ".join(subparsers[command].format_help().split())
+    assert "Claude model to run and stamp in the signature." in help_text
+    assert "Mutually exclusive with --claude-arg --model." in help_text
