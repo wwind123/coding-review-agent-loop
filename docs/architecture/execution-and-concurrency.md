@@ -75,8 +75,8 @@ symlinks exceed the guarantee. Interior symlinks and substituted probe ancestors
 are not traversed. Unsafe, unreadable, unstable or malformed required health
 refuses reuse; more than 64 directory roots is a configuration error.
 Structural loss includes count decreases, witness type/loss and root binding
-changes, absent or unsupported roots, and ENOENT/ENOTDIR/ELOOP from opening
-saved probes. EACCES/EIO, enumeration churn and opening/post-yield stability
+changes, absent or unsupported roots, missing or non-directory configured
+ancestors, and ENOENT/ENOTDIR/ELOOP from resolving roots or opening saved probes. EACCES/EIO, enumeration churn and opening/post-yield stability
 checks remain unknown, even when a stability check reports a missing path.
 Persistent formats, startup bootstrap policy and recovery commands are unchanged.
 

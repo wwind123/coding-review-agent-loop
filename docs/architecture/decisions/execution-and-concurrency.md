@@ -41,3 +41,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - The library-only image capture service uses service-created sized Bubblewrap tmpfs, capture-only delegated cgroup scopes, kernel-credential gated payload migration, hierarchical writer cleanup and bounded descriptor export. A separate isolated standard-library PNG validator precedes sealed snapshot publication; public activation, transport and durable visual authority remain deferred (#1793).
 
 - Turn shared-health checks retry once under one store lock and publish stale only for repeated structural source/probe loss against the same current baseline, or safely confirmed generation-bound registered-record absence; uncertainty refuses the current run without durable contamination, with existing pending recovery and per-inspection budgets unchanged (#1782).
+
+- Configured source ancestors participate in initial structural-loss classification: missing or non-directory ancestors confirm root loss, while unreadable ancestors and post-yield stability failures remain unknown (#1782).

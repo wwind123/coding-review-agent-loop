@@ -70,8 +70,9 @@ def _root(store: Path, link: str):
     parent = store
     for part in Path(link).parts[:-1]:
         parent /= part
-        if not stat.S_ISDIR(parent.lstat().st_mode):
-            raise OSError(f"unsafe source ancestor {parent}")
+        with _opening():
+            if not stat.S_ISDIR(parent.lstat().st_mode):
+                raise StructuralLoss(f"unsafe source ancestor {parent}")
     with _opening():
         before = source.lstat()
         resolved = os.path.realpath(source)

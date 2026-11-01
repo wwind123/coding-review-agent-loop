@@ -332,18 +332,22 @@ def test_stale_restart_diagnostic_names_damaged_second_source(tmp_path, monkeypa
     assert "--worktree-setup 'npm ci'" in diagnostic
 
 
-def registered_store(tmp_path, monkeypatch, *, backed=True):
+def registered_store(tmp_path, monkeypatch, *, backed=True, link='.venv'):
     env, store, config = source_store(tmp_path, monkeypatch)
+    if link != '.venv':
+        (store / link).parent.mkdir(parents=True)
+        (store / '.venv').rename(store / link)
     with rw.store_lock(store):
-        data = health.publish(store, ('.venv',), config=config, setup_backed=backed)
+        data = health.publish(store, (link,), config=config, setup_backed=backed)
     if backed:
         setup._write_setup_record(store, {'version': 1, 'health_generation': data['generation'],
                                         'store_identity': data['store_identity']})
         setup._write_private_json(setup.generated_ledger_path(store), {'sentinel': 'retain'})
     root = tmp_path / 'run'
     root.mkdir()
-    (root / '.venv').symlink_to(store / '.venv')
-    cv.register_worktree_links(root, {'.venv': str(store / '.venv')}, shared_store=store)
+    (root / link).parent.mkdir(parents=True, exist_ok=True)
+    (root / link).symlink_to(store / link)
+    cv.register_worktree_links(root, {link: str(store / link)}, shared_store=store)
     return store, config, root
 
 
@@ -446,42 +450,58 @@ def test_unknown_health_only_poisons_current_run(tmp_path, monkeypatch, failure,
     assert not cv.has_poisoned_entry(root)
 
 
-@pytest.mark.parametrize('damage', ['delete', 'file', 'symlink', 'root', 'fifo', 'binding', 'witness-type', 'witness-loss'])
+@pytest.mark.parametrize('damage', ['delete', 'file', 'symlink', 'root', 'fifo', 'binding', 'witness-type', 'witness-loss',
+                                    'ancestor-delete', 'ancestor-file', 'ancestor-symlink'])
 @pytest.mark.parametrize('parent_mode', ['saturated', 'offset'])
-def test_confirmed_probe_loss_retains_durable_recovery(tmp_path, monkeypatch, damage, parent_mode):
-    store, config, root = registered_store(tmp_path, monkeypatch)
-    source = store / '.venv'
-    probe = source / 'bin'
-    # Ensure the saved count directory is selected, then saturate its parent.
+@pytest.mark.parametrize('post_turn', [False, True])
+def test_confirmed_probe_loss_retains_durable_recovery(tmp_path, monkeypatch, damage, parent_mode, post_turn):
+    link = 'frontend/deps/.venv' if damage.startswith('ancestor-') else '.venv'
+    store, config, root = registered_store(tmp_path, monkeypatch, link=link)
+    source = store / link
+    # Use only directories so a saturated scan must select count probes.
     if parent_mode == 'saturated':
         for n in range(140):
-            (source / f'extra{n}').touch()
-    save_data = save(store, config)
+            (source / f'extra{n}').mkdir()
+    save_data = save(store, config, (link,))
+    probes = save_data['sources'][link]
+    probe = source / next(path for path, _count in probes['counts'] if path)
+    assert any(path == str(probe.relative_to(source)) for path, _count in probes['counts'])
+    assert probes['counts'][0][1] == (health.CHILD_COUNT_CAP if parent_mode == 'saturated' else 1)
     setup._write_setup_record(store, {'version': 1, 'health_generation': save_data['generation'],
                                     'store_identity': save_data['store_identity']})
     ledger = setup.generated_ledger_path(store).read_bytes()
     moved = store / 'saved-source'
     target = source if damage in ('root', 'fifo', 'binding') else probe
     if damage in ('witness-type', 'witness-loss'):
-        witness = next(p for p, kind in save_data['sources']['.venv']['witnesses'] if kind == stat.S_IFREG)
+        count_paths = {p for p, _count in probes['counts']}
+        witness = next(p for p, _kind in probes['witnesses'] if p not in count_paths)
         target = source / witness
+    if damage.startswith('ancestor-'):
+        target = source.parent if parent_mode == 'saturated' else source.parent.parent
     target.rename(moved)
     if damage == 'witness-loss':
         target.with_name('offset-witness').touch()
     if parent_mode == 'offset' and target == probe:
         (source / 'offset').touch()
-    if damage == 'file':
+    if damage in ('file', 'ancestor-file'):
         target.touch()
-    elif damage in ('symlink', 'binding'):
+    elif damage in ('symlink', 'binding', 'ancestor-symlink'):
         target.symlink_to(moved)
     elif damage == 'fifo':
         os.mkfifo(target)
     elif damage == 'witness-type':
-        target.mkdir()
-    cv._check_shared_health(config, root, post_turn=True)
+        if moved.is_dir():
+            target.touch()
+        else:
+            target.mkdir()
+    if post_turn:
+        cv._check_shared_health(config, root, post_turn=True)
+    else:
+        with pytest.raises(CheckoutVerificationError):
+            cv._check_shared_health(config, root)
     assert cv.has_poisoned_entry(root)
     current = json.loads(health.health_path(store).read_text())
-    assert current['stale'] and current['stale_link'] == '.venv'
+    assert current['stale'] and current['stale_link'] == link
     assert not setup.setup_record_path(store).exists()
     assert setup.generated_ledger_path(store).read_bytes() == ledger
     if target.is_symlink() or target.is_file() or damage == 'fifo':
@@ -492,10 +512,10 @@ def test_confirmed_probe_loss_retains_durable_recovery(tmp_path, monkeypatch, da
     cv.reset_checkout_baselines()
     before = health.health_path(store).read_bytes()
     with rw.store_lock(store):
-        assert health.ensure_health(store, ('.venv',), config=config)
+        assert health.ensure_health(store, (link,), config=config)
     assert health.health_path(store).read_bytes() == before
     with pytest.raises(CheckoutVerificationError):
-        cv.register_worktree_links(root, {'.venv': str(source)}, shared_store=store)
+        cv.register_worktree_links(root, {link: str(source)}, shared_store=store)
 
 
 @pytest.mark.parametrize('metadata', ['malformed', 'symlink', 'parent-symlink', 'stale', 'setup-mismatch', 'unreadable'])
@@ -554,6 +574,7 @@ def test_registered_record_loss_publication_boundaries(tmp_path, monkeypatch, tr
     monkeypatch.setattr(health, 'inspect_result', inspect)
     cv._check_shared_health(config, root, post_turn=True)
     assert len(calls) == 2
+    assert cv.has_poisoned_entry(root) == (transition != 'healthy')
     if transition == 'absent':
         pending = path.read_bytes()
         assert json.loads(pending)['state'] == 'pending'
@@ -571,8 +592,6 @@ def test_registered_record_loss_publication_boundaries(tmp_path, monkeypatch, tr
         assert path.read_bytes() == b'{'
     else:
         assert not path.exists()
-    if transition != 'healthy':
-        assert cv.has_poisoned_entry(root) or transition == 'absent'
 
 
 @pytest.mark.parametrize('change', ['generation', 'configuration', 'source', 'probe'])
