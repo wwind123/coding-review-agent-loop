@@ -446,7 +446,7 @@ def test_unknown_health_only_poisons_current_run(tmp_path, monkeypatch, failure,
     assert not cv.has_poisoned_entry(root)
 
 
-@pytest.mark.parametrize('damage', ['delete', 'file', 'symlink', 'root', 'fifo', 'binding', 'witness-type'])
+@pytest.mark.parametrize('damage', ['delete', 'file', 'symlink', 'root', 'fifo', 'binding', 'witness-type', 'witness-loss'])
 @pytest.mark.parametrize('parent_mode', ['saturated', 'offset'])
 def test_confirmed_probe_loss_retains_durable_recovery(tmp_path, monkeypatch, damage, parent_mode):
     store, config, root = registered_store(tmp_path, monkeypatch)
@@ -462,10 +462,12 @@ def test_confirmed_probe_loss_retains_durable_recovery(tmp_path, monkeypatch, da
     ledger = setup.generated_ledger_path(store).read_bytes()
     moved = store / 'saved-source'
     target = source if damage in ('root', 'fifo', 'binding') else probe
-    if damage == 'witness-type':
+    if damage in ('witness-type', 'witness-loss'):
         witness = next(p for p, kind in save_data['sources']['.venv']['witnesses'] if kind == stat.S_IFREG)
         target = source / witness
     target.rename(moved)
+    if damage == 'witness-loss':
+        target.with_name('offset-witness').touch()
     if parent_mode == 'offset' and target == probe:
         (source / 'offset').touch()
     if damage == 'file':
