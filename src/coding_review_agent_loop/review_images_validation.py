@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from .agent_failure import ValidatedAgentResponse, _response_identity_fields
-from .architecture_contract import _accept_candidate
+from .architecture_contract import _accept_candidate, _with_validation_context
 from .errors import AgentLoopError
 from .repair import attempt_envelope_normalization
 
@@ -31,8 +31,9 @@ def validate_image_turn(runner, *, image_inputs, run_agent, agent, config, promp
         except ValueError:
             raise AgentLoopError("Image delivery/model binding rejected") from None
         text = result.text
+        response_validator = _with_validation_context(validate, runner=runner, acquisition=result)
         try:
-            parsed = validate(text)
+            parsed = response_validator(text)
         except (AgentLoopError, ValueError):
             if not use_repair:
                 raise
@@ -42,7 +43,7 @@ def validate_image_turn(runner, *, image_inputs, run_agent, agent, config, promp
             if normalized is None:
                 raise AgentLoopError("Image response requires unsupported format repair") from None
             text = normalized
-            parsed = validate(text)
+            parsed = response_validator(text)
         proof.require(binding)
         candidate = _accept_candidate(text, parsed, strict_revalidate=strict_revalidate,
                                       runner=runner, acquisition=result)

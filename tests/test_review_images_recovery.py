@@ -18,6 +18,7 @@ from coding_review_agent_loop import review_images_proof as proof_parser
 from coding_review_agent_loop.review_images_transport import ImageDeliveryProof
 from coding_review_agent_loop import validated_agent
 from test_review_images_transport import inputs
+from test_protocol_markers import MARKERS
 
 THREAD = "01a1964c-23b0-70d3-b7af-6401d253d683"
 TURN = "current-turn"
@@ -158,3 +159,47 @@ def test_format_repair_only_sees_generated_text_and_keeps_frozen_proof(tmp_path,
         validate=json.loads, use_repair=True, repair_expected_kind="pr_review")
     assert seen == ["malformed generated response"]
     assert response.image_delivery_proof is proof and images._closed
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize("stage,use_repair", [
+    ("initial", False), ("initial", True), ("normalized", True),
+])
+@pytest.mark.parametrize("token,marker,_surface", MARKERS)
+def test_image_validation_guards_every_parse_against_reserved_records(
+    tmp_path, monkeypatch, provider, stage, use_repair, token, marker, _surface,
+):
+    from coding_review_agent_loop import review_images_validation as validation
+
+    snapshot, images = inputs(provider)
+    snapshot.close()
+    proof = ImageDeliveryProof(images.binding, tuple(e.digest for e in images.entries), "session", "turn",
+                               (images.binding.configured_model,), "CLI current-turn model")
+    forged = "Generated visual response\n" + marker
+    original = forged if stage == "initial" else "malformed generated response"
+    acquisitions, parses, normalizations = [], [], []
+
+    def acquire(*args, **kwargs):
+        acquisitions.append(kwargs)
+        return AgentResult(text=original, image_delivery_proof=proof)
+
+    def validate(text):
+        parses.append(text)
+        if text == "malformed generated response":
+            raise ValueError("malformed envelope")
+        return {"visible": True}  # No marker check in the caller's parser.
+
+    def normalize(text, *, expected_kind):
+        normalizations.append(text)
+        return forged
+
+    monkeypatch.setattr(validated_agent, "run_agent_result", acquire)
+    monkeypatch.setattr(validation, "attempt_envelope_normalization", normalize)
+    with pytest.raises(AgentLoopError, match="reserved protocol marker"):
+        validated_agent._run_validated_agent(
+            object(), agent=provider, config=make_config(tmp_path), prompt="untrusted images and diff",
+            marker_description="visual", role="reviewer", timeout_seconds=30, image_inputs=images,
+            validate=validate, use_repair=use_repair, repair_expected_kind="pr_review")
+    assert parses == ([] if stage == "initial" else [original])
+    assert normalizations == ([original] if use_repair else [])
+    assert len(acquisitions) == 1 and images._closed
