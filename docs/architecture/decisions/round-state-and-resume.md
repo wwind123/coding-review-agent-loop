@@ -31,3 +31,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Approved publication resumes retain settlement-time item minting; refusal diagnostics use scoped unfiltered history to explain excluded approval bindings (#1805).
 
 - Approved resume preserves an owed same-model reconciliation note, while settled rounds suppress duplicates (#1805).
+
+- 2026-11-01: Valid terminal implementation stops preserve tracked/staged salvage before reporting and cleanup; category-aware rendering distinguishes valid responses, while default rerun discovery still requires an eligible breadcrumb or a reused stable absolute log directory (#1833).

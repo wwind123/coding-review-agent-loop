@@ -1223,3 +1223,36 @@ def test_replaced_link_alone_keeps_shared_health_usable(tmp_path, monkeypatch):
         assert cv.has_poisoned_entry(root)
         store = default_agent_workdir('OWNER/REPO', 'claude')
         assert health.inspect(store, ('.venv',))[1] is None
+
+
+def test_terminal_salvage_patch_survives_claimed_run_finalizer(tmp_path, monkeypatch):
+    from coding_review_agent_loop.salvage import capture_terminal_salvage, SalvageContext
+    env = Env(tmp_path, monkeypatch)
+    config = env.config()
+    runner = Runner()
+    head = git(env.seed, "rev-parse", "HEAD")
+    with pytest.raises(AgentLoopError, match="valid no-PR stop"):
+        with workdir_claim_scope(command="task"):
+            claim_agent_workdirs(config)
+            ensure_agent_workdirs(config, runner)
+            checkout = config.claude_dir
+            (checkout / "a.txt").write_text("updated\n")
+            (checkout / "new.txt").write_text("staged new file\n")
+            git(checkout, "add", "a.txt", "new.txt")
+            diagnostic = capture_terminal_salvage(
+                runner, config=config,
+                context=SalvageContext(repo=config.repo, issue_number=None,
+                    scope="task-implementation", agent=config.coder), reason="valid no-PR stop",
+            )
+            assert "partial.patch" in diagnostic
+            raise AgentLoopError("valid no-PR stop" + diagnostic)
+    assert not checkout.exists()
+    patch, = (config.log_dir / "salvage").glob("*/partial.patch")
+    fresh = tmp_path / "recovery"
+    subprocess.run(["git", "clone", "-q", str(env.bare), str(fresh)], check=True)
+    assert git(fresh, "rev-parse", "HEAD") == head
+    git(fresh, "apply", str(patch))
+    assert (fresh / "a.txt").read_text() == "updated\n"
+    assert (fresh / "new.txt").read_text() == "staged new file\n"
+    assert git(fresh, "rev-parse", "HEAD") == head
+    assert git(env.bare, "for-each-ref", "--format=%(refname)", "refs/heads") == "refs/heads/main"

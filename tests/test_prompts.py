@@ -767,7 +767,7 @@ def test_issue_prompts_include_salvage_guardrail_block(tmp_path):
     ]
 
     for prompt in prompts:
-        assert "Previous failed implementation attempt salvage:" in prompt
+        assert "Previous implementation attempt salvage:" in prompt
         assert "The previous attempt failed." in prompt
         assert "incomplete context only" in prompt
         assert "Do not infer a successful\nresponse or PR" in prompt
@@ -815,7 +815,7 @@ def test_issue_prompts_render_remote_salvage_summary_shape(tmp_path):
 
     prompt = build_issue_prompt(56, config, salvage_summary=salvage_summary)
 
-    assert "Previous failed implementation attempt salvage:" in prompt
+    assert "Previous implementation attempt salvage:" in prompt
     assert "recovered from a GitHub issue comment" in prompt
     assert "agent failed on a different machine" in prompt
     assert "```diff" in prompt
@@ -7215,3 +7215,17 @@ def test_pr_local_environment_note_only_with_the_flag_and_after_a_rebuild(tmp_pa
     assert guidance in second and "rebuilt node_modules privately" not in second
     # Reviewer (non-implementation) prompts never carry either note.
     assert guidance not in _coder_workdir_guidance(on, implementation=False)
+
+
+@pytest.mark.parametrize("source", ["local", "remote"])
+@pytest.mark.parametrize("outcome", ["valid terminal response", "failed before producing a valid public response"])
+def test_salvage_wrapper_is_outcome_neutral(tmp_path, source, outcome):
+    config = make_config(tmp_path)
+    summary = f"{source} summary: {outcome}"
+    for prompt in [build_issue_prompt(56, config, salvage_summary=summary),
+                   build_issue_implementation_prompt(56, "Implement.", config, salvage_summary=summary)]:
+        assert summary in prompt
+        assert "The previous attempt failed." not in prompt
+        assert "Previous implementation attempt salvage:" in prompt
+        assert "Stage intended new files before required tests" in prompt
+        assert "Default managed checkouts are removed" in prompt

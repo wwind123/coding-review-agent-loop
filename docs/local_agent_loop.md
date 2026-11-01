@@ -9737,13 +9737,14 @@ and an operator may delete them manually once they are no longer needed.
 root for usage summaries and salvage artifacts, and old checkout-resident logs
 are not migrated or rediscovered as active captures.
 
-When a mutating coder implementation run reaches a terminal failure with a
+When a mutating coder implementation run reaches a terminal failure or valid
+terminal no-PR stop with a
 non-empty tracked diff, the orchestrator writes local salvage artifacts under
 `<log_dir>/salvage/<run>-<agent>-<scope>/`. That directory contains
 `partial.patch`, `changed-files.txt`, `diff-stat.txt`, best-effort
 `diff-check.txt`, `salvage-summary.md`, and `metadata.json`. The run log and
 local error point to the artifact directory. These artifacts are incomplete
-failure diagnostics only: they are not posted as a successful response, and a
+partial recovery context only: they are not posted as a successful response, and a
 later rerun injects only the latest matching salvage summary into the coder
 prompt so the next attempt can cherry-pick or ignore it selectively. The
 orchestrator never auto-applies the patch.
@@ -9769,6 +9770,28 @@ real discussion when the issue-context prompt is truncated. Posting failures
 are logged and never mask the
 original agent failure. Use `--no-salvage-comments` to keep salvage entirely
 local (matching prior behavior).
+
+Valid terminal stops include issue and approved-plan no-PR results and signed
+requirement conflicts (also after a coverage re-ask), plus task blocking results
+and clarification exits. Successfully answered task clarification continues without
+terminal capture. Capture or publication failure never replaces the original stop.
+Task salvage stays local-only; there is no automatic task restart discovery.
+
+Default managed checkouts are removed when the run ends. Explicit checkouts keep
+their existing lifecycle. Stage intended new files before required tests: capture
+uses tracked/staged `git diff HEAD --binary`, including staged new files, and
+intentionally omits untracked contents (also on mixed checkouts). Clean and
+untracked-only checkouts create no patch or breadcrumb. Do not run recovery
+commands after a required test watchdog expires; return the terminal response
+immediately and let terminal handling attempt preservation.
+
+Default relative log directories are isolated per run. Automatic local issue
+salvage discovery requires reuse of a stable absolute `--log-dir`. Distinct
+default directories rely on an eligible posted breadcrumb. If posting fails,
+comments are disabled, or publication is skipped (including dry-run), no summary
+is automatically injected on a default rerun: the printed patch path is the only
+recovery route. Artifact persistence does not imply automatic discovery or access
+from another machine. Inspect the summary and patch before manually reusing work.
 
 If strict structured-response validation fails, the log may show a repair pass:
 `schema validation failed ... attempting repair pass`, followed by either

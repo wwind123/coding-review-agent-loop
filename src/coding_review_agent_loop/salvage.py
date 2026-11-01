@@ -167,6 +167,10 @@ def _summary_text(
         if response_file_missing
         else "present but failed validation"
     )
+    marker_status = "missing or invalid; the failed response did not satisfy this requirement."
+    if failure_category == VALID_TERMINAL_CATEGORY:
+        response_status = "valid terminal response; no accepted PR handoff"
+        marker_status = "not applicable to a valid terminal response."
     returncode = "none" if result is None or result.returncode is None else str(result.returncode)
     log_path = str(result.log_path) if result is not None and result.log_path is not None else "(none)"
     diff_check_status = (
@@ -189,7 +193,7 @@ def _summary_text(
     )
     return f"""# Salvage Summary
 
-The {context.agent} agent failed before producing a valid public response. No
+{_outcome_text(context.agent, failure_category)} No
 successful response, review result, or pull request should be inferred from this
 artifact.
 
@@ -207,7 +211,7 @@ applicable.
 - Attempt log: `{log_path}`
 - Public response file: {response_status}
 - Required marker: `{required_marker}`
-- Required marker status: missing or invalid; the failed response did not satisfy this requirement.
+- Required marker status: {marker_status}
 - `git diff --check`: {diff_check_status}{untracked_note}
 
 ## Local Artifacts
@@ -342,6 +346,61 @@ def format_salvage_artifacts_for_error(artifacts: SalvageArtifacts) -> str:
         f"- summary: {artifacts.summary_path}\n"
         f"- patch: {artifacts.patch_path}"
     )
+
+
+VALID_TERMINAL_CATEGORY = "valid-terminal-stop"
+
+
+def _outcome_text(agent: str, category: str) -> str:
+    if category == VALID_TERMINAL_CATEGORY:
+        return f"The {agent} agent returned a valid terminal response without an accepted PR handoff."
+    return f"The {agent} agent failed before producing a valid public response."
+
+
+def capture_terminal_salvage(
+    runner: Runner, *, config: AgentLoopConfig, context: SalvageContext, reason: str,
+) -> str:
+    """Best-effort preservation before terminal reporting; never replace the stop reason."""
+    from .workdirs import active_workdir
+
+    try:
+        artifacts = capture_salvage_artifacts(
+            runner, checkout=active_workdir(config), log_dir=config.log_dir,
+            context=context, failure_category=VALID_TERMINAL_CATEGORY,
+            failure_reason=reason, required_marker="", result=None,
+        )
+        if artifacts is None:
+            diagnostic = (
+                "No eligible tracked/staged diff against HEAD; no salvage artifacts or breadcrumb "
+                "were created. Untracked-only contents are intentionally omitted and are not preserved."
+            )
+        else:
+            diagnostic = format_salvage_artifacts_for_error(artifacts)
+            diagnostic += (
+                "\nUntracked contents are omitted; the patch contains tracked/staged changes only. "
+                "Default managed checkouts are removed when the run ends; recover from the saved patch."
+            )
+            try:
+                posted = post_salvage_comment(
+                    runner, config=config, artifacts=artifacts, context=context,
+                    failure_category=VALID_TERMINAL_CATEGORY, failure_reason=reason,
+                )
+            except Exception as exc:
+                posted = False
+                diagnostic += f"\nSalvage breadcrumb publication failed: {exc}."
+            if posted:
+                diagnostic += f"\nA GitHub salvage comment was posted to issue #{context.issue_number}."
+            else:
+                diagnostic += (
+                    "\nNo GitHub salvage comment was posted. On a default run the printed patch path "
+                    "is the only recovery route; no summary is automatically injected on a default rerun. "
+                    "Automatic local issue discovery requires reuse of a stable absolute --log-dir. "
+                    "Task recovery is manual and local-only."
+                )
+    except Exception as exc:
+        diagnostic = f"Terminal salvage capture failed ({exc}); preserving the original terminal reason."
+    log(config, diagnostic)
+    return "\n" + diagnostic
 
 
 def _metadata_matches(
@@ -558,7 +617,7 @@ def _render_salvage_comment_body(payload: dict[str, object]) -> str:
     issue_number = payload.get("issue_number")
     return f"""### Implementation salvage breadcrumb
 
-The {payload['agent']} agent failed before producing a valid public response. No
+{_outcome_text(str(payload['agent']), str(payload.get('failure_category', '')))} No
 successful response, review result, or pull request should be inferred from this
 comment. It exists only so a later rerun (possibly with a different coder, workdir,
 or machine) can recover partial context; do not auto-apply anything from it.
@@ -777,8 +836,7 @@ def render_remote_salvage_summary(record: RemoteSalvageRecord) -> str:
         patch_section = ""
     return f"""# Salvage Summary (recovered from a GitHub issue comment)
 
-The {record.agent} agent failed before producing a valid public response on a
-prior run. No successful response, review result, or pull request should be
+{_outcome_text(record.agent, record.failure_category)} No successful response, review result, or pull request should be
 inferred from this artifact. Local artifact paths below were written on that
 run's machine/workdir and may not exist here.
 

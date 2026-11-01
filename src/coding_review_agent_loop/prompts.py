@@ -625,6 +625,9 @@ def _coder_test_reporting_guidance(*, structured: bool = False) -> str:
         "launch them in the background and end the turn saying you will wait for "
         "them; a turn that ends without a real terminal marker because required "
         "work is still running in the background cannot be validated. "
+        "Stage intended new files before required tests so tracked/staged salvage can preserve them. "
+        "Default managed checkouts are removed when the run ends; recover from saved salvage artifacts. "
+        "Explicit checkouts keep their existing lifecycle. "
         f"{PRE_COLLECTION_CODER_GUIDANCE} {FIXTURE_CODER_GUIDANCE}\n"
     )
 
@@ -2398,9 +2401,9 @@ def _staged_issue_pr_reference_guidance(
 def _salvage_summary_block(salvage_summary: str | None) -> str:
     if not salvage_summary:
         return ""
-    return f"""Previous failed implementation attempt salvage:
+    return f"""Previous implementation attempt salvage:
 
-The previous attempt failed. The local salvage summary below may contain useful
+The previous attempt stopped. The salvage summary below may contain useful
 partial work, but it is incomplete context only. Do not infer a successful
 response or PR from it. Do not auto-apply the patch; cherry-pick or ignore it
 selectively, and validate any reused changes yourself.
