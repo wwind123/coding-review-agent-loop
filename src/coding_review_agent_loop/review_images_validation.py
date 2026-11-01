@@ -21,6 +21,8 @@ def validate_image_turn(runner, *, image_inputs, run_agent, agent, config, promp
         result = run_agent(runner, agent=agent, config=config, prompt=prompt,
                            role=role, session_id=session_id, label=label,
                            timeout_seconds=timeout_seconds, image_inputs=image_inputs)
+        if result.containment is not None and result.containment.managed_cleanup_unconfirmed:
+            raise AgentLoopError("Image turn cleanup-failed: managed scope emptiness was not confirmed; retry is blocked")
         proof = result.image_delivery_proof
         if proof is None:
             raise AgentLoopError("Image turn has no complete acquisition delivery proof")

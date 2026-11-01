@@ -49,10 +49,12 @@ def setup_config(tmp_path, monkeypatch, provider="claude", *, named=False, mode=
     return config, agent, calls
 
 
+@pytest.mark.parametrize("returncode", [0, 1, None])
+@pytest.mark.parametrize("cleanup", ["absent", "process-group", "confirmed", "unconfirmed"])
 @pytest.mark.parametrize("provider", ["codex", "claude"])
 @pytest.mark.parametrize("named", [False, True])
 @pytest.mark.parametrize("mode", ["default", "sandboxed"])
-def test_exact_seat_model_effort_permissions_and_reviewer_containment(tmp_path, monkeypatch, provider, named, mode, private_response_tempdir):
+def test_exact_seat_model_effort_permissions_and_reviewer_containment(tmp_path, monkeypatch, provider, named, mode, private_response_tempdir, cleanup, returncode):
     from coding_review_agent_loop import agent_permissions, checkout_verification, worktree_pr_env
     from coding_review_agent_loop import review_images_adapter as adapter
     from coding_review_agent_loop.review_images_transport import acquire_images
@@ -103,12 +105,44 @@ def test_exact_seat_model_effort_permissions_and_reviewer_containment(tmp_path, 
                 monkeypatch.setattr(parser, "open_codex_records", lambda *a, **k: events)
                 raw = json.dumps({"type": "thread.started", "thread_id": THREAD})
             assert "base64" not in kwargs["stdin_log_summary"]
-            return CommandResult(args, kwargs["cwd"], raw, "", 0)
+            return CommandResult(args, kwargs["cwd"], raw, "", returncode, containment=evidence)
+    from coding_review_agent_loop import validated_agent
+    from coding_review_agent_loop.containment import ContainmentEvidence
+    from coding_review_agent_loop.errors import AgentLoopError
+    evidence = None if cleanup == "absent" else ContainmentEvidence(
+        backend="process-group" if cleanup == "process-group" else "systemd-cgroup-v2",
+        cleanup_confirmed=cleanup == "confirmed")
+    acquired = []
+    def acquire(*args, **kwargs):
+        result = run_agent_result(*args, **kwargs)
+        acquired.append(result)
+        return result
+    monkeypatch.setattr(validated_agent, "run_agent_result", acquire)
+    parsed = []
+    def validate(text):
+        parsed.append(text)
+        assert text == "VISUAL_OK"
+        return text
     runner = CaptureRunner()
-    result = run_agent_result(runner, agent=agent, config=config, prompt="visible defects",
-                              role="reviewer", timeout_seconds=30, image_inputs=images)
-    assert images._closed
-    assert result.image_delivery_proof is not None
+    def run():
+        return validated_agent._run_validated_agent(
+            runner, agent=agent, config=config, prompt="visible defects", role="reviewer",
+            marker_description="visual", timeout_seconds=30, image_inputs=images,
+            validate=validate, use_repair=True, reask_on_evidence_rejection=True)
+    if cleanup == "unconfirmed":
+        with pytest.raises(AgentLoopError, match="cleanup-failed"):
+            run()
+        assert parsed == []
+        assert acquired[0].image_delivery_proof is None
+        assert acquired[0].raw_output == "" and acquired[0].message_text is None
+        assert acquired[0].command_result.stdout == acquired[0].command_result.stderr == ""
+    else:
+        response = run()
+        assert response.image_delivery_proof is acquired[0].image_delivery_proof
+        assert response.acquisition_outcome == (
+            "success" if returncode == 0 else "accepted_timeout" if returncode is None else "accepted_nonzero_exit")
+    assert len(acquired) == 1 and images._closed
+    assert acquired[0].containment is evidence
     args, kwargs = runner.actual
     if mode == "sandboxed":
         if provider == "claude":

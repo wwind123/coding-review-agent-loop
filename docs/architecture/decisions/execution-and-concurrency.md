@@ -49,3 +49,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Image conformance drives production preflight and adapter commands in both permission modes. All correlated CLI model metadata shares one fail-closed gate; non-tool thinking/reasoning and earlier messages do not replace the final response. Claude retains one sandboxed role tool grant and disables settings sources; visual manifests and diffs share an escaped untrusted boundary (#1794).
 
 - Codex image proof allowlists non-tool rollout records before attribution; native calls, outputs, execution items and unknown kinds fail closed, while developer tool declarations remain configuration metadata. Real-CLI tool calls and sanitized replay cover refusal after image delivery and final text in both permission modes (#1794).
+
+- Image adapter proof publication and validated acceptance share the ordinary turn's managed-cleanup predicate: unconfirmed cgroup emptiness refuses every exit status before parsing or repair, without another assessment (#1794).

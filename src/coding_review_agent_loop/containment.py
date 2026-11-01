@@ -1683,6 +1683,11 @@ class ContainmentEvidence:
     diagnostics: tuple[str, ...] = ()
 
     @property
+    def managed_cleanup_unconfirmed(self) -> bool:
+        """A managed invocation cannot be accepted until its tree is gone."""
+        return self.backend == "systemd-cgroup-v2" and not self.cleanup_confirmed
+
+    @property
     def resource_exhausted(self) -> bool:
         # cgroup event files are cumulative. A descendant can increment one
         # while the target still returns a valid response, so counters alone

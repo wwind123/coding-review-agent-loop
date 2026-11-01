@@ -1903,8 +1903,7 @@ def _run_validated_agent_in_scope(
                 break
         if (
             containment is not None
-            and containment.backend == "systemd-cgroup-v2"
-            and not containment.cleanup_confirmed
+            and containment.managed_cleanup_unconfirmed
         ):
             last_error = (
                 "agent invocation cleanup-failed: managed scope emptiness was not "

@@ -839,19 +839,20 @@ launches cannot demonstrate confinement.
 ## Internal image transport (#1794)
 
 `review_images_transport.py` validates capture's sealed `SnapshotSet`: exact
-head/config/snapshot digests, canonical inventory, logical screenshot/baseline
-mapping, read-only descriptors, seals, PNG bounds, sizes and hashes. It owns duplicated descriptors until acquisition exit, never reopening manifest
-paths. Shared baselines use one entry; distinct paths retain equal-byte multiplicity.
+head/config/snapshot digests, inventory, screenshot/baseline mapping, read-only
+descriptors, seals, PNG bounds, sizes and hashes. It owns duplicated descriptors
+until acquisition exit, never reopening manifest paths. Shared baselines use one entry; distinct paths retain equal-byte multiplicity.
 
 `review_images_capabilities.py` resolves one named or legacy reviewer to an
 immutable model/effort view; omission requires the configured primary. Its catalog
 pins executable hashes, releases, explicit models and proof grammar.
-Unknown aliases, passthrough overrides and unverified model chains refuse. Bounded
-version probes use a private home without model calls; bounded alias warnings are
-diagnostic only. Identity is rechecked before and after spawn; no admission cache persists.
+Unknown aliases, overrides and unverified model chains refuse. Local version
+probes use a private home without model calls; alias warnings are diagnostic.
+Identity is rechecked around spawn; no admission cache persists.
 
-`review_images_adapter.py` preserves reviewer role, containment and response
-permissions. Claude embeds base64 PNG blocks in one correlated stdin message,
+`review_images_adapter.py` preserves reviewer permissions and containment.
+Unconfirmed managed cleanup blocks proof and validation at any exit status,
+before parsing or normalization, without retry. Claude embeds base64 PNG blocks in one correlated stdin message,
 disables user/project settings, and needs no filesystem grant. Sandboxed mode
 retains exactly one reviewer tool grant; default mode disables tools. Actual tool
 use fails proof. Codex passes one equals-form image option per owned
@@ -882,14 +883,13 @@ checking requests and reasoning/multiple-message output in a loopback-only netwo
 namespace. Default CI replays fixtures and deselects real CLI tests before sharding;
 explicit selection fails on missing prerequisites.
 
-`review_images_validation.py` requires original immutable proof for every candidate,
-including timeout/nonzero completion and deterministic envelope normalization.
-Repair has no images or authority to change proof. Resume, semantic re-asks,
-fallbacks, updater replay and post-submission retries are disabled; uncertain
-completion is terminal. The bounded prompt encloses manifest, inventory, mappings
+`review_images_validation.py` requires original proof for every candidate,
+including timeout/nonzero exits and envelope normalization. Repair has no images
+or authority to change proof. Resume, re-asks, fallbacks, updater replay and
+post-submission retries are disabled; uncertain completion is terminal. The bounded prompt encloses manifest, inventory, mappings
 and diff as escaped untrusted data and requests only visible defects and coverage.
-These library APIs add no scheduling, durable round state, finding authority,
-screenshot clearance or public visual flags; parent #1787 owns integration.
+Parent #1787 owns scheduling, durable state, finding authority, screenshot
+clearance and public flags; these library APIs provide none.
 
 ## Decisions
 

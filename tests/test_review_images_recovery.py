@@ -104,18 +104,21 @@ def test_codex_session_open_is_bounded_invocation_identified_and_no_follow(tmp_p
         proof_parser.open_codex_records(tmp_path, THREAD, started=now - 1, ended=now + 1)
 
 
+@pytest.mark.parametrize("cleanup_confirmed", [False, True])
 @pytest.mark.parametrize("returncode", [0, 1, None])
 @pytest.mark.parametrize("proof_present", [False, True])
-def test_all_validated_acceptance_paths_gate_original_proof_and_never_reask(tmp_path, monkeypatch, returncode, proof_present):
+def test_all_validated_acceptance_paths_gate_original_proof_and_never_reask(tmp_path, monkeypatch, returncode, proof_present, cleanup_confirmed):
     snapshot, images = inputs()
     snapshot.close()
     proof = ImageDeliveryProof(images.binding, tuple(e.digest for e in images.entries), "session", "turn",
                                (images.binding.configured_model,), "CLI current-turn model")
+    from coding_review_agent_loop.containment import ContainmentEvidence
+    evidence = ContainmentEvidence(backend="systemd-cgroup-v2", cleanup_confirmed=cleanup_confirmed)
     calls = []
     def acquire(*a, **kwargs):
         calls.append(kwargs)
         return AgentResult(text='{"visible": true}', returncode=returncode,
-                           image_delivery_proof=proof if proof_present else None)
+                           image_delivery_proof=proof if proof_present else None, containment=evidence)
     monkeypatch.setattr(validated_agent, "run_agent_result", acquire)
     def run():
         return validated_agent._run_validated_agent(
@@ -123,7 +126,11 @@ def test_all_validated_acceptance_paths_gate_original_proof_and_never_reask(tmp_
             marker_description="visual", role="reviewer", timeout_seconds=30, image_inputs=images,
             validate=json.loads, use_repair=True, reask_on_evidence_rejection=True,
             completion_recovery=object())
-    if proof_present:
+    if not cleanup_confirmed:
+        monkeypatch.setattr("coding_review_agent_loop.review_images_validation.attempt_envelope_normalization",
+                            lambda *a, **k: pytest.fail("normalized before cleanup refusal"))
+        with pytest.raises(AgentLoopError, match="cleanup-failed"): run()
+    elif proof_present:
         response = run()
         assert response.image_delivery_proof is proof
         assert response.marker_value == {"visible": True}

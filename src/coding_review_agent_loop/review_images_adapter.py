@@ -84,6 +84,12 @@ def _acquire(runner, config, prompt, images, *, provider, role, session_id,
                                  stdin_log_summary=f"[immutable image acquisition {images.binding.acquisition_id}; payload redacted]",
                                  timeout_seconds=timeout_seconds, containment_role="reviewer")
     ended = time.time()
+    if result.containment is not None and result.containment.managed_cleanup_unconfirmed:
+        sanitized = replace(result, stdout="", stderr="", capture_diagnostics=())
+        return AgentResult(text="Image acquisition cleanup-failed: managed scope emptiness was not confirmed.",
+                           raw_output="", message_text=None, returncode=result.returncode or 1,
+                           provider=provider, role="reviewer", log_path=log_path,
+                           command_result=sanitized)
     # On every failure exit only adapter-generated diagnostics leave this module.
     # Replay bytes stay in the private invocation log, never recovery candidates.
     try:
