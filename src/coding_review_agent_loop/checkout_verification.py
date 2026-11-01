@@ -971,19 +971,24 @@ def _check_shared_health(config, path: Path, *, post_turn: bool = False) -> None
     if registration is None or registration.shared_store is None or not registration.links:
         return
     from .run_worktrees import store_lock
-    from .worktree_link_integrity import inspect, mark_stale, refusal
+    from .worktree_link_integrity import inspect_result, confirm_failure, mark_stale, refusal
     store = registration.shared_store
     selected = {os.fsdecode(link) for link in registration.links}
     message = None
     try:
         with store_lock(store):
-            _data, reason, link = inspect(store, registration.health_links, selected=selected)
-            if reason:
-                message = refusal(store, link, reason, turn=True)
-                try:
-                    mark_stale(store, registration.health_links, reason, link=link)
-                except (AgentLoopError, OSError, ValueError, KeyError, TypeError) as exc:
-                    message += f" Source-health stale publication failed: {exc}."
+            first = inspect_result(store, registration.health_links, selected=selected)
+            result = first
+            if first.reason:
+                result = inspect_result(store, registration.health_links, selected=selected)
+            if result.reason:
+                message = refusal(store, result.link, result.reason, turn=True)
+                if confirm_failure(store, registration.health_links, first, result,
+                                   registered_generation=registration.health_generation):
+                    try:
+                        mark_stale(store, registration.health_links, result.reason, link=result.link)
+                    except (AgentLoopError, OSError, ValueError, KeyError, TypeError) as exc:
+                        message += f" Source-health stale publication failed: {exc}."
     except (AgentLoopError, OSError) as exc:
         message = refusal(store, next(iter(selected)), f"unknown source health: {exc}", turn=True)
     if message:
