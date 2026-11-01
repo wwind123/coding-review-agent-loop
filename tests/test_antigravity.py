@@ -1405,7 +1405,7 @@ def test_gemini_failure_appends_migration_guidance(tmp_path, capsys, monkeypatch
     err = capsys.readouterr().err
     assert "Antigravity" in err and "2026-06-18" in err
     # The guidance must travel with the *returned* result (raw_output and text),
-    # since run_external classifies/persists failures from those, not stderr (#215).
+    # since callers classify/persist failures from those, not stderr (#215).
     assert "2026-06-18" in result.raw_output
     assert "antigravity" in result.raw_output
     assert result.raw_output.startswith("Error: quota exceeded")  # original error preserved

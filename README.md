@@ -57,10 +57,7 @@ Round metadata and the existing bounded sidecar persist its canonical identity,
 so a renderer change does not invalidate an otherwise authentic plan. A corrupt
 or unfittable matrix closes only the matrix channel and reports a diagnostic;
 it does not withdraw a separately valid plan hash and subject. Historical plans
-without a matrix remain resumable without invented rows. The same contract is
-available to skill helpers: use `helpers.validate_response` or
-`helpers.render_response` with `--require-risk-test-matrix-contract` when a fresh
-generation-1 matrix is required.
+without a matrix remain resumable without invented rows.
 
 Sidecar comments that precede a large plan or review carry machine-readable
 overflow data and are not independent agent responses. Each shows a short
@@ -230,12 +227,7 @@ rejected before spawn until the earlier managed attempt exits or is explicitly
 terminated. Standalone commands not run through the wrapper cannot be
 deduplicated from free-form agent logs, but their complete agent tree remains
 resource-bounded when launched by agent-loop. The aggregate is per user
-manager, not cross-user host isolation. A skill host's in-session Claude turn
-and arbitrary descendants remain part of that host session; use the managed
-wrapper for test gates and external skill agents for the mechanical boundary.
-
-In skill mode, the test-gate policy is selected with
-`AGENT_LOOP_CONTAINMENT_MODE=auto|required|off` (default `auto`).
+manager, not cross-user host isolation.
 
 ## Install
 
@@ -302,8 +294,8 @@ regardless: it is what puts the `gh` shim ahead of the real `gh` on `PATH`,
 and `agent-loop` itself never adds it.
 
 **3. Put the shim ahead of the real `gh`.** `agent-loop-gh` is a
-`gh`-compatible shim that answers exactly the porcelain forms agent-loop, its
-skill helpers, and its coder prompts use over REST, printing the same `--json`
+`gh`-compatible shim that answers exactly the porcelain forms agent-loop and its
+coder prompts use over REST, printing the same `--json`
 shape `gh` would. Every other command, including every `gh api` call, passes
 through to the real `gh` unchanged. It must be found as `gh` on `PATH`, not only
 passed with `--gh-cmd`, because the coder and reviewer agents run `gh`
@@ -1502,7 +1494,7 @@ snapshot with bounded, spillable excerpts.
 
 | Backend | CLI | Notes |
 | --- | --- | --- |
-| Claude | `claude` | Default coder. Select a model with `--claude-model`. |
+| Claude | `claude` | Default coder. `--claude-model` selects the model to run and stamp in the signature. |
 | Codex | `codex` | Default reviewer. Select a model with `--codex-model`. |
 | Antigravity | `agy` | Accepted as `agy` or `antigravity`; supports coder and reviewer roles. |
 | Gemini | `gemini` | Legacy, best-effort path for accounts that still have CLI access. |
@@ -2151,27 +2143,11 @@ managed run always waits for `final-ci/exact-head` after approval, with or
 without `--auto-merge`, and applies the same plumbing rerun-once rule with a
 full, contract-verified rerun.
 
-## Claude Code Skill Mode
-
-The repository also contains a Claude Code skill for running the orchestration
-inside an attended Claude Code session. In skill mode, Claude acts in the
-current interactive session while external agents still run through their
-local CLIs.
-
-Use the standalone CLI for predictable or unattended runs. Use skill mode when
-you want conversational setup, active steering, and interactive recovery.
-Skill mode never auto-merges.
-
-See [`SKILL.md`](SKILL.md) for invocation instructions and
-[`docs/skill_mode.md`](docs/skill_mode.md) for its design and limitations.
-
 ## Documentation
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): canonical component map, execution flows, state, and trust boundaries.
 - [`agent-loop --help`](docs/local_agent_loop.md#usage): full command and option reference.
 - [`docs/local_agent_loop.md`](docs/local_agent_loop.md): detailed lifecycle, protocol, recovery, CI, memory, and safety reference.
-- [`docs/skill_mode.md`](docs/skill_mode.md): Claude Code skill architecture and operation.
-- [`SKILL.md`](SKILL.md): executable instructions for Claude Code skill mode.
 
 The detailed guide is intentionally the source for protocol schemas, durable
 markers, repair passes, fallback ladders, CI provenance, and compatibility

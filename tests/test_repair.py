@@ -203,65 +203,6 @@ def test_fresh_matrix_contract_guard_rejects_absent_or_partial_source(missing):
         )
 
 
-def test_skill_fresh_matrix_guard_runs_before_model_repair():
-    from helpers.skill_runner import _recover_structured_response
-
-    raw = structured_v1_plan_state()
-    payload, end = json.JSONDecoder().raw_decode(raw.lstrip())
-    payload.pop("risk_test_matrix")
-    partial = json.dumps(payload) + raw.lstrip()[end:]
-    with pytest.raises(FreshContractIntegrityError, match="new planner turn"):
-        _recover_structured_response(
-            partial,
-            expected_kind="plan_state",
-            validate=lambda text: validate_structured_plan_state(
-                text, require_execution_strategy_contract=1
-            ),
-            require_execution_strategy_contract=True,
-            require_risk_test_matrix_contract=True,
-        )
-
-
-def test_skill_fresh_contract_normalizes_complete_json_fence_before_guard():
-    from helpers.skill_runner import _recover_structured_response
-    from agent_loop_helpers import structured_v1_plan_state
-
-    raw = structured_v1_plan_state()
-    fenced = f"```json\n{raw}\n```"
-    recovered, parsed = _recover_structured_response(
-        fenced,
-        expected_kind="plan_state",
-        validate=lambda text: validate_structured_plan_state(
-            text, require_execution_strategy_contract=1
-        ),
-        require_execution_strategy_contract=True,
-    )
-
-    assert recovered.startswith("{")
-    assert "```" not in recovered
-    assert parsed.execution_recommendation is not None
-
-
-def test_skill_fresh_contract_still_rejects_partial_normalized_source():
-    from helpers.skill_runner import _recover_structured_response
-    from agent_loop_helpers import structured_v1_plan_state
-
-    raw = structured_v1_plan_state()
-    payload, end = json.JSONDecoder().raw_decode(raw.lstrip())
-    del payload["execution_recommendation"]
-    partial = json.dumps(payload) + raw.lstrip()[end:]
-
-    with pytest.raises(FreshContractIntegrityError, match="new planner turn"):
-        _recover_structured_response(
-            f"```json\n{partial}\n```",
-            expected_kind="plan_state",
-            validate=lambda text: validate_structured_plan_state(
-                text, require_execution_strategy_contract=1
-            ),
-            require_execution_strategy_contract=True,
-        )
-
-
 def test_answer_repair_shape_preserves_answer_and_rejects_triage_fields():
     valid = json.dumps({
         "schema_version": 1, "kind": "discuss_answer", "position": "answer",
@@ -1481,7 +1422,6 @@ def test_antigravity_repair_attempts_directly_when_catalog_fails(tmp_path, monke
     assert all(attempt.outcome == "nonzero_exit" for attempt in attempts)
     assert all("catalog unavailable" in attempt.diagnostic for attempt in attempts)
     assert sum("models" in command for command, _ in runner.commands) == 1
-
 
 
 _MODEL_ACCESS_FAILURE = "Error: model-access validation errors (retry later)"
@@ -4469,8 +4409,6 @@ def test_build_repair_prompt_includes_new_discuss_expected_kind_schemas(kind, fo
     assert f"You MUST repair this response as `{kind}`." in prompt
     assert format_name in prompt
     assert field in prompt
-
-
 
 
 # --- #872: semantic plan_revision_patch disposition stripping -----------------

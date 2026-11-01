@@ -10,8 +10,7 @@ This file is the root overview of the architecture set: the component map,
 system-wide invariants, the main flows, and an index of the detail documents
 under `docs/architecture/`. Start with the [README](README.md) for installation
 and examples; use the [CLI guide](docs/local_agent_loop.md) for exact options,
-schemas, and recovery contracts. [Skill mode](docs/skill_mode.md) documents the
-interactive host path. Diagrams in the detail documents show responsibility and
+schemas, and recovery contracts. Diagrams in the detail documents show responsibility and
 data flow, not a strictly enforced Python import hierarchy.
 
 ## Component map

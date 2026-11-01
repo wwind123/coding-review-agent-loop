@@ -2120,7 +2120,7 @@ def make_config(tmp_path, *, create_dirs=True, **overrides):
         "agent_memory_dir": tmp_path / "agent-cache" / "memory",
         "refresh_test_profile": False,
         # These fixtures exercise historical unversioned plans.  Production
-        # CLI/skill configurations retain the generation-1 default.
+        # CLI configurations retain the generation-1 default.
         "execution_strategy_contract_required": False,
     }
     config.update(overrides)

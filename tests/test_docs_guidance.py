@@ -23,11 +23,6 @@ HEADING_TEXT = "Phased decomposition versus split materialization"
 CI_STALL_HEADING_TEXT = "External CI infrastructure stalls"
 MANAGED_CI_HEADING_TEXT = "Managed exact-head CI"
 LOCAL_TEST_SCOPE_HEADING_TEXT = "Focused, bounded local test selection"
-SKILL_LOCAL_TEST_SCOPE_HEADING_TEXT = "Gates & guardrails"
-SKILL_MODE_LOCAL_TEST_SCOPE_HEADING_TEXT = "Focused, bounded local test runs"
-README_SKILL_MODE_HEADING_TEXT = "Claude Code Skill Mode"
-SKILL = REPO_ROOT / "SKILL.md"
-SKILL_MODE_DOC = REPO_ROOT / "docs" / "skill_mode.md"
 
 
 def _github_anchor(heading_text: str) -> str:
@@ -66,7 +61,7 @@ def _architecture_set_text() -> str:
 
 def test_architecture_is_discoverable_from_existing_guides():
     assert "(ARCHITECTURE.md)" in README.read_text(encoding="utf-8")
-    for path in (LOCAL_AGENT_LOOP_DOC, SKILL_MODE_DOC):
+    for path in (LOCAL_AGENT_LOOP_DOC,):
         assert "(../ARCHITECTURE.md)" in path.read_text(encoding="utf-8")
     # Preserve the old inbound anchor while the overview moves to its own file.
     assert "## Architecture\n" in LOCAL_AGENT_LOOP_DOC.read_text(encoding="utf-8")
@@ -99,7 +94,7 @@ def test_architecture_root_is_a_bounded_overview_linking_every_detail_doc():
     on_disk = {path.relative_to(REPO_ROOT).as_posix() for path in detail_dir.glob("*.md")}
     members = {path.relative_to(REPO_ROOT).as_posix() for path in _architecture_set_paths()[1:]}
     assert on_disk and members == on_disk
-    for name in ("README.md", "docs/local_agent_loop.md", "docs/skill_mode.md"):
+    for name in ("README.md", "docs/local_agent_loop.md"):
         assert f"]({name})" in root
 
 
@@ -289,7 +284,7 @@ def test_readme_documents_review_and_approval_semantics():
 def test_readme_documents_ci_watcher_controls():
     readme_text = README.read_text(encoding="utf-8")
     section_start = readme_text.index("## CI and Merge")
-    section_end = readme_text.index("## Claude Code Skill Mode", section_start)
+    section_end = readme_text.index("## Documentation", section_start)
     section = " ".join(readme_text[section_start:section_end].split())
 
     assert "`--ci-timeout-seconds` (default 2400)" in section
@@ -304,15 +299,6 @@ def test_readme_describes_tests_directory_as_test_modules():
 
     assert "Browse the focused test modules in [`tests/`](tests/)" in section
     assert "module map in [`tests/`](tests/)" not in section
-
-
-def test_skill_links_to_current_readme_skill_mode_heading():
-    readme_text = README.read_text(encoding="utf-8")
-    assert f"## {README_SKILL_MODE_HEADING_TEXT}" in readme_text
-    expected_anchor = _github_anchor(README_SKILL_MODE_HEADING_TEXT)
-
-    skill_text = SKILL.read_text(encoding="utf-8")
-    assert f"README.md#{expected_anchor}" in skill_text
 
 
 def test_cli_help_points_to_decision_section():
@@ -493,28 +479,6 @@ def test_local_agent_loop_doc_has_focused_bounded_local_test_section():
     assert "default 600-second whole-invocation deadline may be too short" in section
     assert "additional budget for analysis, edits, reporting, and other turn work" in section
     assert "other backend-imposed whole-turn deadline" in section
-
-
-def test_skill_docs_keep_focused_bounded_local_test_policy_aligned():
-    skill_text = SKILL.read_text(encoding="utf-8")
-    skill_section_start = skill_text.index(f"## {SKILL_LOCAL_TEST_SCOPE_HEADING_TEXT}")
-    skill_section_end = skill_text.index("\n---", skill_section_start)
-    skill_section = " ".join(skill_text[skill_section_start:skill_section_end].split())
-
-    skill_mode_text = SKILL_MODE_DOC.read_text(encoding="utf-8")
-    skill_mode_section_start = skill_mode_text.index(f"## {SKILL_MODE_LOCAL_TEST_SCOPE_HEADING_TEXT}")
-    skill_mode_section_end = skill_mode_text.index("## Session state", skill_mode_section_start)
-    skill_mode_section = " ".join(skill_mode_text[skill_mode_section_start:skill_mode_section_end].split())
-
-    for section in (skill_section, skill_mode_section):
-        assert section.count("1,800 seconds by default") == 1
-        assert "configured finite run-level ceiling" in section
-        assert "individually justified command" in section
-        assert "not a reason to choose a broad suite" in section
-        assert "foreground with visible output" in section
-        assert "background" in section
-        assert "`ps`/`kill -0`/`wait`" in section
-        assert "naming the exact command and the timeout" in section
 
 
 def test_cli_help_documents_ci_queued_grace_seconds():
@@ -1022,7 +986,7 @@ def test_antigravity_quota_group_docs_describe_five_model_chain():
         "Antigravity unavailable on all models",
     ):
         assert expected in guide
-    for doc in (README, SKILL, SKILL_MODE_DOC):
+    for doc in (README,):
         assert "Claude Opus 5.5 (Medium)" in doc.read_text(encoding="utf-8")
     architecture = _architecture_set_text()
     assert "Antigravity quota-group fallback" in architecture
@@ -1759,3 +1723,12 @@ def test_hang_diagnostic_timing_and_attribution_limits():
             "does not terminate the test", "existing timeout and shard failure gates",
         ):
             assert phrase in text, (document, phrase)
+
+
+@pytest.mark.parametrize("command", ["issue", "pr", "managed-pr", "task", "discuss"])
+def test_claude_model_help_describes_execution_and_signature(command):
+    parser = build_parser()
+    subparsers = parser._subparsers._group_actions[0].choices
+    help_text = " ".join(subparsers[command].format_help().split())
+    assert "Claude model to run and stamp in the signature." in help_text
+    assert "Mutually exclusive with --claude-arg --model." in help_text

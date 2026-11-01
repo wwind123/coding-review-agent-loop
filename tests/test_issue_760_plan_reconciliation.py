@@ -25,7 +25,7 @@ from coding_review_agent_loop.unresolved_items import (
     _raise_if_maintained_disputed_items,
     _validate_coder_followup_response,
     _validate_review_response,
-    apply_item_dispositions,
+    _apply_unresolved_item_dispositions,
 )
 from coding_review_agent_loop.repair import _build_repair_prompt
 
@@ -324,7 +324,7 @@ def test_fixture_scenarios_use_their_review_finding_and_existing_orchestration_r
             reviewer="OpenAI Codex",
             unresolved_items=tuple(annotated), architecture_status_mode="legacy",
         )
-        remaining, future = apply_item_dispositions(
+        remaining, future = _apply_unresolved_item_dispositions(
             tuple(annotated),
             {"item-1": list(maintained_review.dispositions)},
             same_status="same-pr",
@@ -354,7 +354,7 @@ def test_fixture_scenarios_use_their_review_finding_and_existing_orchestration_r
         reviewer="OpenAI Codex",
         unresolved_items=(item,), architecture_status_mode="legacy",
     )
-    remaining, future = apply_item_dispositions(
+    remaining, future = _apply_unresolved_item_dispositions(
         (item,),
         {"item-1": list(resolved_review.dispositions)},
         same_status="same-pr",

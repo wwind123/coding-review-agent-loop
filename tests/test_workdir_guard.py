@@ -192,7 +192,7 @@ def test_chained_managed_tests_preserve_wrapper_exemption(tmp_path, origin, wrap
     wrapped = (
         f"EXECUTION_MODE=inline {wrapper} --timeout-seconds 120 "
         "--memory-dir '/outside/cache with spaces' -- python3 -m pytest "
-        "tests/test_skill_helpers.py tests/test_decomposition.py tests/test_split_materialization.py -q"
+        "tests/test_repair.py tests/test_decomposition.py tests/test_split_materialization.py -q"
     )
     validate_test_commands_within_workdir(
         [chain.format(wrapper=wrapped)], assigned_workdir=tmp_path, origin=origin,

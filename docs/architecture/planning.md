@@ -60,7 +60,7 @@ and execution ownership. Draft changes are auditable before approval; the
 approved payload is immutable until a newly reviewed substantive replan. Round
 metadata and its existing sidecar authenticate canonical structured bytes and a
 payload-bound section boundary independently of rendered markdown. Prompts,
-repair, skill mode, and PR resume consume the semantic payload first. Renderer
+repair and PR resume consume the semantic payload first. Renderer
 drift therefore does not invalidate authentic history; malformed, oversized, or
 matrix-only hydration/rendering data closes only the matrix channel and leaves
 an independently valid plan hash/subject available. Legacy records remain
@@ -101,8 +101,7 @@ skips the repair model and becomes a replan diagnostic instead. Every plan promp
 through one shared lossless renderer that shows exactly the compared form. Both
 prompt blocks fail closed rather than truncate: oversized parent obligations
 stop child planning before any planner turn, and an oversized delta set rejects
-the candidate into the replan loop. Parent dispatch, direct child invocation,
-and both skill-runner PR-validation branches apply the same function.
+the candidate into the replan loop. Parent dispatch and direct child invocation apply the same function.
 
 A historical approved child plan that fails this comparison has two audited
 recovery edges instead of a dead end. Before any implementation handoff, the
@@ -479,7 +478,7 @@ reviewed child plan.
 
 The phase handoff is the durable no-switch boundary. Its effective disposition
 and optional override-record digest are reconciled identically during parent
-preflight, direct child entry, PR recovery, and skill-mode recovery. An
+preflight, direct child entry, and PR recovery. An
 override-bound mismatch is accepted only while the exact signed record remains
 discoverable and matches the parent, plan, stage, and disposition; edited,
 deleted, post-handoff, conflicting, or superseding records stop for human

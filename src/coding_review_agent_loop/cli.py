@@ -552,7 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--claude-model",
             default="",
             help=(
-                "Claude model to run (CLI mode) / declare for the signature (host mode). "
+                "Claude model to run and stamp in the signature. "
                 "Mutually exclusive with --claude-arg --model."
             ),
         )
