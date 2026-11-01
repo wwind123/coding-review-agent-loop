@@ -335,7 +335,7 @@ startup.
   staged restart of a completed round applies the recorded dispositions of
   reviewers paused on their carried exact-plan approvals, so items they
   resolved in that round are not reopened.
-- **Plan root anchor and legacy root.** Every plan round record carries
+- **Plan root anchor and legacy root.** Substantive plan round records carry
   `plan_board_root` and `plan_board_identity`, stamped at the single
   round-metadata encoder (`set_plan_board_stamp`). Board identity fields are
   flow-scoped: `plan_board_*` fields on a PR-flow record, `pr_board_*` fields on
@@ -347,6 +347,23 @@ startup.
   agent invocation. The configured policy and primary seed the root only for a
   plan with no round records at all, so even coder-only legacy history keeps
   the all-reviewers root. Persisted rounds are never rewritten.
+- **Neutral staged advances.** An identity-less orchestrator summary with phase
+  `plan-phase-advance` is admitted read-only, including existing persisted
+  history, when it claims no scheduler metadata, board fields, lineage digests,
+  new findings, dispositions or evidence clearances. Carried prior items remain
+  obligations. In index-ordered projected plan history, the immediately preceding
+  contiguous same-subject round must be N before the advance to N+1 and contain
+  reconciliation (including legacy authoritative reconciliation). Supported used
+  scheduler openings and qualified reviews after reconciliation are permitted;
+  they retain their own validation and obligations. Idle checkpoints removed by
+  projection do not affect the boundary. Different subjects or rounds cannot be
+  bridged, and an optional advance candidate key must agree with available keys
+  in that segment. Only eligible advances are excluded from legacy seat-binding
+  comparisons, including under the root or successive links; their bindings
+  also cannot seed legacy root derivation. Binding structure remains validated.
+  They cannot initialize seats, consume links or amendments, claim scheduling or supply
+  approval. Raw history remains available; records after a still-pending link
+  remain refused. This exception does not broaden amendment activation.
 - **Plan board-change links.** For a plan that is not approved, a configured
   plan board that differs from the effective one is posted as one
   orchestrator-authored link on the issue. That covers membership, primary,
