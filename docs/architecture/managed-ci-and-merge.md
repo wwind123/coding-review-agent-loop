@@ -2,7 +2,7 @@
 
 How agent-loop observes CI and merges: the counted check board, managed exact-head CI and its hosted workflow boundary, managed-label handling, base-workflow dispatch authorization, sharded and split layouts, integration targets, preflight 403 fallbacks and protection states, issue-created managed-CI authorization, the authorization continuity chain across coder, merge-conflict, CI-repair and rejected-coder recovery heads, and the coder CI-dispatch guard.
 
-Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_reconciliation.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/managed_ci_status.py`, `src/coding_review_agent_loop/pr_loop_plumbing.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
+Source paths: `src/coding_review_agent_loop/checks.py`, `src/coding_review_agent_loop/ci_health.py`, `src/coding_review_agent_loop/managed_ci.py`, `src/coding_review_agent_loop/managed_ci_reconciliation.py`, `src/coding_review_agent_loop/managed_ci_failure.py`, `src/coding_review_agent_loop/managed_ci_result.py`, `src/coding_review_agent_loop/managed_ci_status.py`, `src/coding_review_agent_loop/pr_loop_plumbing.py`, `src/coding_review_agent_loop/managed_ci_recovery_commands.py`, `src/coding_review_agent_loop/managed_ci_intent_validation.py`, `src/coding_review_agent_loop/managed_ci_bases.py`, `src/coding_review_agent_loop/managed_pr.py`, `src/coding_review_agent_loop/coder_ci_guard.py`, `src/coding_review_agent_loop/integration_close.py`, `src/coding_review_agent_loop/github.py`, `.github/workflows/ci.yml`, `.github/workflows/managed-ci.yml`, `ci/managed/ci_shard_verify.py`, `tests/test_managed_ci.py`, `tests/test_ci_sharding.py`, `tests/test_managed_ci_integration_bases.py`, `tests/test_pr_loop_ci_gate.py`, `tests/test_pr_loop_managed_ci.py`, `tests/test_pr_loop_merge.py`, `tests/test_pr_loop_coder_ci_guard.py`.
 
 ## CI and Merge
 
@@ -83,7 +83,7 @@ qualify for manual merging instead.
 
 A repair checkpoint has a separate observation path in
 `managed_ci_reconciliation.py` (#1709). `FailedManagedRun` binds the original
-completed audit record, nonce, run, failed attempt, generation and workflow
+audit record, nonce, run, failed attempt, generation and workflow
 revision to the repository, PR, target head, base and obligation. Before repair
 routing and immediately before a coder handoff, a bounded read can verify a
 later successful attempt of that same run. It uses the shared status predicates
@@ -96,7 +96,33 @@ settle the obligation. A pending or unreadable rerun stops before another
 coder handoff, retaining the obligation and its budget. Observation never
 renews an audit record or dispatches CI.
 
-The baseline failure can authorize repair during the publication race: the
+The ordinary and managed CI watch default is 2400 seconds, independent of the
+hosted 30-minute shard timeout. Positive shorter and longer overrides are
+preserved; longer consumer jobs and queue delays can require larger budgets.
+Startup timeout and opt-in ordinary watching stay unchanged.
+
+`managed_ci_failure.py` provides a separate live failure path. A complete,
+consistent paginated attempt-jobs response can report a completed non-plumbing
+`failure` or `timed_out` before sibling completion, ahead of infrastructure-stall
+routing. Strict workflow provenance, original intent identity and a positive
+raw live attempt are revalidated around observation, together with head, base
+and managed authority. Cancelled, startup failure and action-required jobs
+alone do not grant early repair authority. Legacy status watching and terminal
+classification are unchanged. Success still requires correlated final status
+and the complete counted board; job success alone never qualifies.
+
+The existing repair obligation retains the failed reference. Before coder
+handoff, both in-process and on restart, fresh original-reference authentication
+and exact-attempt jobs must still justify repair. Ambiguity stops boundedly
+without spending a coder round. Active intents stay attached for the publisher;
+only an authenticated terminal observation of that exact baseline can settle
+the original record, using correlated terminal status or the bounded no-status
+confirmation. Later attempts and superseding intents cannot be overwritten.
+A coder head change leaves old attached history for normal new-head activation.
+No job cancellation, status publication or plumbing rerun is added. Historical
+clearance keeps its completed-record and later-completed-success gates.
+
+The baseline failure can also authorize repair during the publication race: the
 strictly authenticated live run must be `in_progress` with no conclusion and
 explicitly report a positive integer attempt equal to the recorded failed
 attempt. A matching authenticated failure status must bind the nonce, run,

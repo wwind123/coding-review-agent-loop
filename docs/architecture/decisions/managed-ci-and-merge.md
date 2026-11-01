@@ -25,3 +25,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Same-head managed repair recovery observes an authenticated later successful attempt of the recorded run through a separate immutable result, preserving fresh-generation dispatch authority and carrying original result identity into automatic proof and manual publication (#1709).
 
 - Reusable ordinary and managed shard jobs share an optional consumer-selected job budget; named pytest timeouts and the outer shard ceiling address different hangs while preserving aggregate and authorization gates, and local CI watching remains independent (#1769).
+
+- The local watch defaults to 2400 seconds; authenticated current-attempt test failures can authorize early repair through fresh live job evidence while active intents remain attached and historical clearance retains completed-result gates (#1790).

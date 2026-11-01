@@ -6959,12 +6959,38 @@ blocks (ordinary `ci` and `managed`), coordinating their pinned revisions:
 ```
 
 The selected shard job budget is independent of the local CI watch. The
-30-minute default exceeds `--ci-timeout-seconds 1200` (20 minutes); local watch
-expiry does not cancel hosted CI. For the default job budget, for example,
-select `--ci-timeout-seconds 2400`, allowing additional time for validation,
-queueing, setup, aggregation and publication. This is an example, not a guarantee
-under arbitrary queue delays. Larger consumer budgets need a correspondingly
-longer watch plus that overhead. CLI defaults remain unchanged.
+local ordinary and managed watch defaults to **2400 seconds** (40 minutes),
+covering the 30-minute default with ten minutes for validation,
+queueing, setup, aggregation and publication. Watch expiry does not cancel hosted CI.
+This is not a guarantee under arbitrary queue delays. Explicit positive
+shorter overrides such as `--ci-timeout-seconds 1200` are preserved, as are
+longer overrides such as `--ci-timeout-seconds 2400` or
+`--ci-timeout-seconds 4200`. Larger consumer budgets need a correspondingly
+longer watch plus overhead. Startup timeout and opt-in ordinary watching are
+unchanged.
+
+Managed v2 watching can report a failed test shard while siblings are still
+running and the final status is absent or pending. Only completed non-plumbing
+jobs with `failure` or `timed_out` count, from a complete paginated jobs listing
+for the authenticated run's exact current positive attempt. The watcher
+rechecks live attempt, head, base and authority after reading jobs. Ambiguous,
+stale or unreadable evidence continues the bounded watch. An allowed test
+failure takes precedence over sibling infrastructure stalls; `cancelled`,
+`startup_failure` and `action_required` alone retain existing infrastructure
+recovery or bounded watching. Legacy managed CI keeps status-based watching.
+
+Early failure creates the existing repair obligation without cancelling jobs,
+publishing status or rerunning plumbing. Coder handoff freshly authenticates
+the original audit reference and job evidence, both in-process and on restart.
+Lost authority or an advanced attempt retains the checkpoint and stops before
+consuming a coder round. The active intent remains attached for the in-flight
+publisher. On same-head resume, the exact terminal baseline settles through
+correlated terminal status or the bounded terminal-without-status confirmation;
+a newer attempt cannot be stamped as that baseline. Historical clearance still
+requires a completed record, a later completed successful attempt, correlated
+status and a complete board. After a coder head change the old attachment is
+historical. A fresh same-head invocation can queue behind unfinished baseline
+shards; explicit longer watch budgets may be needed.
 
 A failed per-test timeout or a shard job timeout reaches the always-evaluated
 aggregate, whose literal all-shards-success gate fails before the coverage

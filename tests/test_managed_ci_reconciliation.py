@@ -610,7 +610,8 @@ def test_baseline_race_requires_explicit_live_attempt(tmp_path, attempt):
     else:
         with pytest.raises(ci.AgentLoopError, match='repair remains unresolved'):
             _handoff(fixture)
-    assert runner.run_reads == 1
+    # Live job evidence is probed before the existing published-status route.
+    assert runner.run_reads == 2
     assert dataclasses.asdict(contract) == before
     _no_dispatch_or_agents(runner)
 
@@ -748,7 +749,8 @@ def test_baseline_failure_classification_and_normalized_url(tmp_path, state):
     status['target_url'] += '/?view=logs#summary'
     runner.pr_status_payload['statuses'] = [status]
     _handoff(fixture)
-    assert runner.run_reads == 1
+    # Live job evidence is probed before the existing published-status route.
+    assert runner.run_reads == 2
     assert any(f'/commits/{V2_HEAD}/statuses?' in part
                for cmd, _ in runner.commands for part in cmd)
     _no_dispatch_or_agents(runner)
