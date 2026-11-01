@@ -43,3 +43,4 @@ timeout = 600
 timeout_method = "signal"
 # Independent watchdog prints stacks without terminating the test.
 faulthandler_timeout = 300
+markers = ["image_cli_contract: explicit provider-free conformance of pinned real image CLIs"]

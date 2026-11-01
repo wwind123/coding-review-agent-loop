@@ -466,6 +466,7 @@ class AgentSelection:
 
 def configured_agent_selections(config: AgentLoopConfig) -> tuple[AgentSelection, ...]:
     """Every agent a sandboxed run could spawn, with the option that selects it."""
+    from .reviewer_seats import seat_backend
     selections = [
         AgentSelection("coder", config.coder, "--coder claude|codex"),
     ]
@@ -476,15 +477,16 @@ def configured_agent_selections(config: AgentLoopConfig) -> tuple[AgentSelection
             )
         )
     for reviewer in config.reviewer:
-        selections.append(AgentSelection("reviewer", reviewer, "--reviewer claude|codex"))
+        selections.append(AgentSelection("reviewer", seat_backend(reviewer), "--reviewer claude|codex"))
     for seat in getattr(config, "reviewer_seats", ()):
+        seat_id = getattr(seat, "seat_id", str(seat))
         selections.append(AgentSelection(
-            f"reviewer seat {seat.seat_id!r}", seat.backend,
-            f"--reviewer-seat {seat.seat_id}=claude|codex",
+            f"reviewer seat {seat_id!r}", seat.backend,
+            f"--reviewer-seat {seat_id}=claude|codex",
         ))
     if config.primary_reviewer is not None:
         selections.append(
-            AgentSelection("primary_reviewer", config.primary_reviewer, "--primary-reviewer claude|codex")
+            AgentSelection("primary_reviewer", seat_backend(config.primary_reviewer), "--primary-reviewer claude|codex")
         )
     if config.primary_plan_reviewer is not None:
         selections.append(

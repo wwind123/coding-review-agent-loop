@@ -236,6 +236,18 @@ visible. Stable-failure rules, journal schema, environment privacy and PR
 approval gates are unchanged. See the [CLI guide](../local_agent_loop.md#failures-restored-across-a-restart)
 for the full receipt eligibility contract.
 
+
+## Internal image transport components
+
+The library-only image transport (#1794) is owned by
+`review_images_transport.py` (sealed input ownership),
+`review_images_capabilities.py` (seat and executable/model admission),
+`review_images_adapter.py` and `review_images_proof.py` (native delivery and proof),
+`review_images_validation.py` (single-acquisition acceptance), and
+`review_images_prompts.py` (bounded visual scope). Optional inputs pass through
+`agents/base.py`, `agents/registry.py`, both supported adapters and
+`validated_agent.py`. See [Execution and concurrency](execution-and-concurrency.md#internal-image-transport-1794).
+
 ## Decisions
 
 [Decision log](decisions/components.md)

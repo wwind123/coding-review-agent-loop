@@ -1,0 +1,195 @@
+{
+  "stdout": "",
+  "records": [
+    {
+      "type": "system",
+      "subtype": "init",
+      "session_id": "ceec5dd0-1364-4ddf-8ea6-2cca1440882d",
+      "model": "claude-sonnet-4-6"
+    },
+    {
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "Visual acquisition 85b5a88d-e54c-4976-905e-655ba8ac656e.\nInspect visible defects. Say VISUAL_OK.\nReturn your assessment in the final response."
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAC0lEQVR4nGNgQAcAABIAAXfx+gAAAAAASUVORK5CYII="
+            }
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAC0lEQVR4nGNgQAcAABIAAXfx+gAAAAAASUVORK5CYII="
+            }
+          },
+          {
+            "type": "image",
+            "source": {
+              "type": "base64",
+              "media_type": "image/png",
+              "data": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAC0lEQVR4nGNgQAcAABIAAXfx+gAAAAAASUVORK5CYII="
+            }
+          }
+        ]
+      },
+      "session_id": "ceec5dd0-1364-4ddf-8ea6-2cca1440882d",
+      "parent_tool_use_id": null,
+      "uuid": "85b5a88d-e54c-4976-905e-655ba8ac656e",
+      "timestamp": "2026-11-01T14:53:35.099Z",
+      "isReplay": true
+    },
+    {
+      "type": "assistant",
+      "message": {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [
+          {
+            "type": "text",
+            "text": "VISUAL_OK"
+          }
+        ],
+        "stop_reason": null,
+        "stop_sequence": null,
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 0
+        },
+        "context_management": null
+      },
+      "parent_tool_use_id": null,
+      "session_id": "ceec5dd0-1364-4ddf-8ea6-2cca1440882d",
+      "uuid": "6e6fa020-d016-4d91-a7e2-86529a688cb9",
+      "timestamp": "2026-11-01T14:53:35.139Z",
+      "user_message_uuid": "85b5a88d-e54c-4976-905e-655ba8ac656e",
+      "user_message_uuids": [
+        "85b5a88d-e54c-4976-905e-655ba8ac656e"
+      ]
+    },
+    {
+      "duration_api_ms": 13,
+      "stop_reason": "end_turn",
+      "session_id": "ceec5dd0-1364-4ddf-8ea6-2cca1440882d",
+      "total_cost_usd": 1.7999999999999997e-05,
+      "usage": {
+        "input_tokens": 1,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 1,
+        "output_tokens_details": {
+          "thinking_tokens": 0
+        },
+        "server_tool_use": {
+          "web_search_requests": 0,
+          "web_fetch_requests": 0
+        },
+        "service_tier": "standard",
+        "cache_creation": {
+          "ephemeral_1h_input_tokens": 0,
+          "ephemeral_5m_input_tokens": 0
+        },
+        "inference_geo": "",
+        "iterations": [],
+        "speed": "standard",
+        "fallback_credit": null
+      },
+      "modelUsage": {
+        "claude-sonnet-4-6": {
+          "inputTokens": 1,
+          "outputTokens": 1,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0,
+          "webSearchRequests": 0,
+          "costUSD": 1.7999999999999997e-05,
+          "contextWindow": 200000,
+          "maxOutputTokens": 32000,
+          "thinkingTokens": 0,
+          "cacheCreationEphemeral5mInputTokens": 0,
+          "cacheCreationEphemeral1hInputTokens": 0,
+          "canonicalModel": "claude-sonnet-4-6",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      },
+      "permission_denials": [],
+      "terminal_reason": "completed",
+      "fast_mode_state": "off",
+      "fast_mode_disabled_reason": "sdk_opt_in_required",
+      "subagent_stats": {
+        "spawned": 0,
+        "requested": {
+          "background": 0,
+          "foreground": 0,
+          "unset": 0
+        },
+        "started_in_background": 0,
+        "max_depth": 0,
+        "spawned_by_subagents": 0,
+        "completed": 0,
+        "failed": 0,
+        "killed": {
+          "parent": 0,
+          "user": 0,
+          "system": 0
+        },
+        "refused": {
+          "depth_limit": 0,
+          "concurrency_limit": 0,
+          "budget": 0
+        },
+        "by_type": {}
+      },
+      "safety_stops": 0,
+      "is_error": false,
+      "num_turns": 1,
+      "subtype": "success",
+      "api_error_status": null,
+      "result": "VISUAL_OK",
+      "ttft_ms": 57,
+      "type": "result",
+      "duration_ms": 64,
+      "uuid": "f7277512-9c36-4664-a854-ce3d3a9c1474",
+      "ttft_stream_ms": 56,
+      "time_to_request_ms": 50,
+      "first_content_frame_ms": 56,
+      "user_message_uuid": "85b5a88d-e54c-4976-905e-655ba8ac656e",
+      "user_message_uuids": [
+        "85b5a88d-e54c-4976-905e-655ba8ac656e"
+      ],
+      "request_sent_wall_ms": 1793544815133,
+      "first_request_input_tokens": 1,
+      "queued_turn_count": 0,
+      "result_index": 0,
+      "model_usage_since_last_result": {
+        "claude-sonnet-4-6": {
+          "inputTokens": 1,
+          "outputTokens": 1,
+          "cacheReadInputTokens": 0,
+          "cacheCreationInputTokens": 0,
+          "webSearchRequests": 0,
+          "costUSD": 1.7999999999999997e-05,
+          "contextWindow": 200000,
+          "maxOutputTokens": 32000,
+          "thinkingTokens": 0,
+          "cacheCreationEphemeral5mInputTokens": 0,
+          "cacheCreationEphemeral1hInputTokens": 0,
+          "canonicalModel": "claude-sonnet-4-6",
+          "provider": "firstParty",
+          "costBasis": "list"
+        }
+      }
+    }
+  ]
+}

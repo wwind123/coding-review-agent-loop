@@ -835,6 +835,62 @@ and delegated cleanup receipts are required evidence; ordinary CI skips or mock
 launches cannot demonstrate confinement.
 
 
+
+## Internal image transport (#1794)
+
+`review_images_transport.py` validates capture's sealed `SnapshotSet`: exact
+head/config/snapshot digests, inventory, screenshot/baseline mapping, read-only
+descriptors, seals, PNG bounds, sizes and hashes. It owns duplicated descriptors
+until acquisition exit, never reopening manifest paths. Shared baselines use one entry; distinct paths retain equal-byte multiplicity.
+
+`review_images_capabilities.py` resolves one named or legacy reviewer to an
+immutable model/effort view; omission requires the configured primary. Its catalog
+pins executable hashes, releases, explicit models and proof grammar.
+Unknown aliases, overrides and unverified model chains refuse. Local version
+probes use a private home without model calls; alias warnings are diagnostic.
+Identity is rechecked around spawn; no admission cache persists.
+
+`review_images_adapter.py` preserves reviewer permissions and containment.
+Unconfirmed managed cleanup blocks proof and validation at any exit status,
+before parsing or normalization, without retry. Claude embeds base64 PNG blocks in one correlated stdin message,
+disables user/project settings, and needs no filesystem grant. Sandboxed mode
+retains exactly one reviewer tool grant; default mode disables tools. Actual tool
+use fails proof. Codex passes one equals-form image option per owned
+`/proc/<parent>/fd/<fd>` path, then `--` and stdin `-`. Native loading adds no grants, writable copies or descriptor inheritance;
+incompatible proc visibility refuses. PNGs are limited to 768 pixels per dimension and 2 MiB each,
+within capture's aggregate bounds. Unverified transformations fail digest checks.
+
+`review_images_proof.py` separates proof from generated text. Claude requires
+complete replay and single-turn completion; continuation blocks must share the
+correlated CLI message ID. Codex opens the fresh named session with bounded,
+ownership-checked, no-follow reads. Both verify ordered inventory and final text,
+allowing commentary and non-tool reasoning. Before attribution, Codex allowlists
+non-tool records: message/reasoning items, developer tool declarations and known
+events. Calls, outputs, execution items and unknown kinds fail even without turn
+IDs. Declarations supply no proof. Replay, images and malformed streams never
+become response, transient or repair candidates. Private logs retain streams;
+stdin summaries redact payloads without changing delivery.
+
+Model identity is CLI-record evidence, not provider attestation. Codex uses the
+current-turn session record behind `_detect_codex_model`, including fresh-session
+and turnless metadata; Claude uses current-turn `model`/`modelUsage` events,
+including init. Every reported model must match the explicit seat model. Missing
+or differing evidence fails; configured labels and foreign turns cannot supply it.
+Unrecorded server-side substitution is an accepted limitation, as for text review.
+Independent actual-request image proof remains mandatory. Provider-free conformance
+runs production preflight and adapters with real permissions in both modes,
+checking requests and reasoning/multiple-message output in a loopback-only network
+namespace. Default CI replays fixtures and deselects real CLI tests before sharding;
+explicit selection fails on missing prerequisites.
+
+`review_images_validation.py` requires original proof for every candidate,
+including timeout/nonzero exits and envelope normalization. Repair has no images
+or authority to change proof. Resume, re-asks, fallbacks, updater replay and
+post-submission retries are disabled; uncertain completion is terminal. The bounded prompt encloses manifest, inventory, mappings
+and diff as escaped untrusted data and requests only visible defects and coverage.
+Parent #1787 owns scheduling, durable state, finding authority, screenshot
+clearance and public flags; these library APIs provide none.
+
 ## Decisions
 
 [Decision log](decisions/execution-and-concurrency.md)

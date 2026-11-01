@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 import os
 import shutil
@@ -17,6 +18,7 @@ from ..usage import UsageMetadata
 
 if TYPE_CHECKING:
     from ..config import AgentLoopConfig
+    from ..review_images_transport import ImageInputs, ImageDeliveryProof
 
 AgentName = Literal["claude", "codex", "gemini", "antigravity"]
 AgentTextSource = Literal["response_file", "stdout_marker", "stdout"]
@@ -89,6 +91,8 @@ class AgentResult:
     antigravity_log_path: Path | None = None
     antigravity_log_quota_evidence: AntigravityLogQuotaEvidence | None = None
 
+    image_delivery_proof: ImageDeliveryProof | None = None
+
     def __post_init__(self) -> None:
         if self.containment is None and self.command_result is not None:
             object.__setattr__(self, "containment", self.command_result.containment)
@@ -114,7 +118,21 @@ class AgentBackend(Protocol):
         label: str | None = None,
         timeout_seconds: float | None = None,
         attempt_suffix: str | None = None,
+        image_inputs: ImageInputs | None = None,
     ) -> AgentResult: ...
+
+
+def close_image_inputs(function):
+    """Bound image descriptor ownership to a direct registry call on every exit."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        images = kwargs.get("image_inputs")
+        try:
+            return function(*args, **kwargs)
+        finally:
+            if images is not None:
+                images.close()
+    return wrapped
 
 
 def public_response_path(

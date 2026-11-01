@@ -43,3 +43,11 @@ never rewritten or deleted. The detail doc describes the current design.
 - Turn shared-health checks retry once under one store lock and publish stale only for repeated structural source/probe loss against the same current baseline, or safely confirmed generation-bound registered-record absence; uncertainty refuses the current run without durable contamination, with existing pending recovery and per-inspection budgets unchanged (#1782).
 
 - Configured source ancestors participate in initial structural-loss classification: missing or non-directory ancestors confirm root loss, while unreadable ancestors and post-yield stability failures remain unknown (#1782).
+
+- Library-only image transport owns duplicated sealed capture descriptors, admits provider-free tested executable/model contracts, and requires independent image delivery proof plus every current-turn CLI model record. Unrecorded server substitutions are an accepted limitation; absent or differing CLI models fail closed. Reviewer permissions and containment remain intact, and deterministic envelope repair retains original proof; public activation and durable state remain deferred (#1794).
+
+- Image conformance drives production preflight and adapter commands in both permission modes. All correlated CLI model metadata shares one fail-closed gate; non-tool thinking/reasoning and earlier messages do not replace the final response. Claude retains one sandboxed role tool grant and disables settings sources; visual manifests and diffs share an escaped untrusted boundary (#1794).
+
+- Codex image proof allowlists non-tool rollout records before attribution; native calls, outputs, execution items and unknown kinds fail closed, while developer tool declarations remain configuration metadata. Real-CLI tool calls and sanitized replay cover refusal after image delivery and final text in both permission modes (#1794).
+
+- Image adapter proof publication and validated acceptance share the ordinary turn's managed-cleanup predicate: unconfirmed cgroup emptiness refuses every exit status before parsing or repair, without another assessment (#1794).
