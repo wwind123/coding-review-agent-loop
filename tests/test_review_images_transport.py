@@ -116,16 +116,17 @@ def test_runner_redacts_stdin_log_without_changing_delivery(tmp_path):
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])
-def test_committed_actual_cli_replay_and_dropped_equal_byte_twin(monkeypatch, provider):
+@pytest.mark.parametrize("scenario", ["", "-reasoning"])
+def test_committed_actual_cli_replay_and_dropped_equal_byte_twin(monkeypatch, provider, scenario):
     import datetime
     import re
     import time
     from coding_review_agent_loop import review_images_proof as parser
     snapshot, images = inputs(provider)
-    fixture = json.loads((ROOT / f"tests/fixtures/review_images/{provider}-replay.json").read_text())
+    fixture = json.loads((ROOT / f"tests/fixtures/review_images/{provider}{scenario}-replay.json").read_text())
     raw = json.dumps(fixture).replace("<CWD>", str(ROOT))
     if provider == "claude":
-        acquisition = fixture["records"][1]["uuid"]
+        acquisition = next(e["uuid"] for e in fixture["records"] if e.get("type") == "user")
     else:
         acquisition = re.search(r"Visual acquisition ([a-f0-9-]+)", raw).group(1)
         old_paths = list(dict.fromkeys(re.findall(r"/proc/\d+/fd/\d+", raw)))
@@ -147,9 +148,10 @@ def test_committed_actual_cli_replay_and_dropped_equal_byte_twin(monkeypatch, pr
         assert len(proof.inventory_digests) == 3
         proof.require(images.binding)
         if provider == "claude":
-            fixture["records"][1]["message"]["content"].pop()
+            next(e for e in fixture["records"] if e.get("type") == "user")["message"]["content"].pop()
         else:
-            message = next(e for e in fixture["records"] if e.get("type") == "response_item")
+            message = next(e for e in fixture["records"] if e.get("type") == "response_item"
+                           and any(b.get("type") == "input_image" for b in e["payload"].get("content", [])))
             block = next(b for b in message["payload"]["content"] if b.get("type") == "input_image")
             message["payload"]["content"].remove(block)
         with pytest.raises(ValueError): parse()
@@ -245,8 +247,9 @@ def test_clean_text_never_supplies_claude_image_proof(fault):
 
 @pytest.mark.image_cli_contract
 @pytest.mark.parametrize("provider", ["codex", "claude"])
-@pytest.mark.parametrize("scenario", ["single", "multiple"])
-def test_real_cli_image_request_contract(tmp_path, provider, scenario):
+@pytest.mark.parametrize("scenario", ["single", "multiple", "reasoning-messages"])
+@pytest.mark.parametrize("mode", ["default", "sandboxed"])
+def test_real_cli_image_request_contract(tmp_path, provider, scenario, mode):
     binary = os.environ.get("IMAGE_CONTRACT_" + provider.upper())
     assert binary and Path(binary).is_file(), f"IMAGE_CONTRACT_{provider.upper()} must name the pinned CLI"
     bwrap = shutil.which("bwrap")
@@ -255,11 +258,14 @@ def test_real_cli_image_request_contract(tmp_path, provider, scenario):
     scratch.mkdir()
     target = scratch / "cli"
     target.touch()
+    common_git = subprocess.check_output(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                         cwd=ROOT, stdin=subprocess.DEVNULL, text=True).strip()
     command = [bwrap, "--unshare-net", "--ro-bind", "/", "/", "--tmpfs", "/tmp",
-               "--ro-bind", str(ROOT), str(ROOT), "--bind", str(scratch), str(scratch),
+               "--ro-bind", str(ROOT), str(ROOT), "--ro-bind", common_git, common_git,
+               "--bind", str(scratch), str(scratch),
                "--ro-bind", str(Path(binary).resolve()), str(target), "--proc", "/proc", "--dev", "/dev",
                "--", sys.executable, str(ROOT / "tests/fixtures/review_images/harness.py"),
-               provider, str(target), str(scratch), scenario]
+               provider, str(target), str(scratch), scenario, mode]
     run = subprocess.run(command, cwd=ROOT, stdin=subprocess.DEVNULL, capture_output=True,
                          text=True, timeout=60, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
     assert run.returncode == 0, run.stdout + run.stderr

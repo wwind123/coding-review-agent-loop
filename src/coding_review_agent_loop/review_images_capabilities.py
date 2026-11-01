@@ -7,6 +7,7 @@ from pathlib import Path
 import os
 import shutil
 import subprocess
+import tempfile
 
 from .config import DEFAULT_REASONING_EFFORT, resolve_invocation
 from .reviewer_seats import SeatAgent, seat_backend
@@ -88,10 +89,14 @@ def preflight_images(config, selection=None) -> ImageCapability:
         raise ValueError("image CLI is unavailable")
     executable = str(Path(command).resolve(strict=True))
     identity, checksum = executable_identity(executable)
-    probe = subprocess.run([executable, "--version"], stdin=subprocess.DEVNULL,
-                           capture_output=True, timeout=5, check=True,
-                           env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LC_ALL": "C"})
-    if len(probe.stdout) > 1024 or probe.stderr:
+    # Probe with isolated configuration. The pinned release can emit benign
+    # alias-setup diagnostics under a temporary home; bounded stderr is not
+    # capability evidence. Admission still requires exact version and hash.
+    with tempfile.TemporaryDirectory(prefix="image-cli-probe-") as probe_home:
+        probe = subprocess.run([executable, "--version"], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=5, check=True,
+                               env={"PATH": "/usr/bin:/bin", "HOME": probe_home, "LC_ALL": "C"})
+    if len(probe.stdout) > 1024 or len(probe.stderr) > 4096:
         raise ValueError("unrecognized image CLI version output")
     version = probe.stdout.decode().strip()
     contracts = [CONTRACTS.get((provider, version, model)) for model in chain]

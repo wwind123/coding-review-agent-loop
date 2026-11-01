@@ -31,9 +31,11 @@ assistant/result events carry that user UUID and session. Model identity uses
 all current-turn reported model/modelUsage entries. Mechanism documentation
 alone does not admit another executable or release.
 
-The `*-replay.json` fixtures retain the proof-bearing fields of the actual
-multiple-image runs, with unrelated system/tool descriptions and usage fields
-omitted. Checkout and timestamp values are placeholders; tests rebind acquisition
+The `*-replay.json` fixtures retain the proof-bearing fields of actual
+production-adapter multiple-image runs, including fresh-session model metadata.
+The `*-reasoning-replay.json` captures add non-tool thinking/reasoning and
+earlier commentary followed by final text. Unrelated system/tool descriptions
+and developer prompts are omitted. Checkout and timestamp values are placeholders; tests rebind acquisition
 IDs and native descriptor paths. The inert PNG bytes, inventory order, equal-byte
 multiplicity, shared baseline references and CLI envelope shapes are preserved.
 No fixture is a replacement for explicit real-release conformance.
@@ -52,3 +54,15 @@ Run the explicit command documented in `docs/local_agent_loop.md`, setting
 `IMAGE_CONTRACT_CODEX` and `IMAGE_CONTRACT_CLAUDE` to these exact executables.
 Missing tools fail instead of skip. Default CI deselects this marker before
 sharding and keeps the replay and negative tests.
+
+The harness now calls `preflight_images` and `run_image_adapter` with the real
+`Runner`, reviewer role permissions and model/effort environment. Twelve cases
+cover both default and sandboxed modes for single, shared-baseline/equal-byte,
+and reasoning/multiple-message requests. Codex uses production `--cd` and
+`--output-last-message`, including real configuration passthrough handling.
+Claude uses production settings isolation and exactly one `--tools` option:
+the reviewer grant in sandboxed mode, and the empty tool set in default mode.
+Version probes use production's fresh private home and restricted environment;
+bounded alias-setup stderr warnings do not replace exact version/hash admission.
+Request inventory is checked independently of successful adapter proof. Codex's
+unrecorded provider substitution remains intentional in every scenario.

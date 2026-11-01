@@ -38,7 +38,10 @@ def setup_config(tmp_path, monkeypatch, provider="claude", *, named=False, mode=
     checksum = capabilities.EXECUTABLE_DIGESTS["claude-stream-v1" if provider == "claude" else "codex-native-v1"]
     monkeypatch.setattr(capabilities, "executable_identity", lambda _: ((1, 2, 3, 4), checksum))
     calls = []
+    real_run = capabilities.subprocess.run
     def probe(args, **kwargs):
+        if args != [str(executable), "--version"]:
+            return real_run(args, **kwargs)
         calls.append((args, kwargs))
         assert args == [str(executable), "--version"]
         return SimpleNamespace(stdout=(version + "\n").encode(), stderr=b"")
@@ -49,7 +52,7 @@ def setup_config(tmp_path, monkeypatch, provider="claude", *, named=False, mode=
 @pytest.mark.parametrize("provider", ["codex", "claude"])
 @pytest.mark.parametrize("named", [False, True])
 @pytest.mark.parametrize("mode", ["default", "sandboxed"])
-def test_exact_seat_model_effort_permissions_and_reviewer_containment(tmp_path, monkeypatch, provider, named, mode):
+def test_exact_seat_model_effort_permissions_and_reviewer_containment(tmp_path, monkeypatch, provider, named, mode, private_response_tempdir):
     from coding_review_agent_loop import agent_permissions, checkout_verification, worktree_pr_env
     from coding_review_agent_loop import review_images_adapter as adapter
     from coding_review_agent_loop.review_images_transport import acquire_images
@@ -61,19 +64,16 @@ def test_exact_seat_model_effort_permissions_and_reviewer_containment(tmp_path, 
                             config_digest=snapshot.config_digest, snapshot_digest=snapshot.digest)
     snapshot.close()
     expected = capability.invocation_view
-    seen = []
     monkeypatch.setattr(checkout_verification, "verify_checkout", lambda *a, **k: None)
     monkeypatch.setattr(checkout_verification, "record_checkout_baseline", lambda *a, **k: None)
     monkeypatch.setattr(worktree_pr_env, "refuse_linked_turn", lambda *a, **k: None)
     response = tmp_path / "response.md"
     response.touch()
     monkeypatch.setattr(adapter, "public_response_path", lambda *a: response)
-    monkeypatch.setattr(adapter, "prepare_sandboxed_spawn", lambda c, p, r: response)
-    def permission_args(c, p, r, *, response_dir):
-        seen.append((p, r, response_dir))
-        return ("--narrow-role-grant",)
-    monkeypatch.setattr(adapter, "role_permission_args", permission_args)
-    monkeypatch.setattr(adapter, "role_permission_env", lambda *a: {})
+    if mode == "sandboxed":
+        agent_permissions.establish_response_root_boundary(expected)
+        if provider == "claude":
+            agent_permissions.establish_inspect_provenance(expected)
     monkeypatch.setattr(adapter, "executable_identity", capabilities.executable_identity)
     class CaptureRunner(FakeRunner):
         def configure_from_config(self, c):
@@ -96,15 +96,29 @@ def test_exact_seat_model_effort_permissions_and_reviewer_containment(tmp_path, 
                 assert args[-2:] == ["--", "-"]
                 assert [arg for arg in args if arg.startswith("--image=")] == [f"--image={path}" for path in images.paths()]
                 assert f'model_reasoning_effort="{capability.effort}"' in args
-                raw = "clean text without evidence"
+                from test_review_images_recovery import codex_records, THREAD
+                from coding_review_agent_loop import review_images_proof as parser
+                events = codex_records(images, [capability.model])
+                events[0]["payload"]["cwd"] = str(kwargs["cwd"])
+                monkeypatch.setattr(parser, "open_codex_records", lambda *a, **k: events)
+                raw = json.dumps({"type": "thread.started", "thread_id": THREAD})
             assert "base64" not in kwargs["stdin_log_summary"]
             return CommandResult(args, kwargs["cwd"], raw, "", 0)
     runner = CaptureRunner()
     result = run_agent_result(runner, agent=agent, config=config, prompt="visible defects",
                               role="reviewer", timeout_seconds=30, image_inputs=images)
     assert images._closed
-    assert bool(result.image_delivery_proof) is (provider == "claude")
-    assert seen == ([(provider, "reviewer", tmp_path)] if mode == "sandboxed" else [])
+    assert result.image_delivery_proof is not None
+    args, kwargs = runner.actual
+    if mode == "sandboxed":
+        if provider == "claude":
+            assert args.count("--tools") == 1
+            assert args[args.index("--tools") + 1] == agent_permissions.CLAUDE_READ_ONLY_TOOLS
+            response_dir = Path(args[args.index("--add-dir") + 1])
+            assert response_dir.name.startswith("turn-")
+        else:
+            assert args[args.index("--sandbox") + 1] == "read-only"
+            assert 'approval_policy="never"' in args
     assert all(call[0][-1] == "--version" for call in probes)
 
 
@@ -148,6 +162,64 @@ def test_capability_drift_closed_input_wrong_seat_and_role_refuse(tmp_path, monk
             capabilities.require_image_invocation(images, config, agent, role="reviewer", session_id=None)
     finally:
         images.close(); snapshot.close()
+
+
+@pytest.mark.parametrize("drift", ["model", "effort", "permissions", "binary", "fallback"])
+def test_preflight_binding_refuses_every_contract_change(tmp_path, monkeypatch, drift):
+    from coding_review_agent_loop.review_images_transport import acquire_images
+    config, agent, calls = setup_config(tmp_path, monkeypatch)
+    cap = capabilities.preflight_images(config)
+    snapshot, unused = inputs()
+    unused.close()
+    with acquire_images(snapshot, cap, head_sha=snapshot.head_sha,
+                        config_digest=snapshot.config_digest, snapshot_digest=snapshot.digest) as images:
+        if drift == "model": config = replace(config, reviewer_claude_model="unknown")
+        elif drift == "effort": config = replace(config, reviewer_claude_effort="high")
+        elif drift == "permissions": config = replace(config, agent_permissions="dangerous")
+        elif drift == "binary":
+            monkeypatch.setattr(capabilities, "executable_identity", lambda _: ((5, 6, 7, 8), "changed"))
+        else:
+            agent = SeatAgent(ReviewerSeat("visual", "claude", (cap.model, "unknown")), config.claude_dir)
+            config = replace(config, reviewer=(agent, "codex"), primary_reviewer=agent)
+        with pytest.raises(ValueError):
+            capabilities.require_image_invocation(images, config, agent, role="reviewer", session_id=None)
+    snapshot.close()
+    assert all(args[-1] == "--version" for args, _ in calls)
+
+
+@pytest.mark.parametrize("when", ["before-spawn", "after-spawn"])
+def test_adapter_executable_replacement_cannot_keep_delivery_proof(tmp_path, monkeypatch, when):
+    from coding_review_agent_loop import review_images_adapter as adapter
+    from coding_review_agent_loop.review_images_transport import acquire_images
+    config, agent, _ = setup_config(tmp_path, monkeypatch)
+    cap = capabilities.preflight_images(config)
+    snapshot, unused = inputs()
+    unused.close()
+    images = acquire_images(snapshot, cap, head_sha=snapshot.head_sha,
+                            config_digest=snapshot.config_digest, snapshot_digest=snapshot.digest)
+    snapshot.close()
+    raw = encode(claude_events(images))
+    identity = (cap.executable_identity, cap.executable_digest)
+    replacements = iter([identity, ((9, 9, 9, 9), "changed")] if when == "after-spawn"
+                        else [((9, 9, 9, 9), "changed")])
+    monkeypatch.setattr(adapter, "executable_identity", lambda _: next(replacements))
+    monkeypatch.setattr(adapter, "public_response_path", lambda *a: tmp_path / "response.md")
+    calls = []
+    class Scripted:
+        def run_with_log(self, args, **kwargs):
+            calls.append(args)
+            return CommandResult(args, kwargs["cwd"], raw, "", 0)
+    kwargs = dict(provider="claude", role="reviewer", session_id=None, run_id=None,
+                  label=None, timeout_seconds=30, attempt_suffix=None)
+    if when == "before-spawn":
+        with pytest.raises(ValueError, match="before spawn"):
+            adapter.run_image_adapter(Scripted(), config, "visible defects", images, **kwargs)
+        assert calls == []
+    else:
+        result = adapter.run_image_adapter(Scripted(), config, "visible defects", images, **kwargs)
+        assert len(calls) == 1 and result.image_delivery_proof is None
+        assert result.raw_output == "" and result.message_text is None
+    assert images._closed
 
 
 @pytest.mark.parametrize("raw_kind", ["malformed", "partial", "replayed-transient"])

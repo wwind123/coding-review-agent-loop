@@ -10495,11 +10495,16 @@ The catalog currently admits concrete Codex 0.166.0 / `gpt-6.1-sol` and Claude
 Inputs are bounded PNGs at most 768 pixels per dimension and 2 MiB each.
 Claude receives structured base64 blocks without new filesystem grants; Codex's
 native loader receives exact owned parent descriptor paths without expanding
-agent-shell permissions. Changed or unobservable inventories fail closed.
+agent-shell permissions. Claude image turns disable user/project settings and
+preserve the sandboxed reviewer tool grant exactly once. Actual tool use is
+rejected. Changed or unobservable inventories fail closed.
 
 Model identity is CLI-record evidence, not provider attestation. Codex uses the
 current-turn session record behind `_detect_codex_model`; Claude uses current-turn
-reported `model`/`modelUsage` events. Any differing model, or no current-turn model,
+reported `model`/`modelUsage` events, including fresh-session init metadata. Codex
+checks all current-turn and fresh-session metadata containers. Reasoning/thinking
+is permitted without tool use; only final generated text becomes the result.
+Any differing model, or no current-turn model,
 makes an image turn unsuccessful. Configured-model labels alone are insufficient.
 A server-side substitution the CLI does not record is an accepted limitation,
 as for text review today. This does not weaken independent actual-request image
@@ -10518,7 +10523,9 @@ Pinned-release conformance is opt-in: set `IMAGE_CONTRACT_CODEX` and
 `IMAGE_CONTRACT_CLAUDE` to the pinned executables, then run
 `agent-loop run-tests --timeout-seconds 240 -- python -m pytest -q -p no:cacheprovider -n 0 tests/test_review_images_transport.py --run-image-cli-contract -m image_cli_contract`.
 The harness requires Linux bubblewrap network isolation, inert credentials and
-isolated configuration, inspects actual loopback-only model requests and refuses
+isolated configuration, runs production preflight and adapters with real role
+permissions in both modes, exercises reasoning and multiple messages, inspects
+actual loopback-only model requests and refuses
 missing prerequisites rather than skipping. Default collection deselects this
 marker before managed sharding, including direct file selection. Replay tests
 remain in ordinary CI. See `tests/fixtures/review_images/README.md` for provenance.

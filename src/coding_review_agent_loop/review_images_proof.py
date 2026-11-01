@@ -38,9 +38,13 @@ def reported_models(event):
         if "canonicalModel" in event:
             found.append(event["canonicalModel"])
         if "model" in event:
-            if not isinstance(event["model"], str) or not event["model"]:
+            model = event["model"]
+            if isinstance(model, dict) and "model" in model:
+                pass  # Codex world-state model object; recursively checked below.
+            elif not isinstance(model, str) or not model:
                 raise ValueError("malformed CLI model evidence")
-            found.append(event["model"])
+            else:
+                found.append(model)
         for key, value in event.items():
             if key in {"modelUsage", "model_usage_since_last_result"}:
                 if not isinstance(value, dict):
@@ -48,6 +52,8 @@ def reported_models(event):
                 found.extend(value)
                 for usage in value.values():
                     found.extend(reported_models(usage))
+            # Inspect CLI metadata recursively, including release-specific settings.
+            # Content blocks are lists and are never model evidence.
             elif isinstance(value, dict):
                 found.extend(reported_models(value))
     return found
@@ -84,22 +90,39 @@ def claude_proof(raw, images):
     assistants = []
     completions = []
     models = []
+    message_ids = set()
     for event in events:
+        if event.get("type") != "user":
+            if (event.get("session_id") != session
+                    or event.get("user_message_uuid", acquisition) != acquisition):
+                raise ValueError("uncorrelated Claude session evidence")
+            models.extend(reported_models(event))
         if event.get("type") not in {"assistant", "result"}:
             continue
+        message = event.get("message", {})
+        message_id = message.get("id")
+        event_acquisition = event.get("user_message_uuid")
+        # Claude emits one assistant envelope per content block; only the
+        # first block carries the acquisition UUID. Later blocks must share
+        # its CLI message ID, never just the session or model label.
+        correlated_chunk = (event["type"] == "assistant" and event_acquisition is None
+                            and isinstance(message_id, str) and message_id in message_ids)
         if (event.get("session_id") != session
-                or event.get("user_message_uuid") != acquisition
+                or (event_acquisition != acquisition and not correlated_chunk)
                 or event.get("parent_tool_use_id") is not None):
             raise ValueError("uncorrelated Claude image response")
-        models.extend(reported_models(event))
         if event["type"] == "assistant":
-            message = event.get("message", {})
+            if isinstance(message_id, str) and message_id:
+                message_ids.add(message_id)
             if message.get("role") != "assistant":
                 raise ValueError("unexpected Claude response role")
             content = message.get("content", [])
-            if any(b.get("type") != "text" for b in content):
+            if any(b.get("type") not in {"text", "thinking", "redacted_thinking"} for b in content):
                 raise ValueError("image assessment attempted additional tools")
-            assistants.extend(b["text"] for b in content if isinstance(b.get("text"), str))
+            text = "\n".join(b["text"] for b in content
+                             if b.get("type") == "text" and isinstance(b.get("text"), str))
+            if text:
+                assistants.append(text)
         else:
             completions.append(event)
     if (len(completions) != 1 or completions[0].get("subtype") != "success"
@@ -107,7 +130,7 @@ def claude_proof(raw, images):
             or completions[0].get("num_turns") != 1 or not assistants):
         raise ValueError("Claude image completion is uncertain")
     text = completions[0].get("result")
-    if not isinstance(text, str) or text != "\n".join(assistants):
+    if not isinstance(text, str) or text != assistants[-1]:
         raise ValueError("Claude completion differs from generated response")
     return finish(images, digests, session, acquisition, models,
                   "Claude current-turn model/modelUsage events", text)
@@ -175,8 +198,19 @@ def codex_proof(raw, images, *, session_root, cwd, started, ended):
     digests, models, texts, complete, inventories = [], [], [], [], []
     for event in events:
         payload = event.get("payload", {})
-        if event.get("type") == "turn_context" and payload.get("turn_id") == turn:
-            models.extend(reported_models(payload))
+        # Exactly one fresh turn owns unscoped session metadata, including
+        # context emitted before task_started or after task_complete. Explicit
+        # foreign turn IDs never supply evidence or override current IDs.
+        containers = [event, payload, *(base.get(k, {}) for base in (event, payload)
+                      for k in ("turn", "turn_context", "turn_attribution"))]
+        turn_ids = {c["turn_id"] for c in containers if isinstance(c, dict) and c.get("turn_id")}
+        if turn in turn_ids and turn_ids != {turn}:
+            raise ValueError("conflicting Codex turn attribution")
+        if any(c.get("thread_id", thread) != thread for c in (event, payload)):
+            raise ValueError("foreign Codex thread metadata")
+        if not turn_ids or turn_ids == {turn}:
+            if event.get("type") != "response_item" or payload.get("role") != "user":
+                models.extend(reported_models(event))
         if event.get("type") == "response_item" and payload.get("role") == "user":
             attribution = payload.get("internal_chat_message_metadata_passthrough", {})
             content = payload.get("content", [])
@@ -192,9 +226,6 @@ def codex_proof(raw, images, *, session_root, cwd, started, ended):
                     if not value.startswith(prefix):
                         raise ValueError("Codex image downgrade or transformation")
                     digests.append(image_digest(value[len(prefix):]))
-        if (event.get("type") == "event_msg" and payload.get("type") == "thread_settings_applied"
-                and payload.get("thread_id") == thread):
-            models.extend(reported_models(payload.get("thread_settings", {})))
         if event.get("type") != "event_msg" or payload.get("turn_id") != turn:
             continue
         if payload.get("type") == "item_completed":
@@ -203,14 +234,16 @@ def codex_proof(raw, images, *, session_root, cwd, started, ended):
                 inventories.append(tuple(b["path"] for b in item.get("content", [])
                                          if b.get("type") == "local_image"))
             elif item.get("type") == "AgentMessage":
-                texts.extend(b["text"] for b in item.get("content", []) if b.get("type") == "Text")
+                texts.append("\n".join(b["text"] for b in item.get("content", []) if b.get("type") == "Text"))
+            elif item.get("type") == "Reasoning":
+                pass  # Generated reasoning is neither a tool nor a response candidate.
             else:
                 raise ValueError("image assessment attempted additional tools")
         elif payload.get("type") == "task_complete":
             complete.append(payload)
     if inventories != [images.paths()] or len(complete) != 1 or not texts:
         raise ValueError("Codex image delivery/completion is incomplete")
-    text = "\n".join(texts)
+    text = texts[-1]
     if complete[0].get("last_agent_message") != text:
         raise ValueError("Codex completion differs from generated response")
     return finish(images, digests, thread, turn, models,

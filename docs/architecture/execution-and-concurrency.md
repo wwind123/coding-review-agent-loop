@@ -838,60 +838,56 @@ launches cannot demonstrate confinement.
 
 ## Internal image transport (#1794)
 
-The disconnected `review_images_transport.py` API validates capture's sealed
-`SnapshotSet`: head/config/snapshot digests, canonical path inventory, logical
-screenshot/baseline mapping, read-only descriptor mode, seals, PNG bounds, sizes
-and hashes. It owns duplicated descriptors for one acquisition without opening
-manifest paths. Shared baselines use one entry; equal bytes at distinct paths
-retain their multiplicity. Every exit closes the owned descriptors.
+`review_images_transport.py` validates capture's sealed `SnapshotSet`: exact
+head/config/snapshot digests, canonical inventory, logical screenshot/baseline
+mapping, read-only descriptors, seals, PNG bounds, sizes and hashes. It owns duplicated descriptors until acquisition exit, never reopening manifest
+paths. Shared baselines use one entry; distinct paths retain equal-byte multiplicity.
 
-`review_images_capabilities.py` resolves exactly one configured reviewer, including
-named seats, to an immutable model/effort view. Omitted selection requires the
-configured primary. Its versioned catalog pins executable hashes, concrete CLI
-releases, explicit models and proof grammar. Unknown aliases, passthrough overrides
-and unverified model chains refuse. Bounded local version checks make no model
-call; identity is rechecked before spawn and after acquisition. There is no
-persistent capability cache or automatic admission.
+`review_images_capabilities.py` resolves one named or legacy reviewer to an
+immutable model/effort view; omission requires the configured primary. Its catalog
+pins executable hashes, releases, explicit models and proof grammar.
+Unknown aliases, passthrough overrides and unverified model chains refuse. Bounded
+version probes use a private home without model calls; bounded alias warnings are
+diagnostic only. Identity is rechecked before and after spawn; no admission cache persists.
 
-`review_images_adapter.py` preserves role `reviewer`, reviewer containment limits
-and existing response-directory permissions. Claude embeds base64 PNG blocks in
-one correlated structured stdin message, needing no filesystem grant. Codex uses
-one equals-form native image option per owned `/proc/<parent>/fd/<fd>` path,
-followed by `--` and the stdin positional `-`. Native loading adds no shell read
-grant, directory grant, writable copy or descriptor inheritance. Unsupported proc
-visibility fails closed. Images are PNGs at most 768 pixels per dimension and
-2 MiB each, within capture's aggregate limits; delivered digests must match,
-so unverified transformations fail closed.
+`review_images_adapter.py` preserves reviewer role, containment and response
+permissions. Claude embeds base64 PNG blocks in one correlated stdin message,
+disables user/project settings, and needs no filesystem grant. Sandboxed mode
+retains exactly one reviewer tool grant; default mode disables tools. Actual tool
+use fails proof. Codex passes one equals-form image option per owned
+`/proc/<parent>/fd/<fd>` path, then `--` and stdin `-`. Native loading adds no grants, writable copies or descriptor inheritance;
+incompatible proc visibility refuses. PNGs are limited to 768 pixels per dimension and 2 MiB each,
+within capture's aggregate bounds. Unverified transformations fail digest checks.
 
-`review_images_proof.py` separates CLI-origin input proof from generated text.
-Claude requires a complete correlated replay, assistant response and successful
-single-turn result. Codex opens only the fresh invocation-identified session via
-bounded, ownership-checked, no-follow directory/file opens and verifies current-turn
-image inventory and completion. Comparison preserves ordered inventory multiplicity,
-never a digest set. Replayed input, proof events, image bytes and malformed streams
-cannot become response candidates, transient classification input or repair
-diagnostics. Raw streams remain local invocation logs; optional runner stdin
-summaries redact embedded payloads without changing delivery bytes.
+`review_images_proof.py` separates input proof from generated text. Claude requires
+complete replay and successful single-turn completion; later content blocks without
+the acquisition UUID must share an already correlated CLI message ID. Codex opens
+only the fresh invocation-identified session through bounded, ownership-checked,
+no-follow opens. Both verify ordered image inventory and completion against the
+final generated text, permitting earlier commentary and non-tool thinking/reasoning.
+Replayed input, proof, image bytes and malformed streams never become response,
+transient-classification or repair candidates. Local logs retain raw streams; stdin summaries redact payloads without changing delivery.
 
 Model identity is CLI-record evidence, not provider attestation. Codex uses the
-current-turn session model from the same source behind `_detect_codex_model`;
-Claude uses current-turn reported `model`/`modelUsage` events. Every reported model
-must match the explicit seat model; absent evidence is unsuccessful. Configured
-labels cannot supply evidence. A server-side model substitution that the CLI does
-not record is an accepted limitation, as for text review today. Independent
-actual-request image proof remains mandatory. Concrete pinned Codex and Claude
-contracts require provider-free conformance in a loopback-only network namespace.
-Default CI replays fixtures and deselects real CLI tests before managed sharding;
-explicit conformance selection fails on missing prerequisites.
+current-turn session record behind `_detect_codex_model`, including fresh-session
+and turnless metadata; Claude uses current-turn `model`/`modelUsage` events,
+including init. Every reported model must match the explicit seat model. Missing
+or differing evidence fails; configured labels and foreign turns cannot supply it.
+Unrecorded server-side substitution is an accepted limitation, as for text review.
+Independent actual-request image proof remains mandatory. Provider-free conformance
+runs production preflight and adapters with real permissions in both modes,
+checking requests and reasoning/multiple-message output in a loopback-only network
+namespace. Default CI replays fixtures and deselects real CLI tests before sharding;
+explicit selection fails on missing prerequisites.
 
-`review_images_validation.py` gates every candidate on original immutable proof,
-including complete acquisitions ending with timeout/nonzero exit and deterministic
-text envelope normalization. Repair cannot access images or change proof. There
-is no completion resume, semantic re-ask, provider fallback, updater replay or
-post-submission retry. Uncertain completion is terminal. The pure bounded visual
-prompt requests visible defects and missing coverage only. These library APIs add
-no PR scheduling, durable round state, finding authority, screenshot clearance or
-public visual options; integration remains owned by parent #1787.
+`review_images_validation.py` requires original immutable proof for every candidate,
+including timeout/nonzero completion and deterministic envelope normalization.
+Repair has no images or authority to change proof. Resume, semantic re-asks,
+fallbacks, updater replay and post-submission retries are disabled; uncertain
+completion is terminal. The bounded prompt encloses manifest, inventory, mappings
+and diff as escaped untrusted data and requests only visible defects and coverage.
+These library APIs add no scheduling, durable round state, finding authority,
+screenshot clearance or public visual flags; parent #1787 owns integration.
 
 ## Decisions
 

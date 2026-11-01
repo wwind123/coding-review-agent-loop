@@ -53,7 +53,8 @@ def _acquire(runner, config, prompt, images, *, provider, role, session_id,
         args = [executable, "--print", "--input-format", "stream-json", "--output-format",
                 "stream-json", "--verbose", "--replay-user-messages", "--model", invocation.configured_model,
                 "--effort", invocation.resolved_effort, *config.claude_args, *permissions,
-                "--tools", "", "--no-session-persistence"]
+                *(() if is_sandboxed(config) else ("--tools", "")),
+                "--no-session-persistence", "--setting-sources", ""]
         blocks = [{"type": "text", "text": prompt}]
         blocks.extend({"type": "image", "source": {"type": "base64", "media_type": "image/png",
                        "data": base64.b64encode(images.read(i)).decode()}}
