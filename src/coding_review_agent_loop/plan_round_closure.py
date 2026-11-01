@@ -62,6 +62,56 @@ def project_plan_history(records: Sequence[PostedRoundRecord]) -> tuple[PostedRo
     return tuple(record for record in records if record.index not in idle)
 
 
+def neutral_plan_rollover_indices(records: Sequence[PostedRoundRecord]) -> frozenset[int]:
+    """Identify authority-free staged advances, including pre-fix persisted ones.
+
+    This is a lineage compatibility rule only. Retained work in the settled
+    predecessor round still needs its own board and scheduler validation; it
+    does not widen the separate amendment activation boundary.
+    """
+    ordered = sorted(
+        (record for record in project_plan_history(records) if record.metadata.flow == "plan"),
+        key=lambda record: record.index,
+    )
+    eligible: set[int] = set()
+    for position, record in enumerate(ordered):
+        meta = record.metadata
+        if not (
+            meta.role == "summary" and meta.agent == "Orchestrator"
+            and meta.phase == "plan-phase-advance"
+            and meta.scheduler_metadata_status == "absent"
+            and meta.scheduler_contract is None
+            and meta.scheduler_issue_digest is None
+            and not meta.scheduler_stall_reset and not meta.scheduler_step_back_deferral
+            and meta.scheduler_execution_mode is None
+            and meta.plan_board_root is None
+            and meta.plan_board_identity is None
+            and meta.plan_board_binding_init is None
+            and meta.reviewer_board_amendment_digest is None
+            and meta.reviewer_board_change_digest is None
+            and not meta.new_items and not meta.dispositions
+            and not meta.evidence_clearances
+            and not meta.evidence_requests
+            and meta.evidence_freeze is None and meta.evidence_release is None
+        ):
+            continue
+        settled = []
+        for previous in reversed(ordered[:position]):
+            if plan_round_key(previous) != (meta.subject, meta.round_number - 1):
+                break
+            settled.append(previous)
+        if not _plan_round_is_reconciled(settled):
+            continue
+        if meta.plan_candidate_key is not None and any(
+            previous.metadata.plan_candidate_key is not None
+            and previous.metadata.plan_candidate_key != meta.plan_candidate_key
+            for previous in settled
+        ):
+            continue
+        eligible.add(record.index)
+    return frozenset(eligible)
+
+
 def select_plan_round_anchor(records: Sequence[PostedRoundRecord]) -> PostedRoundRecord:
     """Reconciliation owns the ledger even when a later used checkpoint exists."""
     latest = records[-1]

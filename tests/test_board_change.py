@@ -5044,3 +5044,240 @@ def test_approved_all_reviewers_plan_resumed_with_a_baseline_budget_is_not_reope
     assert restored.plan_review_policy == "primary-then-panel"
     assert restored.plan_provenance_baseline_max_chars == 50000
     assert _plan_links(runner) == []
+
+
+# Neutral staged rollover compatibility (#1827).
+def _neutral_lineage_fixture(*, pending=False):
+    root = dataclasses.replace(_identity(("a", "codex"), ("b", "claude")), broad_rules=())
+    board = dataclasses.replace(_identity(("a", "codex"), ("c", "antigravity")), broad_rules=())
+    payload = board_change_link_payload(
+        pr_number=56, surface=PLAN_SURFACE, root=root, predecessor=root.digest,
+        old_board=root, new_board=board, old_seat_binding=root.seat_binding(),
+        binding_init={}, anchor_round=1, advance=True,
+    )
+    def stamped(round_number, identity, digest=None, **extra):
+        return PostedRoundMetadata(
+            flow="plan", role="summary", agent="Orchestrator", subject="candidate",
+            round_number=round_number, phase="reconciliation",
+            plan_board_root=root.payload(), plan_board_identity=identity.payload(),
+            plan_board_binding_init={}, seat_binding=identity.seat_binding(),
+            reviewer_board_change_digest=digest, **extra,
+        )
+    settled = stamped(1, root)
+    active = stamped(2, board, board_change_link_digest(payload))
+    advance = PostedRoundMetadata(
+        flow="plan", role="summary", agent="Orchestrator", subject="candidate",
+        round_number=2 if pending else 3, phase="plan-phase-advance",
+        prior_items=(_item(1, "a"),), seat_binding=board.seat_binding(),
+    )
+    bodies = [_attach_round_metadata("Settled root", settled),
+              str(render_board_change_link(payload, surface=PLAN_SURFACE))]
+    if not pending:
+        bodies.append(_attach_round_metadata("Settled linked round", active))
+    return bodies, advance, board
+
+
+def _resolve_neutral_plan(bodies, board):
+    from coding_review_agent_loop.panel_evidence import _plan_contract_or_none
+    from coding_review_agent_loop.board_amendment import collect_reviewer_board_amendments
+    comments = [SimpleNamespace(body=body, author_id=_PLAN_ACTOR[1]) for body in bodies]
+    return resolve_board_lineage(
+        _extract_round_metadata_records(comments, flow="plan"), comments,
+        amendments=collect_reviewer_board_amendments(comments, flow="plan", issue_number=56),
+        configured=board, pr_number=56, trusted_actor=_PLAN_ACTOR,
+        contract_from_metadata=_plan_contract_or_none,
+        drift_error=lambda persisted, detail: AgentLoopError(detail), surface=PLAN_SURFACE,
+    )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("retained", [False, True])
+def test_neutral_link_advance_preserves_lineage_authority(legacy, retained):
+    bodies, advance, board = _neutral_lineage_fixture()
+    if legacy:
+        from coding_review_agent_loop.round_state import _decode_round_metadata
+        import re
+        meta = _decode_round_metadata(re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", bodies[-1]).group(1))
+        bodies[-1] = _attach_round_metadata("Legacy settlement", dataclasses.replace(meta, phase="authoritative"))
+    if retained:
+        from coding_review_agent_loop.round_state import _decode_round_metadata
+        import re
+        meta = _decode_round_metadata(re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", bodies[-1]).group(1))
+        bodies.append(_attach_round_metadata("Retained reviewer", dataclasses.replace(
+            meta, role="reviewer", agent="a", phase="authoritative", new_items=(_item(1, "a"),),
+        )))
+    before = _resolve_neutral_plan(bodies, board)
+    bodies.append(_attach_round_metadata("Historical neutral advance", advance))
+    after = _resolve_neutral_plan(bodies, board)
+    assert after == before
+    assert advance.prior_items[0].status == "blocking"
+
+
+@pytest.mark.parametrize("changes", [
+    {"role": "reviewer", "agent": "a"}, {"role": "coder"}, {"agent": "a"},
+    {"phase": "authoritative"}, {"phase": "scheduler-prelaunch"},
+    {"scheduler_contract": {"invalid": True}},
+    {"reviewer_board_amendment_digest": "a" * 64},
+    {"new_items": (_item(2, "a"),)}, {"evidence_clearances": (("head", "item-1"),)},
+    {"subject": "another"}, {"round_number": 4},
+])
+def test_neutral_link_advance_rejects_substantive_or_unexplained_shapes(changes):
+    bodies, advance, board = _neutral_lineage_fixture()
+    bodies.append(_attach_round_metadata("Invalid advance", dataclasses.replace(advance, **changes)))
+    with pytest.raises(AgentLoopError):
+        _resolve_neutral_plan(bodies, board)
+
+
+def test_neutral_advance_does_not_activate_pending_link():
+    bodies, advance, board = _neutral_lineage_fixture(pending=True)
+    bodies.append(_attach_round_metadata("Neutral advance", advance))
+    with pytest.raises(AgentLoopError, match="after the pending board-change"):
+        _resolve_neutral_plan(bodies, board)
+
+
+@pytest.mark.parametrize("defect", ["reviewer", "scheduler", "board"])
+def test_neutral_advance_cannot_shelter_invalid_retained_work(defect):
+    bodies, advance, board = _neutral_lineage_fixture()
+    if defect == "board":
+        invalid = dataclasses.replace(advance, round_number=2, phase="reconciliation",
+                                      plan_board_root=board.payload(), plan_board_identity=board.payload())
+    else:
+        invalid = dataclasses.replace(advance, round_number=2,
+            phase="scheduler-prelaunch" if defect == "scheduler" else "authoritative",
+            role="summary" if defect == "scheduler" else "reviewer",
+            agent="Orchestrator" if defect == "scheduler" else "a")
+    bodies.append(_attach_round_metadata("Invalid retained work", invalid))
+    bodies.append(_attach_round_metadata("Neutral advance", advance))
+    with pytest.raises(AgentLoopError):
+        _resolve_neutral_plan(bodies, board)
+
+
+@pytest.mark.parametrize("older_unbound", [False, True])
+@pytest.mark.parametrize("successive", [False, True])
+def test_neutral_advances_do_not_compare_seat_bindings_across_boards(older_unbound, successive):
+    from coding_review_agent_loop.round_state import _decode_round_metadata
+    import re
+    bodies, advance, board = _neutral_lineage_fixture()
+    root_meta = _decode_round_metadata(re.search(r"<!-- AGENT_LOOP_META: (\S+) -->", bodies[0]).group(1))
+    root = BoardIdentity.from_payload(root_meta.plan_board_root)
+    root_advance = dataclasses.replace(advance, round_number=2, seat_binding=root.seat_binding())
+    bodies.insert(1, _attach_round_metadata("Neutral root advance", root_advance))
+    if older_unbound:
+        bodies.insert(0, _attach_round_metadata("Older unbound history", dataclasses.replace(
+            root_meta, plan_board_root=None, plan_board_identity=None,
+            plan_board_binding_init=None, seat_binding=None,
+        )))
+    bodies.append(_attach_round_metadata("Neutral linked advance", advance))
+    lineage = _resolve_neutral_plan(bodies, board)
+    assert not lineage.pending_links
+    if successive:
+        next_board = dataclasses.replace(board, seats=(board.seats[1], board.seats[0]))
+        payload = board_change_link_payload(
+            pr_number=56, surface=PLAN_SURFACE, root=root,
+            predecessor=lineage.elements[-1].digest, old_board=board, new_board=next_board,
+            old_seat_binding=board.seat_binding(), binding_init={}, anchor_round=2, advance=True,
+        )
+        bodies.append(str(render_board_change_link(payload, surface=PLAN_SURFACE)))
+        bodies.append(_attach_round_metadata("Genuine next-board reconciliation", dataclasses.replace(
+            root_meta, round_number=3, plan_board_identity=next_board.payload(),
+            seat_binding=next_board.seat_binding(), reviewer_board_change_digest=board_change_link_digest(payload),
+        )))
+        bodies.append(_attach_round_metadata("Neutral next-board advance", dataclasses.replace(
+            advance, round_number=4, seat_binding=next_board.seat_binding(),
+        )))
+        assert len(_resolve_neutral_plan(bodies, next_board).elements) == 2
+
+
+@pytest.mark.parametrize("binding", [None, {"broken": {}}, "changed-board"])
+def test_substantive_legacy_binding_validation_remains_strict(binding):
+    bodies, advance, board = _neutral_lineage_fixture()
+    if binding == "changed-board":
+        binding = _identity(("a", "codex"), ("b", "claude")).seat_binding()
+    bodies.insert(0, _attach_round_metadata("Legacy substantive reviewer", dataclasses.replace(
+        advance, round_number=1, role="reviewer", agent="a", phase="publication", seat_binding=binding,
+    )))
+    # A neutral summary cannot shelter structural binding problems on itself,
+    # nor differences or bound/unbound mixing on substantive legacy records.
+    bodies.insert(1, _attach_round_metadata("Bound legacy reviewer", dataclasses.replace(
+        advance, round_number=1, role="reviewer", agent="a", phase="publication",
+    )))
+    bodies.append(_attach_round_metadata("Neutral advance", advance))
+    with pytest.raises(AgentLoopError, match="binding|bound and unbound"):
+        _resolve_neutral_plan(bodies, board)
+
+
+def test_neutral_summary_still_validates_its_own_binding_structure():
+    bodies, advance, board = _neutral_lineage_fixture()
+    bodies.append(_attach_round_metadata("Malformed neutral binding", dataclasses.replace(
+        advance, seat_binding={"a": {}},
+    )))
+    with pytest.raises(AgentLoopError, match="malformed"):
+        _resolve_neutral_plan(bodies, board)
+
+
+
+def test_neutral_summary_does_not_consume_pending_amendment():
+    bodies, advance, board = _neutral_lineage_fixture()
+    bodies.append(format_reviewer_board_amendment_comment(
+        flow="plan", issue=56, pr_number=None, original_required_reviewers=board.names,
+        policy="all-reviewers", primary_reviewer=None, removed_reviewers=("c",),
+        effective_from_round=3, reason="backend-unavailable", rationale="Quota unavailable.",
+    ))
+    before = _resolve_neutral_plan(bodies, board)
+    bodies.append(_attach_round_metadata("Neutral advance", advance))
+    assert _resolve_neutral_plan(bodies, board) == before
+    assert len(before.pending_amendments) == 1
+    amended = dataclasses.replace(board, seats=(board.seats[0],))
+    element = before.elements[-1]
+    bodies.append(_attach_round_metadata("Genuine stamped work", dataclasses.replace(
+        advance, phase="reconciliation", plan_board_root=before.root.payload(),
+        plan_board_identity=amended.payload(), plan_board_binding_init={},
+        seat_binding=amended.seat_binding(), reviewer_board_amendment_digest=element.digest,
+    )))
+    assert not _resolve_neutral_plan(bodies, amended).pending_amendments
+
+
+@pytest.mark.parametrize("claim", ["digest", "identity", "binding"])
+def test_identity_bearing_advance_keeps_normal_validation(claim):
+    bodies, advance, board = _neutral_lineage_fixture()
+    before = _resolve_neutral_plan(bodies, board)
+    stamped = dataclasses.replace(
+        advance, plan_board_root=before.root.payload(), plan_board_identity=board.payload(),
+        plan_board_binding_init={}, reviewer_board_change_digest=before.elements[-1].digest,
+    )
+    if claim == "digest":
+        stamped = dataclasses.replace(stamped, reviewer_board_change_digest=None)
+    elif claim == "identity":
+        stamped = dataclasses.replace(stamped, plan_board_identity=before.root.payload())
+    else:
+        stamped = dataclasses.replace(stamped, seat_binding=before.root.seat_binding())
+    bodies.append(_attach_round_metadata("Stamped advance", stamped))
+    with pytest.raises(AgentLoopError):
+        _resolve_neutral_plan(bodies, board)
+
+
+
+def test_pr_phase_advance_does_not_receive_plan_lineage_exception():
+    root = _identity(("a", "codex"), ("b", "claude"))
+    board = _identity(("a", "codex"), ("c", "antigravity"))
+    link, digest = _link_body(root, root.digest, root, board, anchor=1, advance=True)
+    bodies = [_record_body(1, root, root), link, _record_body(2, root, board, change=digest)]
+    bodies.append(_legacy("summary", "Orchestrator", 3, phase="plan-phase-advance",
+                          seat_binding=board.seat_binding()))
+    with pytest.raises(AgentLoopError, match="carries no board identity"):
+        _resolve(bodies, configured=board)
+
+
+
+def test_neutral_summary_cannot_seed_legacy_root_bindings():
+    board = dataclasses.replace(_identity(("Codex", "codex"), ("Gemini", "gemini")), broad_rules=())
+    settled = PostedRoundMetadata(flow="plan", role="summary", agent="Orchestrator",
+        subject="candidate", round_number=1, phase="reconciliation")
+    bodies = [_attach_round_metadata("Legacy unbound settlement", settled)]
+    before = _resolve_neutral_plan(bodies, board)
+    advance = dataclasses.replace(settled, round_number=2, phase="plan-phase-advance",
+        seat_binding=_identity(("injected", "antigravity")).seat_binding())
+    bodies.append(_attach_round_metadata("Neutral bound advance", advance))
+    after = _resolve_neutral_plan(bodies, board)
+    assert after.root == before.root
+    assert after.inits == before.inits == {}

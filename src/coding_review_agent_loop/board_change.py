@@ -1214,7 +1214,10 @@ def _resolve_board_lineage(
     def init_of(metadata: object) -> object:
         return getattr(metadata, surface.init_field)
 
+    from .plan_round_closure import neutral_plan_rollover_indices
+
     ordered = sorted(records, key=lambda record: record.index)
+    neutral_advances = neutral_plan_rollover_indices(ordered) if surface.flow == "plan" else frozenset()
     links = collect_board_change_links(
         comments, pr_number=pr_number, trusted_actor=trusted_actor, surface=surface
     )
@@ -1246,7 +1249,7 @@ def _resolve_board_lineage(
         anchored = True
     else:
         root = derive_legacy_root(
-            ordered,
+            [record for record in ordered if record.index not in neutral_advances],
             configured=configured,
             amendments=amendments,
             contract_from_metadata=contract_from_metadata,
@@ -1374,7 +1377,14 @@ def _resolve_board_lineage(
         current_contract = elements[-1].contract
         segment_base = link.new_board
 
-    _validate_legacy_seat_bindings([r for r in ordered if root_of(r.metadata) is None])
+    # Neutral summaries can retain the writer's seat binding. Validate its
+    # structure individually without comparing boards across lineage segments.
+    for record in ordered:
+        if record.index in neutral_advances:
+            _validate_legacy_seat_bindings((record,))
+    _validate_legacy_seat_bindings([
+        r for r in ordered if root_of(r.metadata) is None and r.index not in neutral_advances
+    ])
 
     # Pass 2: walk records and links in comment order, accumulating binding
     # initializations and validating every record against its governing element.
@@ -1505,7 +1515,11 @@ def _resolve_board_lineage(
             if governing is not None:
                 carried.add(governing.digest)
             continue
-        # A legacy-shaped record: never under a link.
+        # Only neutral staged summaries are compatible without a stamp. They
+        # neither initialize bindings nor consume a link or amendment.
+        if record.index in neutral_advances:
+            continue
+        # A substantive legacy-shaped record: never under a link.
         if governing is not None and governing.kind == "link":
             raise _fail(
                 f"{locator} was posted under a board-change record but carries no board identity"

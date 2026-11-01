@@ -2230,3 +2230,74 @@ def test_plan_amendment_activation_boundary_requires_closed_immediate_predecesso
         amendment.effective_from_round = 0
     lineage = SimpleNamespace(pending_amendments=(amendment,))
     assert plan_amendment_activation_round(records, lineage, 2) == (1 if defect is None else 2)
+
+
+@pytest.mark.parametrize("tail", ["reconciliation", "legacy", "idle", "reviewer-backed",
+                                  "different-subject", "different-round", "unreconciled", "absent"])
+@pytest.mark.parametrize("candidate", ["absent", "matching", "contradictory"])
+def test_neutral_rollover_uses_only_contiguous_settled_projected_round(tail, candidate):
+    from coding_review_agent_loop.plan_round_closure import (
+        neutral_plan_rollover_indices, plan_amendment_activation_round, project_plan_history,
+    )
+    settled = PostedRoundMetadata(flow="plan", role="summary", agent="Orchestrator",
+                                  subject="s", round_number=1, phase="reconciliation",
+                                  plan_candidate_key={"key": "old"})
+    advance = replace(settled, round_number=2, phase="plan-phase-advance",
+        plan_candidate_key=None if candidate == "absent" else {"key": "new" if candidate == "contradictory" else "old"})
+    metas = [settled]
+    if tail == "legacy":
+        metas[0] = replace(settled, phase="authoritative")
+    elif tail == "unreconciled":
+        metas[0] = replace(settled, role="coder")
+    elif tail == "absent":
+        metas = []
+    elif tail in {"idle", "reviewer-backed"}:
+        metas.append(replace(settled, phase="scheduler-prelaunch"))
+        if tail == "reviewer-backed":
+            metas.append(replace(settled, role="reviewer", agent="Codex", state="blocking"))
+    elif tail.startswith("different-"):
+        metas.append(replace(settled, subject="other" if tail == "different-subject" else "s",
+                             round_number=3 if tail == "different-round" else 1))
+    metas.append(advance)
+    records = [PostedRoundRecord(i, m, "body") for i, m in enumerate(metas)]
+    expected = tail not in {"different-subject", "different-round", "unreconciled", "absent"} and candidate != "contradictory"
+    assert (records[-1].index in neutral_plan_rollover_indices(list(reversed(records)))) == expected
+    if tail == "reviewer-backed":
+        assert len(project_plan_history(records)) == 4
+        # The compatibility rule deliberately does not activate an amendment
+        # across retained substantive work after settlement.
+        lineage = SimpleNamespace(pending_amendments=(SimpleNamespace(comment_index=-1, effective_from_round=1),))
+        assert plan_amendment_activation_round(records, lineage, 2) == 2
+
+
+@pytest.mark.parametrize("field,value", [
+    ("flow", "pr"), ("role", "reviewer"), ("agent", "Codex"),
+    ("scheduler_metadata_status", "invalid"), ("scheduler_force_full", False),
+    ("scheduler_issue_digest", "digest"), ("scheduler_stall_reset", True),
+    ("scheduler_step_back_deferral", True), ("scheduler_execution_mode", "one-shot"),
+    ("reviewer_board_amendment_digest", "a" * 64),
+    ("reviewer_board_change_digest", "b" * 64),
+    ("new_items", (_item(),)),
+    ("dispositions", (ReviewItemDisposition("item-1", "Codex", "resolved"),)),
+    ("evidence_clearances", (("head", "item-1"),)),
+])
+def test_neutral_rollover_requires_absent_authority_fields(field, value):
+    from coding_review_agent_loop.plan_round_closure import neutral_plan_rollover_indices
+    settled = PostedRoundMetadata(flow="plan", role="summary", agent="Orchestrator",
+                                  subject="s", round_number=1, phase="reconciliation")
+    advance = replace(settled, round_number=2, phase="plan-phase-advance", **{field: value})
+    assert not neutral_plan_rollover_indices([PostedRoundRecord(0, settled, "body"),
+                                             PostedRoundRecord(1, advance, "body")])
+
+
+def test_neutral_rollover_does_not_treat_malformed_wire_scheduler_as_absent():
+    from coding_review_agent_loop.plan_round_closure import neutral_plan_rollover_indices
+    settled = PostedRoundMetadata(flow="plan", role="summary", agent="Orchestrator",
+                                  subject="s", round_number=1, phase="reconciliation")
+    advance = replace(settled, round_number=2, phase="plan-phase-advance")
+    payload = decode_mapping(_encode_round_metadata(advance))
+    payload["scheduler_contract"] = "malformed"
+    decoded = _decode_round_metadata(encode_mapping(payload))
+    assert decoded.scheduler_metadata_status == "invalid"
+    assert not neutral_plan_rollover_indices([PostedRoundRecord(0, settled, "body"),
+                                             PostedRoundRecord(1, decoded, "body")])
