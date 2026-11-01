@@ -29,7 +29,7 @@ def codex_records(images, models):
                {"type": "event_msg", "payload": {"type": "task_started", "turn_id": TURN}}]
     records.extend({"type": "turn_context", "payload": {"turn_id": TURN, "model": model}} for model in models)
     records.extend([
-        {"type": "response_item", "payload": {"role": "user",
+        {"type": "response_item", "payload": {"type": "message", "role": "user",
          "internal_chat_message_metadata_passthrough": {"turn_id": TURN},
          "content": [{"type": "input_text", "text": images.binding.acquisition_id},
                      *({"type": "input_image", "image_url": "data:image/png;base64," + base64.b64encode(images.read(i)).decode()}

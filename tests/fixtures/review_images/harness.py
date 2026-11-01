@@ -53,6 +53,7 @@ def main():
     home = scratch / "home"
     home.mkdir()
     (home / "codex").mkdir()
+    fake.tool_call = scenario == "tool-call"
     fake.provider = provider
     fake.reasoning_messages = scenario == "reasoning-messages"
     server = fake.ThreadingHTTPServer(("127.0.0.1", 0), fake.Handler)
@@ -112,6 +113,21 @@ def main():
             result = run_image_adapter(runner, config, "Inspect visible defects. Say VISUAL_OK.", images,
                                        provider=provider, role="reviewer", session_id=None,
                                        run_id=None, label=None, timeout_seconds=40, attempt_suffix=None)
+        if fake.tool_call:
+            assert result.image_delivery_proof is None
+            assert result.returncode != 0
+            assert result.raw_output == "" and result.message_text is None
+            delivered = image_blocks(fake.requests[0], provider)
+            assert [hashlib.sha256(base64.b64decode(b.split(",", 1)[1])).hexdigest()
+                    for b in delivered] == expected
+            assert len(fake.requests) == 2, "tool call must be followed by a final model turn"
+            replay = next((home / "codex").glob("sessions/**/*.jsonl")).read_text()
+            assert '"type":"function_call"' in replay
+            assert '"type":"function_call_output"' in replay
+            assert '"type":"task_complete"' in replay
+            (scratch / "replay.json").write_text(json.dumps({"stdout": runner.result.stdout, "records": replay}))
+            print(json.dumps({"provider": provider, "mode": mode, "tool_refused": True}))
+            return
         assert result.returncode == 0, (runner.result.stderr[:500], result.text)
         assert result.image_delivery_proof is not None, result.text
         if provider == "claude":

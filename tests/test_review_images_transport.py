@@ -115,8 +115,9 @@ def test_runner_redacts_stdin_log_without_changing_delivery(tmp_path):
     assert payload not in log.read_text() and "[redacted image stdin]" in log.read_text()
 
 
-@pytest.mark.parametrize("provider", ["claude", "codex"])
-@pytest.mark.parametrize("scenario", ["", "-reasoning"])
+@pytest.mark.parametrize("provider,scenario", [
+    (provider, scenario) for provider in ("claude", "codex") for scenario in ("", "-reasoning")
+] + [("codex", "-tool")])
 def test_committed_actual_cli_replay_and_dropped_equal_byte_twin(monkeypatch, provider, scenario):
     import datetime
     import re
@@ -143,6 +144,24 @@ def test_committed_actual_cli_replay_and_dropped_equal_byte_twin(monkeypatch, pr
         return parser.codex_proof(fixture["stdout"], images, session_root=Path("/unused"),
                                   cwd=ROOT, started=time.time() - 1, ended=time.time() + 1)
     try:
+        if scenario == "-tool":
+            original = fixture["records"]
+            tools = [e for e in original if
+                     (e["type"] == "response_item" and e["payload"]["type"] in
+                      {"function_call", "function_call_output"}) or
+                     (e["type"] == "event_msg" and e["payload"]["type"] == "item_completed"
+                      and e["payload"]["item"]["type"] == "CommandExecution")]
+            assert len(tools) == 3
+            clean = [e for e in original if e not in tools]
+            fixture["records"] = clean
+            text, proof = parse()
+            assert text == "VISUAL_OK"
+            proof.require(images.binding)
+            for tool in tools:
+                fixture["records"] = [*clean, tool]
+                with pytest.raises(ValueError, match="additional tools"):
+                    parse()
+            return
         text, proof = parse()
         assert text == "VISUAL_OK"
         assert len(proof.inventory_digests) == 3
@@ -246,8 +265,10 @@ def test_clean_text_never_supplies_claude_image_proof(fault):
 
 
 @pytest.mark.image_cli_contract
-@pytest.mark.parametrize("provider", ["codex", "claude"])
-@pytest.mark.parametrize("scenario", ["single", "multiple", "reasoning-messages"])
+@pytest.mark.parametrize("provider,scenario", [
+    (provider, scenario) for provider in ("codex", "claude")
+    for scenario in ("single", "multiple", "reasoning-messages")
+] + [("codex", "tool-call")])
 @pytest.mark.parametrize("mode", ["default", "sandboxed"])
 def test_real_cli_image_request_contract(tmp_path, provider, scenario, mode):
     binary = os.environ.get("IMAGE_CONTRACT_" + provider.upper())
@@ -270,6 +291,9 @@ def test_real_cli_image_request_contract(tmp_path, provider, scenario, mode):
                          text=True, timeout=60, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
     assert run.returncode == 0, run.stdout + run.stderr
     evidence = json.loads(run.stdout)
+    if scenario == "tool-call":
+        assert evidence["tool_refused"] is True
+        return
     from coding_review_agent_loop.review_images_capabilities import CONTRACTS, EXECUTABLE_DIGESTS
     contract = CONTRACTS[(provider, evidence["version"], evidence["model"])]
     assert evidence["executable_sha256"] == EXECUTABLE_DIGESTS[contract]

@@ -12,6 +12,31 @@ from .review_images_transport import ImageDeliveryProof, digest
 
 MAX_STREAM_BYTES = 96 * 1024**2
 
+# Pinned 0.166.0 non-tool rollout grammar. Check before attribution: native
+# tool records may have no turn_id. Unknown release shapes fail closed too.
+CODEX_RECORD_TYPES = frozenset({
+    "session_meta", "world_state", "turn_context", "token_usage_record",
+    "response_item", "event_msg",
+})
+CODEX_EVENT_TYPES = frozenset({
+    "task_started", "thread_settings_applied", "item_completed",
+    "token_count", "task_complete",
+})
+
+
+def require_codex_non_tool_record(event):
+    kind = event.get("type")
+    payload = event.get("payload", {})
+    tool_declarations = (kind == "response_item" and payload.get("type") == "additional_tools"
+                         and payload.get("role") == "developer")
+    if (kind not in CODEX_RECORD_TYPES
+            or (kind == "response_item" and payload.get("type") not in {"message", "reasoning"}
+                and not tool_declarations)
+            or (kind == "event_msg" and payload.get("type") not in CODEX_EVENT_TYPES)
+            or (kind == "event_msg" and payload.get("type") == "item_completed"
+                and payload.get("item", {}).get("type") not in {"UserMessage", "AgentMessage", "Reasoning"})):
+        raise ValueError("image assessment attempted additional tools or unknown Codex records")
+
 
 def records(raw):
     if len(raw.encode()) > MAX_STREAM_BYTES:
@@ -182,6 +207,8 @@ def codex_proof(raw, images, *, session_root, cwd, started, ended):
     if thread is None:
         raise ValueError("missing Codex thread identity")
     events = open_codex_records(session_root, thread, started=started, ended=ended)
+    for event in events:
+        require_codex_non_tool_record(event)
     metadata = [e["payload"] for e in events if e.get("type") == "session_meta"]
     if (len(metadata) != 1 or metadata[0].get("id") != thread
             or metadata[0].get("cwd") != str(cwd)

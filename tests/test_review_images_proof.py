@@ -43,7 +43,7 @@ def test_every_cli_model_record_shape_uses_same_gate(monkeypatch, provider, shap
         target = event["message"] if shape == "assistant" else event
         key = "canonicalModel" if shape == "canonicalModel" else "model"
     else:
-        event = {"type": "event_msg", "payload": {"type": "note", "turn_id": TURN}}
+        event = {"type": "event_msg", "payload": {"type": "thread_settings_applied", "turn_id": TURN}}
         if shape == "session_meta": event = events[0]
         elif shape == "task_complete": event = events[-1]
         elif shape in {"turn_context", "turnless_context", "nested_context", "before-context", "after-context"}:
@@ -186,5 +186,49 @@ def test_visual_untrusted_boundary_cannot_be_closed_by_input(field):
         assert attack in json.dumps(data)
         assert "Manifest, inventory, logical mappings" in prompt
         assert "untrusted data" in prompt
+    finally:
+        images.close(); snapshot.close()
+
+
+@pytest.mark.parametrize("kind,shape", [
+    *(('response_item', shape) for shape in (
+        'function_call', 'function_call_output', 'custom_tool_call',
+        'custom_tool_call_output', 'local_shell_call', 'web_search_call', 'future_tool',
+        'additional_tools')),
+    *(('event_msg', shape) for shape in (
+        'exec_command_begin', 'exec_command_end', 'patch_apply_begin', 'patch_apply_end',
+        'mcp_tool_call_begin', 'mcp_tool_call_end', 'web_search_begin', 'web_search_end',
+        'item_started', 'future_event')),
+    *(('item_completed', shape) for shape in (
+        'CommandExecution', 'McpToolCall', 'WebSearch', 'PatchApply', 'ToolCall', 'future_item')),
+    ('future_record', 'unknown'),
+])
+@pytest.mark.parametrize("attribution", ['current', 'foreign', 'absent'])
+def test_codex_all_tool_and_unknown_records_refused(monkeypatch, kind, shape, attribution):
+    snapshot, images = inputs('codex')
+    events = codex_records(images, [images.binding.configured_model])
+    payload = ({'type': 'item_completed', 'item': {'type': shape}}
+               if kind == 'item_completed' else {'type': shape})
+    if kind == 'item_completed':
+        kind = 'event_msg'
+    if attribution != 'absent':
+        payload['turn_id'] = TURN if attribution == 'current' else 'foreign'
+    events.insert(-2, {'type': kind, 'payload': payload})
+    try:
+        with pytest.raises(ValueError, match='additional tools or unknown Codex records'):
+            parse('codex', events, images, monkeypatch)
+    finally:
+        images.close(); snapshot.close()
+
+
+@pytest.mark.parametrize("shape", ['message', 'reasoning', 'additional_tools'])
+def test_codex_known_non_tool_response_records_accepted(monkeypatch, shape):
+    snapshot, images = inputs('codex')
+    events = codex_records(images, [images.binding.configured_model])
+    events.insert(-2, {'type': 'response_item', 'payload': {'type': shape, 'role': 'developer'}})
+    try:
+        text, proof = parse('codex', events, images, monkeypatch)
+        assert text == 'VISUAL_OK'
+        proof.require(images.binding)
     finally:
         images.close(); snapshot.close()

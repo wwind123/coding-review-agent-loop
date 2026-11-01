@@ -859,14 +859,16 @@ use fails proof. Codex passes one equals-form image option per owned
 incompatible proc visibility refuses. PNGs are limited to 768 pixels per dimension and 2 MiB each,
 within capture's aggregate bounds. Unverified transformations fail digest checks.
 
-`review_images_proof.py` separates input proof from generated text. Claude requires
-complete replay and successful single-turn completion; later content blocks without
-the acquisition UUID must share an already correlated CLI message ID. Codex opens
-only the fresh invocation-identified session through bounded, ownership-checked,
-no-follow opens. Both verify ordered image inventory and completion against the
-final generated text, permitting earlier commentary and non-tool thinking/reasoning.
-Replayed input, proof, image bytes and malformed streams never become response,
-transient-classification or repair candidates. Local logs retain raw streams; stdin summaries redact payloads without changing delivery.
+`review_images_proof.py` separates proof from generated text. Claude requires
+complete replay and single-turn completion; continuation blocks must share the
+correlated CLI message ID. Codex opens the fresh named session with bounded,
+ownership-checked, no-follow reads. Both verify ordered inventory and final text,
+allowing commentary and non-tool reasoning. Before attribution, Codex allowlists
+non-tool records: message/reasoning items, developer tool declarations and known
+events. Calls, outputs, execution items and unknown kinds fail even without turn
+IDs. Declarations supply no proof. Replay, images and malformed streams never
+become response, transient or repair candidates. Private logs retain streams;
+stdin summaries redact payloads without changing delivery.
 
 Model identity is CLI-record evidence, not provider attestation. Codex uses the
 current-turn session record behind `_detect_codex_model`, including fresh-session

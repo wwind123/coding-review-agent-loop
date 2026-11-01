@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 provider = None
 reasoning_messages = False
+tool_call = False
 requests = []
 
 
@@ -11,6 +12,12 @@ def codex_events():
     response = {"id": "resp_test", "object": "response", "model": "provider-substitute"}
     events = [("response.created", {"response": {**response, "status": "in_progress", "output": []}})]
     output = []
+    if tool_call and len(requests) == 1:
+        item = {"id": "fc_test", "type": "function_call", "call_id": "call_test",
+                "name": "exec_command", "arguments": json.dumps({"cmd": "printf TOOL_CALLED"})}
+        events += [("response.output_item.added", {"output_index": 0, "item": {**item, "arguments": ""}}),
+                   ("response.output_item.done", {"output_index": 0, "item": item})]
+        output.append(item)
     if reasoning_messages:
         item = {"id": "rs_test", "type": "reasoning",
                 "summary": [{"type": "summary_text", "text": "Inspecting layout."}]}

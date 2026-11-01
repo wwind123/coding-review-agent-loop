@@ -66,3 +66,11 @@ Version probes use production's fresh private home and restricted environment;
 bounded alias-setup stderr warnings do not replace exact version/hash admission.
 Request inventory is checked independently of successful adapter proof. Codex's
 unrecorded provider substitution remains intentional in every scenario.
+
+The `codex-tool-replay.json` capture retains a real `function_call` to
+`exec_command`, its `function_call_output` containing `TOOL_CALLED`, a
+`CommandExecution` completion and final assistant text. Developer tool
+declarations have their descriptions removed. The fake provider emits the
+harmless command once, then final text; production adapters refuse this turn in
+both permission modes despite complete image requests and completion. The
+explicit harness now covers fourteen cases, including these two refusals.
