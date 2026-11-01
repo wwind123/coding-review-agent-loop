@@ -1907,6 +1907,27 @@ def test_repeated_launcher_failure_refreshes_health_timestamp(tmp_path):
     assert runtime._timestamp(rows[0]["timestamp"]) == second
 
 
+@pytest.mark.parametrize("header, expected", [
+    ("", None),
+    ("\x7fELF" + "binary payload" * 10000, None),
+    ("#!/usr/bin/python3\nprint('body')\n", "/usr/bin/python3"),
+    ("#!/usr/bin/env python3\n", "python3"),
+    ("#!/usr/bin/env -S python3 -I\n", "python3"),
+    ("#!\n", None),
+    ("#!'unterminated\n", None),
+    ("#!/usr/bin/python3\r\nbody\n", "/usr/bin/python3"),
+], ids=["empty", "native", "script", "env", "env-split", "empty-shebang", "malformed", "crlf"])
+def test_shebang_interpreter_reads_only_the_header(tmp_path, header, expected):
+    opened = mock.mock_open(read_data=header)
+    with mock.patch.object(Path, "open", opened):
+        assert runtime._shebang_interpreter(tmp_path / "launcher") == expected
+    opened().read.assert_called_once_with(2)
+    if header.startswith("#!"):
+        opened().readline.assert_called_once_with()
+    else:
+        opened().readline.assert_not_called()
+
+
 def test_console_wrapper_identity_fingerprints_actual_shebang_interpreter(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()

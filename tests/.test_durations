@@ -16122,5 +16122,13 @@
  "tests/test_review_images_recovery.py::test_image_validation_guards_every_parse_against_reserved_records[AGENT_WORKFLOW_TRANSACTION-<!-- AGENT_WORKFLOW_TRANSACTION: eyJwaGFzZSI6InByZXBhcmVkIiwic2NoZW1hX3ZlcnNpb24iOjF9 -->-pr_comment-initial-True-claude]": 0.006,
  "tests/test_review_images_recovery.py::test_image_validation_guards_every_parse_against_reserved_records[AGENT_WORKFLOW_TRANSACTION-<!-- AGENT_WORKFLOW_TRANSACTION: eyJwaGFzZSI6InByZXBhcmVkIiwic2NoZW1hX3ZlcnNpb24iOjF9 -->-pr_comment-initial-True-codex]": 0.0061,
  "tests/test_review_images_recovery.py::test_image_validation_guards_every_parse_against_reserved_records[AGENT_WORKFLOW_TRANSACTION-<!-- AGENT_WORKFLOW_TRANSACTION: eyJwaGFzZSI6InByZXBhcmVkIiwic2NoZW1hX3ZlcnNpb24iOjF9 -->-pr_comment-normalized-True-claude]": 0.0062,
- "tests/test_review_images_recovery.py::test_image_validation_guards_every_parse_against_reserved_records[AGENT_WORKFLOW_TRANSACTION-<!-- AGENT_WORKFLOW_TRANSACTION: eyJwaGFzZSI6InByZXBhcmVkIiwic2NoZW1hX3ZlcnNpb24iOjF9 -->-pr_comment-normalized-True-codex]": 0.0063
+ "tests/test_review_images_recovery.py::test_image_validation_guards_every_parse_against_reserved_records[AGENT_WORKFLOW_TRANSACTION-<!-- AGENT_WORKFLOW_TRANSACTION: eyJwaGFzZSI6InByZXBhcmVkIiwic2NoZW1hX3ZlcnNpb24iOjF9 -->-pr_comment-normalized-True-codex]": 0.0063,
+ "tests/test_test_runtime.py::test_shebang_interpreter_reads_only_the_header[crlf]": 0.0044,
+ "tests/test_test_runtime.py::test_shebang_interpreter_reads_only_the_header[empty-shebang]": 0.0041,
+ "tests/test_test_runtime.py::test_shebang_interpreter_reads_only_the_header[empty]": 0.009,
+ "tests/test_test_runtime.py::test_shebang_interpreter_reads_only_the_header[env-split]": 0.0041,
+ "tests/test_test_runtime.py::test_shebang_interpreter_reads_only_the_header[env]": 0.004,
+ "tests/test_test_runtime.py::test_shebang_interpreter_reads_only_the_header[malformed]": 0.0041,
+ "tests/test_test_runtime.py::test_shebang_interpreter_reads_only_the_header[native]": 0.005,
+ "tests/test_test_runtime.py::test_shebang_interpreter_reads_only_the_header[script]": 0.004
 }
