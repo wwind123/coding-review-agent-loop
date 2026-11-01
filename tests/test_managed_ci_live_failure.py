@@ -188,8 +188,10 @@ def test_cli_ci_watch_budget_and_workflow_defaults(tmp_path, mode, budget):
     for file in ('managed-ci.yml', 'managed-ci-ordinary.yml'):
         text = (Path(__file__).parents[1] / '.github/workflows' / file).read_text()
         import re
-        assert re.search(r'shard_timeout_minutes:.*?default: 30', text, re.S)
-        assert 2400 > 30 * 60
+        shard_default = re.search(r'shard_timeout_minutes:.*?default: (\d+)', text, re.S)
+        assert shard_default is not None
+        if budget is None:
+            assert config.ci_timeout_seconds > int(shard_default.group(1)) * 60
 
 
 @pytest.mark.parametrize('auto_merge', [True, False])
@@ -303,3 +305,41 @@ def test_terminal_settlement_rechecks_baseline_after_confirmation(tmp_path, monk
     else:
         assert calls == [] and runner.intent_comments[1] == before
     assert runner.dispatch_count == 0 and observe(fixture) is None
+
+
+@pytest.mark.parametrize('auto_merge', [True, False])
+@pytest.mark.parametrize('baseline', ['active', 'settling', 'completed', 'completed-superseded'])
+def test_real_restart_conflicted_failure_reaches_conflict_coder(tmp_path, monkeypatch, auto_merge, baseline):
+    fixture = live_fixture(tmp_path, monkeypatch, auto_merge=auto_merge)
+    config, runner, metadata, contract, cp, item, ref = fixture
+    runner.pr_payload.update(mergeable='CONFLICTING', mergeStateStatus='DIRTY')
+    if baseline != 'active':
+        runner.workflow_runs[0].update(status='completed', conclusion='failure')
+        runner.pr_status_payload['statuses'] = [_status(1, 'failure')]
+    if baseline.startswith('completed'):
+        runner.intent_comments[1] = v2_intent_comment(state='completed', run_id=100, run_attempt=1)
+    if baseline == 'completed-superseded':
+        runner.intent_comments.append(v2_intent_comment(comment_id=19, nonce='z'*32, run_id=101, run_attempt=1))
+    before = copy.deepcopy(runner.intent_comments[1])
+    _capture_activation(monkeypatch)
+    calls = _stop_at_agent(monkeypatch, runner)
+    prompts = []
+    stop = runner._run_with_log_locked
+    def capture_prompt(args, **kwargs):
+        if args[0] == 'claude':
+            prompts.append(kwargs['input_text'])
+        return stop(args, **kwargs)
+    monkeypatch.setattr(runner, '_run_with_log_locked', capture_prompt)
+    with pytest.raises(RepairReached):
+        pr_loop.run_pr_loop(runner, pr_number=7, config=config, workdirs_ready=True)
+    assert len(calls) == 1 and calls[0][0] == 'claude'
+    assert len(prompts) == 1
+    assert 'merge conflict with its base branch `main`' in prompts[0]
+    assert runner.dispatch_count == 0
+    assert not any('rerun' in cmd or 'cancel' in cmd or cmd[:3] == ['gh', 'pr', 'merge']
+                   for cmd, _ in runner.commands)
+    if baseline == 'settling':
+        assert '"state":"completed"' in runner.intent_comments[1]['body']
+    else:
+        assert runner.intent_comments[1] == before
+    assert observe(fixture) is None  # conflict repair never clears CI qualification

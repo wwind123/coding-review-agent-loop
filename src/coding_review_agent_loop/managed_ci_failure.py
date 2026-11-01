@@ -140,7 +140,10 @@ def live_authority(runner, *, config, pr_number, metadata, contract):
                                             handoff=resume.issue_created_handoff)
     ci.require_recorded_base(runner, config=config, pr_number=pr_number, base_ref=contract.base_ref,
                              repository=config.repo, head_sha=metadata.head_sha, action='live failure observation')
-    return ci.get_pr_mergeability(runner, config=config, pr_number=pr_number).state != 'conflicted'
+    # Mergeability determines coder routing, not failure-evidence authority.
+    # The watcher handles conflicts before observing jobs; handoff must allow
+    # the existing conflict-resolution turn with an authenticated failure.
+    return True
 
 
 def observe_active_failure(runner, *, config, pr_number, metadata, contract, minimum=None):

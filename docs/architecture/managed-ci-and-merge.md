@@ -121,6 +121,10 @@ confirmation. Later attempts and superseding intents cannot be overwritten.
 A coder head change leaves old attached history for normal new-head activation.
 No job cancellation, status publication or plumbing rerun is added. Historical
 clearance keeps its completed-record and later-completed-success gates.
+A confirmed merge conflict routes an authenticated failure to the existing
+conflict-resolution coder turn; it does not revoke failure authority. Completed
+historical failures retain their repair authority across newer same-target
+intents; supersession rejection applies to the separate live failure path.
 
 The baseline failure can also authorize repair during the publication race: the
 strictly authenticated live run must be `in_progress` with no conclusion and
