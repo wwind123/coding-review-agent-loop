@@ -7,8 +7,7 @@ Source paths: `src/coding_review_agent_loop/architecture_context.py`, `src/codin
 ## Tests and Document Maintenance
 
 [`tests/`](../../tests/) contains focused tests for the orchestrator flows, protocol,
-resume/transport, scheduling, CI contracts, backend adapters, process execution,
-and skill helpers. Fake subprocess/GitHub runners let lifecycle tests run
+resume/transport, scheduling, CI contracts, backend adapters, and process execution. Fake subprocess/GitHub runners let lifecycle tests run
 without real provider turns or GitHub mutations. They cannot fully reproduce
 provider behavior, GitHub eventual consistency, or every host capability.
 

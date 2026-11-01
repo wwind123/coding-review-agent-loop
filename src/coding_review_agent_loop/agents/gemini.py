@@ -40,8 +40,8 @@ _GEMINI_CUTOFF_WARN_AHEAD_DAYS = 14
 _GEMINI_MIGRATION_GUIDANCE = (
     "Gemini CLI consumer access (free / Google AI Pro / Ultra) is retiring on "
     "2026-06-18. If you are on a personal Google account, migrate to Antigravity "
-    "(`agy`): --coder antigravity / --reviewer antigravity (skill: --agent "
-    "antigravity). Gemini CLI remains supported for enterprise / API-key paths."
+    "(`agy`): --coder antigravity / --reviewer antigravity. "
+    "Gemini CLI remains supported for enterprise / API-key paths."
 )
 
 # Substrings (lowercased) in a *failed* gemini invocation's output that suggest an
@@ -358,8 +358,8 @@ class GeminiBackend:
         raw_output = result.stdout
         if retired_failure:
             # Append the guidance to the *returned* output, not just stderr: callers
-            # such as helpers.run_external classify/persist failures from
-            # raw_output/text, so the migration guidance must travel with them (#215).
+            # classify failures from raw_output/text, so the migration
+            # guidance must travel with them (#215).
             guidance_block = f"\n\n{_GEMINI_MIGRATION_GUIDANCE}"
             raw_output = (raw_output or "") + guidance_block
             message_text = (message_text or "") + guidance_block

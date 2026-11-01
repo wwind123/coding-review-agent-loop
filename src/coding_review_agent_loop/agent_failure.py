@@ -61,8 +61,7 @@ from .protocol_markers import (
 
 
 # TRANSIENT_AGENT_OUTPUT_RE / NON_RETRYABLE_AGENT_OUTPUT_RE / is_transient_agent_output
-# now live in .transient (imported above) so dependency-light callers such as
-# helpers.run_external can reuse them without importing this module.
+# live in .transient (imported above) for dependency-light classification.
 NEAR_MISS_AGENT_MARKER_RE = re.compile(
     r"(?m)^[ \t]*AGENT_(?:PLAN_)?STATE:[ \t]*(?:approved|blocking)[ \t.]*$",
     re.I,

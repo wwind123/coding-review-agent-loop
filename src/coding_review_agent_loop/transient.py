@@ -1,7 +1,6 @@
 """Lightweight transient/non-retryable agent-output classification.
 
-Extracted from ``orchestrator`` so callers that must stay dependency-light
-(e.g. the skill's ``helpers.run_external`` subprocess launcher) can decide
+Callers that must stay dependency-light can decide
 whether to retry an agent invocation without importing the full orchestrator.
 """
 

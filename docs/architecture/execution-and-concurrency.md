@@ -2,7 +2,7 @@
 
 How agent and Git processes run: per-run worktrees over a shared store, the agent-loop-owned Git boundary and private fetch transport with SSH identity selection, pre-turn checkout verification, process-tree containment, test interpreter and worker budgets, pre-collection launch-failure provenance, the Antigravity quota-group fallback, the opt-in quota reset wait, the agent-loop executable pin with its receipt tool identity, and the other entry paths outside the review loop.
 
-Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/worktree_setup.py`, `src/coding_review_agent_loop/worktree_hints.py`, `src/coding_review_agent_loop/worktree_pr_env.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/agent_executable.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `helpers/`, `tests/test_run_worktrees.py`, `tests/test_worktree_setup.py`, `tests/test_worktree_dependency_hints.py`, `tests/test_worktree_pr_env.py`, `tests/test_containment.py`, `tests/test_test_workers.py`, `tests/test_agent_executable.py`.
+Source paths: `src/coding_review_agent_loop/run_worktrees.py`, `src/coding_review_agent_loop/worktree_setup.py`, `src/coding_review_agent_loop/worktree_hints.py`, `src/coding_review_agent_loop/worktree_pr_env.py`, `src/coding_review_agent_loop/workdirs.py`, `src/coding_review_agent_loop/workdir_claims.py`, `src/coding_review_agent_loop/quota_wait.py`, `src/coding_review_agent_loop/checkout_verification.py`, `src/coding_review_agent_loop/secure_git.py`, `src/coding_review_agent_loop/git_transport.py`, `src/coding_review_agent_loop/transport_check.py`, `src/coding_review_agent_loop/runner.py`, `src/coding_review_agent_loop/agent_executable.py`, `src/coding_review_agent_loop/containment.py`, `src/coding_review_agent_loop/test_workers.py`, `src/coding_review_agent_loop/test_runtime.py`, `src/coding_review_agent_loop/lifecycle_probe.py`, `src/coding_review_agent_loop/agents/antigravity.py`, `src/coding_review_agent_loop/discuss_loop.py`, `tests/test_run_worktrees.py`, `tests/test_worktree_setup.py`, `tests/test_worktree_dependency_hints.py`, `tests/test_worktree_pr_env.py`, `tests/test_containment.py`, `tests/test_test_workers.py`, `tests/test_agent_executable.py`.
 
 ## Execution and Concurrency
 
@@ -490,7 +490,7 @@ logical run: it is keyed by the `workdir_claims` owner's `run_id`, created on
 first use, dropped by a run finalizer when the outermost scope ends, shared by
 nested loops, and reached from reviewer threads because `review_rounds.py` and
 `discuss_loop.py` submit with `contextvars.copy_context()`. With no owner
-(library use, the skill helper process) the memory is local to one attempt
+(direct library use) the memory is local to one attempt
 state. Exhaustion is classified in `transient.py` only from the matched
 provider error frame, extracted from raw unstripped lines (never the whole
 transcript), with capacity wording taking precedence. Auth (auth words or a
@@ -513,7 +513,7 @@ routes it, before the nonzero-exit, empty-response and format/repair branches,
 into the same quota path as a printed frame (reason `agy-log`), unless a typed
 runner retry decision applies. Any lookup failure leaves no evidence and keeps
 the earlier behavior. `AntigravityAttemptState`
-is the single policy shared by `validated_agent.py` and `helpers/run_external.py`:
+is the policy used by `validated_agent.py`:
 transient failures retry then fall back to a later eligible entry; a verified
 exhaustion skips the whole group with no retry or sleep and makes at most one
 cross-group jump per turn; a second verified exhaustion is a shared-limit stop;
@@ -680,11 +680,6 @@ guards remain intact. Display acceptance grants no strict citation eligibility.
   agent dispatch and one issue comment. It reads an optional local history
   export file but never changes the route, execution mode or policy the
   operator selected.
-- Claude Code skill mode uses an interactive host plus [`helpers/`](../../helpers/)
-  for validation, external agents, GitHub operations, and local session state.
-  It reuses library functionality but is not an identical CLI lifecycle and
-  never auto-merges. Host-session work is outside the external-agent process
-  boundary. See [skill architecture](../skill_mode.md#architecture).
 
 ## Internal exact-head image capture
 

@@ -181,8 +181,8 @@ def run_agent_result(
             f"--agent-permissions sandboxed refuses to run {agent!r}: only Claude and "
             "Codex have role-scoped grants."
         )
-    # Configure the runner at the backend boundary so direct library callers,
-    # skill-mode callers, and the CLI all use the same immutable containment
+    # Configure the runner at the backend boundary so direct library callers
+    # and the CLI use the same immutable containment
     # policy.  Test doubles inherit this method but their scripted spawn path
     # remains authoritative and does not need a systemd probe.
     configure = getattr(runner, "configure_from_config", None)

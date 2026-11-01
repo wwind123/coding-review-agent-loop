@@ -966,21 +966,6 @@ def test_search_issues_and_create_issue_through_shim(shim_config):
     assert create_issue(Runner(), config=config, title="T", body="B") == f"https://github.com/{REPO}/issues/30"
 
 
-def test_skill_helper_fetchers_through_shim(shim_config):
-    from helpers.skill_runner import _fetch_issue_context, _fetch_pr_json
-
-    config, serve = shim_config
-    routes = issue_routes([rest_comment(11, "hi")])
-    routes[("GET", f"repos/{REPO}/pulls/5")] = rest_pr()
-    routes[("GET", f"repos/{REPO}/issues/5/comments?per_page=100&page=1")] = []
-    routes[("GET", f"repos/{REPO}/pulls/5/reviews?per_page=100&page=1")] = []
-    serve(routes)
-    pr = _fetch_pr_json(REPO, 5, gh_cmd=config.gh_cmd)
-    assert (pr["headRefOid"], pr["state"], pr["reviews"]) == ("a" * 40, "OPEN", [])
-    issue = _fetch_issue_context(REPO, 1, gh_cmd=config.gh_cmd)
-    assert [c.body for c in issue.comments] == ["hi"]
-
-
 # ------------------------------------- code-review round 1 regressions ---
 
 

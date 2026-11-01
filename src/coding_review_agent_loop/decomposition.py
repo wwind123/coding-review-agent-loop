@@ -2998,7 +2998,7 @@ def find_phase_implementation_handoffs(
     Recovery must inspect mismatched mode/source/stage records too; the
     single-phase lookup intentionally cannot do that because it is used by
     legacy resume paths.  Keeping this inventory beside the marker decoder
-    gives CLI and skill preflight the same fail-closed view.
+    gives CLI preflight a fail-closed view.
     """
     found: list[PhaseImplementationHandoffMetadata] = []
     for comment in comments:

@@ -2,7 +2,7 @@
 
 Install it as ``gh`` earlier on ``PATH`` (``agent-loop-gh shim-install DIR``) or
 pass ``--gh-cmd agent-loop-gh``.  It emulates only the GraphQL-backed ``gh``
-porcelain forms agent-loop, its skill helpers, and its coder prompts use,
+porcelain forms agent-loop and its coder prompts use,
 calling repository-scoped REST through the real ``gh api`` and printing the
 same ``--json`` shape ``gh`` prints.  Everything else, including every
 ``gh api`` call, passes through to the real ``gh`` unchanged.

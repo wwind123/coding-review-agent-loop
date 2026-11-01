@@ -52,8 +52,8 @@ from .review_scheduling import (
 )
 
 # Single source of truth for the Antigravity quota-exhaustion fallback signatures
-# (#348, #350). The dataclass field default, config_from_args, the CLI flag default,
-# and helpers/run_external.py all derive from this so the default can't drift.
+# (#348, #350). The dataclass field default, config_from_args, and CLI flag
+# default all derive from this so the default can't drift.
 DEFAULT_ANTIGRAVITY_QUOTA_SIGNATURES: tuple[str, ...] = (
     "quota",
     "rate limit",

@@ -655,42 +655,6 @@ RISK_TEST_MATRIX_MARKER_RE = re.compile(
     rf"<!--\s*{RISK_TEST_MATRIX_MARKER}:\s*(?P<payload>[A-Za-z0-9+/=_-]+)\s*-->",
     re.IGNORECASE,
 )
-_RISK_TEST_MATRIX_BOUNDARY_RE = re.compile(
-    r"(?m)^<!--\s*risk-test-matrix-section:\s*[0-9a-f]{64}\s*-->[ \t]*$",
-    re.IGNORECASE,
-)
-_RISK_TEST_MATRIX_HEADING_RE = re.compile(
-    r"(?m)^### Risk-based mode and transition test matrix[ \t]*$",
-)
-_RISK_TEST_MATRIX_SECTION_TAIL_RE = re.compile(
-    r"(?m)^(?:#{2,3}[ \t]+|<!--\s*(?:execution-recommendation-section|AGENT_PLAN_STATE):)",
-)
-
-
-def extract_risk_test_matrix_section(text: str) -> str | None:
-    """Extract one complete write-time matrix section from rendered text.
-
-    The structured payload is the authority during recovery, so this helper is
-    intentionally limited to the persistence boundary. It prevents a posted
-    plan from carrying extra reviewer-visible matrix prose after an otherwise
-    valid payload marker while still allowing the normal section separator and
-    subsequent plan/protocol sections.
-    """
-    boundaries = list(_RISK_TEST_MATRIX_BOUNDARY_RE.finditer(text))
-    headings = list(_RISK_TEST_MATRIX_HEADING_RE.finditer(text))
-    markers = list(RISK_TEST_MATRIX_MARKER_RE.finditer(text))
-    if len(boundaries) != 1 or len(headings) != 1 or len(markers) != 1:
-        return None
-    boundary = boundaries[0]
-    marker = markers[0]
-    if marker.start() < boundary.end() or headings[0].start() < boundary.end():
-        return None
-
-    tail_match = _RISK_TEST_MATRIX_SECTION_TAIL_RE.search(text, marker.end())
-    tail_end = tail_match.start() if tail_match is not None else len(text)
-    if text[marker.end():tail_end].strip():
-        return None
-    return text[boundary.start():marker.end()]
 
 
 def render_risk_test_matrix_section(
@@ -2548,7 +2512,7 @@ def render_public_agent_comment(
 ) -> str:
     """Render a parsed agent response and stamp the agent/model signature.
 
-    This is the single render-and-sign seam used by CLI and skill mode. Callers
+    This is the single render-and-sign seam used by the CLI. Callers
     resolve where the actual model came from, then pass it here; footer signing
     stays owned by the renderer.
     """

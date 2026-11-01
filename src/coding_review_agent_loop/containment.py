@@ -1,8 +1,8 @@
 """Process-tree containment for agent-loop invocations.
 
 The containment layer is deliberately independent of the orchestration state
-machine.  It can therefore be used by the normal agent runner, the foreground
-test gate, and the external skill helper without making GitHub or checkout
+machine.  It can therefore be used by the normal agent runner and foreground
+test gate without making GitHub or checkout
 state part of the resource-control protocol.
 
 Linux systems with a delegated cgroup-v2 user manager use a transient systemd

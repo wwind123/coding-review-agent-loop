@@ -224,8 +224,8 @@ rerunning the same `--plan-first` command feeds that record to the next planner
 turn. Neither prompt block is ever truncated: inherited rows too large to show
 losslessly stop child planning with a sizing diagnostic that points at the
 parent plan, and a child whose deltas are too large to show is replanned. PR
-validation applies the same comparison on parent dispatch, direct child
-invocation, and skill mode, so an already approved child plan that satisfies
+validation applies the same comparison on parent dispatch and direct child
+invocation, so an already approved child plan that satisfies
 these rules resumes PR review without replanning.
 
 #### Relaunch commands and staged order
@@ -632,8 +632,7 @@ round metadata and the bounded sidecar; rendered tables are derived output.
 Recovery tolerates renderer wording changes, while payload corruption or a
 matrix-only rendering/hydration problem reports zero enforceable matrix rows
 without invalidating an otherwise verified plan hash and subject. Legacy records
-without a matrix remain resumable without fabrication. Both CLI and skill-mode
-helpers accept `--require-risk-test-matrix-contract` for fresh contract checks.
+without a matrix remain resumable without fabrication.
 
 The default coder is Claude and the default reviewer is Codex. Reverse the direction with `--coder codex --reviewer claude`, or use Gemini with `--coder gemini` / `--reviewer gemini`. Repeat `--reviewer` to require multiple reviewer approvals.
 
@@ -1071,7 +1070,6 @@ The default Antigravity chain is `Gemini 3.8 Flash (High)` → `Gemini 3.7 Flash
 - **Run-scoped memory.** An exhausted group is remembered for the logical run (shared by nested loops and reviewer threads, dropped when the run ends) until its parsed reset, or, with no parsed reset, for `--antigravity-quota-cooldown-seconds` (default 600, max 3600). Later turns skip a cooling group and re-probe it afterwards; each transition is logged once. Nothing is latched for the rest of the run. Memory is not persisted across processes, so a rerun rediscovers exhaustion once.
 - **Early stop.** When every group in the chain is cooling down, the turn stops without invoking agy: `Antigravity unavailable on all models`, naming the last frame, the models tried and when groups become eligible again. `QuotaResetExceededError` is raised only when every group has a parsed long reset; unverified text never stops an Antigravity turn. With `--wait-for-quota-reset`, that verified stop (including the shared-limit stop) waits for the earliest group reset instead when every reset is within DURATION (see [Waiting for a quota reset](#waiting-for-a-quota-reset)). Transient capacity failures (`high traffic`) still retry the same model, then fall back. Each capacity failure logs its attempt duration.
 - **Repair chain.** The format-repair chain is the union of the repair models and the antigravity chain, so it now ends with `Claude Opus 5.5 (Medium)`. Repair neither reads nor marks quota memory.
-- **Skill helper.** `helpers/run_external.py` applies the same classification and group skip within one invocation, with memory local to that invocation.
 - **Independence trade-off.** With the default board (Codex, Claude Code on `claude-opus-5-5`, Antigravity), an Opus fallback means two reviewers run the same model in different harnesses and may share blind spots. The round reconciliation summary and log then state, for example, `note: Claude and Antigravity both reviewed with Claude Opus 5.5` (only for reviews made in that round). To keep models distinct, pass your own chain, for example `--antigravity-models "Gemini 3.8 Flash (High)" "Gemini 3.1 Pro (High)" "Claude Sonnet 5.5 (Medium)"`. Refusing same-model panels is an operator policy choice and is not enforced.
 
 Every `agy --print` call passes `--print-timeout` from
@@ -1083,8 +1081,7 @@ cut short. Override it per run, e.g. `--antigravity-print-timeout-seconds
 ## Architecture
 
 The canonical [architecture overview](../ARCHITECTURE.md) describes component
-ownership, lifecycle and CI flows, GitHub/local persistence, trust boundaries,
-and the CLI/skill distinction. This guide remains the detailed reference for
+ownership, lifecycle and CI flows, GitHub/local persistence, and trust boundaries. This guide remains the detailed reference for
 commands, protocol schemas, and recovery contracts.
 
 The tool shells out to authenticated agent and GitHub CLIs. Durable round,
@@ -1615,9 +1612,6 @@ that disappears unexpectedly is indeterminate. OOM, hard memory/swap, and
 `TasksMax` termination is `resource-exhausted`, while `MemoryHigh` and PSI are
 pressure diagnostics and do not by themselves claim to have killed a process.
 
-When the Claude skill invokes its local test gate, the mode can also be selected
-with `AGENT_LOOP_CONTAINMENT_MODE=auto|required|off` (default `auto`).
-
 Each scope contains a target-start/target-exec-error shim. A missing shim
 report means launcher or unit creation failure regardless of the numeric
 systemd exit status. A target-start report binds numeric statuses, including 1
@@ -1652,9 +1646,7 @@ Same-lane duplicates are rejected before spawn with exit 125 and do not enter
 runtime learning. Intentional parallel reviewer workers have distinct lanes.
 An unwrapped command cannot be deduplicated from free-form logs when no
 structured tool hook exists; it is still contained when it is a descendant of
-an agent scope. In skill mode, the host's in-session Claude coder and arbitrary
-descendants remain part of the host session and receive prompt guidance plus
-the managed wrapper when used. The aggregate is per user manager, not a
+an agent scope. The aggregate is per user manager, not a
 cross-user host isolation boundary.
 
 Parallel test workers are budgeted against these limits; see
@@ -3034,8 +3026,7 @@ provider budget, the source locator must be fetched and verified before a plan
 decision is enforced or challenged; if that fails, no approved decision is
 enforceable or disputable, but ordinary defects remain reviewable. Unavailable,
 mismatched, legacy, and direct-PR contexts must not cause a decision to be
-invented. Host skill review requests include the same reconciliation guidance
-artifact as external reviewer prompts.
+invented.
 
 For staged work, child and authoritative parent issue contexts are labeled
 separately. Resume validates the generated split/decomposition identity and
@@ -5333,11 +5324,6 @@ materialization](#split-issue-materialization) below. The warning here is
 scoped to `decompose-only` and `implement-by-phase` specifically, since only
 those two modes already create detailed per-phase children. It cannot be
 combined with `auto`.
-
-Skill mode's `run-decompose` and `run-implement-by-phase` helper commands
-(see [`docs/skill_mode.md`](skill_mode.md)) drive the same
-`decompose-only` / `implement-by-phase` modes and are subject to the same
-rule.
 
 ### Split issue materialization
 
@@ -9906,7 +9892,7 @@ example `3600`, `90m`, `6h` or `1h30m`. It must be positive and no longer than
   CLI installs its SIGTERM handler for the duration of the command and restores
   the previous handler afterwards. A SIGTERM that arrives when no wait is active
   keeps its previous behaviour, as does every other interrupt.
-- The skill helper `helpers/run_external.py` and format-repair turns never wait.
+- Format-repair turns never wait.
 
 Each top-level run also writes `<run-id>-usage-summary.json` in the same
 directory. That sidecar aggregates usage by call, by agent, and for the full

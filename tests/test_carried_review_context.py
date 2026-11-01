@@ -26,9 +26,9 @@ import coding_review_agent_loop.validated_agent as validated_agent
 from agent_loop_helpers import patch_attr_in
 
 
-CLAIM = "Skill-mode reviewers must receive the PR-bound approved plan."
+CLAIM = "CLI reviewers must receive the PR-bound approved plan."
 SUMMARY = "Recovery still picks the first loose issue reference and hides comment-read failures."
-NOTE = "helpers/skill_runner.py selects the first issue; use the primary-issue contract and test multiple references."
+NOTE = "The PR context selects the first issue; use the primary-issue contract and test multiple references."
 
 
 def test_named_seat_blocker_and_owner_survive_pr_resume(tmp_path):

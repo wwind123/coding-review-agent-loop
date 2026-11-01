@@ -5561,7 +5561,7 @@ def _resume_plan_round(
         # A generation-1 plan is identified by its canonical rendered text.
         # Never resume a record whose subject was computed from a different
         # representation (for example, raw host JSON versus rendered plan
-        # markdown); doing so would make the next skill invocation fork the
+        # markdown); doing so would make the next invocation fork the
         # same plan into a new round.
         if latest_coder_record.metadata.canonical_plan is None:
             raise AgentLoopError(
