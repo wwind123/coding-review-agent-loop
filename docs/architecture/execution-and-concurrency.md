@@ -48,10 +48,21 @@ every checked backend attempt checks still-shared sources before launch. The
 post-turn check inspects the original sources even after link replacement,
 reconciliation failure or sticky checkout poison. Under the store lock it
 revalidates current health, preserving healthy newer setup generations, and
-marks damage stale without deleting the generated-key ledger. No lock spans
+re-inspects a refusal exactly once before deciding whether to publish stale state.
+A healthy retry succeeds without writes. Only the same structural source/probe
+loss against the same valid generation/configuration on both inspections
+newly invalidates setup and publishes stale state, retaining the generated-key
+ledger. The single exception is actual health-record absence confirmed twice
+for a generation-bound registration: this publishes the existing pending
+setup-backed recovery record, preventing bootstrap on restart. Publication
+preconditions are checked under the lock; reappearing or newer records are
+never overwritten using absence evidence. Unknown, inconsistent, invalid and
+already-stale results still refuse before launch or poison after the turn
+without new shared-state writes. No lock spans
 an agent turn. A poisoned run remains poisoned after source repair.
 
-Checks read no dependency-file contents: at most 64 selected directory counts,
+A refused turn check performs at most two inspections; budgets apply per
+inspection. Checks read no dependency-file contents: at most 64 selected directory counts,
 128 children per count (8192 entries total), 128 saved path/type witnesses and
 probe depth 4 (counted children can reach depth 5). The scan payload is at most
 32 KiB and complete record at most 64 KiB. Roots reserve counts first; optional
@@ -63,6 +74,11 @@ deletion, same-count substitution, overwritten bytes and damage behind interior
 symlinks exceed the guarantee. Interior symlinks and substituted probe ancestors
 are not traversed. Unsafe, unreadable, unstable or malformed required health
 refuses reuse; more than 64 directory roots is a configuration error.
+Structural loss includes count decreases, witness type/loss and root binding
+changes, absent or unsupported roots, and ENOENT/ENOTDIR/ELOOP from opening
+saved probes. EACCES/EIO, enumeration churn and opening/post-yield stability
+checks remain unknown, even when a stability check reports a missing path.
+Persistent formats, startup bootstrap policy and recovery commands are unchanged.
 
 Legacy setup-backed stores rebuild once to establish health. Inspectable,
 nonempty manually managed sources bootstrap with a warning: historical partial

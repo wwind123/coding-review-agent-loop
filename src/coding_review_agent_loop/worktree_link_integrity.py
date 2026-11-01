@@ -6,12 +6,14 @@ No dependency file contents are read and interior symlinks are never traversed.
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import os
 import secrets
 import shlex
 import stat
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import AgentLoopError
@@ -46,6 +48,20 @@ def _relative(path: str, depth: int) -> bool:
     ))
 
 
+class StructuralLoss(OSError):
+    """Loss from a path-opening operation, never a stability check."""
+
+
+@contextlib.contextmanager
+def _opening():
+    try:
+        yield
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP):
+            raise StructuralLoss(str(exc)) from exc
+        raise
+
+
 @contextlib.contextmanager
 def _root(store: Path, link: str):
     """Bind the root's lexical and resolved identities, allowing a root symlink only."""
@@ -56,18 +72,25 @@ def _root(store: Path, link: str):
         parent /= part
         if not stat.S_ISDIR(parent.lstat().st_mode):
             raise OSError(f"unsafe source ancestor {parent}")
-    before = source.lstat()
-    resolved = os.path.realpath(source)
-    target = os.stat(source)
-    if not (stat.S_ISDIR(target.st_mode) or stat.S_ISREG(target.st_mode)):
-        raise OSError("source is not a directory or regular file")
+    with _opening():
+        before = source.lstat()
+        resolved = os.path.realpath(source)
+        target = os.stat(source)
+        if not (stat.S_ISDIR(target.st_mode) or stat.S_ISREG(target.st_mode)):
+            raise StructuralLoss("source is not a directory or regular file")
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     if stat.S_ISDIR(target.st_mode):
         flags |= os.O_DIRECTORY
     anchor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    fd = None
     try:
         with _directory(anchor, str(Path(resolved).parent).lstrip("/")) as parent_fd:
-            fd = os.open(Path(resolved).name, flags, dir_fd=parent_fd)
+            with _opening():
+                fd = os.open(Path(resolved).name, flags, dir_fd=parent_fd)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        raise
     finally:
         os.close(anchor)
     try:
@@ -88,7 +111,8 @@ def _directory(root_fd: int, path: str):
     held = []
     try:
         for part in path.split("/") if path else ():
-            next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            with _opening():
+                next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             held.append((fd, part, _identity(os.fstat(next_fd))))
             fd = next_fd
         yield fd
@@ -120,7 +144,8 @@ def _entries(root_fd: int, path: str, *, types: bool) -> list:
 def _witness(root_fd: int, path: str) -> int:
     parent, _, name = path.rpartition("/")
     with _directory(root_fd, parent) as fd:
-        return stat.S_IFMT(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)
+        with _opening():
+            return stat.S_IFMT(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode)
 
 
 class SourceHealthError(OSError):
@@ -254,40 +279,122 @@ def _validate(data: dict, store: Path, links: tuple[str, ...]) -> None:
         raise ValueError("health probe budget exceeded")
 
 
-def inspect(store: Path, links: tuple[str, ...], *, selected=None) -> tuple[dict | None, str | None, str]:
+@dataclass(frozen=True)
+class Inspection:
+    outcome: str
+    data: dict | None
+    reason: str | None
+    link: str
+    probe: tuple[str, str] | None = None
+    exception: bool = False
+
+    @property
+    def confirmation(self):
+        if self.outcome != "structural" or self.data is None:
+            return None
+        return (self.data["generation"], self.data["store_identity"],
+                self.data["links"], self.link, self.probe)
+
+
+def _record_state(store: Path) -> str:
+    """A JSON read failure is not evidence of absence."""
+    path = health_path(store)
+    try:
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return "unknown"
+    try:
+        try:
+            info = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+                return "present"
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            pass
+        return "unknown"
+    finally:
+        os.close(fd)
+
+
+def inspect_result(store: Path, links: tuple[str, ...], *, selected=None) -> Inspection:
     """Unknown/malformed health is a refusal, never an implicit new baseline."""
     from .worktree_setup import _read_private_json
     link = links[0] if links else ""
+    data = None
+    validated = False
+    probe = None
     try:
+        state = _record_state(store)
+        if state != "present":
+            return Inspection("absent" if state == "absent" else "invalid", None,
+                              "missing or malformed source-health record", link)
         data = _read_private_json(health_path(store))
         if data is None:
-            return None, "missing or malformed source-health record", link
+            return Inspection("invalid", None, "missing or malformed source-health record", link)
         _validate(data, store, links)
         if data["stale"]:
-            return data, data["stale"], data["stale_link"]
+            return Inspection("stale", data, data["stale"], data["stale_link"])
         if data["setup_backed"]:
             from .worktree_setup import read_setup_record
             success = read_setup_record(store)
             if (success is None or success.get("health_generation") != data["generation"]
                     or success.get("store_identity") != data["store_identity"]):
-                return data, "setup success is missing for this health generation", link
+                return Inspection("invalid", data, "setup success is missing for this health generation", link)
+        validated = True
         for link in links:
             if selected is not None and link not in selected:
                 continue
             source = data["sources"][link]
+            probe = ("root", "")
             with _root(store, link) as (fd, binding):
                 if binding != source["binding"]:
-                    raise OSError("source root identity or target changed")
+                    raise StructuralLoss("source root identity or target changed")
                 for path, count in source["counts"]:
+                    probe = ("count", path)
                     current = len(_entries(fd, path, types=False))
                     if current < count or (path == "" and current == 0):
-                        raise OSError(f"directory {path!r} child count decreased or root is empty")
+                        raise StructuralLoss(f"directory {path!r} child count decreased or root is empty")
                 for path, kind in source["witnesses"]:
+                    probe = ("witness", path)
                     if _witness(fd, path) != kind:
-                        raise OSError(f"witness {path!r} changed type")
-        return data, None, link
+                        raise StructuralLoss(f"witness {path!r} changed type")
+        return Inspection("healthy", data, None, link)
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        return None, f"source health cannot be verified: {exc}", link
+        return Inspection("structural" if validated and isinstance(exc, StructuralLoss) else "unknown",
+                          data if validated else None, f"source health cannot be verified: {exc}",
+                          link, probe, True)
+
+
+def inspect(store: Path, links: tuple[str, ...], *, selected=None) -> tuple[dict | None, str | None, str]:
+    """Compatibility adapter; exceptions still return data=None."""
+    result = inspect_result(store, links, selected=selected)
+    return None if result.exception else result.data, result.reason, result.link
+
+
+def confirm_failure(store: Path, links: tuple[str, ...], first: Inspection,
+                    second: Inspection, *, registered_generation: str | None) -> bool:
+    """Check publication preconditions under the caller's store lock."""
+    from .run_worktrees import _require_lock_held
+    from .worktree_setup import _read_private_json, read_setup_record
+    _require_lock_held(store)
+    if first.outcome == second.outcome == "absent" and registered_generation:
+        success = read_setup_record(store)
+        if success is not None and success.get("health_generation") != registered_generation:
+            return False
+        return _record_state(store) == "absent"
+    if first.confirmation is None or first.confirmation != second.confirmation:
+        return False
+    if _record_state(store) != "present":
+        return False
+    current = _read_private_json(health_path(store))
+    if current != second.data or current.get("links") != list(links):
+        return False
+    if current["setup_backed"]:
+        success = read_setup_record(store)
+        if not success or success.get("health_generation") != current["generation"]:
+            return False
+    return True
 
 
 def publish(store: Path, links: tuple[str, ...], *, config, setup_backed: bool = False) -> dict:

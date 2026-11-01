@@ -330,3 +330,320 @@ def test_stale_restart_diagnostic_names_damaged_second_source(tmp_path, monkeypa
     diagnostic = health.refusal(store, link, reason)
     assert str(store / 'node_modules') in diagnostic
     assert "--worktree-setup 'npm ci'" in diagnostic
+
+
+def registered_store(tmp_path, monkeypatch, *, backed=True):
+    env, store, config = source_store(tmp_path, monkeypatch)
+    with rw.store_lock(store):
+        data = health.publish(store, ('.venv',), config=config, setup_backed=backed)
+    if backed:
+        setup._write_setup_record(store, {'version': 1, 'health_generation': data['generation'],
+                                        'store_identity': data['store_identity']})
+        setup._write_private_json(setup.generated_ledger_path(store), {'sentinel': 'retain'})
+    root = tmp_path / 'run'
+    root.mkdir()
+    (root / '.venv').symlink_to(store / '.venv')
+    cv.register_worktree_links(root, {'.venv': str(store / '.venv')}, shared_store=store)
+    return store, config, root
+
+
+def persisted(store):
+    return {p: p.read_bytes() if p.exists() else None for p in (
+        health.health_path(store), setup.setup_record_path(store), setup.generated_ledger_path(store))}
+
+
+@pytest.mark.parametrize('post_turn', [False, True])
+@pytest.mark.parametrize('transient', ['healthy', 'enumeration', 'count', 'witness'])
+def test_health_retry_bound_and_single_lock(tmp_path, monkeypatch, post_turn, transient):
+    import contextlib
+    store, config, root = registered_store(tmp_path, monkeypatch)
+    before = persisted(store)
+    original = health.inspect_result
+    original_lock = rw.store_lock
+    calls = []
+    holds = []
+    lock_calls = []
+    @contextlib.contextmanager
+    def lock(path):
+        with original_lock(path):
+            lock_calls.append(1)
+            holds.append(True)
+            try:
+                yield
+            finally:
+                holds.pop()
+    monkeypatch.setattr(rw, 'store_lock', lock)
+    def inspect(*args, **kwargs):
+        assert holds == [True]
+        calls.append(1)
+        artifact = store / '.venv/bin/python'
+        if len(calls) == 1 and transient != 'healthy':
+            if transient == 'enumeration':
+                with monkeypatch.context() as patch:
+                    patch.setattr(health, '_entries', lambda *a, **k: (_ for _ in ()).throw(OSError('changed during enumeration')))
+                    return original(*args, **kwargs)
+            saved = artifact.read_bytes()
+            artifact.unlink()
+            try:
+                # Count loss or witness loss masked by an offsetting addition.
+                if transient == 'witness':
+                    artifact.with_name('replacement').touch()
+                return original(*args, **kwargs)
+            finally:
+                artifact.write_bytes(saved)
+                artifact.with_name('replacement').unlink(missing_ok=True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(health, 'inspect_result', inspect)
+    cv._check_shared_health(config, root, post_turn=post_turn)
+    assert len(calls) == (1 if transient == 'healthy' else 2)
+    assert len(lock_calls) == 1
+    assert persisted(store) == before
+    assert not cv.has_poisoned_entry(root)
+
+
+@pytest.mark.parametrize('failure', ['churn', 'EACCES', 'EIO', 'stability', 'different'])
+@pytest.mark.parametrize('post_turn', [False, True])
+def test_unknown_health_only_poisons_current_run(tmp_path, monkeypatch, failure, post_turn):
+    import contextlib
+    import errno
+    store, config, root = registered_store(tmp_path, monkeypatch)
+    before = persisted(store)
+    calls = []
+    original = health._entries
+    original_root = health._root
+    @contextlib.contextmanager
+    def unstable_root(*args):
+        with original_root(*args) as bound:
+            yield bound
+            raise FileNotFoundError(errno.ENOENT, 'post-yield root change')
+    def entries(fd, path, **kwargs):
+        calls.append(path)
+        if failure == 'different':
+            if len(calls) == 1:
+                return []
+            raise OSError('enumeration churn')
+        if failure == 'churn':
+            raise OSError('enumeration churn')
+        if failure in ('EACCES', 'EIO'):
+            raise OSError(getattr(errno, failure), 'probe unreadable')
+        return original(fd, path, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(health, '_entries', entries)
+        if failure == 'stability':
+            patch.setattr(health, '_root', unstable_root)
+        if post_turn:
+            cv._check_shared_health(config, root, post_turn=True)
+        else:
+            with pytest.raises(CheckoutVerificationError):
+                cv._check_shared_health(config, root)
+    assert cv.has_poisoned_entry(root)
+    assert persisted(store) == before
+    cv._check_shared_health(config, root, post_turn=True)
+    assert cv.has_poisoned_entry(root)
+    cv.reset_checkout_baselines()
+    cv.register_worktree_links(root, {'.venv': str(store / '.venv')}, shared_store=store)
+    cv._check_shared_health(config, root)
+    assert not cv.has_poisoned_entry(root)
+
+
+@pytest.mark.parametrize('damage', ['delete', 'file', 'symlink', 'root', 'fifo', 'binding', 'witness-type'])
+@pytest.mark.parametrize('parent_mode', ['saturated', 'offset'])
+def test_confirmed_probe_loss_retains_durable_recovery(tmp_path, monkeypatch, damage, parent_mode):
+    store, config, root = registered_store(tmp_path, monkeypatch)
+    source = store / '.venv'
+    probe = source / 'bin'
+    # Ensure the saved count directory is selected, then saturate its parent.
+    if parent_mode == 'saturated':
+        for n in range(140):
+            (source / f'extra{n}').touch()
+    save_data = save(store, config)
+    setup._write_setup_record(store, {'version': 1, 'health_generation': save_data['generation'],
+                                    'store_identity': save_data['store_identity']})
+    ledger = setup.generated_ledger_path(store).read_bytes()
+    moved = store / 'saved-source'
+    target = source if damage in ('root', 'fifo', 'binding') else probe
+    if damage == 'witness-type':
+        witness = next(p for p, kind in save_data['sources']['.venv']['witnesses'] if kind == stat.S_IFREG)
+        target = source / witness
+    target.rename(moved)
+    if parent_mode == 'offset' and target == probe:
+        (source / 'offset').touch()
+    if damage == 'file':
+        target.touch()
+    elif damage in ('symlink', 'binding'):
+        target.symlink_to(moved)
+    elif damage == 'fifo':
+        os.mkfifo(target)
+    elif damage == 'witness-type':
+        target.mkdir()
+    cv._check_shared_health(config, root, post_turn=True)
+    assert cv.has_poisoned_entry(root)
+    current = json.loads(health.health_path(store).read_text())
+    assert current['stale'] and current['stale_link'] == '.venv'
+    assert not setup.setup_record_path(store).exists()
+    assert setup.generated_ledger_path(store).read_bytes() == ledger
+    if target.is_symlink() or target.is_file() or damage == 'fifo':
+        target.unlink()
+    elif target.exists():
+        shutil.rmtree(target)
+    moved.rename(target)
+    cv.reset_checkout_baselines()
+    before = health.health_path(store).read_bytes()
+    with rw.store_lock(store):
+        assert health.ensure_health(store, ('.venv',), config=config)
+    assert health.health_path(store).read_bytes() == before
+    with pytest.raises(CheckoutVerificationError):
+        cv.register_worktree_links(root, {'.venv': str(source)}, shared_store=store)
+
+
+@pytest.mark.parametrize('metadata', ['malformed', 'symlink', 'parent-symlink', 'stale', 'setup-mismatch', 'unreadable'])
+def test_invalid_metadata_does_not_publish_stale(tmp_path, monkeypatch, metadata):
+    store, config, root = registered_store(tmp_path, monkeypatch)
+    path = health.health_path(store)
+    outside = tmp_path / 'outside'
+    outside.write_bytes(path.read_bytes())
+    if metadata == 'malformed':
+        path.write_text('{')
+    elif metadata == 'symlink':
+        path.unlink()
+        path.symlink_to(outside)
+    elif metadata == 'parent-symlink':
+        parent = path.parent
+        moved = tmp_path / 'outside-records'
+        parent.rename(moved)
+        parent.symlink_to(moved)
+    elif metadata == 'stale':
+        with rw.store_lock(store):
+            health.mark_stale(store, ('.venv',), 'prior stale')
+    elif metadata == 'setup-mismatch':
+        setup._write_setup_record(store, {'version': 1, 'health_generation': 'different'})
+    else:
+        original = setup._read_private_json
+        monkeypatch.setattr(setup, '_read_private_json', lambda p: None if p == path else original(p))
+    before = persisted(store)
+    external = outside.read_bytes()
+    cv._check_shared_health(config, root, post_turn=True)
+    assert persisted(store) == before
+    assert outside.read_bytes() == external
+    assert cv.has_poisoned_entry(root)
+
+
+@pytest.mark.parametrize('transition', ['absent', 'healthy', 'invalid', 'unbound', 'reappear'])
+def test_registered_record_loss_publication_boundaries(tmp_path, monkeypatch, transition):
+    store, config, root = registered_store(tmp_path, monkeypatch, backed=False)
+    path = health.health_path(store)
+    baseline = path.read_bytes()
+    assert not setup.setup_record_path(store).exists()
+    assert not setup.generated_ledger_path(store).exists()
+    if transition == 'unbound':
+        key = cv._key(root)
+        cv._LINKS[key] = dataclasses.replace(cv._LINKS[key], health_generation=None)
+    path.unlink()
+    original = health.inspect_result
+    calls = []
+    def inspect(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2 and transition in ('healthy', 'invalid'):
+            path.write_bytes(baseline if transition == 'healthy' else b'{')
+        result = original(*args, **kwargs)
+        if len(calls) == 2 and transition == 'reappear':
+            path.write_bytes(baseline)
+        return result
+    monkeypatch.setattr(health, 'inspect_result', inspect)
+    cv._check_shared_health(config, root, post_turn=True)
+    assert len(calls) == 2
+    if transition == 'absent':
+        pending = path.read_bytes()
+        assert json.loads(pending)['state'] == 'pending'
+        assert json.loads(pending)['setup_backed']
+        cv.reset_checkout_baselines()
+        with rw.store_lock(store):
+            assert health.ensure_health(store, ('.venv',), config=config)
+        assert path.read_bytes() == pending
+    elif transition == 'healthy':
+        assert not cv.has_poisoned_entry(root)
+        assert path.read_bytes() == baseline
+    elif transition == 'reappear':
+        assert path.read_bytes() == baseline
+    elif transition == 'invalid':
+        assert path.read_bytes() == b'{'
+    else:
+        assert not path.exists()
+    if transition != 'healthy':
+        assert cv.has_poisoned_entry(root) or transition == 'absent'
+
+
+@pytest.mark.parametrize('change', ['generation', 'configuration', 'source', 'probe'])
+def test_retry_does_not_combine_different_failure_identities(tmp_path, monkeypatch, change):
+    store, config, root = registered_store(tmp_path, monkeypatch)
+    (store / 'cache').mkdir()
+    (store / 'cache/item').touch()
+    save(store, config, ('.venv', 'cache'))
+    (root / 'cache').symlink_to(store / 'cache')
+    cv.register_worktree_links(root, {link: str(store / link) for link in ('.venv', 'cache')}, shared_store=store)
+    original = health.inspect_result
+    original_entries = health._entries
+    calls = []
+    after = []
+    def inspect(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            if change == 'generation':
+                health.publish(store, ('.venv', 'cache'), config=config)
+            elif change == 'configuration':
+                health.publish(store, ('.venv',), config=config)
+            after.append(persisted(store))
+        # Exercise real inspection; inject a count decrease at different saved probes.
+        with monkeypatch.context() as patch:
+            def entries(fd, path, **kw):
+                if change == 'source':
+                    expected = (store / ('.venv' if len(calls) == 1 else 'cache')).stat()
+                    actual = os.fstat(fd)
+                    if (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino):
+                        return []
+                elif change == 'probe':
+                    if path == ('' if len(calls) == 1 else 'bin'):
+                        return []
+                else:
+                    return []
+                return original_entries(fd, path, **kw)
+            patch.setattr(health, '_entries', entries)
+            return original(*args, **kwargs)
+    monkeypatch.setattr(health, 'inspect_result', inspect)
+    cv._check_shared_health(config, root, post_turn=True)
+    assert len(calls) == 2
+    assert persisted(store) == after[0]
+    assert cv.has_poisoned_entry(root)
+
+
+def test_absence_cannot_invalidate_newer_setup_generation(tmp_path, monkeypatch):
+    store, config, root = registered_store(tmp_path, monkeypatch)
+    health.health_path(store).unlink()
+    setup._write_setup_record(store, {'version': 1, 'health_generation': 'newer'})
+    before = persisted(store)
+    cv._check_shared_health(config, root, post_turn=True)
+    assert persisted(store) == before
+    assert cv.has_poisoned_entry(root)
+
+
+def test_selected_sources_survive_link_replacement_without_expansion(tmp_path, monkeypatch):
+    store, config, root = registered_store(tmp_path, monkeypatch, backed=False)
+    (store / 'cache').mkdir()
+    (store / 'cache/item').touch()
+    save(store, config, ('.venv', 'cache'))
+    (root / 'cache').symlink_to(store / 'cache')
+    mapping = {link: str(store / link) for link in ('.venv', 'cache')}
+    cv.register_worktree_links(root, mapping, shared_store=store)
+    key = cv._key(root)
+    cv._LINKS[key] = dataclasses.replace(cv._LINKS[key], links={b'.venv': os.fsencode(store / '.venv')})
+    (store / 'cache/item').unlink()  # Unselected/private source is excluded.
+    before = persisted(store)
+    cv._check_shared_health(config, root)
+    assert persisted(store) == before
+    (root / '.venv').unlink()
+    (root / '.venv').mkdir()
+    (store / '.venv/bin/python').unlink()
+    cv._check_shared_health(config, root, post_turn=True)
+    data = json.loads(health.health_path(store).read_text())
+    assert data['stale_link'] == '.venv'
+    assert cv.has_poisoned_entry(root)
