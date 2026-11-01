@@ -835,6 +835,64 @@ and delegated cleanup receipts are required evidence; ordinary CI skips or mock
 launches cannot demonstrate confinement.
 
 
+
+## Internal image transport (#1794)
+
+The disconnected `review_images_transport.py` API validates capture's sealed
+`SnapshotSet`: head/config/snapshot digests, canonical path inventory, logical
+screenshot/baseline mapping, read-only descriptor mode, seals, PNG bounds, sizes
+and hashes. It owns duplicated descriptors for one acquisition without opening
+manifest paths. Shared baselines use one entry; equal bytes at distinct paths
+retain their multiplicity. Every exit closes the owned descriptors.
+
+`review_images_capabilities.py` resolves exactly one configured reviewer, including
+named seats, to an immutable model/effort view. Omitted selection requires the
+configured primary. Its versioned catalog pins executable hashes, concrete CLI
+releases, explicit models and proof grammar. Unknown aliases, passthrough overrides
+and unverified model chains refuse. Bounded local version checks make no model
+call; identity is rechecked before spawn and after acquisition. There is no
+persistent capability cache or automatic admission.
+
+`review_images_adapter.py` preserves role `reviewer`, reviewer containment limits
+and existing response-directory permissions. Claude embeds base64 PNG blocks in
+one correlated structured stdin message, needing no filesystem grant. Codex uses
+one equals-form native image option per owned `/proc/<parent>/fd/<fd>` path,
+followed by `--` and the stdin positional `-`. Native loading adds no shell read
+grant, directory grant, writable copy or descriptor inheritance. Unsupported proc
+visibility fails closed. Images are PNGs at most 768 pixels per dimension and
+2 MiB each, within capture's aggregate limits; delivered digests must match,
+so unverified transformations fail closed.
+
+`review_images_proof.py` separates CLI-origin input proof from generated text.
+Claude requires a complete correlated replay, assistant response and successful
+single-turn result. Codex opens only the fresh invocation-identified session via
+bounded, ownership-checked, no-follow directory/file opens and verifies current-turn
+image inventory and completion. Comparison preserves ordered inventory multiplicity,
+never a digest set. Replayed input, proof events, image bytes and malformed streams
+cannot become response candidates, transient classification input or repair
+diagnostics. Raw streams remain local invocation logs; optional runner stdin
+summaries redact embedded payloads without changing delivery bytes.
+
+Model identity is CLI-record evidence, not provider attestation. Codex uses the
+current-turn session model from the same source behind `_detect_codex_model`;
+Claude uses current-turn reported `model`/`modelUsage` events. Every reported model
+must match the explicit seat model; absent evidence is unsuccessful. Configured
+labels cannot supply evidence. A server-side model substitution that the CLI does
+not record is an accepted limitation, as for text review today. Independent
+actual-request image proof remains mandatory. Concrete pinned Codex and Claude
+contracts require provider-free conformance in a loopback-only network namespace.
+Default CI replays fixtures and deselects real CLI tests before managed sharding;
+explicit conformance selection fails on missing prerequisites.
+
+`review_images_validation.py` gates every candidate on original immutable proof,
+including complete acquisitions ending with timeout/nonzero exit and deterministic
+text envelope normalization. Repair cannot access images or change proof. There
+is no completion resume, semantic re-ask, provider fallback, updater replay or
+post-submission retry. Uncertain completion is terminal. The pure bounded visual
+prompt requests visible defects and missing coverage only. These library APIs add
+no PR scheduling, durable round state, finding authority, screenshot clearance or
+public visual options; integration remains owned by parent #1787.
+
 ## Decisions
 
 [Decision log](decisions/execution-and-concurrency.md)

@@ -1,0 +1,253 @@
+{
+  "stdout": "{\"type\":\"thread.started\",\"thread_id\":\"01a19658-bfbd-76e3-8cba-89f95d6d7e47\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"error\",\"message\":\"Code Mode is unavailable because failed to spawn code-mode host /tmp/coding-review-agent-loop/scratch/issue-1794-conformance/test_real_cli_image_request_co2/contract/codex-code-mode-host: host executable was not found. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`.\"}}\n{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"id\":\"item_1\",\"type\":\"agent_message\",\"text\":\"VISUAL_OK\"}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":1,\"reasoning_output_tokens\":0}}\n",
+  "records": [
+    {
+      "type": "session_meta",
+      "payload": {
+        "id": "01a19658-bfbd-76e3-8cba-89f95d6d7e47",
+        "cwd": "<CWD>",
+        "timestamp": "<TIMESTAMP>",
+        "cli_version": "0.166.0"
+      }
+    },
+    {
+      "timestamp": "2026-11-01T09:02:41.105Z",
+      "ordinal": 1,
+      "type": "event_msg",
+      "payload": {
+        "type": "task_started",
+        "turn_attribution": {
+          "turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709",
+          "turn_trigger": "exec",
+          "parent_turn_id": null,
+          "initiating_agent_path": null,
+          "root_turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709"
+        },
+        "turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709",
+        "root_turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709",
+        "started_at": 1793523761,
+        "model_context_window": 258400,
+        "collaboration_mode_kind": "default"
+      }
+    },
+    {
+      "type": "turn_context",
+      "payload": {
+        "turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709",
+        "model": "gpt-6.1-sol",
+        "cwd": "<CWD>"
+      }
+    },
+    {
+      "timestamp": "2026-11-01T09:02:41.139Z",
+      "ordinal": 11,
+      "type": "response_item",
+      "payload": {
+        "type": "message",
+        "id": "msg_01a19658-bff3-7b22-937e-8433644dc56c",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "<image name=[Image #1] path=\"/proc/2937328/fd/4\">"
+          },
+          {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAC0lEQVR4nGNgQAcAABIAAXfx+gAAAAAASUVORK5CYII=",
+            "detail": "high"
+          },
+          {
+            "type": "input_text",
+            "text": "</image>"
+          },
+          {
+            "type": "input_text",
+            "text": "<image name=[Image #2] path=\"/proc/2937328/fd/8\">"
+          },
+          {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAC0lEQVR4nGNgQAcAABIAAXfx+gAAAAAASUVORK5CYII=",
+            "detail": "high"
+          },
+          {
+            "type": "input_text",
+            "text": "</image>"
+          },
+          {
+            "type": "input_text",
+            "text": "<image name=[Image #3] path=\"/proc/2937328/fd/9\">"
+          },
+          {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAC0lEQVR4nGNgQAcAABIAAXfx+gAAAAAASUVORK5CYII=",
+            "detail": "high"
+          },
+          {
+            "type": "input_text",
+            "text": "</image>"
+          },
+          {
+            "type": "input_text",
+            "text": "Visual acquisition 8334657c-631b-4a82-9a37-9447623d322a. Inspect visible defects. Say VISUAL_OK."
+          }
+        ],
+        "internal_chat_message_metadata_passthrough": {
+          "turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709",
+          "create_time": 1793523761.1392412,
+          "content_item_kinds": [
+            "user.text",
+            "user.image",
+            "user.text",
+            "user.text",
+            "user.image",
+            "user.text",
+            "user.text",
+            "user.image",
+            "user.text",
+            "user.text"
+          ],
+          "content_item_metadata": [
+            {
+              "provenance": {
+                "type": "user"
+              }
+            },
+            {
+              "provenance": {
+                "type": "user"
+              }
+            },
+            {
+              "provenance": {
+                "type": "user"
+              }
+            },
+            {
+              "provenance": {
+                "type": "user"
+              }
+            },
+            {
+              "provenance": {
+                "type": "user"
+              }
+            },
+            {
+              "provenance": {
+                "type": "user"
+              }
+            },
+            {
+              "provenance": {
+                "type": "user"
+              }
+            },
+            {
+              "provenance": {
+                "type": "user"
+              }
+            },
+            {
+              "provenance": {
+                "type": "user"
+              }
+            },
+            {
+              "provenance": {
+                "type": "user"
+              }
+            }
+          ]
+        }
+      },
+      "metadata": {
+        "retained_source": {
+          "id": {
+            "message_id": "msg_01a19658-bff3-7b22-937e-8433644dc56c",
+            "turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709",
+            "role": "user"
+          },
+          "revision": "retained_01a19658-bff3-7b22-937e-8456d4757b2a",
+          "complete": false
+        },
+        "client_authored": false,
+        "user_input_order": 0,
+        "mcp_attribution": {
+          "status": "none"
+        }
+      }
+    },
+    {
+      "timestamp": "2026-11-01T09:02:41.140Z",
+      "ordinal": 12,
+      "type": "event_msg",
+      "payload": {
+        "type": "item_completed",
+        "thread_id": "01a19658-bfbd-76e3-8cba-89f95d6d7e47",
+        "turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709",
+        "item": {
+          "type": "UserMessage",
+          "id": "01a19658-bff3-7b22-937e-844e8f7b584a",
+          "content": [
+            {
+              "type": "local_image",
+              "path": "/proc/2937328/fd/4"
+            },
+            {
+              "type": "local_image",
+              "path": "/proc/2937328/fd/8"
+            },
+            {
+              "type": "local_image",
+              "path": "/proc/2937328/fd/9"
+            },
+            {
+              "type": "text",
+              "text": "Visual acquisition 8334657c-631b-4a82-9a37-9447623d322a. Inspect visible defects. Say VISUAL_OK.",
+              "text_elements": []
+            }
+          ]
+        },
+        "started_at_ms": 1793523761140,
+        "completed_at_ms": 1793523761140
+      }
+    },
+    {
+      "timestamp": "2026-11-01T09:02:41.156Z",
+      "ordinal": 13,
+      "type": "event_msg",
+      "payload": {
+        "type": "item_completed",
+        "thread_id": "01a19658-bfbd-76e3-8cba-89f95d6d7e47",
+        "turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709",
+        "item": {
+          "type": "AgentMessage",
+          "id": "msg_test",
+          "content": [
+            {
+              "type": "Text",
+              "text": "VISUAL_OK"
+            }
+          ]
+        },
+        "started_at_ms": 1793523761156,
+        "completed_at_ms": 1793523761156
+      }
+    },
+    {
+      "timestamp": "2026-11-01T09:02:41.163Z",
+      "ordinal": 17,
+      "type": "event_msg",
+      "payload": {
+        "type": "task_complete",
+        "root_turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709",
+        "turn_id": "01a19658-bfcc-7b63-970b-e1ee2607c709",
+        "last_agent_message": "VISUAL_OK",
+        "started_at": 1793523761,
+        "completed_at": 1793523761,
+        "duration_ms": 61,
+        "time_to_first_token_ms": 54
+      }
+    }
+  ]
+}

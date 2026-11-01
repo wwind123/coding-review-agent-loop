@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from .base import AgentBackend, AgentName, AgentResult, response_turn_scope
+from .base import AgentBackend, AgentName, AgentResult, response_turn_scope, close_image_inputs
 from .antigravity import BACKEND as ANTIGRAVITY_BACKEND
 from .claude import BACKEND as CLAUDE_BACKEND
 from .codex import BACKEND as CODEX_BACKEND
@@ -116,6 +116,7 @@ def default_agent_args(
     return get_backend(agent).default_args(dangerous=dangerous or mode == "dangerous")
 
 
+@close_image_inputs
 def run_agent_result(
     runner: Runner,
     *,
@@ -128,9 +129,15 @@ def run_agent_result(
     label: str | None = None,
     timeout_seconds: float | None = None,
     attempt_suffix: str | None = None,
+    image_inputs=None,
 ) -> AgentResult:
     from ..agent_permissions import SANDBOXED_PROVIDERS, is_sandboxed
     from ..reviewer_seats import SeatAgent, seat_backend
+
+    if image_inputs is not None:
+        from ..review_images_capabilities import require_image_invocation
+        config = require_image_invocation(image_inputs, config, agent,
+                                          role=role, session_id=session_id)
 
     backend_agent = seat_backend(agent)
     if isinstance(agent, SeatAgent):
@@ -202,6 +209,8 @@ def run_agent_result(
     )
     if attempt_suffix is not None:
         kwargs["attempt_suffix"] = attempt_suffix
+    if image_inputs is not None:
+        kwargs["image_inputs"] = image_inputs
     from .. import checkout_verification
 
     # Verify the assigned checkout before the backend can spawn, on every

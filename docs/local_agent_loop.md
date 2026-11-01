@@ -10467,3 +10467,58 @@ guards. To correct an invalid approved plan, post a new signed human requirement
 requesting a corrected plan, then rerun. The reopened plan enters the unapproved
 round-start correction path. An ordinary issue edit or rerun alone does not retire
 approvals. Compatible legacy plans without recommendations keep their existing route.
+
+
+## Internal image reviewer transport (library only)
+
+Issue #1794 exposes internal APIs, not public visual command-line options. First
+call `review_images_capabilities.preflight_images(config, selection)` with one
+configured named or legacy reviewer; omission requires the configured primary.
+The immutable reviewer invocation view fixes model, effort, permissions and
+containment. All model-chain entries must have a concrete admitted contract.
+Local executable/version probes make no paid call. Unknown versions, aliases,
+backends, binaries and passthrough overrides refuse before model dispatch.
+
+Consume a capture `SnapshotSet` with
+`review_images_transport.acquire_images(snapshot, capability, head_sha=...,
+config_digest=..., snapshot_digest=...)` inside its context manager. It validates
+and owns duplicated sealed read-only descriptors; the capture caller may close
+its original handles. It never reopens manifest paths. Use
+`review_images_prompts.build_visual_prompt(inputs, diff)` to construct a bounded,
+untrusted-content-aware visible-defects prompt. Pass optional `image_inputs` to
+`agents.registry.run_agent_result` or the validated turn, with role `reviewer` and
+an explicit bounded timeout at most 1800 seconds. No session resume is permitted.
+Both direct and validated calls close their acquired descriptors on every exit.
+
+The catalog currently admits concrete Codex 0.166.0 / `gpt-6.1-sol` and Claude
+2.1.316 / `claude-sonnet-4-6` executable contracts, including executable hashes.
+Inputs are bounded PNGs at most 768 pixels per dimension and 2 MiB each.
+Claude receives structured base64 blocks without new filesystem grants; Codex's
+native loader receives exact owned parent descriptor paths without expanding
+agent-shell permissions. Changed or unobservable inventories fail closed.
+
+Model identity is CLI-record evidence, not provider attestation. Codex uses the
+current-turn session record behind `_detect_codex_model`; Claude uses current-turn
+reported `model`/`modelUsage` events. Any differing model, or no current-turn model,
+makes an image turn unsuccessful. Configured-model labels alone are insufficient.
+A server-side substitution the CLI does not record is an accepted limitation,
+as for text review today. This does not weaken independent actual-request image
+proof: clean final text or an acknowledgement alone cannot establish delivery.
+
+All image acceptance, including timeout/nonzero completion and deterministic text
+envelope repair, requires original immutable proof. Repair receives only generated
+text and retains the original frozen proof out of band; it cannot reassess images.
+No semantic re-ask, completion resume, provider fallback or post-submission replay
+is supported. Uncertain completion remains unsuccessful. Text-only calls retain
+their existing warning and recovery behavior. No screenshot clearance, code
+approval, normal finding lifecycle, durable workflow state or PR scheduling is
+introduced. Parent #1787 owns integration and rollout.
+
+Pinned-release conformance is opt-in: set `IMAGE_CONTRACT_CODEX` and
+`IMAGE_CONTRACT_CLAUDE` to the pinned executables, then run
+`agent-loop run-tests --timeout-seconds 240 -- python -m pytest -q -p no:cacheprovider -n 0 tests/test_review_images_transport.py --run-image-cli-contract -m image_cli_contract`.
+The harness requires Linux bubblewrap network isolation, inert credentials and
+isolated configuration, inspects actual loopback-only model requests and refuses
+missing prerequisites rather than skipping. Default collection deselects this
+marker before managed sharding, including direct file selection. Replay tests
+remain in ordinary CI. See `tests/fixtures/review_images/README.md` for provenance.

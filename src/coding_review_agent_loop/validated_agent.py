@@ -1135,6 +1135,9 @@ def _run_validated_agent(*args, **kwargs):
             log(config, message)
 
     with response_turn_scope(on_error=report):
+        if kwargs.get("image_inputs") is not None:
+            from .review_images_validation import validate_image_turn
+            return validate_image_turn(*args, run_agent=run_agent_result, **kwargs)
         return _run_validated_agent_in_scope(*args, **kwargs)
 
 

@@ -43,3 +43,5 @@ never rewritten or deleted. The detail doc describes the current design.
 - Turn shared-health checks retry once under one store lock and publish stale only for repeated structural source/probe loss against the same current baseline, or safely confirmed generation-bound registered-record absence; uncertainty refuses the current run without durable contamination, with existing pending recovery and per-inspection budgets unchanged (#1782).
 
 - Configured source ancestors participate in initial structural-loss classification: missing or non-directory ancestors confirm root loss, while unreadable ancestors and post-yield stability failures remain unknown (#1782).
+
+- Library-only image transport owns duplicated sealed capture descriptors, admits provider-free tested executable/model contracts, and requires independent image delivery proof plus every current-turn CLI model record. Unrecorded server substitutions are an accepted limitation; absent or differing CLI models fail closed. Reviewer permissions and containment remain intact, and deterministic envelope repair retains original proof; public activation and durable state remain deferred (#1794).

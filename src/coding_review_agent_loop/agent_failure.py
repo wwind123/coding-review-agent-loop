@@ -176,6 +176,7 @@ class ValidatedAgentResponse:
     # repair in memory but are intentionally excluded from durable metadata.
     acquisition_test_turn_id: str | None = None
     acquisition_test_observations: tuple[object, ...] = ()
+    image_delivery_proof: object | None = None
 
 
 def _response_identity_fields(

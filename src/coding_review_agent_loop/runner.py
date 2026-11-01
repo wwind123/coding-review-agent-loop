@@ -2592,6 +2592,7 @@ class Runner:
         check: bool = True,
         env: Mapping[str, str] | None = None,
         input_text: str | None = None,
+        stdin_log_summary: str | None = None,
         use_pty: bool = False,
         timeout_seconds: float | None = None,
         containment_role: str | None = None,
@@ -2610,6 +2611,7 @@ class Runner:
                 check=check,
                 env=env,
                 input_text=input_text,
+                stdin_log_summary=stdin_log_summary,
                 use_pty=use_pty,
                 timeout_seconds=timeout_seconds,
                 containment_role=containment_role,
@@ -2630,6 +2632,7 @@ class Runner:
         check: bool = True,
         env: Mapping[str, str] | None = None,
         input_text: str | None = None,
+        stdin_log_summary: str | None = None,
         use_pty: bool = False,
         timeout_seconds: float | None = None,
         containment_role: str | None = None,
@@ -2647,6 +2650,8 @@ class Runner:
         ensure_log_dir_ignored(log_path.parent)
         inferred_role = containment_role or self._containment_role or self._role_from_label(label)
         broker, turn_id = self._start_test_broker(cwd=cwd, role=inferred_role, env=env)
+        if use_pty and stdin_log_summary is not None:
+            raise ValueError("redacted stdin logging requires a non-PTY invocation")
         if use_pty:
             return self._run_with_log_pty(
                 cmd,
@@ -2669,7 +2674,7 @@ class Runner:
         if input_text is not None:
             # Preserve stdin-routed prompts in the log just as argv-routed
             # prompts are preserved in the command header.
-            header += f"\n# stdin\n{input_text}\n"
+            header += f"\n# stdin\n{stdin_log_summary if stdin_log_summary is not None else input_text}\n"
         header += "\n"
         capture_diagnostics: list[str] = []
         last_cgroup: dict[str, object] = {}

@@ -2256,3 +2256,10 @@ node_modules, `--worktree-setup 'npm ci'` in the named clone). Shared links stil
 allow write-through; use `--worktree-setup-pr-local` for writable run isolation.
 See [source integrity and recovery](docs/local_agent_loop.md#shared-source-integrity-and-recovery)
 for migration, persistence and detection limits.
+
+
+Pinned image transport conformance is an internal, opt-in developer check for
+#1794. Ordinary CI replays its fixtures without installed agent CLIs. See
+[internal image reviewer transport](docs/local_agent_loop.md#internal-image-reviewer-transport-library-only)
+for the explicit pytest option, pinned executable prerequisites, loopback-only
+harness and library API. Public visual review options remain deferred to #1787.

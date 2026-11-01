@@ -24,7 +24,18 @@ def host_specific_node_ids(node_ids, host_paths=None):
     return sorted(node_id for node_id in node_ids if any(path in node_id for path in paths))
 
 
+def pytest_addoption(parser):
+    parser.addoption("--run-image-cli-contract", action="store_true",
+                     help="Run provider-free pinned image CLI conformance (prerequisites required)")
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--run-image-cli-contract"):
+        excluded = [item for item in items if item.get_closest_marker("image_cli_contract")]
+        if excluded:
+            items[:] = [item for item in items if item not in excluded]
+            config.hook.pytest_deselected(items=excluded)
     unstable = host_specific_node_ids(item.nodeid for item in items)
     if unstable:
         raise pytest.UsageError(

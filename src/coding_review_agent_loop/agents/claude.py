@@ -198,7 +198,14 @@ class ClaudeBackend:
         label: str | None = None,
         timeout_seconds: float | None = None,
         attempt_suffix: str | None = None,
+        image_inputs=None,
     ) -> AgentResult:
+        if image_inputs is not None:
+            from ..review_images_adapter import run_image_adapter
+            return run_image_adapter(runner, config, prompt, image_inputs,
+                                     provider="claude", role=role, session_id=session_id,
+                                     run_id=run_id, label=label, timeout_seconds=timeout_seconds,
+                                     attempt_suffix=attempt_suffix)
         from ..agent_permissions import (
             SandboxBoundaryError,
             boundary_unavailable_text,
