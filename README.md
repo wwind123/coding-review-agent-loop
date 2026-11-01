@@ -176,8 +176,10 @@ see [trusted integration bases](docs/local_agent_loop.md#trusted-integration-bas
 for the adoption snippet, trust model and limitation. Shard balance comes from `tests/.test_durations`.
 A test without an entry is weighted at the mean of the known durations, so new tests are always scheduled.
 Feature PRs do not refresh `tests/.test_durations`: a full refresh, with
-`PYTHONPATH=ci/managed${PYTHONPATH:+:$PYTHONPATH} CI_SHARD_STORE_DURATIONS=tests/.test_durations python -m pytest -p ci_shard_plugin -n auto` (the plugin is not loaded automatically), belongs in a dedicated maintenance PR (see #1551).
-If the coverage gate in `tests/test_ci_sharding.py` fails in a feature PR, add only the missing entries with
+`PYTHONPATH=ci/managed${PYTHONPATH:+:$PYTHONPATH} CI_SHARD_STORE_DURATIONS=tests/.test_durations CI_SHARD_STORE_DURATIONS_MODE=replace python -m pytest -p ci_shard_plugin -n auto` (the plugin is not loaded automatically), belongs in a dedicated maintenance PR (see #1551).
+Timing drift alone must not block CI or review: missing timings affect balance only,
+while exactly-once coverage and real test failures remain blocking. Optional maintenance
+can add only missing entries with
 `PYTHONPATH=ci/managed${PYTHONPATH:+:$PYTHONPATH} CI_SHARD_STORE_DURATIONS=tests/.test_durations CI_SHARD_STORE_DURATIONS_MODE=add-missing python -m pytest -p ci_shard_plugin -n auto`, which leaves every existing entry unchanged. The always-evaluated publisher writes
 `final-ci/exact-head` only for that validated target, with the nonce, run ID,
 attempt, and Actions URL correlated in the status. Authorization failures

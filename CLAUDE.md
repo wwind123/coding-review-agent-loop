@@ -16,6 +16,7 @@ The main package lives in `src/coding_review_agent_loop/`.  Tests are in
 ```
 
 Do not refresh `tests/.test_durations` in a feature or fix PR; full refreshes
-belong in a dedicated maintenance PR, and if the coverage gate in
-`tests/test_ci_sharding.py` fails, add only the missing entries with
+belong in a dedicated maintenance PR. Timing drift alone must not block CI or review:
+missing timings affect balance only; exactly-once coverage and real test failures
+remain blocking. Optional maintenance can add only missing entries with
 `PYTHONPATH=ci/managed${PYTHONPATH:+:$PYTHONPATH} CI_SHARD_STORE_DURATIONS=tests/.test_durations CI_SHARD_STORE_DURATIONS_MODE=add-missing python -m pytest -p ci_shard_plugin -n auto`.

@@ -214,14 +214,18 @@ def test_malformed_shard_configuration_fails_closed(pytester, shard_env, env):
     result.stderr.fnmatch_lines(["*CI_SHARD*"])
 
 
-def test_shards_select_disjoint_cover_and_write_manifest(pytester, shard_env, tmp_path):
+@pytest.mark.parametrize("timings", [{}, {"test_suite.py::test_a": 10.0, "stale::gone": 999.0}])
+def test_shards_select_disjoint_cover_and_write_manifest(pytester, shard_env, tmp_path, timings):
     pytester.makepyfile(test_suite=SUITE)
+    durations = tmp_path / "durations.json"
+    durations.write_text(json.dumps(timings))
     selected = []
     for index in (1, 2, 3):
         manifest = tmp_path / f"m{index}" / "manifest.json"
         shard_env(CI_SHARD_INDEX=index, CI_SHARD_COUNT=3, CI_SHARD_MANIFEST=manifest,
-                  GITHUB_RUN_ID=RUN_ID, GITHUB_RUN_ATTEMPT=2)
-        pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
+                  GITHUB_RUN_ID=RUN_ID, GITHUB_RUN_ATTEMPT=2, CI_SHARD_DURATIONS=durations)
+        result = pytester.runpytest_inprocess("-p", "ci_shard_plugin", "-q")
+        assert result.ret == 0
         data = json.loads(manifest.read_text())
         assert data["schema_version"] == 1
         assert (data["shard_index"], data["shard_count"]) == (index, 3)
@@ -230,6 +234,7 @@ def test_shards_select_disjoint_cover_and_write_manifest(pytester, shard_env, tm
         assert data["full_collection_digest"] == ci_shard_verify.collection_digest(
             [f"test_suite.py::test_{c}" for c in "abcde"]
         )
+        assert result.parseoutcomes()["passed"] == len(data["selected_ids"])
         selected.extend(data["selected_ids"])
     assert sorted(selected) == [f"test_suite.py::test_{c}" for c in "abcde"]
 
@@ -874,18 +879,6 @@ def test_unsharded_workflow_command_is_still_detected_as_parallel():
     from coding_review_agent_loop.test_workers import detect_parallel_support
 
     assert detect_parallel_support(ROOT) is True
-
-
-def test_committed_durations_cover_most_of_the_real_collection(request):
-    durations = json.loads((TESTS_DIR / ".test_durations").read_text())
-    full = _recorded_full_collection(request) or []
-    if len(full) < 1000:
-        pytest.skip("only meaningful when the whole suite is collected")
-    known = sum(1 for i in full if i in durations)
-    assert known / len(full) > 0.9, (
-        "add the missing tests/.test_durations entries with CI_SHARD_STORE_DURATIONS_MODE=add-missing "
-        "(see README); a full refresh belongs in a dedicated maintenance PR"
-    )
 
 
 def test_callee_files_depend_only_on_the_standard_library_and_pytest():

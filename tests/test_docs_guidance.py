@@ -1199,11 +1199,14 @@ def test_duration_refresh_command_loads_the_callee_owned_shard_plugin():
         assert "-p ci_shard_plugin" in command, path
 
 
-def test_feature_prs_do_not_refresh_durations_and_use_add_missing():
-    # #1660: full refreshes churn thousands of entries; feature PRs only add missing ones.
+def test_timing_maintenance_is_advisory_and_preserves_add_missing():
+    # Timing drift affects balance, so maintenance never blocks CI or review.
     for path in (README, LOCAL_AGENT_LOOP_DOC):
         text = " ".join(path.read_text(encoding="utf-8").split())
         assert "Feature PRs do not refresh `tests/.test_durations`" in text, path
+        assert "Timing drift alone must not block CI or review" in text, path
+        assert "Optional maintenance can add only missing entries" in text, path
+        assert "If the coverage gate" not in text, path
         assert "weighted at the mean of the known durations" in text, path
         assert "belongs in a dedicated maintenance PR" in text, path
         marker = "CI_SHARD_STORE_DURATIONS_MODE=add-missing python -m pytest"
@@ -1216,6 +1219,7 @@ def test_feature_prs_do_not_refresh_durations_and_use_add_missing():
         ), path
     claude = " ".join((REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8").split())
     assert "Do not refresh `tests/.test_durations` in a feature or fix PR" in claude
+    assert "Timing drift alone must not block CI or review" in claude
     assert "CI_SHARD_STORE_DURATIONS_MODE=add-missing" in claude
 
 
