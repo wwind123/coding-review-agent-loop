@@ -518,6 +518,10 @@ new findings. Full-history validation is still required for clearance and
 ownership changes. Lifecycle human stops post the ordinary PR diagnostic.
 A stale local outcome triggers one head refresh; revisiting that head returns
 the spent-attempt diagnostic rather than repeating the stale refresh.
+If the head moves during a verified result publication, the live ledger retains
+all newly published findings and reserves their IDs before refreshing. Stale
+dispositions, acceptance and coder opportunities are withheld; an unchanged-image
+skip at the new head therefore carries the same obligations as restart replay.
 Author-aware recovery from shared transport corruption remains separate work.
 
 Lifecycle corruption stops apply only to enabled, non-dry-run, matching heads.

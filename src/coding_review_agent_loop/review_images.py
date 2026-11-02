@@ -457,7 +457,10 @@ def publish_assessment(runner, *, config, metadata, outcome, items, next_number,
         diagnostic('Visual publication unknown; durable intent remains spent: ' + str(exc)[:1024])
         return VisualOutcome(diagnostic='visual publication unknown; no ledger mutation'), items, next_number
     if current_head() != metadata.head_sha:
-        return VisualOutcome(stale=True), items, next_number
+        # The verified anchor has already made these findings durable. Carry
+        # their obligations and reserve every published ID across the refresh,
+        # but do not apply stale dispositions or grant a coder opportunity.
+        return VisualOutcome(stale=True), [*items, *new], next_number + len(new)
     updated, _ = _apply_unresolved_item_dispositions(items, {d.item_id: [d] for d in parsed.dispositions},
                                                    reconciliation_mode=reconciliation_mode)
     return replace(outcome, fresh=True), [*updated, *new], next_number + len(new)

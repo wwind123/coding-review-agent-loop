@@ -1216,3 +1216,99 @@ def test_lifecycle_corruption_cannot_erase_verified_findings(visual_setup, monke
         run_pr_loop(runner,pr_number=77,config=config)
     assert len([c for c in calls if c[0]=='images'])==1
     assert len([c for c in calls if c[0]=='capture'])==1
+
+
+@pytest.mark.parametrize('policy,parallel', [('all-reviewers', False), ('all-reviewers', True),
+                                           ('primary-then-panel', False)])
+def test_head_moves_after_verified_publication_retains_blockers_and_ids(visual_setup, monkeypatch, policy, parallel):
+    from coding_review_agent_loop import github
+    from test_pr_loop_evidence_conversion import _push_external_head
+    config, calls, original = visual_setup
+    config = replace(config, approved_followups='summarize', review_parallel=parallel, pr_review_policy=policy,
+        reviewer=('codex', 'gemini') if policy == 'primary-then-panel' else ('codex',),
+        primary_reviewer='codex' if policy == 'primary-then-panel' else None)
+    runner = FakeRunner(codex_outputs=[structured_pr_review()]*5,
+                        gemini_outputs=[structured_pr_review(reviewer='Google Gemini')]*5)
+    head_a, head_b = runner.pr_payload['headRefOid'], 'b'*40
+    def unchanged(checkout, head, settings, changes):
+        calls.append(('capture', head))
+        snap = publish(json.dumps(manifest(head)).encode(), head, settings.limits,
+                       {'one.png': png(), 'base.png': png()},
+                       {'one.png': (2, 2), 'base.png': (2, 2)}, head)
+        return CaptureResult('success', snapshots=snap)
+    monkeypatch.setattr(visual, 'capture', unchanged)
+    def reviewer(runner, **kw):
+        result = original(runner, **kw)
+        if kw.get('image_inputs'):
+            text = structured_pr_review(state='blocking', blocking_items=['Published blocker'],
+                same_pr_followups=['Published same-PR obligation'], future_followups=['Published future work'])
+            return replace(result, text=text, message_text=text, raw_output=text)
+        return result
+    monkeypatch.setattr(validated_agent, 'run_agent_result', reviewer)
+    writer = github.post_verified_trusted_pr_round_comment
+    def move_after_write(*a, **kw):
+        anchor = writer(*a, **kw)
+        # Move only after the real verified writer has returned its final anchor.
+        assert records(runner)[-1].metadata.new_items[0].text == 'Published blocker'
+        _push_external_head(runner, head_b)
+        return anchor
+    monkeypatch.setattr(github, 'post_verified_trusted_pr_round_comment', move_after_write)
+    publication = visual.publish_assessment
+    observed = []
+    def inspect_publication(*a, **kw):
+        result = publication(*a, **kw)
+        observed.append((kw['metadata'].head_sha, result))
+        return result
+    monkeypatch.setattr(visual, 'publish_assessment', inspect_publication)
+    with pytest.raises(HumanDecisionRequiredError, match='visual findings item-1'):
+        run_pr_loop(runner, pr_number=77, config=config)
+    assert [head for head, _ in observed] == [head_a, head_b]
+    stale, carried, next_number = observed[0][1]
+    skip, skipped_items, skipped_number = observed[1][1]
+    assert stale.stale and not stale.fresh and stale.response is None
+    assert [i.item_id for i in carried] == ['item-1', 'item-2', 'item-3']
+    assert next_number == skipped_number == 4
+    assert skipped_items == carried and not skip.fresh and skip.response is None
+    lifecycle = [r.metadata.visual_lifecycle for r in records(runner) if r.metadata.visual_lifecycle_present]
+    assert [v['kind'] for v in lifecycle] == ['intent', 'result', 'skip']
+    assert lifecycle[-1]['head'] == head_b and lifecycle[-1]['comparison'] == lifecycle[-2]['comparison']
+    assert [c[1] for c in calls if c[0] == 'capture'] == [head_a, head_b]
+    assert len([c for c in calls if c[0] == 'images']) == 1
+    replay = visual.recover_visual_findings(visual.load_history(runner, config, 77), reconciliation_mode='owner-scoped')
+    assert tuple(carried) == replay
+    assert not any(cmd[:1] == ['claude'] or cmd[:3] == ['gh', 'pr', 'merge'] for cmd, _ in runner.commands)
+
+
+@pytest.mark.parametrize('movement', ['before-write', 'during-write', 'stable'])
+def test_publication_head_boundary_retains_findings_without_stale_clearance(visual_setup, monkeypatch, movement):
+    from coding_review_agent_loop import github
+    from coding_review_agent_loop.unresolved_items import _next_unresolved_item
+    config, _, _ = visual_setup
+    config = replace(config, approved_followups='summarize')
+    head = 'a'*40
+    prior = replace(_next_unresolved_item(item_number=1, reviewer='Codex', source_round=1,
+                    text='Existing blocker', status='blocking'), origin_scope='visible-defects')
+    text = structured_pr_review(state='blocking', blocking_items=['New blocker'],
+        same_pr_followups=['New same-PR work'], future_followups=['New future work'],
+        prior_item_dispositions=[{'item_id': 'item-1', 'disposition': 'resolved'}])
+    outcome = visual.VisualOutcome(response=AgentResult(text=text, raw_output=text, returncode=0),
+        parsed=visual.validate_visual(text, reviewer='Codex', items=(prior,)),
+        scope={'version': 1, 'kind': 'visible-defects', 'head': head, 'seat': 'Codex'})
+    live = [head if movement != 'before-write' else 'b'*40]
+    writes = []
+    def writer(*a, **kw):
+        writes.append(kw['body'])
+        if movement == 'during-write': live[0] = 'b'*40
+    monkeypatch.setattr(github, 'post_verified_trusted_pr_round_comment', writer)
+    result, items, number = visual.publish_assessment(FakeRunner(), config=config,
+        metadata=SimpleNamespace(number=77, head_sha=head), outcome=outcome, items=[prior], next_number=2,
+        round_number=2, seat_binding=None, reconciliation_mode='owner-scoped',
+        current_head=lambda: live[0], diagnostic=lambda _: None)
+    assert len(writes) == int(movement != 'before-write')
+    assert result.stale == (movement != 'stable')
+    assert result.fresh == (movement == 'stable')
+    assert number == (2 if movement == 'before-write' else 5)
+    if movement != 'stable': assert items[0] == prior
+    else: assert prior.item_id not in {i.item_id for i in items}
+    new_items = items if movement == 'stable' else items[1:]
+    assert [i.item_id for i in new_items] == ([] if movement == 'before-write' else ['item-2', 'item-3', 'item-4'])
