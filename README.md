@@ -160,7 +160,7 @@ handoff record before exposing `expected_head_sha`. Freshness is measured on
 the base runner: `created_at` must be at most 15 minutes old and no more than
 5 minutes ahead of the runner clock. A no-status retry may advance only from
 the recorded terminal attempt to the immediate next attempt of that same run.
-A separate set of three shard jobs checks out
+A separate set of six repository-selected shard jobs checks out
 that exact SHA, installs the editable development dependencies, and runs the
 full `python -m pytest` suite once between them; an aggregate job named
 `Test validated exact head` succeeds only if every shard passed and the shard

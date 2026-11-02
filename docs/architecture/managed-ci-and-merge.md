@@ -201,7 +201,7 @@ allowance, and a no-status retry must be the immediate next attempt of the same
 run after its recorded terminal attempt. Only after validation does the
 exact-head job receive the target SHA;
 it verifies checkout, installs editable development dependencies, and runs the
-complete pytest suite once, split across three duration-balanced shard legs
+complete pytest suite once, split across six repository-selected duration-balanced shard legs
 that each test the same validated SHA. A small aggregate keeps the
 original `Test validated exact head` check name: it fails unless every shard
 succeeded, using a workflow-literal result gate before any repository code,

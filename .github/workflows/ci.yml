@@ -68,7 +68,7 @@ jobs:
     with:
       test_command: python -m pytest -n auto
       python_version: '3.12'
-      shards: 3
+      shards: 6
       durations_file: tests/.test_durations
 
   managed:
@@ -96,5 +96,5 @@ jobs:
       managed_nonce: ${{ inputs.managed_nonce }}
       test_command: python -m pytest -n auto
       python_version: '3.12'
-      shards: 3
+      shards: 6
       durations_file: tests/.test_durations

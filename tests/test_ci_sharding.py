@@ -929,7 +929,7 @@ def test_repository_callers_use_reusable_budget_defaults():
         assert job["uses"] == f"./.github/workflows/{workflow.name}"
         assert "shard_timeout_minutes" not in job["with"]
         assert "timeout-minutes" not in job
-        assert job["with"]["shards"] == 3
+        assert job["with"]["shards"] == 6
         assert job["with"]["test_command"] == "python -m pytest -n auto"
 
 
