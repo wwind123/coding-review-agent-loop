@@ -783,7 +783,8 @@ The manifest requires `head_sha` and nonempty `images` with unique `id`, relativ
 has identical confinement; finite numeric `diff_score` is advisory. Duplicate
 JSON keys, control characters, unsafe paths and malformed metadata are rejected.
 Text limits are ID 128, locale 64, state 256 and path 1024 characters. Viewport
-dimensions are positive bounded integers, independent of PNG dimensions.
+dimensions are positive integers with a separate `viewport_dimension` bound
+(16000 maximum), independent of downscaled PNG dimensions.
 
 The supervisor pins scratch and output root descriptors before repository
 execution. Only after payload emptiness does it read output relative to that
@@ -854,6 +855,9 @@ use fails proof. Codex passes one equals-form image option per owned
 `/proc/<parent>/fd/<fd>` path, then `--` and stdin `-`. Native loading adds no grants, writable copies or descriptor inheritance;
 incompatible proc visibility refuses. PNGs are limited to 768 pixels per dimension and 2 MiB each,
 within capture's aggregate bounds. Unverified transformations fail digest checks.
+`delivery_limits()` supplies shared capture/transport limits (at most 16 entries);
+lower overrides apply to both and excessive settings refuse. Aggregate bounds
+count every screenshot/baseline reference, including shared baselines.
 
 `review_images_proof.py` separates proof from generated text. Claude requires
 complete replay and single-turn completion; continuation blocks must share the

@@ -153,3 +153,24 @@ def test_manifest_rejects_unicode_controls_and_overflowing_score():
 def test_malformed_validator_reply_cannot_publish():
     with pytest.raises(ValueError,match='reply'):
         publish(json.dumps(manifest()).encode(),'a'*40,ImageLimits(),{},None,'config')
+
+
+@pytest.mark.parametrize('viewport', [(390, 844), (1280, 720), (16000, 16000)])
+def test_viewport_metadata_is_independent_of_downscaled_png_bounds(viewport):
+    from coding_review_agent_loop.review_images_config import delivery_limits
+    value = manifest()
+    value['images'][0]['viewport'] = dict(zip(('width', 'height'), viewport))
+    data = png()
+    with publish(json.dumps(value).encode(), 'a'*40, delivery_limits(),
+                 {'one.png': data, 'base.png': data},
+                 {'one.png': (2, 2), 'base.png': (2, 2)}, 'config') as snapshot:
+        assert json.loads(snapshot.manifest_json)['images'][0]['viewport']['height'] == viewport[1]
+
+
+@pytest.mark.parametrize('dimension', [16001, 0, -1, True, 1.5])
+def test_viewport_metadata_has_its_own_strict_bound(dimension):
+    from coding_review_agent_loop.review_images_config import delivery_limits
+    value = manifest()
+    value['images'][0]['viewport']['height'] = dimension
+    with pytest.raises(ValueError, match='viewport'):
+        schema(json.dumps(value).encode(), 'a'*40, delivery_limits())
